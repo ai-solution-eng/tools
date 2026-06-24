@@ -1,38 +1,49 @@
-# Frameworks
+# PCAI tools repository
 
-## Disclaimer
+This repo contains some useful tools specific to PCAI that can help during hosted trials. 
+Use the info below on how to push container images and take the **s3-browser** structure as a reference when adding your tools.
 
-This repository contains helm charts adapted to be deployed on HPE Private Ccloud AI offering. They are NOT MEANT for production but for demo purposes and are provided without any warranty. For them, the MIT license apply, which is reported below:
+## Creating a token
+
+The first step is to create a personal access token (PAT):
+- Click the user profile icon and then "Settings" from the dropdown menu to reach the user's profile page
+- On the left menu, find "Developer settings" near the bottom and open it
+- Click "Personal Access Tokens" on the left menu and then "Tokens (classic)"
+- Click "Generate new token" and then "Generate new token (classic)"
+
+In the page that opens, select:
+
+- write:packages
+- delete:packages
+
+Add some notes because they cannot be empty and click "Generate token"
+Save the token somewhere.
+
+## Authenticating
+
+To authenticate just issue:
+
 ```
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+echo "YOUR_PERSONAL_ACCESS_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
 ```
 
-## Structure
+Podman can be used instead of Docker keeping the same syntax.
 
-Each framework has its own folder with the following content:
+## Building the image
 
-- a **logo** of the framework, to be used during the import process
-- a **x.y.z** folder, relative to a specific version of the framework
-- a **porting.md** file, describing how the framework has been ported to PCAI
-- a **FRAMEWORK-x.y.z.tar.gz** file, which is the tar/gz file of the previous folder and FRAMEWORK is the name of the containing folder
+A container can be built using Docker or Podman. Here is an example:
 
-Here are some references to follow:
+```
+podman build --tag ghcr.io/ai-solution-eng/s3-browser:1.0.0 .
+podman push ghcr.io/ai-solution-eng/s3-browser:1.0.0
+```
 
-- https://support.hpe.com/hpesc/public/docDisplay?docId=a00aie16hen_us&docLocale=en_US&page=ManageClusters/importing-applications.html
-- https://github.com/HPEEzmeral/byoa-tutorials/blob/main/tutorial/README.md (this is older but still relevant)
+## Enabling public access
+
+The first time a container is pushed to GitHub, it's package has a **private** visibility and it must be
+changed to **public** to allow a PCAI unit to download it. To do this:
+
+- Click the "Packages" tab at organization level. The list of packages will be shown
+- Click the package just uploaded (for example, the "s3-browser"). You will see the latest version
+- Click the "Package settings" on the right side of the panel
+- Scroll down to the "Danger Zone" and click "Change package visibility"
