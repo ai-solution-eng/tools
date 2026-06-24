@@ -1,0 +1,15 @@
+apiVersion: ezconfig.hpe.ezaf.com/v1alpha1
+kind: EzPolicyBinding
+metadata:
+  name: {{ .Chart.Name }}-policy-binding
+  namespace: ezuser-system
+spec:
+  policyRef:
+    apiGroup: ezconfig.hpe.ezaf.com
+    kind: EzPolicy
+    name: {{ .Chart.Name }}-policy
+  subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: default
+    namespace: {{ .Release.Namespace }}

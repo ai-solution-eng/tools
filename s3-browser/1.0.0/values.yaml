@@ -1,0 +1,14 @@
+
+service:
+  httpPort : 8501
+  
+resources:
+  requests:
+    cpu: 1
+    memory: 1Gi
+
+ezua:
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "s3-browser.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"

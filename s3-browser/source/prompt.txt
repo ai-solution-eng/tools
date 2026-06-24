@@ -1,0 +1,11 @@
+Write a streamlit application that allows to view the files inside a s3 bucket. 
+The list of buckets must be listed on the left part of the application while the right part will list the files.
+When the user clicks a bucket on the left part, all files contained into that bucket must be listed on the right part. 
+If the listed file is a folder, once it is clicked, list all files of that folder. 
+On the top of the screen, show the full path (bucket + folder) of what is listed on the right part.
+The S3 configuration does not require authentication. Look inside ../list-bucket as a guide on how to access the bucket.
+Add the possibility to upload files.
+Add the possibility to create and delete buckets.
+Add the possibility to download and delete files. Also add the possibility to add files using drag&drop.
+When the app starts, check if the "/run/secrets/kubernetes.io/serviceaccount/token" file exists. 
+If yes, read its content and use it as the access key when creating the s3 client connection while for the secret key us the string "s3"

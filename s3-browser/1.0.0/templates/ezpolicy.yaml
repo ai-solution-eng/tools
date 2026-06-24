@@ -1,0 +1,15 @@
+apiVersion: ezconfig.hpe.ezaf.com/v1alpha1
+kind: EzPolicy
+metadata:
+  name: {{ .Chart.Name }}-policy
+  namespace: ezuser-system
+spec:
+  policies:
+  - operations:
+    - READ
+    - WRITE
+    - CREATE
+    - UPDATE
+    - DELETE
+    permission: allow
+    resource: ezrn::s3:local-s3:*

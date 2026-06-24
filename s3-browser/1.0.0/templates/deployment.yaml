@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-browser
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s3-browser
+  template:
+    metadata:
+      labels:
+        app: s3-browser
+        hpe-ezua/app: {{ .Chart.Name }}
+        hpe-ezua/type: vendor-service
+        hpe.com/s3-credentials-helper: "true"
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: {{ .Chart.Name }}
+          image: ghcr.io/ai-solution-eng/s3-browser:{{ .Chart.AppVersion }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

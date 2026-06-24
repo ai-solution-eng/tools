@@ -1,0 +1,8 @@
+apiVersion: v2
+name: s3-browser
+description: A Kubernetes application to browse and manages the PCAI local S3 storage
+
+type: application
+
+version: 1.0.0
+appVersion: 1.0.0
