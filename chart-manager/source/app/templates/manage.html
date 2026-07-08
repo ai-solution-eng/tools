@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChartMuseum Management</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <style>
+        body { 
+            background: linear-gradient(to bottom, #f8f9fa, #e9ecef); 
+            color: #333; 
+            font-family: 'Roboto', sans-serif; 
+            animation: fadeIn 0.5s ease-in-out; 
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .container { margin-top: 50px; max-width: 1200px; }
+        .logo { max-width: 280px; margin-bottom: 20px; display: block; margin-left: auto; margin-right: auto; }
+        h1, h2 { color: #212529; font-weight: 700; text-align: center; }
+        .card { 
+            background-color: #ffffff; 
+            border: none; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            transition: box-shadow 0.3s ease; 
+        }
+        .card:hover { box-shadow: 0 6px 24px rgba(0, 0, 0, 0.15); }
+        .table { border-radius: 8px; overflow: hidden; border: 1px solid #dee2e6; }
+        .table th { background-color: #f1f3f5; color: #495057; text-align: center; font-weight: 500; padding: 15px; }
+        .table td { text-align: center; vertical-align: middle; border-top: 1px solid #dee2e6; padding: 15px; border-bottom: 1px solid #e9ecef; }
+        .table-striped tbody tr:nth-of-type(odd) { background-color: #f9f9f9; }
+        .table tbody tr:hover { background-color: #f1f3f5; transition: background-color 0.3s ease; }
+        .description-col { max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .btn { 
+            border-radius: 20px; 
+            transition: transform 0.3s ease, box-shadow 0.3s ease, background-color 0.3s ease; 
+            font-weight: 500; 
+            padding: 0.5rem 1rem; 
+            background: var(--bs-btn-bg); /* Removed gradient for visibility test */
+            color: #fff !important; 
+            opacity: 1 !important; 
+            text-align: center; 
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1); 
+        }
+        .btn-info { --bs-btn-bg: #0dcaf0; }
+        .btn-success { --bs-btn-bg: #198754; }
+        .btn-danger { --bs-btn-bg: #dc3545; }
+        .btn:hover { 
+            transform: scale(1.05); 
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); 
+        }
+        .input-group { border: 1px solid #ced4da; border-radius: 8px; overflow: hidden; }
+        .input-group input { border: none; }
+        .input-group input:focus { box-shadow: none; }
+        .input-group button { border-radius: 0 8px 8px 0; }
+        .alert { border-radius: 8px; }
+        .modal-content { border-radius: 12px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2); }
+        .btn-group { flex-direction: column; align-items: center; gap: 5px; }
+        .btn-group .btn { width: 140px; display: flex; align-items: center; justify-content: center; gap: 5px; border-radius: 20px; text-align: center; color: #fff !important; opacity: 1 !important; }
+        .btn-group .bi { color: #fff; font-size: 1.1rem; opacity: 1 !important; }
+        @media (max-width: 768px) { 
+            .container { padding: 0 15px; }
+            .btn { width: 100%; margin-bottom: 10px; }
+            .text-center .btn { margin-left: 0 !important; margin-right: 0 !important; }
+            .btn-group .btn { margin-bottom: 5px; width: 100%; }
+            .description-col { max-width: none; white-space: normal; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://i.postimg.cc/pL41hZKk/d051d20f_45a0_41e0_98aa_56c6bd126d80.jpg" alt="HPE Private Cloud AI" class="logo">
+        <h1>ChartMuseum Management</h1>
+        <p class="text-center">Connected to: {{ chartmuseum_url }}</p>
+        <div class="text-center mb-4">
+            <a href="{{ url_for('logs') }}" class="btn btn-info" data-bs-toggle="tooltip" title="View audit logs"><i class="bi bi-journal-text"></i> View Logs</a>
+            <a href="{{ url_for('change_address') }}" class="btn btn-warning mx-2" data-bs-toggle="tooltip" title="Change ChartMuseum IP"><i class="bi bi-arrow-repeat"></i> Change Museum Address</a>
+            <a href="{{ url_for('logout') }}" class="btn btn-secondary" data-bs-toggle="tooltip" title="Logout from session"><i class="bi bi-box-arrow-right"></i> Logout</a>
+        </div>
+        
+        <div class="card">
+            <h2>Upload New Chart</h2>
+            <form method="POST" enctype="multipart/form-data">
+                <div class="mb-3">
+                    <input type="file" class="form-control" name="chart_file" accept=".tgz" multiple required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100"><i class="bi bi-upload"></i> Upload</button>
+            </form>
+        </div>
+        
+        <div class="card">
+            <h2>Existing Charts</h2>
+            <form method="GET" class="mb-3 row">
+                <div class="col-md-3">
+                    <input type="text" class="form-control" name="search" placeholder="Search..." value="{{ search_query }}">
+                </div>
+                <div class="col-md-3">
+                    <input type="date" class="form-control" name="since" value="{{ since }}">
+                </div>
+                <div class="col-md-3">
+                    <input type="date" class="form-control" name="until" value="{{ until }}">
+                </div>
+                <div class="col-md-3">
+                    <input type="text" class="form-control" name="min_version" placeholder="Min Version" value="{{ min_version }}">
+                </div>
+                <div class="col-md-12 mt-2">
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-search"></i> Filter</button>
+                </div>
+            </form>
+            <a href="{{ url_for('manage') }}" class="btn btn-outline-secondary mb-3" data-bs-toggle="tooltip" title="Refresh chart list"><i class="bi bi-arrow-clockwise"></i> Refresh</a>
+            {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+            {% elif flat_charts %}
+                <table class="table table-striped" id="chartsTable">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Version</th>
+                            <th class="description-col">Description</th>
+                            <th>App Version</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for chart in flat_charts %}
+                            <tr>
+                                <td>{{ chart.name }}</td>
+                                <td>{{ chart.version }}</td>
+                                <td class="description-col">{{ chart.description | default('N/A') }}</td>
+                                <td>{{ chart.appVersion | default('N/A') }}</td>
+                                <td>{{ chart.created | default('N/A') }}</td>
+                                <td>
+                                    <div class="btn-group" role="group">
+                                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#detailsModal" 
+                                                data-name="{{ chart.name }}" data-version="{{ chart.version }}" data-description="{{ chart.description | default('N/A') }}" 
+                                                data-appversion="{{ chart.appVersion | default('N/A') }}" data-created="{{ chart.created | default('N/A') }}" 
+                                                data-home="{{ chart.home | default('N/A') }}" data-sources="{{ chart.sources | join(', ') | default('N/A') }}" data-bs-toggle="tooltip" title="View details">
+                                            <i class="bi bi-eye"></i> Details
+                                        </button>
+                                        <a href="{{ url_for('download', name=chart.name, version=chart.version) }}" class="btn btn-success btn-sm" data-bs-toggle="tooltip" title="Download chart"><i class="bi bi-download"></i> Download</a>
+                                        <a href="{{ url_for('delete', name=chart.name, version=chart.version) }}" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure?')" data-bs-toggle="tooltip" title="Delete chart"><i class="bi bi-trash"></i> Delete</a>
+                                    </div>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <div class="text-center mt-3">
+                    {% if page > 1 %}
+                        <a href="{{ url_for('manage', page=page-1, size=size, search=search_query, since=since, until=until, min_version=min_version) }}" class="btn btn-secondary">Previous</a>
+                    {% endif %}
+                    Page {{ page }} of {{ (total // size) + (1 if total % size else 0) }}
+                    {% if page * size < total %}
+                        <a href="{{ url_for('manage', page=page+1, size=size, search=search_query, since=since, until=until, min_version=min_version) }}" class="btn btn-secondary">Next</a>
+                    {% endif %}
+                </div>
+            {% else %}
+                <p class="text-center">No charts found.</p>
+            {% endif %}
+        </div>
+        
+        <!-- Modal for Details -->
+        <div class="modal fade" id="detailsModal" tabindex="-1" aria-labelledby="detailsModalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="detailsModalLabel">Chart Details</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p><strong>Name:</strong> <span id="modal-name"></span></p>
+                        <p><strong>Version:</strong> <span id="modal-version"></span></p>
+                        <p><strong>Description:</strong> <span id="modal-description"></span></p>
+                        <p><strong>App Version:</strong> <span id="modal-appversion"></span></p>
+                        <p><strong>Created:</strong> <span id="modal-created"></span></p>
+                        <p><strong>Home URL:</strong> <span id="modal-home"></span></p>
+                        <p><strong>Sources:</strong> <span id="modal-sources"></span></p>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+            var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+                return new bootstrap.Tooltip(tooltipTriggerEl)
+            })
+            var detailsModal = document.getElementById('detailsModal')
+            detailsModal.addEventListener('show.bs.modal', function (event) {
+                var button = event.relatedTarget
+                document.getElementById('modal-name').textContent = button.getAttribute('data-name')
+                document.getElementById('modal-version').textContent = button.getAttribute('data-version')
+                document.getElementById('modal-description').textContent = button.getAttribute('data-description')
+                document.getElementById('modal-appversion').textContent = button.getAttribute('data-appversion')
+                document.getElementById('modal-created').textContent = button.getAttribute('data-created')
+                document.getElementById('modal-home').textContent = button.getAttribute('data-home')
+                document.getElementById('modal-sources').textContent = button.getAttribute('data-sources')
+            })
+        </script>
+        
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                <div class="alert alert-info mt-3">
+                    {{ messages[0] }}
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
+</body>
+</html>
