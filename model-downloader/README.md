@@ -1,4 +1,4 @@
-# model-downloader
+# Model downloader
 
 A command-line tool for downloading AI models from **HuggingFace** or **NVIDIA NGC** into a local directory or an S3 bucket (including S3-compatible storage like MinIO). It supports resuming interrupted downloads, shows progress bars, and is fully configured via a single YAML file.
 
