@@ -1,0 +1,18 @@
+# Example: Download from HuggingFace to a local directory
+repo:
+  type: hf
+  id: openai/gpt-oss-120b
+  token: "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"  # optional, falls back to HF_TOKEN env var
+
+destination:
+  path: s3://models/
+
+s3:
+  endpoint_url: "http://local-s3-service.ezdata-system.svc.cluster.local:30000"              # optional, for S3-compatible storage (e.g. MinIO)
+  #region: us-east-1
+  # Option A: explicit credentials
+  #access_key_id: AKIAIOSFODNN7EXAMPLE
+  #secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  #session_token: ""             # optional
+  # Option B: AWS profile from ~/.aws/credentials (overrides keys above)
+  # profile: my-profile

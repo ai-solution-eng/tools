@@ -1,0 +1,10 @@
+Build a python program that connects to either nvidia ngc or huggingface repositories, downloads a model into a pvc or local directory. The input parameters are:
+- the remote repository type
+- the remote model
+- the pvc name
+the full content of the remote model must be downloaded and the program must be able to recover in case it is stopped in advance. Show a progress bar that indicates the download percentage
+
+instead of a pvc, assume a directory inside an s3 bucket
+
+add authentication to the s3 storage. put all parameters into a yaml files and read that file instead of passing all parameters on the command line. 
+the only parameter to pass is the name of the configuration file.
