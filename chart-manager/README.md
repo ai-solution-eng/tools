@@ -6,8 +6,8 @@ This Helm chart deploys a simple Flask application on HPE Private Cloud AI (PCAI
 
 Default credentials for access: 
 
-	- Username : **chartadmin**
-	- Password : **chartpassword**
+- Username : **chartadmin**
+- Password : **chartpassword**
 
 ## Adaptations for PCAI
 
