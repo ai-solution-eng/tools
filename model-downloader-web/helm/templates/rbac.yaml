@@ -1,0 +1,66 @@
+# Cluster-wide access to create/delete the HF download Job and its per-submission
+# HF-token Secret in whatever namespace the user submits. This is intentionally
+# broad; tighten by replacing the ClusterRole with per-namespace Roles if your
+# environment requires it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "model-downloader.fullname" . }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs", "jobs/status"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "model-downloader.fullname" . }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "model-downloader.fullname" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "model-downloader.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+---
+# Namespaced Role to read the Job-template ConfigMap (lives in the release namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-template-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames:
+  - {{ include "model-downloader.fullname" . }}-job-template
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-template-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "model-downloader.fullname" . }}-template-reader
+subjects:
+- kind: ServiceAccount
+  name: {{ include "model-downloader.fullname" . }}
+  namespace: {{ .Release.Namespace }}

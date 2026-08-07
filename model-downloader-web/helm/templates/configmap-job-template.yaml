@@ -1,0 +1,324 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-job-template
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+data:
+  job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.downloader.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.downloader.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: downloader
+            securityContext:
+            {{- with .Values.downloader.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            image: {{ .Values.downloader.image.repository }}:{{ .Values.downloader.image.tag }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              export CACHE_ROOT="/mnt/large-models/${MODEL_NAME}"
+              export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}"
+              export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
+              mkdir -p "${CACHE_ROOT}"
+              CACHE_ID="models--$(echo "${MODEL_NAME}" | sed 's|/|--|')"
+              REV_FILE="${CACHE_ROOT}/${CACHE_ID}/refs/main"
+              echo "Completing HF cache for ${MODEL_NAME}"
+              echo "Cache root (HUGGINGFACE_HUB_CACHE): ${CACHE_ROOT}"
+              echo "Repo cache dir: ${CACHE_ROOT}/${CACHE_ID}"
+              BEFORE_REV="none"
+              if [ -f "${REV_FILE}" ]; then BEFORE_REV="$(cat "${REV_FILE}")"; fi
+              echo "refs/main before: ${BEFORE_REV}"
+              if [ -d "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" ]; then
+                echo "=== Existing snapshot contents ==="
+                ls -la "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" || true
+              fi
+              python3 -c "
+              import os, httpx
+              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              _orig = httpx.Client
+              class _Client(_orig):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.Client = _Client
+              _oa = httpx.AsyncClient
+              class _AsyncClient(_oa):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.AsyncClient = _AsyncClient
+              {{- end }}
+              import huggingface_hub.constants as _c
+              _c.MAX_HTTP_DOWNLOAD_SIZE = 500 * 1000 * 1000 * 1000
+              from huggingface_hub import snapshot_download
+              path = snapshot_download(
+                  os.environ['MODEL_NAME'],
+                  cache_dir=os.environ['HUGGINGFACE_HUB_CACHE'],
+                  max_workers=8,
+              )
+              print('Completed (full snapshot) at:', path)
+              "
+              AFTER_REV="$(cat "${REV_FILE}" 2>/dev/null || echo "${BEFORE_REV}")"
+              SNAP_DIR="${CACHE_ROOT}/${CACHE_ID}/snapshots/${AFTER_REV}"
+              echo "=== Verifying resolved snapshot: ${SNAP_DIR} (refs/main=${AFTER_REV}) ==="
+              ls -la "${SNAP_DIR}"
+              if [ -f "${SNAP_DIR}/config.json" ]; then
+                echo "SUCCESS: config.json is now present in the cache."
+              else
+                echo "FAILURE: config.json still missing after download."
+                exit 1
+              fi
+              if [ -n "${CHAT_TEMPLATE_B64}" ]; then
+                CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_PATH}"
+                case "${CHAT_TEMPLATE_FILE}" in
+                  /*) ;;
+                  *) CHAT_TEMPLATE_FILE="${CACHE_ROOT}/${CHAT_TEMPLATE_FILE}" ;;
+                esac
+                mkdir -p "$(dirname "${CHAT_TEMPLATE_FILE}")"
+                printf '%s' "${CHAT_TEMPLATE_B64}" | base64 -d > "${CHAT_TEMPLATE_FILE}"
+                echo "SUCCESS: chat template written to ${CHAT_TEMPLATE_FILE}"
+              fi
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            - name: MODEL_NAME
+              value: __MODEL_NAME__
+            - name: CHAT_TEMPLATE_B64
+              value: "__CHAT_TEMPLATE_B64__"
+            - name: CHAT_TEMPLATE_PATH
+              value: "__CHAT_TEMPLATE_PATH__"
+            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            - name: no_proxy
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: NO_PROXY
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: https_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: http_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTP_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.downloader.user | quote }}
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: {{ .Values.downloader.hf.downloadTimeout | quote }}
+            - name: HF_HUB_ETAG_TIMEOUT
+              value: {{ .Values.downloader.hf.etagTimeout | quote }}
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: {{ .Values.downloader.hf.enableHfTransfer | quote }}
+            - name: HF_HUB_DISABLE_XET
+              value: {{ .Values.downloader.hf.disableXet | quote }}
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+            resources:
+            {{- toYaml .Values.downloader.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: {{ .Values.downloader.pvcName }}
+  job-s3.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.downloader.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.downloader.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: downloader
+            securityContext:
+            {{- with .Values.downloader.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            image: {{ .Values.downloader.image.repository }}:{{ .Values.downloader.image.tag }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              export WORK_CACHE="{{ .Values.downloader.s3WorkPath }}/${MODEL_NAME}"
+              export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
+              mkdir -p "${WORK_CACHE}"
+              DEST_PATH="${MODEL_NAME}"
+              if [ -n "${S3_PREFIX}" ]; then DEST_PATH="${S3_PREFIX}/${MODEL_NAME}"; fi
+              echo "Downloading ${MODEL_NAME} directly to S3 (s3://${S3_BUCKET}/${DEST_PATH})"
+              echo "Scratch (WORK_CACHE): ${WORK_CACHE}"
+              python3 -c "
+              import os, shutil, threading
+              from concurrent.futures import ThreadPoolExecutor, as_completed
+              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              import httpx
+              _orig = httpx.Client
+              class _Client(_orig):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.Client = _Client
+              _oa = httpx.AsyncClient
+              class _AsyncClient(_oa):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.AsyncClient = _AsyncClient
+              {{- end }}
+              import huggingface_hub.constants as _c
+              _c.MAX_HTTP_DOWNLOAD_SIZE = 500 * 1000 * 1000 * 1000
+              from huggingface_hub import list_repo_files, hf_hub_download
+              from pathlib import Path
+              import boto3
+              from boto3.s3.transfer import TransferConfig
+
+              model = os.environ['MODEL_NAME']
+              bucket = os.environ['S3_BUCKET']
+              prefix = os.environ['S3_PREFIX']
+              work_root = Path(os.environ['WORK_CACHE'])
+              dest_prefix = '%s/%s' % (prefix, model) if prefix else model
+
+              kws = {}
+              if os.environ.get('AWS_ENDPOINT_URL'):
+                  kws['endpoint_url'] = os.environ['AWS_ENDPOINT_URL']
+              s3 = boto3.client('s3', **kws)
+              cfg = TransferConfig(multipart_threshold=64*1024*1024, max_concurrency=8)
+
+              files = sorted(f for f in list_repo_files(model) if not f.endswith('/'))
+              if not files:
+                  raise SystemExit('no files found for ' + model)
+              print('Uploading %d file(s) to s3://%s/%s' % (len(files), bucket, dest_prefix))
+
+              _local = threading.local()
+
+              def upload_one(file):
+                  if not getattr(_local, 'cache', None):
+                      _local.cache = work_root / ('w' + threading.current_thread().name.replace('ThreadPoolExecutor-', ''))
+                      _local.cache.mkdir(parents=True, exist_ok=True)
+                  local = Path(hf_hub_download(repo_id=model, filename=file, cache_dir=str(_local.cache)))
+                  s3.upload_file(str(local), bucket, '%s/%s' % (dest_prefix, file), Config=cfg)
+                  shutil.rmtree(_local.cache, ignore_errors=True)
+                  return file
+
+              failed = []
+              with ThreadPoolExecutor(max_workers=8) as ex:
+                  futures = {ex.submit(upload_one, f): f for f in files}
+                  for fut in as_completed(futures):
+                      f = futures[fut]
+                      try:
+                          fut.result()
+                      except Exception as e:
+                          failed.append(f)
+                          print('FAILED %s: %s' % (f, e), flush=True)
+              if failed:
+                  raise SystemExit('failed to upload: %s' % ', '.join(failed))
+              print('SUCCESS: %d file(s) uploaded to s3://%s/%s' % (len(files), bucket, dest_prefix))
+              "
+              echo "SUCCESS: snapshot uploaded to s3://${S3_BUCKET}/${DEST_PATH}"
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            - name: MODEL_NAME
+              value: __MODEL_NAME__
+            - name: S3_BUCKET
+              value: "__S3_BUCKET__"
+            - name: S3_PREFIX
+              value: "__S3_PREFIX__"
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.s3.endpointUrl | quote }}
+            {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.s3.secretAccessKey | quote }}
+            {{- end }}
+            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            - name: no_proxy
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: NO_PROXY
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: https_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: http_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTP_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.downloader.user | quote }}
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: {{ .Values.downloader.hf.downloadTimeout | quote }}
+            - name: HF_HUB_ETAG_TIMEOUT
+              value: {{ .Values.downloader.hf.etagTimeout | quote }}
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: {{ .Values.downloader.hf.enableHfTransfer | quote }}
+            - name: HF_HUB_DISABLE_XET
+              value: {{ .Values.downloader.hf.disableXet | quote }}
+            volumeMounts:
+            - name: work-storage
+              mountPath: /mnt/
+            resources:
+            {{- toYaml .Values.downloader.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: work-storage
+            {{- if .Values.downloader.s3WorkPvcName }}
+            persistentVolumeClaim:
+              claimName: {{ .Values.downloader.s3WorkPvcName }}
+            {{- else }}
+            emptyDir:
+              sizeLimit: {{ .Values.downloader.s3WorkSize | quote }}
+            {{- end }}

@@ -1,0 +1,18 @@
+{{- if .Values.catalog.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-catalog
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.catalog.size }}
+  {{- if .Values.catalog.storageClassName }}
+  storageClassName: {{ .Values.catalog.storageClassName | quote }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "model-downloader.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "model-downloader.fullname" . }}
+      containers:
+      - name: app
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.port }}
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: JOB_TEMPLATE_CONFIGMAP
+          value: {{ include "model-downloader.fullname" . }}-job-template
+        - name: JOB_TEMPLATE_CONFIGMAP_NAMESPACE
+          value: {{ .Release.Namespace }}
+        - name: MAX_CONCURRENCY
+          value: {{ .Values.maxConcurrency | quote }}
+        - name: PVC_NAME
+          value: {{ .Values.downloader.pvcName | quote }}
+        - name: CONTAINER_PATH
+          value: "/mnt/models"
+        - name: PVC_SUBPATH
+          value: "large-models"
+        - name: STORAGE_BACKEND
+          value: {{ .Values.storage.backend | quote }}
+        - name: STORAGE_DEFAULT
+          value: {{ .Values.storage.default | quote }}
+        - name: S3_BUCKET
+          value: {{ .Values.s3.bucket | quote }}
+        - name: S3_PREFIX
+          value: {{ .Values.s3.prefix | quote }}
+        {{- if .Values.catalog.enabled }}
+        - name: CATALOG_PATH
+          value: "/mnt/catalog/catalog.json"
+        {{- end }}
+        - name: AIOLI_DB_HOST
+          value: {{ .Values.aioli.dbHost | quote }}
+        - name: AIOLI_DB_PORT
+          value: {{ .Values.aioli.dbPort | quote }}
+        - name: AIOLI_DB_NAME
+          value: {{ .Values.aioli.dbName | quote }}
+        - name: AIOLI_DB_USER
+          value: {{ .Values.aioli.dbUser | quote }}
+        - name: AIOLI_DB_SECRET_NAME
+          value: {{ .Values.aioli.dbPasswordSecret.name | quote }}
+        - name: AIOLI_DB_SECRET_NS
+          value: {{ .Values.aioli.dbPasswordSecret.namespace | quote }}
+        - name: AIOLI_DB_SECRET_KEY
+          value: {{ .Values.aioli.dbPasswordSecret.key | quote }}
+        livenessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.catalog.enabled }}
+        volumeMounts:
+        - name: catalog-storage
+          mountPath: /mnt/catalog
+        {{- end }}
+      {{- if .Values.catalog.enabled }}
+      volumes:
+      - name: catalog-storage
+        persistentVolumeClaim:
+          claimName: {{ include "model-downloader.fullname" . }}-catalog
+      {{- end }}

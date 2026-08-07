@@ -1,0 +1,172 @@
+# =============================================================================
+# App image (the FastAPI service that serves the UI and submits Jobs).
+# =============================================================================
+image:
+  repository: andrewbydlon/pcai-model-downloader
+  tag: "0.5.0"
+  pullPolicy: IfNotPresent
+
+# Max concurrent model downloads; extras are queued in-process.
+maxConcurrency: 4
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# =============================================================================
+# HPE corporate proxy environment (hpeproxy.its.hpecorp.net + Zscaler MITM).
+# This flag controls ONLY the proxy / no_proxy env vars on downloader Jobs and
+# the httpx TLS-verification bypass needed to get through the Zscaler proxy.
+#
+#   hpe_proxies: true    proxy env + TLS bypass (default)
+#   hpe_proxies: false   no proxy env vars, TLS verification intact
+#
+# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
+# so they are installed by default. When deploying to a generic cluster
+# disable them explicitly:
+#   --set hpe_proxies=false --set kyverno.enabled=false --set ezua.enabled=false
+# =============================================================================
+hpe_proxies: true
+
+# =============================================================================
+# Download storage backend.
+#   backend: "pvc" | "s3" | "both"   which backends users can pick in the UI
+#   default: "pvc" | "s3"            the preselected option
+# =============================================================================
+storage:
+  backend: both
+  default: pvc
+
+# =============================================================================
+# S3-compatible backend for downloads ("s3" storage backend) — e.g. MinIO.
+# The downloader Job streams HF model files straight into this bucket.
+# =============================================================================
+s3:
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL
+  bucket: "mlis-models"         # bucket must already exist
+  prefix: "large-models"       # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
+  accessKeyId: "admin-io"      # MinIO access key (required for MinIO)
+  secretAccessKey: "MinIO$2K"  # MinIO secret key (required for MinIO)
+
+# =============================================================================
+# Downloader Job definition.
+# Rendered into a ConfigMap that the app reads, substitutes per-submission
+# placeholders (__NAMESPACE__, __MODEL_NAME__, __JOB_NAME__, __HF_TOKEN_SECRET__)
+# in, then creates via the k8s API.
+# =============================================================================
+downloader:
+  image:
+    repository: andrewbydlon/hf-downloader
+    tag: "v4.0"
+  # PVC backed at /mnt where the model cache is written (pvc backend only).
+  pvcName: models-pvc
+  # Node selector for the download Job (e.g. node with PVC access).
+  # Empty = let the scheduler choose any node.
+  nodeSelector: {}
+  # S3 backend only: scratch space used while downloading before upload.
+  # When set to an existing PVC name the job uses that; otherwise an emptyDir
+  # sized by s3WorkSize. Files are streamed to S3 per-file (8 in parallel), so
+  # this only needs to hold a handful of in-flight files — not the whole model.
+  s3WorkPvcName: ""
+  s3WorkSize: 20Gi
+  # Path (inside the work volume) the downloader writes its cache to when the
+  # storage backend is S3. Must live under the volume mounted at /mnt.
+  s3WorkPath: "/mnt/s3work"
+  # How many times a failed download Job is retried before it is marked
+  # Failed. The HF cache lives on the shared PVC, so a restart resumes the
+  # partial download instead of starting over (snapshot_download picks up
+  # existing blobs + .incomplete files). Set 0 to disable retries.
+  backoffLimit: 2
+  # When true, downloader pods opt out of the platform security-context
+  # mutation (hpe-ezua/disable-sc: "true") so they can run as root and mount
+  # the shared model PVC. Only relevant on HPE PCAI clusters.
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  ttlSecondsAfterFinished: 3600
+  user: andrew-bydlon  # for HF request headers / logging
+  hf:
+    downloadTimeout: "300"
+    etagTimeout: "30"
+    enableHfTransfer: "0"
+    disableXet: "1"
+    # TLS verification for the downloader. Controlled by `hpe_proxies` (true =
+    # bypass Zscaler MITM / verifyTls=false, false = TLS intact / verifyTls=true).
+    # Override explicitly with `--set downloader.hf.verifyTls=true`.
+    # verifyTls: false
+
+# =============================================================================
+# PCAI environment (corporate proxy + Zscaler bypass).
+# Used only when hpe_proxies=true (see README).
+# =============================================================================
+pcai:
+  # Leave `enabled` to fall back to the hpe_proxies flag; force it explicitly
+  # only to override.
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost
+
+# =============================================================================
+# Kyverno policy that stamps vendor-app labels (hpe-ezua type, hpe-ezua/app)
+# onto Pods/Deployments/Services created in the release namespace. Installed
+# as a pre-install helm hook. On by default (PCAI app); disable only when
+# deploying outside HPE PCAI.
+# =============================================================================
+kyverno:
+  enabled: true
+
+# =============================================================================
+# EZUA / PCAI Istio ingress exposure (VirtualService + AuthorizationPolicy).
+# On by default (PCAI app); disable with `--set ezua.enabled=false` when
+# deploying outside HPE PCAI.
+# =============================================================================
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "model-downloader.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# =============================================================================
+# Model catalog — a small PVC.
+# =============================================================================
+catalog:
+  enabled: true
+  size: 100Mi
+  storageClassName: ""
+
+# =============================================================================
+# AIOLI / MLIS database connection for pushing model configs.
+# =============================================================================
+aioli:
+  dbHost: aioli-db-service-hpe-mlis.mlis.svc.cluster.local
+  dbPort: 5432
+  dbName: aioli
+  dbUser: postgres
+  dbPasswordSecret:
+    name: aioli-db-password
+    namespace: mlis
+    key: password
+
+# Optional name overrides ( Helm convention ).
+nameOverride: ""
+fullnameOverride: ""

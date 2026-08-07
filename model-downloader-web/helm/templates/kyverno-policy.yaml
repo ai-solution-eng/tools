@@ -1,0 +1,36 @@
+{{- if eq (include "model-downloader.kyvernoEnabled" .) "true" }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  background: false
+  rules:
+  - name: add-vendor-app-labels
+    match:
+      any:
+      - resources:
+          namespaces:
+          - {{ .Release.Namespace }}
+          kinds:
+          - Deployment
+          - Service
+    mutate:
+      patchStrategicMerge:
+        metadata:
+            labels:
+              "hpe-ezua/type": app-service-core
+              "hpe-ezua/app": {{ .Chart.Name }}
+        spec:
+          template:
+            metadata:
+              labels:
+                "hpe-ezua/type": app-service-core
+                "hpe-ezua/app": {{ .Chart.Name }}
+{{- end }}
