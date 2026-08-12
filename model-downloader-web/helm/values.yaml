@@ -2,7 +2,7 @@
 # App image (the FastAPI service that serves the UI and submits Jobs).
 # =============================================================================
 image:
-  repository: andrewbydlon/pcai-model-downloader
+  repository: ghcr.io/ai-solution-eng/model-downloader
   tag: "0.5.0"
   pullPolicy: IfNotPresent
 
