@@ -34,7 +34,7 @@ resources:
 # disable them explicitly:
 #   --set hpe_proxies=false --set kyverno.enabled=false --set ezua.enabled=false
 # =============================================================================
-hpe_proxies: true
+hpe_proxies: false
 
 # =============================================================================
 # Download storage backend.
