@@ -140,23 +140,28 @@ def _storage_default() -> str:
     return default if default in allowed else allowed[0]
 
 
+def _page_context() -> dict:
+    return {
+        "max_concurrency": MAX_CONCURRENCY,
+        "tier_labels": TIER_LABELS,
+        "tiers": TIERS,
+        "storage_backend": STORAGE_BACKEND,
+        "storage_default": _storage_default(),
+        "storage_options": _storage_allowed(STORAGE_BACKEND),
+        "s3_bucket": S3_BUCKET,
+        "s3_prefix": S3_PREFIX,
+        "s3_default_path": S3_DEFAULT_PATH,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-        context={
-            "max_concurrency": MAX_CONCURRENCY,
-            "tier_labels": TIER_LABELS,
-            "tiers": TIERS,
-            "storage_backend": STORAGE_BACKEND,
-            "storage_default": _storage_default(),
-            "storage_options": _storage_allowed(STORAGE_BACKEND),
-            "s3_bucket": S3_BUCKET,
-            "s3_prefix": S3_PREFIX,
-            "s3_default_path": S3_DEFAULT_PATH,
-        },
-    )
+    return templates.TemplateResponse(request=request, name="index.html", context=_page_context())
+
+
+@app.get("/catalog", response_class=HTMLResponse)
+async def catalog_page(request: Request):
+    return templates.TemplateResponse(request=request, name="catalog.html", context=_page_context())
 
 
 @app.post("/api/jobs")

@@ -4,13 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HF Model Downloader</title>
-  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=0.5.0">
-  <link rel="stylesheet" href="/static/style.css?v=0.5.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=0.6.0">
+  <link rel="stylesheet" href="/static/style.css?v=0.6.0">
 </head>
 <body>
   <header class="brandbar">
     <span class="wordmark"><span class="bar"></span>HPE</span>
     <span class="app-title">Model Downloader</span>
+    <nav class="main-nav">
+      <a href="/" class="nav-link active">Download</a>
+      <a href="/catalog" class="nav-link">Model Catalog</a>
+    </nav>
     <span class="spacer"></span>
     <span class="tag">Parallel models: {{ max_concurrency }}</span>
   </header>
@@ -27,8 +31,12 @@
       </label>
       <label>
         <span>Model name</span>
-        <input name="model_name" required
-               placeholder="deepseek-ai/DeepSeek-V4-Flash">
+        <div class="combo">
+          <input name="model_name" required id="model-input" autocomplete="off"
+                 placeholder="deepseek-ai/DeepSeek-V4-Flash">
+          <button type="button" id="model-toggle" class="combo-toggle" aria-label="Model suggestions">▾</button>
+          <div id="model-menu" class="combo-menu" hidden></div>
+        </div>
       </label>
       <label>
         <span>HF token</span>
@@ -52,6 +60,12 @@
         <input name="s3_path"
                placeholder="s3://bucket/prefix/"
                value="{{ s3_default_path }}">
+      </label>
+      <label id="template-select-field">
+        <span>Chat template preset</span>
+        <select name="template_preset" id="template-select">
+          <option value="">None (default)</option>
+        </select>
       </label>
       <label class="checkbox-label" id="chat-template-field">
         <input type="checkbox" name="chat_template_enabled">
@@ -92,131 +106,7 @@
         <pre id="log-body"></pre>
       </div>
     </div>
-
-    <h2>Model Catalog</h2>
-    <p class="hint">Predefined model configurations grouped by GPU tier. Select entries and push to MLIS, or add your own.</p>
-    <div class="catalog-controls">
-      <button id="add-model-btn" type="button" class="secondary-btn">+ Add Model</button>
-      <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
-      <button id="refresh-catalog-btn" type="button" class="secondary-btn">Refresh</button>
-    </div>
-    <div id="catalog-tiers"></div>
-    <div id="catalog-msg" class="msg"></div>
-
-    <h2>Push JSON Directly</h2>
-    <p class="hint">Paste a JSON array of model configs to push to MLIS without saving to the catalog.</p>
-    <textarea id="direct-json" class="json-input" rows="12" placeholder='[{"name": "my-model", "version": 1, "uri": "pvc://...", "image": "vllm/vllm-openai:latest", "model_format": "custom", ...}]'></textarea>
-    <button id="push-direct-btn" type="button">Push to MLIS</button>
-    <div id="push-results"></div>
-
-    <div id="add-modal" class="modal" hidden>
-      <div class="modal-backdrop"></div>
-      <div class="modal-panel modal-wide">
-        <div class="modal-header">
-          <span>Add Model Configuration</span>
-          <button class="modal-close" type="button">&times;</button>
-        </div>
-        <div class="modal-body-scroll">
-          <form id="add-model-form" autocomplete="off">
-            <div class="form-grid">
-              <label>
-                <span>Tier</span>
-                <select name="tier">
-                  {% for t in tiers %}
-                  <option value="{{ t }}">{{ tier_labels[t] }}</option>
-                  {% endfor %}
-                </select>
-              </label>
-              <label>
-                <span>Name *</span>
-                <input name="name" required placeholder="my-model">
-              </label>
-              <label>
-                <span>Version</span>
-                <input name="version" type="number" value="1" min="1">
-              </label>
-              <label class="full-width">
-                <span>Description</span>
-                <input name="description" placeholder="Optional description">
-              </label>
-              <label class="full-width">
-                <span>URI</span>
-                <input name="uri" placeholder="pvc://models-pvc/large-models/...?containerPath=/mnt/models">
-              </label>
-              <label class="full-width">
-                <span>Chat template path (optional)</span>
-                <input name="chat_template_path" placeholder="chat_template.jinja">
-              </label>
-              <label class="full-width">
-                <span>Chat template contents (optional)</span>
-                <textarea name="chat_template_contents" rows="5"
-                          placeholder="{% raw %}{% for message in messages %}...{% endfor %}{% endraw %}"></textarea>
-              </label>
-              <label>
-                <span>Model Format</span>
-                <select name="model_format">
-                  <option value="custom">custom</option>
-                  <option value="vllm">vllm</option>
-                  <option value="nim">nim</option>
-                  <option value="openllm">openllm</option>
-                  <option value="bento-archive">bento-archive</option>
-                </select>
-              </label>
-              <label class="full-width">
-                <span>Image *</span>
-                <input name="image" required placeholder="vllm/vllm-openai:latest">
-              </label>
-              <label class="full-width">
-                <span>Arguments (one per line)</span>
-                <textarea name="arguments" rows="5" placeholder="--tensor-parallel-size&#10;4&#10;--port&#10;8080"></textarea>
-              </label>
-              <label class="full-width">
-                <span>Environment (KEY=VALUE per line)</span>
-                <textarea name="environment" rows="4" placeholder="HF_TOKEN=hf_...&#10;AIOLI_DISABLE_LOGGER=1"></textarea>
-              </label>
-              <label>
-                <span>Request CPU</span>
-                <input name="resource_request_cpu" placeholder="4">
-              </label>
-              <label>
-                <span>Request Memory</span>
-                <input name="resource_request_memory" placeholder="32Gi">
-              </label>
-              <label>
-                <span>Request GPU</span>
-                <input name="resource_request_gpu" placeholder="1">
-              </label>
-              <label>
-                <span>Limit CPU</span>
-                <input name="resource_limit_cpu" placeholder="8">
-              </label>
-              <label>
-                <span>Limit Memory</span>
-                <input name="resource_limit_memory" placeholder="64Gi">
-              </label>
-              <label>
-                <span>Limit GPU</span>
-                <input name="resource_limit_gpu" placeholder="1">
-              </label>
-              <label>
-                <span>GPU Type</span>
-                <input name="resource_gpu_type" placeholder="">
-              </label>
-              <label class="checkbox-label">
-                <input name="caching_enabled" type="checkbox">
-                <span>Caching Enabled</span>
-              </label>
-              <label class="full-width">
-                <span>Metadata (JSON)</span>
-                <textarea name="metadata" rows="3" placeholder='{"tags": "", "modelCategory": "llm"}'>{"tags": "", "modelCategory": "other"}</textarea>
-              </label>
-            </div>
-            <button type="submit">Save to Catalog</button>
-          </form>
-        </div>
-      </div>
-    </div>
   </main>
-  <script src="/static/app.js?v=0.5.0"></script>
+  <script src="/static/app.js?v=0.6.0"></script>
 </body>
 </html>
