@@ -50,6 +50,8 @@ spec:
           value: {{ .Values.storage.backend | quote }}
         - name: STORAGE_DEFAULT
           value: {{ .Values.storage.default | quote }}
+        - name: DEFAULT_NAMESPACE
+          value: {{ .Values.defaultNamespace | quote }}
         - name: S3_BUCKET
           value: {{ .Values.s3.bucket | quote }}
         - name: S3_PREFIX

@@ -4,8 +4,27 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Model Catalog — HF Model Downloader</title>
-  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=0.6.0">
-  <link rel="stylesheet" href="/static/style.css?v=0.6.0">
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v=0.7.2">
+  <link rel="stylesheet" href="/static/style.css?v=0.7.2">
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var saved = localStorage.getItem('md-theme');
+      var dark = saved === 'dark' || (saved !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+      if (dark) root.setAttribute('data-theme', 'dark');
+      document.addEventListener('DOMContentLoaded', function () {
+        var btn = document.getElementById('theme-toggle');
+        if (!btn) return;
+        btn.textContent = dark ? 'Light' : 'Dark';
+        btn.addEventListener('click', function () {
+          dark = !dark;
+          root.setAttribute('data-theme', dark ? 'dark' : '');
+          localStorage.setItem('md-theme', dark ? 'dark' : 'light');
+          btn.textContent = dark ? 'Light' : 'Dark';
+        });
+      });
+    })();
+  </script>
 </head>
 <body>
   <header class="brandbar">
@@ -16,6 +35,7 @@
       <a href="/catalog" class="nav-link active">Model Catalog</a>
     </nav>
     <span class="spacer"></span>
+    <button id="theme-toggle" class="theme-toggle" type="button">Dark</button>
     <span class="tag">Parallel models: {{ max_concurrency }}</span>
   </header>
   <main>
@@ -154,6 +174,6 @@
       </div>
     </div>
   </main>
-  <script src="/static/catalog.js?v=0.6.0"></script>
+  <script src="/static/catalog.js?v=0.7.2"></script>
 </body>
 </html>

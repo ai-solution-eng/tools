@@ -30,6 +30,12 @@ chatTemplateCheckbox.addEventListener('change', syncTemplateFields);
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = Object.fromEntries(new FormData(form));
+  if (!body.namespace) body.namespace = form.dataset.defaultNs || '';
+  if (!body.namespace) {
+    msg.className = 'msg error';
+    msg.textContent = 'Namespace is required.';
+    return;
+  }
   if (body.storage === 's3' && !/^s3:\/\/[^/\s]+/.test(body.s3_path || '')) {
     msg.className = 'msg error';
     msg.textContent = 'S3 destination must look like s3://bucket/prefix/';

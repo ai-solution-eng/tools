@@ -3,11 +3,16 @@
 # =============================================================================
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: "0.6.0"
+  tag: "0.7.3"
   pullPolicy: IfNotPresent
 
 # Max concurrent model downloads; extras are queued in-process.
 maxConcurrency: 4
+
+# Namespace pre-filled in the download form. The PVC-backed downloader Job
+# mounts `models-pvc`, which every PCAI project namespace has, so default to a
+# project-user namespace rather than the app's own namespace.
+defaultNamespace: project-user-andrew-bydlon
 
 service:
   type: ClusterIP

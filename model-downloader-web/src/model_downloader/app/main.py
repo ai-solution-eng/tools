@@ -17,6 +17,7 @@ from .k8s import K8sClient
 from .queue import JobQueue
 
 APP_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
+DEFAULT_NAMESPACE = os.environ.get("DEFAULT_NAMESPACE", "project-user-andrew-bydlon")
 JOB_TEMPLATE_CM = os.environ["JOB_TEMPLATE_CONFIGMAP"]
 JOB_TEMPLATE_CM_NS = os.environ.get("JOB_TEMPLATE_CONFIGMAP_NAMESPACE", APP_NAMESPACE)
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
@@ -143,6 +144,8 @@ def _storage_default() -> str:
 def _page_context() -> dict:
     return {
         "max_concurrency": MAX_CONCURRENCY,
+        "default_namespace": DEFAULT_NAMESPACE,
+        "app_namespace": APP_NAMESPACE,
         "tier_labels": TIER_LABELS,
         "tiers": TIERS,
         "storage_backend": STORAGE_BACKEND,
