@@ -418,8 +418,19 @@ def _build_s3_client(s3_config: dict):
       3. boto3 default chain (env vars, IAM role, ~/.aws/credentials)
     """
     import boto3
+    from botocore.config import Config
 
     client_kwargs = {}
+    # Increase retry behavior
+    client_kwargs["config"] = Config(
+        retries={
+            "max_attempts": 20, # default is typically much lower
+            "mode": "adaptive" # adaptive | standard | legacy
+        },
+        connect_timeout=60,
+        read_timeout=300,
+    )
+    
     if s3_config.get("endpoint_url"):
         client_kwargs["endpoint_url"] = s3_config["endpoint_url"]
     if s3_config.get("region"):
@@ -463,7 +474,12 @@ def upload_to_s3(
     parsed = urlparse(s3_dest)
     bucket = parsed.netloc
 
-    config = TransferConfig(multipart_threshold=50 * 1024 * 1024)
+    config = TransferConfig(
+        multipart_threshold=50 * 1024 * 1024,
+        multipart_chunksize=128 * 1024 * 1024,
+        max_concurrency=1,
+        use_threads=False,
+    )
 
     for fpath in tqdm(file_paths, desc="Uploading to S3", unit="file", position=0):
         if _interrupted:
