@@ -41,7 +41,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
+def _add_package_to_path() -> None:
+    """Put the directory containing the ``model_benchmarker`` package on
+    ``sys.path`` so the script runs from anywhere in the repo or the
+    hardlinker deployment (which mirrors the repo layout, e.g.
+    ``<dest>/src/model_benchmarker/benchmark_chat.py``)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(script_dir, "src"),  # flat: <root>/benchmark_chat.py + <root>/src
+        script_dir,  # script run from inside its own directory
+        os.path.dirname(script_dir),  # nested: <root>/src/model_benchmarker/ -> <root>/src
+    )
+    for candidate in candidates:
+        if os.path.isdir(os.path.join(candidate, "model_benchmarker")):
+            sys.path.insert(0, candidate)
+            return
+
+
+_add_package_to_path()
 
 # The shared PCAI modules log model auto-discovery at WARNING during import;
 # keep a clean CLI and let per-request failures surface in our own output.
@@ -157,8 +175,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_class_name",
         default="",
-        help="Name of a model variable in model_benchmarker/utils/pcai_models.py. "
-        "If omitted, --url and --api_key are required.",
+        help="Name of a model variable in model_benchmarker/utils/pcai_models.py "
+        "(imported lazily, only when this flag is used; that module is excluded "
+        "from the hardlink deployment, so --url and --api_key are required "
+        "there). If omitted, --url and --api_key are required.",
     )
     parser.add_argument("--url", default="", help="OpenAI-compatible base URL (root, no /v1).")
     parser.add_argument("--api_key", default="", help="Bearer token for the endpoint.")
@@ -253,9 +273,22 @@ def resolve_tasks(args: argparse.Namespace) -> list[Task]:
 
 
 def build_model(args: argparse.Namespace):
-    """Resolve the model instance from pcai_models or from url+api_key."""
+    """Resolve the model instance from pcai_models or from url+api_key.
+
+    ``pcai_models`` is imported lazily — and only when ``--model_class_name``
+    is given — so the script stays runnable from the hardlinked copy of the
+    repo, where ``pcai_models.py`` is excluded by ``hardlink_config.json``.
+    """
     if args.model_class_name:
-        from model_benchmarker.utils import pcai_models
+        try:
+            from model_benchmarker.utils import pcai_models
+        except ImportError as exc:
+            raise SystemExit(
+                f"--model_class_name={args.model_class_name!r} requires the "
+                "model_benchmarker/utils/pcai_models.py module, which is not "
+                f"available here ({exc}). It is excluded from the hardlink "
+                "deployment; use --url and --api_key instead."
+            ) from exc
 
         model = getattr(pcai_models, args.model_class_name, None)
         if model is None:
