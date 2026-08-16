@@ -38,6 +38,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass
+from typing import TextIO
 
 import numpy as np
 
@@ -236,6 +237,46 @@ def parse_args() -> argparse.Namespace:
         "8192,32768,65536 for a prefill sweep.",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt used for the 'custom' task.")
+    parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="Force Qwen3-style reasoning on via chat_template_kwargs.enable_thinking=True "
+        "(it is on by default; useful if the server default was changed).",
+    )
+    parser.add_argument(
+        "--disable_thinking",
+        action="store_true",
+        help="Force chat_template_kwargs.enable_thinking=False so the model emits content "
+        "tokens directly (no reasoning_content deltas).",
+    )
+    parser.add_argument(
+        "--thinking_budget",
+        type=int,
+        default=None,
+        help="Cap reasoning tokens via chat_template_kwargs.thinking_token_budget. Must be "
+        "smaller than the task's max_tokens or the model may spend the whole budget on "
+        "reasoning and never emit content (TTFT then reads 0).",
+    )
+    parser.add_argument(
+        "--thinking_level",
+        choices=sorted(THINKING_BUDGET_LEVELS),
+        default=None,
+        help="Preset reasoning budget: off=0, low=1024, medium=4096, high=16384, x-high=32768. "
+        "Overrides --thinking_budget. Default (no flag) leaves the server default.",
+    )
+    parser.add_argument(
+        "--debug_stream",
+        action="store_true",
+        help="Print the first delta's field names/values and per-request content vs "
+        "reasoning chunk counts so you can see what the endpoint actually streams "
+        "(helps diagnose TTFT=0 when content arrives in a non-`content` field).",
+    )
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Write the final summary table to this file (in addition to stdout). "
+        "E.g. --output results/qwen_38_27b/H200x4.txt.",
+    )
     return parser.parse_args()
 
 
@@ -311,12 +352,40 @@ def build_model(args: argparse.Namespace):
     return model
 
 
+THINKING_BUDGET_LEVELS: dict[str, int] = {
+    "off": 0,
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "x-high": 32768,
+}
+
 FILLER_BLOCK = (
     "This is auxiliary context text included solely to extend the input "
     "length for benchmarking purposes; it is not part of the task and "
     "should be ignored. The sentence is repeated many times until the "
     "target context size is reached. "
 )
+
+
+def build_chat_template_kwargs(args: argparse.Namespace) -> dict | None:
+    """Resolve per-request reasoning overrides (Qwen3-style chat_template_kwargs).
+
+    Returns None when no override is requested, so the server default stands.
+    """
+    kwargs: dict = {}
+    if args.disable_thinking:
+        kwargs["enable_thinking"] = False
+    elif args.enable_thinking:
+        kwargs["enable_thinking"] = True
+
+    budget = args.thinking_level if args.thinking_level is not None else args.thinking_budget
+    if budget is not None:
+        if isinstance(budget, str):
+            budget = THINKING_BUDGET_LEVELS[budget]
+        kwargs["thinking_token_budget"] = int(budget)
+
+    return {"chat_template_kwargs": kwargs} if kwargs else None
 
 
 def render_prompt(task: Task, context_length: int = 0) -> str:
@@ -346,32 +415,76 @@ def render_prompt(task: Task, context_length: int = 0) -> str:
     return prompt
 
 
-async def stream_once(model, task: Task, context_length: int = 0) -> RequestResult:
-    """One streamed completion: returns TTFT and generation tokens/s."""
+def _debug_first_delta(tag: str, delta, debug_stream: bool) -> None:
+    """Debug print the first text-bearing delta (the chunk that set TTFT)."""
+    if not debug_stream:
+        return
+    extra = getattr(delta, "model_extra", None) or getattr(delta, "__pydantic_extra__", None) or {}
+    combined = {**delta.model_dump(), **extra}
+    text_fields = {k: v for k, v in combined.items() if isinstance(v, str) and v}
+    print(f"  [debug] first token via {tag}: keys={sorted(combined.keys())}")
+    print(f"  [debug]   non-empty text fields: {text_fields}")
+
+
+async def stream_once(
+    model, task: Task, context_length: int = 0, extra_body: dict | None = None, debug_stream: bool = False
+) -> RequestResult:
+    """One streamed completion: returns TTFT and generation tokens/s.
+
+    ``first_token_at`` is set on the first chunk carrying *any* text delta
+    (``content`` or ``reasoning_content``), since thinking models stream
+    reasoning tokens before any answer content.
+    """
     t0 = time.perf_counter()
     first_token_at: float | None = None
     content_deltas = 0
+    reasoning_deltas = 0
     usage_tokens: int | None = None
     try:
-        stream = await model.async_client.chat.completions.create(
-            model=model.model_name,
-            messages=[{"role": "user", "content": render_prompt(task, context_length)}],
-            max_tokens=task.max_tokens,
-            temperature=task.temperature,
-            top_p=task.top_p,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
+        kwargs: dict = {
+            "model": model.model_name,
+            "messages": [{"role": "user", "content": render_prompt(task, context_length)}],
+            "max_tokens": task.max_tokens,
+            "temperature": task.temperature,
+            "top_p": task.top_p,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        stream = await model.async_client.chat.completions.create(**kwargs)
         async for chunk in stream:
             now = time.perf_counter()
             if getattr(chunk, "usage", None) is not None and chunk.usage.completion_tokens is not None:
                 usage_tokens = chunk.usage.completion_tokens
             if chunk.choices:
                 delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    if first_token_at is None:
-                        first_token_at = now
-                    content_deltas += 1
+                if delta is not None:
+                    content = getattr(delta, "content", None)
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if content:
+                        if first_token_at is None:
+                            first_token_at = now
+                            _debug_first_delta("content", delta, debug_stream)
+                        content_deltas += 1
+                    elif reasoning:
+                        if first_token_at is None:
+                            first_token_at = now
+                            _debug_first_delta("reasoning_content", delta, debug_stream)
+                        reasoning_deltas += 1
+                    elif first_token_at is None:
+                        # Some Qwen3 servers stream text under other delta
+                        # fields (e.g. `reasoning`), which the SDK keeps in
+                        # model_extra. Treat any non-empty, non-role string
+                        # delta as a token so TTFT never falls back to 0 on
+                        # an unknown field name.
+                        extra = getattr(delta, "model_extra", None) or getattr(
+                            delta, "__pydantic_extra__", None
+                        ) or {}
+                        combined = {**delta.model_dump(), **extra}
+                        if any(isinstance(v, str) and v for k, v in combined.items() if k != "role"):
+                            first_token_at = now
+                            _debug_first_delta("model_extra", delta, debug_stream)
     except Exception as exc:
         return RequestResult(success=False, task=task.name, error=str(exc))
 
@@ -379,7 +492,7 @@ async def stream_once(model, task: Task, context_length: int = 0) -> RequestResu
     if first_token_at is None:
         first_token_at = t0
 
-    tokens = usage_tokens if usage_tokens is not None else content_deltas
+    tokens = usage_tokens if usage_tokens is not None else (content_deltas + reasoning_deltas)
     total_time = t_end - t0
     gen_time = t_end - first_token_at
     if gen_time <= 0 or gen_time < 0.05 * total_time:
@@ -388,6 +501,11 @@ async def stream_once(model, task: Task, context_length: int = 0) -> RequestResu
         # meaningless — fall back to the full request time.
         gen_time = total_time
     tokens_per_s = tokens / gen_time if gen_time > 0 else 0.0
+    if debug_stream:
+        print(
+            f"  [debug] content_chunks={content_deltas} reasoning_chunks={reasoning_deltas} "
+            f"usage_tokens={usage_tokens} first_token={(first_token_at - t0) * 1000:.0f}ms"
+        )
     return RequestResult(
         success=True,
         task=task.name,
@@ -398,7 +516,13 @@ async def stream_once(model, task: Task, context_length: int = 0) -> RequestResu
 
 
 async def run_concurrency(
-    model, tasks: list[Task], n_users: int, requests_per_user: int, context_length: int = 0
+    model,
+    tasks: list[Task],
+    n_users: int,
+    requests_per_user: int,
+    context_length: int = 0,
+    extra_body: dict | None = None,
+    debug_stream: bool = False,
 ) -> list[RequestResult]:
     sem = asyncio.Semaphore(n_users)
 
@@ -415,7 +539,7 @@ async def run_concurrency(
                 rng.shuffle(round_order)
             task = round_order[i % len(tasks)]
             async with sem:
-                res = await stream_once(model, task, context_length)
+                res = await stream_once(model, task, context_length, extra_body, debug_stream)
             results.append(res)
             async with _print_lock:
                 if res.success:
@@ -453,7 +577,9 @@ def _pct_header() -> str:
     return "".join(f"{p:>{_CELL}}" for p in PCTS)
 
 
-def print_table(rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]]) -> None:
+def print_table(
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]], *, file: TextIO | None = None
+) -> None:
     """One row per (ctx, users, task): TTFT percentiles and tokens/s
     percentiles side by side under a single header, separated by vertical
     rules, with a dotted line whenever ctx or users changes.  A 'failed'
@@ -464,22 +590,22 @@ def print_table(rows: list[tuple[int, int, str, int, dict[str, float], dict[str,
         f"{'tokens/s':^{len(_pct_header())}}"
     )
     pct_row = f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    {_pct_header()}    |    {_pct_header()}"
-    print(title_row)
-    print(pct_row)
+    print(title_row, file=file)
+    print(pct_row, file=file)
     sep = "-" * len(pct_row)
-    print(sep)
+    print(sep, file=file)
     prev_key = None
     for ctx, n_users, task, n_fail, ttft, tps in rows:
         key = (ctx, n_users)
         if prev_key is not None and key != prev_key:
-            print(sep)
+            print(sep, file=file)
         prev_key = key
         line = f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |"
         for i, s in enumerate((ttft, tps)):
             line += "    " + "".join(f"{s[p]:>{_CELL}.1f}" for p in PCTS)
             if i == 0:
                 line += "    |"
-        print(line)
+        print(line, file=file)
 
 
 async def main() -> None:
@@ -501,6 +627,7 @@ async def main() -> None:
 
     tasks = resolve_tasks(args)
     model = build_model(args)
+    extra_body = build_chat_template_kwargs(args)
     task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
     print(
         f"Model: {model.__class__.__name__} name={model.model_name!r} "
@@ -508,6 +635,8 @@ async def main() -> None:
         f"requests_per_user={args.requests_per_user} "
         f"context_lengths={ctx_levels}"
     )
+    if extra_body:
+        print(f"extra_body: {extra_body}")
     print(
         "tokens/s = completion_tokens / time-from-first-token-to-stream-end "
         "(TTFT excluded); completion_tokens from stream usage, else counted "
@@ -518,13 +647,14 @@ async def main() -> None:
     for ctx in ctx_levels:
         for n_users in user_levels:
             print(f"Running ctx={ctx} N={n_users} users (requests_per_user={args.requests_per_user})...")
-            results = await run_concurrency(model, tasks, n_users, args.requests_per_user, ctx)
+            results = await run_concurrency(model, tasks, n_users, args.requests_per_user, ctx, extra_body, args.debug_stream)
             successes = [r for r in results if r.success]
             failures = len(results) - len(successes)
             if not successes:
                 print(f"  all {len(results)} requests failed — skipping level.")
                 print(f"  first error: {results[0].error if results else 'n/a'}")
                 continue
+            level_rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]] = []
             for task in tasks:
                 group = [r for r in successes if r.task == task.name]
                 if not group:
@@ -532,7 +662,7 @@ async def main() -> None:
                 group_fail = sum(1 for r in results if r.task == task.name and not r.success)
                 ttfts = [r.ttft_s * 1000.0 for r in group]
                 tpss = [r.tokens_per_s for r in group]
-                rows.append(
+                level_rows.append(
                     (
                         ctx,
                         n_users,
@@ -544,15 +674,28 @@ async def main() -> None:
                 )
             if failures:
                 print(f"  {failures}/{len(results)} requests failed (excluded from stats)")
+            if level_rows:
+                print(f"\n--- preview ctx={ctx} users={n_users} ---")
+                print_table(level_rows)
+                print()
+            rows.extend(level_rows)
 
     if not rows:
         raise SystemExit("No successful requests; nothing to report.")
 
-    print("\nPer-level latency / throughput (unique-nonce requests, no cache reuse):")
-    print(
+    summary_head = "\nPer-level latency / throughput (unique-nonce requests, no cache reuse):"
+    summary_note = (
         "TTFT (ms): P50/P95/P99/P100 ascending;  tokens/s: higher is better so percentiles are inverted (P100 = slowest)."
     )
+    print(summary_head)
+    print(summary_note)
     print_table(rows)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(summary_head + "\n")
+            fh.write(summary_note + "\n")
+            print_table(rows, file=fh)
+        print(f"Table written to {args.output}")
 
 
 if __name__ == "__main__":

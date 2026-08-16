@@ -875,17 +875,25 @@ class _QueryBatcher:
         texts = [t for t, _ in batch]
         futs = [f for _, f in batch]
 
-        try:
-            embeddings = await self._embed_fn(texts)
-            if len(embeddings) != len(futs):
-                raise RuntimeError(f"Batch embedding returned {len(embeddings)} results for {len(futs)} queries")
-            for fut, emb in zip(futs, embeddings):
-                if not fut.done():
-                    fut.set_result(emb)
-        except Exception as exc:
-            for fut in futs:
-                if not fut.done():
-                    fut.set_exception(exc)
+        # Settle every caller's future from the embedding result — even if the
+        # task that triggered this flush is cancelled (e.g. a client disconnect),
+        # so no queued caller is left hanging forever.
+        def _settle(f: asyncio.Future) -> None:
+            try:
+                embeddings = f.result()
+                if len(embeddings) != len(futs):
+                    raise RuntimeError(f"Batch embedding returned {len(embeddings)} results for {len(futs)} queries")
+                for fut, emb in zip(futs, embeddings):
+                    if not fut.done():
+                        fut.set_result(emb)
+            except BaseException as exc:  # settle callers regardless
+                for fut in futs:
+                    if not fut.done():
+                        fut.set_exception(exc)
+
+        embed_task: asyncio.Future[list[list[float]]] = asyncio.ensure_future(self._embed_fn(texts))
+        embed_task.add_done_callback(_settle)
+        await asyncio.shield(embed_task)
 
 
 class MultiModalEmbeddings:
@@ -1227,7 +1235,7 @@ class MultiModalReranker:
             "/score",
             cast_to=list,
             body={
-                "model": "Qwen/Qwen3-VL-Reranker-8B",
+                "model": self.emb.model_name,
                 "text_1": query,
                 "text_2": documents,
                 "mm_processor_kwargs": self.emb.mm_processor_kwargs,
@@ -1302,7 +1310,7 @@ class MultiModalReranker:
             "/rerank",
             cast_to=list,
             body={
-                "model": "Qwen/Qwen3-VL-Reranker-8B",
+                "model": self.emb.model_name,
                 "query": query,
                 "documents": documents,
                 "mm_processor_kwargs": self.emb.mm_processor_kwargs,
