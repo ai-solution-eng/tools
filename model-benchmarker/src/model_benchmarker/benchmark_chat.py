@@ -10,6 +10,23 @@ shared serving cluster cannot reuse prefix/response caches (RadixAttention
 etc.) — consecutive requests share no tokens, so measurements reflect real
 generation, not cache hits.
 
+With --multiturn, each user instead runs a single growing conversation:
+every request (turn) sends the full prior user+assistant history plus the
+new task prompt, so the shared prefix *is* reused across a user's turns and
+the server's prefix/KV cache (and HiCache tiers) can engage. This measures
+TTFT/tokens/s under real chat-style context growth rather than pure cold
+prefill.
+
+--no-nonce replaces the per-request random nonce with a fixed shared marker,
+so every request (and every user) shares an identical prompt prefix and the
+server can reuse its prefix/KV cache across users — isolating the benefit of
+cache sharing from cold-prefill cost.
+
+--prewarm sends one shared-prefix request per (ctx, task) before each
+concurrency sweep, so the prefix graph is populated ahead of the users
+("prefill happens before the users"). Pairs with --no-nonce so the warm
+prefix matches what the users send.
+
 Usage:
   # Use a model registered in pcai_models (deepseek in particular):
   python benchmark_chat.py --model_class_name deepseek_v4_flash_280B \
@@ -70,6 +87,10 @@ DEFAULT_PROMPT = (
     "Write a concise structured essay about the history of computing, "
     "covering the 1950s to the present day, at least twelve paragraphs long."
 )
+
+# Fixed prefix used when --no-nonce is given: every request renders the same
+# header so all users share an identical prompt prefix the server can cache.
+_SHARED_NONCE = "my-shared-benchmark-prefix"
 
 CODING_PROMPT = """[instance {nonce}]
 Write a complete, production-grade Python implementation of a thread-safe,
@@ -165,10 +186,12 @@ TASK_REGISTRY: dict[str, Task] = {
 class RequestResult:
     success: bool
     task: str = ""
+    turn: int = 0
     ttft_s: float = 0.0
     tokens: int = 0
     tokens_per_s: float = 0.0
     error: str = ""
+    response_text: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,6 +222,39 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Sequential requests each concurrent user performs, cycling through tasks (default: 1).",
+    )
+    parser.add_argument(
+        "--no-nonce",
+        action="store_true",
+        help="Replace the per-request random nonce with a fixed shared marker so "
+        "every request shares an identical prompt prefix and the server can reuse "
+        "its prefix/KV cache across users (isolates cache-sharing benefit from "
+        "cold-prefill cost).",
+    )
+    parser.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="Send one shared-prefix request per (ctx, task) before each "
+        "concurrency sweep so the prefix graph is populated ahead of the users. "
+        "Pairs with --no-nonce so the warm prefix matches the users' requests.",
+    )
+    parser.add_argument(
+        "--multiturn",
+        action="store_true",
+        help="Treat each user's requests as turns of ONE growing conversation "
+        "instead of independent requests: every turn replays the full prior "
+        "user+assistant history and appends a fresh task prompt, so the shared "
+        "prefix is reused and the server's prefix/KV cache (and HiCache tiers) "
+        "can engage. Turn order still cycles through --tasks.",
+    )
+    parser.add_argument(
+        "--separate_tasks",
+        action="store_true",
+        help="Run each task type in its own (ctx, users) pass instead of mixing "
+        "them: for every (ctx, users, task) triple, all users run "
+        "--requests_per_user turns of just that task back-to-back. Gives every "
+        "task a clean turn-1 (prefill) vs turns 2+ (prefix reuse) comparison "
+        "without cross-task interference.",
     )
     parser.add_argument(
         "--tasks",
@@ -388,17 +444,21 @@ def build_chat_template_kwargs(args: argparse.Namespace) -> dict | None:
     return {"chat_template_kwargs": kwargs} if kwargs else None
 
 
-def render_prompt(task: Task, context_length: int = 0) -> str:
-    """Insert a unique nonce so no two requests share any prefix tokens.
+def render_prompt(task: Task, context_length: int = 0, no_nonce: bool = False) -> str:
+    """Render the request prompt, optionally padded to ``context_length`` tokens.
 
-    This defeats server-side prefix/KV caching (vLLM RadixAttention,
-    SGLang prefix cache, response caches keyed on exact input) across the
-    whole benchmark run.  When ``context_length > 0``, neutral filler text
-    is inserted between the nonce header and the task body so the request
-    is padded to ~``context_length`` input tokens.
+    By default a unique random nonce is prepended so no two requests share any
+    prefix tokens — this defeats server-side prefix/KV caching (vLLM
+    RadixAttention, SGLang prefix cache, response caches keyed on exact input)
+    across the whole benchmark run, so measurements reflect real generation,
+    not cache hits.  When ``no_nonce`` is True, a fixed shared marker is used
+    instead so *all* requests share an identical prefix (server cache reuse).
+    When ``context_length > 0``, neutral filler text is inserted between the
+    nonce header and the task body so the request is padded to ~``context_length``
+    input tokens.
     """
     prompt = task.prompt
-    nonce = secrets.token_hex(6)
+    nonce = _SHARED_NONCE if no_nonce else secrets.token_hex(6)
     if "{nonce}" in prompt:
         prompt = prompt.format(nonce=nonce)
     else:
@@ -427,23 +487,37 @@ def _debug_first_delta(tag: str, delta, debug_stream: bool) -> None:
 
 
 async def stream_once(
-    model, task: Task, context_length: int = 0, extra_body: dict | None = None, debug_stream: bool = False
+    model,
+    task: Task,
+    context_length: int = 0,
+    extra_body: dict | None = None,
+    debug_stream: bool = False,
+    messages: list[dict] | None = None,
+    no_nonce: bool = False,
 ) -> RequestResult:
     """One streamed completion: returns TTFT and generation tokens/s.
 
     ``first_token_at`` is set on the first chunk carrying *any* text delta
     (``content`` or ``reasoning_content``), since thinking models stream
     reasoning tokens before any answer content.
+
+    ``messages`` optionally overrides the default single ``user`` message
+    with a full conversation (used for multiturn requests); the assistant
+    text streamed back is returned in ``response_text`` so it can be
+    appended to the history for the next turn.
     """
     t0 = time.perf_counter()
     first_token_at: float | None = None
     content_deltas = 0
     reasoning_deltas = 0
     usage_tokens: int | None = None
+    text_parts: list[str] = []
     try:
+        if messages is None:
+            messages = [{"role": "user", "content": render_prompt(task, context_length, no_nonce)}]
         kwargs: dict = {
             "model": model.model_name,
-            "messages": [{"role": "user", "content": render_prompt(task, context_length)}],
+            "messages": messages,
             "max_tokens": task.max_tokens,
             "temperature": task.temperature,
             "top_p": task.top_p,
@@ -467,11 +541,13 @@ async def stream_once(
                             first_token_at = now
                             _debug_first_delta("content", delta, debug_stream)
                         content_deltas += 1
+                        text_parts.append(content)
                     elif reasoning:
                         if first_token_at is None:
                             first_token_at = now
                             _debug_first_delta("reasoning_content", delta, debug_stream)
                         reasoning_deltas += 1
+                        text_parts.append(reasoning)
                     elif first_token_at is None:
                         # Some Qwen3 servers stream text under other delta
                         # fields (e.g. `reasoning`), which the SDK keeps in
@@ -512,6 +588,7 @@ async def stream_once(
         ttft_s=first_token_at - t0,
         tokens=tokens,
         tokens_per_s=tokens_per_s,
+        response_text="".join(text_parts),
     )
 
 
@@ -523,12 +600,15 @@ async def run_concurrency(
     context_length: int = 0,
     extra_body: dict | None = None,
     debug_stream: bool = False,
+    multiturn: bool = False,
+    no_nonce: bool = False,
 ) -> list[RequestResult]:
     sem = asyncio.Semaphore(n_users)
 
     async def _user(uid: int) -> list[RequestResult]:
         results: list[RequestResult] = []
         rng = random.Random(uid)  # deterministic per-user seed; reproducible
+        history: list[dict] = []
         for i in range(requests_per_user):
             # Each round (len(tasks) requests) uses a freshly shuffled
             # permutation, so every task appears exactly once per round but
@@ -538,9 +618,40 @@ async def run_concurrency(
                 round_order = list(tasks)
                 rng.shuffle(round_order)
             task = round_order[i % len(tasks)]
+            if multiturn:
+                # Carry the whole conversation forward: all prior user +
+                # assistant turns are replayed, and only the newest user
+                # prompt gets a fresh nonce, so the shared prefix *is*
+                # reused by the server's prefix/KV cache across turns.
+                #
+                # context_length padding is applied only to turn 1 (the
+                # "prefill" turn); later turns append just the new task
+                # prompt so the measured TTFT reflects reuse of that prefix.
+                pad = context_length if i == 0 else 0
+                messages: list[dict] | None = history + [
+                    {"role": "user", "content": render_prompt(task, pad, no_nonce)}
+                ]
+            else:
+                messages = None
             async with sem:
-                res = await stream_once(model, task, context_length, extra_body, debug_stream)
+                res = await stream_once(
+                    model,
+                    task,
+                    context_length,
+                    extra_body,
+                    debug_stream,
+                    messages=messages,
+                    no_nonce=no_nonce,
+                )
+            res.turn = i + 1
             results.append(res)
+            if multiturn and messages is not None:
+                if res.success:
+                    history = messages + [{"role": "assistant", "content": res.response_text}]
+                else:
+                    # Keep the conversation going even if a turn failed so the
+                    # user's remaining turns stay aligned with the round order.
+                    history = messages
             async with _print_lock:
                 if res.success:
                     print(
@@ -568,6 +679,40 @@ def stats(values: list[float], inverted: bool = False) -> dict[str, float]:
     return {p: float(np.percentile(arr, qmap[p])) for p in PCTS}
 
 
+async def prewarm(
+    model,
+    tasks: list[Task],
+    context_length: int,
+    extra_body: dict | None,
+    debug_stream: bool,
+) -> None:
+    """Populate the server's prefix cache ahead of a concurrency sweep.
+
+    Sends one warm-up request per task using the *fixed* shared prefix (no
+    random nonce), so the prefix graph is resident before the users fire.
+    Only helps when the subsequent requests share that exact prefix — i.e.
+    when the run uses --no-nonce; otherwise the warm prefix is never matched.
+    """
+    print(
+        f"Prewarming ctx={context_length} cache (one shared-prefix request per task)..."
+    )
+    for task in tasks:
+        messages = [{"role": "user", "content": render_prompt(task, context_length, no_nonce=True)}]
+        res = await stream_once(
+            model,
+            task,
+            context_length,
+            extra_body,
+            debug_stream,
+            messages=messages,
+            no_nonce=True,
+        )
+        if res.success:
+            print(f"  warm {task.name}: TTFT={res.ttft_s * 1000:.0f}ms, {res.tokens} tok")
+        else:
+            print(f"  warm {task.name} FAILED: {res.error}")
+
+
 PCTS = ("P50", "P95", "P99", "P100")
 _print_lock = asyncio.Lock()
 _CELL = 10
@@ -578,34 +723,118 @@ def _pct_header() -> str:
 
 
 def print_table(
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]], *, file: TextIO | None = None
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    *,
+    file: TextIO | None = None,
+    multiturn: bool = False,
 ) -> None:
-    """One row per (ctx, users, task): TTFT percentiles and tokens/s
-    percentiles side by side under a single header, separated by vertical
-    rules, with a dotted line whenever ctx or users changes.  A 'failed'
-    column reports per-row request failures."""
+    """One row per (ctx, users, task): TTFT percentiles for turn 1 and for
+    turns 2+ ('TTFT-post', the prefix-reuse turns) plus tokens/s percentiles,
+    side by side under a single header, separated by vertical rules, with a
+    dotted line whenever ctx or users changes.  A 'failed' column reports
+    per-row request failures.  A None TTFT-post renders dashes (no turn 2+
+    to aggregate, or not in multiturn mode)."""
+    ttft_label = "TTFT turn1 (ms)" if multiturn else "TTFT (ms)"
+    post_label = "TTFT-post (ms)"
     title_row = (
         f"{'':>8} {'':>6} {'':>10} {'':>6}    |    "
-        f"{'TTFT (ms)':^{len(_pct_header())}}    |    "
+        f"{ttft_label:^{len(_pct_header())}}    |    "
+        f"{post_label:^{len(_pct_header())}}    |    "
         f"{'tokens/s':^{len(_pct_header())}}"
     )
-    pct_row = f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    {_pct_header()}    |    {_pct_header()}"
+    pct_row = (
+        f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    "
+        f"{_pct_header()}    |    {_pct_header()}    |    {_pct_header()}"
+    )
     print(title_row, file=file)
     print(pct_row, file=file)
     sep = "-" * len(pct_row)
     print(sep, file=file)
     prev_key = None
-    for ctx, n_users, task, n_fail, ttft, tps in rows:
+    for ctx, n_users, task, n_fail, ttft, ttft_post, tps in rows:
         key = (ctx, n_users)
         if prev_key is not None and key != prev_key:
             print(sep, file=file)
         prev_key = key
-        line = f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |"
-        for i, s in enumerate((ttft, tps)):
-            line += "    " + "".join(f"{s[p]:>{_CELL}.1f}" for p in PCTS)
-            if i == 0:
-                line += "    |"
+        blocks = []
+        for s in (ttft, ttft_post, tps):
+            if s is None:
+                blocks.append("".join(f"{'-':>{_CELL}}" for _ in PCTS))
+            else:
+                blocks.append("".join(f"{s[p]:>{_CELL}.1f}" for p in PCTS))
+        line = (
+            f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |    "
+            + "    |    ".join(blocks)
+        )
         print(line, file=file)
+
+
+async def _run_level(
+    model,
+    tasks: list[Task],
+    n_users: int,
+    ctx: int,
+    args: argparse.Namespace,
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+) -> None:
+    """Run one (ctx, users) level: concurrency of ``n_users``, each doing
+    ``requests_per_user`` requests over the given ``tasks``, then append the
+    per-task summary rows to ``rows``."""
+    print(f"Running ctx={ctx} N={n_users} users (requests_per_user={args.requests_per_user})...")
+    results = await run_concurrency(
+        model,
+        tasks,
+        n_users,
+        args.requests_per_user,
+        ctx,
+        args.extra_body,
+        args.debug_stream,
+        multiturn=args.multiturn,
+        no_nonce=args.no_nonce,
+    )
+    successes = [r for r in results if r.success]
+    failures = len(results) - len(successes)
+    if not successes:
+        print(f"  all {len(results)} requests failed — skipping level.")
+        print(f"  first error: {results[0].error if results else 'n/a'}")
+        return
+    level_rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]] = []
+    for task in tasks:
+        group = [r for r in successes if r.task == task.name]
+        if not group:
+            continue
+        group_fail = sum(1 for r in results if r.task == task.name and not r.success)
+        ttfts = [r.ttft_s * 1000.0 for r in group]
+        tpss = [r.tokens_per_s for r in group]
+        if args.multiturn:
+            # Split TTFT by turn depth: turn 1 pays the full prefill;
+            # turns 2+ reuse the shared prefix, so their TTFT shows the
+            # warm-path (prefix/KV cache) latency.
+            turn1 = [r.ttft_s * 1000.0 for r in group if r.turn == 1]
+            post = [r.ttft_s * 1000.0 for r in group if r.turn >= 2]
+            ttft_post = stats(post) if post else None
+            if turn1:
+                ttfts = turn1
+        else:
+            ttft_post = None
+        level_rows.append(
+            (
+                ctx,
+                n_users,
+                task.name,
+                group_fail,
+                stats(ttfts),
+                ttft_post,
+                stats(tpss, inverted=True),
+            )
+        )
+    if failures:
+        print(f"  {failures}/{len(results)} requests failed (excluded from stats)")
+    if level_rows:
+        print(f"\n--- preview ctx={ctx} users={n_users} ---")
+        print_table(level_rows, multiturn=args.multiturn)
+        print()
+    rows.extend(level_rows)
 
 
 async def main() -> None:
@@ -628,6 +857,8 @@ async def main() -> None:
     tasks = resolve_tasks(args)
     model = build_model(args)
     extra_body = build_chat_template_kwargs(args)
+    args.extra_body = extra_body
+    task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
     task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
     print(
         f"Model: {model.__class__.__name__} name={model.model_name!r} "
@@ -635,6 +866,18 @@ async def main() -> None:
         f"requests_per_user={args.requests_per_user} "
         f"context_lengths={ctx_levels}"
     )
+    if args.multiturn:
+        print(
+            f"MODE: multiturn — each user runs {args.requests_per_user} turns of one "
+            "conversation (shared prefix reused across turns; server prefix/KV cache engages)."
+        )
+    if args.no_nonce:
+        print("MODE: no-nonce — every request uses a fixed shared prefix (server prefix cache reuse enabled).")
+    if args.prewarm:
+        print(
+            "MODE: prewarm — one shared-prefix warm-up request per (ctx, task) before each sweep "
+            "(prefix graph populated ahead of the users)."
+        )
     if extra_body:
         print(f"extra_body: {extra_body}")
     print(
@@ -643,58 +886,63 @@ async def main() -> None:
         "content chunks.\n"
     )
 
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]] = []
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]] = []
     for ctx in ctx_levels:
+        if args.prewarm:
+            await prewarm(model, tasks, ctx, args.extra_body, args.debug_stream)
+            print()
         for n_users in user_levels:
-            print(f"Running ctx={ctx} N={n_users} users (requests_per_user={args.requests_per_user})...")
-            results = await run_concurrency(model, tasks, n_users, args.requests_per_user, ctx, extra_body, args.debug_stream)
-            successes = [r for r in results if r.success]
-            failures = len(results) - len(successes)
-            if not successes:
-                print(f"  all {len(results)} requests failed — skipping level.")
-                print(f"  first error: {results[0].error if results else 'n/a'}")
-                continue
-            level_rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float]]] = []
-            for task in tasks:
-                group = [r for r in successes if r.task == task.name]
-                if not group:
-                    continue
-                group_fail = sum(1 for r in results if r.task == task.name and not r.success)
-                ttfts = [r.ttft_s * 1000.0 for r in group]
-                tpss = [r.tokens_per_s for r in group]
-                level_rows.append(
-                    (
-                        ctx,
+            if args.separate_tasks:
+                # One dedicated (ctx, users, task) pass per task: all N users
+                # run their turns on just this task back-to-back, so each task
+                # gets a clean turn-1 (prefill) vs turns 2+ (prefix reuse) split.
+                for task in tasks:
+                    await _run_level(
+                        model,
+                        [task],
                         n_users,
-                        task.name,
-                        group_fail,
-                        stats(ttfts),
-                        stats(tpss, inverted=True),
+                        ctx,
+                        args,
+                        rows,
                     )
+            else:
+                await _run_level(
+                    model,
+                    tasks,
+                    n_users,
+                    ctx,
+                    args,
+                    rows,
                 )
-            if failures:
-                print(f"  {failures}/{len(results)} requests failed (excluded from stats)")
-            if level_rows:
-                print(f"\n--- preview ctx={ctx} users={n_users} ---")
-                print_table(level_rows)
-                print()
-            rows.extend(level_rows)
 
     if not rows:
         raise SystemExit("No successful requests; nothing to report.")
 
-    summary_head = "\nPer-level latency / throughput (unique-nonce requests, no cache reuse):"
+    if args.multiturn:
+        summary_head = "\nPer-level latency / throughput (multiturn: shared prefix reused across each user's turns):"
+    elif args.no_nonce:
+        summary_head = (
+            "\nPer-level latency / throughput (no-nonce: all requests share one fixed prefix, "
+            "server prefix cache can reuse):"
+        )
+    else:
+        summary_head = "\nPer-level latency / throughput (unique-nonce requests, no cache reuse):"
     summary_note = (
         "TTFT (ms): P50/P95/P99/P100 ascending;  tokens/s: higher is better so percentiles are inverted (P100 = slowest)."
     )
+    if args.multiturn:
+        summary_note += (
+            "\nTTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ "
+            "(shared prefix reused — shows prefix-cache benefit)."
+        )
     print(summary_head)
     print(summary_note)
-    print_table(rows)
+    print_table(rows, multiturn=args.multiturn)
     if args.output:
         with open(args.output, "w") as fh:
             fh.write(summary_head + "\n")
             fh.write(summary_note + "\n")
-            print_table(rows, file=fh)
+            print_table(rows, file=fh, multiturn=args.multiturn)
         print(f"Table written to {args.output}")
 
 

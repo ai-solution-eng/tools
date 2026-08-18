@@ -40,14 +40,16 @@ _NOT_DEPLOYED = ""
 def _pool_limits_from_env() -> httpx.Limits:
     """Build httpx connection-pool limits from env vars.
 
-    Defaults (30 / 10) match the original single-replica chart.  The
-    scale chart raises these so the embedder — on every search's critical
-    path — is not the bottleneck at high concurrency.
+    Default (128) tracks the benchmark target: concurrency levels are chosen
+    so the client is never the bottleneck, and SGLang servers are typically
+    configured with ``--max-running-requests`` up to 128.  Override with
+    ``MODEL_POOL_MAX_CONNECTIONS`` (and ``MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS``)
+    for other deployments (e.g. the original single-replica chart used 30/10).
     """
     try:
-        max_conn = int(os.environ.get("MODEL_POOL_MAX_CONNECTIONS", "30"))
+        max_conn = int(os.environ.get("MODEL_POOL_MAX_CONNECTIONS", "128"))
     except (TypeError, ValueError):
-        max_conn = 30
+        max_conn = 128
     try:
         max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "10"))
     except (TypeError, ValueError):
