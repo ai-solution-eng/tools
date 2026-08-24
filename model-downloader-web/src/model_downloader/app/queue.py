@@ -27,6 +27,7 @@ class JobRecord:
     pvc_url: str = ""
     storage: str = "pvc"  # pvc | s3
     s3_path: str = ""  # user-chosen s3://bucket/prefix/ destination
+    cache_root: str = ""  # user-chosen absolute PVC path; empty => /mnt/large-models/{model_name}
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -56,8 +57,15 @@ class JobQueue:
         self.jobs: dict[str, JobRecord] = {}
         self._sem: asyncio.Semaphore | None = None
 
-    def _pvc_url(self, model_name: str) -> str:
-        return f"pvc://{self.pvc_name}/{self.pvc_subpath}/{model_name}?containerPath={self.container_path}"
+    def _pvc_url(self, model_name: str, cache_root: str = "") -> str:
+        if cache_root:
+            # The job mounts the PVC at /mnt/. cache_root is an absolute path under
+            # that root, so the PVC subpath is cache_root minus the leading /mnt/.
+            sub = cache_root.lstrip("/")
+            sub = sub.removeprefix("mnt/") if sub.startswith("mnt/") else sub
+        else:
+            sub = f"{self.pvc_subpath}/{model_name}"
+        return f"pvc://{self.pvc_name}/{sub}?containerPath={self.container_path}"
 
     def _s3_url(self, model_name: str, s3_path: str = "") -> str:
         if s3_path:
@@ -67,10 +75,10 @@ class JobQueue:
             dest = f"s3://{self.s3_bucket}/{prefix}".rstrip("/")
         return f"{dest}/{model_name}"
 
-    def _output_url(self, model_name: str, storage: str, s3_path: str = "") -> str:
+    def _output_url(self, model_name: str, storage: str, s3_path: str = "", cache_root: str = "") -> str:
         if storage == "s3":
             return self._s3_url(model_name, s3_path)
-        return self._pvc_url(model_name)
+        return self._pvc_url(model_name, cache_root)
 
     async def start(self) -> None:
         self._sem = asyncio.Semaphore(self.max_concurrency)
@@ -90,7 +98,8 @@ class JobQueue:
                 k8s_job_name=m["job_name"],
                 storage=m.get("storage", "pvc"),
                 s3_path=m.get("s3_path", ""),
-                pvc_url=self._output_url(m["model_name"], m.get("storage", "pvc"), m.get("s3_path", "")),
+                cache_root=m.get("cache_root", ""),
+                pvc_url=self._output_url(m["model_name"], m.get("storage", "pvc"), m.get("s3_path", ""), m.get("cache_root", "")),
                 created_at=m["created_at"],
                 finished_at=m["finished_at"],
             )
@@ -109,6 +118,7 @@ class JobQueue:
         s3_path: str = "",
         chat_template_path: str = "",
         chat_template_contents: str = "",
+        cache_root: str = "",
     ) -> JobRecord:
         if self._sem is None:
             raise RuntimeError("queue not started")
@@ -120,7 +130,8 @@ class JobQueue:
             status="queued",
             storage=storage,
             s3_path=s3_path,
-            pvc_url=self._output_url(model_name, storage, s3_path),
+            cache_root=cache_root,
+            pvc_url=self._output_url(model_name, storage, s3_path, cache_root),
         )
         self.jobs[job_id] = record
         asyncio.create_task(self._run(record, hf_token, chat_template_path, chat_template_contents))
@@ -144,6 +155,7 @@ class JobQueue:
                     s3_path=record.s3_path,
                     chat_template_path=chat_template_path,
                     chat_template_contents=chat_template_contents,
+                    cache_root=record.cache_root,
                 )
                 record.hf_secret_name = secret_name
                 record.k8s_job_name = job_name

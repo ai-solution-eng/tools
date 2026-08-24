@@ -2,6 +2,7 @@ const form = document.getElementById('submit-form');
 const msg = document.getElementById('msg');
 const storageSelect = form.querySelector('select[name="storage"]');
 const s3PathField = document.getElementById('s3-path-field');
+const cacheRootField = document.getElementById('cache-root-field');
 const chatTemplateField = document.getElementById('chat-template-field');
 const chatTemplatePathField = document.getElementById('chat-template-path-field');
 const chatTemplateContentsField = document.getElementById('chat-template-contents-field');
@@ -19,6 +20,7 @@ function syncTemplateFields() {
 }
 function syncStorageFields() {
   if (storageSelect) s3PathField.hidden = storageSelect.value !== 's3';
+  if (cacheRootField) cacheRootField.hidden = storageSelect ? storageSelect.value === 's3' : false;
   syncTemplateFields();
 }
 if (storageSelect) {
@@ -45,6 +47,7 @@ form.addEventListener('submit', async (e) => {
     body.chat_template_enabled = '';
     body.chat_template_path = '';
     body.chat_template_contents = '';
+    body.cache_root = '';
   } else if (body.chat_template_enabled === 'on') {
     if (!body.chat_template_path || !body.chat_template_contents) {
       msg.className = 'msg error';

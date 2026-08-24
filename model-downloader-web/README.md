@@ -155,6 +155,20 @@ Downloads write HF cache under `pvc://<pvcName>/<pvcSubpath>/<model>?containerPa
 
 When a job succeeds the UI shows the `pvc://` destination and a copy button.
 
+#### Custom download location (PVC)
+
+For the PVC backend the user can optionally override where the HF cache is
+written via the **Custom download location** field. When blank (default), the
+cache root is `/mnt/large-models/<org>/<Repo-Name>` (i.e. `<pvcSubpath>/<model>`),
+which is what the `pvc://` URI above assumes. Setting it to an absolute path
+under the PVC root (e.g. `/mnt/large-models/Qwen/Qwen3.8-27B-FP8`) places the HF
+cache — including its `models--<org>--<repo>` directory — inside that folder
+instead. This is how a draft/auxiliary checkpoint can be co-located with its
+target model in a single shared cache directory. The job mounts the PVC at
+`/mnt/`, so a cache root of `/mnt/large-models/...` maps to the PVC subpath
+`large-models/...`. The field applies to the PVC backend only; it is hidden and
+ignored when S3 is selected.
+
 ### S3 path
 
 If `storage.backend` includes `s3`, the downloader Job **streams the snapshot
@@ -356,6 +370,18 @@ helm upgrade model-downloader helm/ -n model-downloader \
 - **"Config-missing key / missing `job.yaml`"** → the app reads the
   `-job-template` Configmap in its namespace; make sure chart applied.
 - **PVC mount errors on a hosted cluster** → see the Kyverno section.
+- **`helm install` fails / deployment won't come up on a hosted trial** → a
+  previously failed install can leave the app's cluster-scoped resources
+  behind, blocking a retry. Clean them up and reinstall:
+
+  ```bash
+  kubectl delete clusterrole model-downloader
+  kubectl delete clusterrolebinding model-downloader
+  kubectl delete authorizationpolicy -n istio-system model-downloader-auth-policy
+  ```
+
+  Then re-run `helm install`. These resources are cluster-scoped (or live in
+  `istio-system`), so `helm uninstall` alone won't remove them.
 - **Slow/parallel**: raised concurrency hurts; `downloader.hf.enableHfTransfer`
   and `disableXet` reshape transfer behaviour in a proxy network.
 - **Transient network / DNS failures** (e.g. `BackoffLimitExceeded` after

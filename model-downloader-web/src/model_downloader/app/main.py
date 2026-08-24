@@ -84,6 +84,7 @@ class SubmitRequest(BaseModel):
     s3_path: str = ""
     chat_template_path: str = ""
     chat_template_contents: str = ""
+    cache_root: str = ""
 
     @field_validator("namespace")
     @classmethod
@@ -112,6 +113,16 @@ class SubmitRequest(BaseModel):
         v = v.strip()
         if v and not re.match(r"^s3://[^/\s]+", v):
             raise ValueError("s3_path must start with 's3://<bucket>'")
+        return v
+
+    @field_validator("cache_root")
+    @classmethod
+    def _valid_cache_root(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if not v:
+            return ""
+        if not v.startswith("/") or ".." in v.split("/"):
+            raise ValueError("cache_root must be an absolute path and must not contain '..'")
         return v
 
     @model_validator(mode="after")
@@ -177,6 +188,7 @@ async def submit_job(req: SubmitRequest):
         s3_path=req.s3_path,
         chat_template_path=req.chat_template_path,
         chat_template_contents=req.chat_template_contents,
+        cache_root=req.cache_root,
     )
     return {"id": record.id, "status": record.status, "storage": record.storage}
 

@@ -51,9 +51,9 @@ def _pool_limits_from_env() -> httpx.Limits:
     except (TypeError, ValueError):
         max_conn = 128
     try:
-        max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "10"))
+        max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "32"))
     except (TypeError, ValueError):
-        max_keepalive = 10
+        max_keepalive = 32
     return httpx.Limits(
         max_connections=max(1, max_conn),
         max_keepalive_connections=max(1, max_keepalive),

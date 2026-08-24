@@ -64,6 +64,12 @@
         <input name="hf_token" type="password" required
                placeholder="hf_...">
       </label>
+      <label id="cache-root-field">
+        <span>Custom download location</span>
+        <input name="cache_root" autocomplete="off"
+               placeholder="/mnt/large-models/Qwen/Qwen3.8-27B-FP8">
+        <small class="field-note">If blank, we default to <code>/mnt/large-models/${MODEL_NAME}</code></small>
+      </label>
       {% if storage_options|length > 1 %}
       <label>
         <span>Storage</span>

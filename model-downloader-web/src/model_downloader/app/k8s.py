@@ -23,6 +23,7 @@ JOB_ID_LABEL = "model-downloader/job-id"
 MODEL_NAME_ANNOTATION = "model-downloader/model-name"
 STORAGE_ANNOTATION = "model-downloader/storage"
 S3_PATH_ANNOTATION = "model-downloader/s3-path"
+CACHE_ROOT_ANNOTATION = "model-downloader/cache-root"
 MANAGED_LABEL_SELECTOR = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
 
 
@@ -97,6 +98,7 @@ class K8sClient:
         s3_path: str = "",
         chat_template_path: str = "",
         chat_template_contents: str = "",
+        cache_root: str = "",
     ) -> dict:
         text = self._templates.get(storage)
         if text is None:
@@ -112,6 +114,10 @@ class K8sClient:
             "__CHAT_TEMPLATE_B64__", base64.b64encode(chat_template_contents.encode("utf-8")).decode("ascii")
         )
         text = text.replace("__CHAT_TEMPLATE_PATH__", chat_template_path)
+        # Resolve the cache root here so the job template stays simple. When the
+        # user leaves it blank we default to /mnt/large-models/<model>.
+        resolved_cache_root = cache_root or f"/mnt/large-models/{model_name}"
+        text = text.replace("__CACHE_ROOT__", resolved_cache_root)
         norm_s3 = ""
         if storage == "s3":
             bucket, prefix = _parse_s3_path(s3_path)
@@ -126,6 +132,8 @@ class K8sClient:
         meta.setdefault("labels", {})[MANAGED_BY_LABEL] = MANAGED_BY_VALUE
         meta.setdefault("annotations", {})[MODEL_NAME_ANNOTATION] = model_name
         meta.setdefault("annotations", {})[STORAGE_ANNOTATION] = storage
+        if cache_root:
+            meta.setdefault("annotations", {})[CACHE_ROOT_ANNOTATION] = cache_root
         if norm_s3:
             meta.setdefault("annotations", {})[S3_PATH_ANNOTATION] = norm_s3
         return manifest
@@ -140,6 +148,7 @@ class K8sClient:
         s3_path: str = "",
         chat_template_path: str = "",
         chat_template_contents: str = "",
+        cache_root: str = "",
     ) -> tuple[str, str]:
         """Create the HF token Secret + the download Job. Returns (secret_name, job_name)."""
         base = _sanitize(model_name)
@@ -174,6 +183,7 @@ class K8sClient:
             s3_path=s3_path,
             chat_template_path=chat_template_path,
             chat_template_contents=chat_template_contents,
+            cache_root=cache_root,
         )
         meta = manifest.setdefault("metadata", {})
         meta.setdefault("labels", {})[JOB_ID_LABEL] = job_id
@@ -214,6 +224,7 @@ class K8sClient:
                     "model_name": annotations.get(MODEL_NAME_ANNOTATION, ""),
                     "storage": annotations.get(STORAGE_ANNOTATION, "pvc"),
                     "s3_path": annotations.get(S3_PATH_ANNOTATION, ""),
+                    "cache_root": annotations.get(CACHE_ROOT_ANNOTATION, ""),
                     "status": status,
                     "error": error,
                     "created_at": created,

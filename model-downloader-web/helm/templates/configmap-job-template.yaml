@@ -43,7 +43,7 @@ data:
             - -c
             - |
               set -e
-              export CACHE_ROOT="/mnt/large-models/${MODEL_NAME}"
+              export CACHE_ROOT="__CACHE_ROOT__"
               export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}"
               export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
               mkdir -p "${CACHE_ROOT}"

@@ -1,0 +1,76 @@
+(base) andrew-bydlon@rag-throughput-0:~$ python3 benchmark.py --mode mcp   --url http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp   --api-url http://rag-mcp-server-api.mm-rag.svc.cluster.local   --dataset andrew-test-dataset   --N 200 --duration 120 --ramp-up 5 --top-k 10   --output mm_no_reranker.json
+Checking server health at http://rag-mcp-server-api.mm-rag.svc.cluster.local ... OK
+Query pool: 40 queries
+
+============================================================
+  BENCHMARK CONFIGURATION
+============================================================
+  Mode:            MCP
+  MCP endpoint:    http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp
+  REST API:        http://rag-mcp-server-api.mm-rag.svc.cluster.local
+  Dataset:         andrew-test-dataset
+  Users (N):       200
+  Duration:        120.0s
+  Ramp-up:         5.0s
+  Top K:           10
+  Reranker:        OFF
+  Queries:         40
+  Password:        none
+  TLS verify:      ON
+  Call timeout:    120s
+============================================================
+
+Launching 200 concurrent users (mcp mode) ...
+   elapsed   requests    success     failed  rate (req/s)
+  --------  ---------  ---------  ---------  ------------
+      5.0s         12         12          0           2.4
+     10.0s        413        413          0          41.2
+     15.0s        773        773          0          51.4
+     20.0s       1202       1202          0          60.0
+     25.0s       1624       1624          0          64.9
+     30.0s       2086       2086          0          69.4
+     35.0s       2504       2504          0          71.5
+     40.0s       2953       2953          0          73.7
+     45.0s       3396       3395          1          75.4
+     50.0s       3776       3775          1          75.5
+     55.0s       4186       4185          1          76.0
+     60.0s       4575       4574          1          76.2
+     65.1s       4979       4978          1          76.5
+     70.1s       5435       5434          1          77.6
+     75.1s       5796       5795          1          77.2
+     80.1s       6148       6147          1          76.8
+     85.1s       6646       6645          1          78.1
+     90.1s       7098       7097          1          78.8
+     95.1s       7514       7513          1          79.0
+    100.1s       7956       7955          1          79.5
+   elapsed   requests    success     failed  rate (req/s)
+  --------  ---------  ---------  ---------  ------------
+    105.1s       8390       8389          1          79.8
+    110.1s       8784       8783          1          79.8
+    115.1s       9219       9218          1          80.1
+    120.1s       9686       9685          1          80.6
+    125.1s      10110      10109          1          80.8
+
+============================================================
+  BENCHMARK RESULTS
+============================================================
+  Duration:            126.83s
+  Total requests:      10192
+  Successful:          10191
+  Failed:              1
+  Success rate:        99.99%
+  Response rate:       80.36 req/s
+
+  Latency (ms):
+    min:     0.0
+    mean:    2352.02
+    median:  2265.2
+    p95:     3587.84
+    p99:     4378.45
+    max:     6652.98
+
+  Avg results/query:   1
+  Errors:              {'MCP connect: ExceptionGroup': 1}
+============================================================
+
+Results saved to mm_no_reranker.json
