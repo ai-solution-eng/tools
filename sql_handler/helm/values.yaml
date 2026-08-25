@@ -1,0 +1,228 @@
+# SQLhandler MCP server — PCAI (HPE Ezmeral Unified Analytics) deployment.
+# Deploys SQLhandler as a MCP 2.0 (streamable-http) server exposed at
+# <endpoint>/mcp through the PCAI Istio gateway.
+
+# -- Deployment ---------------------------------------------------------------
+replicaCount: 1
+
+image:
+  # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
+  # the sibling PCAI apps and the deploy-toromont values file.
+  repository: ghcr.io/ai-solution-eng/sqlhandler
+  tag: v0.4.0
+  pullPolicy: IfNotPresent
+
+# -- Backend selection -------------------------------------------------------
+# One data source is read at a time:
+#   onelake       - Microsoft Fabric OneLake (Delta Lake over ABFS)  [default]
+#   s3 | minio    - S3-compatible object store (Parquet files), e.g. MinIO
+#   iceberg       - Apache Iceberg tables through a REST or SQL catalog
+backend: onelake
+
+# -- Naming overrides (rarely needed) ----------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Service account ----------------------------------------------------------
+# SQLhandler does not need RBAC to read k8s Secrets by default; keep this
+# simple unless you add a SecretProvider tier that requires it.
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+# -- Service exposure ---------------------------------------------------------
+# The MCP streamable-http endpoint is served on port 9097 at path /mcp.
+# 9097 is aligned with the other MCP servers in this environment; the
+# container listens on the same port (see mcp.port below).
+service:
+  type: ClusterIP
+  port: 9097
+  targetPort: 9097
+
+# -- MCP endpoint configuration ----------------------------------------------
+mcp:
+  transport: streamable-http   # MCP 2.0 transport
+  path: /mcp                   # FastMCP default; VirtualService routes on it
+  port: 9097                   # container + service port
+
+# -- Resources ----------------------------------------------------------------
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# -- Probes --------------------------------------------------------------------
+# /health and /ready are served by the container (server.py).
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 3
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+
+# -- OneLake / Fabric connection ---------------------------------------------
+# Sensitive values go in a Kubernetes Secret; non-secret connection details
+# go in a ConfigMap. NEVER put the service-principal secret in values.yaml.
+#
+# fabric.credentials.secretName refers to a Secret you create separately
+# (or via `kubectl create secret`, or the example secret.yaml template).
+fabric:
+  # Secret name + keys holding the Entra service-principal credential.
+  credentialsSecret:
+    name: fabric-credentials
+    tenantIdKey: tenant-id
+    clientIdKey: client-id
+    clientSecretKey: client-secret
+    # Set create: true AND fill the values below ONLY to have the chart
+    # create the Secret for you (e.g. a non-production bootstrap). Prefer
+    # creating the Secret out-of-band with `kubectl create secret` or a
+    # sealed/encrypted Secret so the service-principal secret never lands
+    # in a values file. NEVER commit real credentials.
+    create: false
+    values:
+      tenantId: ""
+      clientId: ""
+      clientSecret: ""
+
+  # Non-secret connection details injected via ConfigMap.
+  lakehouseAbfssUrl: ""          # e.g. abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>
+  workspaceId: ""                # fallback (if no full URL)
+  lakehouseId: ""                # fallback (if no full URL)
+  authority: onelake.dfs.fabric.microsoft.com
+
+# -- S3 / MinIO backend (used when backend: s3) ------------------------------------
+# Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
+# key and secret go through a Kubernetes Secret - NEVER in values.yaml.
+s3:
+  # Secret name + keys holding the S3 credentials (create the Secret
+  # out-of-band with `kubectl create secret`, or use create: true below for a
+  # non-production bootstrap). NEVER commit real keys.
+  credentialsSecret:
+    name: s3-credentials
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    create: false
+    values:
+      accessKey: ""
+      secretKey: ""
+
+  # MinIO/S3 connection details (non-secret -> ConfigMap).
+  endpointUrl: ""             # e.g. http://minio:9000 or http://127.0.0.1:9000
+  region: us-east-1
+  bucket: ""                  # required
+  prefix: ""                  # optional sub-tree within the bucket
+  anonymous: false            # read public buckets without keys
+  useSsl: false               # force https when endpointUrl has no scheme
+
+# -- Iceberg backend (used when backend: iceberg) ---------------------------------
+# Tables are discovered through an Iceberg catalog; the Parquet data files
+# live in your object store (S3_* storage vars) or on a local disk. The
+# catalog token (REST) and S3 keys go through a Secret, never values.yaml.
+iceberg:
+  catalogType: rest            # rest | sql
+  catalogUri: ""              # e.g. http://rest-catalog:8181 or sqlite:///path
+  catalogName: sqlhandler      # SQL catalogs partition by this name
+  warehouse: ""               # optional table location root
+  namespace: ""               # optional namespace filter
+  # Credentials Secret: REST token + S3 access/secret keys (create out-of-band).
+  credentialsSecret:
+    name: iceberg-credentials
+    tokenKey: token
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    create: false
+    values:
+      token: ""
+      accessKey: ""
+      secretKey: ""
+  # S3 storage for the Iceberg data files (optional).
+  storage:
+    endpointUrl: ""
+    region: us-east-1
+    anonymous: false
+
+# -- NFS / local filesystem backend (used when backend: nfs) ---------------------
+# Reads Parquet files from a directory mounted into the container (hostPath,
+# NFS via a PV/PVC, or any volume). No credentials required.
+nfs:
+  # Absolute path of the mounted directory containing Parquet files.
+  rootDir: "/data"
+  # Optional volume to mount providing the data (only when backend: nfs).
+  mount:
+    enabled: false
+    pvcName: ""           # PVC to mount
+    mountPath: "/data"    # where it is mounted inside the container
+    readOnly: true
+
+
+# -- Metadata caching --------------------------------------------------------
+# In-process cache for list_tables / describe_table (see README "Performance
+# & caching"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
+cache:
+  # Seconds to keep list_tables / describe_table results in memory (0 disables).
+  ttl: 3600
+  # How often (seconds) a Delta snapshot version is re-checked to invalidate a
+  # cached Dataset (0 = every query; default 10).
+  versionCheckInterval: 10
+  # Comma-separated table names whose data should be warmed at startup,
+  # e.g. "work_order_header,work_order_note_recent".
+  prewarmTables: ""
+
+# -- Runtime arguments for the sqlhandler entrypoint --------------------------
+containerArgs:
+  - --transport
+  - streamable-http
+  - --host
+  - 0.0.0.0
+  - --port
+  - "9097"
+
+# -- Ingress (optional; PCAI normally uses the Istio VirtualService below) ----
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: sqlhandler.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# -- Pod-level annotations / node placement -------------------------------------
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------
+# When enabled, deploys the Istio VirtualService, Istio AuthorizationPolicy,
+# and a Kyverno ClusterPolicy that tags this workload as a vendor-service so
+# the PCAI platform can discover and monitor the MCP endpoint.
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+
+  virtualService:
+    # Public endpoint on the PCAI gateway. MCP clients connect to:
+    #   https://<endpoint>/mcp
+    endpoint: "sqlhandler.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    # Default for normal calls (health etc.); the /mcp route uses longTimeout.
+    timeout: 60s
+    # MCP streamable-http is long-lived (tool calls, streaming responses).
+    longTimeout: 3600s
+
+  # configure the authorization policy (oauth2-proxy in front of PCAI).
+  authorizationPolicy:
+    enabled: true
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

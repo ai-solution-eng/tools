@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Environment / secrets — NEVER commit real credentials
+config/.env
+.env
+*.env.local
+# Deploy values with embedded Toromont credentials
+helm/deploy-toromont-values.yaml
+
+# OS/editor
+.DS_Store
+# Local dev tooling (MinIO binary + test data + scratch scripts)
+.dev/

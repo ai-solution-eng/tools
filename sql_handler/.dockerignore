@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+.venv
+.uv-cache
+.git
+config/.env
+.ruff_cache
+.mypy_cache
+.pytest_cache
+tests
+helm

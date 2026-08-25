@@ -1,0 +1,36 @@
+{{- if .Values.ezua.enabled }}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+    {{- include "sqlhandler.ezua.labels" . | nindent 4 }}
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway | required "\nValid .Values.ezua.virtualService.istioGateway is required when ezua is enabled !" }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required when ezua is enabled !" }}
+  http:
+    # MCP streamable-http — long timeout for agent loops / tool calls.
+    - match:
+        - uri:
+            prefix: {{ .Values.mcp.path }}
+      route:
+        - destination:
+            host: {{ include "sqlhandler.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.longTimeout }}
+    # Everything else (health, root) — short timeout.
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ include "sqlhandler.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+{{- end }}

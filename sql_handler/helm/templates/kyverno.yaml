@@ -1,0 +1,32 @@
+{{- if .Values.ezua.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  background: true
+  rules:
+    - name: add-vendor-app-labels
+      match:
+        any:
+          - resources:
+              namespaces:
+                - {{ .Release.Namespace }}
+              kinds:
+                - Pod
+                - Deployment
+                - Service
+              selector:
+                matchLabels:
+                  app.kubernetes.io/instance: {{ .Release.Name }}
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              "hpe-ezua/type": vendor-service
+              "hpe-ezua/app": {{ .Chart.Name }}
+{{- end }}

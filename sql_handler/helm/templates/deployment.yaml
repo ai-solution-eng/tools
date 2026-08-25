@@ -1,0 +1,157 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+    {{- include "sqlhandler.ezua.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sqlhandler.selectorLabels" . | nindent 8 }}
+        {{- include "sqlhandler.ezua.labels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when the ConfigMap or credential Secret changes,
+        # so a corrected credential value actually reaches the container
+        # (env from a Secret is read at container start, not live).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if or (and (eq .Values.backend "onelake") .Values.fabric.credentialsSecret.create) (and (eq .Values.backend "s3") .Values.s3.credentialsSecret.create) (and (eq .Values.backend "iceberg") .Values.iceberg.credentialsSecret.create) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sqlhandler.serviceAccountName" . }}
+      containers:
+        - name: sqlhandler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcp.port }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "sqlhandler.fullname" . }}-config
+          env:
+            {{- if eq .Values.backend "onelake" }}
+            # OneLake: map the Fabric credential secret keys to the env vars
+            # config.py reads (envFrom would expose tenant-id / client-id /
+            # client-secret, which the app never looks up).
+            - name: FABRIC_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fabric.credentialsSecret.name }}
+                  key: {{ .Values.fabric.credentialsSecret.tenantIdKey }}
+            - name: FABRIC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fabric.credentialsSecret.name }}
+                  key: {{ .Values.fabric.credentialsSecret.clientIdKey }}
+            - name: FABRIC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fabric.credentialsSecret.name }}
+                  key: {{ .Values.fabric.credentialsSecret.clientSecretKey }}
+            {{- else if eq .Values.backend "s3" }}
+            # S3/MinIO backend: credentials from the s3 credentials Secret.
+            {{- if not .Values.s3.anonymous }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.credentialsSecret.name }}
+                  key: {{ .Values.s3.credentialsSecret.accessKeyKey }}
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.credentialsSecret.name }}
+                  key: {{ .Values.s3.credentialsSecret.secretKeyKey }}
+            {{- end }}
+            {{- else if eq .Values.backend "iceberg" }}
+            # Iceberg backend: REST token + S3 storage keys (optional).
+            {{- if .Values.iceberg.catalogToken }}
+            - name: ICEBERG_CATALOG_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.iceberg.credentialsSecret.name }}
+                  key: {{ .Values.iceberg.credentialsSecret.tokenKey }}
+            {{- end }}
+            {{- if not .Values.iceberg.storage.anonymous }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.iceberg.credentialsSecret.name }}
+                  key: {{ .Values.iceberg.credentialsSecret.accessKeyKey }}
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.iceberg.credentialsSecret.name }}
+                  key: {{ .Values.iceberg.credentialsSecret.secretKeyKey }}
+            {{- end }}
+            {{- end }}
+          {{- if eq .Values.backend "nfs" }}
+          {{- if .Values.nfs.mount.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.nfs.mount.mountPath | default "/data" | quote }}
+              readOnly: {{ .Values.nfs.mount.readOnly }}
+          {{- end }}
+          {{- end }}
+          # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
+          # whole command (making --transport the executable and crashing with
+          # 'executable file not found'). Pin the entry command, pass args only.
+          command:
+            - python
+            - -m
+            - sqlhandler.server
+          args:
+            {{- range .Values.containerArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+          {{- end }}
+      {{- if eq .Values.backend "nfs" }}
+      {{- if .Values.nfs.mount.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.nfs.mount.pvcName | required "nfs.mount.pvcName is required when nfs.mount.enabled" }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

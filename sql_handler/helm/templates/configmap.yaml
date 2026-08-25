@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+data:
+  # Streamable HTTP (MCP 2.0) is the default transport.
+  SQLHANDLER_TRANSPORT: {{ .Values.mcp.transport | quote }}
+  # Backend: onelake (default), s3/minio, or iceberg.
+  SQLHANDLER_BACKEND: {{ .Values.backend | default "onelake" | quote }}
+  {{- if eq .Values.backend "onelake" }}
+  # OneLake connection details (non-secret). Credentials come from a Secret.
+  FABRIC_AUTHORITY: {{ .Values.fabric.authority | quote }}
+  {{- if .Values.fabric.lakehouseAbfssUrl }}
+  FABRIC_LAKEHOUSE_ABFSS_URL: {{ .Values.fabric.lakehouseAbfssUrl | quote }}
+  {{- end }}
+  {{- if .Values.fabric.workspaceId }}
+  FABRIC_WORKSPACE_ID: {{ .Values.fabric.workspaceId | quote }}
+  {{- end }}
+  {{- if .Values.fabric.lakehouseId }}
+  FABRIC_LAKEHOUSE_ID: {{ .Values.fabric.lakehouseId | quote }}
+  {{- end }}
+  {{- else if eq .Values.backend "s3" }}
+  # S3/MinIO connection details (non-secret). Credentials come from a Secret.
+  S3_ENDPOINT_URL: {{ .Values.s3.endpointUrl | quote }}
+  S3_REGION: {{ .Values.s3.region | default "us-east-1" | quote }}
+  {{- if .Values.s3.bucket }}
+  S3_BUCKET: {{ .Values.s3.bucket | quote }}
+  {{- end }}
+  {{- if .Values.s3.prefix }}
+  S3_PREFIX: {{ .Values.s3.prefix | quote }}
+  {{- end }}
+  {{- if .Values.s3.anonymous }}
+  S3_ANONYMOUS: "true"
+  {{- end }}
+  {{- if .Values.s3.useSsl }}
+  S3_USE_SSL: "true"
+  {{- end }}
+  {{- else if eq .Values.backend "iceberg" }}
+  # Iceberg catalog connection details (non-secret). Token/keys -> Secret.
+  ICEBERG_CATALOG_TYPE: {{ .Values.iceberg.catalogType | default "rest" | quote }}
+  ICEBERG_CATALOG_URI: {{ .Values.iceberg.catalogUri | quote }}
+  {{- if .Values.iceberg.catalogName }}
+  ICEBERG_CATALOG_NAME: {{ .Values.iceberg.catalogName | quote }}
+  {{- end }}
+  {{- if .Values.iceberg.warehouse }}
+  ICEBERG_WAREHOUSE: {{ .Values.iceberg.warehouse | quote }}
+  {{- end }}
+  {{- if .Values.iceberg.namespace }}
+  ICEBERG_NAMESPACE: {{ .Values.iceberg.namespace | quote }}
+  {{- end }}
+  # S3 storage for the Iceberg data files (optional; same vars as s3 backend).
+  {{- if .Values.iceberg.storage.endpointUrl }}
+  S3_ENDPOINT_URL: {{ .Values.iceberg.storage.endpointUrl | quote }}
+  {{- end }}
+  {{- if .Values.iceberg.storage.region }}
+  S3_REGION: {{ .Values.iceberg.storage.region | quote }}
+  {{- end }}
+  {{- if .Values.iceberg.storage.anonymous }}
+  S3_ANONYMOUS: "true"
+  {{- end }}
+  {{- else if eq .Values.backend "nfs" }}
+  # NFS / local filesystem backend: read-only directory of Parquet files.
+  NFS_ROOT: {{ .Values.nfs.rootDir | default "/data" | quote }}
+  {{- end }}
+  # In-process metadata cache (list_tables / describe_table).
+  SQLHANDLER_CACHE_TTL: {{ .Values.cache.ttl | default 3600 | quote }}
+  SQLHANDLER_VERSION_CHECK_INTERVAL: {{ .Values.cache.versionCheckInterval | default 10 | quote }}
+  {{- if .Values.cache.prewarmTables }}
+  SQLHANDLER_PREWARM_TABLES: {{ .Values.cache.prewarmTables | quote }}
+  {{- end }}

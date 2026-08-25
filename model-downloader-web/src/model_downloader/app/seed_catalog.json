@@ -368,7 +368,7 @@
   {
     "catalog_id": "seed-h200-qwen38-27b-dflash2",
     "tier": "h200",
-    "name": "Qwen3.8-27B DFlash2",
+    "name": "Qwen3.8-27B-DFlash2",
     "version": 1,
     "description": "Qwen3.8-27B-FP8 with SGLang DFlash2 (H200) - block-diffusion speculative decoding, 262K context, fp8_e4m3 KV cache, HiCache hierarchical cache (ratio 3). VLM for multimodal RAG",
     "uri": "pvc://models-pvc/large-models/Qwen/Qwen3.8-27B-FP8?containerPath=/mnt/models",

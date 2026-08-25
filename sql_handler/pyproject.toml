@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlhandler"
+version = "0.4.0"
+description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "HPE AI Solution Engineering" }]
+dependencies = [
+    "mcp>=2.0.0",           # MCP 2.0 SDK (MCPServer, stateless streamable-http)
+    "pyarrow>=17.0.0",      # S3 (AWS/MinIO) + Azure filesystems + dataset engine, bundled in pyarrow
+    "duckdb>=1.0.0",
+    "pandas>=2.0.0",
+    "tabulate>=0.9.0",
+    "deltalake>=1.0.0",     # native Delta reader with OneLake ABFS storage options (onelake backend)
+    "uvicorn>=0.30.0",      # streamable-http (MCP 2.0) + health endpoints
+    "starlette>=0.40.0",    # ASGI app for /health, /ready and /mcp
+]
+
+[project.optional-dependencies]
+# Iceberg backend (catalog + Parquet data files). SQL catalog also needs
+# SQLAlchemy for local/sqlite catalogs.
+iceberg = [
+    "pyiceberg[pyarrow]>=0.10",
+    "sqlalchemy>=2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff",
+    "sqlalchemy>=2.0",
+]
+
+[project.scripts]
+sqlhandler = "sqlhandler.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlhandler"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# BLE001: broad `except Exception` is intentional at MCP tool boundaries
+# (errors are returned to the agent as strings, never crash the server).
+ignore = ["BLE001"]

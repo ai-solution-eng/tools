@@ -1,0 +1,26 @@
+# SQLhandler MCP server — direct SQL access to columnar data. PCAI (HPE
+# Ezmeral Unified Analytics) MCP 2.0 deployment. Backends: OneLake (Delta
+# Lake over ABFS) or S3-compatible object storage (Parquet, e.g. MinIO).
+apiVersion: v2
+name: sqlhandler
+description: >-
+  MCP (Model Context Protocol, streamable-http) server for fast, direct SQL
+  access to columnar data: Microsoft Fabric OneLake (Delta Lake) or an
+  S3-compatible store (MinIO/AWS, Parquet). Exposes list_tables /
+  describe_table / run_sql / scan_table as MCP tools.
+type: application
+version: 0.4.0
+appVersion: "0.4.0"
+keywords:
+  - mcp
+  - onelake
+  - delta
+  - fabric
+  - lakehouse
+  - s3
+  - minio
+  - parquet
+  - pcai
+  - hpe
+maintainers:
+  - name: HPE AI Solution Engineering
