@@ -54,10 +54,41 @@ podman push ghcr.io/ai-solution-eng/s3-browser:1.0.0
 
 ### Enabling public access
 
-The first time a container is pushed to GitHub, it's package has a **private** visibility and it must be
-changed to **public** to allow a PCAI unit to download it. To do this:
+The first time a container is pushed to GitHub, it's package has a **private** visibility. Making it
+**public** is one option to allow a PCAI unit to download it. To do this:
 
 - Click the "Packages" tab at organization level. The list of packages will be shown
 - Click the package just uploaded (for example, the "s3-browser"). You will see the latest version
 - Click the "Package settings" on the right side of the panel
 - Scroll down to the "Danger Zone" and click "Change package visibility"
+
+> If you prefer to keep the package **private**, you can instead pull it into Kubernetes using a
+> secret (imagePullSecret) — see the next section.
+
+### Pulling a private image into Kubernetes with a Helm chart (alternative to public)
+
+Keeping a package private and pulling it with a **Kubernetes imagePullSecret** is an alternative to
+making it public. This is useful for internal images you don't want publicly visible.
+
+1. Create the secret **once per namespace** that will run the workload. Use the helper script:
+
+   ```
+   ./create-ghcr-pull-secret.sh --username YOUR_GITHUB_USERNAME --password YOUR_PAT
+   ./create-ghcr-pull-secret.sh --namespace my-ns --username YOUR_GITHUB_USERNAME --password YOUR_PAT
+   ```
+
+   The script creates a `docker-registry` secret (default name `ghcr-pull`) for `ghcr.io`
+   (override `--server` and `--secret` for other registries). The PAT only needs the
+   `read:packages` scope.
+
+2. Reference the secret in your Helm chart values:
+
+   ```yaml
+   imagePullSecrets:
+     - ghcr-pull
+   ```
+
+   Please ensure the Deployment attaches this `imagePullSecret`, so the kubelet uses those credentials when
+   pulling the private image. Requirements:
+   - the image reference in the chart points at the registry (e.g. `ghcr.io/<org>/<image>:<tag>`),
+   - the secret exists in the **same namespace** as the Deployment, **before** the pod is created.
