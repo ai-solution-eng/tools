@@ -50,7 +50,7 @@ Pass `--no-nonce` to measure the cache-friendly regime instead.
 |---|---|
 | `--model_class_name NAME` | Use a registered model from `utils/pcai_models.py` (e.g. `deepseek_v4_flash_280B`, `qwen38_27B`, `qwen36_27B`, `gemma4_31B`, `glm_52_753B`). Imported lazily; not available in the hardlinked deployment. |
 | `--url URL` | OpenAI-compatible endpoint root (no `/v1`). Required when `--model_class_name` is omitted. |
-| `--api_key KEY` | Bearer token for the endpoint. |
+| `--api_key KEY` | Bearer token for the endpoint. **Optional** — omit it for endpoints that don't require auth; no `Authorization` header is then sent. |
 | `--remote` | Use the public serving URL. Without it, the model targets its **in-cluster** URL (`.svc.cluster.local`). Omit `--remote` when running inside the same cluster. |
 
 ### Load shape
@@ -245,7 +245,19 @@ python benchmark_chat.py --model_class_name glm_52_753B --remote \
   --tasks coding --context_length 32768
 ```
 
-### 11. Server-endpoint via `--url` on a cluster node (no `--remote`)
+### 11. Key-less endpoint (no API key)
+
+Endpoints that don't require auth work with `--url` alone — drop `--api_key`
+entirely and no `Authorization` header is sent (openai SDK credential
+enforcement is relaxed automatically):
+
+```bash
+python benchmark_chat.py --url http://localhost:8080   --number_users 4 --requests_per_user 3 --tasks coding,creative,mixed
+```
+
+For a *public* key-less endpoint pass `--remote` too (see Example 12).
+
+### 12. Server-endpoint via `--url` on a cluster node (no `--remote`)
 
 From a pod inside the same cluster, hit the in-cluster service DNS directly
 (no external hop):
@@ -272,3 +284,44 @@ At 32 concurrent users with 32k of prefill: median TTFT ~54 s, tail (P99)
 ~359 s; median 23.8 tok/s, slowest stream ~19 tok/s. The gap between P50 and
 P100 is queueing (client pool and/or server saturation), not variance in the
 model itself.
+
+---
+
+## HTML report - results_to_html.py
+
+The text tables under `results/` carry the numbers but not the *setup*
+context that produced them (GPU, MTP/speculative-decoding config, replicas,
+engine, HiCache, ...). People reading a raw .txt file out of context can lose
+that context. `results_to_html.py` turns the whole `results/` tree into one
+self-contained HTML file that makes the setup explicit per run:
+
+| Field | Source |
+|---|---|
+| **Model** | results sub-directory (e.g. `qwen_38_27b`) |
+| **GPU type + count** | filename (e.g. `H200Sx4` -> 4x H200 SXM) |
+| **MTP / speculative-decoding config** | filename (`dflash2`, `dspark`, `eagle`, `dsp`, `mtp`) or catalog; else `Disabled` |
+| **Engine** | `sglang` / `vllm` token, or catalog image |
+| **HiCache** | `hicache` or `hicachexN` token |
+| **Replicas** | `replicasxN` token (default 1) |
+| **Obsolete** | files starting `OLD_` are flagged |
+| **PCAI deployment config** | expandable block linking to the matching Model-Downloader catalog entry (image, serving args, resources) |
+| **Compare** | tick 2+ setups for a side-by-side table on shared (ctx, users, task) workloads with best/worst highlighted and a metric selector |
+
+The HTML is fully self-contained (no external CSS/JS), so the file can be
+shared by itself - no repo checkout needed.
+
+```bash
+python3 src/model_benchmarker/results_to_html.py                 # uses results/ beside the script
+python3 src/model_benchmarker/results_to_html.py --results path --output out.html
+python3 src/model_benchmarker/results_to_html.py --catalog path/seed_catalog.json
+python3 src/model_benchmarker/results_to_html.py --title "My benchmarks" --open
+```
+
+The expected result-file naming convention is:
+
+```
+<GPU>[x<count>][_sglang|_vllm][_dflash|_dspark|_eagle|_dsp|_mtp][_hicache[xN]][_replicasxN].txt
+```
+
+e.g. `H200_sglang_dflash2_hicachex3_replicasx3.txt`, `RTXPRO6000x2_hicachex16.txt`,
+`H200.txt`, `OLD_RTXPRO6000x1.txt`.

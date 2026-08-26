@@ -36,6 +36,10 @@ Usage:
   python benchmark_chat.py --url "https://<endpoint>" --api_key "<key>" \
       --remote --number_users 1,4,8 --tasks coding
 
+  # A key-less endpoint (no --api_key; no Authorization header is sent):
+  python benchmark_chat.py --url "http://localhost:8000" \
+      --number_users 1,4,8 --tasks coding
+
   # A single custom task:
   python benchmark_chat.py --model_class_name deepseek_v4_flash_280B --remote \
       --tasks custom --prompt "Write about X" --max_tokens 1024
@@ -58,6 +62,11 @@ from dataclasses import dataclass
 from typing import TextIO
 
 import numpy as np
+
+try:
+    from openai import Omit as _OMIT  # openai>=2.0
+except ImportError:  # openai 1.x keeps the sentinel in _base_client
+    from openai._base_client import Omit as _OMIT  # type: ignore[attr-defined]
 
 
 def _add_package_to_path() -> None:
@@ -202,10 +211,16 @@ def parse_args() -> argparse.Namespace:
         help="Name of a model variable in model_benchmarker/utils/pcai_models.py "
         "(imported lazily, only when this flag is used; that module is excluded "
         "from the hardlink deployment, so --url and --api_key are required "
-        "there). If omitted, --url and --api_key are required.",
+        "there). If omitted, --url is required and --api_key is optional "
+        "(endpoints that don't require auth can omit it).",
     )
     parser.add_argument("--url", default="", help="OpenAI-compatible base URL (root, no /v1).")
-    parser.add_argument("--api_key", default="", help="Bearer token for the endpoint.")
+    parser.add_argument(
+        "--api_key",
+        default="",
+        help="Bearer token for the endpoint. Optional: omit for endpoints "
+        "that don't require auth (no Authorization header is then sent).",
+    )
     parser.add_argument(
         "--remote",
         action="store_true",
@@ -392,10 +407,13 @@ def build_model(args: argparse.Namespace):
             available = ", ".join(pcai_models.__all__)
             raise SystemExit(f"Unknown --model_class_name={args.model_class_name!r}. Available: {available}")
     else:
-        if not args.url or not args.api_key:
-            raise SystemExit("--url and --api_key are required when --model_class_name is not given.")
+        if not args.url:
+            raise SystemExit("--url is required when --model_class_name is not given.")
         from model_benchmarker.utils.pcai_model_classes import ChatModel
 
+        # api_key is optional: a key-less endpoint gets an empty key, and the
+        # OpenAI client is built with credential enforcement relaxed so no
+        # Authorization header is sent (see stream_once / _openai_client_kwargs).
         model = ChatModel(url_remote=args.url, api_key=args.api_key)
 
     if args.remote:
@@ -526,6 +544,12 @@ async def stream_once(
         }
         if extra_body:
             kwargs["extra_body"] = extra_body
+        if not model.api_key:
+            # Key-less endpoint: openai>=2 requires the Authorization header to
+            # be *explicitly omitted* per request (its _validate_headers raises
+            # otherwise); the Omit sentinel also guarantees no empty Bearer
+            # header is sent. Harmless no-op on openai 1.x.
+            kwargs["extra_headers"] = {"Authorization": _OMIT()}
         stream = await model.async_client.chat.completions.create(**kwargs)
         async for chunk in stream:
             now = time.perf_counter()

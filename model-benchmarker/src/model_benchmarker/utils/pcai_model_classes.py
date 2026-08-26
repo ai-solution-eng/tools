@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import inspect
 import io
 import os
 import re
@@ -426,8 +427,38 @@ class BaseModel:
 
     @staticmethod
     def _convert_remote_url_to_local(path: str) -> str:
+        """Rewrite a remote PCAI serving URL to its in-cluster form.
+
+        Only URLs containing the ``.serving.`` marker (PCAI serving hostnames)
+        are rewritten; any other URL (e.g. a localhost test endpoint passed via
+        ``--url``) is returned unchanged instead of being mangled.
+        """
         new_path = path.replace("https", "http")
-        return new_path[: new_path.find(".serving.")] + ".svc.cluster.local"
+        marker = new_path.find(".serving.")
+        if marker == -1:
+            return new_path
+        return new_path[:marker] + ".svc.cluster.local"
+
+    def _openai_client_kwargs(self, client_cls: Callable, http_client: Any) -> dict[str, Any]:
+        """Keyword args shared by the sync/async OpenAI client constructors.
+
+        When ``api_key`` is empty (a key-less OpenAI-compatible endpoint) and
+        the client class supports it, relax credential enforcement
+        (``_enforce_credentials=False``) so a client can still be built — the
+        SDK otherwise raises "Missing credentials" on an empty key. Requests
+        then simply carry no Authorization header (the SDK's ``auth_headers``
+        already returns ``{}`` for an empty key); callers targeting openai>=2
+        additionally pass ``extra_headers={"Authorization": Omit()}`` per
+        request so the header is explicitly omitted.
+        """
+        kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "http_client": http_client,
+        }
+        if not self.api_key and "_enforce_credentials" in inspect.signature(client_cls.__init__).parameters:
+            kwargs["_enforce_credentials"] = False
+        return kwargs
 
     @cached_property
     def client(self) -> OpenAI:
@@ -436,9 +467,7 @@ class BaseModel:
             f"See {_MLIS_PAGE} and change flag `currently_deployed` to enable."
         )
         return self.model_client_class(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            http_client=self.http_client,
+            **self._openai_client_kwargs(self.model_client_class, self.http_client)
         )
 
     @cached_property
@@ -448,9 +477,7 @@ class BaseModel:
             f"See {_MLIS_PAGE} and change flag `currently_deployed` to enable."
         )
         return self.model_async_client_class(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            http_client=self.http_async_client,
+            **self._openai_client_kwargs(self.model_async_client_class, self.http_async_client)
         )
 
     @cached_property
