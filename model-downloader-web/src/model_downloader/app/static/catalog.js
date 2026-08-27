@@ -20,6 +20,24 @@ function extractModelId(e) {
   return arg || '';
 }
 
+// Reduce a model to its "base model" so different quants/variants of the
+// same model share one shade band. Drops the HF org prefix and strips
+// quantization / engine / serving-variant suffixes (FP8, NVFP4, block,
+// sglang, vllm, hicachex3, shared, -it, ...).
+function baseModelKey(e) {
+  let key = String(extractModelId(e) || e.name || '');
+  const slash = key.lastIndexOf('/');
+  if (slash !== -1) key = key.slice(slash + 1);
+  key = key.replace(/[\s_]+/g, '-');
+  const tail = /-?(?:fp8|nvfp4|fp4|bf16|fp16|int8|int4|gptq|awq|gguf|block|e4m3|e5m2|vllm|sglang|dflash2?|dspark|eagle3?|mtp|hicachex?\d*|nohicache|shared|dedicated|replicasx?\d*|it|instruct|chat|draft)$/i;
+  let prev;
+  do {
+    prev = key;
+    key = key.replace(tail, '');
+  } while (key !== prev);
+  return key.toLowerCase();
+}
+
 async function loadCatalog() {
   try {
     const r = await fetch('/api/catalog');
@@ -52,8 +70,16 @@ function renderCatalog() {
       table.className = 'catalog-table';
       table.innerHTML = '<thead><tr><th></th><th>Name</th><th>Ver</th><th>Image</th><th>Format</th><th>GPU</th><th>Cache</th><th></th></tr></thead>';
       const tbody = document.createElement('tbody');
+      // Shade alternates per base model, so all variants/quants of the same
+      // model (vllm / sglang / FP8 / NVFP4...) share one shade and it flips
+      // only when the underlying base model changes.
+      let prevModel = null;
+      let lighter = false;
       for (const e of entries) {
-        tbody.appendChild(buildCatalogRow(e));
+        const model = baseModelKey(e);
+        if (prevModel !== null && model !== prevModel) lighter = !lighter;
+        prevModel = model;
+        tbody.appendChild(buildCatalogRow(e, lighter));
       }
       table.appendChild(tbody);
       section.appendChild(table);
@@ -72,8 +98,9 @@ function renderCatalog() {
   });
 }
 
-function buildCatalogRow(e) {
+function buildCatalogRow(e, lighter) {
   const tr = document.createElement('tr');
+  if (lighter) tr.className = 'model-shade';
   const modelId = extractModelId(e);
   tr.innerHTML =
     '<td><input type="checkbox" data-catalog-id="' + e.catalog_id + '" data-tier="' + e.tier + '"></td>' +

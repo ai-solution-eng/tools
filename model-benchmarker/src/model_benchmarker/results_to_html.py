@@ -86,6 +86,15 @@ MTP_LABELS = {
 # Engine tokens
 ENGINE_TOKENS = {"sglang": "SGLang", "vllm": "vLLM"}
 
+# Weight-precision tokens -> readable label (nvfp4 = Blackwell FP4 quant)
+WEIGHT_LABELS = {
+    "nvfp4": "NVFP4",
+    "fp8": "FP8",
+    "fp8_e4m3": "FP8",
+    "bf16": "BF16",
+    "fp16": "FP16",
+}
+
 # Tokens to ignore when building the "extra info" notes
 _IGNORED_TOKENS = {"old", "hicache", "fp8", "fp8_e4m3", "bf16", "fp16"}
 
@@ -198,6 +207,7 @@ def parse_setup(stem: str) -> dict:
         "gpu_count": 1,
         "engine": None,
         "mtp": None,
+        "weights": None,
         "hicache": None,
         "replicas": 1,
         "obsolete": False,
@@ -240,6 +250,9 @@ def parse_setup(stem: str) -> dict:
         m = re.fullmatch(r"replicasx(\d+)", low)
         if m:
             meta["replicas"] = int(m.group(1))
+            continue
+        if low in WEIGHT_LABELS:
+            meta["weights"] = WEIGHT_LABELS[low]
             continue
         if low in _IGNORED_TOKENS:
             continue
@@ -359,6 +372,18 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
         else:
             if hc in (None, ""):
                 score += 3
+        # Weight-format preference: when the run's filename declares a weight
+        # precision (nvfp4/fp8/bf16/fp16), prefer the catalog entry that
+        # matches it so FP8 vs NVFP4 variants don't get conflated.
+        wf = meta.get("weights")
+        if wf:
+            wlow = wf.lower()
+            hay = " ".join((
+                str(e.get("name", "")),
+                str((e.get("arguments") or ["", ""])[0]),
+                str(e.get("uri", "")),
+            )).lower()
+            score += 6 if wlow in hay else -6
         candidates.append((score, e))
     if not candidates:
         return None
@@ -424,7 +449,7 @@ def main() -> int:
             if rag is not None and not rows:
                 # RAG scale-benchmark: not a chat-table result
                 meta = {"gpu": None, "tier": None, "gpu_count": 1, "engine": None,
-                        "mtp": None, "hicache": None, "replicas": 1, "obsolete": False, "hints": []}
+                        "mtp": None, "weights": None, "hicache": None, "replicas": 1, "obsolete": False, "hints": []}
                 mode = "rag"
             cat_entry = match_catalog(slug, meta, catalog)
             if meta.get("mtp") is None and cat_entry:

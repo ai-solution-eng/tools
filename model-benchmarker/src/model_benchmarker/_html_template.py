@@ -41,6 +41,10 @@ header .sub{color:var(--muted);font-size:13px}
 .model-block{margin-bottom:30px}
 .model-block>h2{margin:0 0 12px;font-size:18px;display:flex;align-items:center;gap:10px}
 .model-block>h2 .count{color:var(--muted);font-weight:400;font-size:13px}
+.model-block>h2 .compare-all{background:var(--panel2);border:1px solid var(--border);color:var(--accent);font-size:12px;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;margin-left:4px}
+.model-block>h2 .compare-all:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+.model-block>h2 .compare-all.all-comparing{background:var(--accent);color:#fff;border-color:var(--accent)}
+.model-block>h2 .compare-all.all-comparing:hover{background:var(--warn);color:#000;border-color:var(--warn)}
 .setup{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:14px}
 .setup.compared-setup{outline:2px solid var(--accent)}
 .setup-head{display:flex;align-items:flex-start;gap:12px}
@@ -51,6 +55,7 @@ header .sub{color:var(--muted);font-size:13px}
 .badge-mtp{background:rgba(124,225,177,.12);border-color:rgba(124,225,177,.4);color:var(--accent2)}
 .badge-hicache{background:rgba(255,209,102,.1);border-color:rgba(255,209,102,.4);color:var(--warn)}
 .badge-old{background:rgba(255,107,107,.12);border-color:rgba(255,107,107,.45);color:var(--bad)}
+.badge-weights{background:rgba(163,120,255,.12);border-color:rgba(163,120,255,.45);color:#b28cff}
 .meta-line{color:var(--muted);font-size:12px;margin:4px 0 10px}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 table.bench{margin-top:8px}
@@ -71,6 +76,8 @@ code.args{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;col
 .compare-view .ctrls{margin-bottom:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .compare-view .ctrls label{color:var(--muted);font-size:12px;display:flex;flex-direction:column;gap:3px}
 .compare-view select{background:var(--panel2);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:5px 9px}
+.compare-view .ctrls button{background:var(--accent);border:0;color:#fff;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer}
+.compare-view .ctrls button:hover{background:var(--warn);color:#000;border-color:var(--warn)}
 .tabs{display:flex;gap:8px;margin-bottom:16px}
 .tabs button{background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-weight:600;padding:8px 18px;border-radius:8px;cursor:pointer}
 .tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -103,7 +110,7 @@ code.args{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;col
     <label>Search<input type="text" id="f-search" placeholder="filename, model..."></label>
     <label class="inline"><input type="checkbox" id="f-obsolete"> show obsolete</label>
     <button id="btn-clear">Reset</button>
-    <div class="hint">Tick the <b>compare</b> box on 2+ setups for a side-by-side table. TTFT percentiles ascend (P100 = worst); tokens/s are inverted (P100 = slowest) &mdash; higher is better everywhere.</div>
+    <div class="hint">Tick the <b>compare</b> box on 2+ setups (or click a model&rsquo;s <b>compare all</b> button) for a side-by-side table. TTFT percentiles ascend (P100 = worst); tokens/s are inverted (P100 = slowest) &mdash; higher is better everywhere.</div>
   </div>
 
   <div class="tabs" id="tabs">
@@ -151,7 +158,7 @@ function matches(s){
   if (!state.showOld && m.obsolete) return false;
   if (state.q){
     const q=state.q.toLowerCase();
-    const hay=(s.file+' '+s.slug+' '+s.model+' '+(m.gpu||'')+' '+(m.mtp||'')).toLowerCase();
+    const hay=(s.file+' '+s.slug+' '+s.model+' '+(m.gpu||'')+' '+(m.mtp||'')+' '+(m.weights||'')).toLowerCase();
     if (!hay.includes(q)) return false;
   }
   return true;
@@ -170,6 +177,7 @@ function badges(m){
   if (m.engine) b.push('<span class="badge">'+esc(m.engine)+'</span>');
   if (m.mtp) b.push('<span class="badge badge-mtp">MTP: '+esc(m.mtp)+'</span>');
   if (m.hicache!==null && m.hicache!==undefined) b.push('<span class="badge badge-hicache">HiCache: '+esc(m.hicache)+'</span>');
+  if (m.weights) b.push('<span class="badge badge-weights">weights: '+esc(m.weights)+'</span>');
   b.push('<span class="badge">replicas: '+esc(m.replicas)+'</span>');
   if (m.obsolete) b.push('<span class="badge badge-old">obsolete</span>');
   return b.join('');
@@ -219,6 +227,7 @@ function setupTitle(s){
   if (m.engine) parts.push(m.engine);
   if (m.mtp) parts.push('MTP: '+m.mtp);
   if (m.hicache!==null&&m.hicache!==undefined) parts.push('HiCache: '+m.hicache);
+  if (m.weights) parts.push('weights: '+m.weights);
   parts.push('replicas: '+m.replicas);
   return parts.join('  ·  ');
 }
@@ -257,7 +266,10 @@ function renderReport(){
   for (const m of source){
     const list=vis.filter(s=>s.slug===m.slug);
     if (!list.length) continue;
-    html+='<div class="model-block"><h2>'+esc(m.name)+' <span class="count">('+list.length+' setup'+(list.length>1?'s':'')+')</span></h2>';
+    const ms=ALL.filter(s=>s.slug===m.slug);
+    const allCmp = !ragTab && ms.length>0 && ms.every(s=>state.compared.has(s.id));
+    const cmp = ragTab ? '' : '<button type="button" class="compare-all'+(allCmp?' all-comparing':'')+'" data-model="'+esc(m.slug)+'" title="'+(allCmp?'Remove all setups of this model from the comparison':'Include all setups of this model in the comparison')+'">'+(allCmp ? 'Remove all' : 'Compare all')+'</button>';
+    html+='<div class="model-block"><h2>'+esc(m.name)+' <span class="count">('+list.length+' setup'+(list.length>1?'s':'')+')</span>'+cmp+'</h2>';
     html+=list.map(renderSetup).join('');
     html+='</div>';
   }
@@ -289,7 +301,7 @@ function renderCompare(){
     document.getElementById('cmp-table-wrap').innerHTML='<p class="muted">Select 2 or more setups with the compare boxes above.</p>';
     return;
   }
-  document.getElementById('cmp-controls').innerHTML=metricSel();
+  document.getElementById('cmp-controls').innerHTML=metricSel()+'<button type="button" id="cmp-clear" title="Deselect all setups from the comparison">Clear</button>';
   const msel=document.getElementById('cmp-metric');
   if (!msel) return;
   if (keptMetric) msel.value=keptMetric;
@@ -414,6 +426,19 @@ function wire(){
       renderReport();
     }
     if (e.target.id==='cmp-metric') renderCompare();
+  });
+  document.addEventListener('click',e=>{
+    if (e.target.matches('button[data-model]')){
+      const slug=e.target.getAttribute('data-model');
+      const ms=ALL.filter(s=>s.slug===slug);
+      const allCmp = ms.length>0 && ms.every(s=>state.compared.has(s.id));
+      if (allCmp) ms.forEach(s=>state.compared.delete(s.id)); else ms.forEach(s=>state.compared.add(s.id));
+      renderReport();
+    }
+    if (e.target.id==='cmp-clear'){
+      state.compared.clear();
+      renderReport();
+    }
   });
 }
 // ---- light / dark mode ----

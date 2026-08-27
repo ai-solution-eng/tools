@@ -18,6 +18,7 @@
   --hpe-skip-tint: #FFF8E6;
   --hpe-tint-hover: #D0ECE4;
   --hpe-critical-hover: #F5D0D0;
+  --hpe-row-alt: #F1F2F4;   /* slightly lighter gray, alternating model shade */
 }
 
 /* Dark mode — HPE dark palette: neutral darks with green accents. */
@@ -37,6 +38,7 @@
   --hpe-skip-tint: #3A3318;
   --hpe-tint-hover: #17403A;
   --hpe-critical-hover: #4A2324;
+  --hpe-row-alt: #303030;   /* slightly lighter gray, alternating model shade */
 }
 
 * { box-sizing: border-box; }
@@ -503,6 +505,7 @@ tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
 }
 .cat-details-btn:hover { color: var(--hpe-text); }
 .cat-image { font-family: "SF Mono", "Fira Code", Consolas, monospace; font-size: 12px; color: var(--hpe-text-soft); }
+.catalog-table tbody tr.model-shade td { background: var(--hpe-row-alt); }
 
 /* ---- JSON textarea ---- */
 .json-input {

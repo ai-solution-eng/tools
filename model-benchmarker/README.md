@@ -300,6 +300,7 @@ self-contained HTML file that makes the setup explicit per run:
 | **Model** | results sub-directory (e.g. `qwen_38_27b`) |
 | **GPU type + count** | filename (e.g. `H200Sx4` -> 4x H200 SXM) |
 | **MTP / speculative-decoding config** | filename (`dflash2`, `dspark`, `eagle`, `dsp`, `mtp`) or catalog; else `Disabled` |
+| **Weights** | `nvfp4` / `fp8` / `bf16` / `fp16` token in the filename |
 | **Engine** | `sglang` / `vllm` token, or catalog image |
 | **HiCache** | `hicache` or `hicachexN` token |
 | **Replicas** | `replicasxN` token (default 1) |
@@ -320,7 +321,7 @@ python3 src/model_benchmarker/results_to_html.py --title "My benchmarks" --open
 The expected result-file naming convention is:
 
 ```
-<GPU>[x<count>][_sglang|_vllm][_dflash|_dspark|_eagle|_dsp|_mtp][_hicache[xN]][_replicasxN].txt
+<GPU>[x<count>][_sglang|_vllm][_dflash|_dspark|_eagle|_dsp|_mtp][_nvfp4|_fp8|_bf16|_fp16][_hicache[xN]][_replicasxN].txt
 ```
 
 e.g. `H200_sglang_dflash2_hicachex3_replicasx3.txt`, `RTXPRO6000x2_hicachex16.txt`,
