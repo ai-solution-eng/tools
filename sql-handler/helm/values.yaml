@@ -9,7 +9,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v0.5.3
+  tag: v0.6.0
   pullPolicy: IfNotPresent
 
 # -- Backend selection -------------------------------------------------------
@@ -18,6 +18,29 @@ image:
 #   s3 | minio    - S3-compatible object store (Parquet files), e.g. MinIO
 #   iceberg       - Apache Iceberg tables through a REST or SQL catalog
 backend: s3
+
+# -- Federated multi-source mode ---------------------------------------------
+# When `sources` is non-empty it OVERRIDES `backend` above: the engine
+# federates every source behind one endpoint (cross-source joins work).
+# Each entry mirrors the per-backend env vars; `name` becomes the source
+# prefix used in the UI and in SQL (name "warehouse" + table "orders" ->
+# `warehouse_orders`).
+#   sources:
+#     - name: sales
+#       backend: s3
+#       endpointUrl: http://minio.minio.svc.cluster.local:9000
+#       bucket: sales-bucket
+#       prefix: ""
+#       accessKey: ""
+#       secretKey: ""
+#     - name: inventory
+#       backend: s3
+#       endpointUrl: http://minio.minio.svc.cluster.local:9000
+#       bucket: inventory-bucket
+#       prefix: raw
+# Credentials land in the ConfigMap (SQLHANDLER_SOURCES as JSON) — for
+# production, mount that env var from a Secret instead of values.yaml.
+sources: []
 
 # -- Naming overrides (rarely needed) ----------------------------------------
 nameOverride: ""

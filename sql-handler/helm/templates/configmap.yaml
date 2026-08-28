@@ -65,6 +65,10 @@ data:
   # NFS / local filesystem backend: read-only directory of Parquet files.
   NFS_ROOT: {{ .Values.nfs.rootDir | default "/data" | quote }}
   {{- end }}
+  {{- if .Values.sources }}
+  # Federated multi-source mode: overrides the single backend (see values.yaml).
+  SQLHANDLER_SOURCES: {{ .Values.sources | toJson | quote }}
+  {{- end }}
   # In-process metadata cache (list_tables / describe_table).
   SQLHANDLER_CACHE_TTL: {{ .Values.cache.ttl | default 3600 | quote }}
   SQLHANDLER_VERSION_CHECK_INTERVAL: {{ .Values.cache.versionCheckInterval | default 10 | quote }}

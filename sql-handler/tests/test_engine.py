@@ -208,7 +208,7 @@ def test_describe_not_cached_when_disabled(tmp_path):
 def test_describe_cache_expires_after_ttl(tmp_path):
     eng, provider = _make_engine(tmp_path, cache_ttl=60, dataset_cache_ttl=0)
     eng.describe_table("workorder/work_order")
-    key = "workorder/work_order"
+    key = ("default", "workorder/work_order")
     eng._describe_cache[key] = (0.0, eng._describe_cache[key][1])  # age past TTL
     eng.describe_table("workorder/work_order")
     assert len(provider.open_calls) == 2

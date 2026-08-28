@@ -123,6 +123,8 @@ Components:
 
 Set `SQLHANDLER_BACKEND=s3` (or `minio`) and point it at an S3-compatible
 store. Everything else — SQL engine, caches, MCP tools — is unchanged.
+To query **multiple buckets or paths** from one endpoint, see
+[Federated multi-source](#federated-multi-source-multiple-buckets--sources).
 
 ```bash
 cd SQLhandler
@@ -170,6 +172,107 @@ SQLHANDLER_TEST_MINIO=1 SQLHANDLER_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
   SQLHANDLER_TEST_S3_ACCESS_KEY=minioadmin SQLHANDLER_TEST_S3_SECRET_KEY=minioadmin \
   pytest tests/test_s3_integration.py -q
 ```
+
+## Federated multi-source (multiple buckets / sources)
+
+Need to query **several S3 buckets (or paths) at once** — or mix S3 with
+OneLake/NFS/Iceberg? Set `SQLHANDLER_SOURCES` (a JSON array) and SQLhandler
+federates every source behind **one endpoint**: same MCP tools, one shared
+cache, and `JOIN` across sources in a single `run_sql`. When set, it overrides
+`SQLHANDLER_BACKEND`.
+
+### How it works
+
+A `MultiProvider` wraps one `DataProvider` per source and presents them as a
+single logical engine:
+
+- Every table is tagged with its **source** name.
+- `describe_table`, `run_sql`, `scan_table` route to the owning source.
+- The table list, describe results and open dataset handles are cached
+  per-source in the shared in-process cache (async list refresh included).
+
+### Configuration (environment)
+
+```bash
+export SQLHANDLER_SOURCES='[
+  {"name":"sales",     "backend":"s3", "endpointUrl":"http://127.0.0.1:9000",
+   "accessKey":"minioadmin","secretKey":"minioadmin","bucket":"sales-bucket"},
+  {"name":"inventory", "backend":"s3", "endpointUrl":"http://127.0.0.1:9000",
+   "accessKey":"minioadmin","secretKey":"minioadmin",
+   "bucket":"inventory-bucket","prefix":"raw"}
+]'
+```
+
+- Each entry accepts any backend (`s3`/`minio`, `onelake`, `nfs`, `iceberg`);
+  the fields mirror that backend's env vars (`bucket`/`prefix`/`endpointUrl`/
+  `region`/`accessKey`/`secretKey`/`anonymous`/`useSsl`, `abfssUrl`,
+  `rootDir`, `catalogUri`, …).
+- `name` is the **source label** and must be unique; it is the top-level
+  namespace for everything that source exposes.
+
+### Configuration (Helm chart)
+
+In `helm/values.yaml`, the `sources:` list (overrides the single `backend`):
+
+```yaml
+sources:
+  - name: sales
+    backend: s3
+    endpointUrl: "http://minio.minio.svc.cluster.local:9000"
+    bucket: "sales-bucket"
+    prefix: ""                # optional sub-tree within the bucket
+    # accessKey/secretKey can go here (non-production) or via a mounted
+    # SQLHANDLER_SOURCES env var from a Secret (preferred)
+  - name: inventory
+    backend: s3
+    endpointUrl: "http://minio.minio.svc.cluster.local:9000"
+    bucket: "inventory-bucket"
+    prefix: "raw"
+```
+
+### Naming: how tables are addressed
+
+| Source + folder | SQL identifier (view) | Web UI label |
+|---|---|---|
+| source `sales`, folder `orders` | `sales_orders` | `sales/orders` |
+| source `inventory`, folder `raw/customers` | `inventory_raw_customers` | `inventory/raw/customers` |
+| source `inventory`, flat `invoices.parquet` | `inventory_invoices` | `inventory/invoices` |
+
+- `list_tables` (MCP) lists **all** sources, source-qualified.
+- `describe_table`/`run_sql` accept the qualified name (preferred) or the bare
+  name **only when that name is unique across every source** — ambiguous bare
+  names are deliberately not registered as DuckDB views, so they raise a
+  clear "table not found" instead of silently returning the wrong source.
+
+### Cross-source SQL
+
+```sql
+SELECT i.customer_name, i.tier, round(sum(s.amount), 2) AS total
+FROM sales_orders s
+JOIN inventory_customers i ON s.customer_id = i.cust_id
+GROUP BY 1, 2
+ORDER BY total DESC
+```
+
+### Caching & freshness
+
+The federated engine shares the same caches as single-source mode, keyed per
+source: list refresh (async), describe and dataset handles — so the
+`SQLHANDLER_CACHE_TTL` / `SQLHANDLER_LIST_ASYNC_REFRESH` knobs behave exactly
+as documented above.
+
+### Caveats & limitations
+
+- **Source labels must be unique and DuckDB-identifier-safe** (letters,
+  digits, underscores). Avoid names that collide with table names.
+- **Credentials**: each source carries its own credentials. When set via
+  `values.yaml` `sources:`, keys land in the ConfigMap as JSON — in
+  production mount `SQLHANDLER_SOURCES` from a Secret instead.
+- **Deep folder nesting** follows the S3 discovery rule: only the leaf folder
+  (table) + its parent (schema) become the name; anything above that only
+  lives in the storage path (`finance/b/c` → `b_c`, `finance` dropped).
+- The per-source table list is cached like any other source; new files appear
+  after the async refresh (see caching & freshness).
 
 ## Iceberg (catalog) backend
 
@@ -304,6 +407,7 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `FABRIC_LAKEHOUSE_ID` | Lakehouse GUID (fallback) |
 | `FABRIC_AUTHORITY` | OneLake authority (default `onelake.dfs.fabric.microsoft.com`) |
 | `SQLHANDLER_BACKEND` | Data source: `onelake` (default), `s3`/`minio`, `iceberg`, or `nfs`/`file`/`local` |
+| `SQLHANDLER_SOURCES` | JSON array to federate **multiple** sources behind one engine (overrides `SQLHANDLER_BACKEND`); see [Federated multi-source](#federated-multi-source-multiple-buckets--sources) |
 | `S3_ENDPOINT_URL` | S3 endpoint, e.g. `http://127.0.0.1:9000` for MinIO |
 | `S3_REGION` | S3 region (default `us-east-1`) |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials |
@@ -448,6 +552,32 @@ The chart wires `SQLHANDLER_BACKEND=s3` and the S3 env vars, and injects
 `S3_ACCESS_KEY` / `S3_SECRET_KEY` from the `s3-credentials` Secret. For a
 public bucket set `s3.anonymous: true` (no credential Secret needed).
 
+#### Deploy multi-source (federated)
+
+To serve several S3 buckets (or mixed backends) from one deployment, use the
+`sources:` list instead of `backend:`:
+
+```yaml
+# (omit `backend:` and the single `s3:` block)
+sources:
+  - name: sales
+    backend: s3
+    endpointUrl: "http://minio:9000"
+    bucket: "sales-bucket"
+    accessKey: "<s3-access-key>"
+    secretKey: "<s3-secret-key>"
+  - name: inventory
+    backend: s3
+    endpointUrl: "http://minio:9000"
+    bucket: "inventory-bucket"
+    prefix: "raw"
+```
+
+The chart renders `SQLHANDLER_SOURCES` (JSON) into the ConfigMap. For
+production, mount that env var from a Secret instead of embedding keys in
+`values.yaml`. Everything else — service, probes, Istio, cache knobs — is
+unchanged.
+
 ### Deploy the Iceberg backend
 
 ```yaml
@@ -510,7 +640,8 @@ SQLhandler bundles a small, dependency-free web UI (a single self-contained
 `index.html` — no build step, no CDN) that gives humans the same data the MCP
 agents query, through the same engine and caches:
 
-- **Table list** (searchable, shows format badges)
+- **Table list** (searchable, shows format badges; in federated multi-source
+  mode each entry is labeled `source/schema/name`, e.g. `sales/orders`)
 - **Schema view** per table — columns + types + table URI
 - **SQL editor** — run read-only queries (Ctrl+Enter), with a row limit
 - **Results table** — rendered with row/column counts, timing, and copy-CSV
@@ -546,6 +677,10 @@ as `/mcp` (long-running queries), while the page itself uses the short timeout.
 - `describe_table`    — columns/types/URI for a table
 - `run_sql`           — run SQL via DuckDB (aggregations/joins), results as markdown
 - `scan_table`        — pull columns/rows via pyarrow with a row limit
+
+In federated multi-source mode, tables are source-qualified: `list_tables`
+returns all sources, and `describe_table` / `run_sql` take names like
+`sales_orders` or `inventory_raw_customers` (bare names only when unique).
 
 ## Other data sources / roadmap
 

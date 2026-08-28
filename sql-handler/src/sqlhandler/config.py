@@ -8,6 +8,7 @@ Toromont must NOT be committed to source control.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -275,6 +276,74 @@ def load_backend_config(env: dict | None = None) -> tuple[str, object]:
     if backend == "iceberg":
         return "iceberg", load_iceberg_config(env)
     return "onelake", load_config(env)
+
+
+def load_source_providers(env: dict | None = None) -> object | None:
+    """Build a federated :class:`MultiProvider` from ``SQLHANDLER_SOURCES``.
+
+    ``SQLHANDLER_SOURCES`` is an optional JSON array of source objects. When
+    set, the engine federates every source behind one endpoint (cross-source
+    joins included); when unset, single-source mode behaves exactly as before.
+
+    Each entry mirrors the backend env vars, e.g.::
+
+      [
+        {"name": "sales",      "backend": "s3",     "bucket": "bucket-a",
+         "endpointUrl": "http://minio:9000", "accessKey": "...", "secretKey": "..."},
+        {"name": "inventory",  "backend": "s3",     "bucket": "bucket-b",
+         "prefix": "raw", "endpointUrl": "http://minio:9000",
+         "accessKey": "...", "secretKey": "..."}
+      ]
+
+    Supported backends: ``s3``/``minio`` (S3_BUCKET/PREFIX/ENDPOINT_URL/
+    REGION/ACCESS_KEY/SECRET_KEY/ANONYMOUS/USE_SSL), ``onelake``
+    (abfssUrl or workspaceId+lakehouseId), ``nfs`` (rootDir) and ``iceberg``
+    (catalogType/catalogUri/warehouse).
+    """
+    e = env if env is not None else os.environ
+    raw = _getenv("SQLHANDLER_SOURCES", e.get("SQLHANDLER_SOURCES", "")).strip()
+    if not raw:
+        return None
+    try:
+        sources = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SQLHANDLER_SOURCES is not valid JSON: {exc}") from exc
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("SQLHANDLER_SOURCES must be a non-empty JSON array")
+
+    from .provider import MultiProvider, make_provider
+
+    labels: list[str] = []
+    providers: list = []
+    for idx, src in enumerate(sources):
+        if not isinstance(src, dict):
+            raise TypeError(f"SQLHANDLER_SOURCES[{idx}] must be an object")
+        label = str(src.get("name") or f"source{idx + 1}")
+        backend = str(src.get("backend") or "s3").lower()
+        src_env = {
+            "SQLHANDLER_BACKEND": backend,
+            "S3_ENDPOINT_URL": src.get("endpointUrl", ""),
+            "S3_REGION": src.get("region", "us-east-1"),
+            "S3_ACCESS_KEY": src.get("accessKey", ""),
+            "S3_SECRET_KEY": src.get("secretKey", ""),
+            "S3_SESSION_TOKEN": src.get("sessionToken", ""),
+            "S3_BUCKET": src.get("bucket", ""),
+            "S3_PREFIX": src.get("prefix", ""),
+            "S3_ANONYMOUS": "true" if src.get("anonymous") else "false",
+            "S3_USE_SSL": "true" if src.get("useSsl") else "false",
+            "FABRIC_LAKEHOUSE_ABFSS_URL": src.get("abfssUrl", ""),
+            "FABRIC_WORKSPACE_ID": src.get("workspaceId", ""),
+            "FABRIC_LAKEHOUSE_ID": src.get("lakehouseId", ""),
+            "NFS_ROOT": src.get("rootDir", ""),
+            "ICEBERG_CATALOG_TYPE": src.get("catalogType", "rest"),
+            "ICEBERG_CATALOG_URI": src.get("catalogUri", ""),
+            "ICEBERG_CATALOG_NAME": src.get("catalogName", "sqlhandler"),
+            "ICEBERG_WAREHOUSE": src.get("warehouse", ""),
+        }
+        _, cfg = load_backend_config(src_env)
+        providers.append(make_provider(cfg))
+        labels.append(label)
+    return MultiProvider(providers, labels)
 
 
 @dataclass(frozen=True)

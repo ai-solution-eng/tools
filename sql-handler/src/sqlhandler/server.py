@@ -48,7 +48,12 @@ from mcp_types import (
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
-from .config import load_backend_config, load_cache_config, load_dotenv
+from .config import (
+    load_backend_config,
+    load_cache_config,
+    load_dotenv,
+    load_source_providers,
+)
 from .engine import SqlEngine
 from .provider import make_provider
 from .webui import register_ui
@@ -207,8 +212,11 @@ def _handler() -> SqlEngine:
     with _handler_lock:
         if _handler_singleton is None:
             load_dotenv()
-            _, config = load_backend_config()
-            provider = make_provider(config)
+            # Federated multi-source mode (SQLHANDLER_SOURCES) or single backend.
+            provider = load_source_providers()
+            if provider is None:
+                _, config = load_backend_config()
+                provider = make_provider(config)
             cache = load_cache_config()
             _handler_singleton = SqlEngine(
                 provider,

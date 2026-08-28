@@ -209,7 +209,9 @@ class SqlEngine:
         keep the per-query cost negligible. Non-versioned sources (plain
         Parquet/S3/Iceberg) reuse until the TTL as before.
         """
-        key = info.path
+        # Source-aware cache key so same-named tables in federated sources
+        # never share a dataset handle.
+        key = (info.source, info.path)
         now = time.monotonic()
         hit = None
         with self._lock:
@@ -258,7 +260,7 @@ class SqlEngine:
         re-opening the metadata on every agent call.
         """
         info = self._resolve(table)
-        key = info.path
+        key = (info.source, info.path)
         now = time.monotonic()
         with self._lock:
             hit = self._describe_cache.get(key)
@@ -351,30 +353,35 @@ class SqlEngine:
         tables, so we only open the datasets the query actually touches.
         """
         known = self.list_tables()
-        wanted: dict[str, TableInfo] = {}
+        wanted: dict[tuple[str, str], TableInfo] = {}
         for info in known:
             for ident in (re.escape(info.name), re.escape(info.qualified_name)):
                 if re.search(rf"\b{ident}\b", sql):
-                    wanted[info.path] = info
+                    wanted[(info.source, info.path)] = info
                     break
         return list(wanted.values())
 
     def _register_schema(self, con, sql: str) -> None:
         """Register each referenced table as a DuckDB view over its Dataset.
 
-        Each referenced table gets two views: its bare name and its
-        qualified name, so queries can be unambiguous when names collide
-        across schemas.
+        Each table gets its qualified view (``[source_]schema_name``) always,
+        and its bare-name view only when that name is globally unique - so
+        same-named tables across federated sources (or schemas) can't silently
+        shadow each other. Queries should prefer qualified names.
         """
+        name_counts: dict[str, int] = {}
+        for info in self.list_tables():
+            name_counts[info.name] = name_counts.get(info.name, 0) + 1
         for info in self._referenced_tables(sql):
-            bare = _safe_ident(info.name)
-            qualified = _safe_ident(info.qualified_name)
+            views = {_safe_ident(info.qualified_name)}
+            if name_counts.get(info.name, 0) <= 1:
+                views.add(_safe_ident(info.name))
             try:
                 dset = self._open_dataset(info)
             except Exception:
                 logger.debug("Could not open dataset for %s", info.path)
                 continue
-            for view in {bare, qualified}:
+            for view in views:
                 try:
                     con.register(view, dset)
                 except Exception:

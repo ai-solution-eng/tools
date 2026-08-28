@@ -150,6 +150,7 @@ def api_tables(engine: SqlEngine) -> dict:
                 "qualified_name": t.qualified_name,
                 "schema": t.schema,
                 "format": t.format,
+                "source": t.source,
             }
             for t in engine.list_tables()
         ]
