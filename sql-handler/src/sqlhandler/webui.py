@@ -232,9 +232,7 @@ def register_ui(app, engine_getter) -> None:
     async def query(request) -> JSONResponse:
         body = await request.json()
         try:
-            return JSONResponse(
-                api_query(engine_getter(), str(body.get("sql", "")), body.get("limit"))
-            )
+            return JSONResponse(api_query(engine_getter(), str(body.get("sql", "")), body.get("limit")))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -243,9 +241,7 @@ def register_ui(app, engine_getter) -> None:
     async def preview(request) -> JSONResponse:
         body = await request.json()
         try:
-            return JSONResponse(
-                api_preview(engine_getter(), str(body.get("table", "")), body.get("limit"))
-            )
+            return JSONResponse(api_preview(engine_getter(), str(body.get("table", "")), body.get("limit")))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 

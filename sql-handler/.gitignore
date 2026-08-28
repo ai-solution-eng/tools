@@ -20,3 +20,5 @@ helm/deploy-toromont-values.yaml
 .DS_Store
 # Local dev tooling (MinIO binary + test data + scratch scripts)
 .dev/
+# Generated test parquet datasets (large, not for VCS)
+data/*.parquet

@@ -68,6 +68,7 @@ data:
   # In-process metadata cache (list_tables / describe_table).
   SQLHANDLER_CACHE_TTL: {{ .Values.cache.ttl | default 3600 | quote }}
   SQLHANDLER_VERSION_CHECK_INTERVAL: {{ .Values.cache.versionCheckInterval | default 10 | quote }}
+  SQLHANDLER_LIST_ASYNC_REFRESH: {{ .Values.cache.listAsyncRefresh | default true | quote }}
   {{- if .Values.cache.prewarmTables }}
   SQLHANDLER_PREWARM_TABLES: {{ .Values.cache.prewarmTables | quote }}
   {{- end }}

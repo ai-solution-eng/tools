@@ -298,6 +298,10 @@ class CacheConfig:
     # How often (seconds) the Delta snapshot version is re-checked to
     # invalidate a cached Dataset. 0 = check on every reuse.
     version_check_interval: int = 10
+    # Serve list_tables from the cache immediately and refresh it in the
+    # background (plus an automatic refresh every ttl_seconds), so callers
+    # never block on the S3/DFS listing. Ignored when ttl_seconds == 0.
+    list_async_refresh: bool = True
 
     @property
     def enabled(self) -> bool:
@@ -321,6 +325,10 @@ def load_cache_config(env: dict | None = None) -> CacheConfig:
       SQLHANDLER_VERSION_CHECK_INTERVAL - how often to re-check a Delta
                                         snapshot version (seconds; 0 = every
                                         reuse; default 10)
+      SQLHANDLER_LIST_ASYNC_REFRESH - serve list_tables from the cache
+                                        immediately and refresh in the
+                                        background every ttl_seconds
+                                        (true/1/on; default true)
     """
     e = env if env is not None else os.environ
     raw_ttl = _getenv("SQLHANDLER_CACHE_TTL", e.get("SQLHANDLER_CACHE_TTL", "3600"))
@@ -333,12 +341,14 @@ def load_cache_config(env: dict | None = None) -> CacheConfig:
     dttl = _to_int("SQLHANDLER_DATASET_CACHE_TTL", e, 3600)
     dcap = _to_int("SQLHANDLER_DATASET_CACHE_TABLES", e, 8)
     vci = _to_int("SQLHANDLER_VERSION_CHECK_INTERVAL", e, 10)
+    async_list = _to_bool("SQLHANDLER_LIST_ASYNC_REFRESH", e, True)
     return CacheConfig(
         ttl_seconds=max(ttl, 0),
         prewarm_tables=prewarm,
         dataset_cache_ttl=max(dttl, 0),
         dataset_cache_tables=max(dcap, 0),
         version_check_interval=max(vci, 0),
+        list_async_refresh=async_list,
     )
 
 

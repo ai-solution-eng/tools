@@ -67,6 +67,7 @@ class SqlEngine:
         dataset_cache_ttl: int = 3600,
         dataset_cache_tables: int = 8,
         version_check_interval: int = 10,
+        list_async_refresh: bool = True,
     ):
         self.provider = provider
         self.cache_ttl = cache_ttl
@@ -75,6 +76,13 @@ class SqlEngine:
         self.version_check_interval = version_check_interval
         self._tables: list[TableInfo] | None = None
         self._tables_ts: float = 0.0
+        # list_tables is served from the cache immediately (never blocks the
+        # caller on a slow S3/DFS listing): a stale list is refreshed on a
+        # background thread, and a daemon timer re-lists every cache_ttl so
+        # the cache stays warm between calls. Disabled when cache_ttl == 0
+        # (caching off) or when list_async_refresh is False.
+        self._async_list = bool(list_async_refresh) and cache_ttl > 0
+        self._list_refreshing = False
         self._describe_cache: dict[str, tuple[float, dict]] = {}
         self._describe_hits = 0
         self._describe_misses = 0
@@ -87,30 +95,100 @@ class SqlEngine:
         # per table (0 = check on every reuse).
         self._version_checked_at: dict[str, float] = {}
         self._lock = threading.RLock()
+        if self._async_list:
+            threading.Thread(
+                target=self._auto_refresh_loop,
+                daemon=True,
+                name="sqlhandler-list-autorefresh",
+            ).start()
 
     # ---------------------------------------------------------------- list
     def list_tables(self) -> list[TableInfo]:
-        """List the tables the provider exposes (cached for cache_ttl)."""
+        """List the tables the provider exposes (cached for cache_ttl).
+
+        With async refresh (the default) the cached list is returned
+        immediately - even a stale one - and the list is re-fetched on a
+        background thread so callers never block on the slow S3/DFS listing.
+        A daemon timer also refreshes the list every ``cache_ttl`` seconds, so
+        it is kept fresh automatically between calls. When caching is disabled
+        (``cache_ttl == 0``) or ``list_async_refresh`` is off, every call
+        re-lists synchronously, preserving the original behavior.
+        """
         now = time.monotonic()
         with self._lock:
-            if self._tables is not None and now - self._tables_ts < self.cache_ttl:
-                return self._tables
+            have = self._tables is not None
+            fresh = have and (now - self._tables_ts < self.cache_ttl)
+        if have and (fresh or self._async_list):
+            if not fresh:  # async_list must be enabled here
+                self._maybe_refresh_async()  # serve stale, refresh in background
+            return self._tables
+        # No cache yet, or caching disabled: fill synchronously so callers
+        # always get a current result.
         tables = self.provider.list_tables()
         with self._lock:
             self._tables = tables
             self._tables_ts = time.monotonic()
+            self._list_refreshing = False
         return tables
+
+    def _maybe_refresh_async(self) -> None:
+        """Start a background list refresh (no-op when one is in flight)."""
+        with self._lock:
+            if self._list_refreshing:
+                return
+            self._list_refreshing = True
+        try:
+            threading.Thread(
+                target=self._refresh_list_worker,
+                daemon=True,
+                name="sqlhandler-list-refresh",
+            ).start()
+        except Exception:
+            with self._lock:
+                self._list_refreshing = False
+            raise
+
+    def _refresh_list_worker(self) -> None:
+        """Re-run provider.list_tables(); fills the cache, never raises."""
+        try:
+            tables = self.provider.list_tables()
+        except Exception:
+            logger.exception("background list-tables refresh failed")
+            with self._lock:
+                self._list_refreshing = False
+            return
+        with self._lock:
+            self._tables = tables
+            self._tables_ts = time.monotonic()
+            self._list_refreshing = False
+
+    def _auto_refresh_loop(self) -> None:
+        """Keep the table list warm: refresh in the background every TTL."""
+        while True:
+            time.sleep(max(self.cache_ttl, 1))
+            try:
+                self._maybe_refresh_async()
+            except Exception:
+                logger.debug("auto list refresh skipped", exc_info=True)
 
     # ------------------------------------------------------------- resolve
     def _resolve(self, table: str) -> TableInfo:
-        """Resolve a bare name (or schema/name) to a TableInfo."""
+        """Resolve a bare name (or schema/name) to a TableInfo.
+
+        Matches the discovered tables first so the physical ``location`` is
+        preserved: a table's logical ``schema/name`` can differ from its
+        object-store folder when the folder is nested more than one level
+        deep (e.g. ``finance/b/c`` -> schema ``b``, name ``c``). Falling back
+        to constructing a fresh TableInfo would drop ``location`` and break
+        opening the dataset.
+        """
+        for info in self.list_tables():
+            if info.path == table or info.name == table or info.qualified_name == table:
+                return info
         if "/" in table:
             schema, name = table.split("/", 1)
             if schema and name:
                 return TableInfo(name=name, schema=schema)
-        for info in self.list_tables():
-            if info.name == table or info.path == table:
-                return info
         raise LakehouseError(f"Table '{table}' not found in data source")
 
     # ------------------------------------------------------------ datasets
@@ -330,6 +408,11 @@ class SqlEngine:
                 "dataset_hits": self._dataset_hits,
                 "dataset_misses": self._dataset_misses,
                 "tables_cached": self._tables is not None,
+                "tables_cached_age_s": round((time.monotonic() - self._tables_ts), 1)
+                if self._tables is not None
+                else None,
+                "list_async_refresh": self._async_list,
+                "list_refreshing": self._list_refreshing,
                 "cache_ttl": self.cache_ttl,
                 "dataset_cache_ttl": self.dataset_cache_ttl,
             }

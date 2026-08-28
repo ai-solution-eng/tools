@@ -216,6 +216,7 @@ def _handler() -> SqlEngine:
                 dataset_cache_ttl=cache.dataset_cache_ttl,
                 dataset_cache_tables=cache.dataset_cache_tables,
                 version_check_interval=cache.version_check_interval,
+                list_async_refresh=cache.list_async_refresh,
             )
             if cache.prewarm_tables:
                 logger.info("prewarming schema cache for %d table(s)", len(cache.prewarm_tables))

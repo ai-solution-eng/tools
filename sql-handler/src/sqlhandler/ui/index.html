@@ -452,7 +452,7 @@ function renderTables() {
     fmt.textContent = t.format || "?";
     const name = document.createElement("span");
     name.className = "tname";
-    name.textContent = t.qualified_name || t.name;
+    name.textContent = t.path || t.name;   // show schema/name, e.g. sales/orders
     el.appendChild(fmt);
     el.appendChild(name);
     el.onclick = () => selectTable(t);

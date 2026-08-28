@@ -9,7 +9,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v0.5.1
+  tag: v0.5.3
   pullPolicy: IfNotPresent
 
 # -- Backend selection -------------------------------------------------------
@@ -17,7 +17,7 @@ image:
 #   onelake       - Microsoft Fabric OneLake (Delta Lake over ABFS)  [default]
 #   s3 | minio    - S3-compatible object store (Parquet files), e.g. MinIO
 #   iceberg       - Apache Iceberg tables through a REST or SQL catalog
-backend: onelake
+backend: s3
 
 # -- Naming overrides (rarely needed) ----------------------------------------
 nameOverride: ""
@@ -109,15 +109,15 @@ s3:
     name: s3-credentials
     accessKeyKey: access-key
     secretKeyKey: secret-key
-    create: false
+    create: true
     values:
-      accessKey: ""
-      secretKey: ""
+      accessKey: "admin-io"
+      secretKey: "MinIO$2K"
 
   # MinIO/S3 connection details (non-secret -> ConfigMap).
-  endpointUrl: ""             # e.g. http://minio:9000 or http://127.0.0.1:9000
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # in-cluster MinIO
   region: us-east-1
-  bucket: ""                  # required
+  bucket: "test-parquet"
   prefix: ""                  # optional sub-tree within the bucket
   anonymous: false            # read public buckets without keys
   useSsl: false               # force https when endpointUrl has no scheme
@@ -175,6 +175,10 @@ cache:
   # Comma-separated table names whose data should be warmed at startup,
   # e.g. "work_order_header,work_order_note_recent".
   prewarmTables: ""
+  # Serve list_tables from the cache immediately and refresh it in the
+  # background (plus automatically once per `ttl` seconds), so callers never
+  # block on the slow S3/DFS listing. Set false for fully synchronous calls.
+  listAsyncRefresh: true
 
 # -- Runtime arguments for the sqlhandler entrypoint --------------------------
 containerArgs:

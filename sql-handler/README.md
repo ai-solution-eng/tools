@@ -319,6 +319,7 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `ICEBERG_NAMESPACE` | Optional namespace filter for `list_tables` |
 | `NFS_ROOT` | Mounted directory with tables (nfs backend; required) |
 | `SQLHANDLER_CACHE_TTL` | Seconds to keep `list_tables`/`describe_table` results in memory (default `3600`, `0` disables) |
+| `SQLHANDLER_LIST_ASYNC_REFRESH` | Serve `list_tables` from cache immediately and refresh in the background (plus automatically every `SQLHANDLER_CACHE_TTL`); default `true`, `false` = synchronous every call |
 | `SQLHANDLER_DATASET_CACHE_TTL` | Seconds to reuse an open Dataset handle (default `3600`, `0` disables) |
 | `SQLHANDLER_DATASET_CACHE_TABLES` | Max tables held in the dataset LRU (default `8`) |
 | `SQLHANDLER_VERSION_CHECK_INTERVAL` | How often a Delta table's snapshot version is re-checked (default `10`s; `0` = every query) |
@@ -335,6 +336,11 @@ lakehouse every time. The server now keeps both in an in-process cache:
 
 - A single process-wide handler is reused (previously a new handler was
   built per tool call, silently discarding the table-list cache).
+- `list_tables` is served from the cache immediately. When the cached list
+  is stale it is refreshed on a background thread (default
+  `SQLHANDLER_LIST_ASYNC_REFRESH=true`) and a daemon timer re-lists every
+  `SQLHANDLER_CACHE_TTL` seconds, so a newly uploaded file appears without
+  restarting and callers never block on the S3/DFS listing.
 - `describe_table` results are cached per table for `SQLHANDLER_CACHE_TTL`
   seconds, so the frequently-described tables return from memory (~ms)
   instead of re-reading the Delta log (~8s).
