@@ -23,7 +23,17 @@ spec:
             port:
               number: {{ .Values.service.port }}
       timeout: {{ .Values.ezua.virtualService.longTimeout }}
-    # Everything else (health, root) — short timeout.
+    # Web UI JSON API — queries can run long (aggregations over big tables).
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: {{ include "sqlhandler.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.longTimeout }}
+    # Everything else (health, UI page, root) — short timeout.
     - match:
         - uri:
             prefix: /

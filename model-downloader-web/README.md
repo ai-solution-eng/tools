@@ -51,7 +51,8 @@ still exist in k8s (TTL-cleaned by `ttlSecondsAfterFinished`, 1h default).
 
 ## Prerequisites
 
-- A Kubernetes cluster (>= 1.26) with Helm.
+- An HPE PCAI environment where you can import the packaged chart and edit its values
+  (PCAI is a Kubernetes wrapper — no `helm`/`kubectl` commands are used).
 - A **models PVC** mounted at `/mnt/models` (`large-models/` subpath) present in
   the namespace where download Jobs run — this is the default target.
   - HPE PCAI clusters ship a shared `models-pvc` per project namespace (RWX,
@@ -70,22 +71,22 @@ verification bypass for the Zscaler MITM proxy), plus the kyverno vendor-app
 label ClusterPolicy and the ezua Istio ingress, which default to enabled since
 this is an HPE PCAI app.
 
-```bash
-# 1. build & push images first (see "Rebuild & re-deploy")
-docker build -t andrewbydlon/pcai-model-downloader:0.5.0 . && docker push andrewbydlon/pcai-model-downloader:0.5.0
-docker build -t andrewbydlon/hf-downloader:v4.0 downloader/ && docker push andrewbydlon/hf-downloader:v4.0
+Import the packaged `model-downloader` chart into PCAI, then set these values
+in the *Helm Values* editor:
 
-# 2. install
-DOMAIN_NAME=pcai.rdlabs.hpecorp.net
-helm install model-downloader helm/ \
-  --namespace model-downloader --create-namespace \
-  --set ezua.domainName="${DOMAIN_NAME}" \
-  --set ezua.virtualService.endpoint="model-downloader.${DOMAIN_NAME}"
-
-# 3. UI
-kubectl port-forward -n model-downloader svc/model-downloader 8000:8000
-open http://localhost:8000
+```yaml
+# values.yaml — the keys PCAI renders from
+ezua:
+  domainName: <pcai-domain>
+  virtualService:
+    endpoint: "model-downloader.<pcai-domain>"
+    istioGateway: "istio-system/ezaf-gateway"
 ```
+
+The UI is then at the PCAI gateway endpoint (e.g.
+`https://model-downloader.<pcai-domain>`); for a local developer preview only,
+`kubectl port-forward -n <ns> svc/model-downloader 8000:8000` and open
+`http://localhost:8000`.
 
 On SE G2 the chart also renders:
 
@@ -97,16 +98,17 @@ On SE G2 the chart also renders:
 
 ## Quick install — any other cluster
 
-This is still an HPE PCAI app, so kyverno and the ezua ingress are installed by
+This is still an HPE PCAI app, so kyverno and the ezua ingress are enabled by
 default. For a generic cluster, disable the proxies **and** the PCAI resources
-explicitly:
+explicitly in values:
 
-```bash
-helm install model-downloader helm/ \
-  --namespace model-downloader --create-namespace \
-  --set hpe_proxies=false \
-  --set kyverno.enabled=false \
-  --set ezua.enabled=false
+```yaml
+# values.yaml
+hpe_proxies: false
+kyverno:
+  enabled: false
+ezua:
+  enabled: false
 ```
 
 ## One flag: `hpe_proxies`
@@ -126,15 +128,22 @@ switches that default to **on** (this is an HPE PCAI app).
 | `kyverno.enabled` | `true` | install the `add-vendor-app-labels` ClusterPolicy (pre-install hook) |
 | `ezua.enabled` | `true` | Istio `VirtualService` + `AuthorizationPolicy` (oauth2-proxy) ingress |
 
-```bash
+```yaml
 # PCAI default — only the domain needs filling in
-helm upgrade model ... --set ezua.domainName=...
+ezua:
+  domainName: <pcai-domain>
 
 # generic cluster — opt out of the PCAI-only bits explicitly
-helm upgrade model ... --set hpe_proxies=false --set kyverno.enabled=false --set ezua.enabled=false
+hpe_proxies: false
+kyverno:
+  enabled: false
+ezua:
+  enabled: false
 
 # fine-grained: keep the ingress but drop the corporate proxy
-helm upgrade model ... --set hpe_proxies=false --set ezua.domainName=...
+hpe_proxies: false
+ezua:
+  domainName: <pcai-domain>
 ```
 
 ## Storage backends
@@ -234,7 +243,7 @@ the S3 job ignores them.
 
 | value | default | meaning |
 |---|---|---|
-| `image.repository` / `image.tag` | `andrewbydlon/pcai-model-downloader:0.5.0` | app image |
+| `image.repository` / `image.tag` | `ghcr.io/ai-solution-eng/model-downloader:v0.9.0` | app image |
 | `maxConcurrency` | `4` | concurrent download Jobs; rest are queued in-process |
 | `hpe_proxies` | `true` | HPE PCAI SE G2 proxy/kyverno/ezua features vs `false` for a generic cluster |
 
@@ -242,7 +251,7 @@ the S3 job ignores them.
 
 | value | default | meaning |
 |---|---|---|
-| `downloader.image.repository`/`tag` | `andrewbydlon/hf-downloader:v4.0` | worker image |
+| `downloader.image.repository`/`tag` | `ghcr.io/ai-solution-eng/hf-downloader:v1.0` | worker image |
 | `downloader.pvcName` | `models-pvc` | PVC used for the PVC backend |
 | `downloader.backoffLimit` | `2` | Job retries on failure; the HF cache persists on the PVC so retries resume the partial snapshot (`0` disables) |
 | `downloader.securityContext` | `{runAsUser:0, runAsGroup:0}` | write permission on the shared PV |
@@ -344,24 +353,32 @@ Other Kyverno quirks worth knowing from this cluster:
 
 ## Rebuild & re-deploy
 
+The images are public in `ghcr.io/ai-solution-eng/...` — you build/push only
+if you fork the code:
+
 ```bash
-# app image
-docker build -t andrewbydlon/pcai-model-downloader:0.5.0 .
-docker push andrewbydlon/pcai-model-downloader:0.5.0
+# app image (only if you change the code)
+docker build -t <your-registry>/pcai-model-downloader:0.9.0 .
+docker push <your-registry>/pcai-model-downloader:0.9.0
 
 # worker (only when S3 support / boto3 changed)
-docker build -t andrewbydlon/hf-downloader:v4.0 downloader/
-docker push andrewbydlon/hf-downloader:v4.0
-
-helm upgrade model-downloader helm/ -n model-downloader \
-  --set image.tag=0.5.0 \
-  --set ezua.domainName="${DOMAIN_NAME}"
+docker build -t <your-registry>/hf-downloader:v1.0 downloader/
+docker push <your-registry>/hf-downloader:v1.0
 ```
 
-> Chart changes other than the image tag roll the Deployment via `helm upgrade`:
-> it re-renders the ConfigMap (job template) with new env, so the pod is
-> recreated. If unsure do `kubectl rollout restart deploy/model-downloader -n
-> model-downloader`.
+Then update the image tag in values.yaml and apply in PCAI:
+
+```yaml
+# values.yaml
+image:
+  tag: 0.9.0
+ezua:
+  domainName: <pcai-domain>
+```
+
+> Chart changes other than the image tag re-render the job-template ConfigMap,
+> so the pod is recreated on apply. If unsure, trigger a rollout from the PCA
+> workload page.
 
 ## Troubleshooting
 
@@ -370,18 +387,11 @@ helm upgrade model-downloader helm/ -n model-downloader \
 - **"Config-missing key / missing `job.yaml`"** → the app reads the
   `-job-template` Configmap in its namespace; make sure chart applied.
 - **PVC mount errors on a hosted cluster** → see the Kyverno section.
-- **`helm install` fails / deployment won't come up on a hosted trial** → a
-  previously failed install can leave the app's cluster-scoped resources
-  behind, blocking a retry. Clean them up and reinstall:
-
-  ```bash
-  kubectl delete clusterrole model-downloader
-  kubectl delete clusterrolebinding model-downloader
-  kubectl delete authorizationpolicy -n istio-system model-downloader-auth-policy
-  ```
-
-  Then re-run `helm install`. These resources are cluster-scoped (or live in
-  `istio-system`), so `helm uninstall` alone won't remove them.
+- **Deployment won't come up on a hosted trial** → a previously failed
+  install can leave the app's cluster-scoped resources behind, blocking a
+  retry. Have an admin clean them up (ClusterRole / ClusterRoleBinding
+  `model-downloader`, and the `authorizationpolicy` in `istio-system`), then
+  re-import the chart in PCAI.
 - **Slow/parallel**: raised concurrency hurts; `downloader.hf.enableHfTransfer`
   and `disableXet` reshape transfer behaviour in a proxy network.
 - **Transient network / DNS failures** (e.g. `BackoffLimitExceeded` after

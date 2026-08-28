@@ -83,11 +83,14 @@ sqlhandler --transport streamable-http --port 9097
 
 ```
 LLM agent ──MCP──> sqlhandler (MCP server) ──DuckDB + pyarrow──> DataProvider
-                                             │
-                                             ├── OneLakeProvider  (ABFS, Delta Lake)
-                                             ├── S3Provider       (MinIO/AWS, Parquet)
-                                             ├── IcebergProvider  (catalog + Parquet)
-                                             └── FileProvider     (NFS/local, Delta + Parquet)
+                       ▲  │                                    │
+                       │  └─ web UI (/ui) + JSON API (/api/*)  │
+                       └────────── read-only, same engine ─────┘
+                                              │
+                                              ├── OneLakeProvider  (ABFS, Delta Lake)
+                                              ├── S3Provider       (MinIO/AWS, Parquet)
+                                              ├── IcebergProvider  (catalog + Parquet)
+                                              └── FileProvider     (NFS/local, Delta + Parquet)
 ```
 
 Components:
@@ -99,6 +102,7 @@ Components:
 - `src/sqlhandler/s3.py`        — S3/MinIO (Parquet) provider
 - `src/sqlhandler/iceberg.py`    — Iceberg (catalog + Parquet) provider
 - `src/sqlhandler/file.py`        — NFS/local filesystem (Delta + Parquet) provider
+- `src/sqlhandler/webui.py`       — read-only web UI + JSON API (`/`, `/ui`, `/api/*`)
 - `src/sqlhandler/server.py`    — the MCP server (`list_tables`, `describe_table`,
                                   `run_sql`, `scan_table`)
 
@@ -239,18 +243,21 @@ sqlhandler --transport streamable-http --port 9097
 | `<root>/work_orders/` (+ `_delta_log/`) | **delta** | `work_orders` | `work_orders` |
 | `<root>/sales/work_orders/` (+ `_delta_log/`) | **delta** | schema `sales`, `work_orders` | `work_orders` / `sales_work_orders` |
 
-### Kubernetes / Helm (NFS)
+### Kubernetes / PCAI (NFS)
 
-Mount a PVC (or hostPath) with the tables and point the chart at it:
+Mount a PVC (or hostPath) with the tables and point the chart at it. Import
+the `sqlhandler` chart in PCAI and set these values:
 
-```bash
-helm install sqlhandler ./helm \
-  --namespace <ns> \
-  --set-string ezua.domainName=<your-domain> \
-  --set backend=nfs \
-  --set nfs.rootDir=/data \
-  --set nfs.mount.enabled=true \
-  --set nfs.mount.pvcName=my-data-pvc
+```yaml
+# values.yaml — the keys PCAI renders from
+backend: nfs
+ezua:
+  domainName: <your-domain>
+nfs:
+  rootDir: /data
+  mount:
+    enabled: true
+    pvcName: my-data-pvc
 ```
 
 The chart sets `NFS_ROOT`, mounts the PVC read-only at `/data`, and the
@@ -349,7 +356,7 @@ The caches are **in-process**: a new replica starts fresh (and pre-warms).
 They only cache metadata — query results are never cached, so you always see
 the latest rows. Set the TTL envs to `0` to disable.
 
-## PCAI / MCP 2.0 deployment (Helm)
+## PCAI / MCP 2.0 deployment
 
 SQLhandler ships as a **PCAI (HPE Ezmeral Unified Analytics) MCP 2.0** server —
 it is built on the **`mcp>=2.0.0` SDK's low-level `Server`** and serves the
@@ -359,74 +366,100 @@ official Python/TS SDKs, MCP Inspector, OWUI). The `helm/` chart wires it
 into the PCAI platform (Istio gateway, oauth2-proxy auth, vendor-service
 discovery labels) exactly like the MultimodalRAG and AgentBuilder charts.
 
+> **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You
+> import the packaged chart (`.tar.gz`) into PCAI once, then drive the whole
+> deployment by setting the chart's **`values.yaml`** in the PCAI *Helm Values*
+> editor (or via the PCAI API). Every `--set` below maps 1:1 to a key in
+> `values.yaml`.
+
 ### Endpoint
 
 | Access method | URL |
 |---|---|
 | Via PCAI gateway (production) | `https://sqlhandler.<your-domain>/mcp` |
-| `kubectl port-forward` (local) | `http://localhost:9097/mcp` |
+| Web UI (data explorer) | `https://sqlhandler.<your-domain>/ui` |
+| `kubectl port-forward` (local, optional) | `http://localhost:9097/mcp` · `http://localhost:9097/ui` |
 
-### Deploy
+### Deploy (OneLake / Fabric backend)
 
-```bash
-cd SQLhandler
+Import the packaged `sqlhandler` chart in PCAI, then set these values in the
+*Helm Values* editor:
 
-# 1. Create the Fabric credential Secret out-of-band (never in values.yaml):
-kubectl -n <ns> create secret generic fabric-credentials \
-  --from-literal=tenant-id="$FABRIC_TENANT_ID" \
-  --from-literal=client-id="$FABRIC_CLIENT_ID" \
-  --from-literal=client-secret="$FABRIC_CLIENT_SECRET"
+```yaml
+# values.yaml — the keys PCAI renders from
+backend: onelake
 
-# 2. Install with the PCAI domain + lakehouse coordinates:
-helm install sqlhandler ./helm \
-  --namespace <ns> \
-  --set-string ezua.domainName=<your-domain> \
-  --set-string ezua.virtualService.endpoint=sqlhandler.<your-domain> \
-  --set fabric.lakehouseAbfssUrl=<abfss://ws@onelake.../lh>
+ezua:
+  domainName: <your-domain>
+  virtualService:
+    endpoint: "sqlhandler.<your-domain>"
+    istioGateway: "istio-system/ezaf-gateway"
 
-# For the Toromont deployment, a ready-made values file with the real
-# service principal + OneLake coordinates is provided (DO NOT commit it):
-#   helm install sqlhandler ./helm -n <ns> -f helm/deploy-toromont-values.yaml \
-#     --set-string ezua.domainName=<your-domain>
-# With it, the chart creates the Secret itself (fabric.credentialsSecret.create=true)
-# and wires the credential env vars (FABRIC_TENANT_ID / FABRIC_CLIENT_ID /
-# FABRIC_CLIENT_SECRET) explicitly into the Deployment.
+fabric:
+  # The chart creates the Secret itself from these values:
+  credentialsSecret:
+    create: true
+    tenantId: "<tenant-id>"
+    clientId: "<client-id>"
+    clientSecret: "<client-secret>"   # keep out of git / never in values history
+  lakehouseAbfssUrl: "abfss://<workspace-guid>@onelake.dfs.fabric.microsoft.com/<lakehouse-guid>"
+  workspaceId: "<workspace-guid>"
+  lakehouseId: "<lakehouse-guid>"
+
+cache:
+  ttl: 3600
+  prewarmTables: "work_order_header,work_order_note_recent,work_order_labour,work_order_parts"
 ```
+
+> **Toromont:** a ready-made values file with the real service principal +
+> OneLake coordinates is provided (`helm/deploy-toromont-values.yaml`). Paste
+> its values into the PCAI *Helm Values* editor — **do NOT commit the file
+> itself**. With it, the chart creates the `fabric-credentials` Secret
+> (`fabric.credentialsSecret.create=true`) and wires the env vars
+> (`FABRIC_TENANT_ID` / `FABRIC_CLIENT_ID` / `FABRIC_CLIENT_SECRET`) into the
+> Deployment.
 
 ### Deploy the S3 / MinIO backend
 
-```bash
-kubectl -n <ns> create secret generic s3-credentials \
-  --from-literal=access-key="$S3_ACCESS_KEY" \
-  --from-literal=secret-key="$S3_SECRET_KEY"
-
-helm install sqlhandler ./helm \
-  --namespace <ns> \
-  --set-string ezua.domainName=<your-domain> \
-  --set backend=s3 \
-  --set s3.endpointUrl=http://minio:9000 \
-  --set s3.bucket=lakehouse \
-  --set s3.prefix=datasets
+```yaml
+backend: s3
+ezua:
+  domainName: "<your-domain>"
+  virtualService:
+    endpoint: "sqlhandler.<your-domain>"
+s3:
+  endpointUrl: "http://minio:9000"
+  bucket: "lakehouse"
+  prefix: "datasets"
+  # create the credentials Secret from values (or provide it out-of-band):
+  credentialsSecret:
+    create: true
+    accessKey: "<s3-access-key>"
+    secretKey: "<s3-secret-key>"
 ```
 
 The chart wires `SQLHANDLER_BACKEND=s3` and the S3 env vars, and injects
 `S3_ACCESS_KEY` / `S3_SECRET_KEY` from the `s3-credentials` Secret. For a
-public bucket set `--set s3.anonymous=true` (no credential Secret needed).
+public bucket set `s3.anonymous: true` (no credential Secret needed).
+
 ### Deploy the Iceberg backend
 
-```bash
-kubectl -n <ns> create secret generic iceberg-credentials \
-  --from-literal=token="$ICEBERG_CATALOG_TOKEN" \
-  --from-literal=access-key="$S3_ACCESS_KEY" \
-  --from-literal=secret-key="$S3_SECRET_KEY"
-
-helm install sqlhandler ./helm \
-  --namespace <ns> \
-  --set-string ezua.domainName=<your-domain> \
-  --set backend=iceberg \
-  --set iceberg.catalogType=rest \
-  --set iceberg.catalogUri=http://rest-catalog:8181 \
-  --set iceberg.storage.endpointUrl=http://minio:9000
+```yaml
+backend: iceberg
+ezua:
+  domainName: "<your-domain>"
+  virtualService:
+    endpoint: "sqlhandler.<your-domain>"
+iceberg:
+  catalogType: rest
+  catalogUri: "http://rest-catalog:8181"
+  storage:
+    endpointUrl: "http://minio:9000"
+  credentialsSecret:
+    create: true
+    token: "<rest-token>"
+    accessKey: "<s3-access-key>"
+    secretKey: "<s3-secret-key>"
 ```
 
 The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars,
@@ -464,6 +497,42 @@ AuthorizationPolicy, Kyverno) and deploy as a plain MCP server.
   }
 }
 ```
+
+## Web UI (read-only data explorer)
+
+SQLhandler bundles a small, dependency-free web UI (a single self-contained
+`index.html` — no build step, no CDN) that gives humans the same data the MCP
+agents query, through the same engine and caches:
+
+- **Table list** (searchable, shows format badges)
+- **Schema view** per table — columns + types + table URI
+- **SQL editor** — run read-only queries (Ctrl+Enter), with a row limit
+- **Results table** — rendered with row/column counts, timing, and copy-CSV
+- **Light/dark theme** — header toggle, persisted per browser, defaults to the
+  OS preference
+- **HPE branding** — Hewlett Packard Enterprise wordmark with the HPE green
+  brand element in the header; HPE green accent throughout, in both themes
+
+It is served by the same server process, so it needs **no extra deployment**:
+
+| URL | What |
+|---|---|
+| `http://host:9097/` or `/ui` | the web UI |
+| `GET  /api/status` | server version + backend |
+| `GET  /api/tables` | table list |
+| `POST /api/describe` | columns/types for a table |
+| `POST /api/query` | run read-only SQL, returns columns+rows JSON |
+| `POST /api/preview` | first N rows of a table |
+
+The UI is deliberately **read-only**: the API rejects anything that isn't a
+`SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `PRAGMA` / `VALUES` statement, so it
+cannot modify the data source. It reuses the process-wide `SqlEngine` — the
+same list/describe caches and DuckDB query path the MCP tools use — and enforces
+the same row caps (`SQLHANDLER_MAX_ROWS`, default 1000).
+
+In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is
+already authenticated. The Helm chart routes `/api` with the same long timeout
+as `/mcp` (long-running queries), while the page itself uses the short timeout.
 
 ## MCP tools
 

@@ -67,4 +67,4 @@ __all__ = [
     "make_provider",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.1"

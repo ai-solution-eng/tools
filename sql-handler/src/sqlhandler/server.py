@@ -51,6 +51,7 @@ from starlette.responses import JSONResponse
 from .config import load_backend_config, load_cache_config, load_dotenv
 from .engine import SqlEngine
 from .provider import make_provider
+from .webui import register_ui
 
 logger = logging.getLogger("sqlhandler")
 
@@ -164,7 +165,7 @@ _TOOLS = [
 mcp = Server(
     "sqlhandler",
     title="SQLhandler MCP Server",
-    version="0.4.0",
+    version="0.5.1",
     description=("Direct, fast SQL access to columnar data (OneLake/Delta, S3/MinIO/Parquet, Iceberg) as MCP tools."),
     instructions=(
         "Direct, fast access to columnar data (OneLake/Delta or S3/MinIO/Parquet) "
@@ -364,6 +365,10 @@ def main(argv: list | None = None) -> None:
         stateless_http=True,
         transport_security=_transport_security,
     )
+
+    # Read-only web explorer + JSON API (list/describe/query/preview) over
+    # the same process-wide engine. Served at / and /ui; API under /api.
+    register_ui(app, _handler)
 
     # Liveness/readiness routes for the k8s probes.
     async def _health(_request) -> JSONResponse:

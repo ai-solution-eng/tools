@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+  // Resolve the theme before first paint to avoid a flash of the wrong theme.
+  // Precedence: saved choice > OS preference > dark (the historical default).
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("sqlhandler-theme"); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<title>SQLhandler · Data Explorer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-2: #1c2438;
+    --border: #2a3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --yellow: #f0b429;
+    --header-grad-1: #131a2b;
+    --header-grad-2: #10162a;
+    --active-bg: #123c30;
+    --row-hover: #1a2338;
+    --row-border: #202a42;
+    --editor-bg: #0d1220;
+    --err-bg: #2a1620;
+    --err-border: #5a2430;
+    --err-text: #ffb3b3;
+    --shadow: rgba(0, 0, 0, 0.4);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  /* Light theme: opt in via <html data-theme="light">, set before first paint
+     by the head script (OS preference) and toggled from the header. */
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --active-bg: #d6f2e8;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+  }
+  * { box-sizing: border-box; }
+  @font-face {
+    font-family: 'MetricHPE';
+    src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, var(--header-grad-1), var(--header-grad-2));
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .hpe-element {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    background: var(--hpe);
+    clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+  .brand-company {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--muted);
+  }
+  .brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+  .brand-product b { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+  header .meta .pill {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    color: var(--text);
+  }
+  header .spacer { flex: 1; }
+  #status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
+  #status-dot.ok { background: var(--green); }
+  #status-dot.err { background: var(--red); }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 320px;
+    min-width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  aside .search {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  aside input[type="search"] {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  aside input[type="search"]:focus { border-color: var(--accent); }
+  #table-list { flex: 1; overflow: auto; padding: 6px; }
+  .table-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text);
+    border: 1px solid transparent;
+  }
+  .table-item:hover { background: var(--panel-2); }
+  .table-item.active { background: var(--active-bg); border-color: var(--accent); }
+  .table-item .fmt {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 5px;
+    text-transform: uppercase;
+  }
+  .table-item .tname { flex: 1; font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 14px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .pane { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
+  .pane.hidden { display: none; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  .table-desc { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; margin-bottom: 10px; }
+  table.grid {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  table.grid th {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  table.grid td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  table.grid tr:hover td { background: var(--row-hover); }
+  .query-box { display: flex; flex-direction: column; }
+  .query-box textarea {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 12px;
+    min-height: 120px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    tab-size: 2;
+  }
+  .query-box textarea:focus { border-color: var(--accent); }
+  .query-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  button {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-2); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button.ghost:hover { border-color: var(--accent); }
+  button.theme-toggle {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 9px;
+    border-radius: 6px;
+  }
+  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  .query-actions .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .result-meta .ok { color: var(--green); font-weight: 600; }
+  .result-meta .bad { color: var(--red); font-weight: 600; }
+  #error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #error.show { display: block; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 20px var(--shadow);
+    display: none;
+    z-index: 50;
+  }
+  .toast.show { display: block; }
+  .toast .close { margin-left: 10px; cursor: pointer; color: var(--muted); }
+  .copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; margin-left: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="hpe-element" aria-hidden="true"></span>
+    <div class="brand-text">
+      <div class="brand-company">Hewlett Packard Enterprise</div>
+      <div class="brand-product"><b>SQLhandler</b> · Data Explorer</div>
+    </div>
+  </div>
+  <div class="meta">
+    <span><span id="status-dot"></span><span id="status-text">connecting…</span></span>
+    <span class="dot" id="backend"></span>
+    <span class="dot" style="color:var(--yellow)">read-only</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="search">
+      <input type="search" id="filter" placeholder="Filter tables…" autocomplete="off" />
+    </div>
+    <div id="table-list"></div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <button class="tab active" data-tab="query">Query</button>
+      <button class="tab" data-tab="schema">Schema</button>
+    </div>
+
+    <div id="pane-query" class="pane">
+      <div class="panel query-box">
+        <h2>SQL query</h2>
+        <textarea id="sql" spellcheck="false" placeholder="SELECT * FROM work_order_header LIMIT 100">SELECT * FROM work_order_header LIMIT 100</textarea>
+        <div class="query-actions">
+          <button id="run">Run (Ctrl+Enter)</button>
+          <button id="preview-btn" class="ghost">Preview selected table</button>
+          <span class="hint">read-only · SELECT / WITH / EXPLAIN / SHOW / PRAGMA / VALUES</span>
+          <span class="spacer"></span>
+          <label class="hint">limit
+            <input id="limit" type="number" value="100" min="1" max="1000" style="width:70px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;" />
+          </label>
+        </div>
+      </div>
+      <div id="error"></div>
+      <div id="result"></div>
+    </div>
+
+    <div id="pane-schema" class="pane hidden">
+      <div class="panel">
+        <h2>Selected table <button id="preview-here" class="ghost copy-btn" style="float:right">Preview rows</button></h2>
+        <div id="schema-desc"></div>
+        <div id="schema-grid"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = { tables: [], selected: null, tab: "query" };
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function toast(msg, isErr) {
+  const el = $("toast");
+  el.textContent = (isErr ? "⚠ " : "✓ ") + msg;
+  el.className = "toast show" + (isErr ? " err" : "");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+function setError(msg) {
+  const el = $("error");
+  if (msg) { el.textContent = msg; el.className = "show"; }
+  else { el.textContent = ""; el.className = ""; }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+// ---- header status -------------------------------------------------------
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("status-dot").className = "ok";
+    $("status-text").textContent = "connected";
+    $("backend").textContent = "backend: " + (s.backend || "?");
+  } catch (e) {
+    $("status-dot").className = "err";
+    $("status-text").textContent = "offline";
+  }
+}
+
+// ---- table list ----------------------------------------------------------
+async function refreshTables() {
+  const listEl = $("table-list");
+  listEl.innerHTML = '<div class="loading">loading tables…</div>';
+  try {
+    const data = await api("/api/tables");
+    state.tables = data.tables || [];
+    renderTables();
+  } catch (e) {
+    listEl.innerHTML = '<div class="empty">Failed to load tables:<br>' + esc(e.message) + "</div>";
+  }
+}
+
+function renderTables() {
+  const listEl = $("table-list");
+  const q = ($("filter").value || "").toLowerCase();
+  const rows = state.tables.filter((t) =>
+    !q || (t.name + " " + t.path + " " + t.qualified_name).toLowerCase().includes(q)
+  );
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="empty">' + (q ? "no tables match" : "no tables") + "</div>";
+    return;
+  }
+  listEl.innerHTML = "";
+  for (const t of rows) {
+    const el = document.createElement("div");
+    el.className = "table-item" + (state.selected && state.selected.path === t.path ? " active" : "");
+    const fmt = document.createElement("span");
+    fmt.className = "fmt";
+    fmt.textContent = t.format || "?";
+    const name = document.createElement("span");
+    name.className = "tname";
+    name.textContent = t.qualified_name || t.name;
+    el.appendChild(fmt);
+    el.appendChild(name);
+    el.onclick = () => selectTable(t);
+    listEl.appendChild(el);
+  }
+}
+
+function selectTable(t) {
+  state.selected = t;
+  renderTables();
+  $("sql").value = "SELECT * FROM " + (t.qualified_name || t.path) + " LIMIT 100";
+  showSchema(t);
+  switchTab("schema");
+}
+
+// ---- schema ---------------------------------------------------------------
+async function showSchema(t) {
+  $("schema-desc").innerHTML = "";
+  $("schema-grid").innerHTML = '<div class="loading">loading schema…</div>';
+  try {
+    const d = await api("/api/describe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: t.path }),
+    });
+    $("schema-desc").textContent = "uri: " + (d.uri || "");
+    const cols = d.columns || [];
+    let html = '<table class="grid"><thead><tr><th>#</th><th>column</th><th>type</th></tr></thead><tbody>';
+    cols.forEach((c, i) => {
+      html += "<tr><td>" + (i + 1) + "</td><td>" + esc(c.name) + "</td><td>" + esc(c.type) + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    $("schema-grid").innerHTML = html;
+  } catch (e) {
+    $("schema-grid").innerHTML = '<div class="empty">failed: ' + esc(e.message) + "</div>";
+  }
+}
+
+// ---- query execution -------------------------------------------------------
+function renderResult(payload) {
+  const panel = $("result");
+  const cols = payload.columns || [];
+  const rows = payload.rows || [];
+  if (!cols.length) {
+    panel.innerHTML = '<div class="empty">no columns returned</div>';
+    return;
+  }
+  let html = '<div class="result-meta"><span class="ok">✓ ' + payload.n_rows + " row(s)" +
+    (payload.truncated ? " (truncated)" : "") + '</span>' +
+    "<span>columns: " + cols.length + "</span>" +
+    "<span>took: " + payload.duration_ms + " ms</span>" +
+    '<button class="copy" id="copy-csv">copy CSV</button></div>';
+  html += '<div style="overflow:auto;max-height:60vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr>';
+  for (const c of cols) html += "<th>" + esc(c) + "</th>";
+  html += "</tr></thead><tbody>";
+  for (const r of rows) {
+    html += "<tr>";
+    for (const v of r) {
+      const txt = v === null ? "<span style='color:var(--muted)'>NULL</span>" : esc(String(v));
+      html += "<td>" + txt + "</td>";
+    }
+    html += "</tr>";
+  }
+  html += "</tbody></table></div>";
+  panel.innerHTML = html;
+  const btn = $("copy-csv");
+  if (btn) btn.onclick = () => {
+    const csv = [cols].concat(rows).map((r) => r.map(csvCell).join(",")).join("\n");
+    navigator.clipboard.writeText(csv).then(() => toast("CSV copied"));
+  };
+}
+
+function csvCell(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+async function runQuery() {
+  const sql = $("sql").value.trim();
+  if (!sql) { setError("Enter a query."); return; }
+  setError("");
+  $("run").disabled = true;
+  $("result").innerHTML = '<div class="loading">running…</div>';
+  try {
+    const payload = await api("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql, limit: parseInt($("limit").value, 10) || 100 }),
+    });
+    renderResult(payload);
+  } catch (e) {
+    $("result").innerHTML = "";
+    setError(e.message);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+// ---- tab switching ---------------------------------------------------------
+function switchTab(tab) {
+  state.current = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("pane-query").classList.toggle("hidden", tab !== "query");
+  $("pane-schema").classList.toggle("hidden", tab !== "schema");
+}
+
+// ---- theme toggle ---------------------------------------------------------
+function initThemeToggle() {
+  const btn = $("theme-toggle");
+  if (!btn) return;
+  const sync = () => {
+    const dark = document.documentElement.dataset.theme !== "light";
+    btn.textContent = dark ? "☀️" : "🌙";
+    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
+  };
+  btn.onclick = () => {
+    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("sqlhandler-theme", t); } catch (e) { /* ignore */ }
+    sync();
+    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
+  };
+  sync();
+}
+
+// ---- wiring ----------------------------------------------------------------
+document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+$("run").onclick = runQuery;
+$("preview-btn").onclick = () => {
+  if (!state.selected && state.tables.length) selectTable(state.tables[0]);
+  if (state.selected) {
+    $("sql").value = "SELECT * FROM " + (state.selected.qualified_name || state.selected.path) + " LIMIT 100";
+    switchTab("query");
+    runQuery();
+  }
+};
+$("filter").oninput = renderTables;
+$("preview-here").onclick = () => {
+  if (state.selected) {
+    $("sql").value = "SELECT * FROM " + (state.selected.qualified_name || state.selected.path) + " LIMIT 100";
+    switchTab("query");
+    runQuery();
+  }
+};
+$("sql").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); }
+});
+
+initThemeToggle();
+refreshStatus();
+refreshTables();
+</script>
+</body>
+</html>

@@ -9,7 +9,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v0.4.0
+  tag: v0.5.1
   pullPolicy: IfNotPresent
 
 # -- Backend selection -------------------------------------------------------

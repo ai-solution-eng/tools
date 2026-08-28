@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlhandler"
-version = "0.4.0"
+version = "0.5.1"
 description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,6 +39,9 @@ sqlhandler = "sqlhandler.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlhandler"]
+# Ship the read-only web UI (index.html) inside the package so the server can
+# serve /ui and / from any install (source checkout, editable, or wheel).
+include = ["ui/**"]
 
 [tool.ruff]
 line-length = 100
