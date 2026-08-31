@@ -132,7 +132,13 @@ class K8sClient:
         meta.setdefault("labels", {})[MANAGED_BY_LABEL] = MANAGED_BY_VALUE
         meta.setdefault("annotations", {})[MODEL_NAME_ANNOTATION] = model_name
         meta.setdefault("annotations", {})[STORAGE_ANNOTATION] = storage
-        if cache_root:
+        # Always record the resolved PVC destination (default or custom) so the
+        # exact cache root a job used is inspectable, even when the user left
+        # the custom field blank. S3 jobs stream straight to the bucket and
+        # ignore CACHE_ROOT, so they keep the old optional-annotation behavior.
+        if storage == "pvc":
+            meta.setdefault("annotations", {})[CACHE_ROOT_ANNOTATION] = resolved_cache_root
+        elif cache_root:
             meta.setdefault("annotations", {})[CACHE_ROOT_ANNOTATION] = cache_root
         if norm_s3:
             meta.setdefault("annotations", {})[S3_PATH_ANNOTATION] = norm_s3

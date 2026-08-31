@@ -2,9 +2,12 @@
 
 Serves a self-contained HTML explorer (``index.html``) and a small JSON API
 that reuses the SAME process-wide ``SqlEngine`` (and its caches) that backs
-the MCP tools. The API is deliberately **read-only**: only SELECT / WITH /
-EXPLAIN / SHOW / PRAGMA / VALUES statements are accepted, so the UI is a
-safe human front-end for the same data the MCP agents query.
+the MCP tools. The API is deliberately **read-only**: every statement is
+parsed with DuckDB's own grammar and only plain SELECT queries (plus EXPLAIN
+of a SELECT) are accepted, so the UI is a safe human front-end for the same
+data the MCP agents query. Additionally, the DuckDB connection used for
+these queries has local-file access disabled (see ``engine.py``), so a
+SELECT cannot read files inside the container or COPY results out.
 
 Endpoints (all JSON unless noted):
 
@@ -26,14 +29,12 @@ from pathlib import Path
 
 from starlette.responses import HTMLResponse, JSONResponse
 
-from .engine import SqlEngine
-
-# Statements a read-only explorer may run. Anything else (INSERT/UPDATE/DELETE/
-# CREATE/DROP/ALTER/MERGE/GRANT/...) is rejected before it reaches DuckDB.
-_ALLOWED_SQL_PREFIXES = ("SELECT", "WITH", "EXPLAIN", "SHOW", "PRAGMA", "VALUES")
+from .engine import SqlEngine, _max_rows
 
 _DEFAULT_LIMIT = 100
-_MAX_LIMIT = 1000  # aligned with the server-side SQLHANDLER_MAX_ROWS cap
+# Fallback UI cap when SQLHANDLER_MAX_ROWS is unset or 0 (unlimited for the
+# MCP path): the browser API still needs a bounded payload size.
+_FALLBACK_MAX_LIMIT = 1000
 
 _HTML = (Path(__file__).parent / "ui" / "index.html").read_text(encoding="utf-8")
 
@@ -43,24 +44,97 @@ _HTML = (Path(__file__).parent / "ui" / "index.html").read_text(encoding="utf-8"
 # ---------------------------------------------------------------------------
 
 
+def _parse_statement_types(sql: str) -> list[str]:
+    """Parse ``sql`` with DuckDB's real parser; return one type per statement.
+
+    Uses DuckDB's own grammar (string literals, comments and multi-statement
+    text are handled correctly), unlike keyword prefix checks. Raises
+    ValueError when the text does not parse at all.
+    """
+    import duckdb
+
+    try:
+        statements = duckdb.extract_statements(sql)
+    except Exception as exc:
+        raise ValueError(f"Could not parse SQL: {exc}") from exc
+    return [str(s.type).split(".")[-1] for s in statements]
+
+
+def _explain_inner_sql(statement: str) -> str:
+    """Strip a leading ``EXPLAIN [ANALYZE] [VERBOSE]`` and return the rest."""
+    rest = statement
+    for keyword in ("EXPLAIN", "ANALYZE", "VERBOSE"):
+        rest = rest.lstrip(" \t\r\n(")
+        parts = rest.split(None, 1)
+        if parts and parts[0].upper() == keyword:
+            rest = parts[1] if len(parts) > 1 else ""
+        else:
+            break
+    return rest
+
+
 def assert_readonly(sql: str) -> str:
     """Return the trimmed SQL if it is a read-only statement, else raise.
 
-    Splits on ``;`` (top-level) and rejects the query if ANY statement is not
-    in the allowed read-only prefixes.
+    Every parsed statement must be a plain SELECT (DuckDB parses WITH/VALUES/
+    SHOW/DESCRIBE/SUMMARIZE as SELECT too). EXPLAIN is allowed only when the
+    explained statement is itself a SELECT — ``EXPLAIN ANALYZE INSERT``
+    actually executes the insert, so it is rejected. PRAGMA/SET, COPY, and
+    every write statement are rejected regardless of position.
+
+    This guards the *web UI / JSON API* only. The MCP ``run_sql`` tool is for
+    trusted agent callers and does not pass through this filter (see README).
     """
-    statements = [s.strip() for s in sql.split(";") if s.strip()]
-    if not statements:
+    text = sql.strip()
+    if not text:
         raise ValueError("Empty SQL statement.")
-    for stmt in statements:
-        head = stmt.lstrip(" \t\r\n(")
-        first = head.split(None, 1)[0].rstrip(")") if head else ""
-        if first.upper() not in _ALLOWED_SQL_PREFIXES:
+    types = _parse_statement_types(text)
+    for stmt_type, statement in zip(types, _split_statements(text), strict=False):
+        # Belt and braces: PRAGMA is a SET alias in DuckDB, and some
+        # table-valued pragmas even parse as SELECT — reject the keyword
+        # itself, the web UI has no use for it.
+        head = statement.lstrip(" \t\r\n(")
+        if head.upper().startswith("PRAGMA"):
             raise ValueError(
-                f"Read-only UI: statement starting with '{first or '<empty>'}' is not allowed. "
-                "Only SELECT / WITH / EXPLAIN / SHOW / PRAGMA / VALUES queries are permitted."
+                "Read-only UI: PRAGMA statements are not allowed. "
+                "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
             )
-    return statements[0] if len(statements) == 1 else sql
+        if stmt_type == "EXPLAIN":
+            inner = _explain_inner_sql(statement)
+            for inner_type in _parse_statement_types(inner):
+                if inner_type != "SELECT":
+                    raise ValueError(
+                        f"Read-only UI: EXPLAIN of a {inner_type} statement is not allowed "
+                        "(EXPLAIN ANALYZE would execute it). Only SELECT queries are permitted."
+                    )
+        elif stmt_type != "SELECT":
+            raise ValueError(
+                f"Read-only UI: {stmt_type} statements are not allowed. "
+                "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
+            )
+    return text
+
+
+def _split_statements(sql: str) -> list[str]:
+    """Best-effort per-statement text slices matching the parsed statements.
+
+    Only used for EXPLAIN inner-statement inspection, where a rough slice is
+    enough (the inner text is re-parsed, not executed as-is).
+    """
+    parts, current = [], []
+    in_string = False
+    for char in sql:
+        if char == "'" and not in_string:
+            in_string = True
+        elif char == "'" and in_string:
+            in_string = False
+        if char == ";" and not in_string:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return [p for p in (part.strip() for part in parts) if p]
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +267,19 @@ def api_preview(engine: SqlEngine, table: str, limit: int | None = None) -> dict
 
 
 def _clamp_limit(limit: int | None) -> int:
-    """Normalise a client limit to (1, _MAX_LIMIT], defaulting to _DEFAULT_LIMIT."""
+    """Normalise a client limit to (1, cap], defaulting to _DEFAULT_LIMIT.
+
+    The cap follows ``SQLHANDLER_MAX_ROWS`` (same knob as the MCP path) when
+    it is set to a positive value, so raising it raises the UI cap too. When
+    it is 0 (unlimited) the UI still clamps to _FALLBACK_MAX_LIMIT to keep
+    the JSON payload bounded.
+    """
+    cap = _max_rows()
+    if cap <= 0:
+        cap = _FALLBACK_MAX_LIMIT
     if limit is None or limit <= 0:
-        return _DEFAULT_LIMIT
-    return min(limit, _MAX_LIMIT)
+        return min(_DEFAULT_LIMIT, cap)
+    return min(limit, cap)
 
 
 # ---------------------------------------------------------------------------
@@ -224,14 +307,20 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def describe(request) -> JSONResponse:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(api_describe(engine_getter(), str(body.get("table", ""))))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def query(request) -> JSONResponse:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(api_query(engine_getter(), str(body.get("sql", "")), body.get("limit")))
         except ValueError as exc:
@@ -240,7 +329,10 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def preview(request) -> JSONResponse:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(api_preview(engine_getter(), str(body.get("table", "")), body.get("limit")))
         except Exception as exc:

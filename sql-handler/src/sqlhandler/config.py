@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -299,6 +300,11 @@ def load_source_providers(env: dict | None = None) -> object | None:
     REGION/ACCESS_KEY/SECRET_KEY/ANONYMOUS/USE_SSL), ``onelake``
     (abfssUrl or workspaceId+lakehouseId), ``nfs`` (rootDir) and ``iceberg``
     (catalogType/catalogUri/warehouse).
+
+    Source labels (``name``) must be unique and valid identifiers
+    (letters/digits/underscores, not starting with a digit) — they become
+    the DuckDB name prefix for that source's tables. Violations raise
+    ``ValueError`` at startup instead of silently shadowing a source.
     """
     e = env if env is not None else os.environ
     raw = _getenv("SQLHANDLER_SOURCES", e.get("SQLHANDLER_SOURCES", "")).strip()
@@ -319,6 +325,18 @@ def load_source_providers(env: dict | None = None) -> object | None:
         if not isinstance(src, dict):
             raise TypeError(f"SQLHANDLER_SOURCES[{idx}] must be an object")
         label = str(src.get("name") or f"source{idx + 1}")
+        # Source labels become DuckDB identifier prefixes (source_schema_name)
+        # and routing keys. Duplicates would silently make the earlier source
+        # unreachable (dict(zip(...)) keeps the last), and non-identifier
+        # characters produce ambiguous SQL names — both are user errors worth
+        # failing on at startup rather than debugging at query time.
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label):
+            raise ValueError(
+                f"SQLHANDLER_SOURCES[{idx}] name {label!r} must be a valid identifier "
+                "(letters, digits, underscores; not starting with a digit)"
+            )
+        if label in labels:
+            raise ValueError(f"SQLHANDLER_SOURCES[{idx}] name {label!r} is duplicated; source names must be unique")
         backend = str(src.get("backend") or "s3").lower()
         src_env = {
             "SQLHANDLER_BACKEND": backend,
@@ -430,10 +448,12 @@ def load_dotenv(path: str | None = None) -> None:
     if path is None:
         path = os.environ.get("SQLHANDLER_ENV_FILE", "")
     if not path:
-        # Try a conventional location next to the config module.
+        # Conventional location: <repo>/config/.env next to the checked-out
+        # src/ tree (two levels up from this module). Do NOT probe further up
+        # the tree — picking up an unrelated sibling project's .env is worse
+        # than finding nothing.
         here = os.path.dirname(os.path.abspath(__file__))
         for candidate in (
-            os.path.join(here, "..", "..", "..", "config", ".env"),
             os.path.join(here, "..", "..", "config", ".env"),
         ):
             if os.path.exists(candidate):

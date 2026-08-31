@@ -1,5 +1,6 @@
 """FastAPI service that serves the HF Model Downloader UI and Job API."""
 
+import hashlib
 import os
 import re
 from contextlib import asynccontextmanager
@@ -41,6 +42,25 @@ AIOLI_DB_SECRET_KEY = os.environ.get("AIOLI_DB_SECRET_KEY", "password")
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+# Content-hash every static asset once at startup so cache-busting query strings
+# change whenever a file changes. The old templates hardcoded "?v=0.7.2", which
+# never changed across releases, so browsers kept running stale JS (e.g. the one
+# that predates the custom download-location field) after an upgrade — silently
+# dropping cache_root from submissions. A per-file hash guarantees the browser
+# refetches the asset on the next deploy.
+ASSET_NAMES = ("app.js", "style.css", "catalog.js", "favicon.jpg")
+
+
+def _static_hashes() -> dict[str, str]:
+    hashes = {}
+    for name in ASSET_NAMES:
+        path = BASE_DIR / "static" / name
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()[:10] if path.is_file() else "0"
+    return hashes
+
+
+STATIC_HASHES = _static_hashes()
 
 k8s_client = K8sClient(template_cm=JOB_TEMPLATE_CM, template_cm_ns=JOB_TEMPLATE_CM_NS)
 queue = JobQueue(
@@ -165,6 +185,7 @@ def _page_context() -> dict:
         "s3_bucket": S3_BUCKET,
         "s3_prefix": S3_PREFIX,
         "s3_default_path": S3_DEFAULT_PATH,
+        "assets": STATIC_HASHES,
     }
 
 

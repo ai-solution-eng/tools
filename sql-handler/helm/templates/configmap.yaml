@@ -10,6 +10,7 @@ data:
   SQLHANDLER_TRANSPORT: {{ .Values.mcp.transport | quote }}
   # Backend: onelake (default), s3/minio, or iceberg.
   SQLHANDLER_BACKEND: {{ .Values.backend | default "onelake" | quote }}
+  {{- if not .Values.sources }}
   {{- if eq .Values.backend "onelake" }}
   # OneLake connection details (non-secret). Credentials come from a Secret.
   FABRIC_AUTHORITY: {{ .Values.fabric.authority | quote }}
@@ -65,14 +66,17 @@ data:
   # NFS / local filesystem backend: read-only directory of Parquet files.
   NFS_ROOT: {{ .Values.nfs.rootDir | default "/data" | quote }}
   {{- end }}
+  {{- end }}
   {{- if .Values.sources }}
   # Federated multi-source mode: overrides the single backend (see values.yaml).
   SQLHANDLER_SOURCES: {{ .Values.sources | toJson | quote }}
   {{- end }}
-  # In-process metadata cache (list_tables / describe_table).
-  SQLHANDLER_CACHE_TTL: {{ .Values.cache.ttl | default 3600 | quote }}
-  SQLHANDLER_VERSION_CHECK_INTERVAL: {{ .Values.cache.versionCheckInterval | default 10 | quote }}
-  SQLHANDLER_LIST_ASYNC_REFRESH: {{ .Values.cache.listAsyncRefresh | default true | quote }}
+  # In-process metadata cache (list_tables / describe_table). NOTE: no sprig
+  # `default` here — `0` (disable caching / check every query) and `false`
+  # are meaningful values that `default` treats as empty and would override.
+  SQLHANDLER_CACHE_TTL: {{ .Values.cache.ttl | quote }}
+  SQLHANDLER_VERSION_CHECK_INTERVAL: {{ .Values.cache.versionCheckInterval | quote }}
+  SQLHANDLER_LIST_ASYNC_REFRESH: {{ .Values.cache.listAsyncRefresh | quote }}
   {{- if .Values.cache.prewarmTables }}
   SQLHANDLER_PREWARM_TABLES: {{ .Values.cache.prewarmTables | quote }}
   {{- end }}

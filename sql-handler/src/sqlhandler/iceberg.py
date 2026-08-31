@@ -45,8 +45,8 @@ class IcebergProvider(DataProvider):
         """Wrap a pyiceberg catalog + its storage credentials."""
         if not config.is_configured:
             raise LakehouseError(
-                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI ",
-                "(and ICEBERG_CATALOG_TYPE=rest|sql).",
+                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI "
+                "(and ICEBERG_CATALOG_TYPE=rest|sql)."
             )
         self.config = config
         self._cat = None

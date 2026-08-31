@@ -2,8 +2,8 @@
 """Benchmark time-to-first-token (TTFT) and tokens/s for PCAI chat models.
 
 Runs one model under a range of concurrency levels, mixing long task types
-(coding, creative writing, ...), and prints per-task stats — average /
-p95 / p99 / max for both metrics.
+(coding, creative writing, ...), and prints per-task P50 / P95 / P99 / P100
+percentiles for both metrics.
 
 Every request gets a unique random nonce prepended to its prompt so the
 shared serving cluster cannot reuse prefix/response caches (RadixAttention
@@ -59,6 +59,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 import numpy as np
@@ -219,7 +220,15 @@ def parse_args() -> argparse.Namespace:
         "--api_key",
         default="",
         help="Bearer token for the endpoint. Optional: omit for endpoints "
-        "that don't require auth (no Authorization header is then sent).",
+        "that don't require auth (no Authorization header is then sent). "
+        "Prefer --api_key_file or the PCAI_API_KEY env var so the secret "
+        "stays out of shell history and the process list.",
+    )
+    parser.add_argument(
+        "--api_key_file",
+        default="",
+        help="Read the bearer token from this file (first line, stripped). "
+        "Ignored when --api_key is given; falls back to $PCAI_API_KEY.",
     )
     parser.add_argument(
         "--remote",
@@ -343,12 +352,35 @@ def parse_args() -> argparse.Namespace:
         "(helps diagnose TTFT=0 when content arrives in a non-`content` field).",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the per-request progress lines (keep prewarm notices, "
+        "level previews and the final table). Recommended when stdout is "
+        "piped/redirected: per-request print() runs on the event loop and a "
+        "blocked stdout stall can distort TTFT/tokens-s.",
+    )
+    parser.add_argument(
         "--output",
         default="",
         help="Write the final summary table to this file (in addition to stdout). "
         "E.g. --output results/qwen_38_27b/H200x4.txt.",
     )
     return parser.parse_args()
+
+
+def resolve_api_key(args: argparse.Namespace) -> str:
+    """Resolve the bearer token for --url mode without putting secrets on the
+    command line.  Priority: --api_key > --api_key_file > $PCAI_API_KEY."""
+    if args.api_key:
+        return args.api_key
+    if args.api_key_file:
+        try:
+            key = Path(args.api_key_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SystemExit(f"--api_key_file: cannot read {args.api_key_file!r}: {exc}") from exc
+        if key:
+            return key
+    return os.environ.get("PCAI_API_KEY", "")
 
 
 def resolve_tasks(args: argparse.Namespace) -> list[Task]:
@@ -414,7 +446,8 @@ def build_model(args: argparse.Namespace):
         # api_key is optional: a key-less endpoint gets an empty key, and the
         # OpenAI client is built with credential enforcement relaxed so no
         # Authorization header is sent (see stream_once / _openai_client_kwargs).
-        model = ChatModel(url_remote=args.url, api_key=args.api_key)
+        # Resolution order: --api_key > --api_key_file > $PCAI_API_KEY.
+        model = ChatModel(url_remote=args.url, api_key=resolve_api_key(args))
 
     if args.remote:
         model.remote()
@@ -478,7 +511,9 @@ def render_prompt(task: Task, context_length: int = 0, no_nonce: bool = False) -
     prompt = task.prompt
     nonce = _SHARED_NONCE if no_nonce else secrets.token_hex(6)
     if "{nonce}" in prompt:
-        prompt = prompt.format(nonce=nonce)
+        # str.replace, not str.format: custom prompts routinely contain literal
+        # braces (dict/JSON examples) that would make .format() raise KeyError.
+        prompt = prompt.replace("{nonce}", nonce)
     else:
         prompt = f"[{nonce}]\n{prompt}"
 
@@ -522,14 +557,16 @@ async def stream_once(
     ``messages`` optionally overrides the default single ``user`` message
     with a full conversation (used for multiturn requests); the assistant
     text streamed back is returned in ``response_text`` so it can be
-    appended to the history for the next turn.
+    appended to the history for the next turn.  ``response_text`` carries
+    only ``content`` deltas — reasoning tokens are counted but NOT replayed
+    into the conversation history, matching what real chat clients resend.
     """
     t0 = time.perf_counter()
     first_token_at: float | None = None
     content_deltas = 0
     reasoning_deltas = 0
     usage_tokens: int | None = None
-    text_parts: list[str] = []
+    content_parts: list[str] = []
     try:
         if messages is None:
             messages = [{"role": "user", "content": render_prompt(task, context_length, no_nonce)}]
@@ -565,22 +602,19 @@ async def stream_once(
                             first_token_at = now
                             _debug_first_delta("content", delta, debug_stream)
                         content_deltas += 1
-                        text_parts.append(content)
+                        content_parts.append(content)
                     elif reasoning:
                         if first_token_at is None:
                             first_token_at = now
                             _debug_first_delta("reasoning_content", delta, debug_stream)
                         reasoning_deltas += 1
-                        text_parts.append(reasoning)
                     elif first_token_at is None:
                         # Some Qwen3 servers stream text under other delta
                         # fields (e.g. `reasoning`), which the SDK keeps in
                         # model_extra. Treat any non-empty, non-role string
                         # delta as a token so TTFT never falls back to 0 on
                         # an unknown field name.
-                        extra = getattr(delta, "model_extra", None) or getattr(
-                            delta, "__pydantic_extra__", None
-                        ) or {}
+                        extra = getattr(delta, "model_extra", None) or getattr(delta, "__pydantic_extra__", None) or {}
                         combined = {**delta.model_dump(), **extra}
                         if any(isinstance(v, str) and v for k, v in combined.items() if k != "role"):
                             first_token_at = now
@@ -612,7 +646,7 @@ async def stream_once(
         ttft_s=first_token_at - t0,
         tokens=tokens,
         tokens_per_s=tokens_per_s,
-        response_text="".join(text_parts),
+        response_text="".join(content_parts),
     )
 
 
@@ -626,6 +660,7 @@ async def run_concurrency(
     debug_stream: bool = False,
     multiturn: bool = False,
     no_nonce: bool = False,
+    quiet: bool = False,
 ) -> list[RequestResult]:
     sem = asyncio.Semaphore(n_users)
 
@@ -676,18 +711,23 @@ async def run_concurrency(
                     # Keep the conversation going even if a turn failed so the
                     # user's remaining turns stay aligned with the round order.
                     history = messages
-            async with _print_lock:
-                if res.success:
-                    print(
-                        f"  [N={n_users} user={uid} req={i + 1}/{requests_per_user}] "
-                        f"task={task.name} -> TTFT={res.ttft_s * 1000:.0f}ms, "
-                        f"{res.tokens} tok, {res.tokens_per_s:.1f} tok/s"
-                    )
-                else:
-                    print(
-                        f"  [N={n_users} user={uid} req={i + 1}/{requests_per_user}] "
-                        f"task={task.name} FAILED: {res.error}"
-                    )
+            if not quiet:
+                # print() is a blocking write on the event-loop thread and this
+                # lock serializes every user; a backpressured stdout (pipe, slow
+                # SSH pane) would stall chunk processing for ALL in-flight
+                # streams and distort TTFT/tokens-s. --quiet skips it entirely.
+                async with _print_lock:
+                    if res.success:
+                        print(
+                            f"  [N={n_users} user={uid} req={i + 1}/{requests_per_user}] "
+                            f"task={task.name} -> TTFT={res.ttft_s * 1000:.0f}ms, "
+                            f"{res.tokens} tok, {res.tokens_per_s:.1f} tok/s"
+                        )
+                    else:
+                        print(
+                            f"  [N={n_users} user={uid} req={i + 1}/{requests_per_user}] "
+                            f"task={task.name} FAILED: {res.error}"
+                        )
         return results
 
     grouped = await asyncio.gather(*(_user(i) for i in range(n_users)))
@@ -717,9 +757,7 @@ async def prewarm(
     Only helps when the subsequent requests share that exact prefix — i.e.
     when the run uses --no-nonce; otherwise the warm prefix is never matched.
     """
-    print(
-        f"Prewarming ctx={context_length} cache (one shared-prefix request per task)..."
-    )
+    print(f"Prewarming ctx={context_length} cache (one shared-prefix request per task)...")
     for task in tasks:
         messages = [{"role": "user", "content": render_prompt(task, context_length, no_nonce=True)}]
         res = await stream_once(
@@ -786,10 +824,7 @@ def print_table(
                 blocks.append("".join(f"{'-':>{_CELL}}" for _ in PCTS))
             else:
                 blocks.append("".join(f"{s[p]:>{_CELL}.1f}" for p in PCTS))
-        line = (
-            f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |    "
-            + "    |    ".join(blocks)
-        )
+        line = f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |    " + "    |    ".join(blocks)
         print(line, file=file)
 
 
@@ -815,6 +850,7 @@ async def _run_level(
         args.debug_stream,
         multiturn=args.multiturn,
         no_nonce=args.no_nonce,
+        quiet=args.quiet,
     )
     successes = [r for r in results if r.success]
     failures = len(results) - len(successes)
@@ -880,9 +916,24 @@ async def main() -> None:
 
     tasks = resolve_tasks(args)
     model = build_model(args)
+    # Warn when the requested concurrency exceeds the client connection pool:
+    # excess requests queue INSIDE the measured TTFT window, so the top level
+    # silently measures "pool_max concurrent streams + queueing" instead of N.
+    try:
+        from model_benchmarker.utils.pcai_model_classes import model_pool_max_connections
+
+        pool_max = model_pool_max_connections()
+        if max(user_levels) > pool_max:
+            print(
+                f"WARNING: max --number_users ({max(user_levels)}) exceeds the httpx "
+                f"connection-pool limit ({pool_max}; MODEL_POOL_MAX_CONNECTIONS). Requests "
+                "beyond the limit queue client-side and inflate measured TTFT — raise the "
+                "env var to at least your max concurrency."
+            )
+    except ImportError:
+        pass
     extra_body = build_chat_template_kwargs(args)
     args.extra_body = extra_body
-    task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
     task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
     print(
         f"Model: {model.__class__.__name__} name={model.model_name!r} "
@@ -951,9 +1002,7 @@ async def main() -> None:
         )
     else:
         summary_head = "\nPer-level latency / throughput (unique-nonce requests, no cache reuse):"
-    summary_note = (
-        "TTFT (ms): P50/P95/P99/P100 ascending;  tokens/s: higher is better so percentiles are inverted (P100 = slowest)."
-    )
+    summary_note = "TTFT (ms): P50/P95/P99/P100 ascending;  tokens/s: higher is better so percentiles are inverted (P100 = slowest)."
     if args.multiturn:
         summary_note += (
             "\nTTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ "

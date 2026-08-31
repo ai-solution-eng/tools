@@ -48,10 +48,25 @@ class FileProvider(DataProvider):
     def _root(self) -> str:
         return self.config.root_dir.rstrip("/")
 
+    def _contained_path(self, info: TableInfo) -> str:
+        """Absolute path for a table, verified to stay under the NFS root.
+
+        The engine resolves user-supplied table names into
+        ``<schema>/<name>`` locations; without this check a name like
+        ``../secret.parquet`` would read files outside the mounted root.
+        Symlinks are resolved on both sides (realpath) so a link planted
+        inside the root cannot point out either.
+        """
+        location = info.location or info.path
+        root = os.path.realpath(self._root())
+        target = os.path.realpath(os.path.join(root, location))
+        if target != root and not target.startswith(root + os.sep):
+            raise LakehouseError(f"Table location {location!r} is outside the NFS root {self._root()!r}")
+        return target
+
     def table_uri(self, info: TableInfo) -> str:
         """Absolute path of the table folder (or single Parquet file)."""
-        location = info.location or info.path
-        return f"{self._root()}/{location}"
+        return self._contained_path(info)
 
     @staticmethod
     def _is_parquet(name: str) -> bool:
@@ -123,14 +138,15 @@ class FileProvider(DataProvider):
 
     def open_dataset(self, info: TableInfo):
         """Open a Delta table or Parquet folder/file as a pyarrow Dataset."""
-        location = info.location or info.path
-        root = f"{self._root()}/{location}"
+        root = self._contained_path(info)
         try:
             if info.format == "delta":
                 from deltalake import DeltaTable
 
                 return DeltaTable(root).to_pyarrow_dataset()
             return pad.dataset(root, filesystem=self._fs(), format="parquet")
+        except LakehouseError:
+            raise
         except Exception as exc:
             raise LakehouseError(f"Could not open NFS table '{info.path}': {exc}") from exc
 
@@ -142,10 +158,10 @@ class FileProvider(DataProvider):
         """
         if info.format != "delta":
             return None
-        delta_log = f"{self._root()}/{info.location}/_delta_log"
         try:
+            delta_log = os.path.join(self._contained_path(info), _DELTA_LOG)
             names = os.listdir(delta_log)
-        except OSError:
+        except (OSError, LakehouseError):
             return None
         versions = [0]
         for name in names:

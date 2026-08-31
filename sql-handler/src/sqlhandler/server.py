@@ -15,7 +15,7 @@ The server is built on the LOW-LEVEL MCP 2.0 Server (mcp.server.lowlevel.Server)
 which speaks the interoperable streamable-http protocol including the standard
 initialize handshake. Any MCP client (DSH assistants, the official Python/TS
 SDKs, MCP Inspector, Codex, Claude Code, etc.) can connect. The higher-level
-MCPServer shipped in mcp>=2.0.0 only implements the 2026-07-28 stateless
+MCPServer shipped in mcp>=2.0.0 only implements the newer stateless
 per-request protocol and rejects the initialize handshake, which blocks
 standard tools; we deliberately avoid that class here.
 
@@ -23,7 +23,7 @@ Tools exposed:
   * list_tables        - enumerate the tables in the configured source
   * describe_table     - inspect columns/types of a table
   * run_sql            - execute SQL via DuckDB (aggregations etc.)
-  * scan_table         - pull rows via pyarrow with filters + limit
+  * scan_table         - pull rows via pyarrow with column projection + limit
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from mcp_types import (
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
+from . import __version__
 from .config import (
     load_backend_config,
     load_cache_config,
@@ -85,10 +86,14 @@ def _dispatch_tool(name: str, args: dict) -> tuple[str, bool]:
         elif name == "run_sql":
             return run_sql(str(args.get("sql", "")), args.get("limit")), False
         elif name == "scan_table":
+            # An explicit limit of 0 is honored (empty result); only a
+            # missing limit defaults to 100.
+            raw_limit = args.get("limit")
+            limit = int(raw_limit) if raw_limit is not None else 100
             return scan_table(
                 str(args.get("table", "")),
                 args.get("columns"),
-                int(args.get("limit") or 100),
+                limit,
             ), False
         return f"Unknown tool: {name}", True
     except Exception as exc:
@@ -140,7 +145,10 @@ _TOOLS = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Optional max number of rows to return (default no limit).",
+                    "description": (
+                        "Optional max number of rows to return. Default: capped by "
+                        "SQLHANDLER_MAX_ROWS (1000)."
+                    ),
                 },
             },
             "required": ["sql"],
@@ -152,7 +160,10 @@ _TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
-                "table": {"type": "string", "description": "Delta table name."},
+                "table": {
+                    "type": "string",
+                    "description": 'Table name; use "schema/name" when the source uses schemas.',
+                },
                 "columns": {
                     "type": "string",
                     "description": "Optional comma-separated list of columns to project.",
@@ -170,7 +181,11 @@ _TOOLS = [
 mcp = Server(
     "sqlhandler",
     title="SQLhandler MCP Server",
-    version="0.5.1",
+    # Single-sourced from sqlhandler.__version__ so the MCP handshake,
+    # /api/status and pyproject.toml always agree (bump_version.sh updates
+    # __init__.py; hardcoding a second number here is how 0.5.1/0.5.3/0.6.0
+    # drifted apart).
+    version=__version__,
     description=("Direct, fast SQL access to columnar data (OneLake/Delta, S3/MinIO/Parquet, Iceberg) as MCP tools."),
     instructions=(
         "Direct, fast access to columnar data (OneLake/Delta or S3/MinIO/Parquet) "
@@ -286,7 +301,8 @@ def run_sql(sql: str, limit: int | None = None) -> str:
 
     Args:
         sql: The SQL SELECT to run against the source tables.
-        limit: Optional max number of rows to return (default no limit).
+        limit: Optional max rows to return; SQLHANDLER_MAX_ROWS (default 1000)
+            caps the result either way.
     """
     try:
         handler = _handler()
@@ -300,15 +316,15 @@ def scan_table(table: str, columns: str | None = None, limit: int = 100) -> str:
     """Fetch rows/columns from a table via pyarrow (columnar).
 
     Args:
-        table: Delta table name.
+        table: Table name (schema/name when the source uses schemas).
         columns: Optional comma-separated list of columns to project.
         limit: Max rows to return (default 100).
     """
     try:
         handler = _handler()
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
-        arrow = handler.scan_arrow(table, columns=col_list, limit=limit)
-        return _arrow_to_markdown(arrow, max_rows=limit)
+        arrow = handler.scan_arrow(table, columns=col_list, limit=int(limit))
+        return _arrow_to_markdown(arrow, max_rows=int(limit))
     except Exception as exc:
         return f"Error scanning table: {exc}"
 
@@ -327,7 +343,11 @@ _MAX_OUTPUT_ROWS = 1000
 def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
     """Render a pyarrow Table as a compact markdown table for an LLM."""
     try:
-        cap = int(os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS)))
+        raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = _MAX_OUTPUT_ROWS  # garbage env value: fall back to the default cap
         cap = max(cap, 0)
         if cap > 0 and max_rows is not None:
             max_rows = min(max_rows, cap)
@@ -342,6 +362,11 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
 
 
 def main(argv: list | None = None) -> None:
+    # Load .env FIRST so every setting -- including SQLHANDLER_TRANSPORT,
+    # which is read by argparse below -- can come from the env file. The
+    # later load_dotenv() inside _handler() stays for programmatic callers
+    # and is a no-op once variables are set (existing env always wins).
+    load_dotenv()
     parser = argparse.ArgumentParser(description="SQLhandler MCP server")
     parser.add_argument(
         "--transport",
@@ -409,9 +434,14 @@ def main(argv: list | None = None) -> None:
 
     app.add_route("/health", _health)
     app.add_route("/ready", _ready)
+    # Browser CORS: any origin by default (the API is read-only and typically
+    # sits behind the PCAI gateway). Restrict in production with e.g.
+    # SQLHANDLER_CORS_ORIGINS="https://ui.example.com,https://other.example.com".
+    origins_raw = os.environ.get("SQLHANDLER_CORS_ORIGINS", "*").strip()
+    allow_origins = [o.strip() for o in origins_raw.split(",") if o.strip()] or ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allow_origins,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["Mcp-Session-Id"],

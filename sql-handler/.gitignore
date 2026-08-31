@@ -12,9 +12,15 @@ dist/
 # Environment / secrets — NEVER commit real credentials
 config/.env
 .env
+.env.*
+!.env.example
 *.env.local
-# Deploy values with embedded Toromont credentials
-helm/deploy-toromont-values.yaml
+# Deploy values with embedded credentials: any per-site values file
+helm/deploy-*-values.yaml
+# Local-only deployment values (helm/local/README.md explains the convention)
+helm/local/*
+!helm/local/README.md
+!helm/local/values.example.yaml
 
 # OS/editor
 .DS_Store
@@ -22,3 +28,7 @@ helm/deploy-toromont-values.yaml
 .dev/
 # Generated test parquet datasets (large, not for VCS)
 data/*.parquet
+data/**/*.parquet
+# Local build artifacts (packaged chart / wheel archives)
+/*.tar.gz
+*.tgz

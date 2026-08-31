@@ -68,8 +68,7 @@ sqlhandler --transport streamable-http --port 9097
 - Use **s3** when your data is Parquet in object storage (MinIO on-prem, AWS
   S3, GCS-interop) or you want a plain-file lake that any tool can dump into.
 - Use **iceberg** when you have a real lakehouse catalog — schema/time-travel
-  management, concurrent writers, cross-engine reads. It is the catalog-only
-  option in the [roadmap](#other-data-sources--roadmap).
+  management, concurrent writers, cross-engine reads.
 - Both onelake and s3 work through the same Helm chart (`backend:` value in
   `values.yaml`); see the deployment sections below.
 ## Why it's faster
@@ -264,7 +263,9 @@ as documented above.
 ### Caveats & limitations
 
 - **Source labels must be unique and DuckDB-identifier-safe** (letters,
-  digits, underscores). Avoid names that collide with table names.
+  digits, underscores). This is validated at startup — a duplicate or unsafe
+  label raises a `ValueError` instead of silently shadowing a source.
+  Avoid names that collide with table names.
 - **Credentials**: each source carries its own credentials. When set via
   `values.yaml` `sources:`, keys land in the ConfigMap as JSON — in
   production mount `SQLHANDLER_SOURCES` from a Secret instead.
@@ -411,10 +412,12 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `S3_ENDPOINT_URL` | S3 endpoint, e.g. `http://127.0.0.1:9000` for MinIO |
 | `S3_REGION` | S3 region (default `us-east-1`) |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials |
+| `S3_SESSION_TOKEN` | Optional STS session token |
 | `S3_BUCKET` | S3 bucket that holds the tables |
 | `S3_PREFIX` | Optional sub-tree within the bucket (default empty) |
 | `S3_ANONYMOUS` | `true` to read a public bucket without keys |
 | `S3_USE_SSL` | Force `https` when `S3_ENDPOINT_URL` has no scheme |
+| `S3_PATH_STYLE` | Path-style addressing (default `true`; what MinIO uses) |
 | `ICEBERG_CATALOG_TYPE` | `rest` (default) or `sql` |
 | `ICEBERG_CATALOG_URI` | REST endpoint or `sqlite:///path` (sql) |
 | `ICEBERG_CATALOG_TOKEN` | Optional REST bearer token |
@@ -422,6 +425,10 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `ICEBERG_WAREHOUSE` | Optional table location root |
 | `ICEBERG_NAMESPACE` | Optional namespace filter for `list_tables` |
 | `NFS_ROOT` | Mounted directory with tables (nfs backend; required) |
+| `SQLHANDLER_TRANSPORT` | Default MCP transport for the CLI (`stdio` default; `streamable-http`) |
+| `SQLHANDLER_ENV_FILE` | Path to a `.env` file (default: auto-discovered `config/.env`) |
+| `SQLHANDLER_CORS_ORIGINS` | Comma-separated browser origins allowed on `/api/*` + `/ui` (default `*`) |
+| `SQLHANDLER_DUCKDB_FILE_ACCESS` | `1` re-enables DuckDB file/table functions (`read_csv`, `COPY ... TO`, URL reads) that are locked down by default — see [Security notes](#security-notes) |
 | `SQLHANDLER_CACHE_TTL` | Seconds to keep `list_tables`/`describe_table` results in memory (default `3600`, `0` disables) |
 | `SQLHANDLER_LIST_ASYNC_REFRESH` | Serve `list_tables` from cache immediately and refresh in the background (plus automatically every `SQLHANDLER_CACHE_TTL`); default `true`, `false` = synchronous every call |
 | `SQLHANDLER_DATASET_CACHE_TTL` | Seconds to reuse an open Dataset handle (default `3600`, `0` disables) |
@@ -430,13 +437,14 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_MAX_ROWS` | Server-side row cap for `run_sql` results (default `1000`; `0` = unlimited) |
 | `SQLHANDLER_MAX_OUTPUT_ROWS` | Max rows rendered as markdown to a client (default `1000`) |
 | `SQLHANDLER_READINESS_CHECK` | `0` to disable the backend-aware `/ready` connectivity probe |
-| `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at startup, e.g. `work_order_header,work_order_note_recent` |
+| `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` |
 
 ## Performance & caching
 
-`list_tables` (DFS REST metadata) and `describe_table` (Delta `_delta_log`)
-are the calls agents/OWUI repeat on every session, and both hit the
-lakehouse every time. The server now keeps both in an in-process cache:
+`list_tables` (DFS REST / S3 listing / catalog) and `describe_table` (Delta
+`_delta_log` or Parquet footers — backend-dependent) are the calls agents/OWUI
+repeat on every session, and both hit the lakehouse every time. The server
+now keeps both in an in-process cache:
 
 - A single process-wide handler is reused (previously a new handler was
   built per tool call, silently discarding the table-list cache).
@@ -506,12 +514,15 @@ ezua:
     istioGateway: "istio-system/ezaf-gateway"
 
 fabric:
-  # The chart creates the Secret itself from these values:
+  # Preferred: create the Secret out-of-band and keep create: false (see
+  # helm/local/README.md). The chart creates it from these values only for
+  # a non-production bootstrap:
   credentialsSecret:
     create: true
-    tenantId: "<tenant-id>"
-    clientId: "<client-id>"
-    clientSecret: "<client-secret>"   # keep out of git / never in values history
+    values:
+      tenantId: "<tenant-id>"
+      clientId: "<client-id>"
+      clientSecret: "<client-secret>"   # keep out of git / never in values history
   lakehouseAbfssUrl: "abfss://<workspace-guid>@onelake.dfs.fabric.microsoft.com/<lakehouse-guid>"
   workspaceId: "<workspace-guid>"
   lakehouseId: "<lakehouse-guid>"
@@ -521,13 +532,29 @@ cache:
   prewarmTables: "work_order_header,work_order_note_recent,work_order_labour,work_order_parts"
 ```
 
+> **In-cluster callers need one line of values.** The chart ships hardened by
+> default, including an ingress NetworkPolicy that allows the pod's own
+> namespace and the Istio gateway. If clients such as Open WebUI call the
+> service **directly** via `http://sqlhandler.<ns>.svc.cluster.local:9097/mcp`
+> from another namespace, add that namespace (no client-side change needed):
+>
+> ```yaml
+> security:
+>   networkPolicy:
+>     allowedNamespaces: ["<client-namespace>"]
+> ```
+>
+> See [Security notes](#security-notes) for the full model.
+
 > **Toromont:** a ready-made values file with the real service principal +
-> OneLake coordinates is provided (`helm/deploy-toromont-values.yaml`). Paste
-> its values into the PCAI *Helm Values* editor — **do NOT commit the file
-> itself**. With it, the chart creates the `fabric-credentials` Secret
-> (`fabric.credentialsSecret.create=true`) and wires the env vars
-> (`FABRIC_TENANT_ID` / `FABRIC_CLIENT_ID` / `FABRIC_CLIENT_SECRET`) into the
-> Deployment.
+> OneLake coordinates is provided (`helm/deploy-toromont-values.yaml`, local
+> only — it is gitignored). Paste its values into the PCAI *Helm Values*
+> editor — **do NOT commit the file itself**. Note it must set
+> `backend: onelake` explicitly (the chart default is `s3`, and the fabric
+> credential wiring is gated on the backend). With it, the chart creates the
+> `fabric-credentials` Secret (`fabric.credentialsSecret.create=true`) and
+> wires the env vars (`FABRIC_TENANT_ID` / `FABRIC_CLIENT_ID` /
+> `FABRIC_CLIENT_SECRET`) into the Deployment.
 
 ### Deploy the S3 / MinIO backend
 
@@ -541,11 +568,16 @@ s3:
   endpointUrl: "http://minio:9000"
   bucket: "lakehouse"
   prefix: "datasets"
-  # create the credentials Secret from values (or provide it out-of-band):
+  # Preferred: create the Secret out-of-band and keep create: false:
+  #   kubectl -n <ns> create secret generic s3-credentials \
+  #     --from-literal=access-key=... --from-literal=secret-key=...
+  # (retrieve: kubectl -n <ns> get secret s3-credentials -o jsonpath='{.data.secret-key}' | base64 -d)
+  # create: true renders the Secret FROM these values (non-production only):
   credentialsSecret:
-    create: true
-    accessKey: "<s3-access-key>"
-    secretKey: "<s3-secret-key>"
+    create: false
+    values:
+      accessKey: "<s3-access-key>"
+      secretKey: "<s3-secret-key>"
 ```
 
 The chart wires `SQLHANDLER_BACKEND=s3` and the S3 env vars, and injects
@@ -592,10 +624,11 @@ iceberg:
   storage:
     endpointUrl: "http://minio:9000"
   credentialsSecret:
-    create: true
-    token: "<rest-token>"
-    accessKey: "<s3-access-key>"
-    secretKey: "<s3-secret-key>"
+    create: false       # create out-of-band (see helm/local/README.md)
+    values:
+      token: "<rest-token>"
+      accessKey: "<s3-access-key>"
+      secretKey: "<s3-secret-key>"
 ```
 
 The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars,
@@ -661,15 +694,46 @@ It is served by the same server process, so it needs **no extra deployment**:
 | `POST /api/query` | run read-only SQL, returns columns+rows JSON |
 | `POST /api/preview` | first N rows of a table |
 
-The UI is deliberately **read-only**: the API rejects anything that isn't a
-`SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `PRAGMA` / `VALUES` statement, so it
-cannot modify the data source. It reuses the process-wide `SqlEngine` — the
-same list/describe caches and DuckDB query path the MCP tools use — and enforces
-the same row caps (`SQLHANDLER_MAX_ROWS`, default 1000).
+The UI is deliberately **read-only**: every statement is parsed with DuckDB's
+own grammar and only plain `SELECT` queries (plus `EXPLAIN SELECT`) are
+accepted — writes, `PRAGMA`/`SET`, and `COPY` are rejected, so it cannot
+modify the data source or mutate engine settings. It reuses the process-wide
+`SqlEngine` — the same list/describe caches and DuckDB query path the MCP
+tools use — and clamps results to the same row cap (`SQLHANDLER_MAX_ROWS`,
+default 1000; when that is `0`/unlimited the UI still caps at 1000 to keep
+the JSON payload bounded).
 
 In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is
 already authenticated. The Helm chart routes `/api` with the same long timeout
 as `/mcp` (long-running queries), while the page itself uses the short timeout.
+
+## Security notes
+
+- **The read-only filter guards the web API only.** The MCP `run_sql` tool is
+  for trusted agent callers and accepts arbitrary SQL (it is the point of the
+  tool).
+- **DuckDB file access is locked down by default** on every query connection
+  (MCP and web): `read_csv`/`read_parquet`/`COPY ... TO` of local files and
+  extension-based URL fetches fail closed, while the registered pyarrow
+  datasets scan normally — all object-store IO (S3/ABFS/NFS) is done by
+  pyarrow outside DuckDB, so nothing legitimate is lost. Set
+  `SQLHANDLER_DUCKDB_FILE_ACCESS=1` if a query genuinely needs DuckDB's own
+  file/table functions.
+- **Table names are traversal-guarded**: `schema/name` values containing
+  `..` or absolute paths are rejected, and the NFS backend verifies every
+  table path stays inside `NFS_ROOT` (symlinks included).
+- **Network posture** (helm chart, `security.hardened: true` default):
+  non-root read-only container, no ServiceAccount token, ingress
+  NetworkPolicy (same namespace + Istio gateway + `allowedNamespaces`), and
+  an optional pod-level AuthorizationPolicy. External access is
+  authenticated at the gateway by the oauth2-proxy AuthorizationPolicy —
+  keep `ezua.authorizationPolicy.enabled: true`.
+- **Credentials**: create Kubernetes Secrets out-of-band (never in values
+  files); see `helm/local/README.md` for create/read/rotate commands.
+  `SQLHANDLER_SOURCES` with embedded keys is for development only.
+- **In-cluster callers** can always be granted access by adding their
+  namespace to `security.networkPolicy.allowedNamespaces` — no other change
+  needed.
 
 ## MCP tools
 
@@ -711,7 +775,7 @@ secret store, and **rotate it** once the integration is confirmed.
 ## Dev
 
 ```bash
-uv pip install -e .[dev]
+uv pip install -e '.[dev]'
 ruff check src
 pytest
 ```

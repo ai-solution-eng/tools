@@ -9,12 +9,29 @@ Run the script from anywhere in the repo or its hardlinked deployment:
 python src/model_benchmarker/benchmark_chat.py ...
 ```
 
+## Setup
+
+Python ≥ 3.12. No package install is needed — the scripts bootstrap `sys.path`
+themselves and are run by path:
+
+```bash
+pip install -r requirements.txt
+```
+
+`httpx2` is a hard dependency of the shared client module (previously missing
+from this file). `tokenizers` is optional — without it, text chunking falls
+back to character-based.
+
+> The examples below abbreviate the script path to `python benchmark_chat.py`;
+> substitute `python src/model_benchmarker/benchmark_chat.py` when running from
+> anywhere else in the repo.
+
 ## What it measures
 
 | Metric | Definition |
 |---|---|
-| **TTFT (ms)** | Time from request send until the first token of any kind (`content` or `reasoning_content`) arrives. |
-| **tokens/s** | `usage.completion_tokens / (stream_end − first_token)` — generation throughput **excluding TTFT**. |
+| **TTFT (ms)** | Time from request send until the first token of any kind (`content` or `reasoning_content`, or any other non-empty string delta field — exotic stream shapes never read TTFT = 0) arrives. |
+| **tokens/s** | `usage.completion_tokens / (stream_end − first_token)` — generation throughput **excluding TTFT**. Falls back to counting content+reasoning chunks when the stream carries no `usage`, and to the full request time when the whole response arrives in one burst. |
 
 The output table shows percentile columns **P50 / P95 / P99 / P100**. For TTFT the
 values are ascending (bigger = worse). For tokens/s the percentiles are *inverted*:
@@ -44,13 +61,18 @@ Pass `--no-nonce` to measure the cache-friendly regime instead.
 
 ## Flags
 
+Flag style is mixed: most flags use underscores exactly as written
+(`--model_class_name`, `--number_users`); `--no-nonce` is the only dash-style
+flag in this script.
+
 ### Model selection
 
 | Flag | Description |
 |---|---|
-| `--model_class_name NAME` | Use a registered model from `utils/pcai_models.py` (e.g. `deepseek_v4_flash_280B`, `qwen38_27B`, `qwen36_27B`, `gemma4_31B`, `glm_52_753B`). Imported lazily; not available in the hardlinked deployment. |
+| `--model_class_name NAME` | Use a registered model from `utils/pcai_models.py` (e.g. `deepseek_v4_flash_280B`, `qwen38_27B`, `qwen36_27B`, `gemma4_31B`, `glm_52_753B`). Imported lazily; not available in the hardlinked deployment. **Caveat:** entries with `currently_deployed=False` in `pcai_models.py` (currently `qwen36_27B`, `glm_52_753B`) fail every request — pick a deployed entry or use `--url`. |
 | `--url URL` | OpenAI-compatible endpoint root (no `/v1`). Required when `--model_class_name` is omitted. |
-| `--api_key KEY` | Bearer token for the endpoint. **Optional** — omit it for endpoints that don't require auth; no `Authorization` header is then sent. |
+| `--api_key KEY` | Bearer token for the endpoint. **Optional** — omit it for endpoints that don't require auth; no `Authorization` header is then sent. Prefer `--api_key_file` / `PCAI_API_KEY` so the secret stays out of shell history and `ps`. |
+| `--api_key_file FILE` | Read the bearer token from a file (first line, stripped). Priority: `--api_key` > `--api_key_file` > `$PCAI_API_KEY`. |
 | `--remote` | Use the public serving URL. Without it, the model targets its **in-cluster** URL (`.svc.cluster.local`). Omit `--remote` when running inside the same cluster. |
 
 ### Load shape
@@ -60,10 +82,10 @@ Pass `--no-nonce` to measure the cache-friendly regime instead.
 | `--number_users N,M,...` | Concurrency levels to sweep. Default `1`. |
 | `--requests_per_user N` | Sequential requests per user, cycling through `--tasks`. Default `1`. |
 | `--tasks t1,t2,...` | Task types: `coding` (max_tokens 8192), `creative` (16384), `mixed` (24576 — one request that must do coding+creative), `custom`. Default `coding,creative`. |
-| `--context_length 0,32768,...` | Prefill-length sweep; each level pads every prompt to ~that many input tokens (≈4 chars/token). `0` disables padding. Default `0`. |
-| `--multiturn` | Each user runs `--requests_per_user` **turns of one growing conversation** (full history replayed each turn) instead of independent requests, so the shared prefix is reused and the server's prefix/KV cache engages. Gives the `turn1` vs `turns-post` split. |
+| `--context_length 0,32768,...` | Prefill-length sweep; each level pads every prompt to ~that many input tokens (≈4 chars/token). With `--multiturn` only **turn 1** is padded (later turns reuse the prefix). `0` disables padding. Default `0`. |
+| `--multiturn` | Each user runs `--requests_per_user` **turns of one growing conversation** (full history replayed each turn) instead of independent requests, so the shared prefix is reused and the server's prefix/KV cache engages. Gives the `turn1` vs `turns-post` split. Assistant turns replay **`content` only** — reasoning tokens are not resent (matches real chat clients; runs made before this change are not directly comparable). |
 | `--separate_tasks` | Run each task in its own (ctx, users) pass, so every task gets a clean turn-1 vs turns-post comparison without cross-task interference. |
-| `--custom` args | `--prompt` (the prompt text), `--max_tokens`, `--temperature`, `--top_p` for the `custom` task. |
+| `--custom` args | `--prompt` (the prompt text), `--max_tokens`, `--temperature`, `--top_p` for the `custom` task. Defaults when omitted: max_tokens 512, temperature 1.0, top_p 1.0, and a built-in essay prompt if `--prompt` is not given. |
 
 ### Cache behavior
 
@@ -88,28 +110,38 @@ Pass `--no-nonce` to measure the cache-friendly regime instead.
 | Flag | Description |
 |---|---|
 | `--debug_stream` | Print the first delta's field names and per-request content/reasoning chunk counts — diagnose TTFT=0 when a server streams under non-standard delta fields. |
+| `--quiet` | Suppress the per-request progress lines (keeps prewarm notices, level previews and the final table). Recommended when stdout is piped/redirected — per-request `print()` runs on the event loop, and a backpressured stdout can stall all streams and distort TTFT/tokens-s. |
 | `--output FILE` | Write the final summary table to FILE (in addition to stdout). |
 
 ### Environment
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MODEL_POOL_MAX_CONNECTIONS` | `128` | httpx connection-pool ceiling. With fewer than the concurrency level, requests serialize client-side and the *high percentile* TTFT blows up (your benchmark is pool-bound, not server-bound). Raise it to match your max `--number_users`. |
-| `MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS` | `10` | Idle keep-alive connections kept by the pool. |
+| `MODEL_POOL_MAX_CONNECTIONS` | `128` | httpx connection-pool ceiling. With fewer than the concurrency level, requests serialize client-side and the *high percentile* TTFT blows up (your benchmark is pool-bound, not server-bound). Raise it to match your max `--number_users`; the script prints a warning when a sweep level exceeds it. |
+| `MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS` | `32` | Idle keep-alive connections kept by the pool. Below your concurrency level, wave boundaries pay fresh TCP+TLS handshakes. |
+| `PCAI_API_KEY` | *(unset)* | Fallback bearer token for `--url` mode. Resolution order: `--api_key` > `--api_key_file` > this env var. |
+| `REMOTE_CA_BUNDLE` | *(unset)* | Path to a CA bundle (`.pem`/`.crt`). When set (and the file exists), **TLS certificate verification is ON** for remote endpoints — against that bundle. When unset, remote endpoints run with verification **disabled** (self-signed PCAI ingress) and a one-time `[security]` warning is printed to stderr. |
+| `DISCOVERED_MODEL_CACHE_MAX` | `512` | Bound on the per-URL `/v1/models` model-name discovery cache. |
+| `SYNC_POOL_SIZE` | `12` | Threads in the sync→async bridge pool (shared platform modules). |
 
-The client read timeout is hardcoded (300 s) in `utils/pcai_model_classes.py`; very
-long generations at high concurrency can exceed it and log `FAILED: Request timed out.`
+The client request timeout is `connect=30s, read=600s` (`_MODEL_REQUEST_TIMEOUT`
+in `utils/pcai_model_classes.py`) and is applied to both the httpx clients and
+the OpenAI SDK clients — the SDK ignores the timeout configured on an injected
+httpx client and would otherwise fall back to its own `connect=5s` default,
+turning slow high-concurrency handshakes into spurious failures. Very long
+generations at high concurrency can still log `FAILED: Request timed out.`
 That is the server being saturated, not a client bug.
 
 ---
 
 ## Examples
 
-### 1. The standard capacity suite (reproduces `results/`)
+### 1. The standard capacity suite (the sweep shape that populated `results/`)
 
 One run per model: 1/4/32/64 concurrent users, 5-turn conversations, all tasks,
-both cold (ctx=0) and 32k prefilled, each task isolated. This is exactly what
-populated `results/`:
+both cold (ctx=0) and 32k prefilled, each task isolated. The committed results
+use this sweep with per-setup filenames — `<SETUP>` encodes the serving config
+(see the naming convention in the HTML report section below):
 
 ```bash
 for m in deepseek_v4_flash_280B qwen38_27B gemma4_31B; do
@@ -120,9 +152,12 @@ for m in deepseek_v4_flash_280B qwen38_27B gemma4_31B; do
     --tasks coding,creative,mixed \
     --context_length 0,32768 \
     --multiturn --separate_tasks \
-    --output results/${m}.txt
+    --output results/<model-dir>/<SETUP>.txt
 done
 ```
+
+Files must live under a per-model subdirectory (`results/<model-dir>/…`) —
+`.txt` files placed directly in `results/` are not picked up by the report.
 
 *Question it answers:* "What TTFT/tokens-s can each concurrency level sustain,
 with and without 32k of memory already present?" — i.e. many back-to-back
@@ -142,7 +177,7 @@ python benchmark_chat.py \
   --tasks coding,creative,mixed \
   --context_length 0,32768 \
   --no-nonce \
-  --output results/agentic_shared_prefix.txt
+  --output results/deepseek_v4_flash_0731/agentic_shared_prefix.txt
 ```
 
 *Question it asks:* "When N instances share the same prefix, does the server
@@ -161,7 +196,7 @@ python benchmark_chat.py --model_class_name deepseek_v4_flash_280B --remote \
   --tasks coding,creative,mixed \
   --context_length 32768 \
   --no-nonce --prewarm \
-  --output results/agentic_prewarm_32k.txt
+  --output results/deepseek_v4_flash_0731/agentic_prewarm_32k.txt
 ```
 
 Compare Example 2 vs 3 to quantify how much of the gain was "cache already
@@ -172,7 +207,8 @@ resident" vs "requests joining the graph."
 Quick sanity check against a single endpoint (no sweep, mixed tasks):
 
 ```bash
-python benchmark_chat.py --url https://<endpoint> --api_key "$PCAI_KEY" \
+python benchmark_chat.py --url https://<endpoint> \
+  --api_key_file ~/.config/pcai/pcai.key \
   --number_users 4 --requests_per_user 3 --tasks coding,creative,mixed
 ```
 
@@ -196,7 +232,7 @@ for lvl in off low high; do
   python benchmark_chat.py --model_class_name qwen38_27B --remote \
     --number_users 8 --requests_per_user 5 \
     --tasks coding --thinking_level $lvl \
-    --output results/qwen_$lvl.txt
+    --output results/qwen_38_27b/qwen_think_$lvl.txt
 done
 ```
 
@@ -240,10 +276,14 @@ If TTFT *high-percentiles* jump when you omit this, you're pool-bound
 ### 10. Single turn, many users (pure prefill/decode capacity)
 
 ```bash
-python benchmark_chat.py --model_class_name glm_52_753B --remote \
+python benchmark_chat.py --model_class_name deepseek_v4_flash_280B --remote \
   --number_users 64 --requests_per_user 1 \
   --tasks coding --context_length 32768
 ```
+
+(Any model with `currently_deployed=True` in `pcai_models.py` works here —
+`qwen36_27B`/`glm_52_753B` are currently marked not-deployed and would fail
+every request.)
 
 ### 11. Key-less endpoint (no API key)
 
@@ -264,7 +304,7 @@ From a pod inside the same cluster, hit the in-cluster service DNS directly
 
 ```bash
 python benchmark_chat.py --url https://<model>.project-user-<name>.serving.<cluster>.<domain> \
-  --api_key <token> \
+  --api_key_file ~/.config/pcai/pcai.key \
   --number_users 32 --requests_per_user 5 \
   --tasks coding,creative,mixed \
   --context_length 0,32768 \
@@ -287,6 +327,33 @@ model itself.
 
 ---
 
+## Deployment to pcai-solutions (hardlink mirror)
+
+The canonical copy of this repo lives here; `pcai-solutions/tools/model-benchmarker/`
+is a **hardlink mirror** — every mirrored file is the same inode, so an edit
+through either path updates both. Sync is driven by `hardlinker.py` +
+`hardlink_config.json`:
+
+```bash
+python3 hardlinker.py --config hardlink_config.json                 # preview (dry run)
+python3 hardlinker.py --config hardlink_config.json --run           # link/overwrite for real
+python3 hardlinker.py --config hardlink_config.json --run --prune   # also offer to delete dest orphans
+```
+
+- The shipped config sets `"dry_run": true`, so a bare run is a **preview
+  only** — pass `--run` to apply.
+- `on_conflict: overwrite` relinks any dest file whose inode differs from
+  the source.
+- The ignore list excludes files that must not ship: `pcai_models.py` (it
+  embeds cluster-internal URLs and bearer keys — this is why
+  `--model_class_name` is unavailable in the deployment; use `--url` /
+  `--api_key` there), plus `ruff.toml`, `mypy.ini`, `formatter.sh`,
+  `prune_charts.py`, caches and `*.zip`.
+- Stale `*-<version>.tgz` / `.tar.gz` chart archives in the repo root are
+  auto-pruned (newest kept) on every run; `--no-charts` disables that.
+
+---
+
 ## HTML report - results_to_html.py
 
 The text tables under `results/` carry the numbers but not the *setup*
@@ -298,7 +365,7 @@ self-contained HTML file that makes the setup explicit per run:
 | Field | Source |
 |---|---|
 | **Model** | results sub-directory (e.g. `qwen_38_27b`) |
-| **GPU type + count** | filename (e.g. `H200Sx4` -> 4x H200 SXM) |
+| **GPU type + count** | filename (e.g. `H200Sx4` -> 4x NVIDIA H200 **PCIe** — the trailing `S` is a legacy filename marker, not SXM) |
 | **MTP / speculative-decoding config** | filename (`dflash2`, `dspark`, `eagle`, `dsp`, `mtp`) or catalog; else `Disabled` |
 | **Weights** | `nvfp4` / `fp8` / `bf16` / `fp16` token in the filename |
 | **Engine** | `sglang` / `vllm` token, or catalog image |
@@ -309,20 +376,43 @@ self-contained HTML file that makes the setup explicit per run:
 | **Compare** | tick 2+ setups for a side-by-side table on shared (ctx, users, task) workloads with best/worst highlighted and a metric selector |
 
 The HTML is fully self-contained (no external CSS/JS), so the file can be
-shared by itself - no repo checkout needed.
+shared by itself - no repo checkout needed. **Re-run it after adding any
+`results/<model>/*.txt`** — `results/benchmark_report.html` is a generated
+snapshot, not live. See also [`results/README.md`](results/README.md) for how
+the committed results were produced.
 
 ```bash
-python3 src/model_benchmarker/results_to_html.py                 # uses results/ beside the script
+python3 src/model_benchmarker/results_to_html.py                 # uses <repo-root>/results (two levels above the script)
 python3 src/model_benchmarker/results_to_html.py --results path --output out.html
 python3 src/model_benchmarker/results_to_html.py --catalog path/seed_catalog.json
 python3 src/model_benchmarker/results_to_html.py --title "My benchmarks" --open
+python3 src/model_benchmarker/results_to_html.py \
+  --results_label "tools/model-benchmarker/results/" \
+  --catalog_label "tools/model-downloader-web/src/model_downloader/app/seed_catalog.json"
 ```
 
+`--results_label` / `--catalog_label` only change the paths *displayed* in the
+report header (defaults show the pcai-solutions layout).
+
+The matching Model-Downloader catalog entry is auto-discovered by walking up
+from the script and checking, at each level,
+`ModelDownloader/src/model_downloader/app/seed_catalog.json` and
+`pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json`.
+Pass `--catalog` explicitly otherwise. The catalog is a JSON **list** of
+entries using `name` / `catalog_id` / `image` / `arguments` / `tier` /
+`resource_request_*` keys. Without a catalog, MTP shows `Disabled` and the
+engine is inferred only from the filename.
+
+Result files must live in a per-model subdirectory — `results/<model-dir>/<SETUP>.txt`.
+The directory name is the model slug; add it to `MODEL_NAMES` in
+`results_to_html.py` for a pretty display name (otherwise it is title-cased).
 The expected result-file naming convention is:
 
 ```
-<GPU>[x<count>][_sglang|_vllm][_dflash|_dspark|_eagle|_dsp|_mtp][_nvfp4|_fp8|_bf16|_fp16][_hicache[xN]][_replicasxN].txt
+<GPU>[x<count>][_sglang|_vllm][_dflash|_dflash2|_dspark|_dsp|_eagle|_eagle3|_mtp|_mtp2|_disabled]
+    [_nvfp4|_fp8|_fp8_e4m3|_bf16|_fp16][_hicache[xN]][_replicasxN].txt
 ```
 
 e.g. `H200_sglang_dflash2_hicachex3_replicasx3.txt`, `RTXPRO6000x2_hicachex16.txt`,
-`H200.txt`, `OLD_RTXPRO6000x1.txt`.
+`H200.txt`, `OLD_RTXPRO6000x1.txt` (the `OLD_` prefix flags the file obsolete in
+the report).

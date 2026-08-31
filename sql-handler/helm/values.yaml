@@ -5,18 +5,28 @@
 # -- Deployment ---------------------------------------------------------------
 replicaCount: 1
 
+# Grace period for in-flight MCP tool calls on rollout (gateway allows up
+# to 3600s per call; the pod gets this many seconds to finish draining).
+terminationGracePeriodSeconds: 90
+
 image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
   tag: v0.6.0
+  # Optional: pin by digest for production (e.g. "sha256:abcd...").
+  digest: ""
   pullPolicy: IfNotPresent
 
 # -- Backend selection -------------------------------------------------------
 # One data source is read at a time:
-#   onelake       - Microsoft Fabric OneLake (Delta Lake over ABFS)  [default]
 #   s3 | minio    - S3-compatible object store (Parquet files), e.g. MinIO
+#                   [default — in-cluster MinIO test bucket]
+#   onelake       - Microsoft Fabric OneLake (Delta Lake over ABFS)
 #   iceberg       - Apache Iceberg tables through a REST or SQL catalog
+#   nfs           - mounted directory (PVC/hostPath) of Parquet/Delta
+# NOTE: when using onelake you MUST set backend: onelake explicitly — the
+# per-backend credential wiring (and Secret creation) is gated on it.
 backend: s3
 
 # -- Federated multi-source mode ---------------------------------------------
@@ -89,14 +99,56 @@ readinessProbe:
   enabled: true
   initialDelaySeconds: 5
   periodSeconds: 10
-  timeoutSeconds: 3
+  # /ready performs a real backend check (server allows ~17s: 2s handler +
+  # 15s connection test). A 3s timeout here would flap a slow-but-healthy
+  # backend out of the Service before the server can answer.
+  timeoutSeconds: 20
+
+# -- Workload security hardening ------------------------------------------------
+# Defense-in-depth for a network-facing SQL endpoint. Each piece can be
+# turned off individually without leaving the hardened profile.
+security:
+  # Master switch: run as non-root, seccomp RuntimeDefault, no privilege
+  # escalation, dropped capabilities, read-only root filesystem, no
+  # auto-mounted ServiceAccount token, ingress NetworkPolicy.
+  hardened: true
+  # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
+  # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
+  # Egress is NOT restricted (the server must reach AAD/OneLake/S3).
+  networkPolicy:
+    enabled: true
+    gatewayNamespace: istio-system
+    # Extra namespaces whose pods may call this service directly
+    # (in-cluster MCP clients, OWUI, DSH, ...). Cluster-internal access
+    # stays frictionless: add the client's namespace here.
+    allowedNamespaces: []
+    # Raw extra NetworkPolicy `from:` peers (CIDRs, podSelectors...),
+    # appended verbatim to the ingress rules.
+    additionalIngress: []
+  # Pod-level Istio AuthorizationPolicy (east-west, service-to-service).
+  # Off by default: principal names are deployment-specific and a wrong
+  # list locks the service completely. The gateway authz (ezua.*) plus the
+  # NetworkPolicy above already cover the common cases. When enabled, at
+  # least one of principals/namespaces is REQUIRED (an ALLOW policy with
+  # no rules would deny everything).
+  authorizationPolicy:
+    enabled: false
+    # e.g. ["cluster.local/ns/istio-system/sa/ezaf-gateway-service-account"]
+    principals: []
+    # Allowed caller namespaces (Istio identity namespaces).
+    namespaces: []
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  # The app never calls the Kubernetes API; don't hand it a token.
+  automountServiceAccountToken: false
 
 # -- OneLake / Fabric connection ---------------------------------------------
 # Sensitive values go in a Kubernetes Secret; non-secret connection details
 # go in a ConfigMap. NEVER put the service-principal secret in values.yaml.
 #
-# fabric.credentials.secretName refers to a Secret you create separately
-# (or via `kubectl create secret`, or the example secret.yaml template).
+# fabric.credentialsSecret.name refers to a Secret you create separately
+# (via `kubectl create secret`, or by the chart when
+# fabric.credentialsSecret.create is true).
 fabric:
   # Secret name + keys holding the Entra service-principal credential.
   credentialsSecret:
@@ -125,17 +177,28 @@ fabric:
 # Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
 # key and secret go through a Kubernetes Secret - NEVER in values.yaml.
 s3:
-  # Secret name + keys holding the S3 credentials (create the Secret
-  # out-of-band with `kubectl create secret`, or use create: true below for a
-  # non-production bootstrap). NEVER commit real keys.
+  # Secret name + keys holding the S3 credentials. Create the Secret
+  # out-of-band (the default), e.g.:
+  #   kubectl -n <namespace> create secret generic s3-credentials \
+  #     --from-literal=access-key=<S3_ACCESS_KEY> \
+  #     --from-literal=secret-key=<S3_SECRET_KEY>
+  # Retrieve/rotate later with:
+  #   kubectl -n <namespace> get secret s3-credentials -o jsonpath='{.data.access-key}' | base64 -d
+  #   kubectl -n <namespace> get secret s3-credentials -o jsonpath='{.data.secret-key}' | base64 -d
+  # Dev/local credentials that must stay out of git belong in helm/local/
+  # (gitignored — see helm/local/README.md).
   credentialsSecret:
     name: s3-credentials
     accessKeyKey: access-key
     secretKeyKey: secret-key
-    create: true
+    # Keep false: with create: true the chart renders the Secret FROM the
+    # values below, which then live in values files and the Helm release
+    # secret (readable via `helm get values <release> -a`). Only for
+    # throwaway clusters, never for a shared chart.
+    create: false
     values:
-      accessKey: "admin-io"
-      secretKey: "MinIO$2K"
+      accessKey: ""
+      secretKey: ""
 
   # MinIO/S3 connection details (non-secret -> ConfigMap).
   endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # in-cluster MinIO
@@ -237,6 +300,13 @@ affinity: {}
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
+
+  # Kyverno ClusterPolicy that tags this workload as a PCAI vendor-service.
+  # Disable on clusters without the kyverno.io CRD — the post-install hook
+  # would otherwise fail the whole release (the same labels are already set
+  # directly by sqlhandler.ezua.labels in _helpers.tpl).
+  kyverno:
+    enabled: true
 
   virtualService:
     # Public endpoint on the PCAI gateway. MCP clients connect to:

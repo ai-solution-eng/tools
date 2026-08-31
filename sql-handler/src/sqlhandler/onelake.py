@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import FabricConfig
 from .provider import DataProvider, LakehouseError, TableInfo
@@ -34,6 +35,11 @@ from .provider import DataProvider, LakehouseError, TableInfo
 logger = logging.getLogger("sqlhandler.onelake")
 
 _DELTA_LOG = "_delta_log"
+
+# Schema directories are listed concurrently in list_tables (one DFS call
+# each); cap the fan-out so a lake with hundreds of schemas doesn't open
+# hundreds of simultaneous connections.
+_SCHEMA_LIST_WORKERS = 8
 
 # Refresh the cached DFS bearer token this many seconds before it expires
 # (Entra client-credentials tokens for storage.azure.com live 1h by default).
@@ -231,7 +237,9 @@ class OneLakeProvider(DataProvider):
         """List the Delta tables under the lake Tables dir.
 
         OneLake doesn't support blob-style listing, so we enumerate via the
-        DFS REST API: Tables -> schema dirs -> table dirs.
+        DFS REST API: Tables -> schema dirs -> table dirs. Schema listings run
+        concurrently (one HTTPS round-trip per schema is the bulk of the
+        latency on lakes with many schemas).
         """
         tables_root = self.base_path
         try:
@@ -239,20 +247,32 @@ class OneLakeProvider(DataProvider):
         except LakehouseError as exc:
             raise LakehouseError(f"Failed to list tables at {tables_root}: {exc}") from exc
 
-        infos: list[TableInfo] = []
-        for entry in schema_entries:
-            schema = entry.get("name", "").rstrip("/").split("/")[-1]
-            if entry.get("isDirectory") != "true" or not schema or schema.startswith("."):
-                continue
-            schema_path = f"{tables_root}/{schema}"
+        schemas = [
+            entry.get("name", "").rstrip("/").split("/")[-1]
+            for entry in schema_entries
+            if entry.get("isDirectory") == "true"
+            and entry.get("name", "").rstrip("/").split("/")[-1]
+            and not entry.get("name", "").rstrip("/").split("/")[-1].startswith(".")
+        ]
+
+        def _list_schema(schema: str) -> list[TableInfo]:
             try:
-                table_entries = self._dfs_list(schema_path)
+                table_entries = self._dfs_list(f"{tables_root}/{schema}")
             except LakehouseError:
-                continue
-            for te in table_entries:
-                name = te.get("name", "").rstrip("/").split("/")[-1]
-                if te.get("isDirectory") == "true" and name and name != _DELTA_LOG and not name.startswith("."):
-                    infos.append(TableInfo(name=name, schema=schema, format="delta"))
+                return []
+            return [
+                TableInfo(name=name, schema=schema, format="delta")
+                for te in table_entries
+                if (name := te.get("name", "").rstrip("/").split("/")[-1])
+                and te.get("isDirectory") == "true"
+                and name != _DELTA_LOG
+                and not name.startswith(".")
+            ]
+
+        infos: list[TableInfo] = []
+        with ThreadPoolExecutor(max_workers=min(_SCHEMA_LIST_WORKERS, max(len(schemas), 1))) as pool:
+            for batch in pool.map(_list_schema, schemas):
+                infos.extend(batch)
 
         infos.sort(key=lambda ti: ti.path)
         return infos

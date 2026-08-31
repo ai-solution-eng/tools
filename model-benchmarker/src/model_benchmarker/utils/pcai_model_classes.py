@@ -4,6 +4,7 @@ import inspect
 import io
 import os
 import re
+import sys
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
@@ -47,19 +48,37 @@ def _pool_limits_from_env() -> httpx.Limits:
     ``MODEL_POOL_MAX_CONNECTIONS`` (and ``MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS``)
     for other deployments (e.g. the original single-replica chart used 30/10).
     """
-    try:
-        max_conn = int(os.environ.get("MODEL_POOL_MAX_CONNECTIONS", "128"))
-    except (TypeError, ValueError):
-        max_conn = 128
-    try:
-        max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "32"))
-    except (TypeError, ValueError):
-        max_keepalive = 32
     return httpx.Limits(
-        max_connections=max(1, max_conn),
-        max_keepalive_connections=max(1, max_keepalive),
+        max_connections=model_pool_max_connections(),
+        max_keepalive_connections=model_pool_max_keepalive_connections(),
         keepalive_expiry=120.0,
     )
+
+
+def model_pool_max_connections() -> int:
+    """Effective ``MODEL_POOL_MAX_CONNECTIONS`` (default 128, min 1)."""
+    try:
+        return max(1, int(os.environ.get("MODEL_POOL_MAX_CONNECTIONS", "128")))
+    except (TypeError, ValueError):
+        return 128
+
+
+def model_pool_max_keepalive_connections() -> int:
+    """Effective ``MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS`` (default 32, min 1)."""
+    try:
+        return max(1, int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "32")))
+    except (TypeError, ValueError):
+        return 32
+
+
+# Single source of truth for model-request timeouts.  NOTE: the openai SDK
+# resolves a *per-request* timeout from the OpenAI/AsyncOpenAI ``timeout``
+# kwarg — falling back to its own DEFAULT_TIMEOUT (connect=5s, read=600s) —
+# and IGNORES the timeout configured on an injected httpx client.  So the
+# SDK clients MUST be given this explicitly (see _openai_client_kwargs) or
+# the httpx-level value is dead config: a 5s connect timeout turns slow
+# TLS handshakes at high concurrency into spurious request failures.
+_MODEL_REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 
 
 # TLS verification for "remote" model endpoints.  PCAI endpoints use
@@ -68,17 +87,46 @@ def _pool_limits_from_env() -> httpx.Limits:
 # and verification will be performed against it (strictly better — it also
 # protects the bearer API keys in flight).
 _REMOTE_CA_BUNDLE = os.environ.get("REMOTE_CA_BUNDLE", "")
+_REMOTE_VERIFY_WARNED = False
+
+
+def _warn_once_insecure_tls(reason: str) -> None:
+    """One-time stderr notice that remote TLS verification is disabled.
+
+    Printed (not logged) because CLI entry points commonly raise the root
+    logger level above WARNING, which would silence a logger.warning here.
+    """
+    global _REMOTE_VERIFY_WARNED
+    if _REMOTE_VERIFY_WARNED:
+        return
+    _REMOTE_VERIFY_WARNED = True
+    print(
+        f"[security] {reason} Bearer tokens are unauthenticated against MITM "
+        "on untrusted networks. Set REMOTE_CA_BUNDLE=/path/to/ca-bundle.pem "
+        "(platform CA) to enable certificate verification.",
+        file=sys.stderr,
+    )
 
 
 def _remote_verify() -> str | bool:
     """TLS verification setting for *remote* model endpoints.
 
-    Returns the pinned CA bundle when configured, else ``False`` (the
-    legacy self-signed-PCAI behaviour).  Local in-cluster endpoints keep
-    normal system-CA verification.
+    Returns the pinned CA bundle when ``REMOTE_CA_BUNDLE`` is set and exists
+    (verification ON against that bundle), else ``False`` (the legacy
+    self-signed-PCAI behaviour, warned about once per process).  Local
+    in-cluster endpoints keep normal system-CA verification.
     """
-    if _REMOTE_CA_BUNDLE and os.path.exists(_REMOTE_CA_BUNDLE):
-        return _REMOTE_CA_BUNDLE
+    if _REMOTE_CA_BUNDLE:
+        if os.path.exists(_REMOTE_CA_BUNDLE):
+            return _REMOTE_CA_BUNDLE
+        _warn_once_insecure_tls(
+            f"REMOTE_CA_BUNDLE={_REMOTE_CA_BUNDLE!r} does not exist — falling back to "
+            "TLS verification DISABLED for remote model endpoints."
+        )
+        return False
+    _warn_once_insecure_tls(
+        "TLS certificate verification is DISABLED for remote model endpoints (self-signed PCAI ingress)."
+    )
     return False
 
 
@@ -176,7 +224,7 @@ def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
             if _async_client_fallback is None:
                 _async_client_fallback = httpx.AsyncClient(
                     verify=_client_verify(remote),
-                    timeout=httpx.Timeout(300.0, connect=30.0),
+                    timeout=_MODEL_REQUEST_TIMEOUT,
                     limits=_pool_limits_from_env(),
                 )
             return _async_client_fallback
@@ -186,7 +234,7 @@ def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
         if client is None:
             client = httpx.AsyncClient(
                 verify=_client_verify(remote),
-                timeout=httpx.Timeout(300.0, connect=30.0),
+                timeout=_MODEL_REQUEST_TIMEOUT,
                 limits=_pool_limits_from_env(),
             )
             cache[loop] = client
@@ -302,11 +350,12 @@ def _streamable_http_factory(
     timeout: httpx2.Timeout | None = None,
     auth: httpx2.Auth | None = None,
 ) -> httpx2.AsyncClient:
-    """httpx2 client factory for MCPServerStreamableHttp (MCP Python SDK v2)
-    that disables TLS verification - required for the PCAI ingress which
-    serves self-signed certs. Mirrors the default factory signature so it
-    can be dropped in via params['httpx_client_factory']."""
-    kwargs: dict = {"follow_redirects": False, "verify": False}
+    """httpx2 client factory for MCPServerStreamableHttp (MCP Python SDK v2).
+    TLS verification follows the same REMOTE_CA_BUNDLE toggle as the main
+    remote clients (PCAI ingress serves self-signed certs, so it defaults
+    to disabled with a one-time warning). Mirrors the default factory
+    signature so it can be dropped in via params['httpx_client_factory']."""
+    kwargs: dict = {"follow_redirects": False, "verify": _remote_verify()}
     if timeout is not None:
         kwargs["timeout"] = timeout
     if headers is not None:
@@ -455,6 +504,10 @@ class BaseModel:
             "api_key": self.api_key,
             "base_url": self.base_url,
             "http_client": http_client,
+            # The SDK ignores the httpx client's timeout and applies its own
+            # DEFAULT_TIMEOUT (connect=5s, read=600s) per request unless one
+            # is given here — pass ours so connect=30s survives.
+            "timeout": _MODEL_REQUEST_TIMEOUT,
         }
         if not self.api_key and "_enforce_credentials" in inspect.signature(client_cls.__init__).parameters:
             kwargs["_enforce_credentials"] = False
@@ -466,9 +519,7 @@ class BaseModel:
             f"Model {self.model_name} is not currently deployed. "
             f"See {_MLIS_PAGE} and change flag `currently_deployed` to enable."
         )
-        return self.model_client_class(
-            **self._openai_client_kwargs(self.model_client_class, self.http_client)
-        )
+        return self.model_client_class(**self._openai_client_kwargs(self.model_client_class, self.http_client))
 
     @cached_property
     def async_client(self) -> AsyncOpenAI:
@@ -545,9 +596,9 @@ class BaseModel:
             if f.name in self._REPR_SKIP or not f.repr:
                 continue
             val = getattr(self, f.name)
-            # Mask long API keys
-            if f.name == "api_key" and isinstance(val, str) and len(val) > 20:
-                val = val[:12] + "..." + val[-4:]
+            # Mask API keys (anything non-empty — short tokens must not leak either)
+            if f.name == "api_key" and isinstance(val, str) and val:
+                val = val[:4] + "..." if len(val) > 8 else "***"
             # Truncate long URLs
             if f.name == "url_remote" and isinstance(val, str) and len(val) > 80:
                 val = val[:60] + "..." + val[-17:]

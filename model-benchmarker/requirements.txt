@@ -1,3 +1,7 @@
 numpy>=2.0
 httpx>=0.27
+httpx2>=2.10
 openai>=1.40
+# Optional: token-count-aware chunking in utils/token_text_splitter.py
+# (character-based fallback when absent):
+# tokenizers

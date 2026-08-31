@@ -1,0 +1,41 @@
+# Copy to helm/local/deploy-<site>-values.yaml and fill in. Tracked example:
+# contains no credentials. See helm/local/README.md.
+
+replicaCount: 1
+terminationGracePeriodSeconds: 90
+
+image:
+  repository: ghcr.io/ai-solution-eng/sqlhandler
+  tag: v0.6.0
+  digest: ""            # pin by digest for production
+  pullPolicy: IfNotPresent
+
+# Set explicitly — the chart default is s3; per-backend credential wiring
+# and Secret creation are gated on the matching backend value.
+backend: onelake
+
+ezua:
+  domainName: <your-domain>
+  virtualService:
+    endpoint: "sqlhandler.<your-domain>"
+    istioGateway: "istio-system/ezaf-gateway"
+  # Keep the gateway AuthorizationPolicy (oauth2-proxy) ENABLED unless you
+  # have a documented alternative; disabling it publishes unauthenticated
+  # /mcp and /api through the gateway.
+  authorizationPolicy:
+    enabled: true
+
+fabric:
+  lakehouseAbfssUrl: "abfss://<workspace-guid>@onelake.dfs.fabric.microsoft.com/<lakehouse-guid>"
+  credentialsSecret:
+    create: false       # create the Secret out-of-band (see ../README.md)
+    # values:            # only when create: true (non-production)
+    #   tenantId: "<tenant-id>"
+    #   clientId: "<client-id>"
+    #   clientSecret: "<client-secret>"
+
+# Optional: lock network access down to specific client namespaces.
+security:
+  hardened: true
+  networkPolicy:
+    allowedNamespaces: []

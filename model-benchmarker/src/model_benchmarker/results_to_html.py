@@ -19,11 +19,13 @@ The output HTML is fully self-contained (no external CSS/JS), so you can
 share the file by itself - no one needs the repo or the .txt files.
 
 Usage:
-  python3 results_to_html.py                 # results/ next to script
+  python3 results_to_html.py                 # <repo-root>/results (two levels above this script)
   python3 results_to_html.py --results path  # explicit results dir
   python3 results_to_html.py --catalog path/seed_catalog.json
   python3 results_to_html.py --output out.html
   python3 results_to_html.py --title "Chat benchmarks"
+  python3 results_to_html.py --results_label "tools/model-benchmarker/results/" \
+      --catalog_label "tools/model-downloader/.../seed_catalog.json"  # display-only path labels
   python3 results_to_html.py --open          # open in browser
 """
 
@@ -31,8 +33,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -46,6 +48,7 @@ MODEL_NAMES = {
     "qwen_38_27b": "Qwen3.8-27B",
     "gemma_4_31b": "Gemma-4-31B",
     "glm_52_753b": "GLM-5.2-753B",
+    "glm-5.3-flash": "GLM-5.3-Flash",
     "RAG": "RAG (Multimodal Retrieval)",
 }
 
@@ -106,9 +109,10 @@ _IGNORED_TOKENS = {"old", "hicache", "fp8", "fp8_e4m3", "bf16", "fp16"}
 def parse_chat_table(text: str) -> tuple[str, list[dict]]:
     """Parse a benchmark_chat.py --output table.
 
-    Returns (mode, rows, multiturn).  mode is "multiturn", "single" or
-    "unknown".  Each row: {ctx, users, task, failed, ttft:[..4], post:[..4]
-    or None, tokens:[..4]}.
+    Returns (mode, rows).  mode is "multiturn", "single" or "unknown"
+    ("multiturn" is surfaced per setup as ``multiturn: True`` by the caller).
+    Each row: {ctx, users, task, failed, ttft:[..4], post:[..4] or None,
+    tokens:[..4]}.
     """
     lines = [ln.rstrip("\n") for ln in text.splitlines()]
     mode = "unknown"
@@ -215,14 +219,14 @@ def parse_setup(stem: str) -> dict:
     }
     if stem.startswith("OLD_"):
         meta["obsolete"] = True
-        stem = stem[len("OLD_"):]
+        stem = stem[len("OLD_") :]
 
     tokens = stem.split("_")
 
     def parse_gpu_token(tok: str) -> None:
         for name, disp, tier in GPU_TOKENS:
             if tok.startswith(name):
-                rest = tok[len(name):]
+                rest = tok[len(name) :]
                 meta["gpu"] = disp
                 meta["tier"] = tier
                 if rest.startswith("x") and rest[1:].isdigit():
@@ -278,7 +282,14 @@ def discover_catalog() -> Path | None:
     for root in [here] + list(here.parents):
         for cand in (
             root / "ModelDownloader" / "src" / "model_downloader" / "app" / "seed_catalog.json",
-            root / "pcai-solutions" / "tools" / "model-downloader-web" / "src" / "model_downloader" / "app" / "seed_catalog.json",
+            root
+            / "pcai-solutions"
+            / "tools"
+            / "model-downloader-web"
+            / "src"
+            / "model_downloader"
+            / "app"
+            / "seed_catalog.json",
         ):
             if cand.exists():
                 return cand
@@ -378,11 +389,13 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
         wf = meta.get("weights")
         if wf:
             wlow = wf.lower()
-            hay = " ".join((
-                str(e.get("name", "")),
-                str((e.get("arguments") or ["", ""])[0]),
-                str(e.get("uri", "")),
-            )).lower()
+            hay = " ".join(
+                (
+                    str(e.get("name", "")),
+                    str((e.get("arguments") or ["", ""])[0]),
+                    str(e.get("uri", "")),
+                )
+            ).lower()
             score += 6 if wlow in hay else -6
         candidates.append((score, e))
     if not candidates:
@@ -408,10 +421,16 @@ def main() -> int:
     ap.add_argument("--output", default=None, help="Output HTML path (default: results/benchmark_report.html).")
     ap.add_argument("--title", default="PCAI Model Benchmarks", help="Page title.")
     ap.add_argument("--open", action="store_true", help="Open the report in the default browser.")
-    ap.add_argument("--results_label", default="pcai-solutions/tools/model-benchmarker/results/",
-                    help="How to display the results directory in the report (default: pcai-solutions/tools path).")
-    ap.add_argument("--catalog_label", default="pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json",
-                    help="How to display the catalog path in the report (default: pcai-solutions/tools path).")
+    ap.add_argument(
+        "--results_label",
+        default="pcai-solutions/tools/model-benchmarker/results/",
+        help="How to display the results directory in the report (default: pcai-solutions/tools path).",
+    )
+    ap.add_argument(
+        "--catalog_label",
+        default="pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json",
+        help="How to display the catalog path in the report (default: pcai-solutions/tools path).",
+    )
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -448,8 +467,18 @@ def main() -> int:
             meta = parse_setup(stem)
             if rag is not None and not rows:
                 # RAG scale-benchmark: not a chat-table result
-                meta = {"gpu": None, "tier": None, "gpu_count": 1, "engine": None,
-                        "mtp": None, "weights": None, "hicache": None, "replicas": 1, "obsolete": False, "hints": []}
+                meta = {
+                    "gpu": None,
+                    "tier": None,
+                    "gpu_count": 1,
+                    "engine": None,
+                    "mtp": None,
+                    "weights": None,
+                    "hicache": None,
+                    "replicas": 1,
+                    "obsolete": False,
+                    "hints": [],
+                }
                 mode = "rag"
             cat_entry = match_catalog(slug, meta, catalog)
             if meta.get("mtp") is None and cat_entry:
@@ -534,10 +563,20 @@ def main() -> int:
     print(f"  models: {data['model_count']}   setups: {data['setup_count']}")
     print(f"  catalog: {data['catalog'] or 'none (metadata inferred from filenames)'}")
     if args.open:
-        if sys.platform == "darwin":
-            os.system(f'open "{output}"')
-        else:
-            os.system(f'xdg-open "{output}" >/dev/null 2>&1 &')
+        # No shell interpolation: --output is operator-supplied and must not
+        # be able to inject commands via quoting.
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(output)], check=False)
+            else:
+                subprocess.Popen(
+                    ["xdg-open", str(output)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except OSError as exc:
+            print(f"warn: could not open browser: {exc}", file=sys.stderr)
     return 0
 
 

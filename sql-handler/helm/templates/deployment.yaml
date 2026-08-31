@@ -29,18 +29,41 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "sqlhandler.serviceAccountName" . }}
+      {{- if .Values.security.hardened }}
+      # The app never calls the Kubernetes API — no token needed.
+      automountServiceAccountToken: {{ .Values.security.automountServiceAccountToken }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.security.runAsUser }}
+        seccompProfile:
+          type: RuntimeDefault
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: sqlhandler
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
               containerPort: {{ .Values.mcp.port }}
               protocol: TCP
+          {{- if .Values.security.hardened }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            {{- if .Values.security.readOnlyRootFilesystem }}
+            readOnlyRootFilesystem: true
+            {{- end }}
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "sqlhandler.fullname" . }}-config
           env:
+            {{- if .Values.sources }}
+            # Multi-source: connection details come from SQLHANDLER_SOURCES
+            # (ConfigMap). No single-backend credential env is wired here.
+            {{- else }}
             {{- if eq .Values.backend "onelake" }}
             # OneLake: map the Fabric credential secret keys to the env vars
             # config.py reads (envFrom would expose tenant-id / client-id /
@@ -76,7 +99,10 @@ spec:
             {{- end }}
             {{- else if eq .Values.backend "iceberg" }}
             # Iceberg backend: REST token + S3 storage keys (optional).
-            {{- if .Values.iceberg.catalogToken }}
+            {{- /* The token lives at iceberg.credentialsSecret.values.token
+                   (written into the Secret by secret.yaml); a phantom key
+                   here used to leave ICEBERG_CATALOG_TOKEN unset forever. */}}
+            {{- if .Values.iceberg.credentialsSecret.values.token }}
             - name: ICEBERG_CATALOG_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -96,13 +122,23 @@ spec:
                   key: {{ .Values.iceberg.credentialsSecret.secretKeyKey }}
             {{- end }}
             {{- end }}
-          {{- if eq .Values.backend "nfs" }}
-          {{- if .Values.nfs.mount.enabled }}
+            {{- end }}
+          {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
+                 backend additionally mounts its PVC. One merged block so the
+                 YAML key is never emitted twice. */}}
+          {{- $needTmp := and .Values.security.hardened .Values.security.readOnlyRootFilesystem }}
+          {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
+          {{- if or $needTmp $needData }}
           volumeMounts:
+            {{- if $needTmp }}
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
+            {{- if $needData }}
             - name: data
               mountPath: {{ .Values.nfs.mount.mountPath | default "/data" | quote }}
               readOnly: {{ .Values.nfs.mount.readOnly }}
-          {{- end }}
+            {{- end }}
           {{- end }}
           # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
           # whole command (making --transport the executable and crashing with
@@ -135,13 +171,19 @@ spec:
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
           {{- end }}
-      {{- if eq .Values.backend "nfs" }}
-      {{- if .Values.nfs.mount.enabled }}
+      {{- $needTmp := and .Values.security.hardened .Values.security.readOnlyRootFilesystem }}
+      {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
+      {{- if or $needTmp $needData }}
       volumes:
+        {{- if $needTmp }}
+        - name: tmp
+          emptyDir: {}
+        {{- end }}
+        {{- if $needData }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Values.nfs.mount.pvcName | required "nfs.mount.pvcName is required when nfs.mount.enabled" }}
-      {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

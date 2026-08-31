@@ -1,0 +1,47 @@
+{{- if and .Values.security.hardened .Values.security.networkPolicy.enabled }}
+{{- /*
+  Ingress default-deny with explicit allows. Internal access stays easy:
+
+    * the pod's own namespace is always allowed (same-namespace tools),
+    * the Istio gateway namespace is always allowed (ezua VirtualService),
+    * add client namespaces via security.networkPolicy.allowedNamespaces,
+    * anything else (cross-namespace strangers) is denied.
+
+  Egress is intentionally NOT restricted: the server must reach AAD /
+  OneLake / S3 endpoints. Probes are unaffected (kubelet, not pod traffic).
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.security.networkPolicy.gatewayNamespace }}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+    {{- range .Values.security.networkPolicy.allowedNamespaces }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.security.networkPolicy.additionalIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -4,6 +4,7 @@ This module holds the full HTML/CSS/JS for the benchmark report.  It is
 embedded as a big string so the whole report is a single shareable file.
 """
 
+import html
 import json
 
 HTML = r"""<!DOCTYPE html>
@@ -469,12 +470,19 @@ renderReport();
 
 def build_html(data: dict, title: str) -> str:
     out = HTML
-    out = out.replace("__TITLE__", title)
-    out = out.replace("__GENERATED__", data.get("generated", ""))
-    out = out.replace("__RESULTS_DIR__", data.get("results_dir", ""))
-    out = out.replace("__CATALOG__", data.get("catalog") or "none")
-    out = out.replace("__MODELS__", str(data.get("model_count", 0)))
-    out = out.replace("__SETUPS__", str(data.get("setup_count", 0)))
-    out = out.replace("__RAG__", str(data.get("rag_count", 0)))
+
+    # Header substitutions are generator-controlled (CLI flags) but escape
+    # them anyway so a title/label containing HTML can never become markup
+    # in the shared report.
+    def _esc_label(v: object) -> str:
+        return html.escape(str(v), quote=True)
+
+    out = out.replace("__TITLE__", _esc_label(title))
+    out = out.replace("__GENERATED__", _esc_label(data.get("generated", "")))
+    out = out.replace("__RESULTS_DIR__", _esc_label(data.get("results_dir", "")))
+    out = out.replace("__CATALOG__", _esc_label(data.get("catalog") or "none"))
+    out = out.replace("__MODELS__", _esc_label(str(data.get("model_count", 0))))
+    out = out.replace("__SETUPS__", _esc_label(str(data.get("setup_count", 0))))
+    out = out.replace("__RAG__", _esc_label(str(data.get("rag_count", 0))))
     out = out.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
     return out

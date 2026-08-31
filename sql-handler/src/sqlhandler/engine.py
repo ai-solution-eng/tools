@@ -50,6 +50,42 @@ def _max_rows() -> int:
         return 1000
 
 
+def _duckdb_fs_lockdown(con) -> None:
+    """Disable DuckDB's own file/network access for SQL queries (default on).
+
+    Tables reach DuckDB as registered pyarrow datasets, and ALL object-store
+    IO (S3/ABFS/NFS) is done by pyarrow *outside* DuckDB — so locking DuckDB's
+    built-in filesystems away costs nothing and closes real holes on a
+    network-facing endpoint: `read_csv('/etc/passwd')`, `COPY ... TO '/tmp'`,
+    `parquet_scan(...)` of local files, and extension-based URL fetches
+    (httpfs) all fail closed. Opt out with SQLHANDLER_DUCKDB_FILE_ACCESS=1 if
+    a query genuinely needs DuckDB file/table functions.
+    """
+    raw = os.environ.get("SQLHANDLER_DUCKDB_FILE_ACCESS", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return
+    try:
+        con.execute("SET disabled_filesystems='LocalFileSystem'")
+        con.execute("SET autoinstall_known_extensions=false")
+        con.execute("SET autoload_known_extensions=false")
+    except Exception:  # older DuckDB without a knob: fail open rather than break queries
+        logger.debug("DuckDB filesystem lockdown partially unavailable", exc_info=True)
+
+
+def _safe_table_name(table: str) -> str:
+    """Reject table names that try to escape their source root.
+
+    Guards the engine's resolve-fallback (which builds ``<schema>/<name>``
+    from raw user input): no absolute paths, no ``..`` traversal segments,
+    no NUL bytes. Legitimate names are bare identifiers or ``schema/name``.
+    """
+    if not table or "\x00" in table or table.startswith(("/", "\\")):
+        raise LakehouseError(f"Invalid table name: {table!r}")
+    if any(part == ".." for part in table.replace("\\", "/").split("/")):
+        raise LakehouseError(f"Invalid table name (path traversal): {table!r}")
+    return table
+
+
 def _safe_ident(name: str) -> str:
     """Quote an identifier for DuckDB if it contains special characters."""
     if name.replace("_", "").isalnum():
@@ -182,6 +218,7 @@ class SqlEngine:
         to constructing a fresh TableInfo would drop ``location`` and break
         opening the dataset.
         """
+        _safe_table_name(table)
         for info in self.list_tables():
             if info.path == table or info.name == table or info.qualified_name == table:
                 return info
@@ -318,11 +355,16 @@ class SqlEngine:
 
         Each referenced table is registered as a DuckDB view backed by its
         pyarrow Dataset; DuckDB pushes predicates/projections into the scan.
+        The connection runs with DuckDB's own filesystem access disabled
+        (see :func:`_duckdb_fs_lockdown`): all storage IO is pyarrow's, and
+        DuckDB-side local-file reads / URL fetches / COPY are refused by
+        default (``SQLHANDLER_DUCKDB_FILE_ACCESS=1`` opts out).
         """
         import duckdb
 
         con = duckdb.connect()
         try:
+            _duckdb_fs_lockdown(con)
             self._register_schema(con, sql)
             rel = con.sql(sql)
             # Enforce a row cap inside the query (LIMIT pushdown) so an

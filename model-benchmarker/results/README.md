@@ -1,9 +1,12 @@
 # results/ — benchmark outputs and how to reproduce them
 
-Each `.txt` here is the `--output` of one `benchmark_chat.py` run. Full flag
-documentation lives in the repo-root [`../README.md`](../README.md); this file
-explains the standard configuration these results were produced with and what
-to look for when reading them.
+Each chat-model `.txt` under a per-model directory is the `--output` of one
+`benchmark_chat.py` run; the files in `RAG/` are transcripts of a separate
+RAG scale-benchmark tool (`benchmark.py`, MCP mode) and are parsed by a
+dedicated path in the report generator. Full flag documentation lives in the
+repo-root [`../README.md`](../README.md); this file explains the standard
+configuration these results were produced with and what to look for when
+reading them.
 
 ## How these were produced
 
@@ -11,9 +14,12 @@ The standard configuration, one run per model:
 
 ```bash
 export m='deepseek_v4_flash_280B'   # for example
-python benchmark_chat.py --model_class_name "$m" --number_users 1,4,32,64 \
+# run from src/model_benchmarker/ (or expand the path); add --remote when
+# running from outside the serving cluster:
+python benchmark_chat.py --model_class_name "$m" --remote --number_users 1,4,32,64 \
   --requests_per_user 5 --tasks coding,creative,mixed \
-  --context_length 0,32768 --multiturn --separate_tasks --output ${m}.txt
+  --context_length 0,32768 --multiturn --separate_tasks \
+  --output "results/<model-dir>/<SETUP>.txt"
 ```
 
 For small systems I only run up to `--number_users 32`.
@@ -34,15 +40,27 @@ serving pod."
 
 ## Files
 
+Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicachexN][_replicasxN].txt`
+(see the repo README for the full grammar); `OLD_`-prefixed files are flagged
+obsolete in the HTML report.
+
 | File | Hardware / notes |
 |---|---|
-| `deepseek_v4_flash_0731/H200Sx4_2x_hicache.txt` | DeepSeek-V4-Flash-0731, 4× H200, hierarchical cache |
-| `deepseek_v4_flash_0731/RTX_PRO_6000_x2_16x_hicache.txt` | 2× RTX PRO 6000 (memory-tight) |
-| `qwen_38_27b/H200.txt` | Qwen3.8-27B, H200 |
-| `qwen_38_27b/RTX_PRO_6000_x2.txt` | Qwen3.8-27B, 2× RTX PRO 6000 |
+| `deepseek_v4_flash_0731/H200Sx4_hicachex2.txt` | DeepSeek-V4-Flash-0731, 4× H200, HiCache ×2 |
+| `deepseek_v4_flash_0731/RTXPRO6000x2_hicachex16.txt` | 2× RTX PRO 6000 (memory-tight), HiCache ×16 |
+| `qwen_38_27b/H200.txt` | Qwen3.8-27B, 1× H200 |
+| `qwen_38_27b/H200_sglang_dflash2_hicachex1.txt` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×1 |
+| `qwen_38_27b/H200_sglang_dflash2_hicachex3.txt` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×3 |
+| `qwen_38_27b/H200_sglang_dflash2_hicachex3_replicasx3.txt` | Same, 3 replicas |
+| `qwen_38_27b/RTXPRO6000_vllm_fp8.txt` | Qwen3.8-27B, 1× RTX PRO 6000, vLLM, FP8 |
+| `qwen_38_27b/RTXPRO6000_vllm_nvfp4.txt` | Qwen3.8-27B, 1× RTX PRO 6000, vLLM, NVFP4 |
 | `gemma_4_31b/H200x1.txt` | Gemma-4-31B, 1× H200 |
-| `gemma_4_31b/RTX_PRO_6000x1.txt` | Gemma-4-31B, 1× RTX PRO 6000 |
-| `RAG/rag_benchmark_scale_medium_n_100.txt` | Multimodal-RAG scale run (N=100) |
+| `gemma_4_31b/OLD_RTXPRO6000x1.txt` | Gemma-4-31B, 1× RTX PRO 6000 (obsolete) |
+| `glm-5.3-flash/H200x4_hicachex4.txt` | GLM-5.3-Flash, 4× H200, HiCache ×4 |
+| `RAG/rag_benchmark_scale_medium_n_100.txt` | Multimodal-RAG scale run (medium chart, N=100) |
+| `RAG/rag_benchmark_scale_large_n_100.txt` | Multimodal-RAG scale run (large chart, N=100) |
+| `RAG/rag_benchmark_scale_large_n_200.txt` | Multimodal-RAG scale run (large chart, N=200) |
+| `benchmark_report.html` | Generated — re-run `results_to_html.py` after adding files |
 
 ## Reading a file
 
@@ -57,7 +75,7 @@ Column layout (one block per `ctx`+`users`, dotted separator between groups):
   the warm/cached path. `TTFT-post << TTFT turn1` = the cache is earning its
   keep.
 - **failed** — requests that errored (usually `Request timed out.` = the
-  client's 300 s read timeout under server saturation); they are excluded
+  client's request timeout under server saturation); they are excluded
   from the percentile stats.
 - **tokens/s** — generation throughput; percentiles are *inverted* (P100 =
   slowest), higher is better everywhere.

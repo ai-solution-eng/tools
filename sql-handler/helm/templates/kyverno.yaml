@@ -1,4 +1,4 @@
-{{- if .Values.ezua.enabled }}
+{{- if and .Values.ezua.enabled .Values.ezua.kyverno.enabled }}
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:

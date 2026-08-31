@@ -169,8 +169,13 @@ class S3Provider(DataProvider):
 
     def open_dataset(self, info: TableInfo):
         """Open a table folder/file as a pyarrow Dataset (cached by engine)."""
-        fs = self._s3fs()
         location = info.location or info.path
+        # S3 keys are flat so ".." cannot escape the bucket, but a traversal
+        # segment is always a caller bug — fail fast with a clear error
+        # instead of a confusing NoSuchKey from a literal "../" prefix.
+        if any(part == ".." for part in location.split("/")):
+            raise LakehouseError(f"Invalid S3 table location: {location!r}")
+        fs = self._s3fs()
         root = f"{self._base()}/{location}"
         try:
             return pad.dataset(root, filesystem=fs, format="parquet")

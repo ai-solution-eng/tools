@@ -1,0 +1,35 @@
+{{- if and .Values.security.hardened .Values.security.authorizationPolicy.enabled }}
+{{- if not (or .Values.security.authorizationPolicy.principals .Values.security.authorizationPolicy.namespaces) }}
+{{- fail "security.authorizationPolicy.enabled requires at least one of principals / namespaces (an ALLOW policy with empty rules denies everything)" }}
+{{- end }}
+{{- /*
+  Pod-level Istio AuthorizationPolicy for east-west traffic. Applying ANY
+  ALLOW policy to the workload makes everything else default-deny, so the
+  caller identities must be listed explicitly. External traffic is normally
+  handled by the gateway-level policy (ezua.authorizationPolicy) instead.
+*/ -}}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-workload
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
+  action: ALLOW
+  rules:
+    - from:
+        {{- if .Values.security.authorizationPolicy.principals }}
+        - source:
+            principals:
+              {{- toYaml .Values.security.authorizationPolicy.principals | nindent 14 }}
+        {{- end }}
+        {{- if .Values.security.authorizationPolicy.namespaces }}
+        - source:
+            namespaces:
+              {{- toYaml .Values.security.authorizationPolicy.namespaces | nindent 14 }}
+        {{- end }}
+{{- end }}

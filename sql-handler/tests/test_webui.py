@@ -33,11 +33,15 @@ from sqlhandler.webui import (
         "select * from t",
         "WITH x AS (SELECT 1) SELECT * FROM x",
         "EXPLAIN SELECT * FROM t",
+        "EXPLAIN ANALYZE SELECT * FROM t",  # ANALYZE is safe on a SELECT
         "SHOW TABLES",
-        "PRAGMA table_info(t)",
+        "DESCRIBE SELECT * FROM t",
+        "SUMMARIZE SELECT * FROM t",
         "VALUES (1, 2)",
         "  (SELECT 1)",  # leading paren is tolerated
         "SELECT * FROM t; SELECT 2;",  # multi-statement all read-only
+        "SELECT * FROM t WHERE s = 'a;b'",  # semicolon inside a string literal
+        "-- drop table t\nSELECT 1",  # write keyword inside a comment
     ],
 )
 def test_assert_readonly_allows(sql):
@@ -49,6 +53,7 @@ def test_assert_readonly_allows(sql):
     [
         "",
         "   ",
+        "not even sql",
         "INSERT INTO t VALUES (1)",
         "UPDATE t SET a = 1",
         "DELETE FROM t",
@@ -57,7 +62,18 @@ def test_assert_readonly_allows(sql):
         "ALTER TABLE t ADD COLUMN b int",
         "MERGE INTO t USING x ON 1=1",
         "GRANT SELECT TO u",
-        "SELECT 1; DROP TABLE t",  # one bad statement fails the whole query
+        "COPY (SELECT * FROM t) TO '/tmp/exfil.parquet'",
+        # PRAGMA is a SET alias in DuckDB (PRAGMA threads=4 mutates settings).
+        "PRAGMA threads=4",
+        "SET threads = 4",
+        "PRAGMA table_info(t)",
+        # EXPLAIN ANALYZE <write> EXECUTES the write — verified on duckdb 1.5.
+        "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+        "EXPLAIN INSERT INTO t VALUES (1)",
+        "explain analyze delete from t",
+        # one bad statement fails the whole query
+        "SELECT 1; DROP TABLE t",
+        "SELECT 1; PRAGMA enable_external_access",
     ],
 )
 def test_assert_readonly_rejects(sql):
@@ -117,6 +133,19 @@ def test_clamp_limit():
     assert _clamp_limit(0) == 100
     assert _clamp_limit(-5) == 100
     assert _clamp_limit(10) == 10
+    assert _clamp_limit(5000) == 1000  # SQLHANDLER_MAX_ROWS default
+
+
+def test_clamp_limit_follows_max_rows_env(monkeypatch):
+    """The UI cap tracks SQLHANDLER_MAX_ROWS (README: 'same row caps')."""
+    monkeypatch.setenv("SQLHANDLER_MAX_ROWS", "500")
+    assert _clamp_limit(5000) == 500
+    assert _clamp_limit(10) == 10
+    # MAX_ROWS=0 means unlimited for MCP, but the UI payload stays bounded.
+    monkeypatch.setenv("SQLHANDLER_MAX_ROWS", "0")
+    assert _clamp_limit(5000) == 1000
+    # A garbage value falls back to the default cap.
+    monkeypatch.setenv("SQLHANDLER_MAX_ROWS", "banana")
     assert _clamp_limit(5000) == 1000
 
 
