@@ -28,9 +28,12 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import asdict
+from pathlib import Path
 
 import pyarrow as pa
 
+from . import resources
 from .provider import DataProvider, LakehouseError, TableInfo
 
 logger = logging.getLogger("sqlhandler.engine")
@@ -72,6 +75,54 @@ def _duckdb_fs_lockdown(con) -> None:
         logger.debug("DuckDB filesystem lockdown partially unavailable", exc_info=True)
 
 
+_budget_logged = False
+
+
+def _apply_memory_budget(con) -> None:
+    """Give DuckDB a budget derived from the container's own limits (fail open).
+
+    DuckDB's defaults are sized from the NODE's RAM (80% of /proc/meminfo) —
+    on a big node with a small pod that means a single wide scan can grow RSS
+    past the pod's cgroup limit and get the process OOMKilled, wiping every
+    in-process cache (table list, describe results, open datasets). Setting
+    ``memory_limit`` to a fraction of the container limit makes DuckDB spill
+    to ``temp_directory`` (k8s: mount an emptyDir there) instead; ``threads``
+    matches the CPU limit so the pool doesn't get sized from the node's cores.
+    Every step is best-effort: an old DuckDB or an unreadable cgroup just
+    leaves DuckDB's defaults in place.
+    """
+    global _budget_logged
+    try:
+        budget = resources.duckdb_budget()
+        if not budget:
+            return
+        mem = budget.get("memory_limit")
+        if mem:
+            con.execute(f"SET memory_limit='{mem}'")
+        threads = budget.get("threads")
+        if threads:
+            con.execute(f"SET threads={int(threads)}")
+        temp_dir = budget.get("temp_directory")
+        if temp_dir:
+            safe_dir = str(temp_dir).replace("'", "")
+            os.makedirs(safe_dir, exist_ok=True)
+            con.execute(f"SET temp_directory='{safe_dir}'")
+        con.execute("SET preserve_insertion_order=false")
+        if not _budget_logged:
+            _budget_logged = True
+            logger.info(
+                "duckdb budget applied: memory_limit=%s threads=%s temp_directory=%s "
+                "(container limit: %s bytes / %s cpus)",
+                mem,
+                threads,
+                temp_dir,
+                budget.get("container_memory_bytes"),
+                budget.get("container_cpu_count"),
+            )
+    except Exception:
+        logger.debug("DuckDB memory budget not applied", exc_info=True)
+
+
 def _safe_table_name(table: str) -> str:
     """Reject table names that try to escape their source root.
 
@@ -104,6 +155,7 @@ class SqlEngine:
         dataset_cache_tables: int = 8,
         version_check_interval: int = 10,
         list_async_refresh: bool = True,
+        cache_dir: str | None = None,
     ):
         self.provider = provider
         self.cache_ttl = cache_ttl
@@ -131,6 +183,17 @@ class SqlEngine:
         # per table (0 = check on every reuse).
         self._version_checked_at: dict[str, float] = {}
         self._lock = threading.RLock()
+        # Disk-warm layer (SQLHANDLER_CACHE_DIR, k8s: mount an emptyDir there):
+        # describe/table-list results are persisted after each fill and
+        # reloaded at startup, so a container restart (OOMKill, node drain)
+        # no longer costs a full cold metadata fetch. The engine's own caches
+        # stay in-process and TTL-driven; disk entries are re-validated
+        # against the wall-clock TTL at load, and never outlive the same
+        # cache_ttl the memory layer uses.
+        env_cache_dir = os.environ.get("SQLHANDLER_CACHE_DIR", "").strip()
+        self._cache_dir = cache_dir or (env_cache_dir or None)
+        if self._cache_dir and self.cache_ttl > 0:
+            self._load_cache_from_disk()
         if self._async_list:
             threading.Thread(
                 target=self._auto_refresh_loop,
@@ -165,6 +228,7 @@ class SqlEngine:
             self._tables = tables
             self._tables_ts = time.monotonic()
             self._list_refreshing = False
+        self._save_cache_to_disk()
         return tables
 
     def _maybe_refresh_async(self) -> None:
@@ -197,6 +261,7 @@ class SqlEngine:
             self._tables = tables
             self._tables_ts = time.monotonic()
             self._list_refreshing = False
+        self._save_cache_to_disk()
 
     def _auto_refresh_loop(self) -> None:
         """Keep the table list warm: refresh in the background every TTL."""
@@ -206,6 +271,94 @@ class SqlEngine:
                 self._maybe_refresh_async()
             except Exception:
                 logger.debug("auto list refresh skipped", exc_info=True)
+
+    # ------------------------------------------------------- disk warm layer
+    def _cache_file(self) -> Path:
+        return Path(self._cache_dir) / "metadata-cache.json"
+
+    def _load_cache_from_disk(self) -> None:
+        """Reload describe/table-list results persisted by a previous run.
+
+        Every entry carries a wall-clock epoch and is only accepted when
+        younger than ``cache_ttl`` — the same lifetime the memory layer uses,
+        so a warm entry is never *more* stale than an in-process one. Loaded
+        entries get fresh monotonic timestamps (the in-process TTL restarts),
+        and each step is best-effort: a missing, corrupt or unwritable file
+        just means a cold start, exactly as before.
+        """
+        try:
+            path = self._cache_file()
+            if not path.exists():
+                return
+            import json
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            now = time.time()
+            tables = data.get("tables")
+            if isinstance(tables, dict) and now - float(tables.get("ts", 0)) < self.cache_ttl:
+                items = tables.get("items")
+                if isinstance(items, list) and items:
+                    infos = [TableInfo(**item) for item in items if isinstance(item, dict)]
+                    if infos:
+                        self._tables = infos
+                        self._tables_ts = time.monotonic()
+                        logger.info("warm-started table list from %s (%d tables)", path, len(infos))
+            describes = data.get("describes")
+            if isinstance(describes, list):
+                loaded = 0
+                for entry in describes:
+                    if not isinstance(entry, dict):
+                        continue
+                    if now - float(entry.get("ts", 0)) >= self.cache_ttl:
+                        continue
+                    key = (str(entry.get("source", "default")), str(entry.get("path", "")))
+                    result = entry.get("result")
+                    if isinstance(result, dict):
+                        self._describe_cache[key] = (time.monotonic(), result)
+                        loaded += 1
+                if loaded:
+                    logger.info("warm-started %d describe result(s) from %s", loaded, path)
+        except Exception:
+            logger.debug("disk cache warm-start skipped", exc_info=True)
+
+    def _save_cache_to_disk(self) -> None:
+        """Persist the current caches for the next process start (best-effort).
+
+        Called right after a synchronous cache fill, so the wall-clock epoch
+        written here is the fill time; entries already on disk get their
+        epoch refreshed, which at most extends one entry's disk lifetime by a
+        single TTL — the memory layer's own TTL still governs correctness.
+        """
+        if not self._cache_dir or self.cache_ttl <= 0:
+            return
+        try:
+            import json
+
+            with self._lock:
+                payload = {
+                    "tables": {
+                        "ts": time.time(),
+                        "items": [asdict(info) for info in self._tables or []],
+                    },
+                    "describes": [
+                        {
+                            "source": source,
+                            "path": path,
+                            "ts": time.time(),
+                            "result": result,
+                        }
+                        for (source, path), (_, result) in self._describe_cache.items()
+                    ],
+                }
+            cache_dir = Path(self._cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache_file().with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, self._cache_file())
+        except Exception:
+            logger.debug("disk cache save skipped", exc_info=True)
 
     # ------------------------------------------------------------- resolve
     def _resolve(self, table: str) -> TableInfo:
@@ -316,6 +469,7 @@ class SqlEngine:
             self._describe_misses += 1
             if self.cache_ttl > 0:
                 self._describe_cache[key] = (time.monotonic(), result)
+        self._save_cache_to_disk()
         return result
 
     # ------------------------------------------------------------- scans
@@ -365,6 +519,7 @@ class SqlEngine:
         con = duckdb.connect()
         try:
             _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
             self._register_schema(con, sql)
             rel = con.sql(sql)
             # Enforce a row cap inside the query (LIMIT pushdown) so an
@@ -464,4 +619,11 @@ class SqlEngine:
                 "list_refreshing": self._list_refreshing,
                 "cache_ttl": self.cache_ttl,
                 "dataset_cache_ttl": self.dataset_cache_ttl,
+                # Resource budget derived from the container's cgroup limits,
+                # plus the process's current RSS — so an OOM-bound pod (RSS
+                # climbing toward the limit) is visible before the kernel
+                # kills it and wipes every cache.
+                "container_memory_bytes": resources.container_memory_bytes(),
+                "container_cpu_count": resources.container_cpu_count(),
+                "process_rss_bytes": resources.process_rss_bytes(),
             }

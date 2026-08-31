@@ -1,11 +1,38 @@
+# VCS / metadata
+.git
+.gitignore
+
+# Python
 __pycache__
 *.pyc
 .venv
 .uv-cache
-.git
-config/.env
 .ruff_cache
 .mypy_cache
 .pytest_cache
 tests
+
+# Local secrets / deployment values — never enter the build context
+config/.env
+.env
+.env.*
 helm
+
+# Local dev tooling and scratch data (large: vendored botocore, MinIO, datasets)
+.dev
+data
+test_parquet
+bench
+.duckdb_home
+
+# Repo tooling and release artifacts
+*.tar.gz
+*.tgz
+.g2_cluster.yaml
+hardlinker.py
+hardlink_config.json
+formatter.sh
+prune_charts.py
+bump_version.sh
+# NOTE: uv.lock is deliberately NOT ignored — the Dockerfile may adopt
+# frozen installs from it later.

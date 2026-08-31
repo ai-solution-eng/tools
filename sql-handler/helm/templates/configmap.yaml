@@ -80,3 +80,14 @@ data:
   {{- if .Values.cache.prewarmTables }}
   SQLHANDLER_PREWARM_TABLES: {{ .Values.cache.prewarmTables | quote }}
   {{- end }}
+  # DuckDB query-engine budget, derived from the container's own cgroup
+  # limits (see src/sqlhandler/resources.py): memory_limit = fraction x the
+  # pod's memory limit, threads = the pod's CPU limit, and a spill directory
+  # for sorts/aggregations that would otherwise push RSS past the limit and
+  # get the pod OOMKilled (which wipes every in-process cache). The spill dir
+  # lives under /tmp, which the hardened profile already backs with an
+  # emptyDir (survives container restarts, so spills + the warm cache both
+  # outlive an OOMKill).
+  SQLHANDLER_DUCKDB_MEMORY_FRACTION: {{ .Values.cache.duckdbMemoryFraction | quote }}
+  SQLHANDLER_DUCKDB_TEMP_DIR: {{ .Values.cache.spillDir | quote }}
+  SQLHANDLER_CACHE_DIR: {{ .Values.cache.cacheDir | quote }}

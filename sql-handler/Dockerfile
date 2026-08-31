@@ -29,6 +29,14 @@ RUN uv pip install --system \
         pyarrow duckdb azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette \
     && uv pip install --system -e ".[iceberg]"
 
+# The build context may carry restrictive file modes (e.g. 600 from a
+# hardlink-based working tree). COPY preserves modes, and the app now runs
+# as uid 1000 — without this it cannot read its own source and crashes on
+# the first import (PermissionError on /app/src/sqlhandler/__init__.py).
+# a+rX: read for everyone, execute only on directories. Files stay
+# root-owned on purpose: the unprivileged runtime cannot modify its code.
+RUN chmod -R a+rX "${APP_HOME}"
+
 ENV PYTHONPATH="/app/src"
 
 # Run unprivileged — the helm chart's hardened profile (security.hardened)
