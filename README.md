@@ -12,6 +12,7 @@ Below is a list of the available tools.
 | [chart-manager](chart-manager/README.md) | Helm chart deploying a Flask app on PCAI to add, delete, view, and date-filter charts, exposed via Istio VirtualService. |
 | [model-downloader-cli](model-downloader-cli/README.md) | CLI tool that downloads AI models from HuggingFace or NVIDIA NGC to a local directory or S3 bucket, with resume support and progress bars. Useful in air-gapped hosted trials.|
 | [model-downloader-web](model-downloader-web/README.md) | HTML frontend with support to run model downloads in parallel (4 models by default, 8 threads each). Also supports patching MLIS with some of our most commonly used models.|
+| [nim-profile-finder](nim-profile-finder/README.md) | Extracts NVIDIA manifest details from NIM container images hosted on NGC without downloading the full image. |
 | [s3-browser](s3-browser/README.md) | Web-based browser for navigating S3-compatible object storage.|
 | [sql-handler](sql-handler/README.md) | Alternative to EZPresto for querying SQL in a few commonly deployed modes. Avoiding JDBC yields a 3-4x speed up with typical SQL queries, and avoids timeouts that are typical for larger datasets.|
 
