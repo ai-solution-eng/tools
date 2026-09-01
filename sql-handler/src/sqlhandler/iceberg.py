@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.dataset as pad
 
 from .config import IcebergConfig
-from .provider import DataProvider, LakehouseError, TableInfo
+from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .s3 import build_s3fs
 
 logger = logging.getLogger("sqlhandler.iceberg")
@@ -137,17 +137,19 @@ class IcebergProvider(DataProvider):
         wh = (self.config.warehouse or "").rstrip("/")
         return f"{wh}/{path}" if wh else path
 
-    def open_dataset(self, info: TableInfo):
+    def open_dataset(self, info: TableInfo, version: int | None = None):
         """Open an Iceberg table as a pyarrow Dataset (cached by the engine).
 
         The dataset is built from the Parquet files listed in the table's
-        current snapshot manifest, so only the metadata (not the rows) is
-        fetched here; predicates/projections still push down into the Parquet
-        scan at query time.
+        snapshot manifest, so only the metadata (not the rows) is fetched
+        here; predicates/projections still push down into the Parquet scan
+        at query time. ``version`` selects a historical snapshot id (time
+        travel); ``None`` scans the current snapshot.
         """
         table = self._load_table(info)
+        scan = table.scan() if version is None else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
         try:
-            files = [f.file.file_path for f in table.scan().plan_files()]
+            files = [f.file.file_path for f in scan.plan_files()]
         except Exception as exc:
             raise LakehouseError(f"Iceberg scan planning {info.path} failed: {exc}") from exc
         files = [self._normalize_path(p) for p in files]

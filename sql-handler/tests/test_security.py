@@ -41,7 +41,7 @@ class _NoTables:
     def table_uri(self, info):
         return f"stub://{info.path}"
 
-    def open_dataset(self, info):  # pragma: no cover - never reached here
+    def open_dataset(self, info, version=None):  # pragma: no cover - never reached here
         raise AssertionError("open_dataset should not be called in these tests")
 
 
@@ -53,7 +53,7 @@ def _registered_engine(monkeypatch) -> SqlEngine:
     """Engine whose schema registration registers a real in-memory view."""
     eng = _engine()
 
-    def fake_register(self, con, sql):
+    def fake_register(self, con, sql, version=None):
         con.register("stub_tbl", pa.table({"a": [1, 2, 3], "s": ["x", "y", "z"]}))
 
     monkeypatch.setattr(SqlEngine, "_register_schema", fake_register)
@@ -63,7 +63,7 @@ def _registered_engine(monkeypatch) -> SqlEngine:
 def _registered_schema_of(table: pa.Table):
     """Return a _register_schema replacement registering ``table`` as 'big'."""
 
-    def fake_register(self, con, sql):
+    def fake_register(self, con, sql, version=None):
         con.register("big", table)
 
     return fake_register

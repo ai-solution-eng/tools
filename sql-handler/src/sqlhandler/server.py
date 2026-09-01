@@ -21,8 +21,12 @@ standard tools; we deliberately avoid that class here.
 
 Tools exposed:
   * list_tables        - enumerate the tables in the configured source
+  * search_tables      - keyword search over names/columns/catalog descriptions
   * describe_table     - inspect columns/types of a table
-  * run_sql            - execute SQL via DuckDB (aggregations etc.)
+  * profile_table      - column-level statistics (min/max, null %, distinct,
+                         quantiles) so agents write correct filters first try
+  * run_sql            - execute SQL via DuckDB (aggregations etc.); output
+                         as markdown, JSON or CSV
   * scan_table         - pull rows via pyarrow with column projection + limit
 """
 
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -46,9 +51,9 @@ from mcp_types import (
     Tool,
 )
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
-from . import __version__
+from . import __version__, mcp_resources, observability
 from .config import (
     load_backend_config,
     load_cache_config,
@@ -83,8 +88,25 @@ def _dispatch_tool(name: str, args: dict) -> tuple[str, bool]:
             return list_tables(), False
         elif name == "describe_table":
             return describe_table(str(args.get("table", ""))), False
+        elif name == "profile_table":
+            cols = args.get("columns")
+            col_list = (
+                [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
+            )
+            return profile_table(str(args.get("table", "")), col_list), False
+        elif name == "search_tables":
+            return search_tables(str(args.get("query", ""))), False
         elif name == "run_sql":
-            return run_sql(str(args.get("sql", "")), args.get("limit")), False
+            params = args.get("params")
+            if params is not None and not isinstance(params, (dict, list)):
+                return "Error running SQL: params must be an object or an array.", True
+            return run_sql(
+                str(args.get("sql", "")),
+                args.get("limit"),
+                args.get("output_format") or "markdown",
+                params,
+                args.get("version_as_of"),
+            ), False
         elif name == "scan_table":
             # An explicit limit of 0 is honored (empty result); only a
             # missing limit defaults to 100.
@@ -94,6 +116,8 @@ def _dispatch_tool(name: str, args: dict) -> tuple[str, bool]:
                 str(args.get("table", "")),
                 args.get("columns"),
                 limit,
+                args.get("output_format") or "markdown",
+                args.get("version_as_of"),
             ), False
         return f"Unknown tool: {name}", True
     except Exception as exc:
@@ -130,9 +154,47 @@ _TOOLS = [
         },
     ),
     Tool(
+        name="profile_table",
+        description=(
+            "Column-level statistics for a table: min/max, approx distinct count, "
+            "null %, avg/std and q25/q50/q75 quantiles, plus the total row count. "
+            "Use it before writing filters/aggregations to pick the right columns, "
+            "value ranges and predicates on the first try instead of guessing."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": 'Table name; use "schema/name" when the source uses schemas.',
+                },
+                "columns": {
+                    "type": "string",
+                    "description": "Optional comma-separated subset of columns to profile (default: all).",
+                },
+            },
+            "required": ["table"],
+        },
+    ),
+    Tool(
+        name="search_tables",
+        description=(
+            "Find tables by keyword: matches table names, columns and catalog "
+            "descriptions. Use when the table list is long or you don't know "
+            "which table holds what."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keywords to look for (e.g. 'work order amount')."},
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
         name="run_sql",
         description=(
-            "Execute a SQL query against the source tables and return results as a table. "
+            "Execute a SQL query against the source tables and return results. "
             "Tables are referenced by folder name (e.g. work_order_header, or schema/name). "
             "Aggregations, filters, and joins are pushed into the scan."
         ),
@@ -148,6 +210,29 @@ _TOOLS = [
                     "description": (
                         "Optional max number of rows to return. Default: capped by "
                         "SQLHANDLER_MAX_ROWS (1000)."
+                    ),
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["markdown", "json", "csv"],
+                    "description": (
+                        "Result rendering: markdown (default, human/LLM friendly), "
+                        "json ({columns, rows} — compact, machine-parseable) or csv."
+                    ),
+                },
+                "params": {
+                    "description": (
+                        "Optional bind parameters: an object for named $placeholders "
+                        "(e.g. {\"status\": \"open\"}) or an array for positional ?. "
+                        "Keeps reusable query templates injection-safe."
+                    ),
+                },
+                "version_as_of": {
+                    "type": "integer",
+                    "description": (
+                        "Optional historical snapshot for time travel: a Delta snapshot "
+                        "version (nfs/onelake backends) or Iceberg snapshot id. Applies "
+                        "to every versionable table the query touches."
                     ),
                 },
             },
@@ -172,6 +257,18 @@ _TOOLS = [
                     "type": "integer",
                     "description": "Max rows to return (default 100).",
                 },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["markdown", "json", "csv"],
+                    "description": "Result rendering (default markdown).",
+                },
+                "version_as_of": {
+                    "type": "integer",
+                    "description": (
+                        "Optional historical snapshot for time travel: a Delta snapshot "
+                        "version (nfs/onelake) or Iceberg snapshot id."
+                    ),
+                },
             },
             "required": ["table"],
         },
@@ -190,11 +287,19 @@ mcp = Server(
     instructions=(
         "Direct, fast access to columnar data (OneLake/Delta or S3/MinIO/Parquet) "
         "as an EzPresto replacement. Use list_tables to discover tables, describe_table "
-        "for schema, and run_sql / scan_table to query. Prefers predicate filters and "
-        "column projections to avoid full scans."
+        "for schema, profile_table for column statistics (value ranges, null %, distinct "
+        "counts — helps write correct filters first try), and run_sql / scan_table to "
+        "query. Prefers predicate filters and column projections to avoid full scans."
     ),
     on_list_tools=_handle_list_tools,
     on_call_tool=_handle_call_tool,
+    # Resources + prompts (see mcp_resources.py): the other MCP primitives.
+    # The handlers reuse the process-wide engine and its caches via _handler.
+    on_list_resources=mcp_resources.handle_list_resources,
+    on_list_resource_templates=mcp_resources.handle_list_resource_templates,
+    on_read_resource=mcp_resources.handle_read_resource,
+    on_list_prompts=mcp_resources.handle_list_prompts,
+    on_get_prompt=mcp_resources.handle_get_prompt,
 )
 
 _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -241,11 +346,20 @@ def _handler() -> SqlEngine:
                 version_check_interval=cache.version_check_interval,
                 list_async_refresh=cache.list_async_refresh,
             )
-            if cache.prewarm_tables:
-                logger.info("prewarming schema cache for %d table(s)", len(cache.prewarm_tables))
+            # Prewarm: explicit SQLHANDLER_PREWARM_TABLES wins; otherwise the
+            # busiest tables from the previous run (usage counts persisted in
+            # the disk-warm cache) are warmed — the server teaches itself
+            # what to prewarm instead of relying on a hand-maintained list.
+            prewarm_tables = cache.prewarm_tables or _handler_singleton.usage_top_tables()
+            if prewarm_tables:
+                logger.info(
+                    "prewarming schema cache for %d table(s)%s",
+                    len(prewarm_tables),
+                    "" if cache.prewarm_tables else " (usage-driven)",
+                )
                 threading.Thread(
                     target=_prewarm,
-                    args=(_handler_singleton, cache.prewarm_tables),
+                    args=(_handler_singleton, prewarm_tables),
                     daemon=True,
                     name="sqlhandler-prewarm",
                 ).start()
@@ -277,7 +391,14 @@ def list_tables() -> str:
         tables = handler.list_tables()
         if not tables:
             return "No tables found in the configured data source."
-        return "Tables:\n" + "\n".join(f"  - {t.name}" for t in tables)
+        lines = ["Tables:"]
+        for t in tables:
+            # Catalog descriptions annotate the list when present (compact:
+            # name first, description after an em dash), so agents can pick
+            # the right table without a describe round-trip per candidate.
+            desc = handler.table_description(t)
+            lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
+        return "\n".join(lines)
     except Exception as exc:
         return f"Error listing tables: {exc}"
 
@@ -288,43 +409,109 @@ def describe_table(table: str) -> str:
         handler = _handler()
         info = handler.describe_table(table)
         lines = [f"Table: {info['table']}", f"URI: {info['uri']}"]
+        if info.get("description"):
+            lines.append(f"Description: {info['description']}")
+        if info.get("aliases"):
+            lines.append(f"Also known as: {', '.join(info['aliases'])}")
         lines.append("Columns:")
         for c in info["columns"]:
-            lines.append(f"  - {c['name']}: {c['type']}")
+            line = f"  - {c['name']}: {c['type']}"
+            if c.get("description"):
+                line += f" — {c['description']}"
+            lines.append(line)
         return "\n".join(lines)
     except Exception as exc:
         return f"Error describing table: {exc}"
 
 
-def run_sql(sql: str, limit: int | None = None) -> str:
-    """Execute a SQL query against the source tables and return results as a table.
+def profile_table(table: str, columns: list[str] | None = None) -> str:
+    """Return per-column statistics for a table as a markdown table."""
+    try:
+        handler = _handler()
+        p = handler.profile_table(table, columns=columns)
+        header = [f"Table: {p['table']}"]
+        if p.get("n_rows") is not None:
+            header.append(
+                f"Rows: {p['n_rows']}"
+                + (
+                    f" (profiled {p['profiled_rows']}, capped by SQLHANDLER_PROFILE_MAX_ROWS)"
+                    if p.get("profile_max_rows", 0) > 0
+                    and p.get("profiled_rows") == p.get("profile_max_rows")
+                    else ""
+                )
+            )
+        import pandas as pd
+
+        df = pd.DataFrame(p["columns"])
+        return "\n".join(header) + "\n\n" + df.to_markdown(index=False)
+    except Exception as exc:
+        return f"Error profiling table: {exc}"
+
+
+def search_tables(query: str) -> str:
+    """Keyword search over table names/columns/catalog descriptions."""
+    try:
+        handler = _handler()
+        results = handler.search_tables(query)
+        if not results:
+            return f"No tables match {query!r}. Try broader keywords, or run list_tables."
+        lines = [f"Found {len(results)} table(s) matching {query!r}:"]
+        for r in results:
+            line = f"  - {r['table']} ({r['format']})"
+            if r["matched_columns"]:
+                line += f" — columns: {', '.join(r['matched_columns'])}"
+            lines.append(line)
+            if r["description"]:
+                lines.append(f"      {r['description']}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error searching tables: {exc}"
+
+
+def run_sql(
+    sql: str,
+    limit: int | None = None,
+    output_format: str = "markdown",
+    params: object | None = None,
+    version_as_of: int | None = None,
+) -> str:
+    """Execute a SQL query against the source tables and return results.
 
     Args:
         sql: The SQL SELECT to run against the source tables.
         limit: Optional max rows to return; SQLHANDLER_MAX_ROWS (default 1000)
             caps the result either way.
+        output_format: markdown (default) | json | csv.
+        params: optional bind parameters (named dict or positional list).
     """
     try:
         handler = _handler()
-        arrow = handler.query_duckdb(sql, limit=limit)
-        return _arrow_to_markdown(arrow, max_rows=limit)
+        arrow = handler.query_duckdb(sql, limit=limit, params=params, version_as_of=version_as_of)
+        return _arrow_to_output(arrow, max_rows=limit, fmt=output_format)
     except Exception as exc:
         return f"Error running SQL: {exc}"
 
 
-def scan_table(table: str, columns: str | None = None, limit: int = 100) -> str:
+def scan_table(
+    table: str,
+    columns: str | None = None,
+    limit: int = 100,
+    output_format: str = "markdown",
+    version_as_of: int | None = None,
+) -> str:
     """Fetch rows/columns from a table via pyarrow (columnar).
 
     Args:
         table: Table name (schema/name when the source uses schemas).
         columns: Optional comma-separated list of columns to project.
         limit: Max rows to return (default 100).
+        output_format: markdown (default) | json | csv.
     """
     try:
         handler = _handler()
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
-        arrow = handler.scan_arrow(table, columns=col_list, limit=int(limit))
-        return _arrow_to_markdown(arrow, max_rows=int(limit))
+        arrow = handler.scan_arrow(table, columns=col_list, limit=int(limit), version_as_of=version_as_of)
+        return _arrow_to_output(arrow, max_rows=int(limit), fmt=output_format)
     except Exception as exc:
         return f"Error scanning table: {exc}"
 
@@ -359,6 +546,72 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
         return df.to_markdown(index=False)
     except Exception:
         return str(arrow)
+
+
+def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
+    """Render a pyarrow Table as markdown (default), JSON, or CSV.
+
+    All formats share the same row cap (SQLHANDLER_MAX_OUTPUT_ROWS) so a
+    machine-readable format can't smuggle an unbounded payload either. JSON
+    reuses the web API's payload shape ({columns, rows, n_rows, truncated});
+    CSV is pandas' RFC-style rendering (header row, no index).
+    """
+    import csv
+    import io
+
+    from .webui import arrow_to_payload
+
+    raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = _MAX_OUTPUT_ROWS
+    cap = max(cap, 0)
+    if cap > 0 and max_rows is not None:
+        max_rows = min(max_rows, cap)
+    if cap > 0 and arrow.num_rows > cap:
+        arrow = arrow.slice(0, cap)
+
+    fmt = (fmt or "markdown").strip().lower()
+    if fmt == "json":
+        return json.dumps(arrow_to_payload(arrow, limit=max_rows), default=str)
+    if fmt == "csv":
+        payload = arrow_to_payload(arrow, limit=max_rows)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(payload["columns"])
+        writer.writerows(payload["rows"])
+        return buf.getvalue()
+    return _arrow_to_markdown(arrow, max_rows=max_rows)
+
+
+class _ApiTokenMiddleware:
+    """ASGI middleware: require a shared token on every /api/* request.
+
+    Comparison is constant-time (hmac.compare_digest). The token protects
+    the JSON API on deployments without gateway auth; the MCP endpoint and
+    the UI stay governed by their own layers.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").startswith("/api"):
+            provided = ""
+            for k, v in scope.get("headers", []):
+                if k == b"authorization":
+                    provided = v.decode("latin-1")
+                    break
+                if k == b"x-api-token":
+                    provided = v.decode("latin-1")
+                    break
+            if not observability.token_matches(provided, self.token):
+                resp = JSONResponse({"error": "Unauthorized: missing or invalid API token."}, status_code=401)
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def main(argv: list | None = None) -> None:
@@ -434,6 +687,29 @@ def main(argv: list | None = None) -> None:
 
     app.add_route("/health", _health)
     app.add_route("/ready", _ready)
+
+    # Prometheus scrape endpoint (Prometheus text exposition; engine gauges
+    # included via the same process-wide engine — list_tables is cached so
+    # scraping is cheap).
+    async def _metrics(_request) -> Response:
+        try:
+            engine = await asyncio.to_thread(_handler)
+        except Exception:
+            engine = None
+        return Response(
+            content=observability.metrics.render(engine),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    app.add_route("/metrics", _metrics)
+
+    # When SQLHANDLER_API_TOKEN is set, every /api/* call must present it
+    # (Authorization: Bearer <token> or X-API-Token: <token>) — for machine
+    # callers of the JSON API on deployments that are NOT behind the PCAI
+    # oauth2-proxy gateway. /mcp, /ui and /health|/ready are unaffected.
+    api_token = os.environ.get("SQLHANDLER_API_TOKEN", "").strip()
+    if api_token:
+        app.add_middleware(_ApiTokenMiddleware, token=api_token)
     # Browser CORS: any origin by default (the API is read-only and typically
     # sits behind the PCAI gateway). Restrict in production with e.g.
     # SQLHANDLER_CORS_ORIGINS="https://ui.example.com,https://other.example.com".

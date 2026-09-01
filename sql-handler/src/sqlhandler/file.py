@@ -18,7 +18,7 @@ import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
 from .config import FileConfig
-from .provider import DataProvider, LakehouseError, TableInfo
+from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 
 logger = logging.getLogger("sqlhandler.file")
 
@@ -136,14 +136,25 @@ class FileProvider(DataProvider):
                 seen.setdefault(info.path, info)
         return sorted(seen.values(), key=lambda ti: ti.path)
 
-    def open_dataset(self, info: TableInfo):
-        """Open a Delta table or Parquet folder/file as a pyarrow Dataset."""
+    def open_dataset(self, info: TableInfo, version: int | None = None):
+        """Open a Delta table or Parquet folder/file as a pyarrow Dataset.
+
+        ``version`` (Delta only) pins a historical snapshot for time travel.
+        """
         root = self._contained_path(info)
         try:
             if info.format == "delta":
                 from deltalake import DeltaTable
 
-                return DeltaTable(root).to_pyarrow_dataset()
+                if version is None:
+                    return DeltaTable(root).to_pyarrow_dataset()
+                _validate_snapshot_version(version, "Delta")
+                return DeltaTable(root, version=int(version)).to_pyarrow_dataset()
+            if version is not None:
+                raise LakehouseError(
+                    f"Time travel is not supported for plain Parquet table '{info.path}' "
+                    "(only Delta and Iceberg tables have version history)."
+                )
             return pad.dataset(root, filesystem=self._fs(), format="parquet")
         except LakehouseError:
             raise

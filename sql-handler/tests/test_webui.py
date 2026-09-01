@@ -217,3 +217,83 @@ def test_api_preview(engine):
     assert len(payload["rows"]) == 2
     assert payload["n_rows"] == 2
     assert payload["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# export
+# ---------------------------------------------------------------------------
+
+
+def test_export_query_csv(tmp_path):
+
+    from sqlhandler.webui import api_export
+
+    eng = _engine(tmp_path)
+    out = api_export(eng, {"sql": "SELECT * FROM work_order ORDER BY a", "format": "csv"})
+    assert out["media_type"] == "text/csv"
+    assert out["filename"] == "query.csv"
+    text = out["content"].decode()
+    lines = text.strip().splitlines()
+    assert lines[0] == "a,s"
+    assert len(lines) == 1 + 5
+
+
+def test_export_query_parquet_roundtrip(tmp_path):
+    import io
+
+    import pyarrow.parquet as pq
+
+    from sqlhandler.webui import api_export
+
+    eng = _engine(tmp_path)
+    out = api_export(eng, {"sql": "SELECT * FROM work_order", "format": "parquet"})
+    assert out["filename"] == "query.parquet"
+    back = pq.read_table(io.BytesIO(out["content"]))
+    assert back.num_rows == 5
+
+
+def test_export_table_uses_safe_filename(tmp_path):
+    from sqlhandler.webui import api_export
+
+    eng = _engine(tmp_path)
+    out = api_export(eng, {"table": "workorder/work_order"})
+    assert out["filename"] == "workorder_work_order.csv"
+    assert b"1" in out["content"]
+
+
+def test_export_guard_blocks_writes(tmp_path):
+    from sqlhandler.webui import api_export
+
+    eng = _engine(tmp_path)
+    with pytest.raises(ValueError, match="not allowed"):
+        api_export(eng, {"sql": "CREATE TABLE x (a int)", "format": "csv"})
+
+
+def test_export_bad_format_and_missing_target(tmp_path):
+    from sqlhandler.webui import api_export
+
+    eng = _engine(tmp_path)
+    with pytest.raises(ValueError, match="Unsupported export format"):
+        api_export(eng, {"sql": "SELECT 1", "format": "xlsx"})
+    with pytest.raises(ValueError, match="either 'sql' or 'table'"):
+        api_export(eng, {"format": "csv"})
+
+
+def test_export_limit_clamped_to_env_cap(tmp_path, monkeypatch):
+    from sqlhandler.webui import _export_max_rows, api_export
+
+    monkeypatch.setenv("SQLHANDLER_EXPORT_MAX_ROWS", "3")
+    assert _export_max_rows() == 3
+    eng = _engine(tmp_path)
+    out = api_export(eng, {"sql": "SELECT * FROM work_order", "limit": 100000, "format": "csv"})
+    assert len(out["content"].decode().strip().splitlines()) == 1 + 3
+    # 0 means the hard ceiling, not unlimited
+    monkeypatch.setenv("SQLHANDLER_EXPORT_MAX_ROWS", "0")
+    assert _export_max_rows() == 1_000_000
+
+
+def _engine(tmp_path):
+    d = tmp_path / "workorder" / "work_order"
+    d.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
+    return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)

@@ -31,7 +31,7 @@ class DirProvider:
     def table_uri(self, info):
         return f"file://{self.root / info.location}"
 
-    def open_dataset(self, info):
+    def open_dataset(self, info, version=None):
         return pad.dataset(str(self.root / info.location), format="parquet")
 
 

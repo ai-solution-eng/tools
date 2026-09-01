@@ -4,6 +4,7 @@ import os
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from sqlhandler.config import FabricConfig, FileConfig, IcebergConfig, S3Config
 from sqlhandler.file import FileProvider
@@ -145,3 +146,75 @@ def test_file_provider_delta_version_check_throttled(tmp_path):
     ds3 = engine2._open_dataset(info)
     assert ds3 is not ds1
     assert ds3.to_table().num_rows == 2
+
+
+# ---------------------------------------------------------------- time travel
+
+
+def _delta_engine(tmp_path):
+    """A FileProvider engine over a 2-version Delta table + a plain Parquet table."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from deltalake import write_deltalake
+
+    from sqlhandler.config import FileConfig
+    from sqlhandler.engine import SqlEngine
+
+    d = tmp_path / "workorder" / "work_order"
+    d.mkdir(parents=True)
+    write_deltalake(str(d), pa.table({"id": [1, 2], "amount": [10.0, 20.0]}), mode="overwrite")
+    write_deltalake(str(d), pa.table({"id": [3], "amount": [30.0]}), mode="append")
+    p = tmp_path / "workorder" / "plain_parquet"
+    p.mkdir(parents=True)
+    pq.write_table(pa.table({"id": [9]}), p / "part.parquet")
+
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+    return eng
+
+
+def test_scan_version_as_of_delta(tmp_path):
+    eng = _delta_engine(tmp_path)
+    assert eng.scan_arrow("workorder/work_order").num_rows == 3
+    v0 = eng.scan_arrow("workorder/work_order", version_as_of=0)
+    assert v0.num_rows == 2 and v0.to_pydict()["id"] == [1, 2]
+    v1 = eng.scan_arrow("workorder/work_order", version_as_of=1)
+    assert v1.num_rows == 3
+
+
+def test_query_version_as_of_delta(tmp_path):
+    eng = _delta_engine(tmp_path)
+    r0 = eng.query_duckdb("SELECT sum(amount) AS total FROM work_order", version_as_of=0)
+    assert r0.to_pydict() == {"total": [30.0]}
+    r1 = eng.query_duckdb("SELECT sum(amount) AS total FROM work_order", version_as_of=1)
+    assert r1.to_pydict() == {"total": [60.0]}
+
+
+def test_time_travel_rejected_for_plain_parquet(tmp_path):
+    eng = _delta_engine(tmp_path)
+    from sqlhandler.provider import LakehouseError
+
+    with pytest.raises(LakehouseError, match="not supported"):
+        eng.scan_arrow("workorder/plain_parquet", version_as_of=0)
+    with pytest.raises(LakehouseError, match="not supported"):
+        eng.query_duckdb("SELECT * FROM plain_parquet", version_as_of=0)
+
+
+def test_time_travel_version_validation(tmp_path):
+    eng = _delta_engine(tmp_path)
+    from sqlhandler.provider import LakehouseError
+
+    with pytest.raises(LakehouseError, match="non-negative integer"):
+        eng.scan_arrow("workorder/work_order", version_as_of="zero")
+    with pytest.raises(LakehouseError, match="non-negative integer"):
+        eng.scan_arrow("workorder/work_order", version_as_of=True)  # bool is not a version
+    with pytest.raises(LakehouseError, match="non-negative integer"):
+        eng.query_duckdb("SELECT * FROM work_order", version_as_of=-1)
+
+
+def test_time_travel_dataset_cache_is_version_keyed(tmp_path):
+    eng = _delta_engine(tmp_path)
+    # Interleave current + historical reads; each read must see its own snapshot.
+    assert eng.scan_arrow("workorder/work_order", version_as_of=0).num_rows == 2
+    assert eng.scan_arrow("workorder/work_order").num_rows == 3
+    assert eng.scan_arrow("workorder/work_order", version_as_of=0).num_rows == 2
+    assert eng.scan_arrow("workorder/work_order", version_as_of=1).num_rows == 3

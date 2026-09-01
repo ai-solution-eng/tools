@@ -9,8 +9,8 @@ description: >-
   S3-compatible store (MinIO/AWS, Parquet). Exposes list_tables /
   describe_table / run_sql / scan_table as MCP tools.
 type: application
-version: 0.8.0
-appVersion: "0.8.0"
+version: 1.0.0
+appVersion: "1.0.0"
 keywords:
   - mcp
   - onelake

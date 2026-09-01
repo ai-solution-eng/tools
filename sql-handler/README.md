@@ -150,6 +150,22 @@ Hive partition folders (`key=value`) inside a table folder are folded into
 the table; hidden folders (starting with `.`) are ignored. Filtering and
 projection push down to the Parquet scan exactly as with the OneLake backend.
 
+### Delta tables on S3 (`S3_FORMAT`)
+
+Parquet buckets whose tables already carry a Delta `_delta_log` (transactions,
+time travel) are read directly — no copying:
+
+- `S3_FORMAT=auto` (default) — folders containing a `_delta_log` are read as
+  Delta tables (deltalake over the same S3 credentials); everything else stays
+  plain Parquet. Delta data files are not re-discovered as separate tables.
+- `S3_FORMAT=delta` — every discovered table is treated as Delta.
+- `S3_FORMAT=parquet` — plain Parquet only (Delta logs ignored).
+
+Delta-on-S3 tables support `version_as_of` time travel; the engine's
+snapshot-version check uses the `_delta_log` listing, so ETL commits are
+picked up without waiting out the TTL. In `SQLHANDLER_SOURCES`, each source
+accepts `"format": "auto" | "parquet" | "delta"`.
+
 ### MinIO specifics
 
 - pyarrow (already a dependency) talks to S3 directly — **no extra pip
@@ -437,7 +453,18 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_MAX_ROWS` | Server-side row cap for `run_sql` results (default `1000`; `0` = unlimited) |
 | `SQLHANDLER_MAX_OUTPUT_ROWS` | Max rows rendered as markdown to a client (default `1000`) |
 | `SQLHANDLER_READINESS_CHECK` | `0` to disable the backend-aware `/ready` connectivity probe |
-| `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` |
+| `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` (when unset, the busiest tables from the previous run are warmed automatically) |
+| `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON file (table/column descriptions merged into list/describe; hot-reloaded) |
+| `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
+| `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
+| `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (default 0 = no timeout) |
+| `SQLHANDLER_MAX_CONCURRENT_QUERIES` | Max simultaneous DuckDB queries (default 8; 0 = unlimited); excess queue |
+| `SQLHANDLER_QUEUE_TIMEOUT` | Seconds a query may wait for a concurrency slot (default 30) |
+| `SQLHANDLER_ASYNC_JOB_TTL` | Seconds a finished async-query job stays fetchable (default 900) |
+| `SQLHANDLER_EXPORT_MAX_ROWS` | Row cap for CSV/Parquet exports (default 100000; 0 = hard 1M ceiling) |
+| `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off) |
+| `SQLHANDLER_API_TOKEN` | Require this bearer token on `/api/*` (unset = no token check) |
+| `S3_FORMAT` | `auto` (detect Delta by `_delta_log`), `parquet`, or `delta` |
 
 ## Performance & caching
 
@@ -675,9 +702,17 @@ agents query, through the same engine and caches:
 
 - **Table list** (searchable, shows format badges; in federated multi-source
   mode each entry is labeled `source/schema/name`, e.g. `sales/orders`)
-- **Schema view** per table — columns + types + table URI
+- **Schema view** per table — columns + types + table URI (+ catalog docs)
+- **Column stats** — lazy per-table profiling panel (min/max, distinct≈, null
+  %, quartiles) via "Profile table"; scans a capped sample
 - **SQL editor** — run read-only queries (Ctrl+Enter), with a row limit
 - **Results table** — rendered with row/column counts, timing, and copy-CSV
+- **Charts** — one-click inline SVG bar chart of the first numeric column
+- **Export** — download the current query (or a preview) as **CSV or Parquet**
+  (`POST /api/export`; capped by `SQLHANDLER_EXPORT_MAX_ROWS`, default 100k)
+- **Saved queries + history** — stored per browser (localStorage): save a
+  query with 💾, click to reload, one-click delete; history records the last
+  30 successful runs
 - **Light/dark theme** — header toggle, persisted per browser, defaults to the
   OS preference
 - **HPE branding** — Hewlett Packard Enterprise wordmark with the HPE green
@@ -690,9 +725,14 @@ It is served by the same server process, so it needs **no extra deployment**:
 | `http://host:9097/` or `/ui` | the web UI |
 | `GET  /api/status` | server version + backend |
 | `GET  /api/tables` | table list |
-| `POST /api/describe` | columns/types for a table |
+| `POST /api/describe` | columns/types for a table (+ catalog docs) |
 | `POST /api/query` | run read-only SQL, returns columns+rows JSON |
+| `POST /api/query/async` | start an async query, returns a `query_id` |
+| `GET  /api/query/{id}` / `/{id}/rows` / `DELETE /api/query/{id}` | async status / paginated rows / cancel |
 | `POST /api/preview` | first N rows of a table |
+| `POST /api/profile` | column statistics (min/max, null %, distinct, quartiles) |
+| `POST /api/export` | download a query or table as CSV / Parquet |
+| `GET  /metrics` | Prometheus metrics |
 
 The UI is deliberately **read-only**: every statement is parsed with DuckDB's
 own grammar and only plain `SELECT` queries (plus `EXPLAIN SELECT`) are
@@ -735,16 +775,155 @@ as `/mcp` (long-running queries), while the page itself uses the short timeout.
   namespace to `security.networkPolicy.allowedNamespaces` — no other change
   needed.
 
+## Observability & ops (0.9.0)
+
+### Prometheus metrics
+
+`GET /metrics` renders the Prometheus text exposition (no extra dependency):
+query counters by outcome (`ok`/`error`/`cancelled`), a query-duration
+histogram, rows returned, cache hit/miss counters per cache type, and gauges
+for the table count, process RSS and the container memory limit.
+
+### Audit log
+
+Set `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` and every query outcome is
+appended as one JSON line (`ts`, `sql`, `state`, `duration_ms`, `n_rows`,
+`error`) — a compliance-grade record of every SQL executed against the lake,
+ready for SIEM tailing. Writes are best-effort and never break a query.
+
+### API token (non-gateway deployments)
+
+When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it
+(`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time
+compared) — for deployments where the JSON API is not already behind the PCAI
+oauth2-proxy gateway. `/mcp`, `/ui`, `/health` and `/ready` are unaffected;
+note the in-browser UI does not send the token, so leave it unset when the UI
+must work without gateway auth.
+
 ## MCP tools
 
-- `list_tables`       — enumerate tables in the configured source (any backend)
-- `describe_table`    — columns/types/URI for a table
-- `run_sql`           — run SQL via DuckDB (aggregations/joins), results as markdown
-- `scan_table`        — pull columns/rows via pyarrow with a row limit
+- `list_tables`       — enumerate tables in the configured source (any backend);
+                        annotated with catalog descriptions when configured
+- `search_tables`     — keyword search over table/column names + catalog docs
+- `describe_table`    — columns/types/URI for a table (+ catalog docs)
+- `profile_table`     — column statistics: min/max, distinct≈, null %, avg/std,
+                        q25/q50/q75, row count (cached like describe)
+- `run_sql`           — run SQL via DuckDB (aggregations/joins); markdown (default),
+                        JSON or CSV output; optional bind `params` and time travel
+- `scan_table`        — pull columns/rows via pyarrow with a row limit; same
+                        output formats and time travel
 
 In federated multi-source mode, tables are source-qualified: `list_tables`
 returns all sources, and `describe_table` / `run_sql` take names like
 `sales_orders` or `inventory_raw_customers` (bare names only when unique).
+
+## Agent ergonomics (0.9.0)
+
+Features that make LLM agents effective against the lake on the first try:
+
+### profile_table — statistics before SQL
+
+`describe_table` gives names/types; `profile_table` gives *values*: min/max,
+approximate distinct counts, null %, avg/std and quartiles per column, plus the
+exact row count (from Parquet/Delta metadata). Agents use it to pick correct
+predicates without trial-and-error queries. Profiling scans a bounded sample
+(`SQLHANDLER_PROFILE_MAX_ROWS`, default 1M; 0 = full table) and is cached like
+describe.
+
+### Semantic catalog — business meaning for tables/columns
+
+Point `SQLHANDLER_CATALOG` at a JSON file of human-written documentation and it
+is merged into `list_tables` / `describe_table` output (and MCP resources):
+
+```json
+{
+  "tables": {
+    "workorder/work_order": {
+      "description": "Maintenance work order headers, one row per order",
+      "aliases": ["work orders"],
+      "columns": {
+        "amount": "Order total in USD",
+        "kind": "Order class: a=planned, b=unplanned"
+      }
+    }
+  }
+}
+```
+
+Keys match the logical `schema/name` path (a bare name or the source-qualified
+name also work). The file is hot-reloaded on change (cached describes are
+invalidated so new wording appears immediately); a missing/broken file never
+breaks queries.
+
+### MCP resources + prompts
+
+Resource-capable clients get read-only context without tool calls:
+
+- `sqlhandler://catalog` — every table + its catalog description
+- `sqlhandler://table/<percent-encoded path>/schema` — one table's schema + column docs
+- `sqlhandler://query-memory` — recent successful queries (see below)
+
+Prompts: `explore-data` (list → catalog → profile → SQL workflow) and
+`analyze-table` (deep-dive one table, profile-first).
+
+### Self-improving loops
+
+- **Query memory** — the engine records the last 50 query outcomes
+  (`SQLHANDLER_QUERY_MEMORY_SIZE`); the `sqlhandler://query-memory` resource lets
+  later agent sessions reuse proven SQL patterns instead of rediscovering them.
+- **Did-you-mean errors** — a bad table name in SQL comes back with the nearest
+  real table names attached ("Did you mean one of: workorder_work_order, …"), so
+  the agent self-corrects in one round-trip.
+- **Usage-driven prewarm** — when `SQLHANDLER_PREWARM_TABLES` is unset, the
+  busiest tables of the previous run (usage counts persisted with the disk-warm
+  cache) are prewarmed on restart. The server teaches itself what to warm.
+
+## Query engine capabilities (0.9.0)
+
+### Parameterized queries
+
+`run_sql` accepts bind `params` — an object for named `$placeholders` or an
+array for positional `?` — so reusable query templates stay injection-safe:
+
+```json
+{"sql": "SELECT * FROM work_order WHERE kind = $k", "params": {"k": "a"}}
+```
+
+### Time travel (`version_as_of`)
+
+`run_sql` and `scan_table` accept `version_as_of` (a non-negative integer) to
+read a historical snapshot — a **Delta snapshot version** (nfs / onelake /
+Delta-on-S3) or an **Iceberg snapshot id**. It applies to every versionable
+table the query touches; plain-Parquet tables in the same query are a clear
+error. Historical datasets are cached per version (a snapshot never changes).
+
+### Query timeout
+
+`SQLHANDLER_QUERY_TIMEOUT` (seconds; 0 = off, the default) interrupts a query
+inside DuckDB when it runs too long — no leaked threads, a clean error to the
+caller. Applies to MCP `run_sql` and the web API alike.
+
+### Async queries (web API)
+
+For long-running queries the JSON API supports submit/poll/paginate/cancel:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/query/async` | validate + start; returns `{"query_id", "state"}` |
+| `GET  /api/query/{id}` | status: `running`/`done`/`error`/`cancelled`, columns, n_rows |
+| `GET  /api/query/{id}/rows?offset=&limit=` | paginated rows (page cap 1000) |
+| `DELETE /api/query/{id}` | cancel a running query (DuckDB interrupt) |
+
+Finished jobs are kept for `SQLHANDLER_ASYNC_JOB_TTL` seconds (default 900), up
+to 100 tracked jobs; the registry refuses (HTTP 429) when full of running jobs.
+The same row caps and read-only guard apply.
+
+### Concurrency cap
+
+`SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8; 0 = unlimited) bounds the
+simultaneous DuckDB queries per pod; excess queries queue up to
+`SQLHANDLER_QUEUE_TIMEOUT` seconds (default 30) and then fail with a clear
+error instead of piling up on the container.
 
 ## Other data sources / roadmap
 

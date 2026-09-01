@@ -30,7 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import FabricConfig
-from .provider import DataProvider, LakehouseError, TableInfo
+from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 
 logger = logging.getLogger("sqlhandler.onelake")
 
@@ -278,13 +278,15 @@ class OneLakeProvider(DataProvider):
         return infos
 
     # ----------------------------------------------------------- data access
-    def _open_delta(self, info: TableInfo):
-        """Open a deltalake DeltaTable handle."""
+    def _open_delta(self, info: TableInfo, version: int | None = None):
+        """Open a deltalake DeltaTable handle (optionally a past version)."""
         from deltalake import DeltaTable as DeltaTableCls
 
         uri = self.table_uri(info)
         try:
-            return DeltaTableCls(uri, storage_options=self._storage_options())
+            if version is None:
+                return DeltaTableCls(uri, storage_options=self._storage_options())
+            return DeltaTableCls(uri, version=version, storage_options=self._storage_options())
         except Exception as exc:
             raise LakehouseError(f"Could not open Delta table {info.path!r}: {exc}") from exc
 
@@ -299,9 +301,16 @@ class OneLakeProvider(DataProvider):
             "blob_endpoint": self.config.fabric_authority.replace("dfs", "blob"),
         }
 
-    def open_dataset(self, info: TableInfo):
-        """Open the Delta table as a pyarrow Dataset (cached by the engine)."""
-        dt = self._open_delta(info)
+    def open_dataset(self, info: TableInfo, version: int | None = None):
+        """Open the Delta table as a pyarrow Dataset (cached by the engine).
+
+        ``version`` pins a historical Delta snapshot for time travel.
+        """
+        if version is not None:
+            _validate_snapshot_version(version, "Delta")
+            dt = self._open_delta(info, version=int(version))
+        else:
+            dt = self._open_delta(info)
         try:
             return dt.to_pyarrow_dataset()
         except Exception as exc:

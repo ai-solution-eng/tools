@@ -20,7 +20,27 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-__all__ = ["DataProvider", "LakehouseError", "MultiProvider", "TableInfo", "make_provider"]
+__all__ = [
+    "DataProvider",
+    "LakehouseError",
+    "MultiProvider",
+    "TableInfo",
+    "make_provider",
+]
+
+
+def _validate_snapshot_version(version: object, backend: str) -> int:
+    """Validate a time-travel version argument (int snapshot id/version).
+
+    Returns the int value; raises LakehouseError for anything else (bools
+    are ints in Python but are never a legitimate snapshot id).
+    """
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise LakehouseError(
+            f"{backend} time travel needs a non-negative integer snapshot version, "
+            f"got {version!r}."
+        )
+    return version
 
 
 class LakehouseError(RuntimeError):
@@ -80,12 +100,17 @@ class DataProvider(ABC):
         """Canonical URI for a table (ABFS/ADLS, s3://, ...), for display."""
 
     @abstractmethod
-    def open_dataset(self, info: TableInfo) -> object:
+    def open_dataset(self, info: TableInfo, version: int | None = None) -> object:
         """Open the table as a pyarrow Dataset (no row data is loaded).
 
         The engine caches the returned handle, so this should be an
         "open metadata" operation (read the Delta _delta_log / Parquet footer
         once), not a full download.
+
+        ``version`` selects a HISTORICAL snapshot for time travel (``None``
+        = current): a Delta snapshot version (nfs/onelake) or an Iceberg
+        snapshot id. Backends without version history (plain Parquet) must
+        raise :class:`LakehouseError` when a version is requested.
         """
 
     def check_connection(self) -> str | None:
@@ -158,8 +183,8 @@ class MultiProvider(DataProvider):
     def table_uri(self, info: TableInfo) -> str:
         return self._owner(info).table_uri(info)
 
-    def open_dataset(self, info: TableInfo) -> object:
-        return self._owner(info).open_dataset(info)
+    def open_dataset(self, info: TableInfo, version: int | None = None) -> object:
+        return self._owner(info).open_dataset(info, version)
 
     def check_version(self, info: TableInfo) -> object | None:
         return self._owner(info).check_version(info)

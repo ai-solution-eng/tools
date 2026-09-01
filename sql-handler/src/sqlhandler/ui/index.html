@@ -307,6 +307,17 @@
   .toast.show { display: block; }
   .toast .close { margin-left: 10px; cursor: pointer; color: var(--muted); }
   .copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; margin-left: 6px; }
+  .mini-row { display: flex; gap: 8px; align-items: baseline; padding: 5px 4px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 12px; }
+  .mini-row:last-child { border-bottom: none; }
+  .mini-row:hover { background: var(--panel-2); }
+  .mini-name { font-weight: 600; white-space: nowrap; }
+  .mini-sql { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-family: var(--mono); font-size: 11px; }
+  .mini-del { color: var(--muted); background: none; border: none; padding: 0 4px; font-size: 11px; }
+  .mini-del:hover { color: var(--red); background: none; }
+  .panel h2 .hint { font-weight: 400; margin-left: 6px; }
+  #chart { margin-top: 10px; overflow-x: auto; }
+  #chart svg text { font-size: 10px; fill: var(--muted); }
+  #chart svg rect { fill: var(--accent); }
 </style>
 </head>
 <body>
@@ -348,6 +359,7 @@
         <div class="query-actions">
           <button id="run">Run (Ctrl+Enter)</button>
           <button id="preview-btn" class="ghost">Preview selected table</button>
+          <button id="save-query" class="ghost" title="Save this query in this browser">💾 Save</button>
           <span class="hint">read-only · SELECT / WITH / EXPLAIN / SHOW / PRAGMA / VALUES</span>
           <span class="spacer"></span>
           <label class="hint">limit
@@ -357,6 +369,14 @@
       </div>
       <div id="error"></div>
       <div id="result"></div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Saved queries <span class="hint">(this browser)</span></h2>
+        <div id="saved-list"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Recent queries</h2>
+        <div id="history-list"></div>
+      </div>
     </div>
 
     <div id="pane-schema" class="pane hidden">
@@ -364,6 +384,10 @@
         <h2>Selected table <button id="preview-here" class="ghost copy-btn" style="float:right">Preview rows</button></h2>
         <div id="schema-desc"></div>
         <div id="schema-grid"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Column stats <button id="load-stats" class="ghost copy-btn" style="float:right" title="Profiling scans data (capped sample)">Profile table</button></h2>
+        <div id="stats-grid"><div class="empty">value ranges, distinct counts and null % — click "Profile table" (scans data)</div></div>
       </div>
     </div>
   </main>
@@ -505,7 +529,11 @@ function renderResult(payload) {
     (payload.truncated ? " (truncated)" : "") + '</span>' +
     "<span>columns: " + cols.length + "</span>" +
     "<span>took: " + payload.duration_ms + " ms</span>" +
-    '<button class="copy" id="copy-csv">copy CSV</button></div>';
+    '<button class="copy" id="copy-csv">copy CSV</button>' +
+    '<button class="copy" id="export-csv">export CSV</button>' +
+    '<button class="copy" id="export-parquet">export Parquet</button>' +
+    (numericColIndex(cols, rows) >= 0 ? '<button class="copy" id="toggle-chart">📊 chart</button>' : "") +
+    '</div><div id="chart"></div>';
   html += '<div style="overflow:auto;max-height:60vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr>';
   for (const c of cols) html += "<th>" + esc(c) + "</th>";
   html += "</tr></thead><tbody>";
@@ -524,6 +552,80 @@ function renderResult(payload) {
     const csv = [cols].concat(rows).map((r) => r.map(csvCell).join(",")).join("\n");
     navigator.clipboard.writeText(csv).then(() => toast("CSV copied"));
   };
+  const ec = $("export-csv");
+  if (ec) ec.onclick = () => exportResult("csv");
+  const ep = $("export-parquet");
+  if (ep) ep.onclick = () => exportResult("parquet");
+  const tc = $("toggle-chart");
+  if (tc) tc.onclick = () => drawChart(cols, rows, tc);
+}
+
+// ---- charts -----------------------------------------------------------------
+// Simple dependency-free SVG bar chart: first column is the label, the first
+// all-numeric column is the value, capped at the first 24 rows.
+function numericColIndex(cols, rows) {
+  for (let i = 1; i < cols.length; i++) {
+    let ok = rows.length > 0;
+    for (const r of rows) {
+      if (r[i] === null || typeof r[i] !== "number") { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+function drawChart(cols, rows, toggleBtn) {
+  const host = $("chart");
+  if (!host) return;
+  if (host.dataset.drawn) { host.innerHTML = ""; delete host.dataset.drawn; toggleBtn.textContent = "📊 chart"; return; }
+  const vi = numericColIndex(cols, rows);
+  if (vi < 0) return;
+  const data = rows.slice(0, 24).map((r) => [String(r[0]), r[vi]]);
+  const max = Math.max(...data.map((d) => Math.abs(d[1])), 1e-9);
+  const bw = Math.max(600, data.length * 64);
+  const bh = 160;
+  const barW = Math.max(8, (bw - 20) / data.length - 8);
+  let svg = '<svg width="' + bw + '" height="' + (bh + 26) + '" role="img" aria-label="bar chart of ' + esc(cols[vi]) + '">';
+  data.forEach((d, i) => {
+    const h = Math.max(1, Math.round((Math.abs(d[1]) / max) * (bh - 10)));
+    const x = 12 + i * ((bw - 20) / data.length);
+    const label = d[0].length > 9 ? d[0].slice(0, 8) + "…" : d[0];
+    svg += '<rect x="' + x + '" y="' + (bh - h) + '" width="' + barW + '" height="' + h + '"><title>' + esc(d[0] + ": " + d[1]) + "</title></rect>";
+    svg += '<text x="' + (x + barW / 2) + '" y="' + (bh + 14) + '" text-anchor="middle">' + esc(label) + "</text>";
+    svg += '<text x="' + (x + barW / 2) + '" y="' + (bh - h - 4) + '" text-anchor="middle">' + esc(String(d[1])) + "</text>";
+  });
+  svg += "</svg>";
+  host.innerHTML = '<div class="hint" style="margin-bottom:4px">' + esc(cols[0]) + " → " + esc(cols[vi]) + " (first " + data.length + " rows)</div>" + svg;
+  host.dataset.drawn = "1";
+  toggleBtn.textContent = "📊 hide chart";
+}
+
+// ---- export -----------------------------------------------------------------
+async function exportResult(format) {
+  const sql = $("sql").value.trim();
+  if (!sql) { setError("Nothing to export."); return; }
+  try {
+    const res = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql, format, limit: parseInt($("limit").value, 10) || 10000 }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      throw new Error(j.error || "HTTP " + res.status);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename="([^"]+)"/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : "query." + format;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("Exported " + a.download);
+  } catch (e) {
+    setError(e.message);
+  }
 }
 
 function csvCell(v) {
@@ -545,11 +647,121 @@ async function runQuery() {
       body: JSON.stringify({ sql, limit: parseInt($("limit").value, 10) || 100 }),
     });
     renderResult(payload);
+    pushHistory(sql, payload.duration_ms);
   } catch (e) {
     $("result").innerHTML = "";
     setError(e.message);
   } finally {
     $("run").disabled = false;
+  }
+}
+
+// ---- saved queries + history (localStorage) --------------------------------
+const SAVED_KEY = "sqlhandler-saved-queries";
+const HIST_KEY = "sqlhandler-query-history";
+
+function lsAll(key, cap) {
+  try { return JSON.parse(localStorage.getItem(key) || "[]").slice(0, cap); } catch (e) { return []; }
+}
+function lsPut(key, val, cap) {
+  try { localStorage.setItem(key, JSON.stringify(val.slice(0, cap))); } catch (e) { /* ignore */ }
+}
+
+function miniList(el, items, onLoad, onDelete) {
+  if (!items.length) { el.innerHTML = '<div class="empty">none yet</div>'; return; }
+  let html = "";
+  items.forEach((q, i) => {
+    html += '<div class="mini-row" data-i="' + i + '"><span class="mini-name">' + esc(q.name || "") + "</span>" +
+      '<span class="mini-sql">' + esc(q.sql) + "</span>" +
+      '<button class="mini-del" data-i="' + i + '" title="delete">✕</button></div>';
+  });
+  el.innerHTML = html;
+  el.querySelectorAll(".mini-row").forEach((row) => {
+    row.onclick = (ev) => {
+      if (ev.target.classList.contains("mini-del")) return;
+      const q = items[Number(row.dataset.i)];
+      if (q) { $("sql").value = q.sql; $("sql").focus(); toast("Loaded: " + (q.name || "query")); }
+    };
+  });
+  el.querySelectorAll(".mini-del").forEach((btn) => {
+    btn.onclick = (ev) => { ev.stopPropagation(); onDelete(Number(btn.dataset.i)); };
+  });
+  void onLoad;
+}
+
+function renderSaved() {
+  const saved = lsAll(SAVED_KEY, 50);
+  miniList($("saved-list"), saved,
+    (q) => { $("sql").value = q.sql; },
+    (i) => {
+      const next = lsAll(SAVED_KEY, 50);
+      next.splice(i, 1);
+      lsPut(SAVED_KEY, next, 50);
+      renderSaved();
+    });
+  if (!saved.length) $("saved-list").innerHTML = '<div class="empty">nothing saved yet — run a query and click 💾 Save</div>';
+}
+
+function renderHistory() {
+  const hist = lsAll(HIST_KEY, 30);
+  const named = hist.map((h) => ({
+    name: new Date(h.ts).toLocaleTimeString() + (h.ms != null ? " · " + h.ms + "ms" : ""),
+    sql: h.sql,
+  }));
+  miniList($("history-list"), named,
+    (q) => { $("sql").value = q.sql; },
+    (i) => {
+      const next = lsAll(HIST_KEY, 30);
+      next.splice(i, 1);
+      lsPut(HIST_KEY, next, 30);
+      renderHistory();
+    });
+  if (!hist.length) $("history-list").innerHTML = '<div class="empty">no queries run in this browser yet</div>';
+}
+
+function pushHistory(sql, ms) {
+  const hist = lsAll(HIST_KEY, 30).filter((h) => h.sql !== sql);
+  hist.unshift({ sql, ts: Date.now(), ms });
+  lsPut(HIST_KEY, hist, 30);
+  renderHistory();
+}
+
+function saveCurrentQuery() {
+  const sql = $("sql").value.trim();
+  if (!sql) { setError("Nothing to save."); return; }
+  const name = prompt("Name for this query:", sql.slice(0, 40));
+  if (!name) return;
+  const saved = lsAll(SAVED_KEY, 50).filter((q) => q.name !== name);
+  saved.unshift({ name, sql });
+  lsPut(SAVED_KEY, saved, 50);
+  renderSaved();
+  toast('Saved "' + name + '"');
+}
+
+// ---- column stats (lazy profiling) ------------------------------------------
+async function loadColumnStats() {
+  const t = state.selected;
+  if (!t) { toast("Select a table first"); return; }
+  $("stats-grid").innerHTML = '<div class="loading">profiling (scans a capped sample)…</div>';
+  try {
+    const p = await api("/api/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: t.path }),
+    });
+    const fmt = (v) => esc(v === null || v === undefined ? "" : String(v));
+    let html = '<div class="hint" style="margin-bottom:8px">rows: ' + fmt(p.n_rows) +
+      " · profiled: " + fmt(p.profiled_rows) + "</div>";
+    html += '<div style="overflow:auto"><table class="grid"><thead><tr><th>column</th><th>min</th><th>max</th><th>distinct≈</th><th>null %</th><th>q25</th><th>q50</th><th>q75</th></tr></thead><tbody>';
+    (p.columns || []).forEach((c) => {
+      html += "<tr><td>" + esc(c.name) + "</td><td>" + fmt(c.min) + "</td><td>" + fmt(c.max) + "</td><td>" +
+        fmt(c.approx_unique) + "</td><td>" + fmt(c.null_pct) + "</td><td>" + fmt(c.q25) + "</td><td>" +
+        fmt(c.q50) + "</td><td>" + fmt(c.q75) + "</td></tr>";
+    });
+    html += "</tbody></table></div>";
+    $("stats-grid").innerHTML = html;
+  } catch (e) {
+    $("stats-grid").innerHTML = '<div class="empty">failed: ' + esc(e.message) + "</div>";
   }
 }
 
@@ -602,10 +814,14 @@ $("preview-here").onclick = () => {
 $("sql").addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); }
 });
+$("save-query").onclick = saveCurrentQuery;
+$("load-stats").onclick = loadColumnStats;
 
 initThemeToggle();
 refreshStatus();
 refreshTables();
+renderSaved();
+renderHistory();
 </script>
 </body>
 </html>

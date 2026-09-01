@@ -28,11 +28,23 @@ import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
 from .config import S3Config
-from .provider import DataProvider, LakehouseError, TableInfo
+from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 
 logger = logging.getLogger("sqlhandler.s3")
 
 _PARQUET_SUFFIX = ".parquet"
+_DELTA_LOG = "_delta_log"
+
+
+def normalize_s3_format(fmt: str) -> str:
+    """Validate the S3_FORMAT value; one of auto | parquet | delta."""
+    fmt = (fmt or "auto").strip().lower()
+    if fmt in ("auto", "parquet", "delta"):
+        return fmt
+    raise LakehouseError(
+        f"Invalid S3_FORMAT {fmt!r}: use 'auto' (detect Delta by _delta_log), "
+        "'parquet' (plain Parquet only) or 'delta' (treat every table as Delta)."
+    )
 
 
 def _endpoint_override(endpoint_url: str, use_ssl: bool) -> str | None:
@@ -78,6 +90,7 @@ class S3Provider(DataProvider):
                 "bucket), plus S3_ENDPOINT_URL when targeting MinIO."
             )
         self.config = config
+        self.format = normalize_s3_format(config.format)
         self._fs: pafs.S3FileSystem | None = None
 
     # ------------------------------------------------------------- client
@@ -136,7 +149,14 @@ class S3Provider(DataProvider):
 
     # ----------------------------------------------------------- listing
     def list_tables(self) -> list[TableInfo]:
-        """Enumerate the Parquet tables under bucket/prefix (recursive)."""
+        """Enumerate the tables under bucket/prefix (recursive).
+
+        With ``S3_FORMAT=auto`` (default), folders containing a ``_delta_log``
+        are Delta tables and their data files are not re-discovered as plain
+        Parquet tables; everything else is Parquet as before. ``parquet``
+        disables Delta detection; ``delta`` tags every discovered table as
+        Delta (the bucket owner has asserted the layout).
+        """
         fs = self._s3fs()
         root = self._base()
         try:
@@ -146,16 +166,105 @@ class S3Provider(DataProvider):
             raise LakehouseError(f"Could not list S3 path '{root}': {exc}") from exc
 
         seen: dict[str, TableInfo] = {}
+        # Delta detection: a data-file path with a _delta_log segment marks
+        # its parent as a Delta table root.
+        delta_roots: set[str] = set()
+        if self.format in ("auto", "delta"):
+            for fi in infos:
+                if fi.type != pafs.FileType.File:
+                    continue
+                parts = fi.path.split("/")
+                if _DELTA_LOG in parts:
+                    delta_roots.add("/".join(parts[: parts.index(_DELTA_LOG)]))
+        for dr in sorted(delta_roots):
+            rel = dr[len(root) :].strip("/")
+            if not rel:
+                continue
+            parts = rel.split("/")
+            name = parts[-1]
+            schema = parts[-2] if len(parts) >= 2 else "default"
+            seen[f"{schema}/{name}"] = TableInfo(
+                name=name, schema=schema, format="delta", location=rel
+            )
         for fi in infos:
             if fi.type != pafs.FileType.File:
                 continue
             rel = fi.path[len(root) :].strip("/")
             if not rel or not self._is_parquet(rel):
                 continue
+            if any(fi.path.startswith(dr + "/") for dr in delta_roots):
+                continue  # data file inside a Delta table, not its own table
             info = self._derive(rel)
             if info is not None:
-                seen[info.path] = info
+                if self.format == "delta":
+                    info = TableInfo(
+                        name=info.name,
+                        schema=info.schema,
+                        format="delta",
+                        location=info.location,
+                    )
+                seen.setdefault(info.path, info)
         return sorted(seen.values(), key=lambda ti: ti.path)
+
+    # ------------------------------------------------------------- delta
+    def _delta_storage_options(self) -> dict:
+        """object_store/deltalake storage options mirroring the S3 config."""
+        c = self.config
+        opts: dict = {"aws_region": c.region}
+        if c.access_key:
+            opts["aws_access_key_id"] = c.access_key
+        if c.secret_key:
+            opts["aws_secret_access_key"] = c.secret_key
+        if c.session_token:
+            opts["aws_session_token"] = c.session_token
+        endpoint = _endpoint_override(c.endpoint_url, c.use_ssl)
+        if endpoint:
+            opts["aws_endpoint"] = endpoint
+            if endpoint.startswith("http://"):
+                opts["aws_allow_http"] = "true"
+        if c.anonymous:
+            opts["aws_skip_signature"] = "true"
+        return opts
+
+    def _open_delta(self, info: TableInfo, version: int | None = None):
+        """Open a deltalake DeltaTable over s3:// (optionally a past version)."""
+        try:
+            from deltalake import DeltaTable as DeltaTableCls
+        except ImportError as exc:  # pragma: no cover - deltalake is a hard dep
+            raise LakehouseError(f"deltalake is required for S3 Delta tables: {exc}") from exc
+        uri = self.table_uri(info)
+        try:
+            if version is None:
+                return DeltaTableCls(uri, storage_options=self._delta_storage_options())
+            return DeltaTableCls(
+                uri, version=version, storage_options=self._delta_storage_options()
+            )
+        except Exception as exc:
+            raise LakehouseError(f"Could not open S3 Delta table {info.path!r}: {exc}") from exc
+
+    def _delta_version(self, info: TableInfo) -> int | None:
+        """Latest Delta version from the table's _delta_log keys (cheap list)."""
+        location = info.location or info.path
+        log_dir = f"{self._base()}/{location}/{_DELTA_LOG}"
+        try:
+            entries = self._s3fs().get_file_info(pafs.FileSelector(log_dir, recursive=False))
+        except Exception:
+            return None
+        versions = [0]
+        for fi in entries:
+            stem = fi.path.split("/")[-1].split(".", 1)[0]
+            if stem.isdigit():
+                versions.append(int(stem))
+        return max(versions)
+
+    def check_version(self, info: TableInfo) -> int | None:
+        """Cheap version token: Delta log listing (delta) / None (parquet)."""
+        if info.format != "delta":
+            return None
+        try:
+            return self._delta_version(info)
+        except Exception:
+            return None
 
     # ----------------------------------------------------------- dataset
     def check_connection(self) -> str | None:
@@ -167,8 +276,24 @@ class S3Provider(DataProvider):
         except Exception as exc:
             return str(exc)
 
-    def open_dataset(self, info: TableInfo):
-        """Open a table folder/file as a pyarrow Dataset (cached by engine)."""
+    def open_dataset(self, info: TableInfo, version: int | None = None):
+        """Open a table as a pyarrow Dataset (cached by engine).
+
+        Delta tables (``S3_FORMAT=auto`` detection or ``S3_FORMAT=delta``)
+        are read with deltalake against the same S3 credentials; ``version``
+        pins a historical snapshot (time travel). Plain Parquet has no
+        version history; requesting one is an error.
+        """
+        if info.format == "delta":
+            if version is not None:
+                _validate_snapshot_version(version, "Delta")
+                return self._open_delta(info, version=int(version)).to_pyarrow_dataset()
+            return self._open_delta(info).to_pyarrow_dataset()
+        if version is not None:
+            raise LakehouseError(
+                f"Time travel is not supported for plain Parquet table '{info.path}' "
+                "(only Delta and Iceberg tables have version history)."
+            )
         location = info.location or info.path
         # S3 keys are flat so ".." cannot escape the bucket, but a traversal
         # segment is always a caller bug — fail fast with a clear error

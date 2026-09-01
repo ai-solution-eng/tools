@@ -132,6 +132,10 @@ class S3Config:
     anonymous: bool = False
     use_ssl: bool = False
     path_style_access: bool = True
+    # Table format: "auto" (default) detects Delta tables by their
+    # _delta_log and reads everything else as plain Parquet; "parquet"
+    # forces plain Parquet; "delta" treats every discovered table as Delta.
+    format: str = "auto"
 
     @property
     def is_configured(self) -> bool:
@@ -157,6 +161,8 @@ def load_s3_config(env: dict | None = None) -> S3Config:
       S3_ANONYMOUS   (true/1/on enables anonymous read of a public bucket)
       S3_USE_SSL     (force https when endpoint_url has no scheme)
       S3_PATH_STYLE  (default true; MinIO uses path-style addressing)
+      S3_FORMAT      (auto | parquet | delta; auto detects Delta tables by
+                      their _delta_log and reads the rest as plain Parquet)
     """
     e = env if env is not None else os.environ
     return S3Config(
@@ -170,6 +176,7 @@ def load_s3_config(env: dict | None = None) -> S3Config:
         anonymous=_to_bool("S3_ANONYMOUS", e, False),
         use_ssl=_to_bool("S3_USE_SSL", e, False),
         path_style_access=_to_bool("S3_PATH_STYLE", e, True),
+        format=_getenv("S3_FORMAT", e.get("S3_FORMAT", "auto")).lower() or "auto",
     )
 
 
@@ -349,6 +356,7 @@ def load_source_providers(env: dict | None = None) -> object | None:
             "S3_PREFIX": src.get("prefix", ""),
             "S3_ANONYMOUS": "true" if src.get("anonymous") else "false",
             "S3_USE_SSL": "true" if src.get("useSsl") else "false",
+            "S3_FORMAT": src.get("format", "auto"),
             "FABRIC_LAKEHOUSE_ABFSS_URL": src.get("abfssUrl", ""),
             "FABRIC_WORKSPACE_ID": src.get("workspaceId", ""),
             "FABRIC_LAKEHOUSE_ID": src.get("lakehouseId", ""),
