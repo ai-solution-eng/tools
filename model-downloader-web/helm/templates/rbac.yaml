@@ -1,7 +1,8 @@
 # Cluster-wide access to create/delete the HF download Job and its per-submission
-# HF-token Secret in whatever namespace the user submits. This is intentionally
-# broad; tighten by replacing the ClusterRole with per-namespace Roles if your
-# environment requires it.
+# HF-token Secret in whatever namespace the user submits. The UI-launched debug
+# shell reuses the same Job + Secret permissions (it is a Job too). This is
+# intentionally broad; tighten by replacing the ClusterRole with per-namespace
+# Roles if your environment requires it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

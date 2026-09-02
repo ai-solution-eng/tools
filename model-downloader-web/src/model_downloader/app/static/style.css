@@ -536,6 +536,28 @@ tr.push-ok td { background: var(--hpe-green-tint); }
 tr.push-skip td { background: var(--hpe-skip-tint); }
 tr.push-err td { background: var(--hpe-critical-tint); }
 
+/* ---- Downloaded models ---- */
+.backend-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-right: 4px;
+  border: 1px solid var(--hpe-border);
+}
+.backend-pvc {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.backend-s3 {
+  background: var(--hpe-code-bg);
+  border-color: var(--hpe-focus);
+  color: var(--hpe-focus);
+}
+
 /* ---- Add-model modal ---- */
 .modal-wide { max-width: 720px; }
 .modal-body-scroll {

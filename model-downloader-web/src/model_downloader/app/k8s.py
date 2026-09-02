@@ -9,6 +9,7 @@ calls are pushed to a thread so the FastAPI event loop is not blocked.
 
 import asyncio
 import base64
+import logging
 import re
 import time
 import uuid
@@ -17,14 +18,27 @@ import yaml
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+log = logging.getLogger(__name__)
+
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "model-downloader"
+# Debug shells use their own managed-by value (they are Jobs, not download
+# Jobs) so list_managed_jobs() never picks them into the Jobs table.
+DEBUG_MANAGED_BY_VALUE = "model-downloader-debug"
+# PVC scanner Jobs get the same treatment: a distinct managed-by value so the
+# Jobs table (and reconcile) only ever sees real download Jobs.
+SCAN_MANAGED_BY_VALUE = "model-downloader-scan"
 JOB_ID_LABEL = "model-downloader/job-id"
+DEBUG_POD_LABEL = "model-downloader/debug-pod"
+K8S_JOB_NAME_LABEL = "batch.kubernetes.io/job-name"
+K8S_JOB_NAME_LABEL_LEGACY = "job-name"
 MODEL_NAME_ANNOTATION = "model-downloader/model-name"
 STORAGE_ANNOTATION = "model-downloader/storage"
 S3_PATH_ANNOTATION = "model-downloader/s3-path"
 CACHE_ROOT_ANNOTATION = "model-downloader/cache-root"
+DEBUG_JOB_NAME_ANNOTATION = "model-downloader/debug-job-name"
 MANAGED_LABEL_SELECTOR = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
+DEBUG_LABEL_SELECTOR = f"{MANAGED_BY_LABEL}={DEBUG_MANAGED_BY_VALUE}"
 
 
 def _sanitize(name: str) -> str:
@@ -44,9 +58,11 @@ def _parse_s3_path(s3_path: str) -> tuple[str, str]:
 
 
 class K8sClient:
-    def __init__(self, template_cm: str, template_cm_ns: str):
+    def __init__(self, template_cm: str, template_cm_ns: str, default_debug_image: str = ""):
         self.template_cm = template_cm
         self.template_cm_ns = template_cm_ns
+        self.default_debug_image = default_debug_image
+        self.debug_pod_available = False
         self._template: str | None = None
         self._batch: client.BatchV1Api | None = None
         self._core: client.CoreV1Api | None = None
@@ -87,6 +103,13 @@ class K8sClient:
         self._templates["pvc"] = cm.data["job.yaml"]
         self._templates["s3"] = cm.data.get("job-s3.yaml") or None
         self._template = self._templates["pvc"]
+        # Optional: the debug-job template only exists in chart >= 1.2.1. When
+        # missing, the UI hides the debug section and the API returns a hint.
+        self._templates["debug-job"] = cm.data.get("debug-job.yaml") or None
+        self.debug_pod_available = self._templates["debug-job"] is not None
+        # Optional: scan-job template for listing models on PVC.
+        self._templates["scan-job"] = cm.data.get("scan-job.yaml") or None
+        self.scan_job_available = self._templates["scan-job"] is not None
 
     def _render(
         self,
@@ -197,6 +220,128 @@ class K8sClient:
         await asyncio.to_thread(self.batch.create_namespaced_job, namespace=namespace, body=manifest)
         return secret_name, job_name
 
+    # ---- Debug shell (UI "Launch debug pod") — implemented as a Job ----
+
+    def _render_debug_job(self, namespace: str, job_name: str, secret_name: str, image: str) -> dict:
+        text = self._templates.get("debug-job")
+        if not text:
+            raise RuntimeError(
+                "debug-job template is missing from the job-template ConfigMap; "
+                "upgrade the chart (helm upgrade) to get the debug pod feature"
+            )
+        resolved_image = image or self.default_debug_image
+        if not resolved_image:
+            raise RuntimeError("no debug pod image configured (set debugPod.image in values)")
+        text = text.replace("__NAMESPACE__", namespace)
+        text = text.replace("__JOB_NAME__", job_name)
+        text = text.replace("__HF_TOKEN_SECRET__", secret_name)
+        text = text.replace("__IMAGE__", resolved_image)
+        docs = [d for d in yaml.safe_load_all(text) if d is not None]
+        if len(docs) != 1:
+            raise RuntimeError(f"debug-job template rendered to {len(docs)} docs, expected exactly 1")
+        return docs[0]
+
+    async def create_debug_job(
+        self, namespace: str, hf_token: str = "", image: str = ""
+    ) -> tuple[str, str]:
+        """Create the (optional) HF-token Secret + a long-running debug Job.
+
+        Returns (job_name, secret_name). Deliberately a Job, not a bare Pod:
+        the Job's Pod is created by the kube-system job-controller — the same
+        admission path as the downloader Jobs — so the platformwide
+        protect-models-pvc Kyverno policy admits it. A Pod created directly by
+        this ServiceAccount is denied for setting the 'hpe-ezua/app: mlis'
+        label (prevent-unauthorized-create-with-mlis).
+        """
+        suffix = uuid.uuid4().hex[:6]
+        job_name = f"md-debug-{suffix}"
+        secret_name = f"hf-token-debug-{suffix}"
+
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(
+                name=secret_name,
+                namespace=namespace,
+                labels={
+                    MANAGED_BY_LABEL: DEBUG_MANAGED_BY_VALUE,
+                    DEBUG_POD_LABEL: "true",
+                },
+                annotations={DEBUG_JOB_NAME_ANNOTATION: job_name},
+            ),
+            # An empty token keeps the env var present but harmless; the debug
+            # shell is mainly for inspecting the PVC.
+            string_data={"HF_TOKEN": hf_token or ""},
+            type="Opaque",
+        )
+        try:
+            await asyncio.to_thread(self.core.create_namespaced_secret, namespace=namespace, body=secret)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+        manifest = self._render_debug_job(namespace, job_name, secret_name, image)
+        try:
+            await asyncio.to_thread(self.batch.create_namespaced_job, namespace=namespace, body=manifest)
+        except ApiException:
+            # Job admission failed (e.g. kyverno) — don't leave the token Secret behind.
+            try:
+                await self.delete_secret(namespace, secret_name)
+            except Exception:
+                pass
+            raise
+        return job_name, secret_name
+
+    async def list_debug_pods(self) -> list[dict]:
+        """List debug-shell pods we created (cluster-wide) so the UI can show them."""
+        pods = await asyncio.to_thread(
+            self.core.list_pod_for_all_namespaces,
+            label_selector=DEBUG_LABEL_SELECTOR,
+        )
+        result = []
+        for pod in pods.items:
+            meta = pod.metadata
+            status = pod.status
+            labels = meta.labels or {}
+            image = ""
+            if pod.spec and pod.spec.containers:
+                image = pod.spec.containers[0].image or ""
+            created = meta.creation_timestamp.timestamp() if meta.creation_timestamp else None
+            result.append(
+                {
+                    "name": meta.name,
+                    "namespace": meta.namespace,
+                    "job_name": labels.get(K8S_JOB_NAME_LABEL) or labels.get(K8S_JOB_NAME_LABEL_LEGACY) or "",
+                    "phase": (status.phase if status else "") or "unknown",
+                    "node": (pod.spec.node_name if pod.spec else "") or "",
+                    "image": image,
+                    "created_at": created,
+                }
+            )
+        return result
+
+    async def delete_debug_job(self, namespace: str, job_name: str) -> None:
+        """Delete a debug Job (its Pod goes with it) and its HF-token Secret.
+
+        404s are ignored so deleting an already-cleaned-up job is a no-op.
+        """
+        try:
+            await asyncio.to_thread(
+                self.batch.delete_namespaced_job,
+                name=job_name,
+                namespace=namespace,
+                propagation_policy="Background",
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        secrets = await asyncio.to_thread(
+            self.core.list_namespaced_secret,
+            namespace=namespace,
+            label_selector=DEBUG_LABEL_SELECTOR,
+        )
+        for secret in secrets.items:
+            if (secret.metadata.annotations or {}).get(DEBUG_JOB_NAME_ANNOTATION) == job_name:
+                await self.delete_secret(namespace, secret.metadata.name)
+
     @staticmethod
     def _parse_job_status(job) -> tuple[str, str, float | None]:
         """Return (status, error, finished_epoch) from a V1Job."""
@@ -263,6 +408,21 @@ class K8sClient:
             await asyncio.sleep(poll)
         return False, "timeout waiting for job to finish"
 
+    @staticmethod
+    def _decode_log(resp) -> str:
+        """Decode a pod-log response across kubernetes-client versions.
+
+        Older clients (<=31) preload the body into ``str``; newer ones (32+)
+        hand back raw ``bytes`` (which ``str()`` would turn into a ``b'...'``
+        repr — the bug that made a perfectly good scan parse as zero models).
+        ``_preload_content=False`` + explicit decode is deterministic on all
+        versions.
+        """
+        data = getattr(resp, "data", resp)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data).decode("utf-8", "replace")
+        return data if isinstance(data, str) else str(data)
+
     async def get_job_logs(self, namespace: str, job_name: str, container: str = "downloader") -> str:
         """Read logs from the first pod belonging to a Job."""
         pods = await asyncio.to_thread(
@@ -279,12 +439,14 @@ class K8sClient:
             return f"(pod is {phase}; logs not available until it starts running)"
         pod_name = pod.metadata.name
         try:
-            logs = await asyncio.to_thread(
+            resp = await asyncio.to_thread(
                 self.core.read_namespaced_pod_log,
                 name=pod_name,
                 namespace=namespace,
                 container=container,
+                _preload_content=False,
             )
+            logs = self._decode_log(resp)
         except ApiException as e:
             body = e.body or ""
             if isinstance(body, bytes):
@@ -326,3 +488,113 @@ class K8sClient:
         """Check download progress by reading pod logs."""
         logs = await self.get_job_logs(namespace, job_name)
         return {"logs": logs}
+
+    # ---- PVC scan job (short-lived, read-only) ----
+
+    async def create_scan_job(
+        self,
+        namespace: str,
+        pvc_name: str,
+        scan_root: str,
+        image: str,
+        job_id: str,
+        mount_path: str = "/mnt/",
+    ) -> str:
+        """Create a short-lived Job that scans the PVC for model directories.
+
+        Returns the job name.  The job is designed to finish quickly (a few
+        seconds) and is cleaned up by the caller after reading its logs.
+        """
+        text = self._templates.get("scan-job")
+        if not text:
+            raise RuntimeError(
+                "scan-job template is missing from the job-template ConfigMap; "
+                "upgrade the chart (helm upgrade) to enable PVC scanning"
+            )
+        job_name = f"md-scan-{job_id}"[:63].rstrip("-")
+        text = text.replace("__NAMESPACE__", namespace)
+        text = text.replace("__JOB_NAME__", job_name)
+        text = text.replace("__PVC_NAME__", pvc_name)
+        text = text.replace("__MOUNT_PATH__", mount_path)
+        text = text.replace("__SCAN_ROOT__", scan_root)
+        text = text.replace("__IMAGE__", image)
+
+        docs = [d for d in yaml.safe_load_all(text) if d is not None]
+        if len(docs) != 1:
+            raise RuntimeError(
+                f"scan-job template rendered to {len(docs)} docs, expected exactly 1"
+            )
+        manifest = docs[0]
+        meta = manifest.setdefault("metadata", {})
+        meta.setdefault("labels", {})[MANAGED_BY_LABEL] = SCAN_MANAGED_BY_VALUE
+        meta.setdefault("labels", {})["model-downloader/scan"] = "true"
+
+        await asyncio.to_thread(
+            self.batch.create_namespaced_job,
+            namespace=namespace,
+            body=manifest,
+        )
+        return job_name
+
+    async def get_scan_results(
+        self, namespace: str, job_name: str, timeout: int = 30, poll: int = 2
+    ) -> tuple[str, str]:
+        """Wait for a scanner Job to finish and return (status, stdout).
+
+        Status is "complete", "failed", or "timeout" so callers can tell the
+        user why a scan produced nothing instead of returning a silent empty.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                job = await asyncio.to_thread(
+                    self.batch.read_namespaced_job_status,
+                    name=job_name,
+                    namespace=namespace,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    return "failed", "scan job disappeared before completing"
+                raise
+            for c in job.status.conditions or []:
+                if c.status == "True":
+                    if c.type == "Complete":
+                        return "complete", await self._read_scan_logs(namespace, job_name)
+                    if c.type == "Failed":
+                        return "failed", await self._read_scan_logs(namespace, job_name)
+            await asyncio.sleep(poll)
+        return "timeout", ""
+
+    async def _read_scan_logs(self, namespace: str, job_name: str) -> str:
+        """Read stdout from the scanner pod.
+
+        Every branch is logged — a scan that yields nothing must be
+        distinguishable (no pod found vs wrong phase vs read error) instead of
+        silently returning an empty string.
+        """
+        try:
+            pods = await asyncio.to_thread(
+                self.core.list_namespaced_pod,
+                namespace=namespace,
+                label_selector=f"job-name={job_name}",
+            )
+            if not pods.items:
+                log.warning("scan %s: no pod found with label job-name=%s", job_name, job_name)
+                return ""
+            pod = pods.items[0]
+            if pod.status.phase not in ("Running", "Succeeded"):
+                log.warning("scan %s: pod %s phase %s; logs not readable", job_name, pod.metadata.name, pod.status.phase)
+                return ""
+            logs = await asyncio.to_thread(
+                self.core.read_namespaced_pod_log,
+                name=pod.metadata.name,
+                namespace=namespace,
+                container="scanner",
+                _preload_content=False,
+            )
+            logs = self._decode_log(logs)
+            log.info("scan %s: read %d bytes from pod %s", job_name, len(logs), pod.metadata.name)
+            return logs or ""
+        except Exception as e:
+            log.warning("scan %s: log read failed: %s", job_name, e)
+            return ""

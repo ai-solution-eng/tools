@@ -322,3 +322,158 @@ data:
             emptyDir:
               sizeLimit: {{ .Values.downloader.s3WorkSize | quote }}
             {{- end }}
+  # Debug shell launched from the UI ("Launch debug pod"). Deliberately a Job,
+  # not a bare Pod: the Job's Pod is then created by the kube-system
+  # job-controller — the exact same admission path as the downloader Jobs —
+  # whereas a Pod created directly by the model-downloader ServiceAccount is
+  # denied by the platformwide protect-models-pvc Kyverno policy
+  # (prevent-unauthorized-create-with-mlis: "Insufficient authorization to set
+  # the 'hpe-ezua/app' label to 'mlis'"). With the job-controller as creator,
+  # the same labels/annotations as downloader pods are admitted as-is.
+  debug-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value so the download-jobs reconciliation
+        # (selector app.kubernetes.io/managed-by=model-downloader) never
+        # picks debug jobs up into the Jobs table.
+        app.kubernetes.io/managed-by: model-downloader-debug
+    spec:
+      # tail -f /dev/null never exits; a restart only matters when the pod
+      # dies (node drain etc.) and 0 avoids masking a Failed state for long.
+      backoffLimit: 0
+      # Only applies once the Job finishes/fails, so a dead debug job
+      # self-cleans instead of lingering forever.
+      ttlSecondsAfterFinished: {{ .Values.debugPod.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.debugPod.disableSecurityContext | quote }}
+          labels:
+            app.kubernetes.io/managed-by: model-downloader-debug
+            model-downloader/debug-pod: "true"
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          restartPolicy: OnFailure
+          containers:
+          - name: debug
+            image: __IMAGE__
+            imagePullPolicy: {{ .Values.debugPod.image.pullPolicy }}
+            # Keeps the container running indefinitely so you can `kubectl exec` in.
+            command: ["tail", "-f", "/dev/null"]
+            securityContext:
+            {{- with .Values.debugPod.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            env:
+            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            - name: no_proxy
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: NO_PROXY
+              value: {{ .Values.pcai.noProxy | quote }}
+            - name: https_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: http_proxy
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            - name: HTTP_PROXY
+              value: {{ .Values.pcai.httpsProxy | quote }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.debugPod.user | quote }}
+            - name: HUGGINGFACE_HUB_CACHE
+              value: {{ .Values.debugPod.cachePath | quote }}
+            # Optional HF token (empty Secret when the user leaves the field blank)
+            # so huggingface-cli / hf download work inside the pod.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: {{ .Values.debugPod.pvcName | default .Values.downloader.pvcName }}
+  # Short-lived scanner Job used to list model directories on the PVC.
+  # Runs a simple shell script that finds directories containing a config.json
+  # and prints "model_name<TAB>mtime" to stdout.
+  scan-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value (like debug shells) so list_managed_jobs()
+        # never picks scanner Jobs into the Downloads table.
+        app.kubernetes.io/managed-by: model-downloader-scan
+        model-downloader/scan: "true"
+    spec:
+      ttlSecondsAfterFinished: 120
+      backoffLimit: 0
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: "true"
+          labels:
+            hpe-ezua/app: mlis
+            model-downloader/scan: "true"
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: scanner
+            image: __IMAGE__
+            command:
+            - /bin/sh
+            - -c
+            - |
+              ROOT="__SCAN_ROOT__"
+              if [ ! -d "$ROOT" ]; then
+                echo "SCAN ERROR: $ROOT not present in scanner container (volume mount problem?)" >&2
+                exit 0
+              fi
+              # Every completed HF download leaves a models--<org>--<Repo>
+              # cache dir, at whatever depth the chosen cache root implies.
+              # Glob those directly — no dependency on config.json or the
+              # snapshot layout. The cache dir NAME is the true repo id
+              # (the path above it is just where the user cached it).
+              find "$ROOT" -type d -name 'models--*--*' 2>/dev/null | while IFS= read -r d; do
+                cache="${d##*/}"
+                model="$(printf '%s' "${cache#models--}" | sed 's|--|/|')"
+                [ -n "$model" ] || continue
+                mtime=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+                printf '%s\t%s\t%s\n' "$model" "$mtime" "$d"
+              done
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            resources:
+              requests:
+                cpu: "50m"
+                memory: 64Mi
+              limits:
+                cpu: "200m"
+                memory: 128Mi
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+              readOnly: true
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: __PVC_NAME__

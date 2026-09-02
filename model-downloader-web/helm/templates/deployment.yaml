@@ -52,10 +52,28 @@ spec:
           value: {{ .Values.storage.default | quote }}
         - name: DEFAULT_NAMESPACE
           value: {{ .Values.defaultNamespace | quote }}
+        - name: DEBUG_POD_ENABLED
+          value: {{ .Values.debugPod.enabled | quote }}
+        - name: DEBUG_POD_IMAGE
+          value: "{{ .Values.debugPod.image.repository }}:{{ .Values.debugPod.image.tag }}"
         - name: S3_BUCKET
           value: {{ .Values.s3.bucket | quote }}
         - name: S3_PREFIX
           value: {{ .Values.s3.prefix | quote }}
+        - name: S3_ENDPOINT_URL
+          value: {{ .Values.s3.endpointUrl | quote }}
+        - name: S3_ACCESS_KEY_ID
+          value: {{ .Values.s3.accessKeyId | quote }}
+        - name: S3_SECRET_ACCESS_KEY
+          value: {{ .Values.s3.secretAccessKey | quote }}
+        - name: DOWNLOAD_LIST_ENABLED
+          value: {{ .Values.downloadList.enabled | quote }}
+        - name: PVC_SCAN_IMAGE
+          value: {{ .Values.downloadList.scanImage | quote }}
+        - name: PVC_SCAN_ENABLED
+          value: {{ .Values.downloadList.pvcScanEnabled | quote }}
+        - name: PVC_REFRESH_INTERVAL
+          value: {{ .Values.downloadList.pvcRefreshInterval | quote }}
         {{- if .Values.catalog.enabled }}
         - name: CATALOG_PATH
           value: "/mnt/catalog/catalog.json"

@@ -133,6 +133,70 @@
         <pre id="log-body"></pre>
       </div>
     </div>
+
+    {% if download_list_enabled %}
+    <h2>Downloaded models</h2>
+    <p class="hint">
+      Models downloaded through this UI, deduplicated by name (most recent
+      location and timestamp shown).{% if pvc_scan_enabled %} The model PVC is
+      scanned automatically, so models placed there outside this UI appear too.{% else %}
+      "Rescan storage" also lists models physically present on the model PVC,
+      even if placed there outside this UI.{% endif %}
+      {% if s3_bucket %} The S3 bucket <code>{{ s3_bucket }}</code> is scanned
+      automatically.{% endif %}
+    </p>
+    <div id="downloaded-msg" class="msg"></div>
+    <table id="downloaded-models">
+      <thead>
+        <tr>
+          <th>Model</th><th>Backends</th><th>Location</th><th>Last modified</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <button type="button" id="downloaded-refresh" class="secondary-btn" style="margin-top:10px;">Rescan storage</button>
+    {% endif %}
+
+    {% if debug_pods_enabled %}
+    <h2>Debug pod</h2>
+    <p class="hint">
+      Launch a long-running debug shell that mounts the model PVC at <code>/mnt</code>. It is
+      submitted as a Job so its pod is created by the job-controller and admitted exactly like
+      downloader job pods (mlis label + security-context opt-outs — a directly-created pod is denied
+      by the platformwide Kyverno policy). Then
+      <code>kubectl exec -it $(kubectl get pods -n &lt;ns&gt; -l job-name=&lt;job&gt; -o jsonpath='{{ '{{' }}.items[0].metadata.name{{ '}}' }}') -- bash</code>.
+      The proxy / no_proxy env vars follow the chart's <code>hpe_proxies</code> setting.
+    </p>
+    <form id="debug-form" autocomplete="off" data-default-ns="{{ default_namespace }}">
+      <label>
+        <span>Namespace</span>
+        <input name="namespace"
+               pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+               value=""
+               placeholder="project-user-{INSERT_YOUR_NAME}">
+      </label>
+      <label>
+        <span>Image</span>
+        <input name="image" value="{{ debug_pod_image }}"
+               placeholder="registry/repo:tag">
+        <small class="field-note">Defaults to the chart's <code>debugPod.image</code>; override with any tools image.</small>
+      </label>
+      <label>
+        <span>HF token (optional)</span>
+        <input name="hf_token" type="password"
+               placeholder="hf_... (leave empty to skip)">
+        <small class="field-note">Set only if you plan to run <code>hf download</code> / <code>huggingface-cli</code> inside the pod.</small>
+      </label>
+      <button type="submit">Launch debug pod</button>
+    </form>
+    <div id="debug-msg" class="msg"></div>
+    <table id="debug-pods">
+      <thead>
+        <tr><th>Pod</th><th>Namespace</th><th>Status</th><th>Node</th><th>Created</th><th>Actions</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    {% endif %}
   </main>
   <script src="/static/app.js?v={{ assets['app.js'] }}"></script>
 </body>

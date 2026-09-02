@@ -3,8 +3,12 @@
 # =============================================================================
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.1.0
-  pullPolicy: IfNotPresent
+  tag: v1.3.1
+  # Always: re-pull on every pod creation, so overwriting this tag in the
+  # registry is enough — just `kubectl rollout restart` afterwards.
+  # (IfNotPresent would silently keep a node-cached image when the same
+  # tag is overwritten, which is how a "rebuilt" deploy serves stale JS.)
+  pullPolicy: Always
 
 # Max concurrent model downloads; extras are queued in-process.
 maxConcurrency: 4
@@ -62,6 +66,23 @@ s3:
   secretAccessKey: "MinIO$2K"  # MinIO secret key (required for MinIO)
 
 # =============================================================================
+# "Downloaded models" section on the main page.
+# Lists models physically present on the PVC (via a short-lived scanner Job)
+# and/or S3 (via boto3 listing).  One row per model, most recent first.
+# =============================================================================
+downloadList:
+  enabled: true
+  # PVC filesystem scanning spawns a short-lived scanner Job. Default off:
+  # the PVC is scanned only when a user clicks "Rescan storage". Set true to
+  # also re-scan automatically every pvcRefreshInterval seconds.
+  pvcScanEnabled: false
+  # How often (seconds) the app re-scans the PVC via a scanner Job.
+  # S3 and job-history are always fresh; only the PVC scan is cached.
+  pvcRefreshInterval: 60
+  # Image used for the short-lived PVC scanner Job.  Needs /bin/sh, find, stat.
+  scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
+
+# =============================================================================
 # Downloader Job definition.
 # Rendered into a ConfigMap that the app reads, substitutes per-submission
 # placeholders (__NAMESPACE__, __MODEL_NAME__, __JOB_NAME__, __HF_TOKEN_SECRET__)
@@ -115,6 +136,49 @@ downloader:
     # bypass Zscaler MITM / verifyTls=false, false = TLS intact / verifyTls=true).
     # Override explicitly with `--set downloader.hf.verifyTls=true`.
     # verifyTls: false
+
+# =============================================================================
+# Debug pod ("Launch debug pod" in the UI): a long-running shell that mounts
+# the same PVC as the downloader Jobs at /mnt so you can inspect the model
+# cache (kubectl exec ...) instead of submitting download Jobs.
+#
+# Implemented as a Job on purpose: its Pod is then created by the kube-system
+# job-controller — the same admission path as the downloader Jobs. A bare Pod
+# created directly by the app's ServiceAccount is denied by the platformwide
+# `protect-models-pvc` Kyverno policy (prevent-unauthorized-create-with-mlis:
+# "Insufficient authorization to set the 'hpe-ezua/app' label to 'mlis'"),
+# while job-controller-created pods with the same labels are admitted.
+#
+# Proxy env vars follow hpe_proxies / pcai (see pcaiEnabled helper), exactly
+# like the downloader Jobs.
+# =============================================================================
+debugPod:
+  enabled: true
+  image:
+    repository: andrewbydlon/basic-ubuntu-essentials
+    tag: v1.0
+    pullPolicy: IfNotPresent
+  # Mount a different PVC than downloader.pvcName by setting it here.
+  pvcName: ""
+  # When true the pod opts out of the platform security-context mutation
+  # (hpe-ezua/disable-sc: "true") so it runs as root and can traverse the
+  # root-owned shared model PVC. Only relevant on HPE PCAI clusters.
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  # USER env var inside the debug pod (matches downloader.user by default).
+  user: andrew-bydlon
+  # HUGGINGFACE_HUB_CACHE inside the debug pod so `huggingface-cli` /
+  # `hf download` resolve the same cache the downloader Jobs write.
+  cachePath: /mnt/large-models
+  # The debug Job never completes (tail -f /dev/null); this TTL only applies
+  # once it finishes/fails, so a dead debug job self-cleans instead of
+  # lingering. Delete debug jobs you're done with from the UI — that also
+  # removes the HF-token Secret.
+  ttlSecondsAfterFinished: 86400
+  # Scheduling follows downloader.nodeSelector (same PVC, same placement
+  # constraints). No separate debugPod.nodeSelector.
 
 # =============================================================================
 # PCAI environment (corporate proxy + Zscaler bypass).

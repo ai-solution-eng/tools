@@ -259,6 +259,50 @@ the S3 job ignores them.
 | `downloader.hf.*` | — | `HF_HUB_*` knobs: timeouts, hf_transfer, Xet |
 | `downloader.resources` | 2/4 CPU · 4/8 Gi | job resource requests/limits |
 
+### Debug pod
+
+The **Launch debug pod** section at the bottom of the download page creates a
+long-running debug shell that mounts the model PVC at `/mnt`
+(`tail -f /dev/null`), so you can inspect the cache with a shell instead of
+submitting download Jobs:
+
+```bash
+kubectl exec -it $(kubectl get pods -n project-user-<you> -l job-name=md-debug-<id> \
+  -o jsonpath='{.items[0].metadata.name}') -- bash
+```
+
+The form takes the target namespace, an optional HF token (stored in a
+per-debug-job Secret; only needed to run `hf download` inside the pod) and an
+optional image override — the default image comes from `debugPod.image`.
+Running debug shells are listed under the form and can be deleted from the UI
+(deleting the Job also deletes its pod and HF-token Secret). The proxy /
+`no_proxy` env vars follow the same `hpe_proxies` / `pcai` flags as the
+downloader Jobs — with `hpe_proxies=false` the shell gets no proxy env at all.
+
+| value | default | meaning |
+|---|---|---|
+| `debugPod.enabled` | `true` | show the debug pod section / API (set `false` to disable) |
+| `debugPod.image.repository`/`tag` | `andrewbydlon/basic-ubuntu-essentials:v1.0` | default debug image (overridable per launch in the UI) |
+| `debugPod.image.pullPolicy` | `IfNotPresent` | set `Always` if you push to a mutable tag |
+| `debugPod.pvcName` | `""` | mount a different PVC than `downloader.pvcName` |
+| `debugPod.securityContext` | `{runAsUser:0, runAsGroup:0}` | root, so the shared PV is traversable |
+| `debugPod.disableSecurityContext` | `true` | adds `hpe-ezua/disable-sc: "true"` (see Kyverno section) |
+| `debugPod.user` | `andrew-bydlon` | `USER` env inside the pod |
+| `debugPod.cachePath` | `/mnt/large-models` | `HUGGINGFACE_HUB_CACHE` inside the pod |
+| `debugPod.ttlSecondsAfterFinished` | `86400` | TTL for a *finished* debug Job only; a running one never expires |
+
+**Why it is a Job, not a bare Pod:** the debug shell is submitted as a Job
+(`md-debug-<id>`) so its Pod is created by the kube-system **job-controller** —
+the exact same admission path as the downloader Jobs. The platformwide
+`protect-models-pvc` Kyverno policy denies a Pod created directly by the
+model-downloader ServiceAccount with
+`prevent-unauthorized-create-with-mlis: Insufficient authorization to set the
+'hpe-ezua/app' label to 'mlis'` (labels that imply MLIS authorization can't be
+self-applied), while job-controller-created pods carrying the same
+`hpe-ezua/app: mlis` label are admitted like every downloader pod. Debug Jobs
+use their own `app.kubernetes.io/managed-by: model-downloader-debug` label so
+they never show up in the download Jobs table.
+
 ### HPE features (only used with `hpe_proxies=true`)
 
 | value | default | meaning |
@@ -340,6 +384,14 @@ After applying, downloader Job pods created by the job-controller are no longer
 denied and the Job can mount `models-pvc`. It may take a few seconds for the
 admission webhook to pick up the updated policy.
 
+> **Debug pods**: the UI-launched debug shell reuses the downloader Jobs'
+> admission path — it is submitted as a Job, so its Pod is created by the
+> job-controller username excepted by the patch above and carries the
+> `hpe-ezua/app: mlis` label. No extra policy changes are needed for it. (An
+> earlier chart version created a bare Pod directly with the model-downloader
+> ServiceAccount and was denied by `prevent-unauthorized-create-with-mlis`
+> for self-applying the mlis label — that's why the Job wrapper exists.)
+
 Other Kyverno quirks worth knowing from this cluster:
 
 - **ClusterPolicy name length**: the chart’s policy is
@@ -386,6 +438,19 @@ ezua:
   uniqueness/length of the job name (`md-<org>-<model>` truncated to 63).
 - **"Config-missing key / missing `job.yaml`"** → the app reads the
   `-job-template` Configmap in its namespace; make sure chart applied.
+- **Debug launch fails with `admission webhook ... prevent-unauthorized-create-with-mlis`**
+  → the debug shell went out as a bare Pod instead of a Job — the deployed
+  app/chart predates 1.2.1. Rebuild the app image and re-import/upgrade the
+  chart so the ConfigMap renders `debug-job.yaml`, then relaunch. (The app
+  shows the full denial message now; the old builds hid it behind an opaque
+  `SyntaxError` from parsing the plain-text 500.)
+- **Debug shell shows in the list but the pod never starts** → same
+  troubleshooting as downloader Job pods: PVC binding, node selector, Kyverno
+  security-context mutation (`hpe-ezua/disable-sc`).
+- **Debug pod section missing from the UI** → the app only shows it when the
+  `-job-template` ConfigMap contains `debug-job.yaml` (chart ≥ 1.2.1) and
+  `debugPod.enabled` is not `false`. Re-run `helm upgrade` / re-import the
+  chart so the ConfigMap is re-rendered.
 - **PVC mount errors on a hosted cluster** → see the Kyverno section.
 - **Deployment won't come up on a hosted trial** → a previously failed
   install can leave the app's cluster-scoped resources behind, blocking a

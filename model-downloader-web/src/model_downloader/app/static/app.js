@@ -66,10 +66,11 @@ form.addEventListener('submit', async (e) => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    const data = await r.json();
-    if (!r.ok) {
+    const text = await r.text();
+    const data = parseJsonSafe(text, null);
+    if (!r.ok || !data) {
       msg.className = 'msg error';
-      msg.textContent = 'Error: ' + (data.detail || r.statusText);
+      msg.textContent = 'Error: ' + (await apiErrorMessage(r, text));
       return;
     }
     msg.className = 'msg ok';
@@ -349,8 +350,7 @@ async function deleteJob(jobId) {
   try {
     const r = await fetch('/api/jobs/' + jobId, { method: 'DELETE' });
     if (!r.ok) {
-      const data = parseJsonSafe(await r.text(), {});
-      alert('Error: ' + (data.detail || r.statusText));
+      alert('Error: ' + (await apiErrorMessage(r)));
       return;
     }
     refresh();
@@ -418,6 +418,248 @@ document.addEventListener('keydown', (e) => {
 
 function parseJsonSafe(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
+}
+
+// Extract a readable message from any API response. Never assume the body is
+// JSON: an unhandled server error used to come back as text/plain "Internal
+// Server Error", and an expired session as a redirect to the login page —
+// both made r.json() throw an opaque SyntaxError and hid the real problem.
+// Pass `text` if the response body was already read; a fetch body can only
+// be consumed once.
+async function apiErrorMessage(r, text) {
+  let body = text;
+  if (body === undefined) {
+    try { body = await r.text(); } catch (e) { body = ''; }
+  }
+  const contentType = r.headers.get('content-type') || '';
+  if (contentType.includes('text/html')) {
+    return 'HTTP ' + r.status + ' — got an HTML page instead of JSON. ' +
+      'Your session may have expired; reload the page and try again.';
+  }
+  const data = parseJsonSafe(body, null);
+  if (data && data.detail) {
+    if (typeof data.detail === 'string') return data.detail;
+    if (Array.isArray(data.detail)) {
+      return data.detail.map((x) => (x.msg ? (x.loc ? x.loc.join('.') + ': ' : '') + x.msg : JSON.stringify(x))).join('; ');
+    }
+    return JSON.stringify(data.detail);
+  }
+  const snippet = String(body || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') + (snippet ? ' — ' + snippet : '');
+}
+
+// ---- Downloaded models (models physically present on PVC / S3) ----
+
+const downloadedTableBody = document.querySelector('#downloaded-models tbody');
+const downloadedRefreshBtn = document.getElementById('downloaded-refresh');
+const downloadedMsg = document.getElementById('downloaded-msg');
+
+function setDownloadedMsg(text, isError) {
+  if (!downloadedMsg) return;
+  downloadedMsg.textContent = text;
+  downloadedMsg.className = isError ? 'msg error' : 'msg ok';
+}
+
+function buildDownloadedRow(m) {
+  const tr = document.createElement('tr');
+  tr.className = 'status-succeeded';
+
+  const tdModel = document.createElement('td');
+  tdModel.className = 'cat-name';
+  tdModel.textContent = m.model_name || '';
+  tr.appendChild(tdModel);
+
+  const tdBackends = document.createElement('td');
+  (m.backends || []).forEach(function (b) {
+    const badge = document.createElement('span');
+    badge.className = 'backend-badge backend-' + b;
+    badge.textContent = b === 's3' ? 'S3' : 'PVC';
+    tdBackends.appendChild(badge);
+  });
+  tr.appendChild(tdBackends);
+
+  const tdLoc = document.createElement('td');
+  const locCode = document.createElement('code');
+  locCode.className = 'pvc-url';
+  locCode.textContent = m.location || '';
+  tdLoc.appendChild(locCode);
+  tr.appendChild(tdLoc);
+
+  const tdMod = document.createElement('td');
+  tdMod.textContent = m.last_modified ? new Date(m.last_modified * 1000).toLocaleString() : '';
+  tr.appendChild(tdMod);
+
+  return tr;
+}
+
+async function refreshDownloaded(force = false) {
+  if (!downloadedTableBody) return;
+  if (force) setDownloadedMsg('Rescanning storage (this spawns a short-lived scan Job)...', false);
+  try {
+    const url = force ? '/api/downloaded?force=1' : '/api/downloaded';
+    const r = await fetch(url);
+    if (!r.ok) {
+      setDownloadedMsg('Scan request failed: HTTP ' + r.status, true);
+      return;
+    }
+    const data = await r.json();
+    const models = data.models || [];
+    downloadedTableBody.innerHTML = '';
+    if (!models.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 4;
+      td.className = 'tier-empty';
+      td.textContent = 'No downloaded models found on storage yet.';
+      tr.appendChild(td);
+      downloadedTableBody.appendChild(tr);
+    } else {
+      for (const m of models) {
+        downloadedTableBody.appendChild(buildDownloadedRow(m));
+      }
+    }
+    // Explain where the rows came from (or why there are none).
+    const scan = data.scan || {};
+    const bits = [];
+    if (scan.pvc) bits.push('PVC: ' + scan.pvc);
+    if (scan.s3) bits.push('S3: ' + scan.s3);
+    if (scan.jobs !== undefined) bits.push('history: ' + scan.jobs + ' job(s)');
+    if (bits.length) setDownloadedMsg(bits.join(' · '), false);
+  } catch (e) {
+    setDownloadedMsg('Scan request error: ' + e, true);
+    console.error('downloaded models refresh failed', e);
+  }
+}
+
+if (downloadedTableBody) {
+  refreshDownloaded();
+  setInterval(refreshDownloaded, 10000);
+  if (downloadedRefreshBtn) {
+    downloadedRefreshBtn.addEventListener('click', () => refreshDownloaded(true));
+  }
+}
+
+// ---- Debug pods ----
+
+const debugForm = document.getElementById('debug-form');
+const debugMsg = document.getElementById('debug-msg');
+const debugTableBody = document.querySelector('#debug-pods tbody');
+
+function podStatusClass(phase) {
+  if (phase === 'Running') return 'status-running';
+  if (phase === 'Pending') return 'status-queued';
+  if (phase === 'Succeeded') return 'status-succeeded';
+  return 'status-failed';
+}
+
+function buildDebugRow(p) {
+  const tr = document.createElement('tr');
+  tr.className = podStatusClass(p.phase || '');
+
+  const tdName = document.createElement('td');
+  const code = document.createElement('code');
+  code.textContent = p.name;
+  tdName.appendChild(code);
+  tr.appendChild(tdName);
+
+  const tdNs = document.createElement('td');
+  tdNs.textContent = p.namespace;
+  tr.appendChild(tdNs);
+
+  const tdStatus = document.createElement('td');
+  tdStatus.className = 'status-cell';
+  tdStatus.textContent = p.phase || 'unknown';
+  tr.appendChild(tdStatus);
+
+  const tdNode = document.createElement('td');
+  tdNode.textContent = p.node || '';
+  tr.appendChild(tdNode);
+
+  const tdCreated = document.createElement('td');
+  tdCreated.textContent = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '';
+  tr.appendChild(tdCreated);
+
+  const tdActions = document.createElement('td');
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'action-btn delete-btn';
+  delBtn.textContent = 'Delete';
+  // Deleting goes through the owning Job (the pod itself is created by the
+  // job-controller); fall back to the name for anything job-less.
+  delBtn.addEventListener('click', () => deleteDebugPod(p.namespace, p.job_name || p.name));
+  tdActions.appendChild(delBtn);
+  tr.appendChild(tdActions);
+
+  return tr;
+}
+
+async function refreshDebugPods() {
+  if (!debugTableBody) return;
+  try {
+    const r = await fetch('/api/debug-pods');
+    if (!r.ok) return;
+    const pods = await r.json();
+    debugTableBody.innerHTML = '';
+    for (const p of pods) {
+      debugTableBody.appendChild(buildDebugRow(p));
+    }
+  } catch (e) {
+    console.error('debug pod refresh failed', e);
+  }
+}
+
+async function deleteDebugPod(namespace, jobName) {
+  if (!confirm('Delete debug job ' + jobName + ' (and its pod + HF-token secret)?')) return;
+  try {
+    const r = await fetch('/api/debug-pods/' + encodeURIComponent(namespace) + '/' + encodeURIComponent(jobName), {
+      method: 'DELETE',
+    });
+    if (!r.ok) {
+      alert('Error: ' + (await apiErrorMessage(r)));
+      return;
+    }
+    refreshDebugPods();
+  } catch (e) {
+    alert('Error: ' + e);
+  }
+}
+
+if (debugForm) {
+  debugForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const body = Object.fromEntries(new FormData(debugForm));
+    if (!body.namespace) body.namespace = debugForm.dataset.defaultNs || '';
+    if (!body.namespace) {
+      debugMsg.className = 'msg error';
+      debugMsg.textContent = 'Namespace is required.';
+      return;
+    }
+    debugMsg.className = 'msg';
+    debugMsg.textContent = 'Launching debug pod...';
+    try {
+      const r = await fetch('/api/debug-pods', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      const data = parseJsonSafe(text, null);
+      if (!r.ok || !data) {
+        debugMsg.className = 'msg error';
+        debugMsg.textContent = 'Error: ' + (await apiErrorMessage(r, text));
+        return;
+      }
+      debugMsg.className = 'msg ok';
+      debugMsg.textContent = 'Launched ' + data.name + ' — ' + (data.kubectl || '');
+      debugForm.reset();
+      refreshDebugPods();
+    } catch (e) {
+      debugMsg.className = 'msg error';
+      debugMsg.textContent = 'Error: ' + e;
+    }
+  });
+  refreshDebugPods();
+  setInterval(refreshDebugPods, 3000);
 }
 
 loadKnownData();
