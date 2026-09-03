@@ -25,7 +25,7 @@ The skill lives in this repo at:
 pcai-helm-port/
 ```
 
-opencode picks up project skills from `~/.opencode/skills/` automatically. To use it in a specific project only, copy the `pcai-helm-port/` directory into that project's `.opencode/skills/`.
+opencode picks up project skills from `~/.config/opencode/skills/` automatically. To use it in a specific project only, copy the `pcai-helm-port/` directory into that project's `.opencode/skills/`.
 
 ## Usage
 
