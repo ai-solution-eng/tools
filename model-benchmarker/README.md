@@ -111,7 +111,7 @@ flag in this script.
 |---|---|
 | `--debug_stream` | Print the first delta's field names and per-request content/reasoning chunk counts — diagnose TTFT=0 when a server streams under non-standard delta fields. |
 | `--quiet` | Suppress the per-request progress lines (keeps prewarm notices, level previews and the final table). Recommended when stdout is piped/redirected — per-request `print()` runs on the event loop, and a backpressured stdout can stall all streams and distort TTFT/tokens-s. |
-| `--output FILE` | Write the final summary table to FILE (in addition to stdout). |
+| `--output FILE` | Write the summary table to FILE (in addition to stdout). The file is rewritten after every completed sweep level and stamped with a `Status:` line (`complete`, `in progress — k/n levels`, `INTERRUPTED…`, `CRASHED…`), so a run that dies mid-sweep still leaves the completed levels on disk. The report generator only picks the file up once at least one level succeeded. |
 
 ### Environment
 

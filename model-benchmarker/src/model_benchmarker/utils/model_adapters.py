@@ -814,8 +814,6 @@ class InputConversion:
         return requests
 
 
-
-
 # Idle early-flush for the query batchers (local _QueryBatcher and the
 # shared embed-batcher singleton, which reuses this class).  DEFAULT 0 =
 # DISABLED (the exact original always-wait-the-window behavior).
@@ -917,10 +915,7 @@ class _QueryBatcher:
                     size_before = len(self._queue)
                     await asyncio.sleep(min(slice_s, remaining))
                     waited += min(slice_s, remaining)
-                    if (
-                        len(self._queue) <= size_before
-                        and 0 < len(self._queue) <= _IDLE_FLUSH_MAX_BATCH
-                    ):
+                    if len(self._queue) <= size_before and 0 < len(self._queue) <= _IDLE_FLUSH_MAX_BATCH:
                         break
         except asyncio.CancelledError:
             return

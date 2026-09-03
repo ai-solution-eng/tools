@@ -8,6 +8,12 @@ repo-root [`../README.md`](../README.md); this file explains the standard
 configuration these results were produced with and what to look for when
 reading them.
 
+Every `--output` file also carries the run's configuration banner (model,
+modes, `extra_body`) and a `Status:` line above the table — `complete` for a
+full sweep, `INTERRUPTED`/`CRASHED` when the run died mid-sweep and only the
+completed levels are in the table (the file is rewritten after every level,
+so an aborted benchmark still leaves its partial results).
+
 ## How these were produced
 
 The standard configuration, one run per model:

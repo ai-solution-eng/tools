@@ -362,8 +362,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default="",
-        help="Write the final summary table to this file (in addition to stdout). "
-        "E.g. --output results/qwen_38_27b/H200x4.txt.",
+        help="Write the summary table to this file (in addition to stdout). The "
+        "file is rewritten after every completed sweep level and stamped with a "
+        "Status: line, so a crashed or interrupted run still leaves the completed "
+        "levels on disk. E.g. --output results/qwen_38_27b/H200x4.txt.",
     )
     return parser.parse_args()
 
@@ -828,6 +830,42 @@ def print_table(
         print(line, file=file)
 
 
+def write_results_file(
+    path: str,
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    *,
+    run_header: str,
+    summary_head: str,
+    summary_note: str,
+    multiturn: bool = False,
+    status: str = "complete",
+) -> None:
+    """Atomically write the current results table to ``path``.
+
+    Called after every completed sweep level and once more at the end (or when
+    the run dies), so a benchmark that crashes, times out or is Ctrl-C'd
+    mid-sweep still leaves every completed level on disk instead of only on
+    stdout.  The write goes through a ``.partial`` temp file + ``os.replace``
+    so a kill mid-write can never leave a truncated table behind (a leftover
+    ``.partial`` file is ignored by results_to_html.py, which only globs
+    ``*.txt``)."""
+    out_path = Path(path).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(out_path.name + ".partial")
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(run_header)
+        fh.write(summary_head.lstrip("\n") + "\n")
+        fh.write(summary_note + "\n")
+        fh.write(f"Status: {status} (last updated {time.strftime('%Y-%m-%d %H:%M:%S')})\n\n")
+        if rows:
+            print_table(rows, file=fh, multiturn=multiturn)
+        else:
+            fh.write("(no levels completed yet)\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, out_path)
+
+
 async def _run_level(
     model,
     tasks: list[Task],
@@ -934,65 +972,45 @@ async def main() -> None:
         pass
     extra_body = build_chat_template_kwargs(args)
     args.extra_body = extra_body
+    # The run banner is built once: printed to stdout AND embedded in every
+    # --output rewrite, so an interrupted run's file still records which
+    # model/modes produced the numbers in it.
     task_desc = ", ".join(f"{t.name}(max_tokens={t.max_tokens})" for t in tasks)
-    print(
-        f"Model: {model.__class__.__name__} name={model.model_name!r} "
-        f"usage={model.model_usage} tasks=[{task_desc}] "
-        f"requests_per_user={args.requests_per_user} "
-        f"context_lengths={ctx_levels}"
-    )
+    header_lines = [
+        (
+            f"Model: {model.__class__.__name__} name={model.model_name!r} "
+            f"usage={model.model_usage} tasks=[{task_desc}] "
+            f"requests_per_user={args.requests_per_user} "
+            f"context_lengths={ctx_levels}"
+        )
+    ]
     if args.multiturn:
-        print(
+        header_lines.append(
             f"MODE: multiturn — each user runs {args.requests_per_user} turns of one "
             "conversation (shared prefix reused across turns; server prefix/KV cache engages)."
         )
     if args.no_nonce:
-        print("MODE: no-nonce — every request uses a fixed shared prefix (server prefix cache reuse enabled).")
+        header_lines.append(
+            "MODE: no-nonce — every request uses a fixed shared prefix (server prefix cache reuse enabled)."
+        )
     if args.prewarm:
-        print(
+        header_lines.append(
             "MODE: prewarm — one shared-prefix warm-up request per (ctx, task) before each sweep "
             "(prefix graph populated ahead of the users)."
         )
     if extra_body:
-        print(f"extra_body: {extra_body}")
-    print(
+        header_lines.append(f"extra_body: {extra_body}")
+    header_lines.append(
         "tokens/s = completion_tokens / time-from-first-token-to-stream-end "
         "(TTFT excluded); completion_tokens from stream usage, else counted "
-        "content chunks.\n"
+        "content chunks."
     )
+    header_lines.append("")
+    for line in header_lines:
+        print(line)
+    run_header = "\n".join(header_lines) + "\n"
 
     rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]] = []
-    for ctx in ctx_levels:
-        if args.prewarm:
-            await prewarm(model, tasks, ctx, args.extra_body, args.debug_stream)
-            print()
-        for n_users in user_levels:
-            if args.separate_tasks:
-                # One dedicated (ctx, users, task) pass per task: all N users
-                # run their turns on just this task back-to-back, so each task
-                # gets a clean turn-1 (prefill) vs turns 2+ (prefix reuse) split.
-                for task in tasks:
-                    await _run_level(
-                        model,
-                        [task],
-                        n_users,
-                        ctx,
-                        args,
-                        rows,
-                    )
-            else:
-                await _run_level(
-                    model,
-                    tasks,
-                    n_users,
-                    ctx,
-                    args,
-                    rows,
-                )
-
-    if not rows:
-        raise SystemExit("No successful requests; nothing to report.")
-
     if args.multiturn:
         summary_head = "\nPer-level latency / throughput (multiturn: shared prefix reused across each user's turns):"
     elif args.no_nonce:
@@ -1008,15 +1026,86 @@ async def main() -> None:
             "\nTTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ "
             "(shared prefix reused — shows prefix-cache benefit)."
         )
-    print(summary_head)
-    print(summary_note)
-    print_table(rows, multiturn=args.multiturn)
-    if args.output:
-        with open(args.output, "w") as fh:
-            fh.write(summary_head + "\n")
-            fh.write(summary_note + "\n")
-            print_table(rows, file=fh, multiturn=args.multiturn)
-        print(f"Table written to {args.output}")
+
+    def update_output(new_status: str) -> None:
+        """Rewrite --output with every level completed so far (no-op without
+        --output).  Runs after each level and once more in the finally block
+        below, so a run that dies mid-sweep still leaves its partial table on
+        disk.  A failed write warns instead of killing the sweep."""
+        if not args.output:
+            return
+        try:
+            write_results_file(
+                args.output,
+                rows,
+                run_header=run_header,
+                summary_head=summary_head,
+                summary_note=summary_note,
+                multiturn=args.multiturn,
+                status=new_status,
+            )
+        except OSError as exc:
+            print(f"Warning: could not write intermediate table to {args.output}: {exc}")
+
+    total_levels = len(ctx_levels) * len(user_levels) * (len(tasks) if args.separate_tasks else 1)
+    completed_levels = 0
+    status = f"complete — all {total_levels} levels completed"
+    try:
+        for ctx in ctx_levels:
+            if args.prewarm:
+                await prewarm(model, tasks, ctx, args.extra_body, args.debug_stream)
+                print()
+            for n_users in user_levels:
+                if args.separate_tasks:
+                    # One dedicated (ctx, users, task) pass per task: all N users
+                    # run their turns on just this task back-to-back, so each task
+                    # gets a clean turn-1 (prefill) vs turns 2+ (prefix reuse) split.
+                    for task in tasks:
+                        await _run_level(
+                            model,
+                            [task],
+                            n_users,
+                            ctx,
+                            args,
+                            rows,
+                        )
+                        completed_levels += 1
+                        update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
+                else:
+                    await _run_level(
+                        model,
+                        tasks,
+                        n_users,
+                        ctx,
+                        args,
+                        rows,
+                    )
+                    completed_levels += 1
+                    update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
+
+        if not rows:
+            raise SystemExit("No successful requests; nothing to report.")
+
+        print(summary_head)
+        print(summary_note)
+        print_table(rows, multiturn=args.multiturn)
+    except KeyboardInterrupt:
+        status = (
+            f"INTERRUPTED (KeyboardInterrupt) after {completed_levels}/{total_levels} levels — table below is partial"
+        )
+        raise
+    except SystemExit:
+        status = "failed — no successful requests"
+        raise
+    except Exception as exc:
+        status = (
+            f"CRASHED ({type(exc).__name__}) after {completed_levels}/{total_levels} levels — table below is partial"
+        )
+        raise
+    finally:
+        if args.output:
+            update_output(status)
+            print(f"Table written to {args.output} (status: {status})")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -164,6 +165,11 @@ _async_client_fallback_lock = threading.Lock()
 _discovered_model_names: dict[str, str] = {}
 _discovered_model_lock = threading.Lock()
 _MAX_DISCOVERED_MODEL_NAMES = max(64, int(os.environ.get("DISCOVERED_MODEL_CACHE_MAX", "512")))
+# Negative cache: a *failed* discovery is retried only after this TTL.
+# Without it, every model construction against a down endpoint repeats the
+# full 10s timeout — historically on the event loop itself.
+_DISCOVERY_FAILURE_TTL_S = 60.0
+_discovery_failures: dict[str, float] = {}
 
 
 def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -> str:
@@ -173,13 +179,17 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
     serve a single model, so the first ``data[].id`` is returned.  Returns
     ``""`` on any failure (network, non-200, empty list) -- keeping this
     best-effort so a transient blip never hard-fails the caller.  Successful
-    lookups are cached per URL; failures are not, so a recovered endpoint is
-    retried on the next call.
+    lookups are cached per URL; failures carry a short negative-TTL so a
+    down endpoint is not re-probed on every single construction.
     """
     url = f"{base_url}/models"
     cached = _discovered_model_names.get(url)
     if cached:
         return cached
+    with _discovered_model_lock:
+        last_failure = _discovery_failures.get(url)
+    if last_failure is not None and (time.monotonic() - last_failure) < _DISCOVERY_FAILURE_TTL_S:
+        return ""
     client = _SHARED_REMOTE_HTTP_CLIENT if remote else _SHARED_HTTP_CLIENT
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
@@ -197,10 +207,13 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
             )
             with _discovered_model_lock:
                 _discovered_model_names[url] = ids[0]
+                _discovery_failures.pop(url, None)
                 if len(_discovered_model_names) > _MAX_DISCOVERED_MODEL_NAMES:
                     _discovered_model_names.pop(next(iter(_discovered_model_names)))
             return ids[0]
         logger.warning("No models listed at %s; leaving model_name empty.", url)
+        with _discovered_model_lock:
+            _discovery_failures[url] = time.monotonic()
     except Exception as e:
         logger.warning(
             "Could not auto-discover model name from %s: %s. "
@@ -208,6 +221,8 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
             url,
             e,
         )
+        with _discovered_model_lock:
+            _discovery_failures[url] = time.monotonic()
     return ""
 
 
@@ -972,7 +987,13 @@ class VoiceModel(BaseModel):
                     "voice": voice,
                 }
 
-            voices_str = ", ".join(sorted(self._get_available_voices())) or "default"
+            # No network I/O at tool-listing time: _get_available_voices()
+            # performs a blocking GET ({base_url}/audio/voices) that used to
+            # stall the event loop on every tools/list.  Advertise voices
+            # already resolved (init-time config or memoized from a prior
+            # call); otherwise advertise the configured default voice — the
+            # handler validates the requested voice against the endpoint.
+            voices_str = ", ".join(sorted(self.tts_supported_voices)) or (self.tts_voice or "default")
             tools.append(
                 ToolDefinition(
                     name="synthesize",

@@ -37,7 +37,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -357,9 +357,7 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
         etier = str(e.get("tier", ""))
         if tier and tier == etier:
             score += 12
-        elif gpu_low and (gpu_low in etier or etier in gpu_low):
-            score += 10
-        elif gpu_low and ("h200" in etier and "h200" in gpu_low):
+        elif gpu_low and (gpu_low in etier or etier in gpu_low) or gpu_low and ("h200" in etier and "h200" in gpu_low):
             score += 10
         eng = (meta.get("engine") or "").lower()
         img = _cat_image(e).lower()
@@ -549,7 +547,7 @@ def main() -> int:
                 s["catalog_source"] = catalog_label
 
     data = {
-        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "generated": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         "results_dir": results_label,
         "catalog": catalog_label,
         "model_count": len(chat_models),
