@@ -1,0 +1,26 @@
+{
+  "skill_name": "pcai-helm-port",
+  "evals": [
+    {
+      "id": 0,
+      "name": "port-existing-kuard-chart",
+      "prompt": "I'm deploying kuard (a k8s demo app) on HPE Private Cloud AI. There's an existing Helm chart at /tmp/opencode-skills/pcai-helm-port-workspace/fixtures/kuard-chart that I'd like to port to PCAI. Please port it: add the ezua values block, the VirtualService, ask me about the AuthorizationPolicy, and add the required hpe-ezua labels. Use the app name kuard. Package the result when done.",
+      "expected_output": "The kuard chart is ported in place: values.yaml has ezua block with endpoint kuard.${DOMAIN_NAME}, templates/ezua/virtualservice.yaml routes to the kuard Service on port 8080, hpe-ezua labels on Deployment/Service (or Kyverno policy), a PORTING.md in the chart directory documenting the changes, and a packaged kuard-helm-*.tgz exists.",
+      "files": ["/tmp/opencode-skills/pcai-helm-port-workspace/fixtures/kuard-chart"]
+    },
+    {
+      "id": 1,
+      "name": "scaffold-from-scratch",
+      "prompt": "We need to deploy a simple python web app called 'dashdemo' (a Streamlit dashboard, listens on port 8501, image ghcr.io/acme/dashdemo:v1.2) on HPE Private Cloud AI. There's no helm chart for it yet. Create the chart from scratch and port it to PCAI so it's deployable: endpoint, VirtualService, and labels. Ask whether they want the auth policy. Package it when done.",
+      "expected_output": "New chart at charts/dashdemo/ with standard structure (Chart.yaml, values.yaml, templates/{_helpers.tpl,deployment.yaml,service.yaml,virtualservice.yaml}), an ezua block with endpoint dashdemo.${DOMAIN_NAME}, destination host templated to the dashdemo Service on port 8080, hpe-ezua labels, a PORTING.md in the chart directory, and a packaged .tgz.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "scaffold-simple-app-declines-auth",
+      "prompt": "I need to publish a small static site 'docs-site' (nginx, port 80, image nginx:alpine) on HPE Private Cloud AI. Please create a chart for it and make it PCAI-ready. No auth policy needed, I don't want the AuthorizationPolicy. Package it.",
+      "expected_output": "New chart at charts/nginx/ (or charts/docs-site/) with an ezua block, a VirtualService routing to the nginx Service on port 80, hpe-ezua labels, NO AuthorizationPolicy template (user declined), a PORTING.md in the chart directory (noting the declined policy), and a packaged .tgz.",
+      "files": []
+    }
+  ]
+}
