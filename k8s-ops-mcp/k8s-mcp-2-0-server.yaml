@@ -1,0 +1,355 @@
+# Usage:
+# export NAMESPACE=project-user-francesco-caliva
+# export MCP_HOSTNAME=k8s-hardened-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+#   ^ must be UNIQUE per deployment — a shared host splits traffic between
+#     every deployment claiming it (see the VirtualService note below)
+# Optional knobs (unset -> defaults: all namespaces readable, exec off):
+# export K8S_MCP_ALLOWED_NAMESPACES="team-a,team-b-*"
+# export K8S_MCP_BLOCKED_NAMESPACES="kube-system,kube-public"
+# export K8S_MCP_EXEC_ENABLED=true
+# export K8S_MCP_EXEC_NAMESPACES="debug-*,team-a"
+# export K8S_MCP_EXEC_REQUIRE_LABEL=false  # not recommended; default true
+# envsubst < k8s-mcp-2-0-server.yaml | kubectl apply -f -
+#
+# The API key is NOT part of this manifest (an unset API_KEY here once emptied
+# the secret). Create/rotate it explicitly:
+#   kubectl -n $NAMESPACE create secret generic k8s-mcp-2-0-apikey \
+#     --from-literal="api-key=$(openssl rand -hex 32)" --dry-run=client -o yaml |
+#   kubectl apply -f -
+#
+# MCP 2.0 (protocol 2026-07-28) is stateless: no initialize handshake, no
+# Mcp-Session-Id header, so this server scales behind a plain round-robin LB.
+# Streamable HTTP requires Mcp-Method / Mcp-Name headers - Istio passes them
+# through untouched. Server runs with stateless_http=True.
+#
+# Security posture:
+# - RBAC is a custom read-only ClusterRole (no secrets, no RBAC objects),
+#   NOT cluster-admin. Extend the CRD apiGroups list per installed operator
+#   instead of using apiGroups: ["*"] — a wildcard there would re-grant
+#   secrets read, which live in the core "" group.
+# - The pod runs non-root with a read-only root filesystem, all
+#   capabilities dropped, and RuntimeDefault seccomp; /tmp is an emptyDir
+#   (the server writes its in-cluster kubeconfig there, mode 0600).
+# - Namespace governance is configured via K8S_MCP_ALLOWED_NAMESPACES /
+#   K8S_MCP_BLOCKED_NAMESPACES (comma-separated, fnmatch globs allowed;
+#   blacklist always wins). Leave both empty for unrestricted read access.
+# - App-layer auth: every HTTP request must present the API key (Secret
+#   k8s-mcp-2-0-apikey) as `Authorization: Bearer <key>` or `X-API-Key:
+#   <key>`; comparison is constant-time. Do NOT apply this manifest with an
+#   empty ${API_KEY} — the server logs a loud warning and serves unauthenticated.
+#   Per-user keys with per-user exec namespace assignments are available via
+#   K8S_MCP_CLIENTS; the optional X-Exec-Namespaces request header can only
+#   NARROW a caller's exec scope, never widen it.
+# - Container exec exists only as the opt-in exec_in_pod tool (off unless
+#   K8S_MCP_EXEC_ENABLED=true): argv-list command, binary allowlist with
+#   hard-denied shells/interpreters, k8s-mcp.io/exec="true" pod label,
+#   self-pod guard, audit logging. The generic kubectl escape hatch NEVER
+#   gains exec. When K8S_MCP_EXEC_NAMESPACES is set, pods/exec RoleBindings
+#   for those namespaces are provisioned automatically at startup — the
+#   provisioner can reference ONLY the k8s-mcp-pods-exec template role
+#   (resourceNames bind), so it cannot escalate to any other permission.
+# - The Istio RequestAuthentication/AuthorizationPolicy example at the bottom
+#   is complementary, stronger hardening (real identity + revocation), not a
+#   replacement requirement.
+# - The MCP HTTP endpoint has no application-layer auth. Terminate authn at
+#   the gateway: attach a RequestAuthentication + AuthorizationPolicy to this
+#   workload (see the commented example at the bottom).
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-mcp-2-0-sa
+  namespace: ${NAMESPACE}
+---
+# NOTE: the API-key Secret is deliberately NOT managed here. An envsubst apply
+# with an unset API_KEY would silently EMPTY the secret (this actually
+# happened) and take the endpoint open. Create/rotate it out-of-band:
+#   kubectl -n $NAMESPACE create secret generic k8s-mcp-2-0-apikey \
+#     --from-literal="api-key=$(openssl rand -hex 32)" --dry-run=client -o yaml |
+#   kubectl apply -f -
+# The Deployment's env reference below fails LOUD (CreateContainerConfigError)
+# until the secret exists — that is the intended fail-loud behavior.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-mcp-2-0-readonly
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - events
+  - namespaces
+  - nodes
+  - persistentvolumeclaims
+  - persistentvolumes
+  - replicationcontrollers
+  - serviceaccounts
+  - limitranges
+  - resourcequotas
+  verbs: [get, list, watch]
+- apiGroups: ["apps"]
+  resources: [deployments, statefulsets, daemonsets, replicasets, controllerrevisions]
+  verbs: [get, list, watch]
+- apiGroups: ["batch"]
+  resources: [jobs, cronjobs]
+  verbs: [get, list, watch]
+- apiGroups: ["networking.k8s.io"]
+  resources: [ingresses, networkpolicies, ingressclasses]
+  verbs: [get, list, watch]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: [customresourcedefinitions]
+  verbs: [get, list, watch]
+- apiGroups: ["metrics.k8s.io"]
+  resources: [nodes, pods]
+  verbs: [get, list]
+# Custom resource groups the MCP tools are expected to serve. Add one entry
+# per installed operator group; do NOT replace with apiGroups: ["*"].
+- apiGroups: ["serving.kserve.io", "genai.hpe.com"]
+  resources: ["*"]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-2-0-viewer-${NAMESPACE}
+subjects:
+- kind: ServiceAccount
+  name: k8s-mcp-2-0-sa
+  namespace: ${NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: k8s-mcp-2-0-readonly
+  apiGroup: rbac.authorization.k8s.io
+---
+# Reusable exec permission TEMPLATE. Granting pods/exec is a namespaced
+# decision — this ClusterRole grants NOTHING until a RoleBinding references
+# it in a specific namespace. Never reference it from a ClusterRoleBinding:
+# that would make every pod in the cluster exec-able.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-mcp-pods-exec
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: [get, create]
+---
+# Automatic exec RBAC: lets the server bind the exec template per namespace
+# at startup, driven by K8S_MCP_EXEC_NAMESPACES. Scoped so it cannot
+# escalate: `bind` is resourceNames-restricted to k8s-mcp-pods-exec (the SA
+# can reference ONLY this role — never cluster-admin or anything else), it
+# cannot create or modify any role content, and it never creates
+# ClusterRoleBindings. Disable with K8S_MCP_EXEC_AUTO_RBAC=false and bind
+# namespaces manually (see DEPLOYMENT.md) if you prefer zero standing RBAC
+# mutation rights on this ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-mcp-2-0-rbac-provisioner
+rules:
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  resourceNames: ["k8s-mcp-pods-exec"]
+  verbs: [get, bind]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["rolebindings"]
+  verbs: [get, list, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-2-0-rbac-provisioner
+subjects:
+- kind: ServiceAccount
+  name: k8s-mcp-2-0-sa
+  namespace: ${NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: k8s-mcp-2-0-rbac-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-mcp-2-0-server
+  namespace: ${NAMESPACE}
+  labels:
+    app: k8s-mcp-2-0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-mcp-2-0
+  template:
+    metadata:
+      labels:
+        app: k8s-mcp-2-0
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: k8s-mcp-2-0-sa
+      automountServiceAccountToken: true
+      # Private image registry (ghcr packages pushed with a PAT are PRIVATE by
+      # default). The pull secret is NAMESPACED: create `ghcr-pull` in EVERY
+      # namespace that runs this image (DEPLOYMENT.md → "Private image
+      # registry") — a live `kubectl patch` does not survive envsubst applies.
+      imagePullSecrets:
+      - name: ghcr-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: k8s-mcp-2-0
+        image: ghcr.io/ai-solution-eng/k8s-mcp:v0.1.3
+        ports:
+        - containerPort: 9090
+          name: mcp-2-0-http
+        env:
+        # All knobs are envsubst-driven: unset exports -> empty values -> the
+        # documented defaults (all namespaces readable, exec disabled, label
+        # gate on, auto-RBAC on). Deploy-time exports or `kubectl set env`
+        # after the fact — both work.
+        - name: K8S_MCP_ALLOWED_NAMESPACES
+          value: "${K8S_MCP_ALLOWED_NAMESPACES}"
+        - name: K8S_MCP_BLOCKED_NAMESPACES
+          value: "${K8S_MCP_BLOCKED_NAMESPACES}"
+        - name: K8S_MCP_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: k8s-mcp-2-0-apikey
+              key: api-key
+        # Exec tool: empty K8S_MCP_EXEC_ENABLED = off (tool not registered).
+        # When enabled with a namespace list, pods/exec RoleBindings for the
+        # list are provisioned automatically at startup.
+        - name: K8S_MCP_EXEC_ENABLED
+          value: "${K8S_MCP_EXEC_ENABLED}"
+        - name: K8S_MCP_EXEC_NAMESPACES
+          value: "${K8S_MCP_EXEC_NAMESPACES}"
+        - name: K8S_MCP_EXEC_ALLOWED_COMMANDS
+          value: "${K8S_MCP_EXEC_ALLOWED_COMMANDS}"
+        - name: K8S_MCP_EXEC_REQUIRE_LABEL
+          value: "${K8S_MCP_EXEC_REQUIRE_LABEL}"
+        - name: K8S_MCP_EXEC_AUTO_RBAC
+          value: "${K8S_MCP_EXEC_AUTO_RBAC}"
+        # Per-user keys with their own exec assignments (optional): each key's
+        # exec scope is ITS pattern list (intersected with everything above) —
+        # users can never widen their own scope. The shared K8S_MCP_API_KEY
+        # keeps working alongside (deployment-wide ceiling).
+        - name: K8S_MCP_CLIENTS
+          value: "${K8S_MCP_CLIENTS}"
+        # The public hostname must reach the CONTAINER too: the server
+        # allowlists it for Host-header (DNS-rebinding) validation. Without
+        # it, the SDK's implicit loopback-only protection 421s every
+        # gateway-fronted request that carries a valid API key.
+        - name: MCP_HOSTNAME
+          value: "${MCP_HOSTNAME}"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        readinessProbe:
+          tcpSocket:
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 9090
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-mcp-2-0-svc
+  namespace: ${NAMESPACE}
+  labels:
+    app: k8s-mcp-2-0
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: mcp-http
+  selector:
+    app: k8s-mcp-2-0
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: k8s-mcp-2-0-server
+  namespace: ${NAMESPACE}
+spec:
+  gateways:
+  - istio-system/ezaf-gateway
+  # MCP_HOSTNAME must be the FULL FQDN and UNIQUE per deployment: two
+  # VirtualServices claiming the same host on the same gateway split traffic
+  # between their backends (this actually happened between two namespaces).
+  # Example: export MCP_HOSTNAME=k8s-hardened-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+  hosts:
+  - ${MCP_HOSTNAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: k8s-mcp-2-0-svc.${NAMESPACE}.svc.cluster.local
+        port:
+          number: 9090
+    timeout: 660s
+---
+# Optional stronger hardening: real identity + revocation via JWT at the mesh
+# edge, complementary to the app-layer API key (a static shared secret has no
+# per-user identity). Adjust issuer/jwksUri and principals to your gateway
+# deployment before applying.
+#
+# apiVersion: security.istio.io/v1
+# kind: RequestAuthentication
+# metadata:
+#   name: k8s-mcp-2-0-jwt
+#   namespace: ${NAMESPACE}
+# spec:
+#   selector:
+#     matchLabels:
+#       app: k8s-mcp-2-0
+#   jwtRules:
+#   - issuer: https://your-idp.example.com
+#     jwksUri: https://your-idp.example.com/.well-known/jwks.json
+# ---
+# apiVersion: security.istio.io/v1
+# kind: AuthorizationPolicy
+# metadata:
+#   name: k8s-mcp-2-0-authz
+#   namespace: ${NAMESPACE}
+# spec:
+#   selector:
+#     matchLabels:
+#       app: k8s-mcp-2-0
+#   action: ALLOW
+#   rules:
+#   - from:
+#     - source:
+#         requestPrincipals: ["https://your-idp.example.com/*"]
