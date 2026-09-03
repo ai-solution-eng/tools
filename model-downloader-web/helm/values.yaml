@@ -3,7 +3,7 @@
 # =============================================================================
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.3.1
+  tag: v1.3.2
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
@@ -57,6 +57,9 @@ storage:
 # =============================================================================
 # S3-compatible backend for downloads ("s3" storage backend) — e.g. MinIO.
 # The downloader Job streams HF model files straight into this bucket.
+# Only injected into the app when storage.backend includes s3 — a pvc-only
+# deployment gets no S3 env at all (no s3 option in the submit form, no S3
+# scan, and the downloaded-models list won't claim s3 scanning).
 # =============================================================================
 s3:
   endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL

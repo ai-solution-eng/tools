@@ -241,7 +241,11 @@ _TOOLS = [
     ),
     Tool(
         name="scan_table",
-        description="Fetch rows/columns from a table via pyarrow (columnar).",
+        description=(
+            "Fetch rows/columns from a table via pyarrow (columnar). Prefer run_sql "
+            "when filters or aggregations can be pushed into the scan; use this to "
+            "sample raw columns or feed a programmatic caller without writing SQL."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -500,6 +504,10 @@ def scan_table(
     version_as_of: int | None = None,
 ) -> str:
     """Fetch rows/columns from a table via pyarrow (columnar).
+
+    Prefer run_sql when filters or aggregations can be pushed into the scan;
+    use this to sample raw columns or feed a programmatic caller without
+    writing SQL.
 
     Args:
         table: Table name (schema/name when the source uses schemas).

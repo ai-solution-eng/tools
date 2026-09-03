@@ -559,19 +559,25 @@ cache:
   prewarmTables: "work_order_header,work_order_note_recent,work_order_labour,work_order_parts"
 ```
 
-> **In-cluster callers need one line of values.** The chart ships hardened by
-> default, including an ingress NetworkPolicy that allows the pod's own
-> namespace and the Istio gateway. If clients such as Open WebUI call the
-> service **directly** via `http://sqlhandler.<ns>.svc.cluster.local:9097/mcp`
-> from another namespace, add that namespace (no client-side change needed):
+> **In-cluster callers work out of the box.** The ingress NetworkPolicy is
+> **disabled by default**: any pod in the cluster can call the service
+> directly via `http://sqlhandler.<ns>.svc.cluster.local:9097/mcp`, and the
+> ClusterIP Service exposes nothing outside the cluster — the right posture
+> for short-lived test deployments.
+>
+> For production / real-data deployments, enable the policy and allowlist
+> any direct callers from other namespaces (no client-side change needed):
 >
 > ```yaml
 > security:
 >   networkPolicy:
+>     enabled: true
 >     allowedNamespaces: ["<client-namespace>"]
 > ```
 >
-> See [Security notes](#security-notes) for the full model.
+> Flipping `enabled` back to `true` is exactly what re-breaks in-cluster
+> callers not on that list. See [Security notes](#security-notes) for the
+> full model.
 
 > **Toromont:** a ready-made values file with the real service principal +
 > OneLake coordinates is provided (`helm/deploy-toromont-values.yaml`, local
@@ -763,17 +769,21 @@ as `/mcp` (long-running queries), while the page itself uses the short timeout.
   `..` or absolute paths are rejected, and the NFS backend verifies every
   table path stays inside `NFS_ROOT` (symlinks included).
 - **Network posture** (helm chart, `security.hardened: true` default):
-  non-root read-only container, no ServiceAccount token, ingress
-  NetworkPolicy (same namespace + Istio gateway + `allowedNamespaces`), and
-  an optional pod-level AuthorizationPolicy. External access is
+  non-root read-only container, no ServiceAccount token, and an optional
+  pod-level AuthorizationPolicy. The ingress NetworkPolicy is **off by
+  default** so in-cluster callers work with zero friction; the ClusterIP
+  Service exposes nothing outside the cluster. Enable it for production /
+  real-data deployments (`security.networkPolicy.enabled: true`) and
+  allowlist direct callers via `allowedNamespaces`. External access is
   authenticated at the gateway by the oauth2-proxy AuthorizationPolicy —
   keep `ezua.authorizationPolicy.enabled: true`.
 - **Credentials**: create Kubernetes Secrets out-of-band (never in values
   files); see `helm/local/README.md` for create/read/rotate commands.
   `SQLHANDLER_SOURCES` with embedded keys is for development only.
-- **In-cluster callers** can always be granted access by adding their
-  namespace to `security.networkPolicy.allowedNamespaces` — no other change
-  needed.
+- **In-cluster callers** need nothing while the NetworkPolicy is off
+  (default). Once it is enabled, direct calls from another namespace require
+  that namespace in `security.networkPolicy.allowedNamespaces` — no
+  client-side change.
 
 ## Observability & ops (0.9.0)
 

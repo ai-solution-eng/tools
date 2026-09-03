@@ -124,13 +124,21 @@ startupProbe:
 security:
   # Master switch: run as non-root, seccomp RuntimeDefault, no privilege
   # escalation, dropped capabilities, read-only root filesystem, no
-  # auto-mounted ServiceAccount token, ingress NetworkPolicy.
+  # auto-mounted ServiceAccount token, plus an optional ingress
+  # NetworkPolicy (security.networkPolicy.enabled below, default false).
   hardened: true
   # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
   # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
   # Egress is NOT restricted (the server must reach AAD/OneLake/S3).
+  #
+  # DEFAULT OFF: in-cluster callers (MCP agents, OWUI, DSH, ...) reach the
+  # Service directly with zero friction — the right posture for short-lived
+  # test deployments. The Service stays ClusterIP, so nothing is exposed
+  # outside the cluster. Turn this ON for production / real-data
+  # deployments, and add direct-caller namespaces to allowedNamespaces
+  # below (flipping it on re-breaks any caller not listed).
   networkPolicy:
-    enabled: true
+    enabled: false
     gatewayNamespace: istio-system
     # Extra namespaces whose pods may call this service directly
     # (in-cluster MCP clients, OWUI, DSH, ...). Cluster-internal access

@@ -56,6 +56,13 @@ spec:
           value: {{ .Values.debugPod.enabled | quote }}
         - name: DEBUG_POD_IMAGE
           value: "{{ .Values.debugPod.image.repository }}:{{ .Values.debugPod.image.tag }}"
+        # S3 config only reaches the pod when the storage backend actually
+        # includes s3. With backend: pvc (an S3-less cluster) the app gets no
+        # bucket/endpoint at all: the submit form hides the s3 option (it
+        # already keys off STORAGE_BACKEND), the downloaded-models list stops
+        # claiming "s3 automatic scanning enabled.", and no poll wastes a
+        # boto3 listing against a MinIO endpoint that doesn't exist here.
+        {{- if ne .Values.storage.backend "pvc" }}
         - name: S3_BUCKET
           value: {{ .Values.s3.bucket | quote }}
         - name: S3_PREFIX
@@ -66,6 +73,7 @@ spec:
           value: {{ .Values.s3.accessKeyId | quote }}
         - name: S3_SECRET_ACCESS_KEY
           value: {{ .Values.s3.secretAccessKey | quote }}
+        {{- end }}
         - name: DOWNLOAD_LIST_ENABLED
           value: {{ .Values.downloadList.enabled | quote }}
         - name: PVC_SCAN_IMAGE

@@ -1,0 +1,77 @@
+{
+  "description": "SQLhandler vs EzPresto benchmark workload on the G2 cluster MinIO test-parquet data. rows_scanned = source rows the engine must touch. queries.ezpresto holds catalog-qualified SQL (filled in after SHOW CATALOGS probe); when absent the harness reuses the sqlhandler SQL.",
+  "queries": [
+    {
+      "name": "count_small",
+      "rows_scanned": 50000,
+      "queries": {
+        "sqlhandler": "SELECT COUNT(*) AS c FROM sales_employees"
+      }
+    },
+    {
+      "name": "range_filter",
+      "rows_scanned": 200000,
+      "queries": {
+        "sqlhandler": "SELECT COUNT(*) AS c FROM sales_orders WHERE order_id BETWEEN 100000 AND 100099"
+      }
+    },
+    {
+      "name": "filtered_agg",
+      "rows_scanned": 200000,
+      "queries": {
+        "sqlhandler": "SELECT region, COUNT(*) AS c, SUM(qty) AS s FROM sales_orders WHERE unit_price > 250 GROUP BY region"
+      }
+    },
+    {
+      "name": "groupby_agg",
+      "rows_scanned": 200000,
+      "queries": {
+        "sqlhandler": "SELECT region, product, COUNT(*) AS c, AVG(unit_price) AS a FROM sales_orders GROUP BY region, product"
+      }
+    },
+    {
+      "name": "join_count",
+      "rows_scanned": 350000,
+      "queries": {
+        "sqlhandler": "SELECT COUNT(*) AS c FROM sales_orders o JOIN customers c ON o.customer_id = c.customer_id"
+      }
+    },
+    {
+      "name": "join_agg",
+      "rows_scanned": 350000,
+      "queries": {
+        "sqlhandler": "SELECT c.segment, COUNT(*) AS n, SUM(o.qty * o.unit_price) AS rev FROM sales_orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.segment"
+      }
+    },
+    {
+      "name": "count_big_3m",
+      "rows_scanned": 3000000,
+      "note": "full scan of 3M rows x 50 cols",
+      "queries": {
+        "sqlhandler": "SELECT COUNT(*) AS c FROM testdata_50col"
+      }
+    },
+    {
+      "name": "col_proj_agg_2cols",
+      "rows_scanned": 3000000,
+      "note": "columnar projection: 2 of 50 columns",
+      "queries": {
+        "sqlhandler": "SELECT SUM(quantity) AS s, AVG(returns_qty) AS a FROM testdata_50col"
+      }
+    },
+    {
+      "name": "filtered_group_3m",
+      "rows_scanned": 3000000,
+      "queries": {
+        "sqlhandler": "SELECT tenant_id, SUM(quantity) AS s FROM testdata_50col WHERE region_id = 11 GROUP BY tenant_id"
+      }
+    },
+    {
+      "name": "wide_agg_4cols",
+      "rows_scanned": 3000000,
+      "queries": {
+        "sqlhandler": "SELECT COUNT(*) AS c, SUM(quantity) AS s, MAX(supplier_id) AS mx, MIN(brand_id) AS mn FROM testdata_50col"
+      }
+    }
+  ]
+}

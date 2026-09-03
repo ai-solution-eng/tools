@@ -214,6 +214,23 @@ def _storage_default() -> str:
     return default if default in allowed else allowed[0]
 
 
+def _download_scan_status() -> str:
+    """Status sentence(s) for the "Downloaded models" section, reading exactly:
+
+      * S3 configured    -> "s3 automatic scanning enabled."
+      * PVC auto scan on -> "pvc automatic scanning enabled at <N> second cadence."
+      * neither          -> "No automatic scanning enabled."
+
+    Both sentences are shown when both sources are enabled.
+    """
+    parts: list[str] = []
+    if S3_BUCKET:
+        parts.append("s3 automatic scanning enabled.")
+    if PVC_SCAN_ENABLED:
+        parts.append(f"pvc automatic scanning enabled at {PVC_REFRESH_INTERVAL} second cadence.")
+    return " ".join(parts) if parts else "No automatic scanning enabled."
+
+
 def _page_context() -> dict:
     return {
         "max_concurrency": MAX_CONCURRENCY,
@@ -231,6 +248,7 @@ def _page_context() -> dict:
         # on the master switch; PVC/S3 scans enrich it when enabled/configured.
         "download_list_enabled": DOWNLOAD_LIST_ENABLED,
         "pvc_scan_enabled": PVC_SCAN_ENABLED,
+        "download_scan_status": _download_scan_status(),
         "debug_pods_enabled": DEBUG_POD_ENABLED and k8s_client.debug_pod_available,
         "debug_pod_image": DEBUG_POD_IMAGE,
         "assets": STATIC_HASHES,
@@ -321,7 +339,7 @@ async def list_downloaded(request: Request):
     """
     force = (request.query_params.get("force") or "") in ("1", "true", "yes")
     if not DOWNLOAD_LIST_ENABLED:
-        return {"models": []}
+        return {"models": [], "scan_status": _download_scan_status()}
 
     # The scanner Job mounts the PVC at /mnt/ and scans the subpath where
     # downloader Jobs write (matches the __CACHE_ROOT__ default in job.yaml).
@@ -347,8 +365,12 @@ async def list_downloaded(request: Request):
     )
     return {
         "models": [m.to_dict() for m in models],
+        # The clean status sentence the UI shows above the table (same text as
+        # the page render — one source of truth: _download_scan_status()).
+        "scan_status": _download_scan_status(),
         # Why each source contributed what it did — so an empty table is
-        # explainable (scan ran and found 0 vs skipped vs error).
+        # explainable (scan ran and found 0 vs skipped vs error). The UI logs
+        # this to the console rather than rendering it.
         "scan": dict(downloaded_cache.last_status),
     }
 

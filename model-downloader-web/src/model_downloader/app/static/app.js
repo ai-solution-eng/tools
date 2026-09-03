@@ -518,13 +518,13 @@ async function refreshDownloaded(force = false) {
         downloadedTableBody.appendChild(buildDownloadedRow(m));
       }
     }
-    // Explain where the rows came from (or why there are none).
-    const scan = data.scan || {};
-    const bits = [];
-    if (scan.pvc) bits.push('PVC: ' + scan.pvc);
-    if (scan.s3) bits.push('S3: ' + scan.s3);
-    if (scan.jobs !== undefined) bits.push('history: ' + scan.jobs + ' job(s)');
-    if (bits.length) setDownloadedMsg(bits.join(' · '), false);
+    // The visible line reads the clean scanning-status sentence served by the
+    // API ("s3 automatic scanning enabled." / "pvc automatic scanning enabled
+    // at <N> second cadence." / "No automatic scanning enabled."). The per-
+    // source diagnostics (ok/cached/error per backend, job count) stay in the
+    // console — useful for explaining an empty table, but not page copy.
+    if (data.scan) console.debug('downloaded models scan detail:', data.scan);
+    setDownloadedMsg(data.scan_status || 'No automatic scanning enabled.', false);
   } catch (e) {
     setDownloadedMsg('Scan request error: ' + e, true);
     console.error('downloaded models refresh failed', e);

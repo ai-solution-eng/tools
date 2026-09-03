@@ -1,0 +1,13 @@
+# Patterns to ignore when packaging the chart (helm package).
+# The helm/local/ tree holds per-site tenant values with real credentials
+# (values.omnilife.yaml, values.toromont.yaml) — those must never ship
+# inside the importable chart tarball. Re-run `helm package helm/` after
+# editing anything here.
+local/
+*.tar.gz
+*.tgz
+.git/
+.ci/
+.dev/
+bench/
+test_parquet/

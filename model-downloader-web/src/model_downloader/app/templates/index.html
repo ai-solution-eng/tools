@@ -138,14 +138,11 @@
     <h2>Downloaded models</h2>
     <p class="hint">
       Models downloaded through this UI, deduplicated by name (most recent
-      location and timestamp shown).{% if pvc_scan_enabled %} The model PVC is
-      scanned automatically, so models placed there outside this UI appear too.{% else %}
-      "Rescan storage" also lists models physically present on the model PVC,
-      even if placed there outside this UI.{% endif %}
-      {% if s3_bucket %} The S3 bucket <code>{{ s3_bucket }}</code> is scanned
-      automatically.{% endif %}
+      location and timestamp shown).
+      {% if not pvc_scan_enabled %}"Rescan storage" also lists models physically
+      present on the model PVC, even if placed there outside this UI.{% endif %}
     </p>
-    <div id="downloaded-msg" class="msg"></div>
+    <div id="downloaded-msg" class="msg ok">{{ download_scan_status }}</div>
     <table id="downloaded-models">
       <thead>
         <tr>
