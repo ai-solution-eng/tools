@@ -15,7 +15,6 @@ Below is a list of the available tools.
 | [nim-profile-finder](nim-profile-finder/README.md) | Extracts NVIDIA manifest details from NIM container images hosted on NGC without downloading the full image. |
 | [pcai-helm-port](pcai-helm-port/README.md) | Skill that ports Helm charts (or scaffolds new ones) so applications are deployable on PCAI. |
 | [s3-browser](s3-browser/README.md) | Web-based browser for navigating S3-compatible object storage.|
-| [sql-handler](sql-handler/README.md) | Alternative to EZPresto for querying SQL in a few commonly deployed modes. Avoiding JDBC yields a 3-4x speed up with typical SQL queries, and avoids timeouts that are typical for larger datasets.|
 
 ## How to push container images to GitHub
 
