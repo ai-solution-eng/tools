@@ -3,7 +3,7 @@
 # =============================================================================
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.4.3
+  tag: v1.4.4
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same

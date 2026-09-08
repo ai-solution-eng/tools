@@ -54,7 +54,10 @@
     <div id="catalog-msg" class="msg"></div>
 
     <h2>Push JSON Directly</h2>
-    <p class="hint">Paste a single model configuration or a JSON array of them to push to MLIS without saving to the catalog, or add them to the catalog table above.</p>
+    <p class="hint">Paste a single model configuration or a JSON array of them to push to MLIS without saving to the catalog, or add them to the catalog table above.
+      When adding to the catalog, set <code>"tier"</code> to <code>"h200"</code>, <code>"rtx-pro-6000"</code>, or <code>"l40s"</code> to choose the GPU group — a missing or misspelled tier silently defaults to <code>h200</code>.
+      <code>tier</code> is for catalog grouping only and is not pushed to MLIS (MLIS-side GPU class is <code>resource_gpu_type</code>).
+      Note: an entry is skipped if its <code>name</code> + <code>version</code> already exist in <em>any</em> tier, regardless of the tier you set — bump the version or rename the model to add a new variant.</p>
     <textarea id="direct-json" class="json-input" rows="12" placeholder='{"name": "my-model", ...}  — or —  [{"name": "mc1", ...}, {"name": "mc2", ...}]'></textarea>
     <button id="push-direct-btn" type="button">Push to MLIS</button>
     <button id="add-direct-btn" type="button" class="secondary-btn">Add to Catalog</button>
