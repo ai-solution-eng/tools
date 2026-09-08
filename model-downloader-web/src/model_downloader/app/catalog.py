@@ -53,19 +53,43 @@ class Catalog:
             return False
         seed_entries = json.loads(SEED_FILE.read_text())
         self._seed_ids = {e.get("catalog_id") for e in seed_entries if e.get("catalog_id")}
-        present = {e.get("catalog_id") for e in self.entries}
-        changed = False
-        for e in seed_entries:
-            cid = e.get("catalog_id")
-            if cid and cid not in present and cid not in self._removed_seed_ids:
-                self.entries.append(e)
-                present.add(cid)
-                changed = True
-        return changed
+        return bool(self.merge_entries(seed_entries, source="seed")["added"])
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.entries, indent=2))
+
+    def merge_entries(self, entries: list[dict], source: str = "seed") -> dict:
+        """Merge external catalog entries (seed file or GitHub refresh).
+
+        Same rules as the on-start seed merge: add only entries whose
+        catalog_id is not present and not explicitly removed, so a refresh
+        ships new entries without overwriting user edits or resurrecting
+        removed ones.  Returns counters for the API response.
+        """
+        if not isinstance(entries, list):
+            raise ValueError("catalog payload must be a JSON array of entries")
+        present = {e.get("catalog_id") for e in self.entries}
+        added = skipped = removed = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                skipped += 1
+                continue
+            cid = entry.get("catalog_id")
+            if not cid:
+                skipped += 1
+                continue
+            if cid in present:
+                skipped += 1
+            elif cid in self._removed_seed_ids:
+                removed += 1
+            else:
+                self.entries.append(entry)
+                present.add(cid)
+                added += 1
+        if added:
+            self._save()
+        return {"source": source, "added": added, "skipped": skipped, "removed": removed}
 
     def all(self) -> list[dict]:
         return list(self.entries)

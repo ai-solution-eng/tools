@@ -450,9 +450,21 @@ tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
 /* ---- Catalog controls ---- */
 .catalog-controls {
   display: flex;
+  align-items: center;
   gap: 10px;
   margin-bottom: 16px;
 }
+/* Inline result of the control-bar actions (refresh / refresh-from-github /
+   add-to-catalog): sits right beside the buttons so feedback is visible
+   without scrolling past the whole table. */
+.ctl-status {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--hpe-text-soft);
+  min-height: 18px;
+}
+.ctl-status.ok { color: var(--hpe-green-dark); }
+.ctl-status.error { color: var(--hpe-critical); }
 .secondary-btn {
   background: var(--hpe-surface);
   border: 1px solid var(--hpe-border);

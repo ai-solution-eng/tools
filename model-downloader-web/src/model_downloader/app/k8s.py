@@ -598,3 +598,14 @@ class K8sClient:
         except Exception as e:
             log.warning("scan %s: log read failed: %s", job_name, e)
             return ""
+
+    # ---- Namespace dropdown search (front page) ----
+
+    async def list_namespaces(self) -> list[str]:
+        """List every cluster namespace name.
+
+        Callers apply the namespace-prefix filter.  An RBAC denial propagates
+        to the API layer, which surfaces it as a clean 403 detail.
+        """
+        ns = await asyncio.to_thread(self.core.list_namespace)
+        return [item.metadata.name for item in ns.items]

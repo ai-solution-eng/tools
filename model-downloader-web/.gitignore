@@ -1,0 +1,5 @@
+# Per-cluster deployment values with credentials — helm/local convention
+# (helm/local/README.md explains it; only README + example are trackable)
+helm*/local/*
+!helm*/local/README.md
+!helm*/local/values.example.yaml

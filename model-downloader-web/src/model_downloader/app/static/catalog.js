@@ -244,14 +244,25 @@ document.getElementById('push-selected-btn').addEventListener('click', async () 
   await doPush(configs);
 });
 
-document.getElementById('push-direct-btn').addEventListener('click', async () => {
+// Parse the direct-JSON textarea: accepts a single {MODEL_CONFIGURATION}
+// object or a [{MC1}, {MC2}, ...] array.  Returns the normalized array or
+// null (after alerting) on invalid input.
+function parseDirectJson() {
   const text = document.getElementById('direct-json').value.trim();
-  if (!text) { alert('Paste a JSON array first.'); return; }
-  let configs;
+  if (!text) { alert('Paste JSON first — a single object or an array.'); return null; }
+  let parsed;
   try {
-    configs = JSON.parse(text);
-    if (!Array.isArray(configs)) throw new Error('not an array');
-  } catch (e) { alert('Invalid JSON: ' + e.message); return; }
+    parsed = JSON.parse(text);
+  } catch (e) { alert('Invalid JSON: ' + e.message); return null; }
+  if (typeof parsed !== 'object' || parsed === null) {
+    alert('Invalid JSON: expected an object or an array.'); return null;
+  }
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+document.getElementById('push-direct-btn').addEventListener('click', async () => {
+  const configs = parseDirectJson();
+  if (!configs) return;
   await doPush(configs);
 });
 
@@ -283,6 +294,94 @@ function renderPushResults(data) {
   pushResults.innerHTML = html;
 }
 
-document.getElementById('refresh-catalog-btn').addEventListener('click', loadCatalog);
+// "Add to Catalog": add the direct-JSON entries (single object or array) to
+// the catalog so they appear in the tiers table above.  Duplicates (same
+// catalog_id or name+version) are skipped server-side.
+document.getElementById('add-direct-btn').addEventListener('click', async () => {
+  const configs = parseDirectJson();
+  if (!configs) return;
+  pushResults.innerHTML = '<p class="hint">Adding ' + configs.length + ' entr' +
+    (configs.length === 1 ? 'y' : 'ies') + ' to the catalog...</p>';
+  try {
+    const r = await fetch('/api/catalog/batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(configs),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    let html = '<div class="push-summary">Added: <strong>' + data.added + '</strong>' +
+      ' | Skipped: <strong>' + data.skipped + '</strong></div>';
+    html += '<table class="catalog-table"><thead><tr><th>Name</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
+    for (const res of data.results) {
+      const cls = res.status === 'added' ? 'push-ok' : 'push-skip';
+      html += '<tr class="' + cls + '"><td>' + esc(res.name) + '</td><td>' + res.status + '</td><td>' + esc(res.detail) + '</td></tr>';
+    }
+    html += '</tbody></table>';
+    pushResults.innerHTML = html;
+    await loadCatalog();
+    setStatus('Added ' + data.added + ' entr' + (data.added === 1 ? 'y' : 'ies') +
+      ' to the catalog' + (data.skipped ? ', skipped ' + data.skipped : '') + '.', 'ok');
+  } catch (e) {
+    pushResults.innerHTML = '<p class="msg error">Error: ' + e.message + '</p>';
+  }
+});
+
+// Inline status next to the buttons (top of the page) — the #catalog-msg
+// div sits below the whole table, which made refresh feedback invisible.
+const catalogStatus = document.getElementById('catalog-status');
+function setStatus(text, kind) {
+  if (!catalogStatus) return;
+  catalogStatus.textContent = text;
+  catalogStatus.className = 'ctl-status' + (kind ? ' ' + kind : '');
+  catalogMsg.className = 'msg' + (kind ? ' ' + kind : '');
+  catalogMsg.textContent = text;  // keep the bottom-of-page copy in sync
+}
+
+const refreshCatalogBtn = document.getElementById('refresh-catalog-btn');
+refreshCatalogBtn.addEventListener('click', async () => {
+  refreshCatalogBtn.disabled = true;
+  setStatus('Reloading catalog...', '');
+  try {
+    await loadCatalog();
+    const n = Object.values(catalogData.tiers || {}).reduce((a, l) => a + l.length, 0);
+    setStatus('Catalog reloaded — ' + n + ' entr' + (n === 1 ? 'y' : 'ies') +
+      ' · ' + new Date().toLocaleTimeString(), 'ok');
+  } catch (e) {
+    setStatus('Reload failed: ' + e.message, 'error');
+  } finally {
+    refreshCatalogBtn.disabled = false;
+  }
+});
+
+// "Refresh from GitHub": fetch the latest catalog JSON from GitHub via the
+// API and merge it in (new entries added, user edits kept, removed entries
+// stay removed), then re-render the table.
+const refreshGithubBtn = document.getElementById('refresh-github-btn');
+if (refreshGithubBtn) {
+  refreshGithubBtn.addEventListener('click', async () => {
+    refreshGithubBtn.disabled = true;
+    setStatus('Refreshing from GitHub...', '');
+    try {
+      const r = await fetch('/api/catalog/refresh', { method: 'POST' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+      if (data.added) {
+        setStatus('Refreshed from GitHub: ' + data.added + ' new entr' +
+          (data.added === 1 ? 'y' : 'ies') + ' added' +
+          (data.skipped ? ', ' + data.skipped + ' already in catalog' : '') +
+          (data.removed ? ', ' + data.removed + ' removed entr' + (data.removed === 1 ? 'y' : 'ies') + ' skipped' : '') + '.', 'ok');
+      } else {
+        setStatus('Up to date with GitHub' +
+          (data.skipped ? ' (' + data.skipped + ' entr' + (data.skipped === 1 ? 'y' : 'ies') + ' already present)' : '') +
+          (data.removed ? ', ' + data.removed + ' removed entr' + (data.removed === 1 ? 'y' : 'ies') + ' stayed removed' : '') + '.', 'ok');
+      }
+      await loadCatalog();
+    } catch (e) {
+      setStatus('Refresh from GitHub failed: ' + e.message, 'error');
+    } finally {
+      refreshGithubBtn.disabled = false;
+    }
+  });
+}
 
 loadCatalog();

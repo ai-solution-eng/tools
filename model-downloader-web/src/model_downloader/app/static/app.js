@@ -224,6 +224,100 @@ document.addEventListener('click', (e) => {
   if (!e.target.closest('.combo')) modelMenu.hidden = true;
 });
 
+// ---- Namespace combobox (dropdown search over project-user-* namespaces) ----
+// Same .combo pattern as the model name combobox, wired into both the submit
+// and the debug form.  The namespace list is fetched once, lazily, on first
+// open; an RBAC/403 fallback (fetch failed) leaves the field typing manually.
+
+let knownNamespaces = null;
+let namespacesPending = false;
+
+async function fetchNamespaces() {
+  if (knownNamespaces !== null) return knownNamespaces;
+  if (namespacesPending) return null;
+  namespacesPending = true;
+  try {
+    const r = await fetch('/api/namespaces');
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    knownNamespaces = data.namespaces || [];
+  } catch (e) {
+    console.error('namespace list fetch failed', e);
+    knownNamespaces = null;
+  } finally {
+    namespacesPending = false;
+  }
+  return knownNamespaces;
+}
+
+function setupNamespaceCombo(inputId, toggleId, menuId) {
+  const input = document.getElementById(inputId);
+  const toggle = document.getElementById(toggleId);
+  const menu = document.getElementById(menuId);
+  if (!input || !toggle || !menu) return;
+
+  async function showNsMenu() {
+    if (knownNamespaces === null) {
+      menu.innerHTML = '';
+      const loading = document.createElement('div');
+      loading.className = 'combo-empty';
+      loading.textContent = 'Loading namespaces...';
+      menu.appendChild(loading);
+      menu.hidden = false;
+      const list = await fetchNamespaces();
+      if (list === null) { menu.hidden = true; return; }
+    }
+    const ql = (input.value || '').toLowerCase();
+    const matches = (knownNamespaces || [])
+      .filter(ns => ns.toLowerCase().includes(ql))
+      .slice(0, 50);
+    menu.innerHTML = '';
+    if (!matches.length) {
+      const empty = document.createElement('div');
+      empty.className = 'combo-empty';
+      empty.textContent = 'No project-user-* namespace matches — you can still type a namespace manually.';
+      menu.appendChild(empty);
+    } else {
+      for (const ns of matches) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'combo-item';
+        item.innerHTML = '<span class="combo-item-id">' + esc(ns) + '</span>';
+        item.addEventListener('click', () => {
+          input.value = ns;
+          menu.hidden = true;
+        });
+        menu.appendChild(item);
+      }
+    }
+    menu.hidden = false;
+  }
+
+  toggle.addEventListener('click', () => {
+    if (menu.hidden) showNsMenu();
+    else menu.hidden = true;
+  });
+  input.addEventListener('input', () => {
+    if (knownNamespaces !== null) showNsMenu();
+  });
+  input.addEventListener('focus', () => showNsMenu());
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' || e.key === 'Enter') menu.hidden = true;
+  });
+}
+
+setupNamespaceCombo('ns-input', 'ns-toggle', 'ns-menu');
+setupNamespaceCombo('ns-input-debug', 'ns-toggle-debug', 'ns-menu-debug');
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.combo')) {
+    for (const id of ['ns-menu', 'ns-menu-debug']) {
+      const m = document.getElementById(id);
+      if (m) m.hidden = true;
+    }
+  }
+});
+
 function applyUrlPreset() {
   const preset = new URLSearchParams(window.location.search).get('model');
   if (!preset) return;

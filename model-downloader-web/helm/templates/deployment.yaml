@@ -85,6 +85,30 @@ spec:
         {{- if .Values.catalog.enabled }}
         - name: CATALOG_PATH
           value: "/mnt/catalog/catalog.json"
+        {{- if .Values.catalog.githubUrl }}
+        - name: CATALOG_GITHUB_URL
+          value: {{ .Values.catalog.githubUrl | quote }}
+        # The app pod itself must traverse the corporate proxy for the GitHub
+        # fetch (the Jobs get the same env via the job template). urllib picks
+        # these up automatically. TLS verify follows the downloader's
+        # skipTls logic (hpe_proxies), overridable with catalog.githubVerifyTls.
+        {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+        - name: no_proxy
+          value: {{ .Values.pcai.noProxy | quote }}
+        - name: NO_PROXY
+          value: {{ .Values.pcai.noProxy | quote }}
+        - name: https_proxy
+          value: {{ .Values.pcai.httpsProxy | quote }}
+        - name: HTTPS_PROXY
+          value: {{ .Values.pcai.httpsProxy | quote }}
+        - name: http_proxy
+          value: {{ .Values.pcai.httpsProxy | quote }}
+        - name: HTTP_PROXY
+          value: {{ .Values.pcai.httpsProxy | quote }}
+        {{- end }}
+        - name: CATALOG_GITHUB_VERIFY_TLS
+          value: {{ include "model-downloader.catalogGithubVerifyTls" . | quote }}
+        {{- end }}
         {{- end }}
         - name: AIOLI_DB_HOST
           value: {{ .Values.aioli.dbHost | quote }}

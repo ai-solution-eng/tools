@@ -64,3 +64,13 @@ MITM with untrusted certs). Can be disabled via .Values.downloader.hf.verifyTls.
 {{- define "model-downloader.skipTlsVerification" -}}
 {{- if and .Values.downloader.hf (hasKey .Values.downloader.hf "verifyTls") }}{{ not .Values.downloader.hf.verifyTls }}{{ else }}{{ include "model-downloader.hpeProxiesEnabled" . }}{{ end -}}
 {{- end -}}
+
+{{/*
+TLS verification for the app pod's catalog refresh-from-GitHub fetch.
+Default: same rule as the downloader (skip verification when hpe_proxies is
+on — the Zscaler MITM presents an untrusted cert). Override explicitly with
+catalog.githubVerifyTls (boolean) — true verifies, false bypasses.
+*/}}
+{{- define "model-downloader.catalogGithubVerifyTls" -}}
+{{- if and .Values.catalog (hasKey .Values.catalog "githubVerifyTls") }}{{ .Values.catalog.githubVerifyTls }}{{ else }}{{ not (eq (include "model-downloader.skipTlsVerification" .) "true") }}{{ end -}}
+{{- end -}}

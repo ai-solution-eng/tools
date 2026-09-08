@@ -44,15 +44,20 @@
     <div class="catalog-controls">
       <button id="add-model-btn" type="button" class="secondary-btn">+ Add Model</button>
       <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
+      {% if catalog_github_url %}
+      <button id="refresh-github-btn" type="button" class="secondary-btn">Refresh from GitHub</button>
+      {% endif %}
       <button id="refresh-catalog-btn" type="button" class="secondary-btn">Refresh</button>
+      <span id="catalog-status" class="ctl-status" role="status" aria-live="polite"></span>
     </div>
     <div id="catalog-tiers"></div>
     <div id="catalog-msg" class="msg"></div>
 
     <h2>Push JSON Directly</h2>
-    <p class="hint">Paste a JSON array of model configs to push to MLIS without saving to the catalog.</p>
-    <textarea id="direct-json" class="json-input" rows="12" placeholder='[{"name": "my-model", "version": 1, "uri": "pvc://...", "image": "vllm/vllm-openai:latest", "model_format": "custom", ...}]'></textarea>
+    <p class="hint">Paste a single model configuration or a JSON array of them to push to MLIS without saving to the catalog, or add them to the catalog table above.</p>
+    <textarea id="direct-json" class="json-input" rows="12" placeholder='{"name": "my-model", ...}  — or —  [{"name": "mc1", ...}, {"name": "mc2", ...}]'></textarea>
     <button id="push-direct-btn" type="button">Push to MLIS</button>
+    <button id="add-direct-btn" type="button" class="secondary-btn">Add to Catalog</button>
     <div id="push-results"></div>
 
     <div id="add-modal" class="modal" hidden>

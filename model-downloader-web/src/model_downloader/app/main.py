@@ -1,9 +1,13 @@
 """FastAPI service that serves the HF Model Downloader UI and Job API."""
 
+import asyncio
 import hashlib
 import json
 import os
 import re
+import ssl
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -48,6 +52,16 @@ PVC_SCAN_ENABLED = os.environ.get("PVC_SCAN_ENABLED", "false").strip().lower() =
 PVC_REFRESH_INTERVAL = int(os.environ.get("PVC_REFRESH_INTERVAL", "60"))
 
 CATALOG_PATH = os.environ.get("CATALOG_PATH", "/mnt/catalog/catalog.json")
+# "Refresh from GitHub" button: raw URL of the catalog JSON on GitHub
+# (e.g. https://raw.githubusercontent.com/<org>/<repo>/<branch>/seed_catalog.json).
+CATALOG_GITHUB_URL = os.environ.get("CATALOG_GITHUB_URL", "")
+# TLS verification for that fetch. On HPE clusters the Zscaler MITM proxy
+# presents an untrusted cert, so hpe_proxies-style deployments verify=off
+# (chart wires this from the same skipTls logic the downloader Jobs use).
+CATALOG_GITHUB_VERIFY_TLS = os.environ.get("CATALOG_GITHUB_VERIFY_TLS", "true").strip().lower() == "true"
+# Namespace dropdown search on the front page: only namespaces with this
+# prefix are offered (empty prefix offers every namespace).
+NAMESPACE_PREFIX = os.environ.get("NAMESPACE_PREFIX", "project-user-")
 AIOLI_DB_HOST = os.environ.get("AIOLI_DB_HOST", "aioli-db-service-hpe-mlis.mlis.svc.cluster.local")
 AIOLI_DB_PORT = int(os.environ.get("AIOLI_DB_PORT", "5432"))
 AIOLI_DB_NAME = os.environ.get("AIOLI_DB_NAME", "aioli")
@@ -251,6 +265,7 @@ def _page_context() -> dict:
         "download_scan_status": _download_scan_status(),
         "debug_pods_enabled": DEBUG_POD_ENABLED and k8s_client.debug_pod_available,
         "debug_pod_image": DEBUG_POD_IMAGE,
+        "catalog_github_url": CATALOG_GITHUB_URL,
         "assets": STATIC_HASHES,
     }
 
@@ -321,6 +336,21 @@ async def get_job_progress(job_id: str):
 @app.get("/api/healthz")
 async def healthz():
     return {"ok": True, "max_concurrency": MAX_CONCURRENCY}
+
+
+@app.get("/api/namespaces")
+async def list_namespaces():
+    """Namespaces for the front-page dropdown search (NAMESPACE_PREFIX-filtered).
+
+    RBAC denial (the pod's service account lacks namespaces/list) surfaces as
+    a clean 403 detail — the UI falls back to typing a namespace manually.
+    """
+    try:
+        names = await k8s_client.list_namespaces()
+    except ApiException as e:
+        raise HTTPException(e.status or 500, _api_error_detail(e)) from e
+    return {"namespaces": sorted(n for n in names if n.startswith(NAMESPACE_PREFIX)),
+            "prefix": NAMESPACE_PREFIX}
 
 
 # ---- Downloaded models listing ----
@@ -481,6 +511,44 @@ async def add_catalog_entry(req: Request):
     return catalog.add(entry)
 
 
+@app.post("/api/catalog/batch")
+async def add_catalog_entries(req: Request):
+    """Add one entry (JSON object) or many (JSON array) from the direct-JSON textarea.
+
+    Each entry needs name and image.  Entries are deduplicated: a catalog_id
+    already present (or a name+version pair already in the catalog) is skipped,
+    so re-pasting the same JSON doesn't create duplicates.  Returns per-entry
+    results for the UI.
+    """
+    entries = await req.json()
+    if isinstance(entries, dict):
+        entries = [entries]  # single {MODEL_CONFIGURATION}
+    if not isinstance(entries, list):
+        raise HTTPException(400, "expected a JSON object or a JSON array of entries")
+    present_ids = {e.get("catalog_id") for e in catalog.all()}
+    present_pairs = {(e.get("name"), e.get("version")) for e in catalog.all()}
+    added = skipped = 0
+    results = []
+    for entry in entries:
+        name = entry.get("name") if isinstance(entry, dict) else ""
+        if not isinstance(entry, dict) or not entry.get("name") or not entry.get("image"):
+            skipped += 1
+            results.append({"status": "skipped", "name": name or "",
+                            "detail": "name and image are required"})
+            continue
+        if (entry.get("catalog_id") and entry["catalog_id"] in present_ids) or \
+                (name, entry.get("version")) in present_pairs:
+            skipped += 1
+            results.append({"status": "skipped", "name": name,
+                            "detail": "already in catalog"})
+            continue
+        e = catalog.add(entry)
+        added += 1
+        present_pairs.add((e["name"], e.get("version")))
+        results.append({"status": "added", "name": e["name"], "catalog_id": e["catalog_id"]})
+    return {"added": added, "skipped": skipped, "results": results}
+
+
 @app.delete("/api/catalog/{catalog_id}")
 async def remove_catalog_entry(catalog_id: str):
     if not catalog.remove(catalog_id):
@@ -488,18 +556,61 @@ async def remove_catalog_entry(catalog_id: str):
     return {"ok": True}
 
 
+def _fetch_github_catalog(url: str) -> bytes:
+    """Blocking fetch of the catalog JSON from GitHub.
+
+    MUST run via asyncio.to_thread: network I/O on the event loop freezes the
+    whole app (every endpoint, incl. /api/healthz) for as long as the
+    connection hangs — on clusters without direct egress the connect/DNS
+    black-holes, probes starve, and kubelet kills the pod. (This exact bug
+    restarted the g2 pod on every refresh click before 1.4.1.)
+    """
+    if CATALOG_GITHUB_VERIFY_TLS:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.read()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(url, timeout=30, context=ctx) as resp:
+        return resp.read()
+
+
+@app.post("/api/catalog/refresh")
+async def refresh_catalog_from_github():
+    """Fetch the latest catalog JSON from GitHub and merge it into the PVC catalog.
+
+    The URL comes from CATALOG_GITHUB_URL (Helm: catalog.githubUrl).  Merge
+    rules match the on-start seed merge: add new entries, keep user edits,
+    don't resurrect removed ones.  Returns per-source counters for the UI.
+    """
+    if not CATALOG_GITHUB_URL:
+        raise HTTPException(503, "CATALOG_GITHUB_URL is not configured")
+    try:
+        body = await asyncio.to_thread(_fetch_github_catalog, CATALOG_GITHUB_URL)
+        entries = json.loads(body.decode("utf-8"))
+        return catalog.merge_entries(entries, source="github")
+    except urllib.error.HTTPError as e:
+        raise HTTPException(502, f"GitHub returned HTTP {e.code} for {CATALOG_GITHUB_URL}") from e
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as e:
+        raise HTTPException(502, f"could not reach GitHub: {e}") from e
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(502, f"invalid catalog JSON from GitHub: {e}") from e
+
+
 # ---- Push to MLIS ----
 
 
 @app.post("/api/push")
 async def push_models(req: Request):
-    """Push a JSON array of model configs into the AIOLI packaged_models table.
+    """Push a JSON object or a JSON array of model configs into the AIOLI packaged_models table.
 
     Duplicate (name, version) entries are skipped.  Returns per-config results.
     """
     configs = await req.json()
+    if isinstance(configs, dict):
+        configs = [configs]  # single {MODEL_CONFIGURATION} — same as a 1-element array
     if not isinstance(configs, list):
-        raise HTTPException(400, "expected a JSON array of model configs")
+        raise HTTPException(400, "expected a JSON object or a JSON array of model configs")
     results = await aioli_db.push_batch(configs)
     pushed = sum(1 for r in results if r["status"] == "pushed")
     skipped = sum(1 for r in results if r["status"] == "skipped")

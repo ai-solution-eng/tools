@@ -3,7 +3,7 @@
 # =============================================================================
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.3.2
+  tag: v1.4.3
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
@@ -225,6 +225,13 @@ catalog:
   enabled: true
   size: 100Mi
   storageClassName: ""
+  # "Refresh from GitHub" button: raw URL of the seed catalog JSON on the
+  # tools repo. The button is hidden when this is empty.
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
+  # TLS verification for that fetch. Default (unset): follows the downloader's
+  # skipTls rule — verified unless hpe_proxies is on (the Zscaler MITM proxy
+  # presents an untrusted cert). Force explicitly with true/false if needed.
+  # githubVerifyTls: true
 
 # =============================================================================
 # AIOLI / MLIS database connection for pushing model configs.

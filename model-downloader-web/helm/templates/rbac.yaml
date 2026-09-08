@@ -16,6 +16,10 @@ rules:
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["create", "get", "list", "delete"]
+# Namespace names for the front-page dropdown search (read-only).
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["list"]
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
   verbs: ["get", "list"]
