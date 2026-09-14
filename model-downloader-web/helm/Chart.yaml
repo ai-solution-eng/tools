@@ -1,6 +1,22 @@
+# Model Downloader — web frontend + queueing service for HuggingFace model
+# downloads in Kubernetes. PCAI (HPE Ezmeral Unified Analytics) deployment:
+# submits PVC- or S3-backed downloader Jobs and pushes model configs to
+# AIOLI/MLIS.
 apiVersion: v2
 name: model-downloader
-description: Web frontend + queueing service for HF model downloads in Kubernetes
+description: >-
+  Web frontend + queueing service for HuggingFace model downloads in
+  Kubernetes: submits PVC- or S3-backed downloader Jobs, lists downloaded
+  models, and pushes model configs to the AIOLI/MLIS database.
 type: application
 version: 1.4.4
 appVersion: "1.4.4"
+keywords:
+  - huggingface
+  - models
+  - download
+  - mlis
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

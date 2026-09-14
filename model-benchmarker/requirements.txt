@@ -2,6 +2,14 @@ numpy>=2.0
 httpx>=0.27
 httpx2>=2.10
 openai>=1.40
+# MCP mode of the universal endpoint benchmarker (streamable-http / sse).
+# The mcp 2.x SDK uses the separately-packaged httpx2 client for its HTTP transports.
+mcp>=2.0.0
 # Optional: token-count-aware chunking in utils/token_text_splitter.py
 # (character-based fallback when absent):
 # tokenizers
+
+# Dev / tests (also: pip install -e ".[dev]")
+# pytest>=8
+# aiohttp>=3.9
+# uvicorn>=0.30

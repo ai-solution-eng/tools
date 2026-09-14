@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, field_validator, model_validator
 
-from .catalog import TIER_LABELS, TIERS, Catalog
+from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog
 from .db import AioliDB
 from .k8s import K8sClient
 from .queue import JobQueue
@@ -251,6 +251,7 @@ def _page_context() -> dict:
         "default_namespace": DEFAULT_NAMESPACE,
         "app_namespace": APP_NAMESPACE,
         "tier_labels": TIER_LABELS,
+        "tier_info": TIER_INFO,
         "tiers": TIERS,
         "storage_backend": STORAGE_BACKEND,
         "storage_default": _storage_default(),
@@ -500,7 +501,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/catalog")
 async def get_catalog():
-    return {"tiers": catalog.list_by_tier(), "tier_labels": TIER_LABELS}
+    return {"tiers": catalog.list_by_tier(), "tier_labels": TIER_LABELS, "tier_info": TIER_INFO}
 
 
 @app.post("/api/catalog")

@@ -55,7 +55,8 @@
 
     <h2>Push JSON Directly</h2>
     <p class="hint">Paste a single model configuration or a JSON array of them to push to MLIS without saving to the catalog, or add them to the catalog table above.
-      When adding to the catalog, set <code>"tier"</code> to <code>"h200"</code>, <code>"rtx-pro-6000"</code>, or <code>"l40s"</code> to choose the GPU group — a missing or misspelled tier silently defaults to <code>h200</code>.
+      When adding to the catalog, set <code>"tier"</code> to <code>"h200"</code>, <code>"rtx-pro-6000"</code>, or <code>"l40s"</code> to choose the GPU group
+      ({% for t in tiers %}{{ tier_labels[t] }}: {{ tier_info[t].quants|join(', ') }} · {{ tier_info[t].vram_gb }} GB{% if not loop.last %} — {% endif %}{% endfor %}) — a missing or misspelled tier silently defaults to <code>h200</code>.
       <code>tier</code> is for catalog grouping only and is not pushed to MLIS (MLIS-side GPU class is <code>resource_gpu_type</code>).
       Note: an entry is skipped if its <code>name</code> + <code>version</code> already exist in <em>any</em> tier, regardless of the tier you set — bump the version or rename the model to add a new variant.</p>
     <textarea id="direct-json" class="json-input" rows="12" placeholder='{"name": "my-model", ...}  — or —  [{"name": "mc1", ...}, {"name": "mc2", ...}]'></textarea>
@@ -77,7 +78,7 @@
                 <span>Tier</span>
                 <select name="tier">
                   {% for t in tiers %}
-                  <option value="{{ t }}">{{ tier_labels[t] }}</option>
+                  <option value="{{ t }}">{{ tier_labels[t] }} — {{ tier_info[t].quants|join('/') }} · {{ tier_info[t].vram_gb }} GB</option>
                   {% endfor %}
                 </select>
               </label>

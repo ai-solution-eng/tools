@@ -57,7 +57,18 @@ function renderCatalog() {
 
     const header = document.createElement('div');
     header.className = 'tier-header';
-    header.innerHTML = '<label class="tier-select-all"><input type="checkbox" data-tier="' + tier + '"><strong>' + label + '</strong> (' + entries.length + ')</label>';
+    // Per-GPU specs (supported quant levels + VRAM) come from the API
+    // (TIER_INFO in catalog.py); unknown/custom tiers just show the count.
+    const info = (catalogData.tier_info || {})[tier] || {};
+    const specChips = [];
+    if (info.quants && info.quants.length) {
+      specChips.push('<span class="tier-spec" title="Quantization levels supported by this GPU">' + esc(info.quants.join(' / ')) + '</span>');
+    }
+    if (info.vram_gb) {
+      specChips.push('<span class="tier-spec" title="VRAM per GPU">' + info.vram_gb + ' GB</span>');
+    }
+    header.innerHTML = '<label class="tier-select-all"><input type="checkbox" data-tier="' + tier + '"><strong>' + esc(label) + '</strong> (' + entries.length + ')</label>' +
+      (specChips.length ? '<span class="tier-specs">' + specChips.join('') + '</span>' : '');
     section.appendChild(header);
 
     if (entries.length === 0) {
