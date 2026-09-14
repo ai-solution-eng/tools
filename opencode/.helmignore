@@ -1,0 +1,6 @@
+*.tgz
+.DS_Store
+shared/.DS_Store
+values-*.yaml
+apply/
+scripts/
