@@ -1,5 +1,8 @@
 # pcai-app-import
 
+> [!WARNING]
+> This skill is experimental - use with caution 
+
 Packages an already-ported HPE Private Cloud AI (PCAI) Helm chart into an `EzAppConfig` custom resource (logo, values, install options), then deploys it — chart uploaded to ChartMuseum, CR applied — via the `ezapp-deploy` MCP server. See `SKILL.md` for the full workflow.
 
 ## Prerequisites
