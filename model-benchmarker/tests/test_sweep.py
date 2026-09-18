@@ -83,7 +83,9 @@ def test_sweep_json_payload_shape(rest_server, tmp_path):
             rest_target=target,
         )
     )
-    payload = build_run_payload(levels, {"mode": "rest", "target": target.describe()}, "run-x", "2026-01-01T00:00:00+00:00", 2.0, None)
+    payload = build_run_payload(
+        levels, {"mode": "rest", "target": target.describe()}, "run-x", "2026-01-01T00:00:00+00:00", 2.0, None
+    )
     assert set(payload) >= {"run_id", "config", "levels", "summary"}
     assert len(payload["levels"]) == 2
     level0 = payload["levels"][0]
@@ -93,7 +95,9 @@ def test_sweep_json_payload_shape(rest_server, tmp_path):
     # single level pair with flat latencies -> knee may be None; structure holds
     assert "knee" in payload["summary"]
     # redaction flows through the payload config
-    secret_target = RestTarget(base_url=rest_server["base_url"], dataset="ds-a", health_path="", headers={"X-Api-Key": "hidden"})
+    secret_target = RestTarget(
+        base_url=rest_server["base_url"], dataset="ds-a", health_path="", headers={"X-Api-Key": "hidden"}
+    )
     payload2 = build_run_payload(levels, {"target": secret_target.describe()}, "run-y", "t", 2.0, None)
     assert payload2["config"]["target"]["headers"]["X-Api-Key"] == "REDACTED"
 

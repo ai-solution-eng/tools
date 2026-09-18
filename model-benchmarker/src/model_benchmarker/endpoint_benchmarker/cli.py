@@ -13,6 +13,7 @@ import httpx
 
 from . import __version__
 from .logging_setup import log, setup_logging
+from .mcp_driver import ResolvedTool
 from .queries import load_queries
 from .report import build_run_payload, print_results, write_artifacts
 from .stats import DEFAULT_PERCENTILES, err_key
@@ -23,7 +24,7 @@ from .telemetry import DEFAULT_GPU_METRICS, TelemetryConfig, capture_idle_baseli
 try:  # py3.11+
     from builtins import BaseExceptionGroup
 except ImportError:  # py3.10 — no exception groups in the stdlib
-    BaseExceptionGroup = ()  # type: ignore[assignment]
+    BaseExceptionGroup = ()  # type: ignore[assignment, misc]  # rebinds a stdlib type name on old pythons
 
 
 def _add_target_args(p: argparse.ArgumentParser) -> None:
@@ -105,8 +106,7 @@ def _add_target_args(p: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Fixed MCP tool argument, repeatable; values are JSON-parsed "
-        "(--arg top_k=10 --arg use_reranker=true).",
+        help="Fixed MCP tool argument, repeatable; values are JSON-parsed (--arg top_k=10 --arg use_reranker=true).",
     )
     p.add_argument(
         "--query-arg",
@@ -250,7 +250,9 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging (per-request lines).")
     p.add_argument("--quiet", action="store_true", help="WARNING logging only (progress table suppressed).")
-    p.add_argument("--progress-interval", type=float, default=5.0, help="Progress table interval in seconds (default 5).")
+    p.add_argument(
+        "--progress-interval", type=float, default=5.0, help="Progress table interval in seconds (default 5)."
+    )
     p.add_argument(
         "--http2",
         action="store_true",
@@ -314,7 +316,9 @@ Examples:
 # ---------------------------------------------------------------------------
 
 
-def _print_config(args: argparse.Namespace, target_desc: dict, n_queries: int, query_label: str, levels: list[int]) -> None:
+def _print_config(
+    args: argparse.Namespace, target_desc: dict, n_queries: int, query_label: str, levels: list[int]
+) -> None:
     prom = args.prom_url or "(none — latency-only)"
     print()
     print("=" * 72)
@@ -336,7 +340,9 @@ def _print_config(args: argparse.Namespace, target_desc: dict, n_queries: int, q
     print(f"  Queries:        {n_queries} ({query_label})")
     print(f"  Prometheus:     {prom}")
     if args.prom_url:
-        print(f"  Selector:       {args.prom_selector or '(none)'}   step {args.prom_step}   baseline {args.baseline_duration}s")
+        print(
+            f"  Selector:       {args.prom_selector or '(none)'}   step {args.prom_step}   baseline {args.baseline_duration}s"
+        )
     print(f"  TLS verify:     {'OFF (--insecure)' if args.insecure else 'ON'}")
     print("=" * 72)
     print()
@@ -359,7 +365,9 @@ async def _rest_health_check(target: RestTarget) -> None:
     if 200 <= resp.status_code < 300:
         log.info("Health check OK")
     else:
-        log.warning("Health endpoint returned HTTP %s — continuing (pass --health-path '' to silence)", resp.status_code)
+        log.warning(
+            "Health endpoint returned HTTP %s — continuing (pass --health-path '' to silence)", resp.status_code
+        )
 
 
 async def _discover_dataset(target: RestTarget) -> None:
@@ -439,7 +447,7 @@ async def run(args: argparse.Namespace) -> int:
 
     # -- build target (shape checks that don't need the network run later) --
     if args.mode == "rest":
-        target: RestTarget | McpTarget = RestTarget(
+        rest_target = RestTarget(
             base_url=args.url,
             path_template=args.path,
             method=args.method.upper(),
@@ -454,7 +462,8 @@ async def run(args: argparse.Namespace) -> int:
         )
         if args.body_file:
             with open(args.body_file, encoding="utf-8") as f:
-                target.body_template = f.read()
+                rest_target.body_template = f.read()
+        target: RestTarget | McpTarget = rest_target
     else:
         target = McpTarget(
             url=args.url,
@@ -473,20 +482,22 @@ async def run(args: argparse.Namespace) -> int:
     # -- mode-specific pre-flight -------------------------------------------
     from .mcp_driver import resolve_mcp_target
 
-    resolved = None
+    resolved: ResolvedTool | None = None
     if args.mode == "rest":
-        rest_target: RestTarget = target  # type: ignore[assignment]
-        if rest_target.health_path:
-            await _rest_health_check(rest_target)
+        assert isinstance(target, RestTarget)  # narrowed: constructed as RestTarget when mode == "rest"
+        if target.health_path:
+            await _rest_health_check(target)
         # Auto-discovery (mm parity) must run BEFORE validation, which checks
         # that every {dataset} placeholder has a value.
-        if "{dataset}" in rest_target.path_template and not rest_target.dataset:
-            await _discover_dataset(rest_target)
-        rest_target.validate()
+        if "{dataset}" in target.path_template and not target.dataset:
+            await _discover_dataset(target)
+        target.validate()
     else:
-        result = await resolve_mcp_target(target, list_only=args.list_tools)  # type: ignore[arg-type]
+        assert isinstance(target, McpTarget)  # narrowed: constructed as McpTarget otherwise
+        result = await resolve_mcp_target(target, list_only=args.list_tools)
         if args.list_tools:
             return 0
+        assert result is not None  # resolve_mcp_target returns None only on the --list-tools path
         resolved = result[0]
         # Record what was actually used in the printed config + artifacts.
         target.tool_name = resolved.tool_name

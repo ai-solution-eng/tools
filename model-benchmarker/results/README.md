@@ -53,6 +53,7 @@ Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicac
 | `glm-5.2/H200x8_8waynvlink_hicache_1TB.md` | GLM-5.2-753B, 8× H200 (8-way NVLink), HiCache on + 1 TB host cache (in-progress run) |
 | `glm-5.3-flash/H200x4_hicachex4.md` | GLM-5.3-Flash, 4× H200, HiCache ×4 |
 | `glm-5.3-flash/H200x4_NVLink2_hicachex6.md` | GLM-5.3-Flash, 4× H200 (dual NVLink), HiCache ×6 |
+| `glm-5.3-flash/H200x8_smx_hicache_1_5TB.md` | GLM-5.3-Flash, 8× H200 (SMX), HiCache + 1.5 TB host cache |
 | `RAG/rag_benchmark_scale_medium_n_100.md` | Multimodal-RAG scale run (medium chart, N=100) |
 | `RAG/rag_benchmark_scale_large_n_100.md` | Multimodal-RAG scale run (large chart, N=100) |
 | `RAG/rag_benchmark_scale_large_n_200.md` | Multimodal-RAG scale run (large chart, N=200) |

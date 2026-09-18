@@ -73,7 +73,14 @@ def _tele(util_mean, samples=6):
                 "samples": samples,
                 "overall": {"mean": util_mean, "min": util_mean - 5, "max": util_mean + 5},
                 "gpus": [
-                    {"host": "n", "device": "0", "mean": util_mean, "min": util_mean - 5, "max": util_mean + 5, "labels": {}},
+                    {
+                        "host": "n",
+                        "device": "0",
+                        "mean": util_mean,
+                        "min": util_mean - 5,
+                        "max": util_mean + 5,
+                        "labels": {},
+                    },
                 ],
             }
         },
@@ -109,7 +116,11 @@ def test_render_html_contains_charts_and_knee():
         "config": {"mode": "rest", "target": {"url": "http://x", "headers": {"Authorization": "REDACTED"}}},
         "idle_baseline": None,
         "levels": [lv.to_json() for lv in levels],
-        "summary": {"rows": _rows(levels), "knee": {"concurrency": 4, "criterion": "latency", "detail": "p99 4x"}, "notes": []},
+        "summary": {
+            "rows": _rows(levels),
+            "knee": {"concurrency": 4, "criterion": "latency", "detail": "p99 4x"},
+            "notes": [],
+        },
     }
     html = render_html(payload, title="Test report")
     assert "<svg" in html

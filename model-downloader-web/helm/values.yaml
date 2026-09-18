@@ -15,7 +15,7 @@ fullnameOverride: ""
 # The FastAPI service that serves the UI and submits Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.4.4
+  tag: v1.5.0
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same

@@ -89,9 +89,22 @@ Separate from the platform policy, the chart installs a **pre-install ClusterPol
 
 On **SE G2** this all works out of the box. On a **hosted trial** the *customer's* platform policies are the gate, and the following must hold before downloads will run:
 
-1. **The platform `protect-models-pvc` policy admits the labeled Jobs.** The chart's Jobs run in `project-user-*` namespaces and present `hpe-ezua/app: mlis` — the exact label the policy wants. If the customer's installed policy is stricter than the stock one (e.g. it also restricts *who* may set the label, or it does not exempt job-controller-created pods), the customer admin must apply the platform policy patch/exception for the namespaces this release writes to. Confirm with the customer's PCAI admin before assuming a denial is an app bug.
+1. **The platform `protect-models-pvc` policy admits the labeled Jobs.** The chart's Jobs run in `project-user-*` namespaces and present `hpe-ezua/app: mlis` — the exact label the policy wants. If the customer's installed policy is stricter than the stock one (e.g. it also restricts *who* may set the label, or it does not exempt job-controller-created pods), the customer admin must apply the platform policy patch/exception for the namespaces this release writes to. Confirm with the customer's PCAI admin before assuming a denial is an app bug. The concrete patch is in [the next subsection](#the-platform-policy-patch-customer-admin).
 2. **`kyverno.enabled` stays `true`.** Disabling it stops the pre-install `add-vendor-app-labels-<release>-<chart>` ClusterPolicy from stamping the vendor labels, and the Deployment/Service can disappear from EZUA's app discovery.
 3. **`debugPod.enabled` / downloader behavior is unchanged** — the debug pod's Job-based admission path is the documented workaround; do not "fix" a denial by switching it to a bare Pod, that will always be denied.
+
+### The platform-policy patch (customer admin)
+
+The concrete patch for the hosted-trial case where the installed `protect-models-pvc` policy denies job-controller-created pods: it appends a `NotEquals` condition to the deny conditions of `rules[1]`, exempting the kube-system job-controller — which creates the Pods for every Job this chart submits (downloader, debug, and scanner alike) — while leaving the original conditions in force for every other creator:
+
+```bash
+kubectl patch clusterpolicy protect-models-pvc --type json -p='[
+  {"op": "add", "path": "/spec/rules/1/validate/deny/conditions/all/-",
+   "value": {"key": "{{request.userInfo.username}}", "operator": "NotEquals", "value": "system:serviceaccount:kube-system:job-controller"}}
+]'
+```
+
+After applying, Job pods created by the job-controller are no longer denied and the Jobs can mount `models-pvc`; the admission webhook may take a few seconds to pick up the updated policy. This mutates a customer-owned, cluster-wide platform policy — apply it only with the customer's PCAI admin, and only if their installed policy does not already carry the exception.
 
 ### What a denial looks like
 

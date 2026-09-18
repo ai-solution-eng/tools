@@ -194,7 +194,10 @@ async def capture_window(
     t_end: float,
 ) -> dict:
     """Fetch + aggregate all configured metrics for one [t_start, t_end] window."""
-    out: dict = {"prom_url": config.prom_url, "window": {"start_epoch": t_start, "end_epoch": t_end, "step": config.step}}
+    out: dict = {
+        "prom_url": config.prom_url,
+        "window": {"start_epoch": t_start, "end_epoch": t_end, "step": config.step},
+    }
     async with httpx.AsyncClient(verify=not config.insecure) as client:
         per_metric: dict[str, dict] = {}
         for metric in config.gpu_metrics:
@@ -264,6 +267,4 @@ def subtract_baseline(level_telemetry: dict, baseline: dict) -> None:
             gpu["mean_minus_idle"] = round(max(0.0, gpu["mean"] - idle["mean"]), 2)
         base_overall = base_agg.get("overall") or {}
         if base_overall.get("mean") is not None and agg.get("overall"):
-            agg["overall"]["mean_minus_idle"] = round(
-                max(0.0, agg["overall"]["mean"] - base_overall["mean"]), 2
-            )
+            agg["overall"]["mean_minus_idle"] = round(max(0.0, agg["overall"]["mean"] - base_overall["mean"]), 2)

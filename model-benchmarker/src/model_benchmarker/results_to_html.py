@@ -40,6 +40,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # --------------------------------------------------------------------------
 # Display names / model slug -> readable name
@@ -276,7 +277,7 @@ def parse_rag_table(text: str) -> dict | None:
 
 def parse_setup(stem: str) -> dict:
     """Infer the serving setup from a result filename stem."""
-    meta = {
+    meta: dict[str, Any] = {
         "gpu": None,
         "tier": None,
         "gpu_count": 1,
@@ -387,7 +388,7 @@ def _cat_spec(entry: dict) -> str | None:
     return None
 
 
-def _cat_hicache(entry: dict) -> int | None:
+def _cat_hicache(entry: dict) -> int | str | None:
     args = [str(a) for a in entry.get("arguments", [])]
     for i, a in enumerate(args):
         if a == "--hicache-ratio" and i + 1 < len(args):
@@ -421,9 +422,8 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
     for e in catalog:
         name = str(e.get("name", "")).lower()
         cid = str(e.get("catalog_id", "")).lower()
-        if not (slug_low in name or slug_low.replace("_", "-") in name):
-            if not (key and (key in name or key in cid)):
-                continue
+        if not (slug_low in name or slug_low.replace("_", "-") in name) and not (key and (key in name or key in cid)):
+            continue
         score = 0
         etier = str(e.get("tier", ""))
         if tier and tier == etier:
@@ -514,7 +514,7 @@ def main() -> int:
         catalog_path = discover_catalog()
     catalog = load_catalog(catalog_path)
 
-    models = []
+    models: list[dict[str, Any]] = []
     for m in sorted(p for p in results_dir.iterdir() if p.is_dir()):
         slug = m.name
         # Markdown results (benchmark_chat.py --output ...md); legacy .txt
@@ -598,13 +598,13 @@ def main() -> int:
     # appear as a model in the "All models" view.
     chat_models: list[dict] = []
     rag_models: list[dict] = []
-    for m in models:
-        chat = [s for s in m["setups"] if "rag" not in s]
-        rag = [s for s in m["setups"] if "rag" in s]
+    for mdl in models:
+        chat = [s for s in mdl["setups"] if "rag" not in s]
+        rag_setups = [s for s in mdl["setups"] if "rag" in s]
         if chat:
-            chat_models.append({"slug": m["slug"], "name": m["name"], "setups": chat})
-        if rag:
-            rag_models.append({"slug": m["slug"], "name": m["name"], "setups": rag})
+            chat_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": chat})
+        if rag_setups:
+            rag_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": rag_setups})
 
     output = Path(args.output) if args.output else (results_dir / "benchmark_report.html")
     output = output.expanduser().resolve()
@@ -615,8 +615,8 @@ def main() -> int:
     results_label = args.results_label
     catalog_label = args.catalog_label if catalog_path else None
 
-    for m in chat_models + rag_models:
-        for s in m["setups"]:
+    for mdl in chat_models + rag_models:
+        for s in mdl["setups"]:
             if s.get("catalog_source") is None and catalog_label:
                 s["catalog_source"] = catalog_label
 
@@ -670,7 +670,7 @@ def render_html(data: dict, title: str) -> str:
         from ._html_template import build_html  # type: ignore[import-not-found]
     except ImportError:  # running as a plain script
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from _html_template import build_html  # type: ignore[import-not-found]
+        from _html_template import build_html  # type: ignore[no-redef]  # fallback import when not run as a package
 
     return build_html(data, title)
 

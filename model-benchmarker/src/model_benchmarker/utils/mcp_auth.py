@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared API-key middleware for the MCP fleet (the K8S-MCP pattern, extracted).
 
 NOT an auth server — a pure-ASGI middleware class each server wraps its own
@@ -120,7 +119,7 @@ class ApiKeyAuthMiddleware:
             return
         keys = configured_keys(self._env_names)
         if not keys:
-            await self.app(scope, receive, send)   # auth disabled (dev mode)
+            await self.app(scope, receive, send)  # auth disabled (dev mode)
             return
         for candidate in presented_keys(scope):
             for valid in keys:

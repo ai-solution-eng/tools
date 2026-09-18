@@ -15,7 +15,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -148,7 +147,7 @@ def scan_s3(
                 key = obj["Key"]
                 if not key.endswith("config.json"):
                     continue
-                relative = key[len(prefix_stripped):] if prefix_stripped else key
+                relative = key[len(prefix_stripped) :] if prefix_stripped else key
                 parts = relative.split("/")
                 # The S3 job uploads the repo's own files (flat — no models--
                 # cache dirs) to <prefix>/<org>/<Model>/<file>. The model id is
@@ -187,7 +186,7 @@ async def scan_pvc_via_job(
     image: str,
     timeout: int = 60,
     mount_path: str = "/mnt/",
-) -> list:
+) -> tuple[list, str]:
     """Scan a PVC for downloaded models by creating a short-lived k8s Job.
 
     The Job mounts the PVC read-only at ``mount_path`` and lists model
@@ -231,8 +230,7 @@ async def scan_pvc_via_job(
         return [], reason + (f": {detail}" if detail else "")
 
     sub = scan_root.lstrip("/")
-    if sub.startswith("mnt/"):
-        sub = sub[len("mnt/"):]
+    sub = sub.removeprefix("mnt/")
     models = []
     for line in (output or "").strip().splitlines():
         line = line.strip()
@@ -252,8 +250,7 @@ async def scan_pvc_via_job(
         cachepath = parts[2].strip() if len(parts) > 2 else ""
         if cachepath:
             rel = cachepath.lstrip("/")
-            if rel.startswith("mnt/"):
-                rel = rel[len("mnt/"):]
+            rel = rel.removeprefix("mnt/")
             location = f"pvc://{pvc_name}/{rel}"
         else:
             location = f"pvc://{pvc_name}/{sub}/{model_name}"
@@ -274,7 +271,9 @@ async def scan_pvc_via_job(
         preview = (output or "")[:200].replace("\n", " | ")
         log.warning(
             "PVC scan %s completed with no model lines (raw output %d bytes)%s",
-            job_name, len(output or ""), f" — preview: {preview!r}" if preview else "",
+            job_name,
+            len(output or ""),
+            f" — preview: {preview!r}" if preview else "",
         )
     else:
         log.info("PVC scan %s: %d model(s)", job_name, len(models))
@@ -313,7 +312,7 @@ class DownloadedModelsCache:
         self._last_s3_scan: float = 0.0
         self._pvc_models: list = []
         self._s3_models: list = []
-        self._lock: Optional[asyncio.Lock] = None
+        self._lock: asyncio.Lock | None = None
         # Diagnostics from the most recent get_models() call, surfaced by the
         # API so the UI can explain an empty result instead of failing silently.
         self.last_status: dict = {}

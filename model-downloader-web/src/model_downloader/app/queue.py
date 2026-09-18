@@ -99,7 +99,9 @@ class JobQueue:
                 storage=m.get("storage", "pvc"),
                 s3_path=m.get("s3_path", ""),
                 cache_root=m.get("cache_root", ""),
-                pvc_url=self._output_url(m["model_name"], m.get("storage", "pvc"), m.get("s3_path", ""), m.get("cache_root", "")),
+                pvc_url=self._output_url(
+                    m["model_name"], m.get("storage", "pvc"), m.get("s3_path", ""), m.get("cache_root", "")
+                ),
                 created_at=m["created_at"],
                 finished_at=m["finished_at"],
             )

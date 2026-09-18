@@ -36,7 +36,14 @@ STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "both")  # pvc | s3 | both
 STORAGE_DEFAULT = os.environ.get("STORAGE_DEFAULT", "pvc")  # pvc | s3
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_PREFIX = os.environ.get("S3_PREFIX", "")
-S3_DEFAULT_PATH = f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")
+# Prefill for the form's S3-destination input (rendered hidden unless s3 is
+# the default backend — and hidden inputs are still submitted with the form).
+# Must be "" when no bucket is configured: a literal "s3:///" prefill would
+# ride along on every PVC-backend submit and be rejected by the s3_path
+# validator, which demands a bucket after the scheme.
+S3_DEFAULT_PATH = (
+    f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")
+) if S3_BUCKET else ""
 # Debug pod ("Launch debug pod" in the UI). Requires chart >= 1.2.0, which
 # renders the debug-pod.yaml template into the job-template ConfigMap.
 DEBUG_POD_ENABLED = os.environ.get("DEBUG_POD_ENABLED", "true").strip().lower() == "true"
@@ -166,6 +173,12 @@ class SubmitRequest(BaseModel):
     @classmethod
     def _valid_s3_path(cls, v: str) -> str:
         v = v.strip()
+        # "s3://" / "s3:///" — scheme but no bucket — is the degenerate prefill
+        # older builds rendered when no S3 bucket is configured. It carries no
+        # information: treat it as empty (storage='s3' then gets the clearer
+        # "s3_path is required" error from the model validator below).
+        if v in ("s3://", "s3:///"):
+            return ""
         if v and not re.match(r"^s3://[^/\s]+", v):
             raise ValueError("s3_path must start with 's3://<bucket>'")
         return v
@@ -350,8 +363,7 @@ async def list_namespaces():
         names = await k8s_client.list_namespaces()
     except ApiException as e:
         raise HTTPException(e.status or 500, _api_error_detail(e)) from e
-    return {"namespaces": sorted(n for n in names if n.startswith(NAMESPACE_PREFIX)),
-            "prefix": NAMESPACE_PREFIX}
+    return {"namespaces": sorted(n for n in names if n.startswith(NAMESPACE_PREFIX)), "prefix": NAMESPACE_PREFIX}
 
 
 # ---- Downloaded models listing ----
@@ -534,14 +546,14 @@ async def add_catalog_entries(req: Request):
         name = entry.get("name") if isinstance(entry, dict) else ""
         if not isinstance(entry, dict) or not entry.get("name") or not entry.get("image"):
             skipped += 1
-            results.append({"status": "skipped", "name": name or "",
-                            "detail": "name and image are required"})
+            results.append({"status": "skipped", "name": name or "", "detail": "name and image are required"})
             continue
-        if (entry.get("catalog_id") and entry["catalog_id"] in present_ids) or \
-                (name, entry.get("version")) in present_pairs:
+        if (entry.get("catalog_id") and entry["catalog_id"] in present_ids) or (
+            name,
+            entry.get("version"),
+        ) in present_pairs:
             skipped += 1
-            results.append({"status": "skipped", "name": name,
-                            "detail": "already in catalog"})
+            results.append({"status": "skipped", "name": name, "detail": "already in catalog"})
             continue
         e = catalog.add(entry)
         added += 1
@@ -594,7 +606,7 @@ async def refresh_catalog_from_github():
         raise HTTPException(502, f"GitHub returned HTTP {e.code} for {CATALOG_GITHUB_URL}") from e
     except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as e:
         raise HTTPException(502, f"could not reach GitHub: {e}") from e
-    except (ValueError, json.JSONDecodeError) as e:
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
         raise HTTPException(502, f"invalid catalog JSON from GitHub: {e}") from e
 
 

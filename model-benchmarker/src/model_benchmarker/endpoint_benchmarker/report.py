@@ -355,12 +355,9 @@ def _svg_chart(
     for frac in (0, 0.25, 0.5, 0.75, 1.0):
         yv = y_min + frac * (y_max - y_min)
         y = Y(yv)
+        parts.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" y2="{y:.1f}" stroke="#e5e7eb"/>')
         parts.append(
-            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" y2="{y:.1f}" stroke="#e5e7eb"/>'
-        )
-        parts.append(
-            f'<text x="{pad_l - 4}" y="{y + 3:.1f}" font-size="9" fill="#555" text-anchor="end">'
-            f"{yv:.4g}</text>"
+            f'<text x="{pad_l - 4}" y="{y + 3:.1f}" font-size="9" fill="#555" text-anchor="end">{yv:.4g}</text>'
         )
     # x ticks (first / last / middle)
     for xv in sorted({x_min, (x_min + x_max) / 2, x_max}):
@@ -375,13 +372,11 @@ def _svg_chart(
     for i, (name, vals) in enumerate(series.items()):
         color = _PALETTE[i % len(_PALETTE)]
         pts = []
-        for xv, yv in zip(x_values, vals):
-            if isinstance(yv, (int, float)):
-                pts.append(f"{X(xv):.1f},{Y(yv):.1f}")
+        for xv, val in zip(x_values, vals):
+            if isinstance(val, (int, float)):
+                pts.append(f"{X(xv):.1f},{Y(val):.1f}")
         if pts:
-            parts.append(
-                f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2"/>'
-            )
+            parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2"/>')
         parts.append(
             f'<rect x="{pad_l + i * 110}" y="{height - 14}" width="9" height="3" fill="{color}"/>'
             f'<text x="{pad_l + i * 110 + 13}" y="{height - 9}" font-size="9" fill="#333">{_esc(name)}</text>'
@@ -457,14 +452,15 @@ def render_html(payload: dict, title: str = "Endpoint benchmark report") -> str:
         tele_summary = "no telemetry"
         if tele:
             util_overall = (tele.get("metrics", {}).get(PRIMARY_GPU_METRIC) or {}).get("overall") or {}
-            tele_summary = f"GPU_UTIL overall mean {util_overall.get('mean', 'n/a')} (max {util_overall.get('max', 'n/a')})"
+            tele_summary = (
+                f"GPU_UTIL overall mean {util_overall.get('mean', 'n/a')} (max {util_overall.get('max', 'n/a')})"
+            )
         # Error deep-dive: per-level category rollup + top raw errors.
         errs = s.get("errors") or {}
         cats = categorize_errors(errs)
         total_failed = s.get("failed", 0)
         cat_rows = "".join(
-            f"<tr><td>{_esc(c)}</td><td>{n}</td><td>{(n / total_failed * 100):.0f}%</td></tr>"
-            for c, n in cats.items()
+            f"<tr><td>{_esc(c)}</td><td>{n}</td><td>{(n / total_failed * 100):.0f}%</td></tr>" for c, n in cats.items()
         )
         cat_table = (
             f"<p><b>Errors by category</b> ({total_failed} failed)</p>"
@@ -472,9 +468,7 @@ def render_html(payload: dict, title: str = "Endpoint benchmark report") -> str:
             if cats
             else "<p>No failed requests at this level.</p>"
         )
-        top_errs = "".join(
-            f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>" for k, v in list(errs.items())[:8]
-        )
+        top_errs = "".join(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>" for k, v in list(errs.items())[:8])
         err_table = (
             f"<p><b>Top error keys</b> (bounded snippets)</p><table><tr><th>error</th><th>count</th></tr>{top_errs}</table>"
             if top_errs
@@ -546,17 +540,17 @@ summary {{ cursor: pointer; }}
 <h1>{_esc(title)}</h1>
 <p class="meta">run {_esc(payload["run_id"])} · started {_esc(payload["started_utc"])} ·
 finished {_esc(payload["finished_utc"])}</p>
-{f'<ul class="meta"><b>Notes:</b> {annotations_html}</ul>' if annotations_html else ''}
+{f'<ul class="meta"><b>Notes:</b> {annotations_html}</ul>' if annotations_html else ""}
 {knee_html}
-{f'<ul class="meta">{notes}</ul>' if notes else ''}
+{f'<ul class="meta">{notes}</ul>' if notes else ""}
 <h2>Scaling summary</h2>
 <pre>{_esc(format_scaling_table(rows))}</pre>
 <h2>Charts</h2>
-<div class="charts">{''.join(c for c in charts if c)}</div>
+<div class="charts">{"".join(c for c in charts if c)}</div>
 {error_section}
 {baseline_html}
 <h2>Per-level details</h2>
-{''.join(level_sections) or '<p>No levels recorded.</p>'}
+{"".join(level_sections) or "<p>No levels recorded.</p>"}
 <h2>Run configuration (secrets redacted)</h2>
 <pre>{_esc(cfg)}</pre>
 </body></html>"""
@@ -624,7 +618,10 @@ def render_md(payload: dict, title: str = "Endpoint benchmark report") -> str:
         ]
     config_pairs += [
         ("Dataset", target.get("dataset") or "(auto)"),
-        ("Query pool", f"{load.get('queries', {}).get('count', '?')} queries ({load.get('queries', {}).get('source', '?')})"),
+        (
+            "Query pool",
+            f"{load.get('queries', {}).get('count', '?')} queries ({load.get('queries', {}).get('source', '?')})",
+        ),
         ("Concurrency levels", ", ".join(str(n) for n in load.get("levels", []))),
         ("Duration per level", f"{load.get('duration_s', '?')} s"),
         ("Ramp-up", f"{load.get('ramp_up_s', '?')} s"),
@@ -703,11 +700,18 @@ def render_md(payload: dict, title: str = "Endpoint benchmark report") -> str:
     for r in rows:
         cells = [r["concurrency"], r["total"], r["success_rate_pct"], r["rps"], r["rps_per_user"]]
         cells += [_fmt_num(r.get(c)) for c in p_cols]
-        cells += [_fmt_num(r.get("lat_max"), 0), _fmt_num(r.get("avg_results")), _fmt_num(r.get("avg_bytes"), 1), _fmt_num(r.get("window_s"), 1)]
+        cells += [
+            _fmt_num(r.get("lat_max"), 0),
+            _fmt_num(r.get("avg_results")),
+            _fmt_num(r.get("avg_bytes"), 1),
+            _fmt_num(r.get("window_s"), 1),
+        ]
         if has_gpu:
             cells += [
                 _fmt_num(r.get("gpu_util_mean"), 1),
-                _fmt_num(r.get("gpu_util_mean_minus_idle"), 1) if r.get("gpu_util_mean_minus_idle") is not None else "–",
+                _fmt_num(r.get("gpu_util_mean_minus_idle"), 1)
+                if r.get("gpu_util_mean_minus_idle") is not None
+                else "–",
                 r.get("gpu_samples", "–"),
             ]
         table_rows.append(cells)

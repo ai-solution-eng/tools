@@ -204,7 +204,14 @@ def test_subtract_baseline():
 
 
 def test_subtract_baseline_floors_at_zero_and_handles_missing():
-    level = {"metrics": {"M": {"overall": {"mean": 10.0}, "gpus": [{"host": "a", "device": "0", "mean": 10.0}, {"host": "a", "device": "1", "mean": 99.0}]}}}
+    level = {
+        "metrics": {
+            "M": {
+                "overall": {"mean": 10.0},
+                "gpus": [{"host": "a", "device": "0", "mean": 10.0}, {"host": "a", "device": "1", "mean": 99.0}],
+            }
+        }
+    }
     baseline = {"metrics": {"M": {"overall": {"mean": 30.0}, "gpus": [{"host": "a", "device": "0", "mean": 30.0}]}}}
     subtract_baseline(level, baseline)
     assert level["metrics"]["M"]["gpus"][0]["mean_minus_idle"] == 0.0

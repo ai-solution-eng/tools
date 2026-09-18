@@ -32,6 +32,11 @@ chatTemplateCheckbox.addEventListener('change', syncTemplateFields);
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = Object.fromEntries(new FormData(form));
+  // Never send s3_path unless S3 is the selected backend: on PVC-only
+  // deployments the S3-destination input stays in the DOM (hidden) and would
+  // otherwise be submitted with its template prefill ("s3:///"), which the
+  // API rejects with "s3_path must start with 's3://<bucket>'".
+  if (body.storage !== 's3') body.s3_path = '';
   if (!body.namespace) body.namespace = form.dataset.defaultNs || '';
   if (!body.namespace) {
     msg.className = 'msg error';

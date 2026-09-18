@@ -38,7 +38,13 @@ def _make_rest_app(state: dict):
         name = request.match_info["name"]
         q = request.query.get("q", "")
         state["searches"].append(
-            {"path": request.path, "dataset": name, "q": q, "params": dict(request.query), "headers": dict(request.headers)}
+            {
+                "path": request.path,
+                "dataset": name,
+                "q": q,
+                "params": dict(request.query),
+                "headers": dict(request.headers),
+            }
         )
         await asyncio.sleep(0.01)
         top_k = int(request.query.get("top_k", "3"))

@@ -32,6 +32,7 @@ def pct_label(p: float) -> str:
     p = float(p)
     return f"p{int(p)}" if p.is_integer() else f"p{p:g}"
 
+
 # Error categories for the deep-dive report. Mapping is by the error key
 # shape the drivers produce: ``HTTP <code>: ...`` (REST non-2xx),
 # ``<ExceptionType>: <snippet>`` (httpx/MCP exception), ``Timeout (>Ns)``

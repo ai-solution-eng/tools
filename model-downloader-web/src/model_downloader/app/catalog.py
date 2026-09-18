@@ -76,7 +76,7 @@ class Catalog:
         removed ones.  Returns counters for the API response.
         """
         if not isinstance(entries, list):
-            raise ValueError("catalog payload must be a JSON array of entries")
+            raise TypeError("catalog payload must be a JSON array of entries")
         present = {e.get("catalog_id") for e in self.entries}
         added = skipped = removed = 0
         for entry in entries:

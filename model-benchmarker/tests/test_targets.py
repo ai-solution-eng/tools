@@ -21,7 +21,7 @@ from model_benchmarker.endpoint_benchmarker.targets import (
 
 
 def test_parse_kv_json_values():
-    out = parse_kv(["top_k=10", "use_reranker=true", "note=hello world", "modalities=[\"text\",\"image\"]"], "--arg")
+    out = parse_kv(["top_k=10", "use_reranker=true", "note=hello world", 'modalities=["text","image"]'], "--arg")
     assert out == {"top_k": 10, "use_reranker": True, "note": "hello world", "modalities": ["text", "image"]}
 
 

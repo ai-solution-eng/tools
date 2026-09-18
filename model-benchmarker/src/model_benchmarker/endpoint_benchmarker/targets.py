@@ -62,7 +62,7 @@ def parse_kv(pairs: list[str] | tuple[str, ...], flag: str) -> dict:
 
 def redact_secrets(data: dict) -> dict:
     """Return a copy of *data* with sensitive values masked (for JSON artifacts)."""
-    out = {}
+    out: dict = {}
     for k, v in data.items():
         if isinstance(v, dict):
             out[k] = redact_secrets(v)
@@ -129,8 +129,7 @@ def pick_tool(tools, requested: str | None):
             return t
     names = ", ".join(t.name for t in tools)
     raise TargetError(
-        f"server exposes {len(tools)} tools ({names}); pass --tool to choose one "
-        f"(or --list-tools to inspect them)"
+        f"server exposes {len(tools)} tools ({names}); pass --tool to choose one (or --list-tools to inspect them)"
     )
 
 
@@ -155,9 +154,7 @@ class RestTarget:
 
     def validate(self) -> None:
         if "{dataset}" in self.path_template and not self.dataset:
-            raise TargetError(
-                f"path template {self.path_template!r} contains {{dataset}} but no --dataset was given"
-            )
+            raise TargetError(f"path template {self.path_template!r} contains {{dataset}} but no --dataset was given")
         if self.body_template is not None:
             # Fail fast on a body template that cannot produce valid JSON.
             try:

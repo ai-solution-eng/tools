@@ -98,19 +98,25 @@ async def _gather_with_progress(tasks: list, stats: BenchmarkStats, label: str, 
 # ---------------------------------------------------------------------------
 
 
-async def _warmup_rest(client: httpx.AsyncClient, target: RestTarget, queries: list[str], n: int, call_timeout: float) -> None:
+async def _warmup_rest(
+    client: httpx.AsyncClient, target: RestTarget, queries: list[str], n: int, call_timeout: float
+) -> None:
     async def one(i: int) -> None:
         query = random.Random(1_000_003 + i).choice(queries)
         url, params, body = target.build_request(query)
         try:
-            await client.request(target.method, url, params=params, headers=target.headers, content=body, timeout=call_timeout)
+            await client.request(
+                target.method, url, params=params, headers=target.headers, content=body, timeout=call_timeout
+            )
         except Exception as exc:
             log.debug("warm-up request failed (ignored): %s", exc)
 
     await asyncio.gather(*(one(i) for i in range(n)))
 
 
-async def _warmup_mcp(target: McpTarget, resolved: ResolvedTool, queries: list[str], n: int, call_timeout: float) -> None:
+async def _warmup_mcp(
+    target: McpTarget, resolved: ResolvedTool, queries: list[str], n: int, call_timeout: float
+) -> None:
     async def one(i: int) -> None:
         query = random.Random(2_000_003 + i).choice(queries)
         await mcp_call_once(target, resolved, query, call_timeout)
@@ -160,6 +166,7 @@ async def run_sweep(
         stats = BenchmarkStats()
 
         if mode == "rest":
+            assert rest_target is not None  # narrowed: mode == "rest" iff a REST target was given
             # Pool sized to the level: ModelBenchmarker's connection-pool warning,
             # made structural — every level gets a pool that fits it.
             limits = httpx.Limits(max_connections=n_users * 2 + 10, max_keepalive_connections=n_users)
@@ -197,6 +204,7 @@ async def run_sweep(
                 stats.end_time = time.monotonic()
                 t_end_epoch = time.time()
         else:
+            assert mcp_target is not None and resolved is not None  # narrowed: MCP mode implies both are set
             if warmup_rounds > 0:
                 log.info(
                     "%s: warm-up %d round(s) -> %d unmeasured session(s)",

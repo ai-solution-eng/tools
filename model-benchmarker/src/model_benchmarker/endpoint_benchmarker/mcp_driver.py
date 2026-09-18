@@ -54,11 +54,7 @@ def _build_tool_args(tool, target: McpTarget, query_arg: str) -> dict:
                 args.setdefault(match, target.dataset)
                 break
 
-    missing = [
-        r
-        for r in required
-        if r not in args and r != query_arg and "default" not in (props.get(r) or {})
-    ]
+    missing = [r for r in required if r not in args and r != query_arg and "default" not in (props.get(r) or {})]
     if missing:
         raise TargetError(
             f"tool '{tool.name}' requires argument(s) {missing} with no default and none were provided; "
@@ -98,9 +94,12 @@ async def open_mcp_session(target: McpTarget) -> AsyncIterator:
         if target.insecure:
             import httpx2
 
-            def factory(**kwargs):
-                kwargs["verify"] = False
-                return httpx2.AsyncClient(**kwargs)
+            def factory(  # signature mirrors mcp's McpHttpClientFactory protocol
+                headers: dict[str, str] | None = None,
+                timeout: httpx2.Timeout | None = None,
+                auth: httpx2.Auth | None = None,
+            ) -> httpx2.AsyncClient:
+                return httpx2.AsyncClient(headers=headers, timeout=timeout, auth=auth, verify=False)
 
             transport = sse_client(target.url, headers=target.headers or None, httpx_client_factory=factory)
         else:
