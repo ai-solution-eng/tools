@@ -122,8 +122,9 @@ data:
         }
 
         # Launch-token exchange: the auth validator (7684) holds the dsh web
-        # token captured by the supervisor and redirects the browser to
-        # /?token=..., where dsh sets its own cookie and lands on /.
+        # token captured by the supervisor, performs the exchange SERVER-SIDE
+        # (capturing dsh's session cookie) and redirects the browser straight
+        # into /<slug>/ — the unit root — fully authenticated.
         location = /__dsh_boot {
           proxy_pass http://127.0.0.1:7684/boot;
           proxy_pass_request_body off;
@@ -197,8 +198,9 @@ data:
 
     // dsh web prints its one-time launch URL on stdout; the supervisor
     // extracts it and hands it over via DSH_BOOT_URL. /boot validates the
-    // PLATFORM session first, then 302s the browser to dsh's own
-    // /?token=... URL where dsh exchanges the token for its cookie.
+    // PLATFORM session first, then performs the token exchange SERVER-SIDE
+    // (capturing dsh's session cookie) and 302s the browser straight into
+    // /<slug>/ — fully authenticated, no main-host detour.
     const BOOT_STATE_FILE = process.env.DSH_BOOT_STATE_FILE || '/var/dsh/state/dsh-boot-url'
     const BOOT_PATH = process.env.AUTH_BOOT_PATH || '/boot'
     // Readiness endpoint: cookieless (kube-probe), performs a server-side
@@ -261,14 +263,74 @@ data:
           res.end(JSON.stringify({ error: 'dsh session missing; reload the page' }))
           return
         }
-        // Redirect RELATIVE to whatever host the browser is using (nginx
-        // proxies with the public Host header). dsh prints its launch URL
-        // with the canonical loopback host (http://127.0.0.1:3080/...),
-        // which is unreachable from the browser; only the path+query carry
-        // the token.
-        const target = new URL(url)
-        res.writeHead(302, { location: target.pathname + target.search })
-        res.end()
+        // Exchange the launch token SERVER-SIDE (the same mechanism the
+        // readiness probe uses), capture dsh's session cookie, and redirect
+        // the browser straight into the unit's prefixed path. The old flow
+        // bounced the browser through /?token=... on the MAIN host, where
+        // dsh's own post-exchange redirect to / landed on the ROUTER's login
+        // menu — so the first login after logout always stranded the user one
+        // click away ("Open your environment") even though the session was
+        // already live. Landing on /<slug>/ keeps the entire boot flow inside
+        // the unit. dsh prints its launch URL with the canonical loopback
+        // host (http://127.0.0.1:3080/...), unreachable from the browser;
+        // only the path+query carry the token — which is exactly what this
+        // server-side exchange consumes. (An empty USER_SLUG never reaches
+        // here: valid() fail-closes on it above.)
+        //
+        // Two hard-won constraints:
+        //  1. The exchange must carry the PUBLIC Host (nginx forwards $host
+        //     onto /__dsh_boot) — dsh validates it against DSH_TRUSTED_HOSTS
+        //     and refuses a loopback Host (observed live: 403, no cookie).
+        //  2. dsh answers the exchange with 303 See Other (NOT 302) — do not
+        //     status-match strictly; follow the redirect chain (max 3 hops)
+        //     and stop as soon as any response carries Set-Cookie. If the
+        //     chain ends without a cookie, fail VISIBLY (503) — a cookieless
+        //     redirect into the unit would bounce straight back here forever.
+        const exchangeStart = new URL(url)
+        const exchangeHost = req.headers.host || exchangeStart.host
+        const exchangeGet = (current) => new Promise((resolve, reject) => {
+          const r = http.request({
+            host: '127.0.0.1',
+            port: current.port || '3080',
+            path: current.pathname + current.search,
+            method: 'GET',
+            headers: { host: exchangeHost, 'x-forwarded-proto': 'https' },
+          }, resolve)
+          r.on('error', reject)
+          r.setTimeout(5000, () => r.destroy(new Error('exchange timeout')))
+          r.end()
+        })
+        ;(async () => {
+          try {
+            let current = exchangeStart
+            const cookies = []
+            let lastStatus = 0
+            for (let hop = 0; hop < 3; hop++) {
+              const resp = await exchangeGet(current)
+              lastStatus = resp.statusCode
+              if (resp.headers['set-cookie']?.length) {
+                cookies.push(...resp.headers['set-cookie'])
+                break // dsh set its session cookie — the browser takes it from here
+              }
+              const loc = resp.headers.location
+              if (loc && [301, 302, 303, 307, 308].includes(resp.statusCode)) {
+                current = new URL(loc, current)
+                continue
+              }
+              break
+            }
+            if (!cookies.length) {
+              res.writeHead(503, { 'content-type': 'text/plain' })
+              res.end(`token exchange failed (dsh answered ${lastStatus}, no session cookie); reload to retry`)
+              return
+            }
+            res.writeHead(302, { location: `/${MY_SLUG}/`, 'set-cookie': cookies })
+            res.end()
+          } catch {
+            res.writeHead(503, { 'content-type': 'text/plain' })
+            res.end('dsh web did not accept the token exchange; reload to retry')
+          }
+        })()
         return
       }
       if (valid(req)) {

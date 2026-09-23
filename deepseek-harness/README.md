@@ -181,6 +181,35 @@ Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs pe
 
 ---
 
+## Baked user image (0.4.7)
+
+User pods previously ran vanilla `node:22-bookworm-slim` and installed everything at boot (apt toolchain, `@deepseek-ai/dsh`, uv, ttyd — several minutes per pod, and the two apt stages re-ran on EVERY restart because apt state lives in the container layer, not on the PVCs). `images.user`/`images.init` now point at a **baked image** (`ghcr.io/ai-solution-eng/deepseek-harness:<tag>`) that carries the whole toolchain under `/opt/dsh` — fresh pods reach Ready in seconds.
+
+Design contract (see `docker/user/Dockerfile`):
+
+- Baked artifacts live under **`/opt/dsh`** (`/opt/dsh/npm`, `/opt/dsh/bin`) — never under `/var/dsh`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/dsh/data/npm`, `/var/dsh/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `dsh-startup.sh` is unchanged.
+- **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `dsh.version` without rebuilding) and the old install-on-boot behavior resumes.
+- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated + warm pool) onto the new image automatically.
+- User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
+
+Build & push (single source of truth: the script reads `dsh.version` + `provisioning.aptPackages` from the values file; the image tag defaults to `dsh.version` — a version bump and an image rebuild stay coupled):
+
+```sh
+docker buildx build --platform linux/amd64 \
+  -t ghcr.io/ai-solution-eng/deepseek-harness:0.1.6-alpha.2 --push docker/user
+# or simply: scripts/build-user-image.sh --push
+```
+
+Then `helm upgrade` (the values files already point at the matching tag).
+
+---
+
+## Login lands inside the unit (0.4.8)
+
+The first login after logout used to strand the user on the login menu ("Signed in as … / Open your environment") even though the session was already live: the in-pod validator's boot flow bounced the browser through `/?token=…` on the **main host**, where dsh's own post-exchange redirect to `/` hit the router's menu. The validator now performs the launch-token exchange **server-side** (the same fetch its readiness probe already used), captures dsh's session cookie, and 302s straight into `/<slug>/` — the entire boot flow stays inside the unit. SSO and local logins are now single-click (including through the provisioning loading screen). Validate locally with `scripts/test-boot-exchange.sh`.
+
+---
+
 ## Troubleshooting (each line cost us a debugging session)
 
 | Symptom | Cause | Fix |
@@ -199,7 +228,7 @@ Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs pe
 | Units **stuck NotReady** after 0.1.5 | Readiness probed dsh's nonexistent `/healthz` route | chart ≥0.1.7 (probe hits dsh root — 302 counts as ready); immediate unblock: revert readinessProbe to `tcpSocket 8082` |
 | PVCs hang Pending / VAST quota collisions | VAST CSI 64-char quota-name truncation | `scripts/cleanup-dsh-web-helm-stale-quotas.sh` (dry-run by default) |
 
-**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version) and re-templates units whose annotation differs. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
+**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
 
 ---
 
@@ -215,6 +244,7 @@ Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs pe
 
 ## Scripts
 
+- `scripts/build-user-image.sh` — build/push the baked user image (reads `dsh.version` + `provisioning.aptPackages` from the values file)
 - `scripts/push_dsh_settings.sh` — push a settings.yaml into every user env (hot-reloaded)
 - `scripts/user_manager.ipynb` — bulk user admin against the router API
 - `scripts/cleanup-dsh-web-helm-stale-quotas.sh` — VAST quota cleanup (dry-run default)

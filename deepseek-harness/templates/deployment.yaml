@@ -71,7 +71,9 @@ spec:
 {{- end }}
       containers:
         - name: {{ .Release.Name }}-router
-          image: {{ .Values.images.user }}
+          # The router only needs node — stay on the slim base even when the
+          # user pods run the baked toolchain image (images.user).
+          image: {{ .Values.images.router | default "node:22-bookworm-slim" }}
           imagePullPolicy: Always
           command:
             - node
@@ -120,6 +122,8 @@ spec:
               value: {{ .Values.images.user }}
             - name: USER_INIT_IMAGE
               value: {{ .Values.images.init }}
+            - name: USER_IMAGE_PULL_SECRET
+              value: {{ .Values.images.pullSecret | default "" | quote }}
             - name: USER_INSTANCE_DSH_VERSION
               value: {{ .Values.dsh.version }}
             - name: USER_INSTANCE_DSH_PORT

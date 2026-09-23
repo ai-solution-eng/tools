@@ -46,9 +46,48 @@ data:
     // process running under the project's unix identity (USER_INFO_* env
     // from the project-info ConfigMap; init chowns the DSH volumes; the
     // startup drops privileges via setpriv).
-    const RUNTIME_REV = '25'
-    const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${userDshVersion}`
+    // v26: baked user image support — the image carries the apt toolchain,
+    // @deepseek-ai/dsh, uv and ttyd under /opt/dsh; init prefers the baked
+    // artifacts (guarded symlinks on the state PVC) and skips the
+    // install-on-boot chain when they match the requested versions. The
+    // image tag joins userTemplateVersion so existing units re-stamp when
+    // the image changes; user pods pull with IfNotPresent (immutable tags).
+    // v27: boot flow keeps the user inside the unit — the in-pod auth
+    // validator now performs the launch-token exchange SERVER-SIDE (same
+    // mechanism as its /dsh-health probe), captures dsh's session cookie,
+    // and 302s straight into /<slug>/. The old main-host /?token= hop made
+    // dsh's own post-exchange redirect to / land on the router's login
+    // menu, stranding the first login after every logout one click away
+    // ("Open your environment") even though the session was already live.
+    // v28: the server-side exchange presents the PUBLIC Host (nginx-forwards
+    // $host) instead of the launch URL's loopback host — dsh validates the
+    // exchange against DSH_TRUSTED_HOSTS and refused the loopback one, which
+    // produced a /__dsh_boot <-> /<slug>/ redirect loop. The exchange is now
+    // a raw http.request carrying req.headers.host, and a cookieless
+    // exchange answer fails visibly (503) instead of redirecting.
+    // v29: real dsh answers the exchange with 303 See Other (not 302) — the
+    // strict status match rejected dsh's VALID exchange (with its session
+    // cookie) and surfaced "token exchange failed (dsh answered 303)". The
+    // validator now follows the exchange redirect chain (max 3 hops) and
+    // stops as soon as any response carries Set-Cookie; status-agnostic.
+    const RUNTIME_REV = '29'
+    // userTemplateVersion is the pod-template convergence contract. Three
+    // independent things must roll existing units when they change:
+    //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
+    //                    probes, env); bump on every such chart change
+    //   userDshVersion — dsh.version in values (covers the version-bumped-
+    //                    without-image-rebuild case: runtime install fills in)
+    //   userImageRev   — the baked image tag (tag == dsh.version by
+    //                    convention, so the two usually dedupe to one slot;
+    //                    they BOTH appear only while they disagree — exactly
+    //                    the drift window the convergence must cover)
+    const userImageRev = (() => {
+      const tag = String(userInstanceImage || '').split('@')[0].split(':').pop() || ''
+      return (tag.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 32)) || 'untagged'
+    })()
+    const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${[...new Set([userDshVersion, userImageRev])].join('-')}`
     const ttydVersion = '1.7.7'
+    const userPullSecret = process.env.USER_IMAGE_PULL_SECRET || ''
     const usernameHeader = 'x-auth-request-preferred-username'
     const fallbackUserHeader = 'x-auth-request-user'
     const kubeHost = process.env.KUBERNETES_SERVICE_HOST
@@ -1303,13 +1342,29 @@ data:
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
         '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc\'',
 {{- end }}
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/dsh/bin sh; fi\' || true',
+        // uv: prefer the baked copy (/opt/dsh/bin, baked user image) when
+        // present; only download when neither the state PVC nor the image
+        // ships one. Keeps the old install-on-boot behavior as the fallback.
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/bin/uv ] && [ ! -f /opt/dsh/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/dsh/bin sh; fi\' || true',
         '$RUN_AS_USER sh -c \'ln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true; ln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\' || true',
         // The dsh npm install runs under the project identity when stamped:
         // version bumps then never re-create root-owned files on the state
         // volume (which would be unwritable for the unit process).
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/data/npm/bin/dsh ] || [ "$(cat /var/dsh/.dsh-version 2>/dev/null)" != "${DSH_VERSION}" ]; then HOME=/var/dsh/home npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --prefix /var/dsh/data/npm && echo "${DSH_VERSION}" > /var/dsh/.dsh-version && (ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true); fi\'',
-        '$RUN_AS_USER sh -c \'if [ ! -x /var/dsh/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/dsh/bin/ttyd; fi\'',
+        // dsh npm package: when the image ships a baked copy under
+        // /opt/dsh/npm whose version matches DSH_VERSION, alias the PVC path
+        // to it (fresh state PVCs only — an existing /var/dsh/data/npm keeps
+        // the user's installed copy) and skip the npm install entirely.
+        // Version mismatch or a vanilla image falls back to the original
+        // install-into-the-state-PVC behavior. PATH keeps working because
+        // the .bashrc entry /var/dsh/data/npm/bin resolves through the alias.
+        '$RUN_AS_USER sh -c \'if [ -f /opt/dsh/npm/.dsh-version ] && [ "$(cat /opt/dsh/npm/.dsh-version 2>/dev/null)" = "${DSH_VERSION}" ]; then if [ ! -e /var/dsh/data/npm ]; then ln -sfn /opt/dsh/npm /var/dsh/data/npm; fi; ln -sf /opt/dsh/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true; elif [ ! -f /var/dsh/data/npm/bin/dsh ] || [ "$(cat /var/dsh/.dsh-version 2>/dev/null)" != "${DSH_VERSION}" ]; then HOME=/var/dsh/home npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --prefix /var/dsh/data/npm && echo "${DSH_VERSION}" > /var/dsh/.dsh-version && (ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true); fi\'',
+        '$RUN_AS_USER sh -c \'if [ ! -x /var/dsh/bin/ttyd ] && [ ! -x /opt/dsh/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/dsh/bin/ttyd; fi\'',
+        // Compat symlinks on the state PVC: dsh-startup.sh execs
+        // /var/dsh/bin/ttyd directly (and PATH carries /var/dsh/bin), so
+        // alias any baked binary into /var/dsh/bin when the PVC copy is
+        // missing or not executable (partial download recovery). PVC copies
+        // always win when present so existing volumes keep their behavior.
+        '$RUN_AS_USER sh -c \'for b in uv uvx ttyd; do if [ -e "/opt/dsh/bin/$b" ]; then if [ ! -e "/var/dsh/bin/$b" ] || [ ! -x "/var/dsh/bin/$b" ]; then ln -sfn "/opt/dsh/bin/$b" "/var/dsh/bin/$b" || true; fi; fi; done\' || true',
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
         // Per-namespace shared PVC seeding (platform units each get their own
         // <release>-shared-pvc; classic units seed here too — cp -n makes it
@@ -1377,6 +1432,9 @@ data:
                 fsGroup: 1000,
                 fsGroupChangePolicy: 'OnRootMismatch',
               },
+              // Optional pull secret for private registries (e.g. a private
+              // ghcr.io package): images.pullSecret -> USER_IMAGE_PULL_SECRET.
+              ...(userPullSecret ? { imagePullSecrets: [{ name: userPullSecret }] } : {}),
               initContainers: [
                 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                 {
@@ -1394,7 +1452,11 @@ data:
                 {
                   name: 'init-dsh-storage',
                   image: userInitImage,
-                  imagePullPolicy: 'Always',
+                  // IfNotPresent: user images are immutable tags (the baked
+                  // user image and node:22-bookworm-slim). Avoids a registry
+                  // round-trip on every pod start; image changes roll pods
+                  // via the userTemplateVersion convergence instead.
+                  imagePullPolicy: 'IfNotPresent',
                   command: ['/bin/sh', '-lc', initCommand],
                   env: [
                     { name: 'DSH_VERSION', value: userDshVersion },
@@ -1429,7 +1491,9 @@ data:
                 {
                   name: 'dsh-web',
                   image: userInstanceImage,
-                  imagePullPolicy: 'Always',
+                  // See the init container note: immutable tags +
+                  // IfNotPresent; template convergence handles upgrades.
+                  imagePullPolicy: 'IfNotPresent',
                   workingDir: '/workspace/personal',
                   command: ['/bin/sh', '-lc', appCommand],
                   stdin: true,
@@ -1559,7 +1623,8 @@ data:
                 {
                   name: 'dsh-auth',
                   image: userInstanceImage,
-                  imagePullPolicy: 'Always',
+                  // Same image as dsh-web; IfNotPresent for the same reason.
+                  imagePullPolicy: 'IfNotPresent',
                   command: ['node', '/opt/preview/auth_validator.mjs'],
                   env: [
                     { name: 'SESSION_KEY', value: crypto.createHmac('sha256', sessionSecret).update(slug).digest('hex') },
