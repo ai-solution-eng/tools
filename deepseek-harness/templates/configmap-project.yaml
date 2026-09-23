@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-project-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+data:
+  # Seeded into $DSH_HOME/settings.yaml on first start of each user pod;
+  # the in-pod supervisor hot-reloads changes (dsh adapters re-read the
+  # settings document on the next request).
+  #
+  # NOTE: AGENTS.md (dshInstructions) and skills (dshSkills) seeding was
+  # removed by design — dsh base-backed profiles still auto-load an
+  # AGENTS.md if users place one in /workspace/personal, and skills can be
+  # dropped into $DSH_HOME/skills/ (dsh hot-refreshes them natively).
+  settings.yaml: |
+{{ .Values.dshSettings | indent 4 }}

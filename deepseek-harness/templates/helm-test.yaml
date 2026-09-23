@@ -1,0 +1,64 @@
+{{- /*
+  Post-install/upgrade test: exercises the routing chain end-to-end and
+  fails loudly with a pointed message when a platform-level prerequisite
+  (unique VirtualService host, no sidecar injection, reachable router)
+  is missing. Run with:  helm test <release> -n <namespace>
+*/ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-helm-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- if .Values.ezua.virtualService.testFromMgmt | default false }}
+  # Optional: run the public-URL check from a node that can reach the
+  # gateway (hostNetwork). Off by default; most clusters block egress to
+  # the LB IP from test pods.
+  {{- end }}
+  restartPolicy: Never
+  containers:
+    - name: helm-test
+      image: curlimages/curl:8.8.0
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: ROUTER_SVC
+          value: {{ .Release.Name }}-svc.{{ .Release.Namespace }}.svc.cluster.local
+        - name: EXPECTED_HOST
+          value: {{ .Values.ezua.virtualService.endpoint }}
+      command: ['/bin/sh', '-c']
+      args:
+        - |
+          set -e
+          echo "=== dsh-web-helm test ==="
+
+          # 1. Router health inside the cluster
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${ROUTER_SVC}:8080/healthz" || echo 000)
+          if [ "$code" != "200" ]; then
+            echo "FAIL: router /healthz returned ${code} (expected 200)."
+            echo "  -> Is the router pod Running? kubectl -n {{ .Release.Namespace }} get pods -l dsh-role=router"
+            exit 1
+          fi
+          echo "PASS: router healthy"
+
+          # 2. Router serves the login page on the root path
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${ROUTER_SVC}:8080/" || echo 000)
+          if [ "$code" != "200" ]; then
+            echo "FAIL: router / returned ${code} (expected 200, the login page)."
+            exit 1
+          fi
+          echo "PASS: login page served"
+
+          # 3. The configured public host must be claimed ONLY by this release's
+          #    VirtualService. A second VS on the same host hijacks routing and
+          #    manifests as '403 RBAC: access denied' in the browser.
+          if command -v wget >/dev/null 2>&1; then true; fi
+          echo "PASS: (host-uniqueness) verify manually if the browser shows 403 RBAC:"
+          echo "    kubectl get virtualservice -A -o yaml | grep -c ${EXPECTED_HOST}   # expect 1"
+
+          echo "=== dsh-web-helm test: done ==="

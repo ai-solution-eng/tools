@@ -1,0 +1,243 @@
+# ============================================================
+# EZUA settings
+# ============================================================
+ezua:
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "deepseekharness.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# ============================================================
+# General configuration
+# ============================================================
+previewDomain: "${DOMAIN_NAME}"
+
+# Session cookie signing secret (also used by each user pod to validate the
+# session cookie that gates access to that pod's UI/terminal/previews).
+sessionSecret: "4nK8wQ2vR7pT3kL1mX9yB5dF3hJ6cZ0aG"
+
+storageClass: gl4f-filesystem
+storage:
+  sharedSize: 20Gi
+  workspaceSize: 5Gi
+  # Version suffix for per-user PVC names. Bump to provision fresh volumes and
+  # avoid colliding with orphaned VAST quotas (when VAST volume deletion is not
+  # enabled). v1 is the first versioned scheme of this chart; no user data
+  # exists yet to migrate.
+  nameVersion: v1
+  stateSize: 2Gi
+
+images:
+  user: node:22-bookworm-slim
+  init: node:22-bookworm-slim
+
+# ============================================================
+# DeepSeek Harness
+# ============================================================
+# dsh web is the ONLY browser-facing UI in this chart (there is no
+# OpenChamber equivalent). It always binds to loopback (the CLI refuses
+# --host 0.0.0.0), so the in-pod nginx terminates all user traffic and
+# proxies it to 127.0.0.1:dsh.port.
+dsh:
+  # npm package version of @deepseek-ai/dsh installed into each user's
+  # state PVC at first start.
+  version: "0.1.6-alpha.2"
+  # Loopback port the dsh web server listens on (dsh web --port).
+  port: 3080
+
+provisioning:
+  aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # Loading screen shown while a user's pod is being provisioned/assigned.
+  # When disabled the router reverts to the original blocking behavior.
+  loadingUI:
+    enabled: true
+    heading: "Setting up your account\u2026"
+    subtext: "This usually takes a few minutes on first launch. Please wait."
+
+# ============================================================
+# Warm pool: pre-provisioned, always-ready per-user units.
+# Same semantics as the opencode chart: the router keeps `size`
+# fully-initialized user pods warm so a new user's first launch
+# proxies in ~seconds instead of waiting for the per-user install
+# (npm install of @deepseek-ai/dsh, uv, ttyd). A warm unit = its own
+# Deployment + Service + workspace PVC + state PVC (the state PVC
+# holds the installed toolchain, so claiming only restarts the pod).
+#
+# Tradeoff: each warm unit is an idle user pod consuming resources
+# (up to the per-user limits). Set size: 0 or enabled: false to keep
+# the on-demand cold spin-up behavior.
+# ============================================================
+warmPool:
+  enabled: false
+  size: 2
+  refreshIntervalSeconds: 15
+
+auth:
+  username: dsh
+  password: "2vF6mQ4xKp8tL1nR7wY5cB9hDz3sUa0N"
+
+# Admin console credentials (admin page to create/delete user accounts).
+admin:
+  username: admin-user
+  password: "admin-password"
+
+# ============================================================
+# dsh settings ($DSH_HOME/settings.yaml)
+# ============================================================
+# Seeded into each user's state volume at first start and hot-reloaded by
+# the in-pod supervisor on change (dsh adapters re-read settings.yaml on
+# the next request, so no pod restart is needed).
+#
+# The default below wires dsh's pi-ai adapter to MLIS endpoints served on
+# the cluster (OpenAI Chat Completions protocol), with the compat switches
+# most self-hosted gateways need, and disables dsh's default-on DeepSeek
+# session-log upload and OTel export (never send tenant sessions off
+# platform). Replace the baseURLs/apiKeyEnv entries with your environment's
+# MLIS service names; keys resolve via apiKeyEnv from the pod env — seed
+# them with `dshEnv` (writes $DSH_HOME/.env) or the Settings→Models UI.
+dshSettings: |
+    # =============================================================================
+    # DSH settings — team starter template
+    # Repo is PRIVATE: internal model/RAG endpoints are committed as-is.
+    # Personal RAG dataset name & password stay in .env (gitignored).
+    # =============================================================================
+    llm-pi-ai:
+      providers:
+        pcai-model-endpoint:
+          apiKeyEnv: PCAI_LLM_KEY
+          api: openai-completions
+          baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
+          headers:
+            X-PCAI-Execute-Tools: "1"
+          reasoning: max
+          models:
+            - id: auto
+              name: PCAI_LLM_FALLBACK_FLOW
+              contextWindow: 1048576
+              # GLM-5.3 is multimodal: accept image attachments.
+              input:
+                - text
+                - image
+              reasoningEfforts:
+                off: off
+                minimal: minimal
+                medium: medium
+                high: high
+                max: max
+              maxTokens: 262144
+
+
+    # Default model for the primary agent
+    agent-default-model:
+      provider: pcai-model-endpoint
+      model: pcai-model-endpoint
+      reasoningEffort: max
+
+    # Which models subagents (delegation) are allowed to use
+    subagent-model-selection:
+      enabled: true
+      allowedModels:
+        - provider: pcai-model-endpoint
+          model: PCAI_LLM_FALLBACK_FLOW
+        - provider: glm53-flash
+          model: glm-5.3-flash
+        - provider: qwen38-27b
+          model: Qwen/Qwen3.8-27B-FP8
+
+    session-log-deepseek:
+      enabled: false
+    client-connection:
+      telemetry:
+        mode: DISABLED
+
+# Seed a .env file into each user's $DSH_HOME on FIRST start (the same
+# launch-env layer a laptop .env provides; dsh reads it when the process
+# starts). Seed-once: user edits in the Data Manager afterwards are never
+# overwritten. The supervisor watches .env and restarts dsh on change.
+# Replace the CHANGEME values with real keys after first login (Data
+# Manager → DSH Home → .env), or here before install for shared deploys.
+dshEnv: |
+    PCAI_LLM_KEY=CHANGEME
+    MCP_BEARER_TOKEN=CHANGEME
+
+
+dshCordisPatch: |
+    # =============================================================================
+    # Profile patch layer for the "web" profile.
+    # Applied after every bundle layer.  `!!js` expressions are evaluated at load
+    # time so personal / env-specific values come from environment variables.
+    #
+    # Internal RAG / MCP endpoints are committed (private repo).
+    # Personal dataset name & password come from .env.
+    # =============================================================================
+
+    # --- MCP client integrations -------------------------------------------------
+    - insert:
+        - id: mcp-pcai-llm-gateway
+          name: '@deepseek-ai/dsh-mcp-client'
+          config:
+            transport: streamable-http
+            serverName: pcai-llm-gateway
+            url: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/mcp
+            headers:
+              Authorization: !!js ('Bearer ' + (process.env.MCP_BEARER_TOKEN || ''))
+            toolCallTimeoutMs: 600000
+
+    # --- Disables -----------------------------------------------------------------
+    # The built-in DeepSeek (api.deepseek.com) endpoint is not used in this setup.
+    - id: llm-deepseek
+      disabled: true
+
+    - id: web
+      config:
+        fetchProvider: http
+
+router:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# ============================================================
+# Pre-delete cleanup hook (removes dynamically-created per-user
+# resources on helm uninstall so the namespace and shared PVC
+# don't hang in Terminating)
+# ============================================================
+cleanup:
+  image: node:22-bookworm-slim
+  podTimeout: 180  # seconds to wait for user pods to terminate
+  pvcTimeout: 120  # seconds to wait for user PVCs to be deleted
+
+# ============================================================
+# Certificate policy (for clusters with private/internal CA)
+# ============================================================
+
+certificatesPolicy:
+  enabled: false
+
+  # These env vars are applied to the router container AND to every dynamically
+  # created user pod (warm pool + per-user). NODE_EXTRA_CA_CERTS is set as a
+  # container env var so it is re-applied automatically on every restart.
+  env: []
+
+# ============================================================
+# Proxy configuration
+# ============================================================
+proxy:
+  enabled: false
+
+# ============================================================
+no_proxy:
+  enabled: false
+
+# ============================================================
+# Shared workspace content (populates the shared PVC)
+# ============================================================
+sharedContent:
+  enabled: true

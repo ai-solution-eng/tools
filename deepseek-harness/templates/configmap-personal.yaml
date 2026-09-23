@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-personal-content
+  namespace: {{ .Release.Namespace }}
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+data:
+{{- range $path, $content := .Files.Glob "personal/**" }}
+  {{- $ext := lower (ext $path) }}
+  {{- $binaryExts := list ".png" ".jpg" ".jpeg" ".gif" ".ico" ".svg" ".webp" ".bmp" ".tiff" ".woff" ".woff2" ".eot" ".ttf" ".otf" ".pdf" ".zip" ".gz" ".tar" ".tgz" }}
+  {{- if and (not (hasPrefix "." (base $path))) (not (has $ext $binaryExts)) }}
+  {{- $key := trimPrefix "personal/" $path | replace "/" "." }}
+  {{ $key }}: |
+{{ $content | toString | indent 4 }}
+  {{- end }}
+{{- end }}
+# NOTE: the root create-server.sh is deliberately NOT rendered here —
+# personal/create-server.sh already fills the create-server.sh key (identical
+# content), and a second range emitted a duplicate YAML key into the ConfigMap.
