@@ -4,7 +4,69 @@ Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.co
 
 Port of the `opencode` chart (`opencode-web-helm`): same router, warm pool, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
-Chart: `dsh-web-helm` · current version **0.2.4** (dsh `0.1.5-rc.1`, Node 22 image).
+Chart: `dsh-web-helm` · current version **0.4.3** (dsh `0.1.6-alpha.2`, Node 22 image).
+0.4.1 fixes a router crash-loop on the first platform (SSO) login: the provision-watch key
+(namespace/name composite) leaked into the deployment-name position of the API path, producing a
+malformed request whose rejection crashed the process; the watch now passes name and namespace
+separately and never rejects (failures surface on the setup-status page instead).
+0.4.2 makes unit cleanup orphan-proof: user deletion discovers unit namespaces via a
+**cluster-wide anchor scan** (`dsh-anchor-<slug>`) in addition to the registry, and the uninstall
+hook adds a **cluster-wide labeled discovery phase** — an uninstall now finds every namespace
+hosting `dsh-user-managed=true` objects even when the registry entry is already gone (delete
+safety unchanged: label-scoped deletes + the `ezprojects.hpe.com/*` skip-assert).
+0.4.3 completes the router's platform ClusterRole: `delete` on configmaps (ownership anchors —
+user deletion cascades the unit through them) and on pods (stale cleanup-job sweeper).
+
+---
+
+## Platform volumes for SSO users (0.4.0, study Option B)
+
+With `platformIntegration.enabled: true` (on in `values-g2.yaml`), **SSO** users get their unit
+deployed **inside their platform project namespace** (`project-user-<username>`) — the namespace
+the EzProject operator created for them — with the platform volumes mounted **read-write**:
+
+| Mount | Platform PVC | What it is |
+|---|---|---|
+| `/mnt/shared` | `kubeflow-shared-pvc` | **one cluster-wide shared filesystem** (every project namespace's PVC binds to the same VAST view); per-user directories live here |
+| `/mnt/user` | `user-pvc` | the user's personal project volume (chowned by the platform to `<uid>:<gid>`) |
+
+Local (non-SSO) users keep the classic single-namespace behavior; DSH's own `personal` / `shared` /
+`state` volumes and Data Manager roots are unchanged for everyone.
+
+**Identity = the platform's.** The router reads the project's unix attributes from the
+`project-info` ConfigMap (`USER_INFO_UID/GID/USERNAME/GROUP/HOMEDIR`), the unit init chowns the
+DSH-owned volumes to that identity (owner-mismatch-only, never the platform volumes), and the
+service stack (dsh, data manager, ttyd terminals) execs under it via `setpriv`. Files written
+from DSH on the platform volumes are therefore **byte-identical to notebook-written files**
+(same uid/gid), and modification rights are exactly "wherever the user's platform privileges
+allow" — enforced by the kernel, surfaced as clean errors in the UI.
+
+**Data Manager:** SSO users additionally see **Platform Shared (Kubeflow)** and **Platform
+Workspace (Kubeflow)** roots (conditional: hidden for local users and while the platform PVCs
+are not `Bound`; a unit provisioned in the pending state is re-stamped automatically once they
+are). `platformIntegration.readOnly: true` mounts them but keeps the UI read-only for the
+platform roots (unix permissions stay the real enforcement).
+
+**Provisioning semantics:** the unit is *born* in the project namespace (K8s objects cannot move
+between namespaces) when the user has **no existing unit** — sticky semantics preserved, so an
+upgrade never silently moves or resets existing units. A brand-new SSO user cold-starts once
+(the platform warm pool only warms classic/local units).
+
+**Requirements (the admin conversation):**
+1. **Cross-namespace RBAC** — enabling the flag renders a `ClusterRole` +
+   `ClusterRoleBinding` for the router and cleanup service accounts (pods/PVCs/services/
+   configmaps/deployments/jobs, read/manifest, plus PVC+configmap delete). Secrets, leases and
+   VirtualServices stay release-namespace-only. This is a real security grant — have the
+   platform admins sign off (study §7.7).
+2. **SSO host registration** at the platform auth layer (out-of-band, as before).
+
+**Uninstall contract (enforced, study §7.6):** `helm uninstall` deletes only DSH-created objects
+in the release namespace **and** each unit namespace from the registry — label-scoped
+(`dsh-user-managed=true`), GC-cascaded through per-user **anchor** ConfigMaps
+(`dsh-anchor-<slug>`) in the project namespaces, with a skip-assert that refuses any PVC carrying
+an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted**; namespaces are never
+deleted. Unit ConfigMap mirrors (the pod template mounts them cross-namespace via mirrored
+copies) are DSH-owned and cleaned with the unit.
 
 ---
 
@@ -47,10 +109,12 @@ Entry: `https://<endpoint>` (values: `ezua.virtualService.endpoint`; per-env hos
 |---|---|
 | Login / account | `https://<host>/` |
 | Admin console | `https://<host>/__dsh_admin` |
-| Personal environment | `https://<host>/u-{slug}` |
-| Terminal | `.../u-{slug}/terminal` (ttyd + tmux, tabbed/persistent) |
-| Data Manager | `.../u-{slug}/data_manager` |
-| Preview for port `PORT` | `.../u-{slug}/__preview/{PORT}/` |
+| Personal environment | `https://<host>/{username}` |
+| Terminal | `.../{username}/terminal` (ttyd + tmux, tabbed/persistent) |
+| Data Manager | `.../{username}/data_manager` |
+| Preview for port `PORT` | `.../{username}/__preview/{PORT}/` |
+
+Since chart **0.3.5** the per-user URL prefix is the sanitized **username** itself (e.g. `/francesco-caliva/`) — usernames are unique in the registry, so the name is a safe identifier. Pre-0.3.5 links of the form `.../u-{12-hex-slug}/...` keep working (legacy bookmark route).
 
 **Local accounts** are admin-provisioned only (self-registration hidden). **Platform SSO is optional** — `ezua.authorizationPolicy.enabled: false` (as in values-g2) deploys no AuthorizationPolicy and the app is gated by the router's own login. With SSO on (`true`), the host must also be registered with the platform auth layer (as opencode's host is) — that registration lives outside Helm.
 
@@ -112,6 +176,10 @@ Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs pe
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| SSO user lands in `dsh-web-helm` (no platform volumes) | platform namespace missing, PVCs not `Bound`, or cross-ns RBAC not yet applied | check `project-user-<name>` exists + `project-info` ConfigMap; verify the ClusterRoles (`dsh-web-helm-router-platform`); the 60s context cache then provisions/adopts the platform unit on the next resolve |
+| Data Manager shows no Platform roots for an SSO user | unit provisioned before the platform PVCs were Bound (mode `pending`), or `platformIntegration.enabled: false` | the router re-stamps the unit once the PVCs are Bound (check the `dsh-web-helm/platform-mounts` annotation); local users never see them by design |
+| Router logs `[platform] context fetch failed … 403` | ClusterRole not applied (feature enabled but RBAC missing) | re-run `helm upgrade` so the gated ClusterRole renders; units keep working in the release namespace meanwhile |
+| **Uninstall deleted nothing in a `project-user-*` ns** | registry unreadable during cleanup (secret gone/renamed) | cleanup falls back to the release namespace only; delete leftover `dsh-user-*`/`dsh-anchor-*` objects manually (platform PVCs are intentionally untouched) |
 | Browser: **403 "RBAC: access denied"** (after SSO login) | ① Router pod has an Istio sidecar → namespace policies enforce on it; ② another VirtualService claims your host (routing hijack) | ① `kubectl label ns <ns> istio-injection=disabled` + restart router; ② `kubectl get virtualservice -A -o yaml \| grep <host>` → pick an unclaimed host |
 | Browser: **500 nginx** on main page | nginx named location missing (`@dsh_boot`) | chart ≥0.1.2 |
 | Redirect lands on **`:8082`** or **`127.0.0.1:3080`** | nginx `absolute_redirect` expands relative Locations with its listen port; validator passed dsh's loopback URL verbatim | chart ≥0.1.2 (`absolute_redirect off; port_in_redirect off`) and relative token redirect |

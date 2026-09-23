@@ -108,6 +108,8 @@ spec:
               value: {{ .Values.ezua.virtualService.endpoint }}
             - name: SHARED_WORKSPACE_CLAIM
               value: {{ .Release.Name }}-shared-pvc
+            - name: SHARED_WORKSPACE_SIZE
+              value: {{ .Values.storage.sharedSize }}
             - name: STORAGE_CLASS_NAME
               value: {{ .Values.storageClass }}
             - name: PERSONAL_WORKSPACE_SIZE
@@ -138,6 +140,25 @@ spec:
               value: {{ .Values.provisioning.loadingUI.heading | default "Setting up your account…" | quote }}
             - name: SETUP_SUBTEXT
               value: {{ .Values.provisioning.loadingUI.subtext | default "This usually takes a few minutes on first launch. Please wait." | quote }}
+{{- if .Values.platformIntegration }}
+            # --- Platform (PCAI/Kubeflow) workspace integration (Option B) ---
+            # SSO users: unit inside project-user-<username> with the platform
+            # volumes mounted read-write under the project's unix identity.
+            - name: PLATFORM_INTEGRATION_ENABLED
+              value: {{ .Values.platformIntegration.enabled | default false | quote }}
+            - name: PLATFORM_NAMESPACE_PREFIX
+              value: {{ .Values.platformIntegration.namespacePrefix | default "project-user-" | quote }}
+            - name: PLATFORM_SHARED_CLAIM
+              value: {{ .Values.platformIntegration.volumes.shared.claim | default "kubeflow-shared-pvc" | quote }}
+            - name: PLATFORM_SHARED_MOUNT
+              value: {{ .Values.platformIntegration.volumes.shared.mountPath | default "/mnt/shared" | quote }}
+            - name: PLATFORM_USER_CLAIM
+              value: {{ .Values.platformIntegration.volumes.user.claim | default "user-pvc" | quote }}
+            - name: PLATFORM_USER_MOUNT
+              value: {{ .Values.platformIntegration.volumes.user.mountPath | default "/mnt/user" | quote }}
+            - name: PLATFORM_VOLUMES_READONLY
+              value: {{ .Values.platformIntegration.readOnly | default false | quote }}
+{{- end }}
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
 {{- range .Values.certificatesPolicy.env }}
             - name: {{ .name }}

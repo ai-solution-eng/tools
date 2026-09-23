@@ -15,4 +15,23 @@ data:
 {{ $content | toString | indent 4 }}
   {{- end }}
 {{- end }}
+  # Seed script for PER-NAMESPACE shared PVCs (platform integration, Option
+  # B: each SSO user's unit mounts its own <release>-shared-pvc inside
+  # project-user-<name>; the unit init runs this script against the mirrored
+  # copy of this ConfigMap). Rendered at helm time so the configmap-key →
+  # path mapping (dots → dirs) stays exact. cp -n = seed-once: user edits in
+  # the shared workspace are never clobbered on pod restart.
+  seed.sh: |
+    #!/bin/sh
+    set -e
+    SEED_SRC="${1:-/dsh-shared-seed}"
+    SEED_DST="${2:-/workspace/shared}"
+    mkdir -p "$SEED_DST"
+{{- range $path, $_ := .Files.Glob "shared/**" }}
+  {{- if not (hasPrefix "." (base $path)) }}
+    mkdir -p "$SEED_DST{{ dir $path | trimPrefix "shared" }}"
+    cp -n "$SEED_SRC/{{ trimPrefix "shared/" $path | replace "/" "." }}" "$SEED_DST{{ dir $path | trimPrefix "shared" }}/{{ base $path }}" 2>/dev/null || true
+  {{- end }}
+{{- end }}
+    echo "[seed] shared workspace content ensured in $SEED_DST"
 {{- end }}

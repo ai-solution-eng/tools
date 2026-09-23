@@ -1,16 +1,25 @@
 {{- /*
   Pre-delete hook: cleans up dynamically-created per-user resources
-  (deployments, pods, PVCs, services, leases) that the router provisions
-  at runtime via the Kubernetes API.  Without this hook `helm uninstall`
-  only removes Helm-tracked resources, leaving user pods — which still
-  mount the shared PVC — stranded.  The shared PVC hangs in Terminating
-  (kubernetes.io/pvc-protection finalizer) and the namespace never
-  completes deletion.
+  (deployments, pods, PVCs, services, leases, Jobs, mirrored ConfigMaps,
+  ownership anchors) that the router provisions at runtime via the
+  Kubernetes API. Without this hook `helm uninstall` only removes
+  Helm-tracked resources, leaving user pods — which still mount PVCs —
+  stranded (the shared PVC hangs in Terminating and the namespace never
+  completes deletion).
+
+  UNINSTALL CONTRACT (docs/platform-pvc-integration-study.md §7.6):
+  Only DSH-created objects (label `dsh-user-managed=true`) are deleted, in
+  the release namespace AND in each unit namespace recorded in the user
+  registry (platform integration Option B: units inside
+  project-user-<name>). Platform PVCs (kubeflow-shared-pvc / user-pvc) are
+  NEVER deleted: they carry no DSH label, and a belt-and-braces skip-assert
+  refuses any PVC carrying an `ezprojects.hpe.com/*` label (or an unreadable
+  PVC). Namespaces are never deleted by this hook.
 
   Execution order (hook weights):
     -4  ServiceAccount
-    -3  Role
-    -2  RoleBinding
+    -3  Role + (platform mode) ClusterRole
+    -2  RoleBinding + (platform mode) ClusterRoleBinding
     -1  Job  (the actual cleanup)
 */ -}}
 ---
@@ -43,6 +52,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods", "persistentvolumeclaims", "services", "secrets"]
   verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "delete"]
@@ -52,6 +64,55 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["virtualservices"]
   verbs: ["get", "list", "delete"]
+{{- if .Values.platformIntegration.enabled }}
+---
+# Platform integration (study Option B): units may live inside the users'
+# platform project namespaces — the cleanup needs the same kinds
+# cross-namespace. Deletion stays bound to the `dsh-user-managed=true`
+# label contract plus the ezprojects.hpe.com/* skip-assert; namespaces
+# themselves are never deleted.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-cleanup-platform
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "persistentvolumeclaims", "services", "configmaps"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-cleanup-platform
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-cleanup-platform
+subjects:
+- kind: ServiceAccount
+  name: {{ .Release.Name }}-cleanup
+  namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -113,6 +174,8 @@ spec:
           value: "{{ .Values.cleanup.pvcTimeout | default 120 }}"
         - name: RELEASE_NAME
           value: "{{ .Release.Name }}"
+        - name: REGISTRY_SECRET
+          value: "{{ .Release.Name }}-users"
         command: ['/bin/sh', '-c']
         args:
         - |
@@ -159,7 +222,18 @@ spec:
             return (result && result.items) || []
           }
 
-          async function deleteByName(path, name) {
+          function isPlatformOwned(meta) {
+            // Uninstall-contract tripwire: platform (EzProject) objects carry
+            // ezprojects.hpe.com/* labels; DSH-created objects never do.
+            const labels = (meta && meta.labels) || {}
+            return Object.keys(labels).some((l) => l.startsWith('ezprojects.hpe.com/'))
+          }
+
+          async function deleteByName(path, name, meta) {
+            if (meta && isPlatformOwned(meta)) {
+              console.log('    SKIP (platform-owned): ' + name)
+              return false
+            }
             try {
               await req('DELETE', path + '/' + name + '?propagationPolicy=Background')
               console.log('    deleted ' + name)
@@ -170,10 +244,10 @@ spec:
             }
           }
 
-          async function deleteByLabel(path, label, desc) {
+          async function deleteByLabel(path, label, desc, ns) {
             const items = await listByLabel(path, label)
-            console.log('  ' + items.length + ' ' + desc + ' to delete')
-            await Promise.all(items.map((item) => deleteByName(path, item.metadata.name)))
+            console.log('  [' + ns + '] ' + items.length + ' ' + desc + ' to delete')
+            await Promise.all(items.map((item) => deleteByName(path, item.metadata.name, item.metadata)))
             return items.length
           }
 
@@ -182,18 +256,42 @@ spec:
             return items.length
           }
 
-          async function waitForGone(path, label, desc, timeoutMs) {
+          async function waitForGone(path, label, desc, timeoutMs, ns) {
             const start = Date.now()
             while (Date.now() - start < timeoutMs) {
               const count = await countByLabel(path, label)
               if (count === 0) {
-                console.log('  ' + desc + ': gone')
+                console.log('  [' + ns + '] ' + desc + ': gone')
                 return
               }
-              console.log('  ' + desc + ': ' + count + ' remaining ...')
+              console.log('  [' + ns + '] ' + desc + ': ' + count + ' remaining ...')
               await new Promise((r) => setTimeout(r, 3000))
             }
-            console.log('  WARN: ' + desc + ' still present after timeout, proceeding')
+            console.log('  [' + ns + '] WARN: ' + desc + ' still present after timeout, proceeding')
+          }
+
+          // Unit namespaces = release namespace + every unitNs recorded in
+          // the user registry (platform units live inside the users'
+          // project-user-<name> namespaces). A registry read failure
+          // degrades to release-namespace-only cleanup.
+          async function unitNamespaces() {
+            const namespaces = new Set([namespace])
+            const secretName = process.env.REGISTRY_SECRET
+            if (secretName) {
+              try {
+                const secret = await req('GET', '/api/v1/namespaces/' + namespace + '/secrets/' + secretName)
+                const raw = secret && secret.data && secret.data.users
+                if (raw) {
+                  const users = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')) || {}
+                  for (const record of Object.values(users)) {
+                    if (record && record.unitNs) namespaces.add(record.unitNs)
+                  }
+                }
+              } catch (e) {
+                console.log('  WARN: registry unreadable (' + e.message + '); cleaning the release namespace only')
+              }
+            }
+            return [...namespaces]
           }
 
           async function main() {
@@ -201,32 +299,73 @@ spec:
             const pods = 'app=dsh-user'
             const routerLabel = 'dsh-role=router'
             const routerDeployment = process.env.RELEASE_NAME || ''
-            const ns = namespace
-
+            const nsList = await unitNamespaces()
             console.log('=== Helm pre-delete cleanup ===')
-            console.log('namespace: ' + ns)
+            console.log('namespaces: ' + nsList.join(', '))
+
+            // Orphan-proof discovery (0.4.2): the registry is only a HINT.
+            // Sweep cluster-wide for DSH-labeled objects and add every
+            // namespace hosting one — catches units whose registry entry is
+            // already gone (deleted earlier, or an older chart revision's
+            // hook ran; observed on g2 as an orphaned unit in
+            // project-user-<name>). Deletion safety is unchanged: only
+            // `dsh-user-managed=true` objects are ever touched, and the
+            // ezprojects.hpe.com/* skip-assert still refuses platform PVCs.
+            console.log('Phase 0b: cluster-wide discovery of DSH-labeled unit namespaces')
+            const scans = [
+              '/api/v1/configmaps',
+              '/apis/apps/v1/deployments',
+              '/api/v1/persistentvolumeclaims',
+              '/api/v1/pods',
+            ]
+            for (const scanPath of scans) {
+              try {
+                const items = await listByLabel(scanPath, um)
+                for (const item of items) {
+                  const ns = item.metadata && item.metadata.namespace
+                  if (ns && !nsList.includes(ns)) {
+                    console.log('  discovered DSH resources in namespace: ' + ns)
+                    nsList.push(ns)
+                  }
+                }
+              } catch (e) {
+                console.log('  WARN: cluster-wide scan failed for ' + scanPath + ': ' + e.message)
+              }
+            }
+            console.log('namespaces (final): ' + nsList.join(', '))
 
             console.log('Phase 0: stop router (prevents warm-unit recreation during teardown)')
             if (routerDeployment) {
-              await deleteByName('/apis/apps/v1/namespaces/' + ns + '/deployments', routerDeployment)
+              await deleteByName('/apis/apps/v1/namespaces/' + namespace + '/deployments', routerDeployment)
             }
-            await waitForGone('/api/v1/namespaces/' + ns + '/pods', routerLabel, 'router pods', podTimeout)
+            await waitForGone('/api/v1/namespaces/' + namespace + '/pods', routerLabel, 'router pods', podTimeout, namespace)
 
-            console.log('Phase 1: delete user deployments, services, leases, virtualservices, secrets (parallel)')
+            console.log('Phase 1: delete user deployments, services, jobs, configmaps (anchors + mirrors)')
+            for (const ns of nsList) {
+              await Promise.all([
+                deleteByLabel('/apis/apps/v1/namespaces/' + ns + '/deployments', um, 'deployments', ns),
+                deleteByLabel('/api/v1/namespaces/' + ns + '/services', um, 'services', ns),
+                deleteByLabel('/apis/batch/v1/namespaces/' + ns + '/jobs', um, 'jobs', ns),
+                deleteByLabel('/api/v1/namespaces/' + ns + '/configmaps', um, 'configmaps', ns),
+              ])
+            }
+            // Release-namespace-only resources (registry, leases, VS).
             await Promise.all([
-              deleteByLabel('/apis/apps/v1/namespaces/' + ns + '/deployments', um, 'deployments'),
-              deleteByLabel('/api/v1/namespaces/' + ns + '/services', um, 'services'),
-              deleteByLabel('/apis/coordination.k8s.io/v1/namespaces/' + ns + '/leases', um, 'leases'),
-              deleteByLabel('/apis/networking.istio.io/v1/namespaces/' + ns + '/virtualservices', um, 'virtualservices'),
-              deleteByLabel('/api/v1/namespaces/' + ns + '/secrets', um, 'secrets'),
+              deleteByLabel('/api/v1/namespaces/' + namespace + '/secrets', um, 'secrets', namespace),
+              deleteByLabel('/apis/coordination.k8s.io/v1/namespaces/' + namespace + '/leases', um, 'leases', namespace),
+              deleteByLabel('/apis/networking.istio.io/v1/namespaces/' + namespace + '/virtualservices', um, 'virtualservices', namespace),
             ])
 
             console.log('Phase 2: wait for user pods to terminate (releases PVC mounts)')
-            await waitForGone('/api/v1/namespaces/' + ns + '/pods', pods, 'pods', podTimeout)
+            for (const ns of nsList) {
+              await waitForGone('/api/v1/namespaces/' + ns + '/pods', pods, 'pods', podTimeout, ns)
+            }
 
-            console.log('Phase 3: delete user PVCs (parallel), then wait for them to be gone')
-            await deleteByLabel('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs')
-            await waitForGone('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', pvcTimeout)
+            console.log('Phase 3: delete DSH-owned PVCs (parallel), then wait for them to be gone')
+            for (const ns of nsList) {
+              await deleteByLabel('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', ns)
+              await waitForGone('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', pvcTimeout, ns)
+            }
 
             console.log('=== Cleanup done ===')
           }

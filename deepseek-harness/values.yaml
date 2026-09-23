@@ -237,6 +237,38 @@ no_proxy:
   enabled: false
 
 # ============================================================
+# Platform (PCAI/Kubeflow) workspace integration — study Option B
+# ============================================================
+# When enabled AND the endpoint is SSO-gated, SSO users get their DSH unit
+# deployed INSIDE their platform project namespace (project-user-<username>)
+# with the platform volumes kubeflow-shared-pvc (/mnt/shared, cluster-wide
+# shared) and user-pvc (/mnt/user, personal project volume) mounted
+# read-write, and the unit process running as the project's unix identity
+# (uid/gid from the project-info ConfigMap) so file ownership on the
+# platform volumes matches notebook-written files exactly.
+#
+# Enabling this renders a cross-namespace ClusterRole for the router and
+# cleanup service accounts (see README "Platform volumes for SSO users").
+# Local (non-SSO) users keep the classic single-namespace behavior.
+platformIntegration:
+  enabled: false
+  # Platform project namespace prefix (ezprojects-operator:
+  # EZPROJECTS_NAMESPACE_NAME=project-{{ .EzProjectName }}, private projects
+  # are named user-<username>).
+  namespacePrefix: "project-user-"
+  volumes:
+    shared:
+      claim: "kubeflow-shared-pvc"
+      mountPath: "/mnt/shared"
+    user:
+      claim: "user-pvc"
+      mountPath: "/mnt/user"
+  # Monitor-only deployments: mount the platform volumes but expose them
+  # read-only in the Data Manager (unix permissions stay the real
+  # enforcement regardless).
+  readOnly: false
+
+# ============================================================
 # Shared workspace content (populates the shared PVC)
 # ============================================================
 sharedContent:

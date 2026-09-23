@@ -36,7 +36,17 @@ data:
     // v23: user pods get PREVIEW_UI_HOST (the VirtualService endpoint) so
     // the port watcher prints preview URLs against the deployed host
     // instead of the hardcoded dsh. subdomain.
-    const RUNTIME_REV = '23'
+    // v24: readable user slugs — the per-user URL prefix becomes the
+    // sanitized username (e.g. /francesco-caliva/) instead of the opaque
+    // sha256 prefix (/u-af5a35ed08b8/); pods re-template to the new
+    // USER_SLUG/SESSION_KEY values on their next resolve (pre-0.3.5
+    // /u-{hash} URLs keep working).
+    // v25: platform integration (study Option B) — SSO users' units deploy
+    // inside project-user-<username> with the platform PVCs mounted and the
+    // process running under the project's unix identity (USER_INFO_* env
+    // from the project-info ConfigMap; init chowns the DSH volumes; the
+    // startup drops privileges via setpriv).
+    const RUNTIME_REV = '25'
     const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${userDshVersion}`
     const ttydVersion = '1.7.7'
     const usernameHeader = 'x-auth-request-preferred-username'
@@ -80,12 +90,78 @@ data:
     // previously-deleted volume (VAST CSI deletes can fail when
     // deletionViewPolicy is not configured to allow local volume deletion).
     const pvcNameVersion = process.env.PVC_NAME_VERSION || '{{ .Values.storage.nameVersion }}'
+    const sharedWorkspaceSize = process.env.SHARED_WORKSPACE_SIZE || '{{ .Values.storage.sharedSize }}'
 
-    function slugForUser(userId) {
+    // --- Platform (PCAI/Kubeflow) workspace integration (Option B) ---------
+    // SSO users whose platform project (EzProject -> namespace
+    // project-user-<username>, created by the ezprojects-operator on first
+    // platform login) already exists get their DSH unit deployed INSIDE that
+    // namespace, with the platform volumes mounted and the process running
+    // under the project's unix identity. See
+    // docs/platform-pvc-integration-study.md.
+    const platformEnabled = process.env.PLATFORM_INTEGRATION_ENABLED === 'true'
+    const platformNsPrefix = process.env.PLATFORM_NAMESPACE_PREFIX || 'project-user-'
+    const platformSharedClaim = process.env.PLATFORM_SHARED_CLAIM || 'kubeflow-shared-pvc'
+    const platformSharedMount = process.env.PLATFORM_SHARED_MOUNT || '/mnt/shared'
+    const platformUserClaim = process.env.PLATFORM_USER_CLAIM || 'user-pvc'
+    const platformUserMount = process.env.PLATFORM_USER_MOUNT || '/mnt/user'
+    const platformReadOnly = process.env.PLATFORM_VOLUMES_READONLY === 'true'
+    // ConfigMaps the unit pod template mounts. For units deployed into a
+    // project namespace these are mirrored (copied + owner-anchored) into
+    // that namespace, since cross-namespace volume mounts are impossible.
+    const unitConfigMapNames = [
+      '{{ .Release.Name }}-project-config',
+      '{{ .Release.Name }}-personal-content',
+      '{{ .Release.Name }}-preview-config',
+      {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
+      '{{ .Release.Name }}-shared-content',
+      {{- end }}
+    ]
+    // TTL caches so the per-request resolve path does not hammer the API
+    // server with platform context / mirror-sync checks.
+    const platformContextCache = new Map() // username -> { at, value }
+    const mirrorSyncCache = new Map() // unitNamespace -> timestamp
+
+    // Readable user slugs. Usernames are unique in the registry (local
+    // registration and admin create reject duplicates, and an SSO identity is
+    // tracked under its exact lowercased header value), so the slug can simply
+    // be the URL-safe username itself: SSO user "francesco-caliva" is served
+    // at /francesco-caliva/ instead of the opaque /u-<sha256-prefix>/ of
+    // pre-0.3.5 releases.
+    const slugMaxLength = 54 // "dsh-user-" + slug must stay a valid DNS-1123 label (<= 63 chars)
+    // Slugs that would shadow router control paths or in-pod root-relative app
+    // routes (nginx serves /terminal, /term, /data_manager) keep the legacy
+    // hash slug instead.
+    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u'])
+    function slugifyUsername(userId) {
+      const cleaned = (userId || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+      if (!cleaned) return ''
+      if (cleaned.length > slugMaxLength) {
+        // Truncated long names keep a hash suffix so two distinct usernames
+        // sharing a long prefix can never collapse into one environment.
+        return cleaned.slice(0, slugMaxLength - 7).replace(/-+$/, '')
+          + '-' + crypto.createHash('sha256').update(userId.toLowerCase()).digest('hex').slice(0, 6)
+      }
+      return cleaned
+    }
+    // Pre-0.3.5 one-way-hash slug; kept for bookmark compatibility, as the
+    // degenerate-name fallback, and to find/migrate pre-0.3.5 environments.
+    function legacySlugForUser(userId) {
       return crypto.createHash('sha256').update(userId.toLowerCase()).digest('hex').slice(0, 12)
     }
+    function slugForUser(userId) {
+      const readable = slugifyUsername(userId)
+      if (!readable || readable.startsWith('__') || readable.startsWith('u-') || slugReservedNames.has(readable)) {
+        return legacySlugForUser(userId)
+      }
+      return readable
+    }
 
-    function namesForSlug(slug) {
+    function namesForSlug(slug, unitNs) {
       const base = `dsh-user-${slug}`
       return {
         deployment: base,
@@ -93,6 +169,9 @@ data:
         workspaceClaim: `${base}-workspace-pvc-${pvcNameVersion}`,
         stateClaim: `${base}-state-pvc-${pvcNameVersion}`,
         virtualService: `dsh-user-vs-${slug}`,
+        // The namespace the unit lives in: the release namespace (classic
+        // shape) or the user's platform project namespace (Option B).
+        namespace: unitNs || namespace,
       }
     }
 
@@ -198,10 +277,10 @@ data:
       }
     }
 
-    async function waitForDeploymentGone(name, timeoutMs = 90000) {
+    async function waitForDeploymentGone(name, timeoutMs = 90000, ns = namespace) {
       const start = Date.now()
       while (Date.now() - start < timeoutMs) {
-        const dep = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`)
+        const dep = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`)
         if (!dep || (dep.status?.replicas || 0) === 0) return
         await new Promise((resolve) => setTimeout(resolve, 2000))
       }
@@ -214,11 +293,12 @@ data:
     // Only conversation data is removed: workspace files,
     // settings.yaml/agents/skills and auth.json (model keys) survive, and the
     // user's session cookie stays valid.
-    function deploymentForSlug(deployments, slug) {
+    function deploymentForSlug(deployments, slug, legacySlug) {
       for (const dep of deployments) {
         const labels = dep.metadata?.labels || {}
         if (labels['dsh-user-slug'] === slug) return dep
-        if (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === slug) return dep
+        if (labels['dsh-user-warmpool'] === 'true'
+          && (labels['dsh-user-owner'] === slug || (legacySlug && labels['dsh-user-owner'] === legacySlug))) return dep
       }
       return null
     }
@@ -229,13 +309,13 @@ data:
       return volume?.persistentVolumeClaim?.claimName || null
     }
 
-    async function podForSlug(slug) {
-      const result = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+    async function podForSlug(slug, legacySlug, ns = namespace) {
+      const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       let fallback = null
       for (const pod of (result && result.items) || []) {
         const labels = pod.metadata?.labels || {}
         const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
-        if (podSlug !== slug || !pod.spec?.nodeName) continue
+        if ((podSlug !== slug && (!legacySlug || podSlug !== legacySlug)) || !pod.spec?.nodeName) continue
         if (pod.status?.phase === 'Running') {
           return { phase: 'Running', nodeName: pod.spec.nodeName }
         }
@@ -250,13 +330,29 @@ data:
     // success at the pod level guards against the JobTrackingWithFinalizers
     // failure mode where status.succeeded sticks behind a finished pod
     // (stuck batch.kubernetes.io/job-tracking finalizer).
-    async function jobPodPhase(jobName) {
-      const result = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/pods?labelSelector=${encodeURIComponent('job-name=' + jobName)}`)
+    async function jobPodPhase(jobName, ns = namespace) {
+      const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('job-name=' + jobName)}`)
       for (const pod of (result && result.items) || []) {
         const phase = pod.status?.phase
         if (phase === 'Succeeded' || phase === 'Failed') return phase
       }
       return null
+    }
+
+    // Distinct namespaces DSH units live in: the release namespace plus every
+    // unit namespace recorded in the registry (platform integration, Option
+    // B). Used by the cleanup sweeps and the admin snapshot paths.
+    async function knownUnitNamespaces() {
+      const namespaces = new Set([namespace])
+      try {
+        const users = await loadUserRegistry()
+        for (const record of Object.values(users)) {
+          if (record?.unitNs) namespaces.add(record.unitNs)
+        }
+      } catch {
+        // Registry unreadable: stay with the release namespace only.
+      }
+      return [...namespaces]
     }
 
     // Cleanup Jobs are removed as soon as their clear finishes (finally block
@@ -265,65 +361,85 @@ data:
     // condition (stuck job-tracking finalizer). The 5-minute age floor is
     // safely beyond the 240s poll deadline, so a live clear is never swept.
     async function sweepStaleClearJobs() {
-      try {
-        const result = await k8sRequest('GET', `/apis/batch/v1/namespaces/${namespace}/jobs?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
-        const cutoff = Date.now() - 5 * 60 * 1000
-        for (const job of (result && result.items) || []) {
-          const name = job.metadata?.name || ''
-          if (!name.startsWith('dsh-clear-')) continue
-          const createdAt = Date.parse(job.metadata?.creationTimestamp || '')
-          if (!Number.isFinite(createdAt) || createdAt > cutoff) continue
-          console.log(`[admin] sweeping stale cleanup job ${name}`)
-          await deleteK8s(`/apis/batch/v1/namespaces/${namespace}/jobs`, name)
-        }
-      } catch (error) {
-        console.error('[admin] cleanup job sweep failed', error)
-      }
-      try {
-        // Orphaned cleanup PODS: when the job controller never removes the
-        // batch.kubernetes.io/job-tracking finalizer (observed on clusters
-        // with wedged job tracking), deleting the Job leaves its Completed
-        // pod behind. Strip the finalizer via a merge patch, then delete the
-        // pod. NOTE: on clusters whose Kyverno policies rewrite immutable
-        // spec fields on pod updates (schedulerName), this PATCH is only
-        // accepted when a policy precondition skips terminating pods — see
-        // 'assign-custom-scheduler-for-ezua-user-vendor-pods' on devday. A
-        // failed strip is logged and the delete is still attempted.
-        const podResult = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/pods?labelSelector=${encodeURIComponent('job-name')}`)
-        const podCutoff = Date.now() - 5 * 60 * 1000
-        for (const pod of (podResult && podResult.items) || []) {
-          const podName = pod.metadata?.name || ''
-          if (!podName.startsWith('dsh-clear-')) continue
-          const podCreatedAt = Date.parse(pod.metadata?.creationTimestamp || '')
-          if (!Number.isFinite(podCreatedAt) || podCreatedAt > podCutoff) continue
-          console.log(`[admin] sweeping stale cleanup pod ${podName}`)
-          try {
-            await k8sRequest('PATCH', `/api/v1/namespaces/${namespace}/pods/${podName}`, { metadata: { finalizers: null } })
-          } catch (error) {
-            if (error.statusCode !== 404) console.error(`[admin] finalizer strip failed for ${podName}: ${error.message}`)
+      const namespaces = await knownUnitNamespaces()
+      for (const ns of namespaces) {
+        try {
+          const result = await k8sRequest('GET', `/apis/batch/v1/namespaces/${ns}/jobs?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+          const cutoff = Date.now() - 5 * 60 * 1000
+          for (const job of (result && result.items) || []) {
+            const name = job.metadata?.name || ''
+            if (!name.startsWith('dsh-clear-')) continue
+            const createdAt = Date.parse(job.metadata?.creationTimestamp || '')
+            if (!Number.isFinite(createdAt) || createdAt > cutoff) continue
+            console.log(`[admin] sweeping stale cleanup job ${name} in ${ns}`)
+            await deleteK8s(`/apis/batch/v1/namespaces/${ns}/jobs`, name)
           }
-          await deleteK8s(`/api/v1/namespaces/${namespace}/pods`, podName)
+        } catch (error) {
+          if (error.statusCode !== 403 && error.statusCode !== 404) console.error(`[admin] cleanup job sweep failed in ${ns}`, error)
         }
-      } catch (error) {
-        console.error('[admin] cleanup pod sweep failed', error)
+        try {
+          // Orphaned cleanup PODS: when the job controller never removes the
+          // batch.kubernetes.io/job-tracking finalizer (observed on clusters
+          // with wedged job tracking), deleting the Job leaves its Completed
+          // pod behind. Strip the finalizer via a merge patch, then delete the
+          // pod. NOTE: on clusters whose Kyverno policies rewrite immutable
+          // spec fields on pod updates (schedulerName), this PATCH is only
+          // accepted when a policy precondition skips terminating pods — see
+          // 'assign-custom-scheduler-for-ezua-user-vendor-pods' on devday. A
+          // failed strip is logged and the delete is still attempted.
+          const podResult = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('job-name')}`)
+          const podCutoff = Date.now() - 5 * 60 * 1000
+          for (const pod of (podResult && podResult.items) || []) {
+            const podName = pod.metadata?.name || ''
+            if (!podName.startsWith('dsh-clear-')) continue
+            const podCreatedAt = Date.parse(pod.metadata?.creationTimestamp || '')
+            if (!Number.isFinite(podCreatedAt) || podCreatedAt > podCutoff) continue
+            console.log(`[admin] sweeping stale cleanup pod ${podName} in ${ns}`)
+            try {
+              await k8sRequest('PATCH', `/api/v1/namespaces/${ns}/pods/${podName}`, { metadata: { finalizers: null } })
+            } catch (error) {
+              if (error.statusCode !== 404) console.error(`[admin] finalizer strip failed for ${podName}: ${error.message}`)
+            }
+            await deleteK8s(`/api/v1/namespaces/${ns}/pods`, podName)
+          }
+        } catch (error) {
+          if (error.statusCode !== 403 && error.statusCode !== 404) console.error(`[admin] cleanup pod sweep failed in ${ns}`, error)
+        }
       }
     }
 
     // One deployments/pods snapshot shared by a whole bulk clear: fetching
     // both lists per user hammers the API server with duplicate heavy
-    // requests and can wedge the batch.
+    // requests and can wedge the batch. Deployment + pod listing covers the
+    // release namespace AND every known unit namespace (platform units).
     async function fetchEnvironmentSnapshot() {
-      const deployments = await listUserDeployments()
-      const result = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+      const namespaces = await knownUnitNamespaces()
+      const deployments = []
+      for (const ns of namespaces) {
+        try {
+          deployments.push(...await listUserDeployments(ns))
+        } catch (error) {
+          if (error.statusCode !== 403 && error.statusCode !== 404) throw error
+        }
+      }
       const podBySlug = new Map()
-      for (const pod of (result && result.items) || []) {
-        const labels = pod.metadata?.labels || {}
-        const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
-        if (!podSlug || !pod.spec?.nodeName) continue
-        const phase = pod.status?.phase || 'Unknown'
-        const existing = podBySlug.get(podSlug)
-        if (!existing || (existing.phase !== 'Running' && phase === 'Running')) {
-          podBySlug.set(podSlug, { phase, nodeName: pod.spec.nodeName })
+      for (const ns of namespaces) {
+        let result = null
+        try {
+          result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+        } catch (error) {
+          if (error.statusCode !== 403 && error.statusCode !== 404) throw error
+          continue
+        }
+        for (const pod of (result && result.items) || []) {
+          const labels = pod.metadata?.labels || {}
+          const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
+          if (!podSlug || !pod.spec?.nodeName) continue
+          const phase = pod.status?.phase || 'Unknown'
+          const existing = podBySlug.get(podSlug)
+          if (!existing || (existing.phase !== 'Running' && phase === 'Running')) {
+            podBySlug.set(podSlug, { phase, nodeName: pod.spec.nodeName, namespace: ns })
+          }
         }
       }
       return { deployments, podBySlug }
@@ -331,22 +447,29 @@ data:
 
     async function clearUserConversations(username, snapshot) {
       const slug = slugForUser(username)
+      const legacySlug = legacySlugForUser(username)
       const deployments = snapshot?.deployments || await listUserDeployments()
-      const deployment = deploymentForSlug(deployments, slug)
+      const deployment = deploymentForSlug(deployments, slug, legacySlug)
       if (!deployment) return { username, slug, status: 'no environment' }
+      // The unit (and its state claim) may live in the user's platform
+      // project namespace (Option B) — every object below targets the
+      // deployment's own namespace.
+      const deploymentNs = deployment.metadata?.namespace || namespace
       const claimName = stateClaimForDeployment(deployment)
       if (!claimName) return { username, slug, status: 'failed: state claim not found on deployment' }
       // Pin the cleanup pod to the node already holding the RWO state PVC so
       // it can co-mount the volume. Prefer a Running pod but fall back to any
       // scheduled pod: an unpinned Job can deadlock on Multi-Attach.
-      const pod = snapshot ? snapshot.podBySlug.get(slug) : await podForSlug(slug)
+      const pod = snapshot
+        ? (snapshot.podBySlug.get(slug) || snapshot.podBySlug.get(legacySlug))
+        : await podForSlug(slug, legacySlug, deploymentNs)
       const jobName = `dsh-clear-${slug}-${Date.now().toString(36)}`
       const manifest = {
         apiVersion: 'batch/v1',
         kind: 'Job',
         metadata: {
           name: jobName,
-          namespace,
+          namespace: deploymentNs,
           labels: {
             app: '{{ .Chart.Name }}',
             'dsh-user-managed': 'true',
@@ -391,7 +514,7 @@ data:
         },
       }
       try {
-        await k8sRequest('POST', `/apis/batch/v1/namespaces/${namespace}/jobs`, manifest)
+        await k8sRequest('POST', `/apis/batch/v1/namespaces/${deploymentNs}/jobs`, manifest)
       } catch (error) {
         if (error.statusCode !== 409) throw error
       }
@@ -403,7 +526,7 @@ data:
       try {
         const deadline = Date.now() + 240000
         while (Date.now() < deadline) {
-          const job = await k8sRequest('GET', `/apis/batch/v1/namespaces/${namespace}/jobs/${jobName}`)
+          const job = await k8sRequest('GET', `/apis/batch/v1/namespaces/${deploymentNs}/jobs/${jobName}`)
           if (!job) {
             return { username, slug, status: 'failed: cleanup job disappeared' }
           }
@@ -414,7 +537,7 @@ data:
             // effect immediately. Recreate strategy swaps the pod cleanly.
             if (pod) {
               try {
-                await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${deployment.metadata.name}`, {
+                await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${deploymentNs}/deployments/${deployment.metadata.name}`, {
                   spec: {
                     template: {
                       metadata: {
@@ -437,34 +560,177 @@ data:
         }
         return { username, slug, status: 'failed: timed out waiting for cleanup job' }
       } finally {
-        await deleteK8s(`/apis/batch/v1/namespaces/${namespace}/jobs`, jobName).catch(() => {})
+        await deleteK8s(`/apis/batch/v1/namespaces/${deploymentNs}/jobs`, jobName).catch(() => {})
       }
     }
 
-    async function deleteUserEnvironment(slug) {
-      const names = namesForSlug(slug)
-      const deployments = await listUserDeployments()
-      let warm = null
-      for (const dep of deployments) {
-        const labels = dep.metadata?.labels || {}
-        if (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === slug) {
-          warm = warmNamesForPoolId(Number(labels['dsh-user-pool-id']))
-          break
+    // Safety tripwire (integration study §7.6 — uninstall contract): never
+    // delete a PVC owned by the platform (ezprojects), even if it somehow
+    // ended up in a target set. Platform PVCs carry ezprojects.hpe.com/*
+    // labels; DSH-created PVCs never do. Unreadable PVCs fail safe (treated
+    // as platform-owned).
+    async function isPlatformOwnedClaim(ns, claimName) {
+      try {
+        const pvc = await k8sRequest('GET', `/api/v1/namespaces/${ns}/persistentvolumeclaims/${claimName}`)
+        if (!pvc) return false
+        const labels = pvc.metadata?.labels || {}
+        if (Object.keys(labels).some((l) => l.startsWith('ezprojects.hpe.com/'))) {
+          console.warn(`[platform] REFUSING to delete platform-owned PVC ${ns}/${claimName}`)
+          return true
+        }
+        return false
+      } catch {
+        console.warn(`[platform] REFUSING to delete unreadable PVC ${ns}/${claimName}`)
+        return true
+      }
+    }
+
+    // Discover the namespace(s) hosting a user's unit WITHOUT relying on the
+    // registry: the ownership anchors (`dsh-anchor-<slug>`, DSH-labeled) are
+    // the durable truth. The registry is only a hint — the entry can already
+    // be deleted or stale, and either case previously orphaned the unit in
+    // the project namespace (observed on g2: an uninstall cleaned the release
+    // namespace but never visited project-user-<name>).
+    async function anchorNamespacesForSlug(slug) {
+      const found = new Set()
+      try {
+        const result = await k8sRequest('GET', `/api/v1/configmaps?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+        for (const cm of (result && result.items) || []) {
+          const meta = cm.metadata || {}
+          if (!String(meta.name || '').startsWith('dsh-anchor-')) continue
+          if ((meta.labels || {})['dsh-user-slug'] !== slug) continue
+          if (meta.namespace && meta.namespace !== namespace) found.add(meta.namespace)
+        }
+      } catch (error) {
+        // 403 (platform RBAC not rendered) degrades to registry-only discovery.
+        console.error(`[platform] anchor scan failed for ${slug}: ${error.message}`)
+      }
+      return [...found]
+    }
+
+    async function deleteUserEnvironment(slug, legacySlug) {
+      // A user may own resources under the readable slug and/or a pre-0.3.5
+      // legacy-hash slug (e.g. deleted before their first post-upgrade login),
+      // so both candidates are cleaned up.
+      const candidates = [...new Set([slug, legacySlug].filter(Boolean))]
+      const names = namesForSlug(candidates[0])
+      // Platform (Option B) unit namespaces: the registry (when the entry
+      // still exists) UNION the cluster-wide anchor scan (durable truth).
+      const unitNsSet = new Set()
+      try {
+        const users = await loadUserRegistry()
+        for (const candidate of candidates) {
+          if (users[candidate]?.unitNs && users[candidate].unitNs !== namespace) {
+            unitNsSet.add(users[candidate].unitNs)
+          }
+          // SSO records are keyed by username while slug is derived; scan as
+          // a fallback for records without a matching key.
+          for (const record of Object.values(users)) {
+            if (record?.slug === candidate && record.unitNs && record.unitNs !== namespace) {
+              unitNsSet.add(record.unitNs)
+            }
+          }
+        }
+      } catch {
+        // Registry unreadable — the anchor scan and explicit deletes still run.
+      }
+      for (const candidate of candidates) {
+        for (const ns of await anchorNamespacesForSlug(candidate)) {
+          unitNsSet.add(ns)
         }
       }
-      const target = warm || {
-        deployment: names.deployment,
-        service: names.service,
-        workspaceClaim: names.workspaceClaim,
-        stateClaim: names.stateClaim,
+      // Delete the ownership anchors first: the Kubernetes GC cascades every
+      // DSH-created object in those namespaces (deployment, service, DSH PVCs,
+      // mirrored ConfigMaps). The platform PVCs are never owner-referenced, so
+      // the GC is structurally unable to touch them.
+      for (const ns of unitNsSet) {
+        for (const candidate of candidates) {
+          await deleteK8s(`/api/v1/namespaces/${ns}/configmaps`, `dsh-anchor-${candidate}`)
+        }
       }
-      await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, names.virtualService)
-      await deleteK8s(`/apis/apps/v1/namespaces/${namespace}/deployments`, target.deployment)
-      await waitForDeploymentGone(target.deployment)
-      await deleteK8s(`/api/v1/namespaces/${namespace}/services`, target.service)
-      await deleteK8s(`/api/v1/namespaces/${namespace}/persistentvolumeclaims`, target.workspaceClaim)
-      await deleteK8s(`/api/v1/namespaces/${namespace}/persistentvolumeclaims`, target.stateClaim)
-      await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `dsh-user-${slug}`)
+      // Explicit belt-and-braces cleanup (independent of the GC path), swept
+      // in the release namespace and every discovered unit namespace.
+      const targetNamespaces = [...new Set([namespace, ...unitNsSet])]
+      const deployments = []
+      for (const ns of targetNamespaces) {
+        try {
+          deployments.push(...await listUserDeployments(ns))
+        } catch {
+          // Namespace unreadable — skip it.
+        }
+      }
+      let warm = null
+      outer: for (const candidate of candidates) {
+        for (const dep of deployments) {
+          const labels = dep.metadata?.labels || {}
+          if (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === candidate) {
+            warm = warmNamesForPoolId(Number(labels['dsh-user-pool-id']))
+            break outer
+          }
+        }
+      }
+      // Prefer the environment that actually exists and derive its claim
+      // names from the deployment spec: an adopted pre-0.3.5 environment
+      // mounts legacy-named claims that a name-derived lookup would miss
+      // (leaking VAST quotas).
+      let target = null
+      if (warm) {
+        // Warm units only exist in the release namespace.
+        target = { ...warm, ns: namespace }
+      } else {
+        for (const candidate of candidates) {
+          const candidateNames = namesForSlug(candidate)
+          for (const ns of targetNamespaces) {
+            const dep = deployments.find((d) => d.metadata?.name === candidateNames.deployment && (d.metadata?.namespace || namespace) === ns)
+            if (!dep) continue
+            const volumeClaims = new Map(
+              (dep.spec?.template?.spec?.volumes || [])
+                .filter((v) => v.persistentVolumeClaim?.claimName)
+                .map((v) => [v.name, v.persistentVolumeClaim.claimName]),
+            )
+            target = {
+              deployment: candidateNames.deployment,
+              service: candidateNames.service,
+              ns,
+              workspaceClaim: volumeClaims.get('personal-workspace') || candidateNames.workspaceClaim,
+              stateClaim: volumeClaims.get('state') || candidateNames.stateClaim,
+              // The DSH-level shared PVC is per-namespace (and
+              // owner-anchored) for platform units, but release-level and
+              // helm-managed for classic units — only delete it when the
+              // unit does NOT live in the release namespace.
+              sharedClaim: ns !== namespace ? volumeClaims.get('shared-workspace') : null,
+            }
+            break
+          }
+          if (target) break
+        }
+      }
+      if (!target && unitNsSet.size > 0) {
+        const tns = [...unitNsSet][0]
+        target = {
+          deployment: names.deployment,
+          service: names.service,
+          ns: tns,
+          workspaceClaim: names.workspaceClaim,
+          stateClaim: names.stateClaim,
+          sharedClaim: sharedWorkspaceClaim,
+        }
+      }
+      for (const candidate of candidates) {
+        const candidateNames = namesForSlug(candidate)
+        await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, candidateNames.virtualService)
+        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `dsh-user-${candidate}`)
+      }
+      if (target) {
+        const tns = target.ns || namespace
+        await deleteK8s(`/apis/apps/v1/namespaces/${tns}/deployments`, target.deployment)
+        await waitForDeploymentGone(target.deployment, 90000, tns)
+        await deleteK8s(`/api/v1/namespaces/${tns}/services`, target.service)
+        for (const claim of [target.workspaceClaim, target.stateClaim, target.sharedClaim].filter(Boolean)) {
+          if (await isPlatformOwnedClaim(tns, claim)) continue
+          await deleteK8s(`/api/v1/namespaces/${tns}/persistentvolumeclaims`, claim)
+        }
+      }
     }
 
     // --- Session cookie --------------------------------------------------
@@ -740,8 +1006,8 @@ data:
       }
     }
 
-    async function ensurePersistentVolumeClaim(name, size) {
-      const path = `/api/v1/namespaces/${namespace}/persistentvolumeclaims/${name}`
+    async function ensurePersistentVolumeClaim(name, size, ns = namespace, ownerRefs = null) {
+      const path = `/api/v1/namespaces/${ns}/persistentvolumeclaims/${name}`
       const existing = await k8sRequest('GET', path)
       if (existing) {
         return
@@ -751,11 +1017,12 @@ data:
         kind: 'PersistentVolumeClaim',
         metadata: {
           name,
-          namespace,
+          namespace: ns,
           labels: {
             app: '{{ .Chart.Name }}',
             'dsh-user-managed': 'true',
           },
+          ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
         spec: {
           accessModes: ['ReadWriteOnce'],
@@ -768,7 +1035,7 @@ data:
         },
       }
       try {
-        await k8sRequest('POST', `/api/v1/namespaces/${namespace}/persistentvolumeclaims`, manifest)
+        await k8sRequest('POST', `/api/v1/namespaces/${ns}/persistentvolumeclaims`, manifest)
       } catch (error) {
         if (error.statusCode !== 409) {
           throw error
@@ -787,7 +1054,7 @@ data:
       })
     }
 
-    function userServiceManifest(name, slug) {
+    function userServiceManifest(name, slug, ns = namespace, ownerRefs = null) {
       // 8082 = the in-pod nginx entry point (dsh web itself is loopback-only).
       const spec = serviceSpec(8082)
       spec.selector = {
@@ -798,12 +1065,13 @@ data:
         kind: 'Service',
         metadata: {
           name,
-          namespace,
+          namespace: ns,
           labels: {
             app: 'dsh-user',
             'dsh-user-managed': 'true',
             'dsh-user-slug': slug,
           },
+          ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
         spec,
       }
@@ -859,12 +1127,14 @@ data:
 
     async function upsertService(manifest) {
       const name = manifest.metadata.name
-      const path = `/api/v1/namespaces/${namespace}/services/${name}`
+      const ns = manifest.metadata.namespace || namespace
+      const path = `/api/v1/namespaces/${ns}/services/${name}`
       const existing = await k8sRequest('GET', path)
       if (existing) {
-        if (!servicePortsMatch(existing.spec?.ports, manifest.spec.ports)) {
+        if (!servicePortsMatch(existing.spec?.ports, manifest.spec.ports)
+          || JSON.stringify(existing.metadata?.ownerReferences || []) !== JSON.stringify(manifest.metadata.ownerReferences || [])) {
           await k8sRequest('PATCH', path, {
-            metadata: { labels: manifest.metadata.labels },
+            metadata: { labels: manifest.metadata.labels, ...(manifest.metadata.ownerReferences ? { ownerReferences: manifest.metadata.ownerReferences } : {}) },
             spec: {
               selector: manifest.spec.selector,
               ports: manifest.spec.ports,
@@ -874,7 +1144,7 @@ data:
         return
       }
       try {
-        await k8sRequest('POST', `/api/v1/namespaces/${namespace}/services`, manifest)
+        await k8sRequest('POST', `/api/v1/namespaces/${ns}/services`, manifest)
       } catch (error) {
         if (error.statusCode !== 409) {
           throw error
@@ -882,8 +1152,8 @@ data:
       }
     }
 
-    async function ensureService(name, slug) {
-      await upsertService(userServiceManifest(name, slug))
+    async function ensureService(name, slug, ns = namespace, ownerRefs = null) {
+      await upsertService(userServiceManifest(name, slug, ns, ownerRefs))
     }
 
     function warmNamesForPoolId(poolId) {
@@ -897,8 +1167,10 @@ data:
       }
     }
 
-    async function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner }) {
+    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform }) {
       slug = owner || (isWarmPool ? `warm-${poolId}` : slug)
+      const manifestNs = unitNs || namespace
+      const platformVolumesMounted = !!(platform && platform.volumesMounted)
       const matchLabels = isWarmPool
         ? { 'dsh-user-pool-id': String(poolId) }
         : { 'dsh-user-slug': slug }
@@ -908,28 +1180,64 @@ data:
         'dsh-role': 'preview',
         ...matchLabels,
         ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
+        ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
       }
       const deploymentLabels = {
         app: 'dsh-user',
         'dsh-user-managed': 'true',
         ...matchLabels,
         ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
+        ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
       }
       if (owner) {
         podLabels['dsh-user-owner'] = owner
         deploymentLabels['dsh-user-owner'] = owner
       }
+      // Identity env (Option B): the project's unix attributes from the
+      // platform project-info ConfigMap. Consumed by the init container
+      // (volume chown + installs under the identity) and by the startup
+      // (setpriv drop for the whole service stack). Absent for classic
+      // units — everything then behaves exactly as before.
+      const platformIdentityEnv = platform && platform.identity ? [
+        { name: 'USER_INFO_UID', value: String(platform.identity.uid) },
+        { name: 'USER_INFO_GID', value: String(platform.identity.gid) },
+        { name: 'USER_INFO_USERNAME', value: platform.identity.user || '' },
+        { name: 'USER_INFO_GROUP', value: platform.identity.group || '' },
+        { name: 'USER_INFO_HOMEDIR', value: platform.identity.homedir || '/var/dsh/home' },
+      ] : []
+      // Data Manager platform roots: mounted → show; pending/off → hide.
+      const platformRootsMode = platform ? (platformVolumesMounted ? 'mounted' : 'pending') : 'off'
+      // Platform PVC volumes — mounted BY REFERENCE (claimName) into the
+      // unit's namespace. Never labeled, never owner-referenced, never
+      // deleted by DSH: they belong to the platform (EzProject).
+      const platformVolumes = platformVolumesMounted ? [
+        { name: 'platform-shared', persistentVolumeClaim: { claimName: platformSharedClaim } },
+        { name: 'platform-user', persistentVolumeClaim: { claimName: platformUserClaim } },
+      ] : []
+      const platformVolumeMounts = platformVolumesMounted ? [
+        { name: 'platform-shared', mountPath: platformSharedMount },
+        { name: 'platform-user', mountPath: platformUserMount },
+      ] : []
       const initCommandParts = [
         'mkdir -p /workspace/personal /workspace/shared /var/dsh/home/.dsh/skills /var/dsh/data /var/dsh/state /var/dsh/cache /var/dsh/bin',
-        'ln -sfn /workspace /var/dsh/home/workspace',
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
-        'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi',
-        'if [ ! -f /var/dsh/home/.dsh/settings.yaml ]; then if [ -f /var/dsh/config/dsh/settings.yaml ]; then cp /var/dsh/config/dsh/settings.yaml /var/dsh/home/.dsh/settings.yaml; elif [ -f /opt/dsh-defaults/settings.yaml ]; then cp /opt/dsh-defaults/settings.yaml /var/dsh/home/.dsh/settings.yaml; fi; fi',
+        // --- Platform identity (Option B): when USER_INFO_* is stamped (SSO
+        // unit inside the project namespace), all VOLUME content work runs as
+        // the project unix identity so file ownership matches the platform.
+        // DSH-owned volumes are chowned ONLY when their root owner differs
+        // (fresh volume) — never a blanket recursive chown on every boot, and
+        // NEVER the platform volumes (/mnt/shared, /mnt/user): those keep
+        // their platform ownership; access is enforced by unix permissions
+        // against the identity, exactly like a notebook.
+        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/dsh/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/dsh /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
+        '$RUN_AS_USER ln -sfn /workspace /var/dsh/home/workspace',
+        '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/settings.yaml ]; then if [ -f /var/dsh/config/dsh/settings.yaml ]; then cp /var/dsh/config/dsh/settings.yaml /var/dsh/home/.dsh/settings.yaml; elif [ -f /opt/dsh-defaults/settings.yaml ]; then cp /opt/dsh-defaults/settings.yaml /var/dsh/home/.dsh/settings.yaml; fi; fi\'',
         // AGENTS.md seeding is best-effort: the file is user-managed now
         // (dshInstructions was removed from the chart), so both sources may
         // legitimately be absent — a failed cp must NOT kill the init
         // container (that would crash-loop every new pod).
-        'if [ ! -f /workspace/personal/AGENTS.md ]; then if [ -f /var/dsh/config/dsh/AGENTS.md ]; then cp /var/dsh/config/dsh/AGENTS.md /workspace/personal/AGENTS.md; elif [ -f /opt/dsh-defaults/AGENTS.md ]; then cp /opt/dsh-defaults/AGENTS.md /workspace/personal/AGENTS.md; fi; fi',
+        '$RUN_AS_USER sh -c \'if [ ! -f /workspace/personal/AGENTS.md ]; then if [ -f /var/dsh/config/dsh/AGENTS.md ]; then cp /var/dsh/config/dsh/AGENTS.md /workspace/personal/AGENTS.md; elif [ -f /opt/dsh-defaults/AGENTS.md ]; then cp /opt/dsh-defaults/AGENTS.md /workspace/personal/AGENTS.md; fi; fi || true\'',
         // Seed $DSH_HOME/.env from chart values (dshEnv) — the same launch-
         // env layer a laptop .env provides. Seed-once semantics like
         // settings.yaml: user edits afterwards are never overwritten. The
@@ -937,7 +1245,7 @@ data:
         // base64: values content must survive the values→JS→shell quoting
         // layers byte-exact (a printf format string would corrupt %/$).
         {{- if and .Values.dshEnv (ne (trim .Values.dshEnv) "") }}
-        'if [ ! -f /var/dsh/home/.dsh/.env ]; then printf %s {{ .Values.dshEnv | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/.env; fi',
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/.env ]; then printf %s {{ .Values.dshEnv | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/.env; fi\'',
         {{- end }}
         // Seed the web profile's patch layer from chart values
         // (dshCordisPatch) — MCP integrations, session content search,
@@ -947,34 +1255,56 @@ data:
         // storage.nameVersion for fresh volumes). The supervisor watches
         // this file and YAML-validates it before restarting dsh on change.
         {{- if and .Values.dshCordisPatch (ne (trim .Values.dshCordisPatch) "") }}
-        'if [ ! -f /var/dsh/home/.dsh/profiles/web/cordis.patch.yml ]; then mkdir -p /var/dsh/home/.dsh/profiles/web && printf %s {{ .Values.dshCordisPatch | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/profiles/web/cordis.patch.yml; fi',
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/profiles/web/cordis.patch.yml ]; then mkdir -p /var/dsh/home/.dsh/profiles/web && printf %s {{ .Values.dshCordisPatch | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/profiles/web/cordis.patch.yml; fi\'',
         {{- end }}
         // Skills are user-managed: drop SKILL.md trees into
         // /var/dsh/home/.dsh/skills/ (Data Manager or terminal) — dsh
         // hot-refreshes them natively, no chart seeding, no watcher restart.
 {{- range $path, $_ := $.Files.Glob "personal/**" }}
 {{- if not (hasPrefix "." (base $path)) }}
-        'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }} || true',
+        '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
 {{- end }}
 {{- end }}
 {{- range $path, $_ := $.Files.Glob "create-server.sh" }}
-        'cp /personal-templates/create-server.sh /var/dsh/bin/create-server.sh && chmod 0755 /var/dsh/bin/create-server.sh || true',
+        '$RUN_AS_USER sh -c \'cp /personal-templates/create-server.sh /var/dsh/bin/create-server.sh && chmod 0755 /var/dsh/bin/create-server.sh\' || true',
 {{- end }}
-        "printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/home/.bashrc",
-        "printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/dsh/home/.bash_profile",
-        "cp /var/dsh/home/.bash_profile /var/dsh/home/.profile",
-        "printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/bin/dsh-bashrc",
-        "printf '#!/bin/sh\\nexport BASH_ENV=/var/dsh/bin/dsh-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/dsh/bin/dsh-login-shell",
-        'chmod 0755 /var/dsh/bin/dsh-login-shell',
+        // NOTE: the printf format strings below stay SINGLE-quoted in the
+        // shell so $HOME/$PATH/$@ are written into the files as literals and
+        // expand at login time. $RUN_AS_USER prefixes each so the files are
+        // created owned by the project identity (a plain root printf into a
+        // uid-owned directory would leave root-owned, non-editable files).
+        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/home/.bashrc",
+        "$RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/dsh/home/.bash_profile",
+        '$RUN_AS_USER cp /var/dsh/home/.bash_profile /var/dsh/home/.profile',
+        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/bin/dsh-bashrc",
+        "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/dsh/bin/dsh-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/dsh/bin/dsh-login-shell",
+        '$RUN_AS_USER chmod 0755 /var/dsh/bin/dsh-login-shell',
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
-        'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc',
+        '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc\'',
 {{- end }}
-        "if [ ! -f /var/dsh/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/dsh/bin sh && ln -sf /var/dsh/bin/uv /usr/local/bin/uv && ln -sf /var/dsh/bin/uvx /usr/local/bin/uvx; fi",
-        "if [ ! -f /var/dsh/data/npm/bin/dsh ] || [ \"$(cat /var/dsh/.dsh-version 2>/dev/null)\" != \"${DSH_VERSION}\" ]; then npm install -g \"@deepseek-ai/dsh@${DSH_VERSION}\" --prefix /var/dsh/data/npm && echo \"${DSH_VERSION}\" > /var/dsh/.dsh-version && ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh; fi",
-        "if [ ! -x /var/dsh/bin/ttyd ]; then arch=\"$(uname -m)\"; case \"$arch\" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo \"unsupported architecture for ttyd: $arch\" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd \"https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}\" && chmod 0755 /var/dsh/bin/ttyd; fi",
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\n/var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\nnode /opt/preview/port_watcher.mjs &\nnode /opt/preview/data_manager.mjs &\nnode /opt/preview/terminal_manager.js &\nexec node /opt/preview/dsh_supervisor.mjs\n' > /var/dsh/bin/dsh-startup.sh",
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/dsh/bin sh; fi\' || true',
+        '$RUN_AS_USER sh -c \'ln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true; ln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\' || true',
+        // The dsh npm install runs under the project identity when stamped:
+        // version bumps then never re-create root-owned files on the state
+        // volume (which would be unwritable for the unit process).
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/data/npm/bin/dsh ] || [ "$(cat /var/dsh/.dsh-version 2>/dev/null)" != "${DSH_VERSION}" ]; then HOME=/var/dsh/home npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --prefix /var/dsh/data/npm && echo "${DSH_VERSION}" > /var/dsh/.dsh-version && (ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true); fi\'',
+        '$RUN_AS_USER sh -c \'if [ ! -x /var/dsh/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/dsh/bin/ttyd; fi\'',
+{{- if and .Values.sharedContent .Values.sharedContent.enabled }}
+        // Per-namespace shared PVC seeding (platform units each get their own
+        // <release>-shared-pvc; classic units seed here too — cp -n makes it
+        // seed-once, so user edits in the shared workspace survive restarts).
+        '$RUN_AS_USER sh -c \'if [ -f /dsh-shared-seed/seed.sh ]; then sh /dsh-shared-seed/seed.sh /dsh-shared-seed /workspace/shared; fi\' || true',
+{{- end }}
+        // The service stack (ttyd, port watcher, data manager, terminal
+        // manager, dsh supervisor) is wrapped in start_services(); the
+        // startup execs it via setpriv under the project identity (USER_INFO_*),
+        // so every user-facing service — and every file it writes, on the DSH
+        // volumes AND on the platform volumes — runs as the platform unix
+        // identity, byte-identical to a Kubeflow notebook. Without identity
+        // (classic local units) it runs as root, exactly as before.
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\nstart_services() {\n  /var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/dsh_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-dshuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/dsh/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-dshuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/dsh/bin/dsh-startup.sh",
         "chmod 0755 /var/dsh/bin/dsh-startup.sh",
-        'rm -rf /workspace/personal/shared',
+        '$RUN_AS_USER sh -c \'rm -rf /workspace/personal/shared\' || true',
       ]
       const initCommand = initCommandParts.join(' && ')
 
@@ -988,8 +1318,9 @@ data:
         kind: 'Deployment',
         metadata: {
           name,
-          namespace,
+          namespace: manifestNs,
           labels: deploymentLabels,
+          ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
         spec: {
           replicas: 1,
@@ -1007,6 +1338,10 @@ data:
               annotations: {
                 'sidecar.istio.io/inject': 'false',
                 'dsh-web-helm/user-template-version': userTemplateVersion,
+                // Convergence key for the platform mounts: when the
+                // platform state changes (pending -> mounted), the router
+                // re-stamps the unit so the pod restarts with the volumes.
+                'dsh-web-helm/platform-mounts': platformVolumesMounted ? 'mounted' : (platform ? 'pending' : 'off'),
               },
             },
             spec: {
@@ -1037,6 +1372,7 @@ data:
                     { name: 'DSH_VERSION', value: userDshVersion },
                     { name: 'TTYD_VERSION', value: ttydVersion },
                     { name: 'DSH_UI_PORT', value: String(userDshPort) },
+                    ...platformIdentityEnv,
                     {{- if and .Values.proxy .Values.proxy.enabled }}
                     {{- range .Values.proxy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
@@ -1054,6 +1390,10 @@ data:
                     { name: 'state', mountPath: '/var/dsh' },
                     { name: 'project-config', mountPath: '/opt/dsh-defaults', readOnly: true },
                     { name: 'personal-content', mountPath: '/personal-templates', readOnly: true },
+{{- if and .Values.sharedContent .Values.sharedContent.enabled }}
+                    { name: 'shared-content-seed', mountPath: '/dsh-shared-seed', readOnly: true },
+{{- end }}
+                    ...platformVolumeMounts,
                   ],
                 },
               ],
@@ -1121,6 +1461,9 @@ data:
                     { name: '{{ .name }}', value: '{{ .value }}' },
                     {{- end }}
                     {{- end }}
+                    ...platformIdentityEnv,
+                    { name: 'DSH_PLATFORM_ROOTS', value: platformRootsMode },
+                    { name: 'DSH_PLATFORM_ROOTS_READONLY', value: platformReadOnly ? 'true' : 'false' },
                     {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                     {{- range .Values.certificatesPolicy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
@@ -1166,6 +1509,7 @@ data:
                     { name: 'preview-config', mountPath: '/opt/preview/terminal_manager.js', subPath: 'terminal_manager.js' },
                     { name: 'preview-config', mountPath: '/opt/preview/terminal_manager.html', subPath: 'terminal_manager.html' },
                     { name: 'preview-config', mountPath: '/opt/preview/tty-attach-session.sh', subPath: 'tty-attach-session.sh' },
+                    ...platformVolumeMounts,
                     {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                     {{- range .Values.certificatesPolicy.volumeMounts }}
                     { name: '{{ .name }}', mountPath: '{{ .mountPath }}'{{ if .subPath }}, subPath: '{{ .subPath }}'{{ end }}{{ if hasKey . "readOnly" }}, readOnly: {{ .readOnly }}{{ end }} },
@@ -1213,6 +1557,10 @@ data:
                 { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
                 { name: 'preview-config', configMap: { name: '{{ .Release.Name }}-preview-config', defaultMode: 365 } },
+{{- if and .Values.sharedContent .Values.sharedContent.enabled }}
+                { name: 'shared-content-seed', configMap: { name: '{{ .Release.Name }}-shared-content' } },
+{{- end }}
+                ...platformVolumes,
                 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                 {{- range .Values.certificatesPolicy.volumes }}
                 { name: '{{ .name }}', {{ if hasKey . "emptyDir" }}emptyDir: {}{{ else }}configMap: { name: '{{ .configMap.name }}', {{- if .configMap.items }} items: [ {{- range .configMap.items }} { key: '{{ .key }}', path: '{{ .path }}' }, {{- end }} ] {{- end }} }{{ end }} },
@@ -1227,14 +1575,18 @@ data:
     }
 
     async function upsertUserDeployment(name, manifest) {
-      const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`)
+      const ns = manifest.metadata.namespace || namespace
+      const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`)
       if (existing) {
         const version = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/user-template-version']
-        // Also converge the rollout strategy on deployments created before
-        // Recreate was introduced (RWO volumes + RollingUpdate deadlock).
         const needsStrategy = existing.spec?.strategy?.type !== 'Recreate'
-        if (version !== userTemplateVersion || needsStrategy) {
-          await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`, {
+        // Platform-mount state is part of the convergence contract: a unit
+        // provisioned while the platform workspace was pending must be
+        // re-stamped once the platform PVCs become available.
+        const mounts = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/platform-mounts']
+        const desiredMounts = manifest.spec.template.metadata.annotations['dsh-web-helm/platform-mounts']
+        if (version !== userTemplateVersion || needsStrategy || mounts !== desiredMounts) {
+          await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`, {
             metadata: { labels: manifest.metadata.labels },
             spec: { strategy: { type: 'Recreate' }, template: manifest.spec.template },
           })
@@ -1242,7 +1594,7 @@ data:
         return
       }
       try {
-        await k8sRequest('POST', `/apis/apps/v1/namespaces/${namespace}/deployments`, manifest)
+        await k8sRequest('POST', `/apis/apps/v1/namespaces/${ns}/deployments`, manifest)
       } catch (error) {
         if (error.statusCode !== 409) {
           throw error
@@ -1250,8 +1602,8 @@ data:
       }
     }
 
-    async function ensureDeployment(name, workspaceClaim, stateClaim, slug) {
-      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool: false })
+    async function ensureDeployment(name, workspaceClaim, stateClaim, slug, options = {}) {
+      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool: false, ...options })
       await upsertUserDeployment(name, manifest)
     }
 
@@ -1269,8 +1621,8 @@ data:
       await ensureWarmDeployment(poolId)
     }
 
-    async function listUserDeployments() {
-      const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
+    async function listUserDeployments(ns = namespace) {
+      const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       return (result && result.items) || []
     }
 
@@ -1386,7 +1738,7 @@ data:
       return prev.then(() => release)
     }
 
-    async function claimWarmForUser(slug) {
+    async function claimWarmForUser(slug, legacySlug) {
       // Bounded retries: re-verify ownership inside the per-pool lock so two
       // concurrent claims can never both PATCH the same warm unit (which would
       // overwrite the owner and strand one user on a pod that authenticates the
@@ -1399,7 +1751,11 @@ data:
         for (const dep of deployments) {
           const state = warmUnitState(dep)
           if (!state.isWarm) continue
-          if (state.owned && state.labels['dsh-user-owner'] === slug) {
+          if (state.owned && (state.labels['dsh-user-owner'] === slug
+            || (legacySlug && state.labels['dsh-user-owner'] === legacySlug))) {
+            // Owns it under the readable slug or the pre-0.3.5 legacy hash
+            // (the claim below re-templates the unit with the readable slug,
+            // rolling the pod while its volumes — and the user's data — stay).
             if (mine === null || state.poolId < mine) mine = state.poolId
           } else if (!state.owned) {
             // Ready units are preferred, but a unit that is still starting
@@ -1450,10 +1806,10 @@ data:
       return null
     }
 
-    async function waitForDeployment(name, timeoutMs = 300000) {
+    async function waitForDeployment(name, timeoutMs = 300000, ns = namespace) {
       const start = Date.now()
       while (Date.now() - start < timeoutMs) {
-        const deployment = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`)
+        const deployment = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`)
         const desiredReplicas = deployment?.spec?.replicas || 1
         if (
           deployment?.status?.observedGeneration >= deployment?.metadata?.generation
@@ -1468,7 +1824,8 @@ data:
     }
 
     async function isEnvironmentReady(names) {
-      const deployment = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`)
+      const ns = names.namespace || namespace
+      const deployment = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${names.deployment}`)
       if (!deployment) return false
       const desiredReplicas = deployment?.spec?.replicas || 1
       return (
@@ -1479,14 +1836,25 @@ data:
     }
 
     function startProvisionWatch(names) {
-      const key = names.deployment
+      const ns = names.namespace || namespace
+      // The MAP KEY includes the namespace (platform units get their own
+      // task slot) — but the watch must pass the namespace separately:
+      // embedding it into the deployment name builds a malformed API path
+      // (observed as a 403 + router crash on the first platform login).
+      const key = `${ns}/${names.deployment}`
       const existing = provisionTasks.get(key)
       if (existing) return existing
       const task = { promise: null, error: null }
-      task.promise = waitForDeployment(key).catch((error) => {
-        task.error = error
-        throw error
-      })
+      // The promise must NEVER reject: with the setup UI enabled nothing
+      // awaits it, and an unhandled rejection would crash the router.
+      // Failures are recorded on the task for /__dsh_setup_status to show.
+      task.promise = waitForDeployment(names.deployment, 300000, ns).then(
+        () => { task.error = null },
+        (error) => {
+          task.error = error
+          console.error(`[provision] watch failed for ${ns}/${names.deployment}: ${error.message}`)
+        },
+      )
       provisionTasks.set(key, task)
       return task
     }
@@ -1495,8 +1863,205 @@ data:
       await startProvisionWatch(names).promise
     }
 
+    // --- Platform environment resolution (Option B) -------------------------
+    // The EzProject name derives from the SSO username with the platform's
+    // own sanitization (dots/underscores -> dashes) — the same shape as
+    // slugifyUsername. The candidate namespace is always VERIFIED against
+    // the live project-info ConfigMap, so a sanitization mismatch or a
+    // not-yet-provisioned workspace degrades safely to the classic
+    // release-namespace unit instead of guessing wrong.
+    function platformNamespaceForUser(userId) {
+      if (!platformEnabled) return null
+      const sanitized = slugifyUsername(userId)
+      if (!sanitized) return null
+      return `${platformNsPrefix}${sanitized}`
+    }
+
+    async function fetchPlatformContext(userId) {
+      const unitNs = platformNamespaceForUser(userId)
+      if (!unitNs || unitNs === namespace) return null
+      const info = await k8sRequest('GET', `/api/v1/namespaces/${unitNs}/configmaps/project-info`)
+      if (!info?.data?.uid || !info?.data?.gid) return null
+      const identity = {
+        uid: info.data.uid,
+        gid: info.data.gid,
+        user: info.data.user || '',
+        group: info.data.group || '',
+        homedir: info.data.homedir || '',
+      }
+      const [sharedPvc, userPvc] = await Promise.all([
+        k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformSharedClaim}`).catch(() => null),
+        k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformUserClaim}`).catch(() => null),
+      ])
+      const bound = (pvc) => !!pvc && pvc.status?.phase === 'Bound'
+      return {
+        unitNamespace: unitNs,
+        identity,
+        volumesMounted: bound(sharedPvc) && bound(userPvc),
+      }
+    }
+
+    async function platformContextForUser(userId) {
+      const cached = platformContextCache.get(userId)
+      const now = Date.now()
+      if (cached && now - cached.at < 60000) return cached.value
+      let value = null
+      try {
+        value = await fetchPlatformContext(userId)
+      } catch (error) {
+        // 403 (cross-namespace RBAC not granted yet) and transient API
+        // failures degrade to the classic release-namespace unit — the
+        // platform feature must never break a user's request.
+        console.error(`[platform] context fetch failed for ${userId}: ${error.message}`)
+      }
+      platformContextCache.set(userId, { at: now, value })
+      return value
+    }
+
+    function anchorManifest(unitNs, slug) {
+      return {
+        apiVersion: 'v1',
+        kind: 'ConfigMap',
+        metadata: {
+          name: `dsh-anchor-${slug}`,
+          namespace: unitNs,
+          labels: {
+            app: '{{ .Chart.Name }}',
+            'dsh-user-managed': 'true',
+            'dsh-user-slug': slug,
+          },
+          // Ownership anchor (integration study §7.6): every DSH-created
+          // object in the project namespace references this anchor via
+          // ownerReferences. Deleting it (admin user-delete or helm
+          // uninstall) cascades the unit — and ONLY the unit: the platform
+          // PVCs are never owner-referenced, so the GC is structurally
+          // unable to touch them.
+          annotations: { 'dsh-web-helm/anchor': 'true' },
+        },
+        data: { note: 'DSH unit ownership anchor. Deleting it deletes the DSH unit resources in this namespace; it never deletes the platform PVCs (kubeflow-shared-pvc / user-pvc).' },
+      }
+    }
+
+    async function ensureUnitAnchor(unitNs, slug) {
+      const manifest = anchorManifest(unitNs, slug)
+      const path = `/api/v1/namespaces/${unitNs}/configmaps/${manifest.metadata.name}`
+      const existing = await k8sRequest('GET', path)
+      if (existing) return existing
+      try {
+        return await k8sRequest('POST', `/api/v1/namespaces/${unitNs}/configmaps`, manifest)
+      } catch (error) {
+        if (error.statusCode !== 409) throw error
+        return await k8sRequest('GET', path)
+      }
+    }
+
+    function ownerRefToAnchor(anchor) {
+      if (!anchor?.metadata?.name || !anchor?.metadata?.uid) return null
+      return [{
+        apiVersion: 'v1',
+        kind: 'ConfigMap',
+        name: anchor.metadata.name,
+        uid: anchor.metadata.uid,
+        blockOwnerDeletion: false,
+        controller: false,
+      }]
+    }
+
+    // Mirror the ConfigMaps the unit pod template mounts into the unit
+    // namespace (cross-namespace volume mounts are impossible). Synced on a
+    // rate-limited path so a helm upgrade converges the mirrors without
+    // hammering the API server on every request.
+    async function syncUnitConfigMaps(unitNs, ownerRefs) {
+      for (const cmName of unitConfigMapNames) {
+        const src = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/configmaps/${cmName}`)
+        if (!src) continue
+        const desiredData = src.data || {}
+        const desiredLabels = {
+          app: '{{ .Chart.Name }}',
+          'dsh-user-managed': 'true',
+        }
+        const existing = await k8sRequest('GET', `/api/v1/namespaces/${unitNs}/configmaps/${cmName}`)
+        if (!existing) {
+          try {
+            await k8sRequest('POST', `/api/v1/namespaces/${unitNs}/configmaps`, {
+              apiVersion: 'v1',
+              kind: 'ConfigMap',
+              metadata: {
+                name: cmName,
+                namespace: unitNs,
+                labels: desiredLabels,
+                ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
+              },
+              data: desiredData,
+            })
+          } catch (error) {
+            if (error.statusCode !== 409) throw error
+          }
+        } else if (JSON.stringify(existing.data || {}) !== JSON.stringify(desiredData)) {
+          await k8sRequest('PUT', `/api/v1/namespaces/${unitNs}/configmaps/${cmName}`, {
+            ...existing,
+            data: desiredData,
+            metadata: { ...existing.metadata, labels: desiredLabels },
+          })
+        }
+      }
+    }
+
+    async function syncUnitConfigMapsRateLimited(unitNs, ownerRefs) {
+      const now = Date.now()
+      const last = mirrorSyncCache.get(unitNs) || 0
+      if (now - last < 60000) return
+      mirrorSyncCache.set(unitNs, now)
+      await syncUnitConfigMaps(unitNs, ownerRefs)
+    }
+
+    // The platform (Option B) environment: unit Deployment/Service/DSH PVCs
+    // in the user's project namespace, all owner-anchored, with the platform
+    // PVCs mounted BY REFERENCE and the identity stamped into the pod.
+    async function resolvePlatformEnvironment(userId, slug, platform) {
+      const unitNs = platform.unitNamespace
+      const names = { ...namesForSlug(slug, unitNs), dshSharedClaim: sharedWorkspaceClaim }
+      const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${unitNs}/deployments/${names.deployment}`)
+      const anchor = await ensureUnitAnchor(unitNs, slug)
+      const ownerRefs = ownerRefToAnchor(anchor)
+      await syncUnitConfigMapsRateLimited(unitNs, ownerRefs)
+      if (existing) {
+        await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs, ownerRefs)
+        await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs, ownerRefs)
+        await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs, ownerRefs)
+        await ensureService(names.service, slug, unitNs, ownerRefs)
+        await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
+        return { slug, names }
+      }
+      // First provision inside the platform namespace: the unit is BORN here
+      // (Kubernetes objects cannot move between namespaces), so a brand-new
+      // SSO user cold-starts once; every later login/resume is warm. A unit
+      // provisioned while the platform PVCs were not Bound yet is re-stamped
+      // (pod restart) once they are — see the platform-mounts annotation.
+      console.log(`[platform] provisioning unit for ${userId} in ${unitNs} (mounts=${platform.volumesMounted ? 'platform+own' : 'own only; platform PVCs not Bound yet'})`)
+      await ensureLease(`dsh-user-${slug}`)
+      await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs, ownerRefs)
+      await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs, ownerRefs)
+      await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs, ownerRefs)
+      await ensureService(names.service, slug, unitNs, ownerRefs)
+      await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
+      try {
+        // Persist the unit location so admin listing, conversation clears
+        // and the uninstall cleanup find the unit without guessing.
+        const users = await loadUserRegistry()
+        if (users[userId]) {
+          users[userId] = { ...users[userId], unitNs }
+          await saveUserRegistry(users)
+        }
+      } catch (error) {
+        console.error(`[platform] registry unitNs persist failed for ${userId}`, error)
+      }
+      return { slug, names }
+    }
+
     async function resolveUserEnvironment(userId) {
       const slug = slugForUser(userId)
+      const legacySlug = legacySlugForUser(userId)
       const names = namesForSlug(slug)
       // Sticky: if the user already has a dedicated (non-warm) environment, keep
       // serving them there. Prevents a user who fell back to a dedicated
@@ -1511,6 +2076,37 @@ data:
         await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug)
         return { slug, names }
       }
+      // Platform (Option B) — only for users WITHOUT an existing
+      // release-namespace unit (sticky semantics preserved: nobody is
+      // silently moved or reset). A fresh install therefore provisions every
+      // SSO user inside their platform project namespace; an upgraded
+      // cluster keeps existing units where they are until they are deleted.
+      if (platformEnabled) {
+        const platform = await platformContextForUser(userId)
+        if (platform) {
+          return await resolvePlatformEnvironment(userId, slug, platform)
+        }
+      }
+      // One-time v0.3.5 migration: a dedicated environment provisioned by a
+      // pre-readable-slug release lives under the legacy hash slug. Re-home it
+      // under the readable slug while KEEPING the user's volumes: PVCs cannot
+      // be renamed, so the new deployment mounts the legacy claims and the
+      // legacy deployment/service/lease are retired (the legacy deployment is
+      // deleted first so its RWO volumes detach before the new pod binds them).
+      const legacyNames = namesForSlug(legacySlug)
+      const legacyDedicated = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${legacyNames.deployment}`)
+      if (legacyDedicated) {
+        console.log(`[migration] adopting legacy environment of ${userId}: ${legacyNames.deployment} -> ${names.deployment}`)
+        await deleteK8s(`/apis/apps/v1/namespaces/${namespace}/deployments`, legacyNames.deployment)
+        await waitForDeploymentGone(legacyNames.deployment)
+        await deleteK8s(`/api/v1/namespaces/${namespace}/services`, legacyNames.service)
+        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `dsh-user-${legacySlug}`)
+        await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, legacyNames.virtualService)
+        await ensureLease(`dsh-user-${slug}`)
+        await ensureService(names.service, slug)
+        await ensureDeployment(names.deployment, legacyNames.workspaceClaim, legacyNames.stateClaim, slug)
+        return { slug, names: { ...names, workspaceClaim: legacyNames.workspaceClaim, stateClaim: legacyNames.stateClaim } }
+      }
       if (warmPoolEnabled && warmPoolSize > 0) {
         let claimed = null
         try {
@@ -1520,7 +2116,7 @@ data:
           // to a dedicated pod (bounded: worst case ~6s, vs minutes of cold
           // provisioning).
           for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
-            claimed = await claimWarmForUser(slug)
+            claimed = await claimWarmForUser(slug, legacySlug)
             if (!claimed && attempt < 2) {
               await new Promise((resolve) => setTimeout(resolve, 2000))
             }
@@ -1542,27 +2138,29 @@ data:
       return { slug, names }
     }
 
-    function targetForUserPath(names, path, slug) {
+    function targetForUserPath(names, path, prefix) {
       return {
-        host: `${names.service}.${namespace}.svc.cluster.local`,
+        host: `${names.service}.${names.namespace || namespace}.svc.cluster.local`,
         port: 8082,
         preserveHost: true,
         path,
-        forwardedPrefix: `/u-${slug}`,
+        forwardedPrefix: prefix,
       }
     }
 
     function targetForPassthrough(names, path) {
       return {
-        host: `${names.service}.${namespace}.svc.cluster.local`,
+        host: `${names.service}.${names.namespace || namespace}.svc.cluster.local`,
         port: 8082,
         preserveHost: true,
         path,
       }
     }
 
-    function stripSlugPrefix(requestUrl, slug) {
-      const prefix = `/u-${slug}`
+    // `prefix` is the browser-visible per-user URL prefix: readable
+    // `/{username-slug}` (v0.3.5+) or legacy `/u-{hash}`. It is stripped
+    // before the proxy hop (the pod nginx serves at root).
+    function stripSlugPrefix(requestUrl, prefix) {
       if (!requestUrl.startsWith(prefix)) return requestUrl
       const rest = requestUrl.slice(prefix.length)
       if (rest === '') return '/'
@@ -1752,7 +2350,7 @@ data:
       try {
         const environment = await resolveUserEnvironment(userId)
         if (url.searchParams.get('reset') === 'retry') {
-          provisionTasks.delete(environment.names.deployment)
+          provisionTasks.delete(`${environment.names.namespace || namespace}/${environment.names.deployment}`)
           json(response, 200, { ready: false, retried: true })
           return
         }
@@ -1761,7 +2359,7 @@ data:
           json(response, 200, { ready: true })
           return
         }
-        const task = provisionTasks.get(environment.names.deployment)
+        const task = provisionTasks.get(`${environment.names.namespace || namespace}/${environment.names.deployment}`)
         if (task?.error) {
           json(response, 200, { ready: false, failed: true, error: task.error.message || 'Provisioning failed' })
           return
@@ -2188,8 +2786,31 @@ data:
     }
 
     function redirectToPod(response, slug) {
-      response.writeHead(302, { location: `/u-${slug}` })
+      response.writeHead(302, { location: `/${slug}` })
       response.end()
+    }
+
+    // Shared body of a per-user prefixed request (readable and legacy URLs).
+    // `prefix` is what the browser sees; it is stripped before the proxy hop
+    // and passed to the pod as x-forwarded-prefix.
+    async function serveUserPath(request, response, identity, prefix) {
+      try {
+        const environment = await resolveUserEnvironment(identity)
+        if (setupUiEnabled) {
+          if (!(await isEnvironmentReady(environment.names))) {
+            startProvisionWatch(environment.names)
+            serveSetupPage(response)
+            return
+          }
+        } else {
+          await provisionReady(environment.names)
+        }
+        const target = targetForUserPath(environment.names, stripSlugPrefix(request.url || '/', prefix), prefix)
+        proxyRequest(request, response, target)
+      } catch (error) {
+        console.error('user path request handling failed', error)
+        json(response, error.statusCode || 500, { error: error.message })
+      }
     }
 
     function adminPageHtml() {
@@ -2348,6 +2969,9 @@ data:
             var lastLogin = u.lastLogin ? new Date(u.lastLogin).toLocaleString() : '&mdash;';
             var nameCell = u.username ? u.username : '<i style="color:var(--text-muted);">unidentified</i>';
             var actions = '';
+            if (u.username) {
+              actions += '<button data-act="open" data-slug="' + u.slug + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Open</button>';
+            }
             if (u.username && u.source !== 'sso') {
               actions += '<button data-act="rename" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Rename</button>' +
                 '<button data-act="reset" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Reset</button>';
@@ -2366,6 +2990,7 @@ data:
             var u = b.getAttribute('data-u');
             var slug = b.getAttribute('data-slug');
             var act = b.getAttribute('data-act');
+            if (act === 'open') { window.location.href = '/' + slug; return; }
             if (act === 'rename') { openModal('rename', u); return; }
             if (act === 'reset') { openModal('reset', u); return; }
             b.disabled = true;
@@ -2544,28 +3169,44 @@ data:
         }
         const users = await loadUserRegistry()
         const deployments = await listUserDeployments()
-        const list = Object.keys(users).map((username) => {
+        const list = await Promise.all(Object.keys(users).map(async (username) => {
           const record = users[username] || {}
           const slug = slugForUser(username)
-          const dep = deployments.find((d) => {
-            const labels = d.metadata?.labels || {}
-            return labels['dsh-user-slug'] === slug
-              || (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === slug)
-          })
+          const legacy = legacySlugForUser(username)
+          let dep = null
+          let unitNs = namespace
+          if (record.unitNs && record.unitNs !== namespace) {
+            // Platform (Option B) unit — lives in the user's project
+            // namespace, look it up there directly.
+            unitNs = record.unitNs
+            dep = await k8sRequest('GET', `/apis/apps/v1/namespaces/${unitNs}/deployments/${namesForSlug(slug, unitNs).deployment}`).catch(() => null)
+          } else {
+            dep = deployments.find((d) => {
+              const labels = d.metadata?.labels || {}
+              return labels['dsh-user-slug'] === slug
+                || (labels['dsh-user-warmpool'] === 'true'
+                  && (labels['dsh-user-owner'] === slug || labels['dsh-user-owner'] === legacy))
+            }) || null
+          }
           return {
             username,
             slug,
             source: record.sso ? 'sso' : 'local',
             lastLogin: record.lastLogin || null,
+            namespace: unitNs,
             exists: !!dep,
             ready: !!dep && (dep.status?.readyReplicas || 0) >= 1,
           }
-        })
+        }))
         // Merge environments that belong to no registry user (e.g. SSO users
         // who signed in before identity tracking existed). The identity behind
         // the slug is a one-way hash, so only the slug can be shown; these
         // rows can still be deleted by slug.
         const knownSlugs = new Set(list.map((u) => u.slug))
+        // A user's pre-0.3.5 environment still carries the legacy hash as its
+        // owner until their first post-upgrade login migrates it — do not list
+        // it as an unknown row in the meantime.
+        for (const username of Object.keys(users)) knownSlugs.add(legacySlugForUser(username))
         for (const d of deployments) {
           const labels = d.metadata?.labels || {}
           const slug = labels['dsh-user-warmpool'] === 'true'
@@ -2629,7 +3270,7 @@ data:
           return
         }
         try {
-          await deleteUserEnvironment(slug)
+          await deleteUserEnvironment(slug, identity ? legacySlugForUser(identity) : undefined)
           if (identity) {
             const users = await loadUserRegistry()
             if (users[identity]) {
@@ -2701,7 +3342,7 @@ data:
           console.error('admin rename provision failed', error)
         }
         try {
-          await deleteUserEnvironment(slugForUser(oldName))
+          await deleteUserEnvironment(slugForUser(oldName), legacySlugForUser(oldName))
         } catch (error) {
           console.error('admin rename cleanup failed', error)
         }
@@ -2785,34 +3426,33 @@ data:
         return
       }
 
-      // Path-based per-user routing: /u-{slug}/... -> that user's pod nginx (:8082).
-      const userPathMatch = pathname.match(/^\/u-([a-f0-9]{12})(\/.*)?$/)
-      if (userPathMatch) {
-        const pathSlug = userPathMatch[1]
+      // Path-based per-user routing -> that user's pod nginx (:8082). Two URL
+      // forms are served, both only for the signed-in user's own slug:
+      //   /{username-slug}/...  readable slug (v0.3.5+), e.g. /francesco-caliva/
+      //   /u-{12-hex}/...       legacy one-way-hash slug (pre-0.3.5 bookmarks)
+      const legacyPathMatch = pathname.match(/^\/u-([a-f0-9]{12})(\/.*)?$/)
+      if (legacyPathMatch) {
+        const pathSlug = legacyPathMatch[1]
         const identity = readSessionIdentity(request)
-        if (!identity || slugForUser(identity) !== pathSlug) {
+        if (!identity || legacySlugForUser(identity) !== pathSlug) {
           response.writeHead(302, { location: '/' })
           response.end()
           return
         }
-        try {
-          const environment = await resolveUserEnvironment(identity)
-          if (setupUiEnabled) {
-            if (!(await isEnvironmentReady(environment.names))) {
-              startProvisionWatch(environment.names)
-              serveSetupPage(response)
-              return
-            }
-          } else {
-            await provisionReady(environment.names)
-          }
-          const target = targetForUserPath(environment.names, stripSlugPrefix(request.url || '/', pathSlug), pathSlug)
-          proxyRequest(request, response, target)
-        } catch (error) {
-          console.error('user path request handling failed', error)
-          json(response, error.statusCode || 500, { error: error.message })
-        }
+        await serveUserPath(request, response, identity, `/u-${pathSlug}`)
         return
+      }
+      const userPathMatch = pathname.match(/^\/([a-z0-9][a-z0-9-]{0,53})(\/.*)?$/)
+      if (userPathMatch) {
+        const pathSlug = userPathMatch[1]
+        const identity = readSessionIdentity(request)
+        if (identity && slugForUser(identity) === pathSlug) {
+          await serveUserPath(request, response, identity, `/${pathSlug}`)
+          return
+        }
+        // Not this user's slug (or no session): fall through to the session
+        // passthrough / login page below — a single-segment match must never
+        // swallow root-relative in-pod app paths (/terminal, /data_manager…).
       }
 
       // Session-keyed passthrough: any other path on the main host is served to the
@@ -2875,15 +3515,17 @@ data:
       serveAuthPage(response, sessionIdentity)
     })
 
-    // WebSocket upgrades for /u-{slug}/... (terminal, ttyd, preview sockets).
+    // WebSocket upgrades for /{slug}/... and legacy /u-{hash}/... (terminal,
+    // ttyd, preview sockets).
     server.on('upgrade', async (request, socket, head) => {
       const pathname = new URL(request.url || '/', 'http://internal').pathname
-      const match = pathname.match(/^\/u-([a-f0-9]{12})(\/.*)?$/)
+      const legacyMatch = pathname.match(/^\/u-([a-f0-9]{12})(\/.*)?$/)
+      const readableMatch = !legacyMatch && pathname.match(/^\/([a-z0-9][a-z0-9-]{0,53})(\/.*)?$/)
       const reject = (status, message) => {
         socket.write(`HTTP/1.1 ${status} ${message}\r\n\r\n`)
         socket.destroy()
       }
-      if (!match) {
+      if (!legacyMatch && !readableMatch) {
         // Root-relative WebSocket from an in-pod app: route to the signed-in user's pod.
         const identity = readSessionIdentity(request)
         if (!identity) {
@@ -2899,15 +3541,33 @@ data:
         }
         return
       }
-      const pathSlug = match[1]
+      const pathSlug = legacyMatch ? legacyMatch[1] : readableMatch[1]
+      const prefix = legacyMatch ? `/u-${pathSlug}` : `/${pathSlug}`
       const identity = readSessionIdentity(request)
-      if (!identity || slugForUser(identity) !== pathSlug) {
-        reject(401, 'Unauthorized')
+      const expectedSlug = !identity
+        ? null
+        : (legacyMatch ? legacySlugForUser(identity) : slugForUser(identity))
+      if (!identity || expectedSlug !== pathSlug) {
+        // A readable slug that is not this user's must not be rejected
+        // outright: root-relative in-pod app sockets (e.g. /pty/...) would be
+        // swallowed by the single-segment match. Only the strict legacy hash
+        // route rejects.
+        if (legacyMatch || !identity) {
+          reject(401, 'Unauthorized')
+          return
+        }
+        try {
+          const environment = await resolveUserEnvironment(identity)
+          proxyUpgrade(request, socket, head, targetForPassthrough(environment.names, request.url || '/'))
+        } catch (error) {
+          console.error('session passthrough upgrade failed', error)
+          reject(502, 'Bad Gateway')
+        }
         return
       }
       try {
         const environment = await resolveUserEnvironment(identity)
-        const target = targetForUserPath(environment.names, stripSlugPrefix(request.url || '/', pathSlug), pathSlug)
+        const target = targetForUserPath(environment.names, stripSlugPrefix(request.url || '/', prefix), prefix)
         proxyUpgrade(request, socket, head, target)
       } catch (error) {
         console.error('user path upgrade failed', error)
