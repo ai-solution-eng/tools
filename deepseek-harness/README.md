@@ -4,7 +4,16 @@ Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.co
 
 Port of the `opencode` chart (`opencode-web-helm`): same router, warm pool, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
-Chart: `dsh-web-helm` · current version **0.4.3** (dsh `0.1.6-alpha.2`, Node 22 image).
+Chart: `dsh-web-helm` · current version **0.4.4** (dsh `0.1.6-alpha.2`, Node 22 image).
+0.4.4 fixes the VAST quota-collision hang for long usernames: quota names are `csi:<ns>:<pvc>`
+**truncated to 64 chars** — with a long namespace (e.g. `project-user-alejandro-morales-martinez`)
+only the first ~20 chars of the PVC name survive, so a version *suffix* was invisible to VAST and
+re-provisions collided with orphaned quotas ("Quota name must be unique per tenant") → workspace
+PVC Pending forever. Per-user PVC names now embed the version **early**
+(`dsh-<nameVersion>-<slug>-workspace-pvc`; deployment/service names unchanged) so every
+nameVersion bump mints a distinct quota name; units converge via the `dsh-web-helm/claims`
+annotation — old claims are left behind and can be label-deleted manually. Per-namespace shared
+PVCs are also provisioned RWX now (matching the release-level shared PVC).
 0.4.1 fixes a router crash-loop on the first platform (SSO) login: the provision-watch key
 (namespace/name composite) leaked into the deployment-name position of the API path, producing a
 malformed request whose rejection crashed the process; the watch now passes name and namespace

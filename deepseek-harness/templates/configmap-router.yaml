@@ -162,12 +162,22 @@ data:
     }
 
     function namesForSlug(slug, unitNs) {
-      const base = `dsh-user-${slug}`
+      // Per-user PVC names embed the nameVersion AND the volume kind EARLY:
+      // VAST quota names are `csi:<ns>:<pvc>` truncated to 64 chars — with a
+      // long namespace (e.g. project-user-alejandro-morales-martinez) only
+      // the first ~20 chars of the PVC name survive. A version SUFFIX was
+      // invisible to VAST (re-provisions collided with orphaned quotas), and
+      // even `-workspace-`/`-state-` must sit INSIDE that window — otherwise
+      // a user's own workspace and state quotas collide with each other.
+      // `dsh-<ver>-ws-<slug>` / `dsh-<ver>-st-<slug>` differ at char 8 and
+      // version at char 5 — safe for namespaces up to ~51 chars.
+      // Deployment/service names are unchanged.
+      const base = `dsh-${pvcNameVersion}`
       return {
-        deployment: base,
-        service: `${base}-svc`,
-        workspaceClaim: `${base}-workspace-pvc-${pvcNameVersion}`,
-        stateClaim: `${base}-state-pvc-${pvcNameVersion}`,
+        deployment: `dsh-user-${slug}`,
+        service: `dsh-user-${slug}-svc`,
+        workspaceClaim: `${base}-ws-${slug}`,
+        stateClaim: `${base}-st-${slug}`,
         virtualService: `dsh-user-vs-${slug}`,
         // The namespace the unit lives in: the release namespace (classic
         // shape) or the user's platform project namespace (Option B).
@@ -1012,6 +1022,10 @@ data:
       if (existing) {
         return
       }
+      // The DSH-level shared claim is a "shared" volume by name and role —
+      // provision it RWX (per-namespace shared PVCs, platform units) so the
+      // access mode matches the release-level shared PVC it mirrors.
+      const accessModes = name === sharedWorkspaceClaim ? ['ReadWriteMany'] : ['ReadWriteOnce']
       const manifest = {
         apiVersion: 'v1',
         kind: 'PersistentVolumeClaim',
@@ -1025,7 +1039,7 @@ data:
           ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
         spec: {
-          accessModes: ['ReadWriteOnce'],
+          accessModes,
           storageClassName,
           resources: {
             requests: {
@@ -1278,7 +1292,14 @@ data:
         '$RUN_AS_USER cp /var/dsh/home/.bash_profile /var/dsh/home/.profile',
         "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/bin/dsh-bashrc",
         "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/dsh/bin/dsh-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/dsh/bin/dsh-login-shell",
-        '$RUN_AS_USER chmod 0755 /var/dsh/bin/dsh-login-shell',
+        // ROOT chmod + ownership reconciliation: the `>` redirections above
+        // are performed by the ROOT shell (setpriv only wraps the command
+        // itself), so those files land root-owned — a $RUN_AS_USER chmod on
+        // them hits EPERM (observed on g2: dsh-login-shell stayed 644 → the
+        // tmux pane couldn't exec → every terminal [exited]). Root performs
+        // the chmod and hands the files to the project identity instead.
+        'chmod 0755 /var/dsh/bin/dsh-login-shell',
+        'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then chown -f "$USER_INFO_UID:$USER_INFO_GID" /var/dsh/home/.bashrc /var/dsh/home/.bash_profile /var/dsh/home/.profile /var/dsh/bin/dsh-bashrc /var/dsh/bin/dsh-login-shell /var/dsh/bin/create-server.sh || true; fi',
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
         '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc\'',
 {{- end }}
@@ -1342,6 +1363,13 @@ data:
                 // platform state changes (pending -> mounted), the router
                 // re-stamps the unit so the pod restarts with the volumes.
                 'dsh-web-helm/platform-mounts': platformVolumesMounted ? 'mounted' : (platform ? 'pending' : 'off'),
+                // Convergence key for the claim names: a storage.nameVersion
+                // bump must reach EXISTING units (fresh VAST quota names —
+                // the documented escape hatch for orphaned-quota collisions;
+                // observed with long usernames on g2, where the VAST quota
+                // name is csi:<ns>:<pvc> truncated to 64 chars). Old claims
+                // are left behind and can be label-deleted manually.
+                'dsh-web-helm/claims': `${workspaceClaim},${stateClaim},${sharedWorkspaceClaim}`,
               },
             },
             spec: {
@@ -1585,7 +1613,12 @@ data:
         // re-stamped once the platform PVCs become available.
         const mounts = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/platform-mounts']
         const desiredMounts = manifest.spec.template.metadata.annotations['dsh-web-helm/platform-mounts']
-        if (version !== userTemplateVersion || needsStrategy || mounts !== desiredMounts) {
+        // Claim names are part of the convergence contract too: a
+        // storage.nameVersion bump (fresh VAST quota names) must reach
+        // EXISTING units, not only newly-provisioned ones.
+        const claims = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/claims']
+        const desiredClaims = manifest.spec.template.metadata.annotations['dsh-web-helm/claims']
+        if (version !== userTemplateVersion || needsStrategy || mounts !== desiredMounts || claims !== desiredClaims) {
           await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`, {
             metadata: { labels: manifest.metadata.labels },
             spec: { strategy: { type: 'Recreate' }, template: manifest.spec.template },
