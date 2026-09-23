@@ -38,8 +38,8 @@ images:
   # router folds the tag into the pod-template version, so existing units
   # re-stamp automatically on upgrade. Set both entries back to
   # node:22-bookworm-slim to revert to install-on-boot behavior.
-  user: ghcr.io/ai-solution-eng/deepseek-harness:0.1.6-alpha.2
-  init: ghcr.io/ai-solution-eng/deepseek-harness:0.1.6-alpha.2
+  user: ghcr.io/ai-solution-eng/deepseek-harness:0.1.6-alpha.2-2
+  init: ghcr.io/ai-solution-eng/deepseek-harness:0.1.6-alpha.2-2
   # The router itself only needs node; keep it on the slim base.
   router: node:22-bookworm-slim
   # Optional: name of an imagePullSecret when the registry requires auth
