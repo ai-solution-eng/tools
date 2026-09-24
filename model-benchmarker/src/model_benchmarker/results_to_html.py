@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Convert the text-based benchmark outputs in results/ into a single,
+"""Convert the Markdown benchmark results in results/ into a single,
 self-contained HTML report.
 
-Each .txt under results/<model>/ is the --output of benchmark_chat.py (or a
-RAG scale-run).  The filename encodes the serving setup (GPU, engine, MTP /
-speculative-decoding config, HiCache ratio, replicas, ...).  The report:
+Each .md under results/<model>/ is the --output of benchmark_chat.py (or a
+RAG scale-run transcript).  The filename encodes the serving setup (GPU,
+engine, MTP / speculative-decoding config, HiCache ratio, replicas, ...).
+Legacy fixed-width .txt results are still parsed too.  The report:
 
   - groups everything by model and lets you filter by model / setup
   - shows, per setup, the full serving metadata (model, GPU, # GPUs, MTP
@@ -16,7 +17,7 @@ speculative-decoding config, HiCache ratio, replicas, ...).  The report:
     (ctx, users, task) workload
 
 The output HTML is fully self-contained (no external CSS/JS), so you can
-share the file by itself - no one needs the repo or the .txt files.
+share the file by itself - no one needs the repo or the .md files.
 
 Usage:
   python3 results_to_html.py                 # <repo-root>/results (two levels above this script)
@@ -39,6 +40,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # --------------------------------------------------------------------------
 # Display names / model slug -> readable name
@@ -48,6 +50,7 @@ MODEL_NAMES = {
     "qwen_38_27b": "Qwen3.8-27B",
     "gemma_4_31b": "Gemma-4-31B",
     "glm_52_753b": "GLM-5.2-753B",
+    "glm-5.2": "GLM-5.2-753B",
     "glm-5.3-flash": "GLM-5.3-Flash",
     "RAG": "RAG (Multimodal Retrieval)",
 }
@@ -102,12 +105,102 @@ WEIGHT_LABELS = {
 _IGNORED_TOKENS = {"old", "hicache", "fp8", "fp8_e4m3", "bf16", "fp16"}
 
 # --------------------------------------------------------------------------
-# .txt parsing
+# Results parsing (Markdown tables, plus the legacy fixed-width .txt layout)
 # --------------------------------------------------------------------------
 
 
+def _parse_md_chat_row(stripped: str) -> dict | None:
+    """One ``| ctx | users | task | failed | ... |`` Markdown table row.
+
+    Returns the chat-row dict, or None for header / separator / junk rows.
+    A dash percentile group is allowed only for the TTFT-post columns (a
+    multiturn run where no turns 2+ were measured).
+    """
+    cells = [c.strip() for c in stripped.strip("|").split("|")]
+    # 12 columns = single-turn (TTFT + tokens/s), 16 = multiturn (+ TTFT-post)
+    if len(cells) not in (12, 16):
+        return None
+    try:
+        ctx, users, failed = int(cells[0]), int(cells[1]), int(cells[3])
+    except ValueError:
+        return None
+    segs: list[list[float] | None] = []
+    for off in range(4, len(cells), 4):
+        group = cells[off : off + 4]
+        if all(t in ("-", "—") for t in group):
+            if off == 8 and len(cells) == 16:
+                segs.append(None)  # multiturn, no turns 2+ measured
+                continue
+            return None
+        try:
+            segs.append([float(t) for t in group])
+        except ValueError:
+            return None
+    if len(segs) == 2:
+        ttft, tokens = segs
+        ttft_post = None
+    elif len(segs) == 3:
+        ttft, ttft_post, tokens = segs
+    else:
+        return None
+    if ttft is None or tokens is None:
+        return None
+    return {
+        "ctx": ctx,
+        "users": users,
+        "task": cells[2],
+        "failed": failed,
+        "ttft": ttft,
+        "ttft_post": ttft_post,
+        "tokens": tokens,
+    }
+
+
+def _parse_fixed_chat_row(ln: str) -> dict | None:
+    """One legacy fixed-width ``ctx users task failed | ... | ...`` row."""
+    parts = [p.strip() for p in ln.split("|")]
+    if len(parts) < 2:
+        return None
+    head = parts[0].split()
+    if len(head) < 4 or not head[0].isdigit() or not head[1].isdigit() or not head[3].isdigit():
+        return None
+    if head[2] == "task":
+        return None
+    try:
+        ctx = int(head[0])
+        users = int(head[1])
+        failed = int(head[3])
+    except ValueError:
+        return None
+    segs = []
+    for seg in parts[1:]:
+        toks = seg.split()
+        if len(toks) != 4:
+            return None
+        try:
+            segs.append([float(t) for t in toks])
+        except ValueError:
+            return None
+    if len(segs) == 2:
+        ttft, tokens = segs
+        ttft_post = None
+    elif len(segs) == 3:
+        ttft, ttft_post, tokens = segs
+    else:
+        return None
+    return {
+        "ctx": ctx,
+        "users": users,
+        "task": head[2],
+        "failed": failed,
+        "ttft": ttft,
+        "ttft_post": ttft_post,
+        "tokens": tokens,
+    }
+
+
 def parse_chat_table(text: str) -> tuple[str, list[dict]]:
-    """Parse a benchmark_chat.py --output table.
+    """Parse a benchmark_chat.py --output file (Markdown .md, or legacy .txt).
 
     Returns (mode, rows).  mode is "multiturn", "single" or "unknown"
     ("multiturn" is surfaced per setup as ``multiturn: True`` by the caller).
@@ -124,71 +217,50 @@ def parse_chat_table(text: str) -> tuple[str, list[dict]]:
 
     rows: list[dict] = []
     for ln in lines:
-        parts = [p.strip() for p in ln.split("|")]
-        if len(parts) < 2:
-            continue
-        head = parts[0].split()
-        if len(head) < 4 or not head[0].isdigit() or not head[1].isdigit() or not head[3].isdigit():
-            continue
-        if head[2] == "task":
-            continue
-        try:
-            ctx = int(head[0])
-            users = int(head[1])
-            task = head[2]
-            failed = int(head[3])
-        except ValueError:
-            continue
-        segs = []
-        ok = True
-        for seg in parts[1:]:
-            toks = seg.split()
-            if len(toks) != 4:
-                ok = False
-                break
-            try:
-                segs.append([float(t) for t in toks])
-            except ValueError:
-                ok = False
-                break
-        if not ok:
-            continue
-        if len(segs) == 2:
-            ttft, tokens = segs
-            ttft_post = None
-        elif len(segs) == 3:
-            ttft, ttft_post, tokens = segs
+        stripped = ln.strip()
+        if stripped.startswith("|"):
+            row = _parse_md_chat_row(stripped)
         else:
-            continue
-        rows.append(
-            {
-                "ctx": ctx,
-                "users": users,
-                "task": task,
-                "failed": failed,
-                "ttft": ttft,
-                "ttft_post": ttft_post,
-                "tokens": tokens,
-            }
-        )
+            row = _parse_fixed_chat_row(ln)
+        if row is not None:
+            rows.append(row)
     return mode, rows
 
 
 def parse_rag_table(text: str) -> dict | None:
-    """Scan a RAG scale-benchmark output into a small summary dict."""
-    if "BENCHMARK CONFIGURATION" not in text and "BENCHMARK RESULTS" not in text:
+    """Scan a RAG scale-benchmark output into a small summary dict.
+
+    Accepts the Markdown transcript (``| key | value |`` rows under
+    ``## Benchmark configuration`` / ``## Benchmark results``) and the legacy
+    ``key:  value`` lines between the all-caps banner blocks.
+    """
+    up_text = text.upper()
+    if "BENCHMARK CONFIGURATION" not in up_text and "BENCHMARK RESULTS" not in up_text:
         return None
     summary: dict = {"config": {}, "results": {}}
     section = None
     for ln in text.splitlines():
         ln = ln.strip()
-        if "BENCHMARK CONFIGURATION" in ln:
+        upper = ln.upper()
+        if "BENCHMARK CONFIGURATION" in upper:
             section = "config"
             continue
-        if "BENCHMARK RESULTS" in ln:
+        if "BENCHMARK RESULTS" in upper:
             section = "results"
             continue
-        if not ln or "=====" in ln or "---" in ln or ln.startswith("("):
+        if not ln or "=====" in ln or "---" in ln or ln.startswith(("-", "(")):
+            # "-" skips Markdown bullets (e.g. a Notes list at the end of an
+            # endpoint-benchmarker report) — their "word: text" shape is prose,
+            # not key/value data.
+            continue
+        if section and ln.startswith("|"):
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            if len(cells) != 2 or not cells[0]:
+                continue
+            # skip the Markdown table header row (| Metric | Value |, ...)
+            if cells[1].lower() == "value" and cells[0].lower() in ("key", "metric", "stat"):
+                continue
+            summary[section][cells[0]] = cells[1]
             continue
         if section and ":" in ln:
             k, _, v = ln.partition(":")
@@ -205,7 +277,7 @@ def parse_rag_table(text: str) -> dict | None:
 
 def parse_setup(stem: str) -> dict:
     """Infer the serving setup from a result filename stem."""
-    meta = {
+    meta: dict[str, Any] = {
         "gpu": None,
         "tier": None,
         "gpu_count": 1,
@@ -316,7 +388,7 @@ def _cat_spec(entry: dict) -> str | None:
     return None
 
 
-def _cat_hicache(entry: dict) -> int | None:
+def _cat_hicache(entry: dict) -> int | str | None:
     args = [str(a) for a in entry.get("arguments", [])]
     for i, a in enumerate(args):
         if a == "--hicache-ratio" and i + 1 < len(args):
@@ -350,9 +422,8 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
     for e in catalog:
         name = str(e.get("name", "")).lower()
         cid = str(e.get("catalog_id", "")).lower()
-        if not (slug_low in name or slug_low.replace("_", "-") in name):
-            if not (key and (key in name or key in cid)):
-                continue
+        if not (slug_low in name or slug_low.replace("_", "-") in name) and not (key and (key in name or key in cid)):
+            continue
         score = 0
         etier = str(e.get("tier", ""))
         if tier and tier == etier:
@@ -443,10 +514,13 @@ def main() -> int:
         catalog_path = discover_catalog()
     catalog = load_catalog(catalog_path)
 
-    models = []
+    models: list[dict[str, Any]] = []
     for m in sorted(p for p in results_dir.iterdir() if p.is_dir()):
         slug = m.name
-        files = sorted(p for p in m.glob("*.txt") if p.is_file())
+        # Markdown results (benchmark_chat.py --output ...md); legacy .txt
+        # files from before the Markdown switch are still picked up.  The
+        # writer's transient <name>.partial files never match either suffix.
+        files = sorted(p for p in m.iterdir() if p.is_file() and p.suffix in (".md", ".txt"))
         if not files:
             continue
         display = MODEL_NAMES.get(slug, slug.replace("_", " ").title())
@@ -494,7 +568,7 @@ def main() -> int:
                 # no catalog matched: keep it explicit that nothing was configured
                 meta["mtp"] = "Disabled"
             # Derive the serving engine from the catalog when the filename
-            # doesn't say (e.g. "H200Sx4_hicachex2.txt" is served by SGLang
+            # doesn't say (e.g. "H200Sx4_hicachex2.md" is served by SGLang
             # per its catalog entry, not by vLLM).
             if meta.get("engine") is None and cat_entry:
                 img = _cat_image(cat_entry).lower()
@@ -524,13 +598,13 @@ def main() -> int:
     # appear as a model in the "All models" view.
     chat_models: list[dict] = []
     rag_models: list[dict] = []
-    for m in models:
-        chat = [s for s in m["setups"] if "rag" not in s]
-        rag = [s for s in m["setups"] if "rag" in s]
+    for mdl in models:
+        chat = [s for s in mdl["setups"] if "rag" not in s]
+        rag_setups = [s for s in mdl["setups"] if "rag" in s]
         if chat:
-            chat_models.append({"slug": m["slug"], "name": m["name"], "setups": chat})
-        if rag:
-            rag_models.append({"slug": m["slug"], "name": m["name"], "setups": rag})
+            chat_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": chat})
+        if rag_setups:
+            rag_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": rag_setups})
 
     output = Path(args.output) if args.output else (results_dir / "benchmark_report.html")
     output = output.expanduser().resolve()
@@ -541,8 +615,8 @@ def main() -> int:
     results_label = args.results_label
     catalog_label = args.catalog_label if catalog_path else None
 
-    for m in chat_models + rag_models:
-        for s in m["setups"]:
+    for mdl in chat_models + rag_models:
+        for s in mdl["setups"]:
             if s.get("catalog_source") is None and catalog_label:
                 s["catalog_source"] = catalog_label
 
@@ -596,7 +670,7 @@ def render_html(data: dict, title: str) -> str:
         from ._html_template import build_html  # type: ignore[import-not-found]
     except ImportError:  # running as a plain script
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from _html_template import build_html  # type: ignore[import-not-found]
+        from _html_template import build_html  # type: ignore[no-redef]  # fallback import when not run as a package
 
     return build_html(data, title)
 

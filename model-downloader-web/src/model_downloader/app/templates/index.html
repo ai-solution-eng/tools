@@ -86,12 +86,14 @@
       {% else %}
       <input type="hidden" name="storage" value="{{ storage_options[0] }}">
       {% endif %}
+      {% if 's3' in storage_options %}
       <label id="s3-path-field" {% if storage_default != 's3' %}hidden{% endif %}>
         <span>S3 destination</span>
         <input name="s3_path"
                placeholder="s3://bucket/prefix/"
                value="{{ s3_default_path }}">
       </label>
+      {% endif %}
       <label id="template-select-field">
         <span>Chat template preset</span>
         <select name="template_preset" id="template-select">

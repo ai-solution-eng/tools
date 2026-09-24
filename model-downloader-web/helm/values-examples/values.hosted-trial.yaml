@@ -1,0 +1,207 @@
+# Model Downloader — hosted-trial (customer PCAI) example values (SANITIZED).
+#
+# READ THIS FIRST: before applying on a hosted trial, see the top-level
+# README section "Kyverno on hosted trial systems — read before deploying".
+# The downloader/debug/scanner Jobs this chart creates must be admitted by
+# the customer platform's cluster-wide `protect-models-pvc` Kyverno policy
+# (they carry hpe-ezua/app: mlis); if the customer's policy denies them,
+# the platform admin must apply the policy patch/exception for the target
+# project-user-* namespaces. Keep kyverno.enabled: true so the chart's own
+# add-vendor-app-labels-<release>-<chart> policy stamps the EZUA discovery
+# labels on the app Deployment/Service.
+#
+# FULL VALUES — complete document; paste this whole file into the PCAI
+# "Helm Values" editor and adjust the '# SITE:' lines. PCAI resolves
+# ${DOMAIN_NAME} before rendering — leave the placeholders untouched.
+
+# -- Naming overrides (rarely needed) -------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# -- App image --------------------------------------------------------------------
+# Tags are packaged with the chart — change only if you build your own images.
+image:
+  repository: ghcr.io/ai-solution-eng/model-downloader
+  tag: v1.4.4
+  # Always: re-pull on every pod creation, so overwriting this tag in the
+  # registry is enough — just `kubectl rollout restart` afterwards.
+  # (IfNotPresent would silently keep a node-cached image when the same
+  # tag is overwritten, which is how a "rebuilt" deploy serves stale JS.)
+  pullPolicy: Always
+
+# -- Download behavior --------------------------------------------------------------
+# Max concurrent model downloads; extras are queued in-process.
+maxConcurrency: 4
+
+# SITE: your project-user namespace (must own a models-pvc for PVC downloads).
+# Namespace pre-filled in the download form. The PVC-backed downloader Job
+# mounts `models-pvc`, which every PCAI project namespace has, so default to a
+# project-user namespace rather than the app's own namespace.
+defaultNamespace: project-user-<USERNAME>
+
+# -- Service exposure -----------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8000
+
+# -- Resources --------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "200m"
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- HPE corporate proxy (hpeproxy.its.hpecorp.net + Zscaler MITM) -----------------------
+# SITE: hosted trials are usually NOT behind the HPE corporate proxy — keep
+# false. Set true only when the cluster egresses via hpeproxy (proxy env +
+# Zscaler TLS bypass on downloader Jobs and the app pod).
+#
+#   hpe_proxies: true    proxy env + TLS bypass
+#   hpe_proxies: false   no proxy env vars, TLS verification intact
+#
+# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
+# so they are installed by default.
+hpe_proxies: false
+
+# Proxy endpoints (used only when hpe_proxies: true).
+pcai:
+  # Leave `enabled` unset to fall back to the hpe_proxies flag; force it
+  # explicitly only to override.
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,192.0.0.0/8,localhost
+
+# SITE: storage backend choice — "pvc" | "s3" | "both" (which backends users
+# can pick in the UI); "default" is the preselected option. A pvc-only trial
+# needs no S3 values at all (no s3 option in the submit form, no S3 scan).
+# -- Download storage backend --------------------------------------------------------------
+storage:
+  backend: both
+  default: pvc
+
+# -- S3-compatible backend (e.g. customer MinIO; used when storage.backend includes s3) -----
+# SITE: customer S3/MinIO endpoint, bucket and credentials. The bucket must
+# already exist. Fill the two keys with the real values at apply time —
+# never publish them.
+s3:
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL
+  bucket: "mlis-models"         # bucket must already exist
+  prefix: "large-models"       # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
+  accessKeyId: "<MINIO_ACCESS_KEY>"      # MinIO access key (required for MinIO)
+  secretAccessKey: "<MINIO_PASSWORD>"  # MinIO secret key (required for MinIO)
+
+# -- "Downloaded models" list -----------------------------------------------------------------
+downloadList:
+  enabled: true
+  # PVC filesystem scanning spawns a short-lived scanner Job. Default off:
+  # the PVC is scanned only when a user clicks "Rescan storage". Set true to
+  # also re-scan automatically every pvcRefreshInterval seconds.
+  pvcScanEnabled: false
+  pvcRefreshInterval: 60
+  # Image used for the short-lived PVC scanner Job. Needs /bin/sh, find, stat.
+  scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
+
+# -- Downloader Job definition -------------------------------------------------------------------
+downloader:
+  image:
+    repository: ghcr.io/ai-solution-eng/hf-downloader
+    tag: v1.0
+  # PVC backed at /mnt where the model cache is written (pvc backend only).
+  pvcName: models-pvc
+  # Node selector for the download Job (e.g. node with PVC access).
+  nodeSelector: {}
+  # S3 backend only: scratch space used while downloading before upload.
+  s3WorkPvcName: ""
+  s3WorkSize: 20Gi
+  s3WorkPath: "/mnt/s3work"
+  # Retried Jobs resume the partial HF cache from the shared PVC.
+  backoffLimit: 2
+  # Opt out of the platform security-context mutation so the Job can run as
+  # root and mount the shared model PVC (PCAI only).
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  ttlSecondsAfterFinished: 3600
+  # SITE: your username (HF request headers / logging).
+  user: <USERNAME>
+  hf:
+    downloadTimeout: "300"
+    etagTimeout: "30"
+    enableHfTransfer: "0"
+    disableXet: "1"
+    # verifyTls follows hpe_proxies (false here → TLS verification intact).
+
+# -- Debug pod ("Launch debug pod" in the UI) ------------------------------------------------------
+# Long-running shell on the same PVC at /mnt for cache inspection. A Job on
+# purpose: job-controller-created pods pass the platformwide
+# `protect-models-pvc` Kyverno admission path that denies bare Pods — see the
+# Kyverno section of the top-level README before using it on a hosted trial.
+debugPod:
+  enabled: true
+  image:
+    repository: andrewbydlon/basic-ubuntu-essentials
+    tag: v1.0
+    pullPolicy: IfNotPresent
+  pvcName: ""
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  # SITE: your username.
+  user: <USERNAME>
+  cachePath: /mnt/large-models
+  ttlSecondsAfterFinished: 86400
+
+# -- Model catalog (a small PVC) ---------------------------------------------------------------------
+catalog:
+  enabled: true
+  size: 100Mi
+  storageClassName: ""
+  # "Refresh from GitHub" button (hidden when empty). A hosted trial without
+  # direct GitHub egress can clear this to disable the button.
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
+
+# -- AIOLI / MLIS database connection (pushing model configs) ------------------------------------------
+# SITE: point at the customer MLIS/AIOLI database service and password Secret.
+aioli:
+  dbHost: aioli-db-service-hpe-mlis.mlis.svc.cluster.local
+  dbPort: 5432
+  dbName: aioli
+  dbUser: postgres
+  dbPasswordSecret:
+    name: aioli-db-password
+    namespace: mlis
+    key: password
+
+# -- Kyverno vendor-app labels --------------------------------------------------------------------------
+# KEEP true on any PCAI cluster: the pre-install ClusterPolicy
+# add-vendor-app-labels-<release>-<chart> stamps hpe-ezua/type: app-service-core
+# onto the app Deployment/Service for EZUA ingress discovery. Disabling it on a
+# hosted trial can make the app invisible to EZUA app discovery; the Job labels
+# (hpe-ezua/app: mlis) come from the Job templates regardless.
+kyverno:
+  enabled: true
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -----------------------------------------------------
+# ${DOMAIN_NAME} placeholders are resolved by PCAI before rendering. The UI
+# is served at https://model-downloader.<customer-domain> behind oauth2-proxy
+# SSO on the platform gateway.
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+  virtualService:
+    endpoint: "model-downloader.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

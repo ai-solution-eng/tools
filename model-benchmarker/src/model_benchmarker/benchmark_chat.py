@@ -362,10 +362,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default="",
-        help="Write the summary table to this file (in addition to stdout). The "
-        "file is rewritten after every completed sweep level and stamped with a "
-        "Status: line, so a crashed or interrupted run still leaves the completed "
-        "levels on disk. E.g. --output results/qwen_38_27b/H200x4.txt.",
+        help="Write the summary table to this Markdown file (in addition to "
+        "stdout). The file is rewritten after every completed sweep level and "
+        "stamped with a Status: line, so a crashed or interrupted run still "
+        "leaves the completed levels on disk. E.g. --output "
+        "results/qwen_38_27b/H200x4.md.",
     )
     return parser.parse_args()
 
@@ -830,6 +831,37 @@ def print_table(
         print(line, file=file)
 
 
+def format_table_markdown(
+    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    *,
+    multiturn: bool = False,
+) -> str:
+    """The same data as print_table, as a GitHub-flavored Markdown table.
+
+    This is what ``--output`` files contain (results_to_html.py parses the
+    Markdown back).  A missing TTFT-post group (no turns 2+) renders as
+    dashes, which the parser reads back as None."""
+    ttft1 = "TTFT turn1" if multiturn else "TTFT"
+    cols = ["ctx", "users", "task", "failed"]
+    cols += [f"{ttft1} {p} (ms)" for p in PCTS]
+    if multiturn:
+        cols += [f"TTFT-post {p} (ms)" for p in PCTS]
+    cols += [f"tokens/s {p}" for p in PCTS]
+    out = [
+        "| " + " | ".join(cols) + " |",
+        "|" + "|".join([":---", ":---", ":---", ":---"] + ["---:"] * (len(cols) - 4)) + "|",
+    ]
+    for ctx, n_users, task, n_fail, ttft, ttft_post, tps in rows:
+        cells = [str(ctx), str(n_users), str(task), str(n_fail)]
+        for block in (ttft, ttft_post, tps) if multiturn else (ttft, tps):
+            if block is None:
+                cells += ["-"] * len(PCTS)
+            else:
+                cells += [f"{block[p]:.1f}" for p in PCTS]
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out)
+
+
 def write_results_file(
     path: str,
     rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
@@ -840,25 +872,34 @@ def write_results_file(
     multiturn: bool = False,
     status: str = "complete",
 ) -> None:
-    """Atomically write the current results table to ``path``.
+    """Atomically write the current results to ``path`` as a Markdown file.
 
     Called after every completed sweep level and once more at the end (or when
     the run dies), so a benchmark that crashes, times out or is Ctrl-C'd
     mid-sweep still leaves every completed level on disk instead of only on
-    stdout.  The write goes through a ``.partial`` temp file + ``os.replace``
-    so a kill mid-write can never leave a truncated table behind (a leftover
-    ``.partial`` file is ignored by results_to_html.py, which only globs
-    ``*.txt``)."""
+    stdout.  The layout matches the committed results/*.md files: H1 title,
+    the run header as bullets, the per-mode explanation lines, a ``Status:``
+    line, then the table as a GitHub-flavored Markdown table (parsed back by
+    results_to_html.py, which globs ``*.md``).  The write goes through a
+    ``.partial`` temp file + ``os.replace`` so a kill mid-write can never
+    leave a truncated file behind; a leftover ``.partial`` file is ignored by
+    results_to_html.py because its suffix never matches."""
     out_path = Path(path).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(out_path.name + ".partial")
     with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(run_header)
-        fh.write(summary_head.lstrip("\n") + "\n")
-        fh.write(summary_note + "\n")
+        fh.write(f"# {out_path.stem}\n\n")
+        for ln in run_header.splitlines():
+            if ln.strip():
+                fh.write(f"- {ln.strip()}\n")
+        fh.write("\n")
+        for para in (summary_head, summary_note):
+            for ln in para.splitlines():
+                if ln.strip():
+                    fh.write(ln.strip() + "\n\n")
         fh.write(f"Status: {status} (last updated {time.strftime('%Y-%m-%d %H:%M:%S')})\n\n")
         if rows:
-            print_table(rows, file=fh, multiturn=multiturn)
+            fh.write(format_table_markdown(rows, multiturn=multiturn))
         else:
             fh.write("(no levels completed yet)\n")
         fh.flush()
@@ -1109,4 +1150,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    asyncio.run(main())
+
+
+def cli_main() -> None:
+    """Sync console-script entry point (``benchmark-chat`` in pyproject.toml).
+
+    ``main()`` is async; setuptools entry points need a plain callable.
+    """
     asyncio.run(main())

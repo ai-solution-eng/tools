@@ -18,6 +18,14 @@ from pathlib import Path
 SEED_FILE = Path(__file__).parent / "seed_catalog.json"
 TIERS = ["h200", "rtx-pro-6000", "l40s"]
 TIER_LABELS = {"h200": "H200", "rtx-pro-6000": "RTX Pro 6000", "l40s": "L40S"}
+# Per-GPU specs shown in the catalog tier headers: the quantization levels the
+# card supports and its VRAM. NVFP4 needs Blackwell tensor cores, so only the
+# RTX Pro 6000 lists it; H200 (Hopper) and L40S (Ada) do FP8.
+TIER_INFO = {
+    "h200": {"quants": ["FP8"], "vram_gb": 141},
+    "rtx-pro-6000": {"quants": ["FP8", "NVFP4"], "vram_gb": 96},
+    "l40s": {"quants": ["FP8"], "vram_gb": 48},
+}
 
 
 class Catalog:
@@ -68,7 +76,7 @@ class Catalog:
         removed ones.  Returns counters for the API response.
         """
         if not isinstance(entries, list):
-            raise ValueError("catalog payload must be a JSON array of entries")
+            raise TypeError("catalog payload must be a JSON array of entries")
         present = {e.get("catalog_id") for e in self.entries}
         added = skipped = removed = 0
         for entry in entries:

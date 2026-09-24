@@ -1,0 +1,179 @@
+# Model Downloader — SE G2 example site values (SANITIZED).
+# Shareable counterpart of the real per-site file (helm/local convention —
+# real credentials live only in helm/local/, which is gitignored,
+# hardlink-ignored and never packaged). Base chart: model-downloader 1.4.4.
+#
+# FULL VALUES — complete document; paste this whole file into the PCAI
+# "Helm Values" editor and adjust the '# SITE:' lines. See the top-level
+# README (Deployment targets → SE G2) for context.
+
+# -- Naming overrides (rarely needed) -------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# -- App image --------------------------------------------------------------------
+image:
+  repository: ghcr.io/ai-solution-eng/model-downloader
+  tag: v1.4.4
+  # Always: re-pull on every pod creation, so overwriting this tag in the
+  # registry is enough — just `kubectl rollout restart` afterwards.
+  # (IfNotPresent would silently keep a node-cached image when the same
+  # tag is overwritten, which is how a "rebuilt" deploy serves stale JS.)
+  pullPolicy: Always
+
+# -- Download behavior ---------------------------------------------------------------
+maxConcurrency: 4
+
+# SITE: your project-user namespace (owns the models-pvc the Jobs mount).
+# Namespace pre-filled in the download form (project namespaces own the
+# models-pvc the downloader Jobs mount).
+defaultNamespace: project-user-<USERNAME>
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8000
+
+# -- Resources -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "200m"
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- HPE corporate proxy ---------------------------------------------------------------------
+# g2: true — downloader Jobs must reach HuggingFace through the corporate
+# proxy. The app pod gets the same proxy env (chart >= 1.4.1) so the catalog
+# "Refresh from GitHub" fetch goes through hpeproxy too; its TLS verify is
+# off here (hpe_proxies=true → skipTls, the Zscaler MITM cert is untrusted).
+hpe_proxies: true
+
+# Proxy endpoints (used only when hpe_proxies: true). The noProxy list keeps
+# cluster-internal traffic (MinIO, MLIS/AIOLI DB, kube API) off the proxy.
+pcai:
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost
+
+# -- Download storage backend -------------------------------------------------------------------
+storage:
+  backend: both
+  default: pvc
+
+# -- S3-compatible backend (MinIO) ----------------------------------------------------------------
+# SITE: real MinIO credentials — never publish them; on G2 they live only in
+# helm/local/values.g2.yaml.
+s3:
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL
+  bucket: "mlis-models"         # bucket must already exist
+  prefix: "large-models"       # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
+  accessKeyId: "<MINIO_ACCESS_KEY>"      # MinIO access key (required for MinIO)
+  secretAccessKey: "<MINIO_PASSWORD>"  # MinIO secret key (required for MinIO)
+
+# -- "Downloaded models" list -----------------------------------------------------------------------
+downloadList:
+  enabled: true
+  pvcScanEnabled: false
+  pvcRefreshInterval: 60
+  scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
+
+# -- Downloader Job definition -------------------------------------------------------------------------
+downloader:
+  image:
+    repository: ghcr.io/ai-solution-eng/hf-downloader
+    tag: v1.0
+  # PVC backed at /mnt where the model cache is written (pvc backend only).
+  pvcName: models-pvc
+  nodeSelector: {}
+  s3WorkPvcName: ""
+  s3WorkSize: 20Gi
+  s3WorkPath: "/mnt/s3work"
+  # The HF cache lives on the shared PVC, so a retried Job resumes the
+  # partial download instead of starting over.
+  backoffLimit: 2
+  # Opt out of the platform security-context mutation so the Job can run as
+  # root and mount the shared model PVC.
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  ttlSecondsAfterFinished: 3600
+  # SITE: your username (HF request headers / logging).
+  user: <USERNAME>
+  hf:
+    downloadTimeout: "300"
+    etagTimeout: "30"
+    enableHfTransfer: "0"
+    disableXet: "1"
+    # verifyTls follows hpe_proxies (true here → Zscaler MITM bypass).
+
+# -- Debug pod ("Launch debug pod" in the UI) -------------------------------------------------------------
+# Long-running shell on the same PVC at /mnt for cache inspection. A Job on
+# purpose: job-controller-created pods pass the platformwide
+# `protect-models-pvc` Kyverno admission path that denies bare Pods.
+debugPod:
+  enabled: true
+  image:
+    repository: andrewbydlon/basic-ubuntu-essentials
+    tag: v1.0
+    pullPolicy: IfNotPresent
+  pvcName: ""
+  disableSecurityContext: true
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  # SITE: your username.
+  user: <USERNAME>
+  cachePath: /mnt/large-models
+  ttlSecondsAfterFinished: 86400
+
+# -- Model catalog (a small PVC) ----------------------------------------------------------------------------
+catalog:
+  enabled: true
+  size: 100Mi
+  storageClassName: ""
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
+
+# -- AIOLI / MLIS database connection -------------------------------------------------------------------------
+aioli:
+  dbHost: aioli-db-service-hpe-mlis.mlis.svc.cluster.local
+  dbPort: 5432
+  dbName: aioli
+  dbUser: postgres
+  dbPasswordSecret:
+    name: aioli-db-password
+    namespace: mlis
+    key: password
+
+# -- Kyverno vendor-app labels ----------------------------------------------------------------------------------
+# Keep enabled: the chart's pre-install ClusterPolicy stamps the EZUA vendor
+# labels (hpe-ezua/type: app-service-core) in the release namespace; the
+# downloader/debug Jobs carry hpe-ezua/app: mlis and are admitted by the
+# platform's protect-models-pvc policy on G2 out of the box.
+kyverno:
+  enabled: true
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------------------------
+# On PCAI, ${DOMAIN_NAME} is resolved by the platform before rendering. On
+# SE G2 it resolves to pcai-se-ai-application.hst.rdlabs.hpecorp.net, so the
+# UI is served at:
+#   https://model-downloader.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+# (behind oauth2-proxy SSO via the ezaf-gateway).
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+  virtualService:
+    endpoint: "model-downloader.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

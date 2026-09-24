@@ -1270,7 +1270,10 @@ class SpeechFlowModel(BaseModel):
                 "models": models,
             }
 
-        from ..orchestration.context import get_current_context
+        # Lazy import: `orchestration.context` only exists when this module is
+        # vendored into a real package tree (src/<pkg>/utils/), never in the
+        # flat pcai_utils checkout — hence the mypy suppression.
+        from ..orchestration.context import get_current_context  # type: ignore[misc]
 
         ctx = get_current_context()
         artifact_store = getattr(ctx, "artifact_store", None)

@@ -485,9 +485,25 @@ tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
   background: var(--hpe-green-tint);
   padding: 10px 14px;
   border-bottom: 1px solid var(--hpe-border-soft);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 .tier-select-all { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
 .tier-select-all input { width: 16px; height: 16px; }
+/* GPU spec chips in the tier header: supported quants + VRAM. */
+.tier-specs { display: flex; align-items: center; gap: 6px; }
+.tier-spec {
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 8px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 10px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+}
 .tier-empty { padding: 14px; color: var(--hpe-text-soft); font-style: italic; font-size: 13px; }
 
 /* ---- Catalog table ---- */

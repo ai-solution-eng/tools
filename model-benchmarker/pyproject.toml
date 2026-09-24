@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-benchmarker"
+version = "0.2.0"
+description = "PCAI model benchmarking toolkit: universal endpoint load benchmarker (REST/MCP + GPU scaling curves) and chat streaming benchmarker (TTFT / tokens-per-second)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "PCAI Solutions" }]
+dependencies = [
+    "numpy>=2.0",
+    "httpx>=0.27",
+    "httpx2>=2.10",
+    "openai>=1.40",
+    # MCP mode of the universal benchmarker (streamable-http / sse transports)
+    "mcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "aiohttp>=3.9",
+    "uvicorn>=0.30",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+# Universal tool: any REST endpoint or MCP server, sweeps + GPU telemetry.
+endpoint-benchmarker = "model_benchmarker.endpoint_benchmarker.cli:main"
+# Chat-specific: TTFT / tokens-per-second for OpenAI-compatible endpoints.
+benchmark-chat = "model_benchmarker.benchmark_chat:cli_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

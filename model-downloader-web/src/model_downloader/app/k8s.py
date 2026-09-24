@@ -241,9 +241,7 @@ class K8sClient:
             raise RuntimeError(f"debug-job template rendered to {len(docs)} docs, expected exactly 1")
         return docs[0]
 
-    async def create_debug_job(
-        self, namespace: str, hf_token: str = "", image: str = ""
-    ) -> tuple[str, str]:
+    async def create_debug_job(self, namespace: str, hf_token: str = "", image: str = "") -> tuple[str, str]:
         """Create the (optional) HF-token Secret + a long-running debug Job.
 
         Returns (job_name, secret_name). Deliberately a Job, not a bare Pod:
@@ -521,9 +519,7 @@ class K8sClient:
 
         docs = [d for d in yaml.safe_load_all(text) if d is not None]
         if len(docs) != 1:
-            raise RuntimeError(
-                f"scan-job template rendered to {len(docs)} docs, expected exactly 1"
-            )
+            raise RuntimeError(f"scan-job template rendered to {len(docs)} docs, expected exactly 1")
         manifest = docs[0]
         meta = manifest.setdefault("metadata", {})
         meta.setdefault("labels", {})[MANAGED_BY_LABEL] = SCAN_MANAGED_BY_VALUE
@@ -583,7 +579,9 @@ class K8sClient:
                 return ""
             pod = pods.items[0]
             if pod.status.phase not in ("Running", "Succeeded"):
-                log.warning("scan %s: pod %s phase %s; logs not readable", job_name, pod.metadata.name, pod.status.phase)
+                log.warning(
+                    "scan %s: pod %s phase %s; logs not readable", job_name, pod.metadata.name, pod.status.phase
+                )
                 return ""
             logs = await asyncio.to_thread(
                 self.core.read_namespaced_pod_log,
