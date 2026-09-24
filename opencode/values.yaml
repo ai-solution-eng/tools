@@ -30,8 +30,19 @@ storage:
   stateSize: 2Gi
 
 images:
-  user: node:22-bookworm-slim
-  init: node:22-bookworm-slim
+  # Baked user image: carries the apt toolchain, opencode-ai,
+  # @openchamber/web, uv and ttyd under /opt/opencode so pods stop installing
+  # everything at boot (see docker/user/Dockerfile +
+  # scripts/build-user-image.sh). Rebuild and bump whenever opencode.version /
+  # openchamber.version / provisioning.aptPackages change — the router folds
+  # the tag into the pod-template version, so existing units re-stamp
+  # automatically on upgrade. Set both entries back to node:22-bookworm-slim
+  # to revert to install-on-boot behavior.
+  user: ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1
+  init: ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1
+  # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
+  # Public ghcr.io packages pull anonymously (leave empty).
+  pullSecret: ""
 
 opencode:
   version: 1.18.11
@@ -200,6 +211,47 @@ proxy:
 # ============================================================ 
 no_proxy:
   enabled: false
+
+# ============================================================
+# Platform (PCAI/Kubeflow) workspace integration
+# ============================================================
+# When enabled AND the endpoint is SSO-gated, SSO users get their unit
+# deployed INSIDE their platform project namespace (project-user-<username>)
+# with the platform volumes kubeflow-shared-pvc (/mnt/shared, cluster-wide
+# shared) and user-pvc (/mnt/user, personal project volume) mounted
+# read-write, and the unit process running as the project's unix identity
+# (uid/gid from the project-info ConfigMap) so file ownership on the
+# platform volumes matches notebook-written files exactly.
+#
+# Enabling this renders a cross-namespace ClusterRole for the router and
+# cleanup service accounts (see README "Platform volumes for SSO users").
+# Local (non-SSO) users keep the classic single-namespace behavior.
+platformIntegration:
+  enabled: false
+  # Platform project namespace prefix (ezprojects-operator:
+  # EZPROJECTS_NAMESPACE_NAME=project-{{ .EzProjectName }}, private projects
+  # are named user-<username>).
+  namespacePrefix: "project-user-"
+  # Candidate naming patterns for a user's platform project namespace —
+  # comma-separated templates with a {username} placeholder (the sanitized
+  # username). A trailing * acts as a wildcard: any namespace whose name
+  # starts with the expanded prefix becomes a candidate (ownership is
+  # verified through the project-info user field). The first candidate that
+  # verifies (namespace exists + project-info carries uid/gid) wins.
+  # Example: "project-user-{username},user-{username},{username}-slug"
+  # When empty, the legacy single-prefix behavior applies (namespacePrefix).
+  namespacePatterns: ""
+  volumes:
+    shared:
+      claim: "kubeflow-shared-pvc"
+      mountPath: "/mnt/shared"
+    user:
+      claim: "user-pvc"
+      mountPath: "/mnt/user"
+  # Monitor-only deployments: mount the platform volumes but expose them
+  # read-only in the Data Manager (unix permissions stay the real
+  # enforcement regardless).
+  readOnly: false
 
 # ============================================================
 # Shared workspace content (populates the shared PVC)

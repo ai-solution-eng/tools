@@ -103,8 +103,16 @@ spec:
               value: {{ .Release.Name }}-users
             - name: ISTIO_GATEWAY
               value: {{ .Values.ezua.virtualService.istioGateway }}
+            # Public host the UI is actually reached on (the chart's
+            # VirtualService endpoint). Forwarded to user pods as
+            # PREVIEW_UI_HOST so the port watcher prints preview URLs against
+            # the deployed host instead of a hardcoded opencode. subdomain.
+            - name: UI_ENDPOINT_HOST
+              value: {{ .Values.ezua.virtualService.endpoint }}
             - name: SHARED_WORKSPACE_CLAIM
               value: {{ .Release.Name }}-shared-pvc
+            - name: SHARED_WORKSPACE_SIZE
+              value: {{ .Values.storage.sharedSize }}
             - name: STORAGE_CLASS_NAME
               value: {{ .Values.storageClass }}
             - name: PERSONAL_WORKSPACE_SIZE
@@ -115,6 +123,8 @@ spec:
               value: {{ .Values.images.user }}
             - name: USER_INIT_IMAGE
               value: {{ .Values.images.init }}
+            - name: USER_IMAGE_PULL_SECRET
+              value: {{ .Values.images.pullSecret | default "" | quote }}
             - name: USER_INSTANCE_OPENCODE_VERSION
               value: {{ .Values.opencode.version }}
             - name: USER_INSTANCE_OPENCHAMBER_VERSION
@@ -123,6 +133,29 @@ spec:
               value: {{ .Values.ui.mode | quote }}
             - name: PREVIEW_DOMAIN_SUFFIX
               value: {{ .Values.previewDomain }}
+{{- if .Values.platformIntegration }}
+            # --- Platform (PCAI/Kubeflow) workspace integration ---
+            # SSO users: unit inside project-user-<username> with the platform
+            # volumes mounted read-write under the project's unix identity.
+            - name: PLATFORM_INTEGRATION_ENABLED
+              value: {{ .Values.platformIntegration.enabled | default false | quote }}
+            - name: PLATFORM_NAMESPACE_PREFIX
+              value: {{ .Values.platformIntegration.namespacePrefix | default "project-user-" | quote }}
+            # Comma-separated namespace naming patterns ({username} placeholder,
+            # optional trailing * wildcard). Overrides namespacePrefix when set.
+            - name: PLATFORM_NAMESPACE_PATTERNS
+              value: {{ .Values.platformIntegration.namespacePatterns | default "" | quote }}
+            - name: PLATFORM_SHARED_CLAIM
+              value: {{ .Values.platformIntegration.volumes.shared.claim | default "kubeflow-shared-pvc" | quote }}
+            - name: PLATFORM_SHARED_MOUNT
+              value: {{ .Values.platformIntegration.volumes.shared.mountPath | default "/mnt/shared" | quote }}
+            - name: PLATFORM_USER_CLAIM
+              value: {{ .Values.platformIntegration.volumes.user.claim | default "user-pvc" | quote }}
+            - name: PLATFORM_USER_MOUNT
+              value: {{ .Values.platformIntegration.volumes.user.mountPath | default "/mnt/user" | quote }}
+            - name: PLATFORM_VOLUMES_READONLY
+              value: {{ .Values.platformIntegration.readOnly | default false | quote }}
+{{- end }}
             - name: WARM_POOL_ENABLED
               value: {{ .Values.warmPool.enabled | quote }}
             - name: WARM_POOL_SIZE

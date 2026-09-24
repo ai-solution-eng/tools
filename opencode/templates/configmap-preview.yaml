@@ -178,10 +178,17 @@ data:
     )
 
     function url(port) {
-      // The UI host is `opencode.<domain suffix>`. Build it from the runtime
-      // env: ezua.virtualService.endpoint ships as a platform-pipeline
-      // placeholder and must never be rendered into this JS template literal.
-      return `https://opencode.${domain}/u-${userSlug}/__preview/${port}/`
+      // Build the URL from the host the UI is actually served on: the chart's
+      // VirtualService endpoint (PREVIEW_UI_HOST, e.g. opencode.<domain>).
+      // The old hardcoded `opencode.` prefix broke deployments whose endpoint
+      // moved off opencode.<domain>. opencode.<domain suffix> remains the
+      // fallback when PREVIEW_UI_HOST is unset. Never render the Helm value
+      // into this template literal: ezua.virtualService.endpoint ships as a
+      // platform-pipeline placeholder and must stay runtime-configurable.
+      const host = process.env.PREVIEW_UI_HOST || `opencode.${domain}`
+      // Per-user prefix is the readable slug (the username); legacy
+      // /u-<hash> bookmarks are handled by the router, not here.
+      return `https://${host}/${userSlug}/__preview/${port}/`
     }
 
     async function broadcast(message) {
@@ -271,6 +278,9 @@ data:
   preview-url: |
     #!/bin/sh
     DOMAIN="${PREVIEW_DOMAIN_SUFFIX:-}"
+    # Canonical public UI host (the chart's VirtualService endpoint, e.g.
+    # opencode.<domain>). Falls back to opencode.<domain> when unset.
+    UI_HOST="${PREVIEW_UI_HOST:-opencode.${DOMAIN}}"
     STATE_FILE="${PREVIEW_STATE_FILE:-/var/opencode/state/preview-ports.txt}"
     USER_SLUG="${PREVIEW_USER_SLUG:-shared}"
 
@@ -286,7 +296,7 @@ data:
           exit 1
           ;;
       esac
-      echo "https://opencode.${DOMAIN}/u-$USER_SLUG/__preview/$1/"
+      echo "https://${UI_HOST}/$USER_SLUG/__preview/$1/"
       exit 0
     fi
 
@@ -782,16 +792,60 @@ data:
     const MAX_TEXT_SIZE = 5 * 1024 * 1024
     const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '1024', 10) * 1024 * 1024
     
-    const ROOTS = [
+    const BASE_ROOTS = [
       { key: 'personal', label: 'Personal', path: '/workspace/personal', navigable: true, shared: false },
       { key: 'shared', label: 'Shared', path: '/workspace/shared', navigable: true, shared: true },
       { key: 'config', label: 'Config', path: '/var/opencode/home/.config', navigable: true, shared: false },
       { key: 'state', label: 'State', path: '/var/opencode', navigable: false, shared: false },
     ]
-    
-    const NAVIGABLE_ROOTS = ROOTS.filter((r) => r.navigable)
-    const NAVIGABLE_PATHS = NAVIGABLE_ROOTS.map((r) => r.path)
-    
+
+    // Platform volumes (PCAI/Kubeflow integration): mounted BY REFERENCE
+    // into SSO users' units from their platform project namespace. Their
+    // write permissions are the PLATFORM's unix permissions — the unit
+    // process runs as the project identity (uid parity with notebooks), so
+    // the Data Manager simply surfaces what the kernel allows.
+    //  - platform-shared: kubeflow-shared-pvc at /mnt/shared — ONE
+    //    cluster-wide shared filesystem across all platform users; the
+    //    statfs numbers below are therefore the whole platform FS.
+    //  - platform-user: user-pvc at /mnt/user — the user's project volume.
+    const PLATFORM_ROOTS = [
+      { key: 'platform-shared', label: 'Platform Shared (Kubeflow)', path: process.env.PLATFORM_SHARED_MOUNT || '/mnt/shared', navigable: true, shared: true, platform: true },
+      { key: 'platform-user', label: 'Platform Workspace (Kubeflow)', path: process.env.PLATFORM_USER_MOUNT || '/mnt/user', navigable: true, shared: false, platform: true },
+    ]
+    // 'off'     — classic units / local users (no platform roots, ever)
+    // 'pending' — SSO unit whose platform workspace is not provisioned yet
+    // 'mounted' — SSO unit with the platform volumes attached
+    const PLATFORM_ROOTS_MODE = (process.env.OPENCODE_PLATFORM_ROOTS || 'off').toLowerCase()
+    const PLATFORM_ROOTS_READONLY = (process.env.OPENCODE_PLATFORM_ROOTS_READONLY || 'false') === 'true'
+
+    let ROOTS = []
+    let NAVIGABLE_ROOTS = []
+    let NAVIGABLE_PATHS = []
+
+    function rebuildRoots() {
+      const platformActive = PLATFORM_ROOTS_MODE === 'mounted'
+        ? PLATFORM_ROOTS.filter((r) => {
+            try { return fs.statSync(r.path).isDirectory() } catch { return false }
+          })
+        : []
+      ROOTS = [...BASE_ROOTS, ...platformActive]
+      NAVIGABLE_ROOTS = ROOTS.filter((r) => r.navigable)
+      NAVIGABLE_PATHS = NAVIGABLE_ROOTS.map((r) => r.path)
+    }
+    rebuildRoots()
+    // Self-heal: a platform volume that appears after startup (platform
+    // PVCs finished binding, unit re-stamped) is picked up without waiting
+    // for a process restart. The env mode itself only changes on a re-stamp.
+    setInterval(rebuildRoots, 60000).unref()
+
+    // Read-only policy toggle for platform roots (platformIntegration.readOnly).
+    // Unix permissions remain the real enforcement in every mode.
+    function platformWriteBlocked(safePath) {
+      if (!PLATFORM_ROOTS_READONLY) return null
+      const root = PLATFORM_ROOTS.find((r) => safePath === r.path || safePath.startsWith(r.path + path.sep))
+      return root ? 'Platform volumes are mounted read-only (platformIntegration.readOnly=true)' : null
+    }
+
     let storageCache = null
     let storageCacheTime = 0
     const STORAGE_CACHE_MS = 2000
@@ -891,6 +945,7 @@ data:
         label: r.label,
         path: r.path,
         shared: r.shared,
+        platform: !!r.platform,
       })))
     }
     
@@ -1059,6 +1114,11 @@ data:
           uploaded.push({ name: part.filename, error: 'Forbidden path' })
           continue
         }
+        const blocked = platformWriteBlocked(safeFilePath)
+        if (blocked) {
+          uploaded.push({ name: part.filename, error: blocked })
+          continue
+        }
         await fsp.mkdir(path.dirname(safeFilePath), { recursive: true })
         await fsp.writeFile(safeFilePath, part.data)
         uploaded.push({ name: part.filename, size: part.data.length })
@@ -1107,6 +1167,11 @@ data:
         sendError(res, 403, 'Forbidden')
         return
       }
+      const blocked = platformWriteBlocked(safePath)
+      if (blocked) {
+        sendError(res, 403, blocked)
+        return
+      }
       try {
         await fsp.mkdir(path.dirname(safePath), { recursive: true })
         const tmpPath = safePath + '.tmp-' + Date.now()
@@ -1123,6 +1188,11 @@ data:
       const safePath = await resolveSafe(dirPath)
       if (!safePath) {
         sendError(res, 403, 'Forbidden')
+        return
+      }
+      const blocked = platformWriteBlocked(safePath)
+      if (blocked) {
+        sendError(res, 403, blocked)
         return
       }
       try {
@@ -1146,6 +1216,11 @@ data:
           deleted.push({ path: p, error: 'Forbidden' })
           continue
         }
+        const blocked = platformWriteBlocked(safe)
+        if (blocked) {
+          deleted.push({ path: p, error: blocked })
+          continue
+        }
         try {
           await fsp.rm(safe, { recursive: true })
           deleted.push({ path: p, ok: true })
@@ -1165,6 +1240,11 @@ data:
         sendError(res, 403, 'Forbidden')
         return
       }
+      const blocked = platformWriteBlocked(safeFrom) || platformWriteBlocked(safeTo)
+      if (blocked) {
+        sendError(res, 403, blocked)
+        return
+      }
       try {
         await fsp.mkdir(path.dirname(safeTo), { recursive: true })
         await fsp.rename(safeFrom, safeTo)
@@ -1182,6 +1262,9 @@ data:
       }
       const results = []
       for (const root of ROOTS) {
+        // platform-shared statfs reports the WHOLE cluster-wide filesystem
+        // (every platform user's data), not this user's share — label it so.
+        const label = root.key === 'platform-shared' ? root.label + ' — all users' : root.label
         try {
           const stats = await fsp.statfs(root.path)
           const total = stats.blocks * stats.bsize
@@ -1195,10 +1278,11 @@ data:
           const inodesPercent = inodesTotal > 0 ? Math.round((inodesUsed / inodesTotal) * 100) : 0
           results.push({
             key: root.key,
-            label: root.label,
+            label,
             path: root.path,
             navigable: root.navigable,
             shared: root.shared,
+            platform: !!root.platform,
             total,
             used,
             available,
@@ -1212,10 +1296,11 @@ data:
         } catch (err) {
           results.push({
             key: root.key,
-            label: root.label,
+            label,
             path: root.path,
             navigable: root.navigable,
             shared: root.shared,
+            platform: !!root.platform,
             error: err.message,
           })
         }
@@ -1250,7 +1335,7 @@ data:
         if (!spaHtml) {
           spaHtml = loadSpaHtml()
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
-            .replace('__OPENCODE_HOME__', USER_SLUG ? `/u-${USER_SLUG}/` : '/')
+            .replace('__OPENCODE_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(spaHtml)
@@ -1914,7 +1999,9 @@ data:
       roots.forEach(r => {
         const opt = document.createElement('option');
         opt.value = r.path;
-        opt.textContent = r.label + (r.shared ? ' (shared)' : '');
+        // Platform roots carry their own disambiguating label
+        // ("Platform … (Kubeflow)") — no '(shared)' suffix needed.
+        opt.textContent = r.label + (r.platform ? '' : (r.shared ? ' (shared)' : ''));
         sel.appendChild(opt);
       });
       if (roots.length > 0) {
@@ -2724,7 +2811,7 @@ data:
         if (!spaHtml) {
           spaHtml = loadSpaHtml()
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
-            .replace('__OPENCODE_HOME__', USER_SLUG ? `/u-${USER_SLUG}/` : '/')
+            .replace('__OPENCODE_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(spaHtml)

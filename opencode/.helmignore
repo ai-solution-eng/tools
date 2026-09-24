@@ -1,6 +1,11 @@
 *.tgz
+*.tar.gz
 .DS_Store
 shared/.DS_Store
 values-*.yaml
 apply/
 scripts/
+docker/
+dist/
+docs/
+README.md

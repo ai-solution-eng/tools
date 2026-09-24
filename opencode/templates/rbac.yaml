@@ -51,3 +51,69 @@ subjects:
 - kind: ServiceAccount
   name: {{ .Release.Name }}-router
   namespace: {{ .Release.Namespace }}
+{{- if .Values.platformIntegration.enabled }}
+---
+# Platform integration: the router provisions units INSIDE each SSO user's
+# platform project namespace (project-user-<name>), so it needs
+# cross-namespace access to the unit object kinds. Secrets, leases and
+# VirtualServices stay release-namespace-only (namespaced Role above) — the
+# router never reads or writes platform secrets, and never touches
+# platform-owned objects (platform PVCs are only mounted BY REFERENCE, never
+# labeled, never patched, never deleted).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-router-platform
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "create", "patch", "update", "delete"]
+- apiGroups: [""]
+  # delete is required for the ownership anchors (opencode-anchor-<slug>) —
+  # user deletion cascades the unit through them.
+  resources: ["configmaps"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: [""]
+  # Mirrored per-unit secrets (the filtered auth secret + the optional image
+  # pull secret — cross-namespace secretRefs cannot resolve). Create, then
+  # strategic-merge patch on 409. Deliberately NO get/list: the router never
+  # reads a mirror back and never touches platform secrets.
+  resources: ["secrets"]
+  verbs: ["create", "patch"]
+- apiGroups: [""]
+  # `list` powers the wildcard namespace-pattern scan
+  # (platformIntegration.namespacePatterns) — namespace NAMES only.
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "create", "patch", "update", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-router-platform
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-router-platform
+subjects:
+- kind: ServiceAccount
+  name: {{ .Release.Name }}-router
+  namespace: {{ .Release.Namespace }}
+{{- end }}

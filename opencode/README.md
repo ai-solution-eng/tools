@@ -16,7 +16,7 @@ SSO). From there you choose how to log in:
   accounts are created by an admin — see [Admin Console](#admin-console).)
 
 After logging in you are redirected to your personal path
-`https://opencode.{DOMAIN_NAME}/u-{slug}`, which serves your UI, terminal,
+`https://opencode.{DOMAIN_NAME}/{username}`, which serves your UI, terminal,
 data manager, and previews directly from your own pod. Access is gated by the
 signed session cookie issued at login, so each user can only reach their own
 pod.
@@ -24,16 +24,23 @@ pod.
 ### URL scheme
 
 Everything lives on the single main host; each user's environment is addressed
-by its deterministic slug:
+by its readable slug — the **sanitized username itself**:
 
 | Purpose | URL |
 |---|---|
 | Login / SSO / Admin | `https://opencode.{DOMAIN_NAME}` |
 | Admin console | `https://opencode.{DOMAIN_NAME}/__oc_admin` |
-| Personal environment | `https://opencode.{DOMAIN_NAME}/u-{slug}` |
-| Terminal | `.../u-{slug}/terminal` |
-| Data Manager | `.../u-{slug}/data_manager` |
-| Preview for port `PORT` | `.../u-{slug}/__preview/{PORT}/` |
+| Personal environment | `https://opencode.{DOMAIN_NAME}/{username}` |
+| Terminal | `.../{username}/terminal` |
+| Data Manager | `.../{username}/data_manager` |
+| Preview for port `PORT` | `.../{username}/__preview/{PORT}/` |
+
+Since chart **1.2.0** the per-user URL prefix is the sanitized **username**
+(e.g. `/francesco-caliva/`) — usernames are unique in the registry, so the name
+is a safe identifier. Pre-1.2.0 links of the form `.../u-{12-hex-slug}/...`
+keep working (legacy bookmark route); an environment created under the legacy
+hash slug is adopted under the readable slug (keeping its volumes) the first
+time its user logs in after the upgrade.
 
 Previews are auth-gated (same cookie as the rest of the pod). Share them with
 someone who can authenticate to that pod.
@@ -238,6 +245,88 @@ Every user gets their own personal PVC (sized via `storage.workspaceSize`) and s
 
 ---
 
+## Platform volumes for SSO users
+
+With `platformIntegration.enabled: true` (on in `values-g2.yaml`), **SSO** users get
+their unit deployed **inside their platform project namespace** (`project-user-<username>`)
+— the namespace the EzProject operator created for them — with the platform volumes
+mounted **read-write**:
+
+| Mount | Platform PVC | What it is |
+|---|---|---|
+| `/mnt/shared` | `kubeflow-shared-pvc` | **one cluster-wide shared filesystem** (every project namespace's PVC binds to the same VAST view); per-user directories live here |
+| `/mnt/user` | `user-pvc` | the user's personal project volume (chowned by the platform to `<uid>:<gid>`) |
+
+Local (non-SSO) users keep the classic single-namespace behavior; the chart's own
+`personal` / `shared` / `state` volumes and Data Manager roots are unchanged for everyone.
+
+**Platform namespace naming:** the router derives the candidate project namespace from
+the SSO username. By default it uses `platformIntegration.namespacePrefix` +
+username (`project-user-<username>`). Platforms that name projects differently can set
+`platformIntegration.namespacePatterns` — a comma-separated list of templates with a
+`{username}` placeholder, tried in order (first candidate whose namespace exists and
+whose `project-info` ConfigMap carries `uid`/`gid` wins). A trailing `*` acts as a
+wildcard: any namespace whose name starts with the expanded prefix becomes a candidate
+(resolved via a namespace-list scan and verified for **ownership** through the
+project-info `user` field, so one user's prefix can never adopt another user's
+namespace). Examples:
+
+```yaml
+platformIntegration:
+  namespacePatterns: "project-user-{username}"          # default, = namespacePrefix behavior
+  # namespacePatterns: "user-{username},{username}-slug" # several shapes, tried in order
+  # namespacePatterns: "{username}-*"                    # username followed by anything
+```
+
+**Identity = the platform's.** The router reads the project's unix attributes from the
+`project-info` ConfigMap (`USER_INFO_UID/GID/USERNAME/GROUP/HOMEDIR`), the unit init
+chowns the chart-owned volumes to that identity (owner-mismatch-only, never the platform
+volumes), and the service stack (opencode, data manager, ttyd terminals) execs under it
+via `setpriv`. Files written from the unit on the platform volumes are therefore
+**byte-identical to notebook-written files** (same uid/gid), and modification rights are
+exactly "wherever the user's platform privileges allow" — enforced by the kernel,
+surfaced as clean errors in the UI.
+
+**Secrets:** the pod template references the release auth Secret
+(`<release>-auth`, basic-auth pair) — cross-namespace secretRefs cannot resolve, so the
+router mirrors a **filtered copy** (only `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`)
+into the project namespace, owner-anchored and cleaned with the unit. `SESSION_SECRET` and
+the admin credentials stay release-namespace-only (the project namespace is user-readable —
+mirroring the session key there would allow forging any user's session cookie). The
+`images.pullSecret` (private registries) is mirrored the same way when set. The router
+never *reads* a mirror back (create + merge-patch on conflict) — the platform ClusterRole
+grants no secret read, so platform secrets remain untouched.
+
+**Data Manager:** SSO users additionally see **Platform Shared (Kubeflow)** and
+**Platform Workspace (Kubeflow)** roots (conditional: hidden for local users and while
+the platform PVCs are not `Bound`; a unit provisioned in the pending state is re-stamped
+automatically once they are). `platformIntegration.readOnly: true` mounts them but keeps
+the UI read-only for the platform roots (unix permissions stay the real enforcement).
+
+**Provisioning semantics:** the unit is *born* in the project namespace (K8s objects
+cannot move between namespaces) when the user has **no existing unit** — sticky
+semantics preserved, so an upgrade never silently moves or resets existing units. A
+brand-new SSO user cold-starts once (the warm pool only warms classic/local units).
+
+**Requirements (platform admin sign-off needed):**
+
+1. **Cross-namespace RBAC** — enabling the flag renders a `ClusterRole` +
+   `ClusterRoleBinding` for the router and cleanup service accounts (pods/PVCs/services/
+   configmaps/deployments/jobs, read/manifest, plus PVC+configmap delete). Secrets,
+   leases and VirtualServices stay release-namespace-only. This is a real security grant
+   — have the platform admins sign off.
+2. **SSO host registration** at the platform auth layer (out-of-band, as before).
+
+**Uninstall contract (enforced):** `helm uninstall` deletes only chart-created objects
+in the release namespace **and** each unit namespace from the registry — label-scoped
+(`opencode-user-managed=true`), GC-cascaded through per-user **anchor** ConfigMaps
+(`opencode-anchor-<slug>`) in the project namespaces, with a skip-assert that refuses any
+PVC carrying an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted**;
+namespaces are never deleted. Unit ConfigMap mirrors (the pod template mounts them
+cross-namespace via mirrored copies) are chart-owned and cleaned with the unit.
+
+---
+
 ## Demo Content
 
 Pre-seeded demos help you get started immediately.
@@ -309,18 +398,47 @@ The data manager runs as a zero-dependency Node.js process (`data_manager.mjs`) 
 
 A background watcher (`port_watcher.mjs`) polls `/proc/net/tcp` every 3 seconds. When any process listens on a port in the 3000–9999 range (excluding reserved ports), the watcher:
 
-1. Generates a public preview URL: `https://opencode.{DOMAIN_NAME}/u-{slug}/__preview/{port}/`
+1. Generates a public preview URL: `https://<endpoint>/{username}/__preview/{port}/` — the host is the chart's `ezua.virtualService.endpoint` value, forwarded to the pod as `PREVIEW_UI_HOST` (falls back to `opencode.{DOMAIN_NAME}` when unset), so the printed URL always matches the deployed host
 2. Prints the URL directly to the terminal (and all PTY sessions)
 3. Writes it to a state file for querying via the `preview-url` helper
 
-The platform's routing layer — the router proxy (`/u-{slug}` + the in-pod
+The platform's routing layer — the router proxy (`/{username}` + the in-pod
 nginx) — forwards traffic to the correct local port.
 
 ### Quick start a preview server
 
 ```bash
 /workspace/create-server.sh /workspace/personal/my-file.html 8000
-# → [preview] Preview available for port 8000: https://opencode.{DOMAIN_NAME}/u-abc123def456/__preview/8000/
+# → [preview] Preview available for port 8000: https://opencode.{DOMAIN_NAME}/francesco-caliva/__preview/8000/
+```
+
+---
+
+## Baked user image (1.2.0)
+
+User pods previously ran vanilla `node:22-bookworm-slim` and installed everything at boot (apt toolchain, `opencode-ai`, `@openchamber/web`, uv, ttyd — several minutes per pod, and the two apt stages re-ran on EVERY restart because apt state lives in the container layer, not on the PVCs). `images.user`/`images.init` now point at a **baked image** (`ghcr.io/ai-solution-eng/opencode-<opencode-version>-openchamber-<openchamber-version>:<tag>`) that carries the whole toolchain under `/opt/opencode` — fresh pods reach Ready in seconds.
+
+Design contract (see `docker/user/Dockerfile`):
+
+- Baked artifacts live under **`/opt/opencode`** (`/opt/opencode/npm`, `/opt/opencode/bin`) — never under `/var/opencode`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/opencode/data/npm`, `/var/opencode/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `opencode-startup.sh` is unchanged.
+- **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `opencode.version`/`openchamber.version` without rebuilding) and the old install-on-boot behavior resumes.
+- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated + warm pool) onto the new image automatically.
+- User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
+
+Build & push (single source of truth: the script reads `opencode.version`, `openchamber.version` and `provisioning.aptPackages` from the values file; the repo name embeds both app versions and the tag is the image revision):
+
+```sh
+docker buildx build --platform linux/amd64 \
+  -t ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1 --push docker/user
+# or simply: scripts/build-user-image.sh --push
+```
+
+Then `helm upgrade` (the values files already point at the matching image).
+
+Sanity-test the image without a cluster:
+
+```sh
+scripts/test-user-image.sh   # verifies baked artifacts + replays the router's real init guards
 ```
 
 ---
@@ -347,4 +465,13 @@ preview-url 8000
 | `~/.config/opencode/skills/` | Custom skill definitions |
 | `/workspace/personal/` | Your private workspace |
 | `/workspace/shared/` | Team shared workspace |
+| `/mnt/shared/`, `/mnt/user/` | Platform volumes (SSO users with `platformIntegration.enabled` only) |
 | `/workspace/create-server.sh` | Preview server launcher |
+
+## Scripts
+
+- `scripts/build-user-image.sh` — build/push the baked user image (reads `opencode.version` + `openchamber.version` + `provisioning.aptPackages` from the values file; repo name embeds both versions)
+- `scripts/test-user-image.sh` — sanity-test the baked image locally (no cluster needed)
+- `scripts/push_opencode_json_config.sh` — push an opencode.json into every user env (hot-reloaded)
+- `scripts/user_manager.ipynb` — bulk user admin against the router API
+- `scripts/cleanup-opencode-web-helm-stale-quotas.sh` — VAST quota cleanup (dry-run default)
