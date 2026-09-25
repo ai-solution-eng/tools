@@ -70,7 +70,13 @@ data:
     // cookie) and surfaced "token exchange failed (dsh answered 303)". The
     // validator now follows the exchange redirect chain (max 3 hops) and
     // stops as soon as any response carries Set-Cookie; status-agnostic.
-    const RUNTIME_REV = '29'
+    // v30: tr211 compatibility — platform admission (EzProject/Kyverno)
+    // forces the tenant uid/gid into every pod of project-user-* namespaces.
+    // Startup script: full PATH (sbin included) + skip groupadd/useradd/setpriv
+    // when the container is ALREADY the forced tenant uid. Init container:
+    // RUN_AS_USER/chown block only as root. nginx sidecar: emptyDir cache/log
+    // mounts + pid in /tmp so the forced non-root nginx starts cleanly.
+    const RUNTIME_REV = '30'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -1282,7 +1288,13 @@ data:
         // NEVER the platform volumes (/mnt/shared, /mnt/user): those keep
         // their platform ownership; access is enforced by unix permissions
         // against the identity, exactly like a notebook.
-        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/dsh/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/dsh /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
+        // The ROOT guard matters on clusters whose platform admission webhook
+        // (EzProject/Kyverno, observed on tr211) FORCES the tenant uid/gid into
+        // every pod of project-user-* namespaces: there the init container is
+        // NOT root, chown/setpriv cannot work, and the platform has already
+        // applied the identity — so RUN_AS_USER degrades to "" and every step
+        // runs directly as the (already correct) forced identity.
+        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ] && [ "$(id -u)" = "0" ]; then export HOME=/var/dsh/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/dsh /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
         '$RUN_AS_USER ln -sfn /workspace /var/dsh/home/workspace',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
         '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/settings.yaml ]; then if [ -f /var/dsh/config/dsh/settings.yaml ]; then cp /var/dsh/config/dsh/settings.yaml /var/dsh/home/.dsh/settings.yaml; elif [ -f /opt/dsh-defaults/settings.yaml ]; then cp /opt/dsh-defaults/settings.yaml /var/dsh/home/.dsh/settings.yaml; fi; fi\'',
@@ -1378,7 +1390,7 @@ data:
         // volumes AND on the platform volumes — runs as the platform unix
         // identity, byte-identical to a Kubeflow notebook. Without identity
         // (classic local units) it runs as root, exactly as before.
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\nstart_services() {\n  /var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/dsh_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-dshuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/dsh/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-dshuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/dsh/bin/dsh-startup.sh",
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\nstart_services() {\n  /var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/dsh_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): already the tenant uid — setpriv is a\n  # no-op requirement and groupadd/useradd cannot run as non-root.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-dshuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/dsh/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-dshuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/dsh/bin/dsh-startup.sh",
         "chmod 0755 /var/dsh/bin/dsh-startup.sh",
         '$RUN_AS_USER sh -c \'rm -rf /workspace/personal/shared\' || true',
       ]
@@ -1616,8 +1628,15 @@ data:
                   // No ports[] here: the dsh-web container already declares
                   // containerPort 8082 (kubelet warns on duplicates), and
                   // the Service targets the pod on that port regardless.
+                  // Non-root-safe (platform admission webhooks — EzProject on
+                  // tr211 — force the tenant uid into every pod of project
+                  // namespaces): nginx's default cache/log dirs are root-owned
+                  // image paths; emptyDir over them keeps them writable by any
+                  // uid. Harmless no-op when the pod runs as root.
                   volumeMounts: [
                     { name: 'preview-config', mountPath: '/etc/nginx/nginx.conf', subPath: 'nginx.conf' },
+                    { name: 'nginx-cache', mountPath: '/var/cache/nginx' },
+                    { name: 'nginx-logs', mountPath: '/var/log/nginx' },
                   ],
                 },
                 {
@@ -1650,6 +1669,9 @@ data:
                 { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
                 { name: 'preview-config', configMap: { name: '{{ .Release.Name }}-preview-config', defaultMode: 365 } },
+                // Non-root-safe nginx sidecar scratch dirs (see container above)
+                { name: 'nginx-cache', emptyDir: {} },
+                { name: 'nginx-logs', emptyDir: {} },
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
                 { name: 'shared-content-seed', configMap: { name: '{{ .Release.Name }}-shared-content' } },
 {{- end }}
