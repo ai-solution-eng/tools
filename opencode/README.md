@@ -180,17 +180,34 @@ concern.
 ### Uninstall / `helm uninstall`
 
 A `pre-delete` hook deletes the dynamically-created per-user/warm resources
-(which Helm does not own) so the namespace and shared PVC do not hang in
-`Terminating`. The hook:
+(which Helm does not own) so the namespace does not hang in `Terminating`.
+The hook:
 
 1. **Stops the router first** (deletes the router `Deployment`) so it can no
    longer reconcile/re-create warm units while teardown is running.
 2. Deletes the per-user **Deployments, Services, and Leases in parallel**.
-3. Waits for their **pods to terminate**, then deletes the per-user **PVCs**
-   (PVC deletion must wait for the pods that mount them to unmount first, so
-   that step is ordered after the pods).
-4. Leaves the Helm-owned shared PVC intact (it carries only `hpe-ezua/*`
-   labels, not `opencode-user-managed`).
+3. Waits for their **pods to terminate** (releasing the PVC mounts).
+4. **Keeps every user data PVC** (default `storage.keepPvcOnDelete: true`):
+   per-user `opencode-*-ws-*/-st-*` claims, warm-pool claims
+   (`opencode-user-warm-N-*-pvc-v2`) and the per-namespace shared mirror are
+   listed and logged, never deleted — the first re-login / re-install re-binds
+   the exact same volumes and the data is still there. Set
+   `storage.keepPvcOnDelete: false` to restore the legacy
+   delete-PVCs-on-uninstall behavior.
+5. Leaves the Helm-owned shared PVC intact (it carries
+   `helm.sh/resource-policy: keep` plus only `hpe-ezua/*` labels, never
+   `opencode-user-managed`).
+
+**PVC-survival contract:** user data PVCs are never deleted by the app — not
+via the anchor GC cascade (PVCs are no longer owner-referenced), not by the
+admin user-delete flow, not by uninstall. Deliberate purge = manual
+`kubectl delete pvc -n <ns> <claim>`. If you manually delete the kept release
+shared PVC before reinstalling, nothing else needs to change.
+
+**Existing-install migration (run once after upgrading to ≥ 1.2.3):**
+`scripts/strip-pvc-owner-refs.sh` removes the legacy anchor `ownerReferences`
+from all `opencode-user-managed=true` PVCs; without it, pre-existing PVCs
+would still be GC-cascaded by anchor deletion.
 
 ---
 
@@ -321,8 +338,11 @@ brand-new SSO user cold-starts once (the warm pool only warms classic/local unit
 in the release namespace **and** each unit namespace from the registry — label-scoped
 (`opencode-user-managed=true`), GC-cascaded through per-user **anchor** ConfigMaps
 (`opencode-anchor-<slug>`) in the project namespaces, with a skip-assert that refuses any
-PVC carrying an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted**;
-namespaces are never deleted. Unit ConfigMap mirrors (the pod template mounts them
+PVC carrying an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted** —
+and by default (since 1.2.3, `storage.keepPvcOnDelete: true`) **neither are the user data
+PVCs** (ws/st, warm-pool claims, per-namespace shared mirror): the hook lists them, keeps
+them, and the anchor cascade no longer references them. Namespaces are never deleted.
+Unit ConfigMap mirrors (the pod template mounts them
 cross-namespace via mirrored copies) are chart-owned and cleaned with the unit.
 
 ---

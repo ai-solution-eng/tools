@@ -27,6 +27,7 @@ storage:
   # avoid colliding with orphaned VAST quotas (when VAST volume deletion is not
   # enabled). v2 is the first versioned scheme; no user data exists yet to migrate.
   nameVersion: v2
+  keepPvcOnDelete: true
   stateSize: 2Gi
 
 images:

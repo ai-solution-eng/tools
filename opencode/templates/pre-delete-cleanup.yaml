@@ -1,6 +1,6 @@
 {{- /*
   Pre-delete hook: cleans up dynamically-created per-user resources
-  (deployments, pods, PVCs, services, leases, Jobs, mirrored ConfigMaps,
+  (deployments, pods, services, leases, Jobs, mirrored ConfigMaps,
   ownership anchors) that the router provisions at runtime via the
   Kubernetes API. Without this hook `helm uninstall` only removes
   Helm-tracked resources, leaving user pods — which still mount PVCs —
@@ -15,6 +15,15 @@
   NEVER deleted: they carry no chart label, and a belt-and-braces skip-assert
   refuses any PVC carrying an `ezprojects.hpe.com/*` label (or an unreadable
   PVC). Namespaces are never deleted by this hook.
+
+  PVC SURVIVAL (storage.keepPvcOnDelete=true, the default): user data PVCs —
+  per-user ws/st claims, warm-pool claims and the per-namespace shared mirror
+  — are NOT deleted on uninstall. They are listed and logged only, so the
+  first re-login / re-install re-binds the exact same volumes. Deliberate
+  purge = manual `kubectl delete pvc` (set storage.keepPvcOnDelete=false to
+  restore the legacy delete-on-uninstall behavior). The Helm-tracked release
+  shared PVC carries `helm.sh/resource-policy: keep` and likewise survives
+  uninstall; delete it manually before reinstalling if a fresh one is wanted.
 
   Execution order (hook weights):
     -4  ServiceAccount
@@ -177,6 +186,8 @@ spec:
           value: "{{ .Release.Name }}"
         - name: REGISTRY_SECRET
           value: "{{ .Release.Name }}-users"
+        - name: KEEP_PVC_ON_DELETE
+          value: {{ .Values.storage.keepPvcOnDelete | default true | quote }}
         command: ['/bin/sh', '-c']
         args:
         - |
@@ -362,10 +373,25 @@ spec:
               await waitForGone('/api/v1/namespaces/' + ns + '/pods', pods, 'pods', podTimeout, ns)
             }
 
-            console.log('Phase 3: delete chart-owned PVCs (parallel), then wait for them to be gone')
+            console.log('Phase 3: user data PVCs (keepPvcOnDelete=' + (process.env.KEEP_PVC_ON_DELETE || 'true') + ')')
             for (const ns of nsList) {
-              await deleteByLabel('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', ns)
-              await waitForGone('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', pvcTimeout, ns)
+              const claims = await listByLabel('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um)
+              if (claims.length === 0) {
+                console.log('  [' + ns + '] no user data PVCs found')
+                continue
+              }
+              if ((process.env.KEEP_PVC_ON_DELETE || 'true') !== 'false') {
+                // PVC-survival contract: list them so operators can purge
+                // deliberately, but never delete them. The first re-login /
+                // re-install re-binds the exact same volumes.
+                for (const claim of claims) {
+                  if (isPlatformOwned(claim.metadata)) { console.log('    SKIP (platform-owned): ' + claim.metadata.name); continue }
+                  console.log('    KEPT (manual deletion required to purge): ' + claim.metadata.name)
+                }
+              } else {
+                await deleteByLabel('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', ns)
+                await waitForGone('/api/v1/namespaces/' + ns + '/persistentvolumeclaims', um, 'PVCs', pvcTimeout, ns)
+              }
             }
 
             console.log('=== Cleanup done ===')
