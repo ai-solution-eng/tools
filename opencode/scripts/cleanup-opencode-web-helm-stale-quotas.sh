@@ -14,19 +14,23 @@
 #   1. Reads the VMS endpoint + credentials from the gl4f-csi/gl4f-mgmt secret
 #      (works from any node with kubectl access to the cluster).
 #   2. Lists BOUND PVCs in the target namespace -> protects their quotas.
-#   3. Deletes every VAST quota under 'csi:<namespace>:' that does not belong
-#      to a currently Bound PVC (and optionally the legacy 'csi:opencode:*'
-#      quotas from a namespace that no longer exists).
-#   4. Optionally deletes Pending (unbound) PVCs so the opencode controller
-#      recreates them fresh.
+#   3. Deletes every VAST quota under 'csi:<namespace>:' that belongs to an
+#      opencode-web-helm-managed PVC but does not belong to a currently Bound
+#      PVC (and optionally the legacy 'csi:opencode-web-helm:*' quotas from a
+#      namespace that no longer exists).
+#   4. Optionally deletes Pending (unbound) PVCs so the opencode-web-helm
+#      controller recreates them fresh.
 #
 # SAFETY:
 #   - Dry run by default. Nothing is deleted without --apply.
-#   - Only quotas whose name starts with the exact target prefixes are touched.
-#     Quotas of every other namespace (project-user-*, monitoring, ...) are
-#     never matched.
+#   - Chart-scope allowlist: only quotas whose PVC-name segment starts with
+#     'opencode' (opencode-v2-*, opencode-web-helm-shared-pvc, warm-pool
+#     units, ...) are deletion candidates. Quotas of anything else in the
+#     namespace (platform PVCs like user-pvc, default-notebook-*, kubeflow-*)
+#     are SKIPPED and printed, never deleted — even when their names are
+#     truncated so hard that ownership cannot be proven.
 #   - Quotas of Bound PVCs are always protected, including truncated names
-#     (matched by the UID fragment embedded in the quota name).
+#     (matched by prefix against the full expected quota name).
 #
 # Requirements: sh (POSIX), kubectl, curl, jq, network access to VMS :443.
 #
@@ -41,10 +45,10 @@ set -eu
 NS=opencode-web-helm
 SECRET_NS=gl4f-csi
 SECRET=gl4f-mgmt
-LEGACY_PREFIX='csi:opencode:'
+LEGACY_PREFIX='csi:opencode-web-helm:'
 APPLY=0
 RESET_PVCS=0
-SKIP_OPENCODE=0
+SKIP_LEGACY=0
 
 BOUND_FILE=$(mktemp)
 QUOTA_FILE=$(mktemp)
@@ -57,7 +61,7 @@ usage: $0 [options]
   --apply            actually delete stale quotas (default: dry run)
   --namespace NS     target k8s namespace (default: opencode-web-helm)
   --reset-pvcs       after cleanup, delete Pending PVCs so they are recreated
-  --skip-opencode    do not touch legacy 'csi:opencode:*' quotas
+  --skip-legacy      do not touch legacy 'csi:opencode-web-helm:*' quotas
   -h, --help         this help
 EOF
     exit 1
@@ -68,7 +72,7 @@ while [ $# -gt 0 ]; do
         --apply) APPLY=1 ;;
         -n|--namespace) NS="$2"; shift ;;
         --reset-pvcs) RESET_PVCS=1 ;;
-        --skip-opencode) SKIP_OPENCODE=1 ;;
+        --skip-legacy) SKIP_LEGACY=1 ;;
         -h|--help) usage ;;
         *) usage ;;
     esac
@@ -117,34 +121,73 @@ kubectl -n "$NS" get pvc -o custom-columns=NAME:.metadata.name,PHASE:.status.pha
 kubectl -n "$NS" get pvc -o json 2>/dev/null \
     | jq -r '.items[]
              | select(.spec.volumeName != null and .spec.volumeName != "")
-             | "\(.metadata.name)\t\(.metadata.uid)"' > "$BOUND_FILE" || true
+             | "\(.metadata.name)\t\(.spec.volumeName)"' > "$BOUND_FILE" || true
 
 echo "==> Protected (Bound) PVC count: $(awk 'END{print NR}' "$BOUND_FILE" 2>/dev/null || echo 0)"
 
 fetch_quotas > "$QUOTA_FILE"
 [ -s "$QUOTA_FILE" ] || { echo "ERROR: VMS returned no quotas (auth ok? API version?)"; exit 1; }
 
-# A quota is LIVE only if its pvc-name is currently Bound AND the UID fragment
-# embedded in the quota name is a prefix of that PVC's UID. Everything else
-# under the target prefix is stale.
+# A quota is LIVE only if it is the (possibly 64-char-truncated) name the CSI
+# would have minted for a currently-Bound PVC: "csi:<ns>:<pvc>:pvc-<uid>".
+# We therefore build the FULL expected name for every Bound PVC and keep any
+# quota that is a PREFIX of one. The old heuristic (parse pvc name + uid
+# fragment out of the quota, compare 10 chars) had two false positives on
+# long namespaces that would have deleted LIVE quotas:
+#   - truncation can cut the ENTIRE uid ("...workspace:pvc") or even part of
+#     the ":pvc-" token ("...shared-pvc:p") — unparseable by the old splitter;
+#   - the uid fragment surviving truncation can be LONGER than the 10-char
+#     sample the old code compared against.
+# Everything else under the target prefix is stale — BUT only if the quota's
+# PVC segment belongs to a chart this script manages (see allowlist below).
+# The chart-scope guard exists so that quota names this script cannot map to
+# an opencode PVC (e.g. platform PVCs like user-pvc, default-notebook-*,
+# whose truncation can even hide the uid entirely) are NEVER deletion
+# candidates, regardless of Bound/Pending state.
 awk -F'\t' -v ns="$NS" '
-    FILENAME == ARGV[1] { if (NF >= 2) bound[$1] = substr($2, 1, 10); next }
+    FILENAME == ARGV[1] {
+        # name<TAB>volumeName; only dynamically provisioned (pvc-<uid>) PVs
+        # mint "csi:<ns>:<pvc>:pvc-<uid>" quotas. Static PVs (named volumes
+        # like "…-kf-pv") never go through CSI CreateVolume and have none.
+        if (NF >= 2 && $2 ~ /^pvc-/) {
+            uid = $2; sub(/^pvc-/, "", uid)
+            full[$1] = "csi:" ns ":" $1 ":pvc-" uid
+        }
+        next
+    }
     {
         name = $2
         if (index(name, "csi:" ns ":") != 1) next
-        rest = name
-        sub(/^csi:[^:]*:/, "", rest)
-        pvc = rest;     sub(/:pvc-.*$/, "", pvc)
-        uidpart = rest; sub(/^[^:]*:pvc-/, "", uidpart)
+        # Chart-scope allowlist: the quota is only eligible for deletion when
+        # its PVC-name segment (between the second and third ":") starts with
+        # the chart-managed prefix. Everything else (platform PVCs, notebooks,
+        # anything foreign to opencode) is skipped and reported as SKIPPED.
+        rest = name; sub(/^csi:[^:]*:/, "", rest)
+        pvcseg = rest; sub(/:.*/, "", pvcseg)
+        if (pvcseg !~ /^opencode(-|$)/) {
+            print "SKIPPED\t" name > "/dev/stderr"
+            next
+        }
         keep = 0
-        if (pvc in bound && uidpart != "" && index(bound[pvc], uidpart) == 1) keep = 1
+        for (pvc in full) {
+            # live quota == exact match OR truncation-prefix of the expected name
+            if (index(full[pvc], name) == 1) { keep = 1; break }
+        }
         if (keep == 0) print $1 "\t" name
     }
 ' "$BOUND_FILE" "$QUOTA_FILE" > "$STALE_FILE"
 
-# Legacy 'csi:opencode:*' quotas (namespace 'opencode' no longer exists)
-if [ "$SKIP_OPENCODE" != "1" ] && [ "$NS" != "opencode" ]; then
-    awk -F'\t' '$2 ~ /^csi:opencode:/ { print $1 "\t" $2 }' "$QUOTA_FILE" >> "$STALE_FILE"
+# Legacy 'csi:opencode-web-helm:*' quotas (legacy namespace no longer exists).
+# Same chart-scope rule applies: only delete when the PVC segment looks like a
+# chart-managed claim (opencode-v2-* / opencode-web-helm-shared-pvc style).
+if [ "$SKIP_LEGACY" != "1" ] && [ "$NS" != "opencode-web-helm" ]; then
+    awk -F'\t' '
+        $2 ~ /^csi:opencode-web-helm:/ {
+            rest = $2; sub(/^csi:[^:]*:/, "", rest)
+            pvcseg = rest; sub(/:.*/, "", pvcseg)
+            if (pvcseg ~ /^opencode(-|$)/) print $1 "\t" $2
+        }
+    ' "$QUOTA_FILE" >> "$STALE_FILE"
 fi
 
 N=$(awk 'END{print NR}' "$STALE_FILE")
@@ -181,7 +224,7 @@ if [ "$RESET_PVCS" = "1" ]; then
         | jq -r '.items[] | select(.spec.volumeName == null or .spec.volumeName == "") | .metadata.name' || true)
     if [ -n "$PENDING" ]; then
         echo
-        echo "==> Deleting Pending PVCs (opencode controller recreates them):"
+        echo "==> Deleting Pending PVCs (opencode-web-helm controller recreates them):"
         echo "$PENDING"
         echo "$PENDING" | xargs kubectl -n "$NS" delete pvc
     fi
