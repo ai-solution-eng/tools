@@ -69,7 +69,7 @@ data:
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_buffering off;
         }
-        location ^~ /data_manager {
+        location ^~ /data-manager {
           proxy_pass http://127.0.0.1:7682;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
@@ -77,6 +77,11 @@ data:
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_buffering off;
+        }
+        # Legacy underscore path: redirect pre-rename bookmarks to the new route.
+        location ^~ /data_manager {
+          rewrite ^/data_manager(/.*)$ /data-manager$1 permanent;
+          return 301 /data-manager;
         }
         location ~ ^/__preview/(?<preview_port>[0-9]+)(?<preview_rest>.*)$ {
           if ($preview_port !~ '^[1-9][0-9]{3,4}$') {
@@ -787,7 +792,7 @@ data:
     
     const PORT = parseInt(process.env.DATA_MANAGER_PORT || '7682', 10)
     const HOST = '0.0.0.0'
-    const BASE = '/data_manager'
+    const BASE = '/data-manager'
     const USER_SLUG = process.env.PREVIEW_USER_SLUG || ''
     const MAX_TEXT_SIZE = 5 * 1024 * 1024
     const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '1024', 10) * 1024 * 1024
@@ -1930,7 +1935,7 @@ data:
     
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
     <script>
-    const API = '/data_manager/api';
+    const API = '/data-manager/api';
     let currentPath = '';
     let currentRoot = null;
     let roots = [];
@@ -3045,7 +3050,7 @@ data:
       </div>
       <a class="btn" href="/" target="_blank">To Login</a>
       <a class="btn" href="__OPENCODE_HOME__" target="_blank">OpenCode</a>
-      <a class="btn" href="/data_manager" target="_blank">Data Manager</a>
+      <a class="btn" href="/data-manager" target="_blank">Data Manager</a>
     </header>
     
     <div class="tabbar-row">

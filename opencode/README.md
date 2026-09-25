@@ -32,7 +32,7 @@ by its readable slug — the **sanitized username itself**:
 | Admin console | `https://opencode.{DOMAIN_NAME}/__oc_admin` |
 | Personal environment | `https://opencode.{DOMAIN_NAME}/{username}` |
 | Terminal | `.../{username}/terminal` |
-| Data Manager | `.../{username}/data_manager` |
+| Data Manager | `.../{username}/data-manager` |
 | Preview for port `PORT` | `.../{username}/__preview/{PORT}/` |
 
 Since chart **1.2.0** the per-user URL prefix is the sanitized **username**
@@ -398,7 +398,7 @@ It is always available and gives you **multiple independent terminal tabs**, eac
 A web-based file manager is served at:
 
 ```
-https://opencode.{DOMAIN_NAME}/u-{slug}/data_manager
+https://opencode.{DOMAIN_NAME}/u-{slug}/data-manager
 ```
 
 It provides a full UI for navigating, uploading, downloading, and editing files across the **Personal**, **Shared**, and **Config** (`~/.config`) roots:

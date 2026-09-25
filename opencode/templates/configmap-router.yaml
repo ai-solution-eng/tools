@@ -47,11 +47,13 @@ data:
     //                    the image changes; user pods pull with IfNotPresent
     //                    (immutable tags).
     // v8→v10: readable user slugs (v9) + baked user image support (v10).
+    // v10→v11: data-manager route renamed /data_manager → /data-manager (in-pod
+    // nginx location + data_manager.mjs BASE + in-app links roll with the re-stamp).
     const userImageRev = (() => {
       const tag = String(userInstanceImage || '').split('@')[0].split(':').pop() || ''
       return (tag.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 32)) || 'untagged'
     })()
-    const userTemplateVersion = `terminal-tab-v10-opencode-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    const userTemplateVersion = `terminal-tab-v11-opencode-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
     const ttydVersion = '1.7.7'
     const userPullSecret = process.env.USER_IMAGE_PULL_SECRET || ''
     const usernameHeader = 'x-auth-request-preferred-username'
@@ -151,9 +153,11 @@ data:
     // earlier releases.
     const slugMaxLength = 54 // "opencode-user-" + slug stays well under the DNS name limits
     // Slugs that would shadow router control paths or in-pod root-relative app
-    // routes (nginx serves /terminal, /term, /data_manager) keep the legacy
-    // hash slug instead.
-    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u'])
+    // routes (nginx serves /terminal, /term, /data-manager) keep the legacy
+    // hash slug instead. "data_manager" slugifies to "data-manager", so the
+    // hyphenated form must be reserved since the endpoint rename (the old
+    // underscore path could never collide with a slug).
+    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u', 'data-manager'])
     function slugifyUsername(userId) {
       const cleaned = (userId || '')
         .toLowerCase()
@@ -3671,7 +3675,7 @@ data:
         }
         // Not this user's slug (or no session): fall through to the session
         // passthrough / login page below — a single-segment match must never
-        // swallow root-relative in-pod app paths (/terminal, /data_manager…).
+        // swallow root-relative in-pod app paths (/terminal, /data-manager…).
       }
 
       // Session-keyed passthrough: any other path on the main host is served to the
