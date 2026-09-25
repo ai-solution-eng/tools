@@ -25,6 +25,13 @@ data:
     const userUiHost = process.env.USER_INSTANCE_UI_HOST || 'dsh'
     const workspaceSize = process.env.PERSONAL_WORKSPACE_SIZE || '{{ .Values.storage.workspaceSize }}'
     const stateSize = process.env.PERSONAL_STATE_SIZE || '{{ .Values.storage.stateSize }}'
+    // PVC-survival contract (KEEP_PVC_ON_DELETE=true, the default): user data
+    // PVCs (per-user ws/st and the per-namespace shared mirror) are never
+    // deleted by the app — not via the anchor GC cascade, not by the admin
+    // user-delete flow, not by the helm uninstall hook. They survive so the
+    // first re-SSO re-binds the exact same volumes. Manual `kubectl delete
+    // pvc` remains the deliberate purge path.
+    const keepPvcOnDelete = (process.env.KEEP_PVC_ON_DELETE || 'true') !== 'false'
     // Rolls existing user deployments whenever the pod template meaningfully
     // changes (config layout, nginx/validator/supervisor code, ports). Bump
     // RUNTIME_REV on every chart change to per-user runtime behavior; dsh
@@ -781,9 +788,16 @@ data:
         await deleteK8s(`/apis/apps/v1/namespaces/${tns}/deployments`, target.deployment)
         await waitForDeploymentGone(target.deployment, 90000, tns)
         await deleteK8s(`/api/v1/namespaces/${tns}/services`, target.service)
-        for (const claim of [target.workspaceClaim, target.stateClaim, target.sharedClaim].filter(Boolean)) {
-          if (await isPlatformOwnedClaim(tns, claim)) continue
-          await deleteK8s(`/api/v1/namespaces/${tns}/persistentvolumeclaims`, claim)
+        if (keepPvcOnDelete) {
+          // PVC-survival contract: the user's data PVCs are NEVER deleted
+          // here. They survive so the first re-SSO re-binds the exact same
+          // volumes. Deliberate purge = manual `kubectl delete pvc`.
+          console.log(`[platform] keeping user data PVCs for ${candidates.join('/')}: ${[target.workspaceClaim, target.stateClaim, target.sharedClaim].filter(Boolean).join(', ')} (manual deletion required to purge)`)
+        } else {
+          for (const claim of [target.workspaceClaim, target.stateClaim, target.sharedClaim].filter(Boolean)) {
+            if (await isPlatformOwnedClaim(tns, claim)) continue
+            await deleteK8s(`/api/v1/namespaces/${tns}/persistentvolumeclaims`, claim)
+          }
         }
       }
     }
@@ -2050,15 +2064,15 @@ data:
             'dsh-user-managed': 'true',
             'dsh-user-slug': slug,
           },
-          // Ownership anchor (integration study §7.6): every DSH-created
-          // object in the project namespace references this anchor via
-          // ownerReferences. Deleting it (admin user-delete or helm
-          // uninstall) cascades the unit — and ONLY the unit: the platform
-          // PVCs are never owner-referenced, so the GC is structurally
-          // unable to touch them.
+          // Ownership anchor (integration study §7.6): the unit's
+          // Deployment, Service and mirrored ConfigMaps reference this anchor
+          // via ownerReferences. Deleting it (admin user-delete or helm
+          // uninstall) cascades the unit compute — and ONLY the compute: the
+          // platform PVCs and the user data PVCs (ws/st/shared) are never
+          // owner-referenced, so the GC is structurally unable to touch them.
           annotations: { 'dsh-web-helm/anchor': 'true' },
         },
-        data: { note: 'DSH unit ownership anchor. Deleting it deletes the DSH unit resources in this namespace; it never deletes the platform PVCs (kubeflow-shared-pvc / user-pvc).' },
+        data: { note: 'DSH unit ownership anchor. Deleting it deletes the DSH unit compute resources in this namespace (deployment, service, mirrored configmaps); it never deletes the platform PVCs (kubeflow-shared-pvc / user-pvc) nor the user data PVCs (dsh-*-ws-*/-st-* / dsh-web-helm-shared-pvc) — those survive and must be deleted manually.' },
       }
     }
 
@@ -2146,9 +2160,12 @@ data:
       const ownerRefs = ownerRefToAnchor(anchor)
       await syncUnitConfigMapsRateLimited(unitNs, ownerRefs)
       if (existing) {
-        await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs, ownerRefs)
-        await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs, ownerRefs)
-        await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs, ownerRefs)
+        // PVCs are deliberately NOT owner-anchored (keepPvcOnDelete): they
+        // must survive anchor deletion / helm uninstall so a re-SSO re-binds
+        // the exact same volumes.
+        await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs)
+        await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs)
+        await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs)
         await ensureService(names.service, slug, unitNs, ownerRefs)
         await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
         return { slug, names }
@@ -2160,9 +2177,12 @@ data:
       // (pod restart) once they are — see the platform-mounts annotation.
       console.log(`[platform] provisioning unit for ${userId} in ${unitNs} (mounts=${platform.volumesMounted ? 'platform+own' : 'own only; platform PVCs not Bound yet'})`)
       await ensureLease(`dsh-user-${slug}`)
-      await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs, ownerRefs)
-      await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs, ownerRefs)
-      await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs, ownerRefs)
+      // PVCs are deliberately NOT owner-anchored (keepPvcOnDelete): they must
+      // survive anchor deletion / helm uninstall so a re-SSO re-binds the
+      // exact same volumes.
+      await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs)
+      await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs)
+      await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs)
       await ensureService(names.service, slug, unitNs, ownerRefs)
       await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
       try {

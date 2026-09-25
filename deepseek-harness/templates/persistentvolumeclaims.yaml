@@ -3,6 +3,11 @@ kind: PersistentVolumeClaim
 metadata:
   name: {{ .Release.Name }}-shared-pvc
   namespace: {{ .Release.Namespace }}
+  annotations:
+    # PVC-survival contract: the release shared PVC survives `helm uninstall`
+    # (like every other user-data PVC). Reinstalling over a kept PVC works
+    # as-is; delete it manually first only when a fresh empty one is wanted.
+    helm.sh/resource-policy: keep
   labels:
     hpe-ezua/type: vendor-service
     hpe-ezua/app: {{ .Chart.Name }}

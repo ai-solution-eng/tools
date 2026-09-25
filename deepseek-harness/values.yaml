@@ -28,6 +28,7 @@ storage:
   # enabled). v1 is the first versioned scheme of this chart; no user data
   # exists yet to migrate.
   nameVersion: v1
+  keepPvcOnDelete: true
   stateSize: 2Gi
 
 images:

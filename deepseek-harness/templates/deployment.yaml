@@ -118,6 +118,13 @@ spec:
               value: {{ .Values.storage.workspaceSize }}
             - name: PERSONAL_STATE_SIZE
               value: {{ .Values.storage.stateSize }}
+            # PVC-survival contract: when true (default) per-user and per-ns
+            # shared PVCs are NEVER deleted by the app (anchor GC cascade,
+            # admin user-delete, helm uninstall) — they survive so a re-SSO
+            # re-binds the exact same volumes. Manual `kubectl delete pvc`
+            # stays possible.
+            - name: KEEP_PVC_ON_DELETE
+              value: {{ .Values.storage.keepPvcOnDelete | default true | quote }}
             - name: USER_INSTANCE_IMAGE
               value: {{ .Values.images.user }}
             - name: USER_INIT_IMAGE

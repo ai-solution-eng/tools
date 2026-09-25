@@ -77,6 +77,21 @@ an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted**; namesp
 deleted. Unit ConfigMap mirrors (the pod template mounts them cross-namespace via mirrored
 copies) are DSH-owned and cleaned with the unit.
 
+**PVC-survival contract (since 0.4.13, `storage.keepPvcOnDelete: true`):** user data PVCs —
+per-user `dsh-*-ws-*/-st-*` claims, warm-pool claims (`dsh-user-warm-N-*-pvc-v2`) and the
+per-namespace `dsh-web-helm-shared-pvc` mirror — are never deleted by the app: not via the
+anchor GC cascade (PVCs are no longer owner-referenced), not by the admin user-delete flow,
+not by uninstall (the hook lists them and keeps them). The release shared PVC carries
+`helm.sh/resource-policy: keep` and survives uninstall too. The first re-login / re-install
+re-binds the exact same volumes, data intact. Deliberate purge = manual
+`kubectl delete pvc -n <ns> <claim>`. Set `storage.keepPvcOnDelete: false` to restore the
+legacy delete-on-uninstall behavior.
+
+**Existing-install migration (run once after upgrading to ≥ 0.4.13):**
+`scripts/strip-pvc-owner-refs.sh` removes the legacy anchor `ownerReferences` from all
+`dsh-user-managed=true` PVCs; without it, pre-existing PVCs would still be GC-cascaded by
+anchor deletion.
+
 ---
 
 ## Install (from-scratch, lessons baked in)
@@ -177,7 +192,7 @@ Data Manager roots: **Personal**, **Shared**, **DSH Home** (`$DSH_HOME` — sett
 
 ## Warm Pool
 
-Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs per unit, warm-first assignment, Recreate strategy, stuck-unit recreation). Tradeoff: each unit idles up to 2 CPU / 2Gi. `warmPool.enabled/size` control it. Pre-delete hook cleans up all dynamic resources on `helm uninstall`.
+Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs per unit, warm-first assignment, Recreate strategy, stuck-unit recreation). Tradeoff: each unit idles up to 2 CPU / 2Gi. `warmPool.enabled/size` control it. Pre-delete hook cleans up all dynamic compute resources on `helm uninstall`; user data PVCs survive by default (`storage.keepPvcOnDelete: true`) and must be purged manually.
 
 ---
 
