@@ -80,6 +80,20 @@ data:
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_buffering off;
         }
+        location ^~ /data-manager {
+          proxy_pass http://127.0.0.1:7682;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_buffering off;
+        }
+        # Legacy /data_manager (underscore) — renamed to /data-manager in
+        # 0.4.14. Proxied AS-IS (no 301): a redirect would rewrite POST→GET
+        # and corrupt upload/archive/mkdir/delete/rename calls still coming
+        # from browser-cached SPA copies. data_manager.mjs aliases the
+        # legacy prefix in-app instead.
         location ^~ /data_manager {
           proxy_pass http://127.0.0.1:7682;
           proxy_http_version 1.1;
@@ -1031,7 +1045,13 @@ data:
     
     const PORT = parseInt(process.env.DATA_MANAGER_PORT || '7682', 10)
     const HOST = '0.0.0.0'
-    const BASE = '/data_manager'
+    const BASE = '/data-manager'
+    // Legacy alias — the endpoint was renamed from /data_manager (underscore
+    // seen badly in URLs, chart 0.4.14). Normalized in-app in handleRequest
+    // (NOT via nginx 301, which would corrupt POST bodies from stale cached
+    // SPA copies): bookmarks and old cached pages keep working on either
+    // spelling. Filenames (data_manager.mjs/.html) intentionally unchanged.
+    const LEGACY_BASE = '/data_manager'
     const USER_SLUG = process.env.PREVIEW_USER_SLUG || ''
     const MAX_TEXT_SIZE = 5 * 1024 * 1024
     const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '1024', 10) * 1024 * 1024
@@ -1565,16 +1585,20 @@ data:
     }
     
     let spaHtml = null
-    
+
     async function handleRequest(req, res) {
       const url = new URL(req.url, 'http://internal')
-      const pathname = url.pathname
-    
+      let pathname = url.pathname
+
+      if (pathname.startsWith(LEGACY_BASE)) {
+        pathname = BASE + pathname.slice(LEGACY_BASE.length)
+      }
+
       if (!pathname.startsWith(BASE)) {
         sendError(res, 404, 'Not found')
         return
       }
-    
+
       const subPath = pathname.slice(BASE.length)
     
       if (subPath === '' || subPath === '/' || subPath === '/index.html') {
@@ -2176,7 +2200,7 @@ data:
     
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
     <script>
-    const API = '/data_manager/api';
+    const API = '/data-manager/api';
     let currentPath = '';
     let currentRoot = null;
     let roots = [];
@@ -3291,7 +3315,7 @@ data:
       </div>
       <a class="btn" href="/" target="_blank">To Login</a>
       <a class="btn" href="__DSH_HOME__" target="_blank">DeepSeek Harness</a>
-      <a class="btn" href="/data_manager" target="_blank">Data Manager</a>
+      <a class="btn" href="/data-manager" target="_blank">Data Manager</a>
     </header>
     
     <div class="tabbar-row">

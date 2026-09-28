@@ -8,7 +8,7 @@
 # Usage:
 #   scripts/build-user-image.sh                       # build for linux/amd64,
 #                                                     # tag = dsh.version from values
-#   scripts/build-user-image.sh --tag 0.1.6-alpha.2 --push   # build + push
+#   scripts/build-user-image.sh --tag 0.1.7-rc.2 --push   # build + push
 #   scripts/build-user-image.sh --values values-g2.yaml
 #
 # Sources of truth (kept in sync automatically):

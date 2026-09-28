@@ -83,7 +83,10 @@ data:
     // when the container is ALREADY the forced tenant uid. Init container:
     // RUN_AS_USER/chown block only as root. nginx sidecar: emptyDir cache/log
     // mounts + pid in /tmp so the forced non-root nginx starts cleanly.
-    const RUNTIME_REV = '30'
+    // 31 (0.4.14): /data_manager renamed to /data-manager (nginx locations +
+    // preview SPA/API; legacy underscore path aliased in-app by
+    // data_manager.mjs, proxied as-is — no 301, POST bodies must survive).
+    const RUNTIME_REV = '31'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -182,7 +185,8 @@ data:
     // pre-0.3.5 releases.
     const slugMaxLength = 54 // "dsh-user-" + slug must stay a valid DNS-1123 label (<= 63 chars)
     // Slugs that would shadow router control paths or in-pod root-relative app
-    // routes (nginx serves /terminal, /term, /data_manager) keep the legacy
+    // routes (nginx serves /terminal, /term, /data-manager — the legacy
+    // /data_manager spelling stays aliased in-app) keep the legacy
     // hash slug instead.
     const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u'])
     function slugifyUsername(userId) {
@@ -3592,7 +3596,7 @@ data:
         }
         // Not this user's slug (or no session): fall through to the session
         // passthrough / login page below — a single-segment match must never
-        // swallow root-relative in-pod app paths (/terminal, /data_manager…).
+        // swallow root-relative in-pod app paths (/terminal, /data-manager…).
       }
 
       // Session-keyed passthrough: any other path on the main host is served to the

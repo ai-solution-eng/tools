@@ -76,7 +76,8 @@ echo "==> [1/4] baked artifacts present in the image"
   echo "  dsh bin:      $(command -v dsh)"
   echo "  uv:           $(command -v uv) ($(uv --version 2>/dev/null | head -1))"
   echo "  ttyd:         $(command -v ttyd) ($(/opt/dsh/bin/ttyd --version 2>/dev/null | head -1))"
-  for c in bash curl git script tmux jq make python3 pip3 rg gh vim fd unzip zstd; do
+  echo "  helm:         $(command -v helm) ($(helm version --short 2>/dev/null))"
+  for c in bash curl git script tmux jq make python3 pip3 rg gh vim fd unzip zstd helm; do
     command -v "$c" >/dev/null || { echo "  MISSING: $c"; exit 1; }
   done
   echo "  toolchain:    all present"
