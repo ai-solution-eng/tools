@@ -9,7 +9,7 @@ import platform
 import sys
 from datetime import UTC, datetime
 
-import httpx
+import httpx2
 
 from . import __version__
 from .logging_setup import log, setup_logging
@@ -357,7 +357,7 @@ async def _rest_health_check(target: RestTarget) -> None:
     url = target.base_url.rstrip("/") + target.health_path
     log.info("Health check %s ...", url)
     try:
-        async with httpx.AsyncClient(verify=not target.insecure, timeout=10) as client:
+        async with httpx2.AsyncClient(verify=not target.insecure, timeout=10) as client:
             resp = await client.get(url, headers=target.headers)
     except Exception as exc:
         print(f"Error: health check failed — {err_key(exc)}", file=sys.stderr)
@@ -375,7 +375,7 @@ async def _discover_dataset(target: RestTarget) -> None:
     url = target.base_url.rstrip("/") + "/api/datasets"
     log.info("Discovering datasets at %s ...", url)
     try:
-        async with httpx.AsyncClient(verify=not target.insecure, timeout=10) as client:
+        async with httpx2.AsyncClient(verify=not target.insecure, timeout=10) as client:
             resp = await client.get(url, headers=target.headers)
             resp.raise_for_status()
             names = [ds["name"] for ds in resp.json().get("datasets", [])]

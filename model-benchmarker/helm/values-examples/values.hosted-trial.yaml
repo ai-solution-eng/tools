@@ -1,0 +1,103 @@
+# =============================================================================
+# ModelBenchmarker -- HOSTED TRIAL values (sanitized) -- single-replica.
+#
+# Customer PCAI: oauth2-proxy AuthorizationPolicy at the gateway PLUS the
+# chart installs a Kyverno vendor-label ClusterPolicy as a pre-install hook
+# (add-vendor-app-labels-<release>-<chart>) -- the customer admin may need to
+# permit ClusterPolicy creation on locked-down clusters.
+#
+# ALL credentials are fillers. Hardlinked to the public delivery repo --
+# never put real credentials here.
+# =============================================================================
+
+replicaCount: 1
+
+deployment:
+  name: model-benchmarker
+  appName: model-benchmarker
+
+image:
+  repository: ghcr.io/ai-solution-eng/model-benchmarker
+  tag: v0.4.1
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+bench:
+  # SITE: the customer endpoints they will benchmark (leave empty to ship
+  # estimator-only; add entries with the customer)
+  endpoints: []
+  #  - name: their-model
+  #    url: http://their-model.<their-ns>.svc.cluster.local
+  #    kind: chat
+
+  # SITE: keys for targets that need auth -- fillers here (or use the
+  # existingSecret route below)
+  endpointApiKeys: {}
+  endpointApiKeysExistingSecret: ""
+  endpointApiKeysExistingSecretKey: endpoint-api-keys
+
+  # SITE: the cluster Prometheus (empty = latency-only benchmarks)
+  prometheusUrl: ""
+
+persistence:
+  enabled: true
+  mountPath: /data
+  # SITE: size + storage class per the customer cluster
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+security:
+  # SITE: the chart ships NO key material. Either point existingSecret at a
+  # Secret you own, set apiKey as an inline seed, or leave both empty and let
+  # the chart auto-generate into <deployment.name>-keys on first install
+  # (retrieve with the kubectl one-liner in the release NOTES).
+  apiKey: "<BENCH_API_KEY>"
+  existingSecret: ""
+  existingSecretApiKey: BENCH_API_KEYS
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# SITE: customer clusters usually have their OWN egress path — flip to true
+# ONLY if this PCAI reaches the internet through the HPE corporate proxy.
+hpe_proxies: false
+pcai:
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+
+extraEnv: {}
+
+# -- Vendor labels / Kyverno -------------------------------------------------------------
+# Hosted trials: enable the pre-install ClusterPolicy (the customer admin may
+# need to permit ClusterPolicy creation). The static vendor labels on the
+# Deployment/Service are ALWAYS rendered regardless — they are what makes the
+# EZUA console card show "Ready".
+kyverno:
+  enabled: true
+
+ezua:
+  enabled: true
+  virtualService:
+    # SITE: the DOMAIN placeholder is substituted by PCAI; change the prefix only.
+    endpoint: model-benchmarker.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 60s
+    longTimeout: 7200s
+  authorizationPolicy:
+    # Enabled for hosted trials: customer SSO via oauth2-proxy at the gateway.
+    # This also switches ON the chart's Kyverno vendor-label pre-install hook.
+    enabled: true
+    namespace: istio-system
+    providerName: oauth2-proxy

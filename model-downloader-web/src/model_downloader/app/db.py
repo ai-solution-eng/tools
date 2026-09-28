@@ -73,6 +73,35 @@ class AioliDB:
         password = await self._password()
         return await asyncio.to_thread(self._push_sync, configs, password)
 
+    async def fetch_packaged_uris(self) -> list[tuple[str, str]]:
+        """Read-only SELECT of packaged_models (name, uri) for the GC cross-check.
+
+        db.py connects as the postgres superuser — this connection is used
+        ONLY for this constant SELECT (no parameters, no writes, no DDL):
+        the GC's AIOLI access is strictly read-only by construction. Rows
+        with a NULL/empty uri still come back (name, '') so callers can log
+        them; the gc matching treats '' as non-matching.
+        """
+        password = await self._password()
+        return await asyncio.to_thread(self._fetch_packaged_uris_sync, password)
+
+    def _fetch_packaged_uris_sync(self, password: str) -> list[tuple[str, str]]:
+        conn = psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            dbname=self.dbname,
+            user=self.user,
+            password=password,
+            connect_timeout=10,
+            options="-c default_transaction_read_only=on",
+        )
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT name, uri FROM packaged_models ORDER BY name")
+                return [(str(name), uri or "") for name, uri in cur.fetchall()]
+        finally:
+            conn.close()
+
     def _push_sync(self, configs: list[dict], password: str) -> list[dict]:
         results = []
         conn = psycopg2.connect(

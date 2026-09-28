@@ -1,0 +1,16 @@
+# Never package site-local values (real credentials live there by convention).
+local/
+.git
+.venv
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+results/
+docker/
+tests/
+documentation/
+*.tgz
+*.tar.gz
+.mb.zip

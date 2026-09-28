@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from math import ceil
 from typing import Any, overload
 
-import httpx
+import httpx2
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
 from .general_tools import list_chunker, sync_wrapper_safe
@@ -1094,17 +1094,17 @@ class MultiModalEmbeddings:
         # queries from every worker/pod into one /v1/embeddings call, so
         # batch size is independent of the number of app processes.
         self._batch_url = os.environ.get("RAG_EMBED_BATCH_URL", "").rstrip("/")
-        # Per-loop httpx clients for the shared batcher.  httpx.AsyncClient
+        # Per-loop httpx2 clients for the shared batcher.  httpx2.AsyncClient
         # binds its connection pool to one event loop, so a single client
         # shared across loops (e.g. main loop + sync_wrapper_safe's
         # background loop in one process) is unsafe — mirror self._batchers.
-        self._batch_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+        self._batch_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx2.AsyncClient] = (
             weakref.WeakKeyDictionary()
         )
         # Per-loop semaphores bounding concurrent multimodal embedding POSTs:
         # aembed_documents gathers one POST per converted doc (up to
         # chunk_size = 64 per sub-batch) and concurrent ingests multiply
-        # that — the httpx pool caps sockets, not request pressure on the
+        # that — the httpx2 pool caps sockets, not request pressure on the
         # endpoint.  MODEL_EMBED_MAX_CONCURRENCY (default 32, 0 disables).
         self._embed_sems: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
             weakref.WeakKeyDictionary()
@@ -1226,14 +1226,14 @@ class MultiModalEmbeddings:
 
     # -- remote (shared) query batcher -----------------------------------------
 
-    def _batch_http_client(self) -> httpx.AsyncClient:
+    def _batch_http_client(self) -> httpx2.AsyncClient:
         loop = asyncio.get_running_loop()
         client = self._batch_clients.get(loop)
         if client is None:
             from .pcai_model_classes import _pool_limits_from_env
 
-            client = httpx.AsyncClient(
-                timeout=httpx.Timeout(300.0, connect=30.0),
+            client = httpx2.AsyncClient(
+                timeout=httpx2.Timeout(300.0, connect=30.0),
                 limits=_pool_limits_from_env(),
             )
             self._batch_clients[loop] = client

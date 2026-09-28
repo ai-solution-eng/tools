@@ -1,0 +1,21 @@
+# ModelBenchmarker -- PCAI app: the LLM memory estimator (default page) plus
+# API-key-gated benchmark launchers that fire the repo's bench engines from a
+# browser. Targets are restricted to the operator-configured endpoint
+# allowlist, one benchmark per endpoint at a time.
+apiVersion: v2
+name: model-benchmarker
+description: >-
+  ModelBenchmarker web app -- the LLM memory estimator plus benchmark launchers
+  (chat TTFT/tokens-s and universal REST/MCP load with GPU scaling curves),
+  behind the PCAI Istio gateway. Benchmarks are restricted to the configured
+  endpoint allowlist, one endpoint at a time, gated by an API key.
+type: application
+version: 0.4.1
+appVersion: "v0.4.1"
+keywords:
+  - benchmarking
+  - pcai
+  - llm
+  - hpe
+maintainers:
+  - name: HPE AI Solution Engineering

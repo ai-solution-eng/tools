@@ -3,9 +3,11 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
@@ -20,7 +22,14 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog
 from .db import AioliDB
+from .gc import build_gc_plan, parse_aioli_rows
 from .k8s import K8sClient
+from .preflight import (
+    PreflightConfig,
+    PreflightError,
+    PreflightService,
+    parse_k8s_quantity,
+)
 from .queue import JobQueue
 from .storage import DownloadedModelsCache
 
@@ -77,6 +86,38 @@ AIOLI_DB_SECRET_NAME = os.environ.get("AIOLI_DB_SECRET_NAME", "aioli-db-password
 AIOLI_DB_SECRET_NS = os.environ.get("AIOLI_DB_SECRET_NS", "mlis")
 AIOLI_DB_SECRET_KEY = os.environ.get("AIOLI_DB_SECRET_KEY", "password")
 
+# ---- MD-B preflight + per-namespace quota --------------------------------
+# PREFLIGHT_MODE: refuse (default) | warn | off. warn reports the same
+# decisions in the response but never refuses; off skips the check entirely.
+PREFLIGHT_ENABLED = os.environ.get("PREFLIGHT_ENABLED", "true").strip().lower() == "true"
+PREFLIGHT_MODE = os.environ.get("PREFLIGHT_MODE", "refuse")
+# Bytes map: "ns1:536870912000,ns2:1099511627776" + a default. Values accept
+# plain integers or k8s quantities ("500Gi") for readability.
+QUOTA_DEFAULT = os.environ.get("QUOTA_DEFAULT", "")
+QUOTA_NAMESPACES = os.environ.get("QUOTA_NAMESPACES", "")
+QUOTA_MODE = os.environ.get("QUOTA_MODE", "refuse")  # refuse | warn | off
+# Safety margin subtracted from free space before the fit check (headroom for
+# growth of in-flight writes the du pass cannot see yet).
+PREFLIGHT_SAFETY_MARGIN = int(os.environ.get("PREFLIGHT_SAFETY_MARGIN", "0"))
+# TTL for the cached storage census / size estimates (seconds).
+PREFLIGHT_USAGE_TTL = int(os.environ.get("PREFLIGHT_USAGE_TTL", "120"))
+PREFLIGHT_SIZE_TTL = int(os.environ.get("PREFLIGHT_SIZE_TTL", "300"))
+
+# ---- MD-C TTL/GC -----------------------------------------------------------
+# The GC deletion itself runs in the CronJob's pod (it needs the PVC); the
+# app exposes the dry-run report (gc.dryRun defaults true — the report lands
+# in the UI BEFORE any deletion is ever enabled) and the settings the job
+# reads from its own env. GC_REPORT_TTL mirrors the single-flight cache
+# pattern of the downloaded-models listing.
+GC_ENABLED = os.environ.get("GC_ENABLED", "false").strip().lower() == "true"
+GC_TTL_DAYS = float(os.environ.get("GC_TTL_DAYS", "30"))
+GC_DRY_RUN = os.environ.get("GC_DRY_RUN", "true").strip().lower() == "true"
+GC_PROTECTED = [p for p in os.environ.get("GC_PROTECTED", "").split(",") if p.strip()]
+GC_MIN_KEEP = int(os.environ.get("GC_MIN_KEEP", "0"))
+GC_REPORT_TTL = int(os.environ.get("GC_REPORT_TTL", "120"))
+
+log = logging.getLogger(__name__)
+
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -125,6 +166,63 @@ aioli_db = AioliDB(
     secret_key=AIOLI_DB_SECRET_KEY,
 )
 downloaded_cache = DownloadedModelsCache(pvc_refresh_interval=PVC_REFRESH_INTERVAL)
+
+
+def _parse_quota_map(spec: str) -> dict[str, int]:
+    """``ns:500Gi,ns2:1099511627776`` -> {ns: bytes}.
+
+    Values may be integers or k8s quantities; bad entries are logged and
+    skipped (a typo must not zero a namespace's quota into unlimited-by-
+    accident — skipping falls back to quota.default, which is the stricter
+    default posture).
+    """
+    from .preflight import parse_k8s_quantity
+
+    quotas: dict[str, int] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        ns, sep, value = part.partition(":")
+        ns = ns.strip()
+        value = value.strip()
+        if not sep or not ns or not value:
+            log.warning("ignoring malformed quota entry %r (want namespace:bytes)", part)
+            continue
+        parsed = int(value) if value.isdigit() else parse_k8s_quantity(value)
+        if parsed is None:
+            log.warning("ignoring quota entry with unparseable size %r", part)
+            continue
+        quotas[ns] = parsed
+    return quotas
+
+
+preflight_service = PreflightService(
+    PreflightConfig(
+        enabled=PREFLIGHT_ENABLED,
+        mode=PREFLIGHT_MODE,
+        quota_default_bytes=parse_k8s_quantity(QUOTA_DEFAULT) if QUOTA_DEFAULT else None,
+        quota_namespaces=_parse_quota_map(QUOTA_NAMESPACES),
+        quota_mode=QUOTA_MODE,
+        safety_margin_bytes=PREFLIGHT_SAFETY_MARGIN,
+    ),
+    k8s=k8s_client,
+    usage_ttl=PREFLIGHT_USAGE_TTL,
+    size_ttl=PREFLIGHT_SIZE_TTL,
+    scan_image=PVC_SCAN_IMAGE,
+)
+
+# ---- MD-C GC dry-run report cache (single-flight, DownloadedModelsCache
+# pattern): concurrent requests share one build; ?force=1 rebuilds debounced.
+gc_report_cache: dict = {"report": None, "built_at": 0.0}
+_gc_lock: asyncio.Lock | None = None
+
+
+async def _gc_lock_or_create() -> asyncio.Lock:
+    global _gc_lock
+    if _gc_lock is None:
+        _gc_lock = asyncio.Lock()
+    return _gc_lock
 
 
 @asynccontextmanager
@@ -280,6 +378,9 @@ def _page_context() -> dict:
         "debug_pods_enabled": DEBUG_POD_ENABLED and k8s_client.debug_pod_available,
         "debug_pod_image": DEBUG_POD_IMAGE,
         "catalog_github_url": CATALOG_GITHUB_URL,
+        "gc_enabled": GC_ENABLED,
+        "gc_ttl_days": GC_TTL_DAYS,
+        "gc_dry_run": GC_DRY_RUN,
         "assets": STATIC_HASHES,
     }
 
@@ -296,16 +397,27 @@ async def catalog_page(request: Request):
 
 @app.post("/api/jobs")
 async def submit_job(req: SubmitRequest):
-    record = await queue.submit(
-        req.namespace,
-        req.model_name,
-        req.hf_token,
-        storage=req.storage,
-        s3_path=req.s3_path,
-        chat_template_path=req.chat_template_path,
-        chat_template_contents=req.chat_template_contents,
-        cache_root=req.cache_root,
-    )
+    # MD-B: preflight/quota runs inside queue.submit before Job creation.
+    # A refusal raises PreflightError/QuotaExceededError with the exact
+    # bytes-needed vs bytes-free / used-vs-quota reason — surfaced as a 4xx
+    # detail the UI shows verbatim in the submit error path. Warn decisions
+    # ride along in the response so the UI can display them non-fatally.
+    try:
+        record = await queue.submit(
+            req.namespace,
+            req.model_name,
+            req.hf_token,
+            storage=req.storage,
+            s3_path=req.s3_path,
+            chat_template_path=req.chat_template_path,
+            chat_template_contents=req.chat_template_contents,
+            cache_root=req.cache_root,
+            preflight=preflight_service,
+        )
+    except PreflightError as e:
+        # QuotaExceededError subclasses PreflightError; both carry the exact
+        # human-readable refusal (bytes-needed vs bytes-free / used vs quota).
+        raise HTTPException(422, e.detail) from e
     return {"id": record.id, "status": record.status, "storage": record.storage}
 
 
@@ -415,6 +527,146 @@ async def list_downloaded(request: Request):
         # explainable (scan ran and found 0 vs skipped vs error). The UI logs
         # this to the console rather than rendering it.
         "scan": dict(downloaded_cache.last_status),
+    }
+
+
+# ---- MD-C TTL/GC dry-run report -------------------------------------------------
+
+
+def _require_gc() -> None:
+    if not GC_ENABLED:
+        raise HTTPException(400, "gc is disabled (gc.enabled=false)")
+
+
+async def _build_gc_report(force: bool = False) -> dict:
+    """The GC dry-run report (no deletion — deletion runs in the GC Job).
+
+    Pipeline (gc.py): scanner/du enumeration -> TTL/LRU line -> AIOLI
+    packaged_models cross-check (strictly read-only SELECT) -> live managed
+    Job cross-check (annotations) -> three-key AND verdict per cache dir.
+    Cached single-flight with a TTL; ?force=1 rebuilds (debounced by the
+    same interval, matching the downloaded-listing pattern).
+
+    The report lands in the UI FIRST — gc.dryRun=true is the chart default
+    and the GC Job refuses to delete until an operator flips it — so this
+    endpoint never performs or triggers a deletion itself.
+    """
+    lock = await _gc_lock_or_create()
+    async with lock:
+        fresh = (time.time() - gc_report_cache["built_at"]) < GC_REPORT_TTL
+        if gc_report_cache["report"] is not None and fresh and not force:
+            return gc_report_cache["report"]
+
+        scan_root = f"/mnt/{PVC_SUBPATH}"
+        entries: list[dict] = []
+        scan_error = ""
+        if PVC_SCAN_IMAGE and PVC_NAME:
+            from .storage import scan_pvc_via_job
+
+            models, err = await scan_pvc_via_job(
+                k8s_client,
+                namespace=DEFAULT_NAMESPACE,
+                pvc_name=PVC_NAME,
+                scan_root=scan_root,
+                image=PVC_SCAN_IMAGE,
+                timeout=300,
+                mount_path="/mnt/",
+            )
+            if err:
+                scan_error = err
+            for m in models:
+                entries.append(
+                    {
+                        "model_name": m.model_name,
+                        "cachepath": m.cachepath or "",
+                        "mtime": m.last_modified,
+                        "bytes": m.bytes,
+                        "manifest": m.provenance_manifest,
+                        "scanned": m.scanned,
+                    }
+                )
+        else:
+            scan_error = "not configured (pvc or pvcScanImage missing)"
+
+        aioli_uris: list[str] = []
+        aioli_error = ""
+        try:
+            aioli_uris = parse_aioli_rows(await aioli_db.fetch_packaged_uris())
+        except Exception as e:
+            aioli_error = f"{type(e).__name__}: {e}"
+            log.warning("GC AIOLI cross-check failed: %s — treating ALL dirs as AIOLI-protected", e)
+            # Fail-safe: an unreachable AIOLI must not unprotect anything.
+            # Mark every entry as aioli-protected by injecting a catch-all.
+            aioli_uris = ["*AIOLI-UNAVAILABLE*"]
+
+        live_jobs: list[dict] = []
+        try:
+            live_jobs = await k8s_client.list_managed_jobs_by_annotation()
+        except Exception as e:
+            log.warning("GC live-job cross-check failed: %s", e)
+
+        if aioli_error:
+            plan = build_gc_plan(
+                entries,
+                ttl_days=GC_TTL_DAYS,
+                aioli_uris=[],
+                live_jobs=live_jobs,
+                protected_models=GC_PROTECTED,
+                min_keep=GC_MIN_KEEP,
+            )
+            # Override: without a usable AIOLI read, nothing is deletable.
+            for row in plan["rows"]:
+                if row["action"] == "delete":
+                    row["action"] = "keep"
+                    row["reason"] = "AIOLI cross-check unavailable — fail-safe keeps everything"
+            plan["summary"]["delete"] = 0
+            plan["summary"]["aioli_unavailable"] = True
+        else:
+            plan = build_gc_plan(
+                entries,
+                ttl_days=GC_TTL_DAYS,
+                aioli_uris=aioli_uris,
+                live_jobs=live_jobs,
+                protected_models=GC_PROTECTED,
+                min_keep=GC_MIN_KEEP,
+            )
+
+        report = {
+            "generated_at": plan["generated_at"],
+            "ttl_days": GC_TTL_DAYS,
+            "dry_run": GC_DRY_RUN,
+            "enabled": GC_ENABLED,
+            "protected_models": GC_PROTECTED,
+            "min_keep": GC_MIN_KEEP,
+            "scan_error": scan_error,
+            "aioli_error": aioli_error,
+            "aioli_model_count": len(aioli_uris),
+            "live_job_count": len(live_jobs),
+            "rows": plan["rows"],
+            "summary": plan["summary"],
+        }
+        gc_report_cache["report"] = report
+        gc_report_cache["built_at"] = time.time()
+        return report
+
+
+@app.get("/api/gc/report")
+async def gc_report(request: Request):
+    """Dry-run GC report for the UI (cached; ?force=1 rebuilds)."""
+    _require_gc()
+    force = (request.query_params.get("force") or "") in ("1", "true", "yes")
+    return await _build_gc_report(force=force)
+
+
+@app.get("/api/gc/config")
+async def gc_config():
+    """The GC settings the UI renders (no cluster calls)."""
+    return {
+        "enabled": GC_ENABLED,
+        "ttl_days": GC_TTL_DAYS,
+        "dry_run": GC_DRY_RUN,
+        "protected_models": GC_PROTECTED,
+        "min_keep": GC_MIN_KEEP,
     }
 
 

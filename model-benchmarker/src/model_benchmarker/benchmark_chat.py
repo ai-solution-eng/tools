@@ -53,12 +53,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import random
+import re
 import secrets
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
@@ -150,6 +152,175 @@ class Task:
     top_p: float = 1.0
 
 
+# ---------------------------------------------------------------------------
+# ITL (inter-token latency) collection — MB-A
+# ---------------------------------------------------------------------------
+#
+# Raw per-gap lists would scale with generated tokens: 64 users x max_tokens
+# 24576 is ~1.5M floats per level. Gaps are therefore collected into a FIXED
+# log-spaced histogram (memory is O(buckets), not O(gaps)) plus a running max.
+
+ITL_MIN_MS = 0.1  # log-histogram low edge (ms); sub-0.1ms gaps clip into bucket 0
+ITL_MAX_MS = 60_000.0  # high edge (60 s) — stalls beyond it clip into the last bucket
+ITL_BUCKETS = 96  # 64–128 buckets per the implementation review; edges are log-spaced
+
+# Log-spaced bucket edges in ms (len = ITL_BUCKETS + 1). Edges are computed once
+# at import so every histogram shares identical, comparable bucketing.
+ITL_EDGES_MS: tuple[float, ...] = tuple(
+    ITL_MIN_MS * (ITL_MAX_MS / ITL_MIN_MS) ** (i / ITL_BUCKETS) for i in range(ITL_BUCKETS + 1)
+)
+
+PCTS = ("P50", "P95", "P99", "P100")
+
+
+class GapHistogram:
+    """Fixed log-spaced histogram of inter-token gaps, in milliseconds.
+
+    ``record(gap_s)`` takes seconds (the stream loop's clock unit) and clips
+    into the first/last bucket outside [ITL_MIN_MS, ITL_MAX_MS]. ``merge``
+    folds another histogram in (same edges — asserted) so per-level
+    aggregation stays O(buckets). ``max_gap_ms`` carries the exact running
+    maximum regardless of bucketing.
+    """
+
+    __slots__ = ("counts", "max_gap_ms", "n", "total_ms")
+
+    def __init__(self) -> None:
+        self.counts: list[int] = [0] * ITL_BUCKETS
+        self.max_gap_ms: float = 0.0
+        self.total_ms: float = 0.0
+        self.n: int = 0
+
+    def record(self, gap_s: float) -> None:
+        if gap_s < 0:
+            return
+        gap_ms = gap_s * 1000.0
+        self.n += 1
+        self.total_ms += gap_ms
+        self.max_gap_ms = max(self.max_gap_ms, gap_ms)
+        if gap_ms <= ITL_EDGES_MS[0]:
+            self.counts[0] += 1
+            return
+        if gap_ms >= ITL_EDGES_MS[-1]:
+            self.counts[-1] += 1
+            return
+        # Log-bucket: position between the edges, linear-interpolated onto
+        # the bucket grid in log space (edges are geometric).
+        pos = math.log(gap_ms / ITL_EDGES_MS[0]) / math.log(ITL_EDGES_MS[-1] / ITL_EDGES_MS[0])
+        idx = min(ITL_BUCKETS - 1, max(0, int(pos * ITL_BUCKETS)))
+        self.counts[idx] += 1
+
+    def merge(self, other: GapHistogram) -> None:
+        if len(other.counts) != len(self.counts):
+            raise ValueError("cannot merge GapHistograms with different bucketing")
+        for i in range(ITL_BUCKETS):
+            self.counts[i] += other.counts[i]
+        self.max_gap_ms = max(self.max_gap_ms, other.max_gap_ms)
+        self.total_ms += other.total_ms
+        self.n += other.n
+
+    def percentiles(self, pcts: tuple[str, ...] = PCTS) -> dict[str, float]:
+        """Approximate percentiles (ms) by walking the bucket counts.
+
+        Each bucket's gaps are represented by its midpoint in log space;
+        clipping buckets (0 / last) use their edge values. Exactness is not
+        the goal — the histogram exists to bound memory — but log-spaced
+        edges keep the relative error per bucket uniform (<= ~8% at 96
+        buckets across the 0.1ms–60s span).
+        """
+        if self.n == 0:
+            return {}
+        centers = [math.sqrt(ITL_EDGES_MS[i] * ITL_EDGES_MS[i + 1]) for i in range(ITL_BUCKETS - 1)] + [
+            ITL_EDGES_MS[-1]
+        ]
+        centers[0] = ITL_EDGES_MS[0]  # clip bucket: everything at or under the low edge
+        out: dict[str, float] = {}
+        for p in pcts:
+            q = {"P50": 0.50, "P95": 0.95, "P99": 0.99, "P100": 1.0}.get(p, 0.50)
+            target = q * self.n
+            cum = 0
+            value = self.max_gap_ms
+            for i, c in enumerate(self.counts):
+                if c == 0:
+                    continue
+                cum += c
+                if cum >= target:
+                    value = centers[i]
+                    break
+            out[p] = float(value)
+        return out
+
+    def mean_ms(self) -> float:
+        return self.total_ms / self.n if self.n else 0.0
+
+
+@dataclass
+class ITLSummary:
+    """Per-request ITL summary folded into a RequestResult.
+
+    ``hist`` is the raw histogram (for merging into level aggregates);
+    the percentile dict / mean / max are precomputed views for the tables.
+    ``tpot_ms`` is None when it cannot be computed (0/1 token or no first
+    token); ``tpot_approximate`` marks burst-guard requests whose TPOT is
+    really TTFT-or-total-time, not a token cadence.
+    """
+
+    hist: GapHistogram = field(default_factory=GapHistogram)
+    tpot_ms: float | None = None
+    tpot_approximate: bool = False
+    last_gap_ms: float | None = None  # stream-end minus last text-bearing delta
+
+    @property
+    def max_stall_ms(self) -> float:
+        return self.hist.max_gap_ms
+
+    def percentile_summary(self) -> dict[str, float] | None:
+        return self.hist.percentiles() if self.hist.n else None
+
+
+def parse_goodput_spec(spec: str) -> list[tuple[str, str, float]]:
+    """Parse a ``--goodput`` spec like ``"ttft<=2000,tpot<=50"``.
+
+    Returns (metric, op, threshold_ms) triples; op is always ``<=`` (SLOs are
+    upper bounds). Metric aliases: ``ttft`` (also ``ttft_ms``), ``tpot`` (also
+    ``tpot_ms``), ``itl`` / ``itl_p99`` (P99 of the inter-token gaps).
+    Raises SystemExit on a malformed term so a typo can never silently
+    disable the goodput check.
+    """
+    aliases = {
+        "ttft": "ttft",
+        "ttft_ms": "ttft",
+        "tpot": "tpot",
+        "tpot_ms": "tpot",
+        "itl": "itl_p99",
+        "itl_p99": "itl_p99",
+        "itl_p50": "itl_p50",
+        "max_stall": "max_stall",
+    }
+    terms: list[tuple[str, str, float]] = []
+    for raw in spec.split(","):
+        term = raw.strip().lower()
+        if not term:
+            continue
+        m = re.fullmatch(r"([a-z_0-9]+)\s*(<=)\s*([0-9]*\.?[0-9]+)", term)
+        if not m or m.group(2) != "<=":
+            raise SystemExit(
+                f"--goodput: cannot parse term {raw.strip()!r}. "
+                'Expected "<metric><=<ms>", e.g. "ttft<=2000,tpot<=50" '
+                "(metrics: ttft, tpot, itl_p99, itl_p50, max_stall; thresholds in ms)."
+            )
+        metric = aliases.get(m.group(1))
+        if metric is None:
+            raise SystemExit(
+                f"--goodput: unknown metric {m.group(1)!r}. "
+                f"Available: {', '.join(sorted(set(aliases)))} (thresholds are milliseconds)."
+            )
+        terms.append((metric, "<=", float(m.group(3))))
+    if not terms:
+        raise SystemExit('--goodput: empty spec — expected e.g. "ttft<=2000,tpot<=50".')
+    return terms
+
+
 def _strip_instance_line(prompt: str) -> str:
     """Drop the leading '[instance {nonce}]' line so prompts can be nested."""
     head, sep, rest = prompt.partition("\n")
@@ -202,9 +373,15 @@ class RequestResult:
     tokens_per_s: float = 0.0
     error: str = ""
     response_text: str = ""
+    # MB-A: per-request ITL/TPOT records (goodput's precondition).
+    itl: ITLSummary | None = None
+    # True when the burst guard rewrote gen_time to the full request time —
+    # tokens_per_s (and TPOT derived from the same window) is then an
+    # approximation, not a measured cadence.
+    burst_guarded: bool = False
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--model_class_name",
@@ -279,6 +456,66 @@ def parse_args() -> argparse.Namespace:
         "--requests_per_user turns of just that task back-to-back. Gives every "
         "task a clean turn-1 (prefill) vs turns 2+ (prefix reuse) comparison "
         "without cross-task interference.",
+    )
+    parser.add_argument(
+        "--arrival_mode",
+        choices=("closed", "open", "poisson"),
+        default="closed",
+        help="Arrival process (MB-C). 'closed' (default) is the classic engine: N "
+        "users each run requests_per_user sequential requests, a new request "
+        "starts the moment the previous one finishes. 'open' (alias 'poisson') "
+        "issues requests on a schedule (--request_rate arrivals/s) so "
+        "server-side queueing shows up in TTFT by design; levels become time "
+        "windows (--level_duration) and the closed-loop semantics of "
+        "--requests_per_user do not apply. Open-loop runs are stamped "
+        "arrival=open in the artifacts (filename token _ol) and are never "
+        "comparable to closed-loop numbers.",
+    )
+    parser.add_argument(
+        "--request_rate",
+        type=float,
+        default=None,
+        help="Open-loop arrival rate in requests/second (requires "
+        "--arrival_mode open). Level size = rate x --level_duration.",
+    )
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=math.inf,
+        help="Open-loop inter-arrival variability (vLLM convention): inf "
+        "(default) = exponential inter-arrivals (Poisson process, cv=1); a "
+        "finite value b draws Gamma(b², 1/(b²·rate)) — mean 1/rate, cv = 1/b "
+        "— so b < 1 is more regular than Poisson, b > 1 is burstier (b=2 "
+        "doubles the cv).",
+    )
+    parser.add_argument(
+        "--level_duration",
+        type=float,
+        default=30.0,
+        help="Open-loop level length in seconds (arrival window; requires "
+        "--arrival_mode open). Arrivals are scheduled inside the window and "
+        "the level ends when the last issued request completes, so the drain "
+        "tail extends the measured window. Default 30s.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed the open-loop arrival schedule (and per-request task "
+        "selection) for reproducible runs. Default: random.",
+    )
+    parser.add_argument(
+        "--goodput",
+        type=str,
+        default="",
+        help='Goodput SLOs (MB-D), e.g. --goodput "ttft<=2000,tpot<=50": a '
+        "request has goodput when EVERY threshold holds (ms). The report adds "
+        "a goodput fraction per (ctx, users, task) row plus a max "
+        "goodput-satisfying load summary; failed requests are never goodput "
+        "(counted in 'failed' separately, vLLM convention). Burst-guarded "
+        "requests (approximate TPOT) are excluded from TPOT predicates and "
+        "the artifact says so. Thresholds are stamped into the artifact "
+        "header — a goodput number without its thresholds is meaningless.",
     )
     parser.add_argument(
         "--tasks",
@@ -357,7 +594,9 @@ def parse_args() -> argparse.Namespace:
         help="Suppress the per-request progress lines (keep prewarm notices, "
         "level previews and the final table). Recommended when stdout is "
         "piped/redirected: per-request print() runs on the event loop and a "
-        "blocked stdout stall can distort TTFT/tokens-s.",
+        "blocked stdout stall can distort TTFT/tokens-s — and ITL/TPOT even "
+        "more (every inter-token gap absorbs the stall). Pair --quiet with "
+        "any ITL/TPOT-sensitive run.",
     )
     parser.add_argument(
         "--output",
@@ -368,7 +607,7 @@ def parse_args() -> argparse.Namespace:
         "leaves the completed levels on disk. E.g. --output "
         "results/qwen_38_27b/H200x4.md.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def resolve_api_key(args: argparse.Namespace) -> str:
@@ -570,6 +809,8 @@ async def stream_once(
     reasoning_deltas = 0
     usage_tokens: int | None = None
     content_parts: list[str] = []
+    gaps = GapHistogram()  # MB-A: inter-token gaps of THIS request
+    last_text_at: float | None = None  # timestamp of the last text-bearing delta
     try:
         if messages is None:
             messages = [{"role": "user", "content": render_prompt(task, context_length, no_nonce)}]
@@ -600,28 +841,33 @@ async def stream_once(
                 if delta is not None:
                     content = getattr(delta, "content", None)
                     reasoning = getattr(delta, "reasoning_content", None)
-                    if content:
+                    # A delta is text-bearing when ANY of its fields carries
+                    # text — `elif reasoning:` below counts a dual-field delta
+                    # once, so the gap recording must not live inside the
+                    # branch order. Gaps run from the previous text-bearing
+                    # delta to this one (the first delta starts the stream and
+                    # records no gap).
+                    extra = getattr(delta, "model_extra", None) or getattr(delta, "__pydantic_extra__", None) or {}
+                    combined = {**delta.model_dump(), **extra}
+                    has_extra_text = any(isinstance(v, str) and v for k, v in combined.items() if k != "role")
+                    if content or reasoning or has_extra_text:
                         if first_token_at is None:
                             first_token_at = now
-                            _debug_first_delta("content", delta, debug_stream)
+                            if content:
+                                _debug_first_delta("content", delta, debug_stream)
+                            elif reasoning:
+                                _debug_first_delta("reasoning_content", delta, debug_stream)
+                            else:
+                                _debug_first_delta("model_extra", delta, debug_stream)
+                        else:
+                            if last_text_at is not None:
+                                gaps.record(now - last_text_at)
+                        last_text_at = now
+                    if content:
                         content_deltas += 1
                         content_parts.append(content)
                     elif reasoning:
-                        if first_token_at is None:
-                            first_token_at = now
-                            _debug_first_delta("reasoning_content", delta, debug_stream)
                         reasoning_deltas += 1
-                    elif first_token_at is None:
-                        # Some Qwen3 servers stream text under other delta
-                        # fields (e.g. `reasoning`), which the SDK keeps in
-                        # model_extra. Treat any non-empty, non-role string
-                        # delta as a token so TTFT never falls back to 0 on
-                        # an unknown field name.
-                        extra = getattr(delta, "model_extra", None) or getattr(delta, "__pydantic_extra__", None) or {}
-                        combined = {**delta.model_dump(), **extra}
-                        if any(isinstance(v, str) and v for k, v in combined.items() if k != "role"):
-                            first_token_at = now
-                            _debug_first_delta("model_extra", delta, debug_stream)
     except Exception as exc:
         return RequestResult(success=False, task=task.name, error=str(exc))
 
@@ -632,16 +878,32 @@ async def stream_once(
     tokens = usage_tokens if usage_tokens is not None else (content_deltas + reasoning_deltas)
     total_time = t_end - t0
     gen_time = t_end - first_token_at
-    if gen_time <= 0 or gen_time < 0.05 * total_time:
+    burst_guarded = bool(gen_time <= 0 or gen_time < 0.05 * total_time)
+    if burst_guarded:
         # Whole response arrived in one burst (short generations): the
         # first token and stream end are ~simultaneous, so throughput is
         # meaningless — fall back to the full request time.
         gen_time = total_time
     tokens_per_s = tokens / gen_time if gen_time > 0 else 0.0
+
+    # MB-A: TPOT = (t_end − first_token_at) / (tokens − 1), with the same
+    # usage-token precedence as the tokens rule above. The ITL histogram is
+    # recorded raw (never inherits the burst fallback); a burst-guarded
+    # request's TPOT is flagged approximate instead.
+    tpot_ms: float | None = None
+    if tokens >= 2 and t_end > first_token_at:
+        tpot_ms = (t_end - first_token_at) / (tokens - 1) * 1000.0
+    itl = ITLSummary(
+        hist=gaps,
+        tpot_ms=tpot_ms,
+        tpot_approximate=burst_guarded,
+        last_gap_ms=(t_end - last_text_at) * 1000.0 if last_text_at is not None else None,
+    )
     if debug_stream:
         print(
             f"  [debug] content_chunks={content_deltas} reasoning_chunks={reasoning_deltas} "
-            f"usage_tokens={usage_tokens} first_token={(first_token_at - t0) * 1000:.0f}ms"
+            f"usage_tokens={usage_tokens} first_token={(first_token_at - t0) * 1000:.0f}ms "
+            f"gaps={gaps.n} max_stall={gaps.max_gap_ms:.1f}ms"
         )
     return RequestResult(
         success=True,
@@ -650,6 +912,8 @@ async def stream_once(
         tokens=tokens,
         tokens_per_s=tokens_per_s,
         response_text="".join(content_parts),
+        itl=itl,
+        burst_guarded=burst_guarded,
     )
 
 
@@ -665,6 +929,9 @@ async def run_concurrency(
     no_nonce: bool = False,
     quiet: bool = False,
 ) -> list[RequestResult]:
+    """Closed-loop engine (unchanged semantics): ``n_users`` concurrent users,
+    each running ``requests_per_user`` sequential requests — the default and
+    --multiturn path. Open-loop runs use ``run_open_loop`` (MB-C) instead."""
     sem = asyncio.Semaphore(n_users)
 
     async def _user(uid: int) -> list[RequestResult]:
@@ -737,6 +1004,267 @@ async def run_concurrency(
     return [r for g in grouped for r in g]
 
 
+# ---------------------------------------------------------------------------
+# Open-loop arrivals (MB-C)
+# ---------------------------------------------------------------------------
+
+
+def _interarrival_s(rng: random.Random, rate: float, burstiness: float) -> float:
+    """One open-loop inter-arrival time (seconds) at ``rate`` req/s.
+
+    vLLM-style burstiness convention: ``burstiness = inf`` is exponential
+    (Poisson process, cv = 1); a finite positive b draws Gamma(k=b²,
+    θ = 1/(b²·R)) — mean 1/R, cv = 1/b — so b < 1 is more regular than
+    Poisson and b > 1 is burstier.
+    """
+    if rate <= 0:
+        raise ValueError("request_rate must be > 0")
+    if burstiness == math.inf:
+        return rng.expovariate(rate)
+    if burstiness <= 0:
+        raise ValueError("burstiness must be > 0 (or inf)")
+    b = float(burstiness)
+    return rng.gammavariate(b * b, 1.0 / (b * b * rate))
+
+
+def _arrival_schedule(
+    rng: random.Random,
+    rate: float,
+    burstiness: float,
+    window_s: float,
+    max_requests: int = 100_000,
+) -> list[float]:
+    """Arrival offsets (seconds from window start) for one open-loop level.
+
+    Draws inter-arrivals until the cumulative time exceeds ``window_s`` —
+    arrivals scheduled inside the window are issued; the level then runs
+    until every issued request completes (the drain tail is part of the
+    measurement: open-loop TTFT includes server queueing by design).
+    ``max_requests`` bounds the list so a pathological rate × duration
+    product cannot exhaust memory.
+    """
+    offsets: list[float] = []
+    t = 0.0
+    while t <= window_s and len(offsets) < max_requests:
+        offsets.append(t)
+        t += _interarrival_s(rng, rate, burstiness)
+    return offsets
+
+
+async def run_open_loop(
+    model,
+    tasks: list[Task],
+    *,
+    rate: float,
+    window_s: float,
+    context_length: int = 0,
+    extra_body: dict | None = None,
+    debug_stream: bool = False,
+    no_nonce: bool = False,
+    quiet: bool = False,
+    burstiness: float = math.inf,
+    seed: int | None = None,
+    n_users: int = 0,
+    pool_max: int | None = None,
+    call_timeout_s: float = 600.0,
+) -> tuple[list[RequestResult], float, float]:
+    """Open-loop arrival engine (MB-C): requests are issued on a schedule —
+    Poisson at ``burstiness=inf``, gamma-shaped otherwise — NOT as soon as a
+    user slot frees. Server-side queueing therefore shows up in TTFT, which
+    is the point of the mode.
+
+    The level's arrival window is ``window_s`` seconds; arrivals scheduled
+    inside it are all issued, and the level ends when every issued request
+    completes (the drain tail is measured too).
+
+    Returns (results, achieved_rate, duration_s): achieved_rate is
+    completions / wall-clock of the whole level (arrivals + drain), so it
+    reads slightly below the configured rate when the drain tail is long —
+    the artifact records both numbers.
+
+    The in-flight cap is min(rate × timeout, pool_max) and is surfaced: when
+    rate × timeout exceeds the pool, arrivals beyond the pool queue
+    client-side and pollute the arrival process (the pool warning applies
+    identically to open-loop). ``n_users`` only seeds deterministic per-
+    request task selection — it is NOT a concurrency cap here (the closed-
+    loop semaphore would corrupt the arrival process).
+    """
+    rng = random.Random(seed)
+    timeout_cap = rate * call_timeout_s
+    inflight_cap = min(timeout_cap, float(pool_max)) if pool_max else timeout_cap
+    max_requests = max(1, int(rate * window_s * 4) + 64)
+    offsets = _arrival_schedule(rng, rate, burstiness, window_s, max_requests)
+    if not quiet:
+        b_desc = "inf (Poisson)" if burstiness == math.inf else f"{burstiness:g}"
+        print(
+            f"  open-loop: {len(offsets)} arrivals over a {window_s:.1f}s window at "
+            f"{rate:.2f} req/s (burstiness {b_desc}); in-flight cap ≈ {inflight_cap:.0f} "
+            f"= min(rate×timeout, pool {pool_max if pool_max else 'n/a'})"
+        )
+        if pool_max and timeout_cap > pool_max:
+            print(
+                f"  WARNING: rate × timeout ({timeout_cap:.0f}) exceeds the connection pool "
+                f"({pool_max}); arrivals beyond the pool cap queue client-side and pollute the "
+                "arrival process — raise MODEL_POOL_MAX_CONNECTIONS or lower --request_rate."
+            )
+        if len(offsets) >= max_requests:
+            print(
+                f"  WARNING: arrival schedule truncated at {max_requests} arrivals — "
+                "rate × --level_duration is very large; shorten the window or raise the rate."
+            )
+
+    task_cycle = list(tasks)
+    n_seeded = max(1, n_users)
+
+    async def _fire(idx: int) -> RequestResult:
+        # Deterministic per-request task selection seeded by the arrival index
+        # (same reproducibility convention as the closed-loop per-user seeds).
+        req_rng = random.Random((seed if seed is not None else 0) * 1_000_003 + idx)
+        task = task_cycle[req_rng.randrange(len(task_cycle))] if len(task_cycle) > 1 else task_cycle[0]
+        res = await stream_once(
+            model,
+            task,
+            context_length,
+            extra_body,
+            debug_stream,
+            messages=None,
+            no_nonce=no_nonce,
+        )
+        res.turn = 1
+        if not quiet:
+            async with _print_lock:
+                uid = idx % n_seeded
+                if res.success:
+                    print(
+                        f"  [open user={uid} arr={idx + 1}/{len(offsets)}] task={task.name} -> "
+                        f"TTFT={res.ttft_s * 1000:.0f}ms, {res.tokens} tok, {res.tokens_per_s:.1f} tok/s"
+                    )
+                else:
+                    print(f"  [open user={uid} arr={idx + 1}/{len(offsets)}] task={task.name} FAILED: {res.error}")
+        return res
+
+    async def _runner(offset: float, idx: int) -> RequestResult:
+        delay = offset - (time.monotonic() - start)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await _fire(idx)
+
+    t_start = time.monotonic()
+    start = t_start
+    results = await asyncio.gather(*(_runner(off, i) for i, off in enumerate(offsets)))
+    duration = time.monotonic() - t_start
+    achieved = len(results) / duration if duration > 0 else 0.0
+    return list(results), achieved, duration
+
+
+# ---------------------------------------------------------------------------
+# Goodput (MB-D)
+# ---------------------------------------------------------------------------
+
+
+def compute_goodput(
+    results: list[RequestResult],
+    slo: list[tuple[str, str, float]],
+) -> tuple[float | None, dict[str, float]]:
+    """Fraction of successful requests meeting ALL SLO predicates (MB-D).
+
+    SLO metrics (thresholds in ms, always upper bounds):
+      ``ttft``      — per-request TTFT.
+      ``tpot``      — per-request TPOT. Burst-guarded requests have
+                      approximate TPOT (their gen_time was rewritten to the
+                      full request time) and are EXCLUDED from the TPOT
+                      predicate — neither a hit nor a miss — while still
+                      counting for TTFT SLOs. The artifact stamps the burst
+                      fraction per row so the reader knows the policy.
+      ``itl_p99`` / ``itl_p50`` / ``max_stall`` — from the request's gap
+                      histogram.
+
+    Failed requests are NOT goodput (vLLM convention): they are counted in
+    the row's ``failed`` column, never as goodput misses.
+
+    Returns (joint_fraction_or_None, per_metric_fractions). The joint
+    fraction is None when no successful request could be judged at all
+    (e.g. a TPOT-only SLO where every success is burst-guarded).
+    """
+    successes = [r for r in results if r.success and r.itl is not None]
+    if not successes or not slo:
+        return None, {}
+
+    def meets(r: RequestResult, metric: str, threshold_ms: float) -> bool | None:
+        itl = r.itl
+        assert itl is not None  # successes always carry an ITLSummary
+        if metric == "ttft":
+            return r.ttft_s * 1000.0 <= threshold_ms
+        if metric == "tpot":
+            if itl.tpot_ms is None or itl.tpot_approximate:
+                return None  # unmeasurable/approximate → excluded, not a miss
+            return itl.tpot_ms <= threshold_ms
+        if metric == "max_stall":
+            return itl.max_stall_ms <= threshold_ms
+        # itl_p99 / itl_p50: histogram percentiles (P99 default alias 'itl')
+        pcts = itl.percentile_summary()
+        if not pcts:
+            return None
+        return pcts.get(metric, pcts["P99"]) <= threshold_ms
+
+    per_metric: dict[str, float] = {}
+    for metric, _op, threshold in slo:
+        judged = [v for r in successes if (v := meets(r, metric, threshold)) is not None]
+        if judged:
+            per_metric[metric] = sum(1 for v in judged if v) / len(judged)
+
+    joint_vals: list[bool] = []
+    for r in successes:
+        preds = [meets(r, m, t) for m, _o, t in slo]
+        known = [p for p in preds if p is not None]
+        if not known:
+            continue  # excluded entirely (e.g. TPOT-only SLO, burst-guarded)
+        joint_vals.append(all(known))
+    joint = (sum(joint_vals) / len(joint_vals)) if joint_vals else None
+    return joint, per_metric
+
+
+def max_goodput_level(rows: list[LevelRow], min_goodput: float = 0.9) -> LevelRow | None:
+    """The largest load level (max ctx, then max users) whose joint goodput
+    meets ``min_goodput`` — the "max goodput-satisfying load" summary (MB-D).
+    None when no level qualifies."""
+    qualifying = [r for r in rows if r.goodput is not None and r.goodput >= min_goodput]
+    if not qualifying:
+        return None
+    return max(qualifying, key=lambda r: (r.ctx, r.users))
+
+
+def goodput_cell(row: LevelRow) -> str:
+    """Compact goodput cell for stdout previews: joint fraction as percent,
+    with per-metric fractions in parentheses when they differ."""
+    if row.goodput is None:
+        return "-"
+    s = f"{row.goodput * 100:.0f}%"
+    if row.goodput_each and len(row.goodput_each) > 1:
+        s += " (" + "/".join(f"{v * 100:.0f}" for v in row.goodput_each.values()) + ")"
+    return s
+
+
+def print_goodput_table(rows: list[LevelRow], *, file: TextIO | None = None) -> None:
+    """Goodput summary table (MB-D): one line per level row, joint fraction
+    plus per-metric fractions and the burst-guarded share (whose TPOT is
+    excluded from TPOT predicates). Rows without a computed goodput render
+    '-'."""
+    print("\nGoodput (fraction of successful requests meeting ALL SLOs):", file=file)
+    header = f"{'ctx':>8} {'users':>6} {'task':>10} {'goodput':>9} {'reqs':>6} {'burst':>6}"
+    print(header, file=file)
+    print("-" * len(header), file=file)
+    for row in rows:
+        each = ""
+        if row.goodput_each:
+            each = "  " + ", ".join(f"{k}={v * 100:.0f}%" for k, v in row.goodput_each.items())
+        print(
+            f"{row.ctx:>8} {row.users:>6} {row.task:>10} "
+            f"{goodput_cell(row):>9} {row.n_requests:>6} {row.burst_guarded_frac * 100:>5.0f}%{each}",
+            file=file,
+        )
+
+
 def stats(values: list[float], inverted: bool = False) -> dict[str, float]:
     """Percentile summary. For tokens/s, ``inverted`` reports the "slow" tail:
     higher t/s is better, so P100 is the *slowest* measurement and P95/P99
@@ -744,6 +1272,83 @@ def stats(values: list[float], inverted: bool = False) -> dict[str, float]:
     arr = np.asarray(values, dtype=float)
     qmap = {"P50": 50, "P95": 5, "P99": 1, "P100": 0} if inverted else {"P50": 50, "P95": 95, "P99": 99, "P100": 100}
     return {p: float(np.percentile(arr, qmap[p])) for p in PCTS}
+
+
+def build_level_rows(
+    ctx: int,
+    users: int,
+    task_name: str,
+    group: list[RequestResult],
+    group_fail: int,
+    *,
+    multiturn: bool,
+    slo: list[tuple[str, str, float]] | None = None,
+    arrival: str = "closed",
+    request_rate: float | None = None,
+    achieved_rate: float | None = None,
+) -> list[LevelRow]:
+    """Aggregate one task's successful requests into its summary LevelRow.
+
+    This is the per-(ctx, users, task) aggregation core shared by
+    ``_run_level``: TTFT (turn1 vs turns-2+ split under multiturn), inverted
+    tokens/s, the MB-A ITL/TPOT aggregates from merged gap histograms, and —
+    when ``slo`` is given — the MB-D goodput fractions over the same records.
+    """
+    ttfts = [r.ttft_s * 1000.0 for r in group]
+    tpss = [r.tokens_per_s for r in group]
+    if multiturn:
+        # Split TTFT by turn depth: turn 1 pays the full prefill;
+        # turns 2+ reuse the shared prefix, so their TTFT shows the
+        # warm-path (prefix/KV cache) latency.
+        turn1 = [r.ttft_s * 1000.0 for r in group if r.turn == 1]
+        post = [r.ttft_s * 1000.0 for r in group if r.turn >= 2]
+        ttft_post = stats(post) if post else None
+        if turn1:
+            ttfts = turn1
+    else:
+        ttft_post = None
+
+    # MB-A: fold per-request gap histograms into level aggregates. The merged
+    # histogram is memory O(buckets); TTFT/TPOT percentiles run over the
+    # per-request values.
+    merged = GapHistogram()
+    tpots_ms: list[float] = []
+    for r in group:
+        if r.itl is not None:
+            merged.merge(r.itl.hist)
+            if r.itl.tpot_ms is not None and not r.itl.tpot_approximate:
+                tpots_ms.append(r.itl.tpot_ms)
+    itl_pcts = merged.percentiles() if merged.n else None
+    burst_frac = sum(1 for r in group if r.burst_guarded) / len(group)
+
+    goodput: float | None = None
+    goodput_each: dict[str, float] | None = None
+    if slo:
+        goodput, goodput_each = compute_goodput(group, slo)
+
+    return [
+        LevelRow(
+            ctx=ctx,
+            users=users,
+            task=task_name,
+            failed=group_fail,
+            ttft=stats(ttfts),
+            ttft_post=ttft_post,
+            tps=stats(tpss, inverted=True),
+            itl=itl_pcts,
+            itl_mean_ms=merged.mean_ms() if merged.n else None,
+            max_stall_ms=merged.max_gap_ms if merged.n else None,
+            tpot=stats(tpots_ms) if tpots_ms else None,
+            tpot_mean_ms=(sum(tpots_ms) / len(tpots_ms)) if tpots_ms else None,
+            burst_guarded_frac=burst_frac,
+            arrival=arrival,
+            request_rate=request_rate,
+            achieved_rate=achieved_rate,
+            goodput=goodput,
+            goodput_each=goodput_each,
+            n_requests=len(group),
+        )
+    ]
 
 
 async def prewarm(
@@ -778,9 +1383,55 @@ async def prewarm(
             print(f"  warm {task.name} FAILED: {res.error}")
 
 
-PCTS = ("P50", "P95", "P99", "P100")
 _print_lock = asyncio.Lock()
 _CELL = 10
+
+
+# ---------------------------------------------------------------------------
+# Level rows — the parsed-back shape of one (ctx, users, task) row
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LevelRow:
+    """One (ctx, users, task) summary row — table cells + the aggregates the
+    artifacts and goodput computation are built from.
+
+    ``ttft_post`` is None outside multiturn runs (or when no turns 2+ were
+    measured); ``itl`` / ``tps`` are None only when a row is rendered as
+    dashes (legacy compatibility) — in practice they are always set for
+    successful groups.
+    """
+
+    ctx: int
+    users: int
+    task: str
+    failed: int
+    ttft: dict[str, float]
+    ttft_post: dict[str, float] | None = None
+    tps: dict[str, float] | None = None
+    # MB-A aggregates (percentile dicts in ms; mean over requests):
+    itl: dict[str, float] | None = None
+    itl_mean_ms: float | None = None
+    max_stall_ms: float | None = None
+    tpot: dict[str, float] | None = None
+    tpot_mean_ms: float | None = None
+    # share of the group's successful requests flagged by the burst guard —
+    # their TPOT (and tokens/s) are approximations, excluded from goodput's
+    # TPOT predicate
+    burst_guarded_frac: float = 0.0
+    # MB-B/MB-D level stamps (mirrored into every row so the parsed-back
+    # artifact rows are self-describing):
+    arrival: str = "closed"  # closed | open
+    request_rate: float | None = None  # configured R (open-loop)
+    achieved_rate: float | None = None  # measured req/s over the level window
+    goodput: float | None = None  # fraction of successes meeting ALL SLOs
+    goodput_each: dict[str, float] | None = None  # per-metric fraction
+    n_requests: int = 0  # successes contributing to this row
+
+    def as_tuple(self) -> tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float] | None]:
+        """Legacy 7-tuple view (print_table / format_table_markdown callers)."""
+        return (self.ctx, self.users, self.task, self.failed, self.ttft, self.ttft_post, self.tps)
 
 
 def _pct_header() -> str:
@@ -788,41 +1439,57 @@ def _pct_header() -> str:
 
 
 def print_table(
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    rows: list[LevelRow],
     *,
     file: TextIO | None = None,
     multiturn: bool = False,
+    extended: bool = True,
 ) -> None:
     """One row per (ctx, users, task): TTFT percentiles for turn 1 and for
     turns 2+ ('TTFT-post', the prefix-reuse turns) plus tokens/s percentiles,
     side by side under a single header, separated by vertical rules, with a
     dotted line whenever ctx or users changes.  A 'failed' column reports
     per-row request failures.  A None TTFT-post renders dashes (no turn 2+
-    to aggregate, or not in multiturn mode)."""
+    to aggregate, or not in multiturn mode).
+
+    With ``extended`` (default) two more metric groups are appended: ITL
+    P50/P95/P99/P100 (ms) and TPOT P50/P95/P99/P100 (ms), from the MB-A
+    per-request gap histograms.
+    """
     ttft_label = "TTFT turn1 (ms)" if multiturn else "TTFT (ms)"
-    post_label = "TTFT-post (ms)"
-    title_row = (
-        f"{'':>8} {'':>6} {'':>10} {'':>6}    |    "
-        f"{ttft_label:^{len(_pct_header())}}    |    "
-        f"{post_label:^{len(_pct_header())}}    |    "
-        f"{'tokens/s':^{len(_pct_header())}}"
+    head_labels = [ttft_label]
+    if multiturn:
+        head_labels.append("TTFT-post (ms)")
+    head_labels.append("tokens/s")
+    if extended:
+        head_labels += ["ITL (ms)", "TPOT (ms)"]
+    title_row = f"{'':>8} {'':>6} {'':>10} {'':>6}    |    " + "    |    ".join(
+        f"{lab:^{len(_pct_header())}}" for lab in head_labels
     )
-    pct_row = (
-        f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    "
-        f"{_pct_header()}    |    {_pct_header()}    |    {_pct_header()}"
+    pct_row = f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    " + "    |    ".join(
+        _pct_header() for _ in head_labels
     )
     print(title_row, file=file)
     print(pct_row, file=file)
     sep = "-" * len(pct_row)
     print(sep, file=file)
     prev_key = None
-    for ctx, n_users, task, n_fail, ttft, ttft_post, tps in rows:
+    for row in rows:
+        ctx, n_users, task, n_fail, ttft, ttft_post, tps = row.as_tuple()
+        # Same group layout as the header: TTFT, [TTFT-post only in
+        # multiturn], tokens/s, [ITL, TPOT when extended].
+        blocks_src: list[dict[str, float] | None] = [ttft]
+        if multiturn:
+            blocks_src.append(ttft_post)
+        blocks_src.append(tps)
+        if extended:
+            blocks_src += [row.itl, row.tpot]
         key = (ctx, n_users)
         if prev_key is not None and key != prev_key:
             print(sep, file=file)
         prev_key = key
         blocks = []
-        for s in (ttft, ttft_post, tps):
+        for s in blocks_src:
             if s is None:
                 blocks.append("".join(f"{'-':>{_CELL}}" for _ in PCTS))
             else:
@@ -832,45 +1499,68 @@ def print_table(
 
 
 def format_table_markdown(
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    rows: list[LevelRow],
     *,
     multiturn: bool = False,
+    extended: bool = True,
 ) -> str:
     """The same data as print_table, as a GitHub-flavored Markdown table.
 
     This is what ``--output`` files contain (results_to_html.py parses the
-    Markdown back).  A missing TTFT-post group (no turns 2+) renders as
-    dashes, which the parser reads back as None."""
+    Markdown back).  COMPACT percentiles: one cell per metric group holding
+    all four percentiles slash-joined (``706.8 / 706.8 / 706.8 / 706.8``),
+    so the widest table is 9 columns and renders WITHOUT a horizontal
+    scrollbar on GitHub (their renderer fixes table width to the page; a
+    20+ column table clips the row header out of view).  A missing group
+    renders as a single dash cell, which the parser reads back as None.
+    ``extended`` adds the ITL and TPOT groups; results_to_html identifies
+    groups by header name, so old wide files keep parsing and new compact
+    files gain the columns.
+    """
     ttft1 = "TTFT turn1" if multiturn else "TTFT"
     cols = ["ctx", "users", "task", "failed"]
-    cols += [f"{ttft1} {p} (ms)" for p in PCTS]
+    cols.append(f"{ttft1} P50/P95/P99/P100 (ms)")
     if multiturn:
-        cols += [f"TTFT-post {p} (ms)" for p in PCTS]
-    cols += [f"tokens/s {p}" for p in PCTS]
+        cols.append("TTFT-post P50/P95/P99/P100 (ms)")
+    cols.append("tokens/s P50/P95/P99/P100")
+    if extended:
+        cols.append("ITL P50/P95/P99/P100 (ms)")
+        cols.append("TPOT P50/P95/P99/P100 (ms)")
     out = [
         "| " + " | ".join(cols) + " |",
         "|" + "|".join([":---", ":---", ":---", ":---"] + ["---:"] * (len(cols) - 4)) + "|",
     ]
-    for ctx, n_users, task, n_fail, ttft, ttft_post, tps in rows:
-        cells = [str(ctx), str(n_users), str(task), str(n_fail)]
-        for block in (ttft, ttft_post, tps) if multiturn else (ttft, tps):
+    for row in rows:
+        _, _, _, _, ttft, ttft_post, tps = row.as_tuple()
+        # Blocks must match the emitted header exactly: TTFT, [TTFT-post only
+        # in multiturn], tokens/s, [ITL, TPOT when extended]. A None block
+        # renders as one dash cell (parsed back as None).
+        blocks: list[dict[str, float] | None] = [ttft]
+        if multiturn:
+            blocks.append(ttft_post)
+        blocks.append(tps)
+        if extended:
+            blocks += [row.itl, row.tpot]
+        cells = [str(row.ctx), str(row.users), str(row.task), str(row.failed)]
+        for block in blocks:
             if block is None:
-                cells += ["-"] * len(PCTS)
+                cells.append("-")
             else:
-                cells += [f"{block[p]:.1f}" for p in PCTS]
+                cells.append(" / ".join(f"{block[p]:.1f}" for p in PCTS))
         out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out)
 
 
 def write_results_file(
     path: str,
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    rows: list[LevelRow],
     *,
     run_header: str,
     summary_head: str,
     summary_note: str,
     multiturn: bool = False,
     status: str = "complete",
+    extended: bool = True,
 ) -> None:
     """Atomically write the current results to ``path`` as a Markdown file.
 
@@ -899,7 +1589,7 @@ def write_results_file(
                     fh.write(ln.strip() + "\n\n")
         fh.write(f"Status: {status} (last updated {time.strftime('%Y-%m-%d %H:%M:%S')})\n\n")
         if rows:
-            fh.write(format_table_markdown(rows, multiturn=multiturn))
+            fh.write(format_table_markdown(rows, multiturn=multiturn, extended=extended))
         else:
             fh.write("(no levels completed yet)\n")
         fh.flush()
@@ -913,58 +1603,82 @@ async def _run_level(
     n_users: int,
     ctx: int,
     args: argparse.Namespace,
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]],
+    rows: list[LevelRow],
+    *,
+    arrival: str = "closed",
+    request_rate: float | None = None,
+    achieved_rate: float | None = None,
+    slo: list[tuple[str, str, float]] | None = None,
 ) -> None:
     """Run one (ctx, users) level: concurrency of ``n_users``, each doing
     ``requests_per_user`` requests over the given ``tasks``, then append the
-    per-task summary rows to ``rows``."""
-    print(f"Running ctx={ctx} N={n_users} users (requests_per_user={args.requests_per_user})...")
-    results = await run_concurrency(
-        model,
-        tasks,
-        n_users,
-        args.requests_per_user,
-        ctx,
-        args.extra_body,
-        args.debug_stream,
-        multiturn=args.multiturn,
-        no_nonce=args.no_nonce,
-        quiet=args.quiet,
+    per-task summary rows to ``rows``.
+
+    ``arrival`` stamps every row with the level's arrival mode (MB-B:
+    ``closed`` | ``open``); open-loop levels carry the configured
+    ``request_rate`` and the measured ``achieved_rate``. When ``slo`` is
+    given (MB-D), each row also carries its goodput fractions.
+    """
+    mode_desc = (
+        f"requests_per_user={args.requests_per_user}"
+        if arrival == "closed"
+        else f"rate={request_rate:.2f}/s duration={args.level_duration}s"
     )
+    print(f"Running ctx={ctx} N={n_users} users ({mode_desc}, arrival={arrival})...")
+    results: list[RequestResult]
+    if arrival == "open":
+        results, achieved_rate, _level_duration_s = await run_open_loop(
+            model,
+            tasks,
+            rate=request_rate or 0.0,
+            window_s=args.level_duration,
+            context_length=ctx,
+            extra_body=args.extra_body,
+            debug_stream=args.debug_stream,
+            no_nonce=args.no_nonce,
+            quiet=args.quiet,
+            burstiness=args.burstiness,
+            seed=args.seed,
+            n_users=n_users,
+            call_timeout_s=600.0,
+        )
+    else:
+        results = await run_concurrency(
+            model,
+            tasks,
+            n_users,
+            args.requests_per_user,
+            ctx,
+            args.extra_body,
+            args.debug_stream,
+            multiturn=args.multiturn,
+            no_nonce=args.no_nonce,
+            quiet=args.quiet,
+        )
     successes = [r for r in results if r.success]
     failures = len(results) - len(successes)
     if not successes:
         print(f"  all {len(results)} requests failed — skipping level.")
         print(f"  first error: {results[0].error if results else 'n/a'}")
         return
-    level_rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]] = []
+    level_rows: list[LevelRow] = []
     for task in tasks:
         group = [r for r in successes if r.task == task.name]
         if not group:
             continue
         group_fail = sum(1 for r in results if r.task == task.name and not r.success)
-        ttfts = [r.ttft_s * 1000.0 for r in group]
-        tpss = [r.tokens_per_s for r in group]
-        if args.multiturn:
-            # Split TTFT by turn depth: turn 1 pays the full prefill;
-            # turns 2+ reuse the shared prefix, so their TTFT shows the
-            # warm-path (prefix/KV cache) latency.
-            turn1 = [r.ttft_s * 1000.0 for r in group if r.turn == 1]
-            post = [r.ttft_s * 1000.0 for r in group if r.turn >= 2]
-            ttft_post = stats(post) if post else None
-            if turn1:
-                ttfts = turn1
-        else:
-            ttft_post = None
-        level_rows.append(
-            (
+        level_rows.extend(
+            build_level_rows(
                 ctx,
                 n_users,
                 task.name,
+                group,
                 group_fail,
-                stats(ttfts),
-                ttft_post,
-                stats(tpss, inverted=True),
+                multiturn=args.multiturn,
+                slo=slo,
+                arrival=arrival,
+                request_rate=request_rate,
+                achieved_rate=achieved_rate,
             )
         )
     if failures:
@@ -972,14 +1686,51 @@ async def _run_level(
     if level_rows:
         print(f"\n--- preview ctx={ctx} users={n_users} ---")
         print_table(level_rows, multiturn=args.multiturn)
+        if slo:
+            for r in level_rows:
+                print(f"  goodput[{r.task}] = {goodput_cell(r)}")
         print()
     rows.extend(level_rows)
 
 
-async def main() -> None:
-    args = parse_args()
+def validate_args(args: argparse.Namespace) -> None:
+    """Cross-flag validation for the arrival/goodput flags. Runs in main()
+    BEFORE any traffic is sent, so a contradiction exits immediately."""
+    # 'poisson' is an accepted alias for the open-loop mode (Poisson arrivals
+    # are open-loop at burstiness=inf); the canonical value is 'open'.
+    if args.arrival_mode == "poisson":
+        args.arrival_mode = "open"
     if args.requests_per_user < 1:
         raise SystemExit("--requests_per_user must be >= 1")
+    open_loop = args.arrival_mode == "open"
+    if open_loop:
+        if not args.request_rate or args.request_rate <= 0:
+            raise SystemExit("--arrival_mode open requires a positive --request_rate (req/s).")
+        if args.level_duration <= 0:
+            raise SystemExit("--level_duration must be > 0 seconds.")
+        if args.burstiness <= 0:
+            raise SystemExit("--burstiness must be > 0 (or inf for Poisson).")
+        if args.multiturn:
+            # Contradiction guard: multiturn needs per-user sequential history
+            # (a request's input depends on the previous one), which open-loop
+            # arrivals contradict — force closed-loop.
+            raise SystemExit(
+                "--multiturn is closed-loop only: each user's turn needs the previous "
+                "turn's reply, which scheduled (open-loop) arrivals contradict. "
+                "Drop --multiturn or use --arrival_mode closed."
+            )
+    else:
+        if args.request_rate is not None:
+            raise SystemExit("--request_rate applies only with --arrival_mode open.")
+        if args.burstiness is not math.inf:
+            raise SystemExit("--burstiness applies only with --arrival_mode open.")
+
+
+async def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    open_loop = args.arrival_mode == "open"
+    slo = parse_goodput_spec(args.goodput) if args.goodput else None
     try:
         user_levels = [int(x) for x in args.number_users.split(",") if x.strip()]
     except ValueError:
@@ -1002,12 +1753,19 @@ async def main() -> None:
         from model_benchmarker.utils.pcai_model_classes import model_pool_max_connections
 
         pool_max = model_pool_max_connections()
-        if max(user_levels) > pool_max:
+        if not open_loop and max(user_levels) > pool_max:
             print(
-                f"WARNING: max --number_users ({max(user_levels)}) exceeds the httpx "
+                f"WARNING: max --number_users ({max(user_levels)}) exceeds the httpx2 "
                 f"connection-pool limit ({pool_max}; MODEL_POOL_MAX_CONNECTIONS). Requests "
                 "beyond the limit queue client-side and inflate measured TTFT — raise the "
                 "env var to at least your max concurrency."
+            )
+        if open_loop:
+            in_flight = min(args.request_rate * 600.0, float(pool_max))
+            print(
+                f"Open-loop: in-flight cap ≈ {in_flight:.0f} = min(request_rate × read-timeout, "
+                f"pool {pool_max}). Arrivals beyond the cap queue client-side and pollute the "
+                "arrival process — keep request_rate × timeout under the pool."
             )
     except ImportError:
         pass
@@ -1021,10 +1779,26 @@ async def main() -> None:
         (
             f"Model: {model.__class__.__name__} name={model.model_name!r} "
             f"usage={model.model_usage} tasks=[{task_desc}] "
-            f"requests_per_user={args.requests_per_user} "
-            f"context_lengths={ctx_levels}"
+            + (
+                f"request_rate={args.request_rate} req/s level_duration={args.level_duration}s "
+                if open_loop
+                else f"requests_per_user={args.requests_per_user} "
+            )
+            + f"context_lengths={ctx_levels}"
         )
     ]
+    # MB-B: the arrival mode is stamped as its own MODE line (the filename
+    # carries the matching _ol token for open-loop runs; closed-loop files
+    # stay unmarked for backward compatibility).
+    if open_loop:
+        b_desc = "inf" if args.burstiness == math.inf else f"{args.burstiness:g}"
+        header_lines.append(
+            f"MODE: arrival=open — requests issued on a schedule at {args.request_rate} req/s "
+            f"(burstiness {b_desc}), levels are {args.level_duration}s arrival windows; "
+            "TTFT includes server-side queueing by design. NOT comparable to closed-loop runs."
+        )
+    else:
+        header_lines.append("MODE: arrival=closed")
     if args.multiturn:
         header_lines.append(
             f"MODE: multiturn — each user runs {args.requests_per_user} turns of one "
@@ -1041,18 +1815,35 @@ async def main() -> None:
         )
     if extra_body:
         header_lines.append(f"extra_body: {extra_body}")
+    if slo:
+        # MB-D: stamp the SLO thresholds alongside the mode — a goodput
+        # number without its thresholds is meaningless.
+        header_lines.append(
+            "GOODPUT SLOs: "
+            + ", ".join(f"{m}<={t:g}ms" for m, _op, t in slo)
+            + " — goodput = fraction of successful requests meeting ALL SLOs; failed "
+            "requests are not goodput (counted separately); burst-guarded requests "
+            "(approximate TPOT) are excluded from TPOT predicates, counted for TTFT."
+        )
     header_lines.append(
         "tokens/s = completion_tokens / time-from-first-token-to-stream-end "
         "(TTFT excluded); completion_tokens from stream usage, else counted "
-        "content chunks."
+        "content chunks. ITL/TPOT (ms) come from per-request gap histograms; "
+        "TPOT = (stream_end − first_token)/(tokens−1); burst-guarded requests "
+        "(single-burst responses) are flagged, their TPOT is approximate."
     )
     header_lines.append("")
     for line in header_lines:
         print(line)
     run_header = "\n".join(header_lines) + "\n"
 
-    rows: list[tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float]]] = []
-    if args.multiturn:
+    rows: list[LevelRow] = []
+    if open_loop:
+        summary_head = (
+            f"\nPer-level latency / throughput (open-loop arrivals at {args.request_rate} req/s, "
+            f"{args.level_duration}s windows; TTFT includes server queueing by design):"
+        )
+    elif args.multiturn:
         summary_head = "\nPer-level latency / throughput (multiturn: shared prefix reused across each user's turns):"
     elif args.no_nonce:
         summary_head = (
@@ -1067,6 +1858,11 @@ async def main() -> None:
             "\nTTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ "
             "(shared prefix reused — shows prefix-cache benefit)."
         )
+    summary_note += (
+        "\nITL (ms) = inter-token gaps (log-spaced histogram); TPOT (ms) = per-request "
+        "mean token interval = (stream_end − first_token)/(tokens−1); burst-guarded "
+        "requests' TPOT is approximate and excluded from the TPOT percentiles."
+    )
 
     def update_output(new_status: str) -> None:
         """Rewrite --output with every level completed so far (no-op without
@@ -1088,7 +1884,10 @@ async def main() -> None:
         except OSError as exc:
             print(f"Warning: could not write intermediate table to {args.output}: {exc}")
 
-    total_levels = len(ctx_levels) * len(user_levels) * (len(tasks) if args.separate_tasks else 1)
+    if open_loop:
+        total_levels = len(ctx_levels) * len(user_levels) * (len(tasks) if args.separate_tasks else 1)
+    else:
+        total_levels = len(ctx_levels) * len(user_levels) * (len(tasks) if args.separate_tasks else 1)
     completed_levels = 0
     status = f"complete — all {total_levels} levels completed"
     try:
@@ -1109,6 +1908,9 @@ async def main() -> None:
                             ctx,
                             args,
                             rows,
+                            arrival="open" if open_loop else "closed",
+                            request_rate=args.request_rate if open_loop else None,
+                            slo=slo,
                         )
                         completed_levels += 1
                         update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
@@ -1120,6 +1922,9 @@ async def main() -> None:
                         ctx,
                         args,
                         rows,
+                        arrival="open" if open_loop else "closed",
+                        request_rate=args.request_rate if open_loop else None,
+                        slo=slo,
                     )
                     completed_levels += 1
                     update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
@@ -1130,6 +1935,16 @@ async def main() -> None:
         print(summary_head)
         print(summary_note)
         print_table(rows, multiturn=args.multiturn)
+        if slo:
+            print_goodput_table(rows)
+            best = max_goodput_level(rows, min_goodput=0.9)
+            if best is not None and best.goodput is not None:
+                print(
+                    f"Max goodput-satisfying load (goodput ≥ 90%): ctx={best.ctx} users={best.users} "
+                    f"task={best.task} (goodput {best.goodput * 100:.0f}%)"
+                )
+            else:
+                print("Max goodput-satisfying load: no level reached goodput ≥ 90%.")
     except KeyboardInterrupt:
         status = (
             f"INTERRUPTED (KeyboardInterrupt) after {completed_levels}/{total_levels} levels — table below is partial"

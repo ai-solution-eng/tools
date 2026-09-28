@@ -1,0 +1,36 @@
+{
+  "downloaded_at": "2026-09-23T12:40:53Z",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "af82aec29b8403bc6457ee7b00286d47d9f26af8869dac6eac4270ae9d6c6705",
+      "size": 31
+    },
+    {
+      "path": "config.json",
+      "sha256": "0e0ef11f33b28ebcc2fdae5315859075414425f8c4b670ede1b36a2bd6033728",
+      "size": 23
+    },
+    {
+      "path": "model.safetensors",
+      "sha256": "372a456500cbdaacdcc193bd422bbfac0c0ea773b7ba9198149bffee53ade13a",
+      "size": 2097159
+    },
+    {
+      "path": "tokenizer.json",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "size": 2
+    }
+  ],
+  "hub_metadata_fetched": false,
+  "job_id": "testjob123",
+  "license": "llama3.2",
+  "namespace": "project-user-test",
+  "notes": "sha256 values are local hashes of the downloaded files. For LFS-backed files lfs_sha256 is the Hub-side digest and lfs_sha256_verified records the byte-for-byte match against it; non-LFS files have no Hub-side digest, so their integrity rests on the local hash alone.",
+  "repo": "acme/Test-Model",
+  "revision": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
+  "revision_requested": "main",
+  "revision_resolved": true,
+  "schema": "model-downloader.provenance/1.0",
+  "submitted_by": ""
+}

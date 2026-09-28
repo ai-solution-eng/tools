@@ -27,10 +27,13 @@ Each `<SETUP>.md` is written by `write_results_file()` in `benchmark_chat.py`:
 
 1. `# <filename stem>` — the H1 title.
 2. The **run configuration as bullets** — model class/name, tasks with their
-   `max_tokens`, `requests_per_user`, `context_lengths`, one MODE line per
-   active mode (`multiturn`, `no-nonce`, `prewarm`), and the effective
-   `extra_body` (thinking overrides). This banner is built once and embedded
-   in every rewrite, so even a crashed run's file records what produced it.
+   `max_tokens`, `requests_per_user` (or `request_rate`/`level_duration`
+   for open-loop), `context_lengths`, one MODE line per active mode
+   (`arrival=closed|open`, `multiturn`, `no-nonce`, `prewarm`), the
+   effective `extra_body` (thinking overrides), and — when `--goodput` is
+   given — the **`GOODPUT SLOs:`** stamp naming every threshold. This banner
+   is built once and embedded in every rewrite, so even a crashed run's
+   file records what produced it.
 3. Two fixed explanation lines (percentile semantics; turn1 vs TTFT-post).
 4. A **`Status:` line** — `complete — all N levels completed`, or
    `in progress — k/n levels completed` (rewritten after every level), or
@@ -41,7 +44,7 @@ Each `<SETUP>.md` is written by `write_results_file()` in `benchmark_chat.py`:
    (ctx, users, task), which `results_to_html.py` parses back:
 
 ```
-| ctx | users | task | failed | TTFT turn1 P50 (ms) | … | TTFT-post P50 (ms) | … | tokens/s P50 | … |
+| ctx | users | task | failed | TTFT turn1 P50/P95/P99/P100 (ms) | TTFT-post P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 | ITL P50/P95/P99/P100 (ms) | TPOT P50/P95/P99/P100 (ms) |
 ```
 
 - **`ctx`** — target input-token prefill length (0 = unpadded).
@@ -60,6 +63,24 @@ Each `<SETUP>.md` is written by `write_results_file()` in `benchmark_chat.py`:
 - **`tokens/s`** — generation throughput excluding TTFT. Percentiles are
   **inverted**: P100 is the slowest stream, so higher is better everywhere.
   A small P50→P100 spread means the setup sustains the load.
+- **`ITL`** (inter-token latency, ms) — P50/P95/P99/P100 of the gaps
+  between consecutive text-bearing deltas, collected into a fixed
+  log-spaced histogram per request (memory O(96 buckets), never raw gap
+  lists) and merged per level. P99 ITL and the run-wide **max stall**
+  (printed in the run header notes, tracked exactly per request) are what
+  a prefill-pause or KV-eviction stall looks like from the client.
+- **`TPOT`** (time per output token, ms) — per request
+  `(stream_end − first_token) / (tokens − 1)`, using the same usage-token
+  precedence as tokens/s. **Burst-guarded requests** (whole response in one
+  burst, `gen_time < 0.05 × total`) have *approximate* TPOT — the guard
+  rewrites their generation window to the full request time — so they are
+  excluded from the TPOT percentiles; the goodput table prints each row's
+  burst share. ITL is always raw (never inherits the guard's fallback).
+
+Run `benchmark_chat.py` with piped/redirected stdout **only together with
+`--quiet`**: per-request `print()` runs on the event loop, and a
+backpressured stdout stall distorts every inter-token gap (ITL/TPOT more
+than TTFT) — that pairing is documented in the flag's own help text.
 
 ### Worked example
 
@@ -80,12 +101,12 @@ a fixed grammar that the report parses:
 
 ```
 <GPU>[x<count>][_sglang|_vllm][_dflash|_dflash2|_dspark|_dsp|_eagle|_eagle3|_mtp|_mtp2|_disabled]
-    [_nvfp4|_fp8|_fp8_e4m3|_bf16|_fp16][_hicache[xN]][_replicasxN].md
+    [_nvfp4|_fp8|_fp8_e4m3|_bf16|_fp16][_hicache[xN]][_replicasxN][_ol].md
 ```
 
 e.g. `H200_sglang_dflash2_hicachex3_replicasx3.md`, `RTXPRO6000x2_hicachex16.md`,
-`H200.md`, `OLD_RTXPRO6000x1.md` (the `OLD_` prefix flags the file obsolete
-in the report).
+`H200_ol.md` (open-loop arrivals), `H200.md`, `OLD_RTXPRO6000x1.md` (the
+`OLD_` prefix flags the file obsolete in the report).
 
 What the report derives from the filename (falling back to the
 Model-Downloader catalog, then to `Disabled`/inference):
@@ -99,6 +120,7 @@ Model-Downloader catalog, then to `Disabled`/inference):
 | **Engine** | `sglang` / `vllm` token, or catalog image |
 | **HiCache** | `hicache` or `hicachexN` token |
 | **Replicas** | `replicasxN` token (default 1) |
+| **Arrival mode** | `_ol` token → open-loop; closed-loop files stay **unmarked** (files whose name predates the token fall back to the run header's `MODE: arrival=open` line) |
 | **Obsolete** | files starting `OLD_` |
 
 ## HTML report — `results_to_html.py`
@@ -130,6 +152,18 @@ lets you tick 2+ setups for a **side-by-side comparison** on shared
 selector. The HTML is fully self-contained (no external CSS/JS) — share the
 file by itself, no repo checkout needed.
 
+## Memory estimates
+
+Files produced by `memory-estimate` (`--output results/<model>/<name>_memory.md`)
+carry a `tool: memory-estimate` config row and render in the report's
+**Memory** tab: config + structure tables, the `Status:` line (fits / does
+not fit / unknown weights), the deployment-scenario verdicts, and the
+capacity grid (concurrent requests per context length) behind a details
+expander. Like the RAG tab, they never appear in the "All models" view and
+carry no compare checkbox. The wide grid rows are deliberately
+unparseable as chat rows, and the `tool:` row keeps them out of
+`parse_rag_table`'s path.
+
 ## RAG transcripts
 
 The files in `results/RAG/` are Markdown transcripts of a separate RAG
@@ -149,5 +183,30 @@ dedicated path in the report generator — do not mix that format with
 - The default per-request nonce makes turn 1 a true cold prefill by design —
   a deliberate worst case. Only compare runs that used the same
   nonce/multiturn/prewarm regime.
+- **Closed-loop and open-loop numbers are never compared** — the HTML
+  report's compare view refuses mixed-mode selection outright. Open-loop
+  TTFT includes server-side queueing (requests arrive on a schedule, not
+  when a user slot frees); that queueing is the measurement, not noise.
 - There are no saved non-HiCache runs in the committed tree: this setup was
   built for the hierarchical cache, so that is all there is data for.
+
+## Goodput (MB-D)
+
+`--goodput "ttft<=2000,tpot<=50"` turns each run's per-request records into
+a **goodput fraction**: the share of *successful* requests meeting **every**
+SLO (thresholds in ms; per-metric fractions reported alongside the joint
+one). Semantics, stamped in the artifact header next to the mode:
+
+- Failed requests are **not goodput** (vLLM convention) — they stay in the
+  `failed` column, never as goodput misses.
+- **Burst-guarded requests have approximate TPOT** (the guard rewrote their
+  generation window), so they are excluded from `tpot` predicates — neither
+  hit nor miss — while still counting for `ttft`. Each goodput row prints
+  its burst-guarded share so the reader knows which policy applied.
+- SLO metrics: `ttft`, `tpot`, `itl_p99` / `itl_p50` (histogram
+  percentiles), `max_stall` (exact running max gap). The run summary adds a
+  **max goodput-satisfying load** line: the largest level (ctx, users)
+  whose goodput ≥ 90%.
+- A goodput number without its thresholds is meaningless — the thresholds
+  are mandatory in the artifact header (a `_gp` filename token is optional;
+  the header stamp is not).

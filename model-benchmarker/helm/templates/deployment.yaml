@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    # STATIC vendor labels (not Kyverno-stamped): the EZUA console's app-card
+    # "Ready" badge is a LABEL MATCH on Deployment/Service — the ClusterPolicy
+    # is background:false (admission-time only) and can never relabel an
+    # already-created or upgraded resource. Static labels work at every install.
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+        hpe-ezua/type: vendor-service
+        hpe-ezua/app: {{ .Chart.Name }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      automountServiceAccountToken: false
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          command:
+            - python
+            - -m
+            - model_benchmarker.webapp
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --work-dir
+            - {{ .Values.persistence.mountPath | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ .Values.deployment.name }}-config
+            - secretRef:
+                name: {{ .Values.deployment.name }}-keys
+          env:
+            {{- if .Values.security.existingSecret }}
+            # Web-app API key from a Secret YOU own (security.existingSecret).
+            # The benchmark pages' gate re-reads BENCH_API_KEYS per request, so
+            # updating this Secret takes effect without a restart. The chart's
+            # own Secret renders no BENCH_API_KEYS when this is set (see
+            # templates/secret.yaml) — this env is the ONLY source then.
+            - name: BENCH_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.existingSecret }}
+                  key: {{ .Values.security.existingSecretApiKey }}
+            {{- end }}
+            {{- if and .Values.bench.endpointApiKeysExistingSecret (not .Values.bench.endpointApiKeys) }}
+            # Target-endpoint keys from a Secret YOU own (overrides the chart
+            # Secret's seeded copy for the endpoint-keys var only).
+            - name: BENCH_ENDPOINT_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bench.endpointApiKeysExistingSecret }}
+                  key: {{ .Values.bench.endpointApiKeysExistingSecretKey }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath | quote }}
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 0
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.deployment.name }}-data
+        {{- else }}
+        - name: data
+          emptyDir: {}
+        {{- end }}

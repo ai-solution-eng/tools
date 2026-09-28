@@ -27,6 +27,21 @@ class DownloadedModel:
     backends: list[str] = field(default_factory=list)
     location: str = ""
     last_modified: float = 0.0
+    # Provenance manifest presence (MD-A1): True when manifest.json sits next
+    # to the models--* cache dir on the PVC. None = unknown (source cannot
+    # tell — job history, S3). Populated from PVC scanner column 4.
+    provenance_manifest: bool | None = None
+    # Absolute on-disk path of the models--* cache dir (column 3 verbatim,
+    # e.g. /mnt/large-models/models--org--Repo). Empty for sources that
+    # cannot know it (job history, S3).
+    cachepath: str = ""
+    # On-disk size in bytes (scanner column 5 — `du -sb` of the whole cache
+    # dir, chart >= 1.7). None = unknown.
+    bytes: int | None = None
+    # ModelScan verdict (scanner column 6, read out of the manifest's scan
+    # block, chart >= 1.7): "clean" | "suspicious" | "error" | ...
+    # Empty string = never scanned / unknown.
+    scanned: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +49,10 @@ class DownloadedModel:
             "backends": self.backends,
             "location": self.location,
             "last_modified": self.last_modified,
+            "provenance_manifest": self.provenance_manifest,
+            "cachepath": self.cachepath,
+            "bytes": self.bytes,
+            "scanned": self.scanned,
         }
 
 
@@ -46,7 +65,10 @@ def merge_models(*model_lists: list) -> list:
     """Merge several lists of DownloadedModel, deduplicating by model_name.
 
     For each model name the entry with the most recent ``last_modified`` wins
-    for the timestamp and location, while backends are unioned.
+    for the timestamp and location, while backends are unioned. The provenance
+    flag follows whichever entry knows it (a None never shadows a concrete
+    True/False). cachepath/bytes/scanned follow the newest entry that knows
+    them (non-empty / non-None wins; otherwise the first seen).
     """
     merged: dict[str, DownloadedModel] = {}
     for models in model_lists:
@@ -60,12 +82,24 @@ def merge_models(*model_lists: list) -> list:
                 if m.last_modified > existing.last_modified:
                     existing.last_modified = m.last_modified
                     existing.location = m.location
+                if m.provenance_manifest is not None:
+                    existing.provenance_manifest = m.provenance_manifest
+                if m.cachepath:
+                    existing.cachepath = m.cachepath
+                if m.bytes is not None:
+                    existing.bytes = m.bytes
+                if m.scanned:
+                    existing.scanned = m.scanned
             else:
                 merged[key] = DownloadedModel(
                     model_name=m.model_name,
                     backends=list(m.backends),
                     location=m.location,
                     last_modified=m.last_modified,
+                    provenance_manifest=m.provenance_manifest,
+                    cachepath=m.cachepath,
+                    bytes=m.bytes,
+                    scanned=m.scanned,
                 )
     return sorted(merged.values(), key=lambda m: m.last_modified, reverse=True)
 
@@ -178,6 +212,69 @@ def scan_s3(
 # ---------------------------------------------------------------------------
 
 
+def parse_scan_line(line: str, pvc_name: str, scan_root: str) -> DownloadedModel | None:
+    """Parse one scanner stdout line into a DownloadedModel (or None to skip).
+
+    Scanner contract (scan-job.yaml): ``model<TAB>mtime<TAB>cachepath``,
+    extended in chart >= 1.6 with a fourth column reporting whether a
+    provenance ``manifest.json`` sits next to the models--* cache dir
+    ("true"/"false"), and in chart >= 1.7 with a fifth (du bytes) and sixth
+    (ModelScan verdict from the manifest's scan block) column. Older scanners
+    emit fewer columns — unknown fields stay None/"" (never fabricated).
+    Factor out so the parsing stays unit-testable against rendered-job
+    fixtures.
+    """
+    line = line.strip()
+    if not line or "\t" not in line:
+        return None
+    parts = line.split("\t")
+    if len(parts) < 2:
+        return None
+    model_name = parts[0].strip()
+    try:
+        mtime = float(parts[1])
+    except ValueError:
+        mtime = 0.0
+    # Third field (when present): absolute path of the models-- cache dir
+    # — the precise on-disk location, which may differ from
+    # <scan_root>/<model> when the user chose a custom cache root.
+    cachepath = parts[2].strip() if len(parts) > 2 else ""
+    if cachepath:
+        rel = cachepath.lstrip("/")
+        rel = rel.removeprefix("mnt/")
+        location = f"pvc://{pvc_name}/{rel}"
+    else:
+        sub = scan_root.lstrip("/").removeprefix("mnt/")
+        location = f"pvc://{pvc_name}/{sub}/{model_name}"
+    # Fourth field (when present, chart >= 1.6): provenance manifest presence
+    # next to the cache dir. Anything but "true"/"false" counts as unknown.
+    manifest_col = parts[3].strip().lower() if len(parts) > 3 else ""
+    provenance = {"true": True, "false": False}.get(manifest_col)
+    # Fifth field (when present, chart >= 1.7): du -sb bytes of the cache dir.
+    bytes_col = parts[4].strip() if len(parts) > 4 else ""
+    size_bytes: int | None = None
+    if bytes_col:
+        try:
+            size_bytes = int(bytes_col)
+        except ValueError:
+            size_bytes = None
+    # Sixth field (when present, chart >= 1.7): ModelScan verdict from the
+    # manifest's scan block ("clean" / "suspicious" / "error" / ...).
+    scanned_col = parts[5].strip() if len(parts) > 5 else ""
+    if not model_name:
+        return None
+    return DownloadedModel(
+        model_name=model_name,
+        backends=["pvc"],
+        location=location,
+        last_modified=mtime,
+        provenance_manifest=provenance,
+        cachepath=cachepath,
+        bytes=size_bytes,
+        scanned=scanned_col,
+    )
+
+
 async def scan_pvc_via_job(
     k8s,
     namespace: str,
@@ -191,8 +288,11 @@ async def scan_pvc_via_job(
 
     The Job mounts the PVC read-only at ``mount_path`` and lists model
     directories (under ``scan_root``) that contain a ``config.json`` file.
-    Results are returned as ``model_name<TAB>mtime`` lines read from the Job's
-    logs.
+    Results are returned as ``model_name<TAB>mtime<TAB>cachepath<TAB>manifest``
+    lines read from the Job's logs; the trailing manifest column (chart >= 1.6)
+    reports whether a provenance ``manifest.json`` sits next to the cache dir.
+    Chart >= 1.7 scanners append the du bytes and the ModelScan verdict
+    (columns 5/6), which this parser picks up when present.
     """
     import uuid
 
@@ -229,40 +329,11 @@ async def scan_pvc_via_job(
         # Keep the Job (TTL cleans it up) so `kubectl logs` still works for debugging.
         return [], reason + (f": {detail}" if detail else "")
 
-    sub = scan_root.lstrip("/")
-    sub = sub.removeprefix("mnt/")
     models = []
     for line in (output or "").strip().splitlines():
-        line = line.strip()
-        if not line or "\t" not in line:
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        model_name = parts[0].strip()
-        try:
-            mtime = float(parts[1])
-        except ValueError:
-            mtime = 0.0
-        # Third field (when present): absolute path of the models-- cache dir
-        # — the precise on-disk location, which may differ from
-        # <scan_root>/<model> when the user chose a custom cache root.
-        cachepath = parts[2].strip() if len(parts) > 2 else ""
-        if cachepath:
-            rel = cachepath.lstrip("/")
-            rel = rel.removeprefix("mnt/")
-            location = f"pvc://{pvc_name}/{rel}"
-        else:
-            location = f"pvc://{pvc_name}/{sub}/{model_name}"
-        if model_name:
-            models.append(
-                DownloadedModel(
-                    model_name=model_name,
-                    backends=["pvc"],
-                    location=location,
-                    last_modified=mtime,
-                )
-            )
+        parsed = parse_scan_line(line, pvc_name, scan_root)
+        if parsed:
+            models.append(parsed)
     # Evidence + diagnosability: a completed scan with zero lines is the one
     # case that used to be indistinguishable from a broken read. Log it, and
     # KEEP the Job (ttlSecondsAfterFinished cleans it up) so its pod logs

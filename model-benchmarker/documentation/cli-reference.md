@@ -40,6 +40,12 @@ deployment itself.
 | `--context_length 0,…` | `0` | Prefill-length sweep; each level pads every prompt to ≈ that many input tokens (≈4 chars/token filler text). `0` disables padding. With `--multiturn` only **turn 1** is padded — later turns reuse the prefix. |
 | `--multiturn` | off | Each user runs `--requests_per_user` **turns of one growing conversation**: full prior user+assistant history replayed each turn, only the newest user prompt gets a fresh nonce. Assistant turns replay `content` only — reasoning tokens are not resent (matches real chat clients; runs made before this behavior are not directly comparable). Gives the `turn1` vs `TTFT-post` split. |
 | `--separate_tasks` | off | Run each task in its own (ctx, users) pass — every task gets a clean turn-1 vs turns-post comparison without cross-task interference. Status counts one level per (ctx, users, task). |
+| `--arrival_mode closed\|open` | `closed` | **Open-loop (MB-C):** `open` issues requests on a schedule (`--request_rate` arrivals/s) instead of the closed-loop "next request when a user slot frees" — server-side queueing then shows up in TTFT **by design**. Levels become time windows (`--level_duration`); `--requests_per_user` does not apply; every row/artifact is stamped `arrival=open` (filename token `_ol`). Multiturn is closed-loop only (guard exits). Closed- and open-loop numbers are never comparable — the HTML compare view refuses mixing them. |
+| `--request_rate R` | required with `open` | Open-loop arrival rate (requests/second). Level size ≈ `R × --level_duration`. |
+| `--burstiness b` | `inf` | Inter-arrival variability (vLLM convention): `inf` = exponential/Poisson (cv=1); finite b draws Gamma(b², 1/(b²·R)) — mean 1/R, cv = 1/b — so b < 1 is more regular, b > 1 burstier. |
+| `--level_duration S` | `30` | Open-loop arrival-window seconds. Arrivals are scheduled inside the window; the level ends when the last issued request completes (drain tail included). |
+| `--seed N` | random | Seeds the open-loop arrival schedule and per-request task selection for reproducible runs. |
+| `--goodput "m<=X,…"` | off | **Goodput-with-SLO (MB-D):** a request has goodput when every threshold (ms) holds, e.g. `"ttft<=2000,tpot<=50"`. Metrics: `ttft`, `tpot`, `itl_p99`/`itl_p50`, `max_stall`. Failed requests are not goodput (counted in `failed`, vLLM convention); burst-guarded requests (approximate TPOT) are excluded from `tpot` predicates — each row prints its burst share. Adds a goodput fraction per row plus a max goodput-satisfying-load summary line; thresholds are stamped into the artifact header (mandatory). |
 | `--prompt TEXT` | built-in essay | Prompt for the `custom` task. |
 | `--max_tokens N` | per task | Override output cap for every task. |
 | `--temperature F` | per task | Override sampling temperature (built-ins use 1.0). |
@@ -65,7 +71,7 @@ deployment itself.
 | Flag | Description |
 |---|---|
 | `--debug_stream` | Print the first delta's field names/values and per-request content vs reasoning chunk counts — diagnose TTFT=0 when a server streams text under a non-`content` delta field. |
-| `--quiet` | Suppress per-request progress lines (keeps prewarm notices, level previews, the final table). Recommended when stdout is piped/redirected: per-request `print()` runs on the event loop, and a backpressured stdout can stall all streams and distort TTFT/tokens-s. |
+| `--quiet` | Suppress per-request progress lines (keeps prewarm notices, level previews, the final table). Recommended when stdout is piped/redirected: per-request `print()` runs on the event loop, and a backpressured stdout can stall all streams and distort TTFT/tokens-s — and ITL/TPOT even more (every inter-token gap absorbs the stall). Pair `--quiet` with any ITL/TPOT-sensitive run. |
 | `--output FILE` | Write the summary table to FILE (in addition to stdout), rewritten after **every completed sweep level** and stamped with a `Status:` line (`complete`, `in progress — k/n levels`, `INTERRUPTED…`, `CRASHED…`). Writes are atomic (`.partial` temp file + `os.replace`), so a killed run never leaves a truncated file. The report generator only picks the file up once at least one level succeeded. Result files must live under a per-model subdirectory (`results/<model-dir>/<SETUP>.md`). |
 
 ## Environment variables
@@ -82,7 +88,8 @@ deployment itself.
 ## Timeouts and failure behavior
 
 - Request timeout is `connect=30s, read=600s` (`_MODEL_REQUEST_TIMEOUT` in `utils/pcai_model_classes.py`), applied to both the httpx clients and the OpenAI SDK clients (the SDK otherwise ignores an injected httpx client's timeout and falls back to its own `connect=5s`, turning slow high-concurrency handshakes into spurious failures).
+- Open-loop in-flight cap: the client never holds more than ≈ `min(request_rate × read-timeout, MODEL_POOL_MAX_CONNECTIONS)` streams; the cap is printed per run. When `request_rate × timeout` exceeds the pool, arrivals beyond it queue client-side and pollute the arrival process — the run warns; raise the pool or lower the rate.
 - Very long generations at high concurrency can still log `FAILED: Request timed out.` — that is the server being saturated, not a client bug.
 - If **all** requests in a level fail, the level is skipped (rows omitted), the first error is printed, and the sweep continues to the next level.
-- Failed requests are excluded from percentile stats but counted in the `failed` column.
-- Invalid values (`--number_users abc`, negative `--context_length`, `--requests_per_user < 1`, unknown task or model class names) exit immediately with a message before any traffic is sent.
+- Failed requests are excluded from percentile stats but counted in the `failed` column (and never counted as goodput).
+- Invalid values (`--number_users abc`, negative `--context_length`, `--requests_per_user < 1`, unknown task or model class names, `--arrival_mode open` without `--request_rate`, `--multiturn` with open-loop, malformed `--goodput` terms) exit immediately with a message before any traffic is sent.

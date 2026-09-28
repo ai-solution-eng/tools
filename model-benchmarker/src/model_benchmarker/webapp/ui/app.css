@@ -1,0 +1,211 @@
+/* ---- HPE fleet design tokens (MM RAG / SQLhandler standard) ---- */
+:root, [data-theme="light"] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --panel2: #eef0f5;
+  --chip: #eef0f5;
+  --border: #d1d5db;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --accent: #01a982;
+  --accent-hover: #02c99a;
+  --accent2: #01a982;
+  --ok: #059669;
+  --bad: #dc2626;
+  --warn: #d97706;
+  --radius: 6px;
+  --shadow: rgba(15, 23, 42, 0.08);
+}
+[data-theme="dark"] {
+  --bg: #0b0e14;
+  --panel: #161a24;
+  --panel2: #1e2432;
+  --chip: #1e2432;
+  --border: #2a3142;
+  --text: #e0e4ed;
+  --muted: #8891a8;
+  --accent: #01a982;
+  --accent-hover: #02c99a;
+  --accent2: #01a982;
+  --ok: #34d399;
+  --bad: #f87171;
+  --warn: #fbbf24;
+  --shadow: rgba(0, 0, 0, 0.4);
+}
+
+/* ---- HPE brand header (fleet pattern) ---- */
+.hpe-header {
+  display: flex; align-items: center; gap: 18px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  background: var(--panel); position: sticky; top: 0; z-index: 5;
+}
+.hpe-brand-name {
+  font-size: 0.7rem; font-weight: 500; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 2px; margin-bottom: 1px;
+}
+.hpe-brand-title { font-size: 1.3rem; font-weight: 600; color: var(--text); }
+.hpe-brand-title b { color: var(--accent); }
+.hpe-brand-sub { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+.hpe-header nav { display: flex; gap: 4px; margin-left: 18px; }
+.hpe-header nav a {
+  color: var(--muted); padding: 6px 12px; border-radius: var(--radius); font-weight: 500;
+}
+.hpe-header nav a:hover { color: var(--text); text-decoration: none; background: var(--panel2); }
+.hpe-header nav a.active { color: var(--text); background: var(--panel2); }
+
+/* ---- theme toggle (fleet pattern) ---- */
+.theme-toggle {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
+  font-size: .75rem; color: var(--muted); margin-left: auto;
+}
+.theme-toggle-track {
+  position: relative; width: 36px; height: 20px; border-radius: 10px;
+  background: var(--border); transition: background .2s; flex-shrink: 0;
+}
+.theme-toggle-thumb {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--accent); transition: transform .2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+}
+[data-theme="dark"] .theme-toggle-thumb { transform: translateX(16px); }
+
+/* legacy token block removed — see tokens.css */
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+  border-bottom: 1px solid var(--border); background: var(--panel);
+  position: sticky; top: 0; z-index: 5;
+}
+header .brand { font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+header .brand span { color: var(--accent); }
+header nav { display: flex; gap: 4px; margin-left: 8px; }
+header nav a {
+  color: var(--muted); padding: 6px 12px; border-radius: 6px; font-weight: 500;
+}
+header nav a:hover { color: var(--text); text-decoration: none; background: var(--chip); }
+header nav a.active { color: var(--text); background: var(--chip); }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 20px 80px; }
+h1 { font-size: 20px; margin: 6px 0 2px; }
+h2 { font-size: 15px; margin: 22px 0 8px; color: var(--text); }
+p.sub { color: var(--muted); margin: 2px 0 18px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px; margin: 14px 0;
+}
+.grid { display: grid; gap: 12px; }
+.g2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.g3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.g4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+input, select, textarea {
+  width: 100%; background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; font: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent2); border-color: var(--accent2); }
+textarea { resize: vertical; min-height: 90px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+button, .btn {
+  background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  padding: 9px 18px; border-radius: 6px; font: inherit; font-weight: 600; cursor: pointer;
+}
+button:hover { background: var(--accent-hover); }
+button.secondary { background: var(--panel2); border-color: var(--border); color: var(--text); }
+button.danger { background: transparent; border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.badge.ok { background: rgba(5,150,105,.15); color: var(--ok); }
+.badge.bad { background: rgba(220,38,38,.15); color: var(--bad); }
+.badge.warn { background: rgba(217,119,6,.15); color: var(--warn); }
+.badge.run { background: rgba(1,169,130,.15); color: var(--accent); }
+.badge.idle { background: var(--chip); color: var(--muted); }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+.banner {
+  border: 1px solid var(--border); border-left: 4px solid var(--warn);
+  background: var(--panel); border-radius: 8px; padding: 10px 14px; margin: 10px 0;
+  color: var(--warn); font-size: 13px;
+}
+.banner.ok { border-left-color: var(--ok); color: var(--ok); }
+.banner.bad { border-left-color: var(--bad); color: var(--bad); }
+pre.log {
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; overflow: auto; max-height: 420px; font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap;
+}
+.kv { display: grid; grid-template-columns: 220px 1fr; gap: 2px 14px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.spinner {
+  display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+  border-top-color: var(--accent2); border-radius: 50%; animation: spin .8s linear infinite;
+  vertical-align: -2px; margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.verdict { font-size: 16px; font-weight: 700; margin: 8px 0; }
+.verdict.ok { color: var(--ok); }
+.verdict.bad { color: var(--bad); }
+.verdict.unknown { color: var(--warn); }
+.chip { background: var(--chip); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: 999px; font-size: 12px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 40px; border-top: 1px solid var(--border); padding-top: 14px; }
+
+/* ---- HPE brand layer (fleet kit: prometheus-mcp explorer) ---- */
+@font-face {
+  font-family: 'MetricHPE';
+  src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+}
+body {
+  font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.hpe-element {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  background: var(--accent2);
+  clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+  flex-shrink: 0;
+}
+.brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+.brand-company {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--muted);
+}
+.brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+.brand-product b { color: var(--accent); }
+
+/* ---- Searchable combobox (ModelDownloader fleet pattern) ---- */
+.combo { position: relative; min-width: 0; }
+.combo input { width: 100%; min-width: 0; padding-right: 34px; }
+.combo-toggle {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+  padding: 4px 8px; font-size: 13px; line-height: 1;
+}
+.combo-toggle:hover { color: var(--accent2); }
+.combo-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 50;
+  max-height: 260px; overflow: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.35);
+}
+.combo-item {
+  display: block; width: 100%; text-align: left; background: none; border: 0;
+  padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--border);
+  color: var(--text); font: inherit;
+}
+.combo-item:hover { background: rgba(1,169,130,.12); }
+.combo-item-id { display: block; font-size: 13px; color: var(--text); }
+.combo-item-name { display: block; font-size: 11px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+.combo-empty { padding: 10px; color: var(--muted); font-style: italic; font-size: 12px; }

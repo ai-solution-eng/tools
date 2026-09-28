@@ -1,0 +1,156 @@
+# =============================================================================
+# ModelBenchmarker -- SE G2 deployment values (sanitized) -- single-replica.
+#
+# SE G2: the ezaf-gateway applies HPE SSO centrally, so the chart does not
+# create its own AuthorizationPolicy, and the web-app API key still gates the
+# benchmark pages (belt-and-suspenders: the key also gates non-SSO access).
+#
+# Sanitized G2 deployment: real (non-secret) serving URLs are examples; ALL
+# credentials are fillers. This folder is hardlinked to the public delivery
+# repo -- never put real credentials here. Real per-site values live in
+# helm/local/ (gitignored + hardlink-ignored + never packaged).
+#
+# PCAI usage: import the packaged chart once, paste this whole file into the
+# release's Helm Values editor, adjust the '# SITE:' lines, apply.
+# =============================================================================
+
+replicaCount: 1
+
+deployment:
+  name: model-benchmarker
+  appName: model-benchmarker
+
+image:
+  repository: ghcr.io/ai-solution-eng/model-benchmarker
+  tag: v0.4.1
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Benchmark targets ------------------------------------------------------------
+# SITE: the target suggestions below populate the UI's searchable combobox
+# (chat models + the MCP fleet's in-cluster addresses). They are ADVICE ONLY —
+# any http(s) URL stays typeable by hand. Contention rule: one benchmark per
+# endpoint origin at a time (a second run against a busy origin is refused).
+bench:
+  suggestions:
+    # Chat models (SE-G2 shared serving endpoints, MLIS) — kind: chat
+    - name: qwen-38-27b (chat)
+      url: https://qwen-38-27b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      kind: chat
+    - name: glm-53-flash (chat)
+      url: https://glm-53-flash.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      kind: chat
+    # Retrieval / RAG pipeline endpoints — kind: endpoint
+    - name: qwen3-vl-embedding-8b
+      url: https://qwen3-vl-embedding-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      kind: endpoint
+    - name: qwen3-vl-reranker-8b
+      url: https://qwen3-vl-reranker-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      kind: endpoint
+    - name: cohere-transcribe
+      url: https://cohere-transcribe-03-2026.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      kind: any
+    # MCP fleet servers (in-cluster addresses, as registered in the gateway —
+    # in-cluster preferred over the public serving URLs; each needs the fleet
+    # MCP key even in-cluster, see endpointApiKeys below) — kind: endpoint
+    - name: mm-rag (MCP)
+      url: http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp
+      kind: endpoint
+    - name: applygate (MCP)
+      url: http://applygate-mcp-service.applygate-mcp.svc.cluster.local:9102/mcp
+      kind: endpoint
+    - name: k8s-ops (MCP)
+      url: http://k8s-mcp-service.k8s-mcp-ops.svc.cluster.local:9090/mcp
+      kind: endpoint
+    - name: logsearch (MCP)
+      url: http://logsearch-mcp-service.logsearch-mcp.svc.cluster.local:9101/mcp
+      kind: endpoint
+    - name: prometheus (MCP)
+      url: http://prometheus-mcp-service.prometheus-mcp.svc.cluster.local:9095/mcp
+      kind: endpoint
+    - name: seaborn (MCP)
+      url: http://mcp-seaborn-server.mcp-seaborn-server.svc.cluster.local:9092/mcp
+      kind: endpoint
+    - name: searxng (MCP)
+      url: http://searxng-mcp-service.searxng-mcp.svc.cluster.local:9090/mcp
+      kind: endpoint
+    - name: sqlhandler (MCP)
+      url: http://sqlhandler.sqlhandler.svc.cluster.local:9097/mcp
+      kind: endpoint
+    - name: workbench (MCP)
+      url: http://workbench-mcp-service.workbench-mcp.svc.cluster.local:9103/mcp
+      kind: endpoint
+
+  # Keys for targets that need auth (exact URL -> key; trailing slash ignored).
+  # The fleet MCP servers all accept the SAME shared fleet key — repeat it per
+  # server URL you benchmark. Chat models take their platform JWTs. This block
+  # is KEY MATERIAL: fillers only in this file (real values live in helm/local/).
+  endpointApiKeys:
+    "https://qwen-38-27b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net": "<QWEN_API_KEY>"
+    "https://glm-53-flash.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net": "<GLM_API_KEY>"
+    "http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp": "<MCP_FLEET_KEY>"
+
+# -- Run storage --------------------------------------------------------------
+persistence:
+  enabled: true
+  mountPath: /data
+  # SITE: size to your artifact volume
+  size: 10Gi
+  # SITE: RWX class on G2 enables replicaCount > 1
+  storageClass: gl4f-filesystem
+  accessModes:
+    - ReadWriteMany
+
+# -- Web-app auth --------------------------------------------------------------
+security:
+  # SITE (P0-7): key material lives in a Secret YOU manage -- the chart
+  # renders no BENCH_API_KEYS into its own Secret when existingSecret is set.
+  #   kubectl -n <ns> create secret generic bench-platform-keys \
+  #     --from-literal=BENCH_API_KEYS='<key1>,<key2>'
+  existingSecret: "bench-platform-keys"
+  existingSecretApiKey: BENCH_API_KEYS
+  apiKey: ""
+
+# -- Service / resources --------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# HPE corporate proxy — ON for G2 (hpeproxy.its.hpecorp.net). The estimator's
+# huggingface.co config fetches traverse it; in-cluster targets stay in noProxy.
+hpe_proxies: true
+pcai:
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+
+extraEnv: {}
+
+# -- Vendor labels / Kyverno -------------------------------------------------------------
+# G2 needs no Kyverno stamping: the vendor labels are rendered statically on
+# the Deployment/Service (that is what makes the EZUA card "Ready").
+kyverno:
+  enabled: false
+
+# -- PCAI integration -------------------------------------------------------------
+ezua:
+  enabled: true
+  virtualService:
+    # SITE: SE-G2 cluster domain (literal)
+    endpoint: model-benchmarker.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 60s
+    longTimeout: 7200s
+  authorizationPolicy:
+    # false on SE G2 -- HPE SSO is applied centrally at the ezaf-gateway.
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

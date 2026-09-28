@@ -23,6 +23,15 @@ rules:
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
   verbs: ["get", "list"]
+{{- if .Values.preflight.enabled }}
+# MD-B preflight: read the target namespace's PVC status.capacity (the
+# bytes-free half of the fit check; used-bytes come from the scanner Job's
+# du pass). Strictly read-only, extended per apiGroup — core PVC objects
+# only, no write verbs.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

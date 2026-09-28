@@ -122,6 +122,8 @@ class K8sClient:
         chat_template_path: str = "",
         chat_template_contents: str = "",
         cache_root: str = "",
+        job_id: str = "",
+        submitted_by: str = "",
     ) -> dict:
         text = self._templates.get(storage)
         if text is None:
@@ -137,6 +139,11 @@ class K8sClient:
             "__CHAT_TEMPLATE_B64__", base64.b64encode(chat_template_contents.encode("utf-8")).decode("ascii")
         )
         text = text.replace("__CHAT_TEMPLATE_PATH__", chat_template_path)
+        # Provenance manifest inputs (MD-A1). Older charts without the
+        # provenance step don't carry the placeholders, so replacing them is
+        # harmless there.
+        text = text.replace("__JOB_ID__", job_id or job_name)
+        text = text.replace("__SUBMITTED_BY__", submitted_by)
         # Resolve the cache root here so the job template stays simple. When the
         # user leaves it blank we default to /mnt/large-models/<model>.
         resolved_cache_root = cache_root or f"/mnt/large-models/{model_name}"
@@ -178,6 +185,7 @@ class K8sClient:
         chat_template_path: str = "",
         chat_template_contents: str = "",
         cache_root: str = "",
+        submitted_by: str = "",
     ) -> tuple[str, str]:
         """Create the HF token Secret + the download Job. Returns (secret_name, job_name)."""
         base = _sanitize(model_name)
@@ -213,6 +221,8 @@ class K8sClient:
             chat_template_path=chat_template_path,
             chat_template_contents=chat_template_contents,
             cache_root=cache_root,
+            job_id=job_id,
+            submitted_by=submitted_by,
         )
         meta = manifest.setdefault("metadata", {})
         meta.setdefault("labels", {})[JOB_ID_LABEL] = job_id
@@ -607,3 +617,57 @@ class K8sClient:
         """
         ns = await asyncio.to_thread(self.core.list_namespace)
         return [item.metadata.name for item in ns.items]
+
+    # ---- PVC read (MD-B preflight) ----
+
+    async def read_pvc_capacity(self, namespace: str, pvc_name: str) -> int | None:
+        """A PVC's status.capacity in bytes (None when unknown/unreadable).
+
+        Read-only `persistentvolumeclaims` get on the ClusterRole (MD-B).
+        The app pod cannot mount the models PVC, so capacity comes from the
+        API while used-bytes come from the scanner's du pass (preflight.py).
+        """
+        from .preflight import parse_k8s_quantity
+
+        pvc = await asyncio.to_thread(
+            self.core.read_namespaced_persistent_volume_claim,
+            name=pvc_name,
+            namespace=namespace,
+        )
+        capacity = (pvc.status.capacity or {}).get("storage") if pvc.status else None
+        return parse_k8s_quantity(capacity)
+
+    # ---- GC live-job cross-check (MD-C) ----
+
+    async def list_managed_jobs_by_annotation(self) -> list[dict]:
+        """Every live managed Job (all managed-by values) as an attribution row.
+
+        The GC three-key rule cross-checks live Jobs because ttlSecondsAfterFinished
+        erases finished-job evidence: a cache dir with no Job *right now* may
+        still serve. Includes scan/debug managed-by values on purpose — a
+        running scanner or debug shell on a cache root is evidence of use.
+        """
+        jobs = await asyncio.to_thread(
+            self.batch.list_job_for_all_namespaces,
+            label_selector=f"{MANAGED_BY_LABEL} in ({MANAGED_BY_VALUE},{DEBUG_MANAGED_BY_VALUE},{SCAN_MANAGED_BY_VALUE})",
+        )
+        result = []
+        for job in jobs.items:
+            meta = job.metadata
+            annotations = meta.annotations or {}
+            labels = meta.labels or {}
+            status, _error, finished = self._parse_job_status(job)
+            result.append(
+                {
+                    "namespace": meta.namespace,
+                    "job_name": meta.name,
+                    "model_name": annotations.get(MODEL_NAME_ANNOTATION, ""),
+                    "storage": annotations.get(STORAGE_ANNOTATION, "pvc"),
+                    "cache_root": annotations.get(CACHE_ROOT_ANNOTATION, ""),
+                    "managed_by": labels.get(MANAGED_BY_LABEL, ""),
+                    "status": status,
+                    "created_at": meta.creation_timestamp.timestamp() if meta.creation_timestamp else None,
+                    "finished_at": finished,
+                }
+            )
+        return result

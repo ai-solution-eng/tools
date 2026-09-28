@@ -82,6 +82,56 @@ spec:
           value: {{ .Values.downloadList.pvcScanEnabled | quote }}
         - name: PVC_REFRESH_INTERVAL
           value: {{ .Values.downloadList.pvcRefreshInterval | quote }}
+        {{- if .Values.preflight.enabled }}
+        # MD-B preflight + per-namespace quota (values: preflight.*, quota.*).
+        {{- if .Values.preflight.safetyMargin }}
+        - name: PREFLIGHT_SAFETY_MARGIN
+          value: {{ .Values.preflight.safetyMargin | quote }}
+        {{- end }}
+        {{- if ne (toString .Values.preflight.mode) "refuse" }}
+        - name: PREFLIGHT_MODE
+          value: {{ .Values.preflight.mode | quote }}
+        {{- end }}
+        {{- if ne (int .Values.preflight.usageTtl) 120 }}
+        - name: PREFLIGHT_USAGE_TTL
+          value: {{ .Values.preflight.usageTtl | quote }}
+        {{- end }}
+        {{- if ne (int .Values.preflight.sizeTtl) 300 }}
+        - name: PREFLIGHT_SIZE_TTL
+          value: {{ .Values.preflight.sizeTtl | quote }}
+        {{- end }}
+        {{- if .Values.quota.default }}
+        - name: QUOTA_DEFAULT
+          value: {{ .Values.quota.default | quote }}
+        {{- end }}
+        {{- with .Values.quota.namespaces }}
+        - name: QUOTA_NAMESPACES
+          # "ns:bytes,ns2:bytes" — rendered from the quota.namespaces map.
+          value: {{ $nslist := list }}{{ range $ns, $bytes := . }}{{ $nslist = append $nslist (printf "%s:%s" $ns (toString $bytes)) }}{{ end }}{{ join "," $nslist | quote }}
+        {{- end }}
+        {{- if ne (toString .Values.quota.mode) "refuse" }}
+        - name: QUOTA_MODE
+          value: {{ .Values.quota.mode | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.gc.enabled }}
+        # MD-C GC report settings (the deletion itself runs in the CronJob;
+        # the app only serves the dry-run report + these settings to the UI).
+        - name: GC_ENABLED
+          value: {{ .Values.gc.enabled | quote }}
+        - name: GC_TTL_DAYS
+          value: {{ .Values.gc.ttlDays | quote }}
+        - name: GC_DRY_RUN
+          value: {{ .Values.gc.dryRun | quote }}
+        {{- if .Values.gc.minKeep }}
+        - name: GC_MIN_KEEP
+          value: {{ .Values.gc.minKeep | quote }}
+        {{- end }}
+        {{- with .Values.gc.protectedModels }}
+        - name: GC_PROTECTED
+          value: {{ join "," . | quote }}
+        {{- end }}
+        {{- end }}
         {{- if .Values.catalog.enabled }}
         - name: CATALOG_PATH
           value: "/mnt/catalog/catalog.json"

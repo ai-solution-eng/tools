@@ -33,7 +33,7 @@ values.
 ## Using a file on PCAI
 
 1. **Import the chart once** into PCAI (the packaged chart, e.g.
-   `model-downloader-1.4.4.tar.gz`). PCAI users never run `helm install` /
+   `model-downloader-1.6.2.tar.gz`). PCAI users never run `helm install` /
    `kubectl apply` — deployment is values-only after the import.
 2. **Open the chart's Helm Values editor** in PCAI and paste the whole file
    (both files are *full values* documents — they stand alone and do not

@@ -75,11 +75,15 @@ form.addEventListener('submit', async (e) => {
     const data = parseJsonSafe(text, null);
     if (!r.ok || !data) {
       msg.className = 'msg error';
-      msg.textContent = 'Error: ' + (await apiErrorMessage(r, text));
+      const detail = await apiErrorMessage(r, text);
+      // Preflight/quota refusals (422, MD-B) name bytes-needed vs bytes-free
+      // / used-vs-quota — prefix so users see it's a storage gate, not a bug.
+      msg.textContent = (r.status === 422 ? 'Submission refused: ' : 'Error: ') + detail;
       return;
     }
     msg.className = 'msg ok';
-    msg.textContent = 'Submitted as ' + data.id + ' (' + data.status + ')';
+    msg.textContent = 'Submitted as ' + data.id + ' (' + data.status + ')' +
+      (data.warnings && data.warnings.length ? ' — warning: ' + data.warnings.join(' · ') : '');
     form.reset();
     syncStorageFields();
     refresh();
@@ -584,6 +588,13 @@ function buildDownloadedRow(m) {
   tdLoc.appendChild(locCode);
   tr.appendChild(tdLoc);
 
+  // Overall size of the checkpoint on storage (du -sb of the whole cache
+  // dir, from the PVC scanner). Unknown for job-history/S3 rows — show a
+  // dash rather than fabricating a number.
+  const tdSize = document.createElement('td');
+  tdSize.textContent = (m.bytes === null || m.bytes === undefined) ? '—' : fmtBytes(m.bytes);
+  tr.appendChild(tdSize);
+
   const tdMod = document.createElement('td');
   tdMod.textContent = m.last_modified ? new Date(m.last_modified * 1000).toLocaleString() : '';
   tr.appendChild(tdMod);
@@ -607,7 +618,7 @@ async function refreshDownloaded(force = false) {
     if (!models.length) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
-      td.colSpan = 4;
+      td.colSpan = 5;
       td.className = 'tier-empty';
       td.textContent = 'No downloaded models found on storage yet.';
       tr.appendChild(td);
@@ -635,6 +646,129 @@ if (downloadedTableBody) {
   setInterval(refreshDownloaded, 10000);
   if (downloadedRefreshBtn) {
     downloadedRefreshBtn.addEventListener('click', () => refreshDownloaded(true));
+  }
+}
+
+// ---- Storage GC (dry-run report) ----
+
+const gcTableBody = document.querySelector('#gc-report tbody');
+const gcRefreshBtn = document.getElementById('gc-refresh');
+const gcMsg = document.getElementById('gc-msg');
+
+function setGcMsg(text, isError) {
+  if (!gcMsg) return;
+  gcMsg.textContent = text;
+  gcMsg.className = isError ? 'msg error' : 'msg ok';
+}
+
+function fmtBytes(n) {
+  if (n === null || n === undefined || isNaN(Number(n))) return '';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = Number(n), u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return (u === 0 ? String(v) : v.toFixed(1)) + ' ' + units[u];
+}
+
+function buildGcRow(r) {
+  const tr = document.createElement('tr');
+  tr.className = r.action === 'delete' ? 'status-failed' : 'status-succeeded';
+
+  const tdModel = document.createElement('td');
+  tdModel.className = 'cat-name';
+  tdModel.textContent = r.model_name || '';
+  tr.appendChild(tdModel);
+
+  const tdSize = document.createElement('td');
+  tdSize.textContent = fmtBytes(r.bytes);
+  tr.appendChild(tdSize);
+
+  const tdAge = document.createElement('td');
+  tdAge.textContent = (r.age_days === null || r.age_days === undefined) ? '' : r.age_days;
+  tr.appendChild(tdAge);
+
+  const tdManifest = document.createElement('td');
+  if (r.manifest === true) {
+    const badge = document.createElement('span');
+    badge.className = 'backend-badge backend-pvc';
+    badge.textContent = 'manifest';
+    tdManifest.appendChild(badge);
+  } else if (r.manifest === false) {
+    tdManifest.textContent = '—';
+  } else {
+    tdManifest.textContent = '?';
+  }
+  tr.appendChild(tdManifest);
+
+  const tdScan = document.createElement('td');
+  if (r.scanned) {
+    const badge = document.createElement('span');
+    badge.className = r.scanned === 'clean' ? 'backend-badge backend-pvc' : 'backend-badge backend-scan-risk';
+    badge.textContent = r.scanned;
+    tdScan.appendChild(badge);
+  } else {
+    tdScan.textContent = '—';
+  }
+  tr.appendChild(tdScan);
+
+  const tdAction = document.createElement('td');
+  tdAction.className = 'status-cell';
+  tdAction.textContent = r.action;
+  tr.appendChild(tdAction);
+
+  const tdReason = document.createElement('td');
+  tdReason.textContent = r.reason || '';
+  tr.appendChild(tdReason);
+
+  return tr;
+}
+
+async function refreshGcReport(force = false) {
+  if (!gcTableBody) return;
+  if (force) setGcMsg('Rebuilding GC report (spawns a scan Job + AIOLI read)...', false);
+  try {
+    const url = force ? '/api/gc/report?force=1' : '/api/gc/report';
+    const r = await fetch(url);
+    if (!r.ok) {
+      setGcMsg('GC report failed: ' + (await apiErrorMessage(r)), true);
+      return;
+    }
+    const data = await r.json();
+    if (data.scan_error) {
+      setGcMsg('Scan problem: ' + data.scan_error + (data.aioli_error ? ' · AIOLI: ' + data.aioli_error : ''), true);
+    } else if (data.aioli_error) {
+      setGcMsg('AIOLI cross-check unavailable — fail-safe keeps everything. ' + data.aioli_error, true);
+    } else {
+      const s = data.summary || {};
+      setGcMsg(
+        s.total + ' model dir(s): ' + s.delete + ' deletion candidate(s) (' + fmtBytes(s.delete_bytes) +
+        '), ' + s.keep + ' kept. Deletion runs in the GC CronJob' +
+        (data.dry_run ? ' — currently dryRun=true (deletion disabled).' : ' — dryRun is OFF (deletion enabled).'),
+        false
+      );
+    }
+    const rows = data.rows || [];
+    gcTableBody.innerHTML = '';
+    if (!rows.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 7;
+      td.className = 'tier-empty';
+      td.textContent = data.scan_error ? 'No scan data (see status above).' : 'No models found on the PVC scan root.';
+      tr.appendChild(td);
+      gcTableBody.appendChild(tr);
+      return;
+    }
+    for (const row of rows) gcTableBody.appendChild(buildGcRow(row));
+  } catch (e) {
+    setGcMsg('GC report error: ' + e, true);
+    console.error('gc report failed', e);
+  }
+}
+
+if (gcTableBody) {
+  refreshGcReport();
+  if (gcRefreshBtn) {
+    gcRefreshBtn.addEventListener('click', () => refreshGcReport(true));
   }
 }
 

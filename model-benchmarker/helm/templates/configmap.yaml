@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.deployment.name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+data:
+  {{- if .Values.bench.suggestions }}
+  # Combobox suggestions (advice only — the UI allows any http(s) URL).
+  BENCH_TARGET_SUGGESTIONS: {{ .Values.bench.suggestions | toJson | quote }}
+  {{- end }}
+  {{- if .Values.bench.prometheusUrl }}
+  # Operator-configured telemetry join (the scaling curve). The client may
+  # only pick the label selector, never this URL.
+  BENCH_PROM_URL: {{ .Values.bench.prometheusUrl | quote }}
+  {{- end }}
+  {{- range $key, $val := .Values.extraEnv }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+
+{{- /* HPE corporate proxy env (ModelDownloader convention): rendered ONLY when
+   pcaiEnabled — hpe_proxies: false (or pcai.enabled: false) renders nothing.
+   NO_PROXY pre-seeds the in-cluster ranges so benchmark traffic never
+   traverses the proxy. */ -}}
+{{- if eq (include "model-benchmarker.pcaiEnabled" .) "true" }}
+  no_proxy: {{ .Values.pcai.noProxy | quote }}
+  NO_PROXY: {{ .Values.pcai.noProxy | quote }}
+  https_proxy: {{ .Values.pcai.httpsProxy | quote }}
+  HTTPS_PROXY: {{ .Values.pcai.httpsProxy | quote }}
+  http_proxy: {{ .Values.pcai.httpsProxy | quote }}
+  HTTP_PROXY: {{ .Values.pcai.httpsProxy | quote }}
+{{- end }}

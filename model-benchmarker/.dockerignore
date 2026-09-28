@@ -1,0 +1,40 @@
+# Docker build-context ignores. The build runs from the repo root
+# (automation.sh: docker buildx build -f docker/Dockerfile .) — this file MUST
+# sit at the context root to take effect.
+#
+# Credential hygiene (mirrors hardlink_config.json's delivery exclusions):
+# pcai_models.py carries platform JWTs for the serving endpoints — it ships in
+# NO delivery artifact (hardlink mirror, image). The bench engines and the web
+# app address targets by --url + Secret-sourced keys and never import it
+# (benchmark_chat imports it lazily, only for the --model_class_name flag).
+**/pcai_models.py
+**/*.zip
+*.tgz
+*.tar.gz
+
+# Python build artifacts (a wheel test leaves build/ — which duplicates the
+# whole src tree, pcai_models.py included)
+build/
+dist/
+*.egg-info
+
+# VCS / runtime junk
+.git
+.venv
+.venvs
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# Not part of the image: results artifacts, deployment + dev trees
+results/
+helm*
+documentation/
+tests/
+automation.sh
+bump_version.sh
+hardlinker.py
+prune_charts.py
+.mb.zip

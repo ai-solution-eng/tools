@@ -15,11 +15,21 @@ fullnameOverride: ""
 # The FastAPI service that serves the UI and submits Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.5.0
+  tag: v1.6.2
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
   # tag is overwritten, which is how a "rebuilt" deploy serves stale JS.)
+  #
+  # CAVEAT: the restart refreshes ONLY the image. Helm-managed resources —
+  # in particular the job-template ConfigMap whose downloader/scan/debug Job
+  # scripts the app reads at startup — are NOT touched by a tag overwrite.
+  # After bumping the image you must still run the chart upgrade (helm
+  # upgrade, or the packaged tarball) before/alongside the rollout restart,
+  # or the new app code can end up driving old Job scripts (seen live as
+  # 1.6.2: scanner gained the du -sb size column, but a 1.6.0-era ConfigMap
+  # kept the "Downloaded models" Size column at "—" until the chart was
+  # upgraded and the pod restarted).
   pullPolicy: Always
 
 # -- Download behavior --------------------------------------------------------------
@@ -98,6 +108,125 @@ downloadList:
   pvcRefreshInterval: 60
   # Image used for the short-lived PVC scanner Job. Needs /bin/sh, find, stat.
   scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
+
+# -- Provenance manifest (MD-A1) -----------------------------------------------------
+# After a successful PVC download the Job writes a manifest.json next to the
+# model cache dir recording what was downloaded: repo, the exact revision
+# (git commit) resolved, per-file sha256 + size, license, and who/what ran it.
+# The file is ${cache_root}/models--<org>--<Repo>/manifest.json — the scanner
+# surfaces its presence next to each model so the UI (and a future GC pass)
+# can find it without mounting the PVC.
+provenance:
+  # When false the manifest step is omitted from the downloader Job entirely —
+  # no extra Hub API call, no hashing pass, no manifest.json on disk.
+  enabled: true
+  # Revision the Job pins the download to. "main" keeps today's behavior
+  # (snapshot_download on the default branch, resolved commit recorded).
+  # Set an exact tag or commit sha for reproducible re-downloads.
+  revision: "main"
+
+# -- ModelScan provenance gate (MD-A2) ------------------------------------------------
+# Runs ModelScan inside the downloader Job on the unsafe serialization formats
+# (.bin/.pt/.pth/.ckpt/pickle-class files) AFTER the download and manifest
+# hashing; safetensors needs no scan and is skipped. The verdict lands in
+# manifest.json (scan.verdict) and the PVC scanner surfaces it as a column.
+# NOTE: this feature rides the downloader image — rebuild/redeploy
+# ghcr.io/ai-solution-eng/hf-downloader (Dockerfile gains the modelscan dep).
+gate:
+  # Master switch. When false the scan step is omitted from the downloader
+  # Job entirely (no modelscan run, no scan block in manifest.json).
+  enabled: true
+  # mode: "warn" | "block". warn records the verdict and proceeds; block
+  # makes the Job exit 1 on an unsafe scan — the failure surfaces verbatim
+  # in the Jobs table's Error column. A scan-tool error is ALWAYS warn-only
+  # (a broken scanner must not block downloads); only a positive unsafe
+  # verdict can block.
+  mode: warn
+  # Downgrade ModelScan severities at or below this level to "clean" so a
+  # LOW-severity finding doesn't block in block mode. One of
+  # critical|high|medium|low; findings above the threshold keep their level.
+  # Set "low" to treat every finding as unsafe (the strictest reading).
+  threshold: low
+
+# -- PVC preflight + per-namespace quota (MD-B) ----------------------------------------
+# Submit-time gate BEFORE a downloader Job is created. Two numbers, cached:
+# capacity via the k8s API (PVC status.capacity — the chart adds a read-only
+# persistentvolumeclaims get/list to the ClusterRole) and used bytes via a
+# du pass in the PVC scanner Job. Model size comes from the Hub API; unknown
+# size degrades to warn-only, never a blind refusal. Refusals are 422s that
+# name bytes-needed vs bytes-free (disk) or used+requested vs quota.
+preflight:
+  # Master switch; when false no ClusterRole addition and no gate.
+  enabled: true
+  # mode: refuse | warn | off. warn computes and reports but never refuses;
+  # off skips the check entirely (and the RBAC addition stays out).
+  mode: refuse
+  # Headroom (bytes or k8s quantity) subtracted from free space before the
+  # fit check — covers writes the du snapshot can't see yet. 0 = none.
+  safetyMargin: 0
+  # TTL (seconds) of the cached storage census (used bytes / usage split).
+  usageTtl: 120
+  # TTL (seconds) of cached Hub size estimates.
+  sizeTtl: 300
+
+# Per-namespace byte quotas (enforced submit-time; see preflight.mode).
+# quota.default is the fallback for namespaces without their own entry;
+# leave empty for "no default quota" (namespace entries still apply).
+# Values accept k8s quantities ("500Gi", "1Ti") or plain byte integers.
+quota:
+  default: ""
+  # namespaces:
+  #   project-user-alice: 1Ti
+  #   project-user-bob: 500Gi
+  namespaces: {}
+  # refuse | warn | off — independent of preflight.mode so a site can warn
+  # on disk-fit but hard-refuse on quota (or vice versa).
+  mode: refuse
+
+# -- TTL/GC eviction (MD-C) --------------------------------------------------------------
+# Garbage collection of expired model cache dirs on the shared PVC. The
+# deletion runs in a CronJob whose pod mounts the model PVC (the app pod
+# cannot); the app serves the DRY-RUN REPORT (/api/gc/report, UI section)
+# that shows every keep/delete verdict BEFORE deletion is ever enabled.
+#
+# Deletion rule — three-key AND, all three must hold for a cache dir to be
+# deleted (each signal alone is unreliable: job TTLs erase evidence, custom
+# cache roots break path equality, MLIS rows can be stale):
+#   1. manifest.json present next to the models--* dir (ownership record);
+#   2. no AIOLI packaged_models row references the model (matched by
+#      cache-dir name / repo id appearing in the uri — never exact paths);
+#   3. no live managed job (downloader/debug/scanner) pins the cache root.
+gc:
+  # Master switch: renders the CronJob + the UI report section. When false
+  # nothing GC-related is rendered and /api/gc/* return 400.
+  enabled: false
+  # CronJob schedule (standard cron). "0 3 * * *" = nightly 03:00.
+  schedule: "0 3 * * *"
+  # Delete model cache dirs whose mtime is older than this many days.
+  # Their newest-mtime is the age signal (downloads refresh it; a re-used
+  # cache dir's mtime tracks the latest write). 0 disables the TTL line.
+  ttlDays: 30
+  # DRY RUN BY DEFAULT. true = the job evaluates and LOGS every verdict but
+  # deletes nothing (the report in the UI is the review surface). Flip to
+  # false only after reviewing the report — that is the whole point of the
+  # dry-run-first design.
+  dryRun: true
+  # LRU floor: never delete if fewer than this many cache dirs would remain
+  # on the PVC scan root (0 = no floor). Protects against a values typo
+  # emptying the cache.
+  minKeep: 0
+  # Glob list of model ids or cache-dir names never to delete
+  # ("deepseek-ai/*", "models--Qwen--*", ...).
+  protectedModels: []
+  # Concurrency policy: Forbid keeps two GC pods from ever running at once.
+  concurrencyPolicy: Forbid
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi
 
 # -- Downloader Job definition -------------------------------------------------------------------
 # Rendered into a ConfigMap that the app reads, substitutes per-submission

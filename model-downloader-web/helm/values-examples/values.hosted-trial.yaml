@@ -22,7 +22,7 @@ fullnameOverride: ""
 # Tags are packaged with the chart — change only if you build your own images.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.4.4
+  tag: v1.6.2
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
@@ -139,6 +139,83 @@ downloader:
     enableHfTransfer: "0"
     disableXet: "1"
     # verifyTls follows hpe_proxies (false here → TLS verification intact).
+
+# -- Provenance manifest (MD-A1)  ----------------------------------------------------------
+provenance:
+  enabled: true
+  revision: "main"
+
+# -- ModelScan provenance gate (MD-A2) -----------------------------------------------------
+# SHOWCASE: enabled in warn mode — every download of an unsafe-format model
+# (.bin/.pt/.pth/.ckpt/pickle) is scanned and the verdict lands in
+# manifest.json + the UI's scan column, WITHOUT blocking customer downloads
+# (a positive unsafe verdict in block mode would exit-1 the Job). Flip
+# mode: block only after a warn period on real downloads (and see the
+# top-level README's hosted-trial Kyverno section). Requires the rebuilt
+# downloader image (Dockerfile gains modelscan); on an old image the gate
+# records "error" verdicts and never blocks. Turn the feature off with
+# enabled: false.
+gate:
+  enabled: true
+  mode: warn          # demo the scan badge; flip to block after a warn period
+  threshold: low
+
+# -- PVC preflight + per-namespace quota (MD-B) --------------------------------------------
+# SHOWCASE: preflight refuses a submit only when the model provably would
+# not fit the target PVC's free space (422 naming bytes-needed vs
+# bytes-free) — pure safety, no demo downside. Unknown model sizes degrade
+# to warn-only, never a blind refusal. Turn it off with enabled: false.
+preflight:
+  enabled: true
+  mode: refuse
+  safetyMargin: 0
+  usageTtl: 120
+  sizeTtl: 300
+
+# Per-namespace byte quotas — SHOWCASE default cap enabled.
+# quota.default is the fallback cap for namespaces without their own entry;
+# 2Ti is a GENEROUS DEMO QUOTA (typical models are 20-200GiB, so normal
+# downloads sail through while a runaway/repeated-download spree gets a
+# clear 422 naming used+requested vs quota) — raise or lower it as the
+# per-customer cap. Per-team entries go under namespaces; turn the whole
+# enforcement off with quota.mode: off (or preflight.enabled above, which
+# gates both).
+quota:
+  default: 2Ti        # SITE: per-customer cap — tune per trial
+  # namespaces:                  # per-team overrides (k8s quantities or bytes)
+  #   project-user-<USERNAME>: 500Gi
+  namespaces: {}
+  mode: refuse
+
+# -- TTL/GC eviction (MD-C) ------------------------------------------------------------------
+# OFF BY DEFAULT — dry-run-first discipline: GC deletes model cache dirs from
+# the shared PVC, and enabling deletion on a customer-facing trial before
+# the dry-run report has been reviewed is a foot-gun. The safe enable path
+# is: (1) set enabled: true and leave dryRun: true — the job
+# evaluates + logs every verdict and the UI's /api/gc/report section becomes
+# the review surface, deleting nothing; (2) only after reviewing the report
+# WITH THE CUSTOMER, flip dryRun: false and let ttlDays age out stale
+# caches. Deletion needs the three-key AND (manifest present + no AIOLI
+# row + no live job), so serving models are protected. NOTE: on a hosted
+# trial the GC CronJob pod carries the same hpe-ezua/app: mlis labels as
+# the downloader Jobs — the customer's protect-models-pvc policy must admit
+# it (same platform-policy patch as the other Jobs). Turn the feature off
+# again with enabled: false (nothing rendered).
+gc:
+  enabled: false
+  schedule: "0 3 * * *"
+  ttlDays: 30
+  dryRun: true
+  minKeep: 0
+  protectedModels: []
+  concurrencyPolicy: Forbid
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi
 
 # -- Debug pod ("Launch debug pod" in the UI) ------------------------------------------------------
 # Long-running shell on the same PVC at /mnt for cache inspection. A Job on
