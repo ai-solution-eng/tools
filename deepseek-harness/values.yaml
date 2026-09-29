@@ -115,58 +115,9 @@ admin:
 # them with `dshEnv` (writes $DSH_HOME/.env) or the Settings→Models UI.
 dshSettings: |
     # =============================================================================
-    # DSH settings — team starter template
-    # Repo is PRIVATE: internal model/RAG endpoints are committed as-is.
-    # Personal RAG dataset name & password stay in .env (gitignored).
+    # DSH settings — This is a legacy file. 
+    # Please refer to ~/.dsh/profile/web/cordis.patch.yml
     # =============================================================================
-    llm-pi-ai:
-      providers:
-        pcai-model-endpoint:
-          apiKeyEnv: PCAI_LLM_KEY
-          api: openai-completions
-          baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
-          headers:
-            X-PCAI-Execute-Tools: "1"
-          reasoning: max
-          models:
-            - id: auto
-              name: PCAI_LLM_FALLBACK_FLOW
-              contextWindow: 1048576
-              # GLM-5.3 is multimodal: accept image attachments.
-              input:
-                - text
-                - image
-              reasoningEfforts:
-                off: off
-                minimal: minimal
-                medium: medium
-                high: high
-                max: max
-              maxTokens: 262144
-
-
-    # Default model for the primary agent
-    agent-default-model:
-      provider: pcai-model-endpoint
-      model: pcai-model-endpoint
-      reasoningEffort: max
-
-    # Which models subagents (delegation) are allowed to use
-    subagent-model-selection:
-      enabled: true
-      allowedModels:
-        - provider: pcai-model-endpoint
-          model: PCAI_LLM_FALLBACK_FLOW
-        - provider: glm53-flash
-          model: glm-5.3-flash
-        - provider: qwen38-27b
-          model: Qwen/Qwen3.8-27B-FP8
-
-    session-log-deepseek:
-      enabled: false
-    client-connection:
-      telemetry:
-        mode: DISABLED
 
 # Seed a .env file into each user's $DSH_HOME on FIRST start (the same
 # launch-env layer a laptop .env provides; dsh reads it when the process
@@ -198,7 +149,7 @@ dshCordisPatch: |
             serverName: pcai-llm-gateway
             url: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/mcp
             headers:
-              Authorization: !!js ('Bearer ' + (process.env.MCP_BEARER_TOKEN || ''))
+              Authorization: !!js ('Bearer ' + (process.env.PCAI_LLM_KEY || ''))
             toolCallTimeoutMs: 600000
 
     # --- Disables -----------------------------------------------------------------
@@ -209,6 +160,69 @@ dshCordisPatch: |
     - id: web
       config:
         fetchProvider: http
+    - id: llm-pi-ai
+      name: "@deepseek-ai/dsh-llm-pi-ai"
+      config:
+        providers:
+          pcai-model-endpoint:
+            apiKeyEnv: PCAI_LLM_KEY
+            api: openai-completions
+            baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
+            headers:
+              X-PCAI-Execute-Tools: "1"
+            reasoning: max
+            models:
+              - id: auto
+                name: PCAI_LLM_FALLBACK_FLOW
+                contextWindow: 1048576
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                maxTokens: 262144
+              - id: GLM-5.3-Flash
+                name: GLM-5.3-Flash
+                contextWindow: 1048576
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                maxTokens: 262144
+              - id: Qwen3.8-27B
+                name: Qwen3.8-27B
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+    - id: agent-default-model
+      name: "@deepseek-ai/dsh-agent-default-model"
+      config:
+        provider: pcai-model-endpoint
+        model: GLM-5.3-Flash
+        reasoningEffort: max
+    - id: session-log-deepseek
+      name: "@deepseek-ai/dsh-session-log-deepseek"
+      config:
+        enabled: false
+    - id: ui-settings-general
+      name: "@deepseek-ai/dsh-client-ui-settings-general"
+      config:
+        welcomeNoticeVersion: 2026-09-28.1
 
 router:
   resources:

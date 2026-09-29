@@ -1,4 +1,4 @@
-# Vibe Code with OpenCode in HPE Private Cloud AI
+# Vibe Code with DeepSeek Harness in HPE Private Cloud AI
 
 Interactive Open Source Coding Agent that operates directly inside your terminal
 
@@ -6,7 +6,7 @@ Interactive Open Source Coding Agent that operates directly inside your terminal
 
 ## Introduction
 
-In this demo you will use **OpenCode**, an open source coding agent assistant.
+In this demo you will use **DeepSeek Harness**, an open source coding agent assistant.
 
 You will interact with:
 
@@ -17,7 +17,7 @@ You will interact with:
 ---
 
 ## Primers
-Opencode has two main agents:
+DeepSeek Harness has two main agents:
 
 - **Agent Plan**: Helps you plan your coding tasks.
 - **Agent Build**: Assists you in building and implementing your code.
@@ -124,4 +124,4 @@ Replace `/workspace/personal/README.html` and the port as needed. The file will 
 
 ---
 
-*OpenCode Web Demo; 2026 | Powered by HPE Private Cloud AI*
+*DeepSeek Harness Web Demo; 2026 | Powered by HPE Private Cloud AI*

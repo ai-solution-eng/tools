@@ -1,3 +1,3 @@
-# Opencode Workspace
+# DeepSeek Harness Workspace
 
 This PVC-backed workspace is ready for files.
