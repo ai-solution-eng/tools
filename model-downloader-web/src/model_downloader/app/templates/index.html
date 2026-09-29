@@ -152,12 +152,33 @@
     <table id="downloaded-models">
       <thead>
         <tr>
-          <th>Model</th><th>Backends</th><th>Location</th><th>Last modified</th>
+          <th>Model</th><th>Backends</th><th>Location</th><th>Size</th><th>Last modified</th>
         </tr>
       </thead>
       <tbody></tbody>
     </table>
     <button type="button" id="downloaded-refresh" class="secondary-btn" style="margin-top:10px;">Rescan storage</button>
+    {% endif %}
+
+    {% if gc_enabled %}
+    <h2>Storage GC (dry-run report)</h2>
+    <p class="hint">
+      Models on the model PVC evaluated against the TTL line (<code>{{ gc_ttl_days }} days</code>) and the
+      three-key rule — a directory is a deletion candidate <em>only</em> when a provenance manifest exists,
+      no AIOLI <code>packaged_models</code> row references it, and no live job pins it. This report is
+      read-only: the actual deletion runs in the GC CronJob{% if gc_dry_run %} with <code>dryRun: true</code>
+      (deletion disabled — flip <code>gc.dryRun</code> to enable){% else %} with <strong>deletion enabled</strong>{% endif %}.
+    </p>
+    <div id="gc-msg" class="msg ok">Loading GC report...</div>
+    <table id="gc-report">
+      <thead>
+        <tr>
+          <th>Model</th><th>Size</th><th>Age (days)</th><th>Manifest</th><th>Scan</th><th>Action</th><th>Reason</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <button type="button" id="gc-refresh" class="secondary-btn" style="margin-top:10px;">Rebuild GC report</button>
     {% endif %}
 
     {% if debug_pods_enabled %}

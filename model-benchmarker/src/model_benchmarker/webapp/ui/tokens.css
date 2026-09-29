@@ -1,0 +1,91 @@
+/* ---- HPE fleet design tokens (MM RAG / SQLhandler standard) ---- */
+:root, [data-theme="light"] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --panel2: #eef0f5;
+  --chip: #eef0f5;
+  --border: #d1d5db;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --accent: #01a982;
+  --accent-hover: #02c99a;
+  --accent2: #01a982;
+  --ok: #059669;
+  --bad: #dc2626;
+  --warn: #d97706;
+  --radius: 6px;
+  --shadow: rgba(15, 23, 42, 0.08);
+}
+[data-theme="dark"] {
+  --bg: #0b0e14;
+  --panel: #161a24;
+  --panel2: #1e2432;
+  --chip: #1e2432;
+  --border: #2a3142;
+  --text: #e0e4ed;
+  --muted: #8891a8;
+  --accent: #01a982;
+  --accent-hover: #02c99a;
+  --accent2: #01a982;
+  --ok: #34d399;
+  --bad: #f87171;
+  --warn: #fbbf24;
+  --shadow: rgba(0, 0, 0, 0.4);
+}
+
+/* ---- HPE brand header (fleet pattern) ---- */
+.hpe-header {
+  display: flex; align-items: center; gap: 18px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  background: var(--panel); position: sticky; top: 0; z-index: 5;
+}
+.hpe-brand-name {
+  font-size: 0.7rem; font-weight: 500; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 2px; margin-bottom: 1px;
+}
+.hpe-brand-title { font-size: 1.3rem; font-weight: 600; color: var(--text); }
+.hpe-brand-title b { color: var(--accent); }
+.hpe-brand-sub { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+.hpe-header nav { display: flex; gap: 4px; margin-left: 18px; }
+.hpe-header nav a {
+  color: var(--muted); padding: 6px 12px; border-radius: var(--radius); font-weight: 500;
+}
+.hpe-header nav a:hover { color: var(--text); text-decoration: none; background: var(--panel2); }
+.hpe-header nav a.active { color: var(--text); background: var(--panel2); }
+
+/* ---- theme toggle (fleet pattern) ---- */
+.theme-toggle {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
+  font-size: .75rem; color: var(--muted); margin-left: auto;
+}
+.theme-toggle-track {
+  position: relative; width: 36px; height: 20px; border-radius: 10px;
+  background: var(--border); transition: background .2s; flex-shrink: 0;
+}
+.theme-toggle-thumb {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--accent); transition: transform .2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+}
+[data-theme="dark"] .theme-toggle-thumb { transform: translateX(16px); }
+
+/* ---- estimator form: sectioned list layout ---- */
+h2.sect {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
+  color: var(--muted); margin: 18px 0 10px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+h2.sect:first-of-type { margin-top: 0; }
+.sect-list { display: flex; flex-direction: column; gap: 12px; }
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.field label { margin-bottom: 4px; }
+.field .mini { color: var(--muted); font-weight: 400; font-style: italic; }
+.mini-details summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+.switch-field {
+  display: flex; align-items: center; gap: 8px; margin: 0;
+  padding: 8px 10px; background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--text); font-weight: 500;
+}
+.switch-field input { width: auto; margin: 0; }
+.switch-field.on { border-color: var(--accent); background: rgba(1, 169, 130, .08); }
+.switch-field.on #m-spec-text { color: var(--accent); font-weight: 700; }

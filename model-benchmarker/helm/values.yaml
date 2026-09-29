@@ -1,0 +1,165 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
+# ModelBenchmarker -- the LLM memory estimator (default page) plus
+# API-key-gated benchmark launchers (chat + universal REST/MCP), deployed on
+# PCAI behind the Istio gateway.
+
+# -- Deployment ----------------------------------------------------------------
+replicaCount: 1
+deployment:
+  name: model-benchmarker
+  appName: model-benchmarker
+
+# -- Image ------------------------------------------------------------------------
+image:
+  repository: ghcr.io/ai-solution-eng/model-benchmarker
+  # Packaged with the chart -- kept in lockstep by ./bump_version.sh.
+  tag: v0.4.1
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE.
+imagePullSecrets: []
+
+# -- Benchmark endpoints (THE core knob) ------------------------------------------
+# The allowlist of benchmarkable targets. The web UI offers ONLY these: a
+# benchmark run never accepts a URL from the browser. An EMPTY list disables
+# benchmarking outright (fail-closed) -- the estimator page keeps working.
+# Each entry:
+#   name  - shown in the UI dropdown (letters/digits/_ . : -)
+#   url   - the exact target the bench CLIs will load ("http(s)://...")
+#   kind  - chat | endpoint | any  (which launcher page offers it)
+bench:
+  endpoints: []
+  # endpoints:
+  #   - name: rag-mcp
+  #     url: http://rag-mcp-server-api.rag.svc.cluster.local
+  #     kind: endpoint
+  #   - name: deepseek-v4-flash
+  #     url: http://deepseek-v4-flash.project-user-andrew.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+  #     kind: chat
+
+  # Per-endpoint API keys for the TARGETS (JSON object name -> key). SECRET
+  # material: sourced ONLY from the release Secret (see security below) or an
+  # existing Secret; an empty object means the targets take no auth. When a
+  # benchmark launches, the matching key is injected as PCAI_API_KEY / a
+  # Bearer header into the bench subprocess -- never served to the browser.
+  endpointApiKeys: {}
+
+  # Per-endpoint keys as a pre-existing Secret reference (alternative to
+  # endpointApiKeys): the Secret's key holds the same JSON object.
+  endpointApiKeysExistingSecret: ""
+  endpointApiKeysExistingSecretKey: endpoint-api-keys
+
+  # Suggestions for the target combobox (name/url/kind) — operator-curated
+  # CONVENIENCE entries: the UI offers them in a searchable dropdown, and any
+  # http(s) URL remains typeable by hand. Leave empty in the plain chart;
+  # fill per site (see values-examples/values.g2.yaml).
+  suggestions: []
+  # suggestions:
+  #   - name: their-model
+  #     url: http://model.ns.svc.cluster.local:8000
+  #     kind: chat
+
+  # Optional Prometheus for the GPU-telemetry join (the scaling curve).
+  # OPERATOR-configured -- the browser never picks the scrape target. Leave
+  # empty for latency-only benchmarks.
+  # G2 default: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+  prometheusUrl: ""
+
+# -- Run storage ----------------------------------------------------------------------
+# Every run writes its artifacts (run.json/run.csv/report.md/report.html/run.log)
+# to <workDir>/runs/<run-id>/. A PVC keeps them across pod updates. The PVC is
+# helm.sh/resource-policy: keep -- deleting the release does not delete results.
+persistence:
+  enabled: true
+  mountPath: /data
+  size: 10Gi
+  # "" = cluster default StorageClass. G2: gl4f-filesystem (RWX) supports
+  # replicaCount > 1; a RWO class pins one replica.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+# -- Web-app auth (the benchmark pages' API key) ---------------------------------------
+# The benchmark surface (/benchmark/*, /api/runs*, /api/endpoints) requires an
+# API key; the memory estimator (/) and its /api/estimate stay public (pure
+# math). Keys are read PER REQUEST (rotation without restart) and matched
+# constant-time. Sourcing precedence:
+#   1. security.existingSecret (a Secret YOU own; key security.existingSecretApiKey)
+#   2. the chart's release Secret (sticky: inline security.apiKey seeds it on
+#      first install, upgrades reuse the stored value, and with neither set a
+#      key is auto-generated on first install)
+# Comma-separated keys = the rotation mechanism (append, move clients, drop).
+security:
+  apiKey: ""
+  existingSecret: ""
+  existingSecretApiKey: BENCH_API_KEYS
+
+# -- Service ------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+# -- Resources ------------------------------------------------------------------------------
+# The app is a thin web server + subprocess supervisor; benchmarks consume the
+# TARGET's GPUs, not this pod. Size requests modestly, keep a modest limit.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# -- HPE corporate proxy (hpeproxy.its.hpecorp.net + Zscaler MITM) -----------------------
+# Controls the proxy / no_proxy env vars for the estimator's outbound fetches
+# (huggingface.co config.json for seed-catalog models). Mirrors the
+# ModelDownloader convention:
+#
+#   hpe_proxies: true    proxy env injected (HPE PCAI default)
+#   hpe_proxies: false   no proxy env vars
+#
+# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
+# so kyverno stays off here by default (static vendor labels suffice) and ezua
+# renders the VirtualService by default.
+hpe_proxies: true
+
+pcai:
+  # Leave `enabled` unset to fall back to the hpe_proxies flag; force it
+  # explicitly only to override.
+  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+
+# -- Extra env (pass-through: BENCH_MAX_CONCURRENT_RUNS, BENCH_MAX_RUN_SECONDS,
+#    BENCH_CATALOG_PATH, HF_TOKEN for gated repos like CohereLabs, ...)
+extraEnv: {}
+
+# -- Vendor labels / Kyverno (EZUA console discovery) ---------------------------------------
+# The console's app card shows "Ready" by matching hpe-ezua/type +
+# hpe-ezua/app labels on the Deployment and Service; the chart renders them
+# STATICALLY (always, at install and upgrade). The pre-install ClusterPolicy
+# is optional belt-and-suspenders for platforms that stamp labels on
+# admission — enable it only where the customer admin permits ClusterPolicy
+# creation (hosted trials). It matches Deployment+Service, never Pods.
+kyverno:
+  enabled: false
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ---------------------------------------
+ezua:
+  enabled: true
+  virtualService:
+    # SITE: the DOMAIN placeholder is substituted by PCAI; change only the prefix.
+    endpoint: model-benchmarker.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    # The launcher pages poll; the gateway timeout covers an API call, not a
+    # run (runs execute server-side). Keep the default.
+    timeout: 60s
+    longTimeout: 7200s
+  authorizationPolicy:
+    # SITE: false on SE G2 (HPE SSO at the gateway centrally). Set true (+
+    # provider oauth2-proxy) on customer PCAI clusters.
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

@@ -57,6 +57,7 @@ header .sub{color:var(--muted);font-size:13px}
 .badge-hicache{background:rgba(255,209,102,.1);border-color:rgba(255,209,102,.4);color:var(--warn)}
 .badge-old{background:rgba(255,107,107,.12);border-color:rgba(255,107,107,.45);color:var(--bad)}
 .badge-weights{background:rgba(163,120,255,.12);border-color:rgba(163,120,255,.45);color:#b28cff}
+.badge-open{background:rgba(77,163,255,.14);border-color:rgba(77,163,255,.5);color:var(--accent)}
 .meta-line{color:var(--muted);font-size:12px;margin:4px 0 10px}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 table.bench{margin-top:8px}
@@ -95,7 +96,7 @@ code.args{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;col
 <header>
   <div class="brand">
     <h1>__TITLE__</h1>
-    <div class="sub">Generated __GENERATED__ &middot; results from <b>__RESULTS_DIR__</b> &middot; deployment catalog: <b>__CATALOG__</b> &middot; __MODELS__ model(s) / __SETUPS__ setup(s)<br>__RAG__ RAG scale-benchmark(s) in the RAG tab</div>
+    <div class="sub">Generated __GENERATED__ &middot; results from <b>__RESULTS_DIR__</b> &middot; deployment catalog: <b>__CATALOG__</b> &middot; __MODELS__ model(s) / __SETUPS__ setup(s)<br>__RAG__ RAG scale-benchmark(s) in the RAG tab &middot; __MEMORY__ memory estimate(s) in the Memory tab</div>
   </div>
   <button id="btn-theme" title="Toggle light / dark mode" aria-label="Toggle theme">&#x2600;</button>
 </header>
@@ -117,6 +118,7 @@ code.args{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;col
   <div class="tabs" id="tabs">
     <button id="tab-models" class="active">Models</button>
     <button id="tab-rag">RAG</button>
+    <button id="tab-memory">Memory</button>
   </div>
 
   <div class="compare-view" id="compare-view">
@@ -142,6 +144,7 @@ function flatSetups(){
 }
 const ALL = flatSetups();
 const ALL_RAG = (()=>{ const out=[]; for (const m of (DATA.rag_models||[])) for (const s of m.setups) out.push({...s, model:m.name, slug:m.slug, id:m.slug+'::'+s.file}); return out; })();
+const ALL_MEMORY = (()=>{ const out=[]; for (const m of (DATA.memory_models||[])) for (const s of m.setups) out.push({...s, model:m.name, slug:m.slug, id:m.slug+'::'+s.file}); return out; })();
 const uniq = (a) => [...new Set(a)].filter(Boolean).sort();
 
 function fillSelect(id, vals, placeholder){
@@ -180,6 +183,9 @@ function badges(m){
   if (m.hicache!==null && m.hicache!==undefined) b.push('<span class="badge badge-hicache">HiCache: '+esc(m.hicache)+'</span>');
   if (m.weights) b.push('<span class="badge badge-weights">weights: '+esc(m.weights)+'</span>');
   b.push('<span class="badge">replicas: '+esc(m.replicas)+'</span>');
+  // Arrival mode (MB-B): open-loop runs are stamped; closed-loop files predate
+  // the stamp and stay unmarked.
+  if (m.arrival==='open') b.push('<span class="badge badge-open">arrival: open-loop</span>');
   if (m.obsolete) b.push('<span class="badge badge-old">obsolete</span>');
   return b.join('');
 }
@@ -194,19 +200,30 @@ function catalogHtml(c){
   const args=(c.arguments||[]).join(' ');
   return '<details class="cfg"><summary>PCAI deployment config — click to expand</summary><table class="cfg">'+rows+'</table>'+(args?'<code class="args">'+esc(args)+'</code>':'')+'</details>';
 }
+function hasAny(s, key){
+  // true when at least one parsed row carries the group (itl / tpot)
+  return (s.rows||[]).some(r=>r[key]);
+}
 function tableHtml(s){
   const hdr=['ctx','users','task','failed','TTFT (ms):' + NBSP + 'P50 / P95 / P99 / P100'];
   if (s.multiturn) hdr.push('TTFT-post (ms):' + NBSP + 'P50 / P95 / P99 / P100');
   hdr.push('tokens/s:' + NBSP + 'P50 / P95 / P99 / P100');
+  // ITL / TPOT groups render only when the file carries them (legacy files keep their old shape)
+  const showItl = hasAny(s,'itl'), showTpot = hasAny(s,'tpot');
+  if (showItl) hdr.push('ITL (ms):' + NBSP + 'P50 / P95 / P99 / P100');
+  if (showTpot) hdr.push('TPOT (ms):' + NBSP + 'P50 / P95 / P99 / P100');
   const thead='<thead><tr>'+hdr.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead>';
   const rows = s.rows.filter(rowMatches);
   if (!rows.length) return '<p class="muted">No rows for the selected Task / Users / Context.</p>';
+  const group=(v)=>v===null||v===undefined?'—':v.map(x=>x.toFixed(1)).join(' / ');
   const body=rows.map(r=>{
     const tds=['<td>'+r.ctx+'</td>','<td>'+r.users+'</td>','<td>'+esc(r.task)+'</td>',
       '<td class="'+(r.failed?'fail-any':'')+'">'+r.failed+'</td>',
       '<td class="num">'+r.ttft.map(v=>v.toFixed(1)).join(' / ')+'</td>'];
     if (s.multiturn) tds.push('<td class="num">'+(r.ttft_post?r.ttft_post.map(v=>v.toFixed(1)).join(' / '):'—')+'</td>');
     tds.push('<td class="num">'+r.tokens.map(v=>v.toFixed(1)).join(' / ')+'</td>');
+    if (showItl) tds.push('<td class="num">'+group(r.itl)+'</td>');
+    if (showTpot) tds.push('<td class="num">'+group(r.tpot)+'</td>');
     return '<tr>'+tds.join('')+'</tr>';
   }).join('');
   return '<table class="bench">'+thead+'<tbody>'+body+'</tbody></table>';
@@ -221,6 +238,30 @@ function ragTable(rag){
   }
   return '<table class="cfg">'+rows.join('')+'</table>';
 }
+function memConfigTable(mem){
+  const cfg = mem.config||{};
+  const order=['tool','model','gpu','weight dtype','kv dtype','mem fraction','overhead','max context'];
+  const rows = order.filter(k=>cfg[k]!==undefined).map(k=>'<tr><th>'+esc(k)+'</th><td>'+esc(cfg[k])+'</td></tr>').join('');
+  return '<table class="cfg">'+rows+'</table>';
+}
+function memBody(mem){
+  let html = memConfigTable(mem);
+  if (mem.status) html += '<p class="hint" style="margin:6px 0 0"><b>Status:</b> '+esc(mem.status)+'</p>';
+  const scen = mem.scenarios||[];
+  if (scen.length){
+    html += '<table class="cfg"><thead><tr><th>Deployment</th><th>Verdict</th></tr></thead><tbody>'
+      + scen.map(s=>'<tr><th>'+esc(s.label)+'</th><td>'+esc(s.verdict)+'</td></tr>').join('')
+      + '</tbody></table>';
+  }
+  const grid = mem.grid||[];
+  if (grid.length){
+    const hdr = grid[0];
+    const body = grid.slice(1).map(r=>'<tr>'+r.map(c=>'<td>'+esc(c)+'</td>').join('')+'</tr>').join('');
+    html += '<details class="cfg"><summary>Capacity grid (concurrent requests by context)</summary>'
+      + '<table class="cfg"><thead><tr>'+hdr.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></details>';
+  }
+  return html;
+}
 function setupTitle(s){
   const m=s.meta||{};
   const parts=[];
@@ -230,13 +271,14 @@ function setupTitle(s){
   if (m.hicache!==null&&m.hicache!==undefined) parts.push('HiCache: '+m.hicache);
   if (m.weights) parts.push('weights: '+m.weights);
   parts.push('replicas: '+m.replicas);
+  if (m.arrival==='open') parts.push('open-loop');
   return parts.join('  ·  ');
 }
 function renderSetup(s){
   const m=s.meta||{};
   const compared=state.compared.has(s.id);
-  const body = s.rag ? ragTable(s.rag) : tableHtml(s);
-  const cmpLabel = s.rag ? '' : '<label class="compare"><input type="checkbox" data-id="'+esc(s.id)+'" '+(compared?'checked':'')+'> compare</label>';
+  const body = s.rag ? ragTable(s.rag) : (s.memory ? memBody(s.memory) : tableHtml(s));
+  const cmpLabel = (s.rag||s.memory) ? '' : '<label class="compare"><input type="checkbox" data-id="'+esc(s.id)+'" '+(compared?'checked':'')+'> compare</label>';
   return '<section class="setup'+(compared?' compared-setup':'')+'" data-id="'+esc(s.id)+'">'+
     '<div class="setup-head">'+
       cmpLabel+
@@ -261,15 +303,18 @@ function matchesRag(s){
 function renderReport(){
   const report=document.getElementById('report');
   const ragTab = state.tab==='rag';
-  const vis = ragTab ? (ALL_RAG||[]).filter(matchesRag) : filtered();
-  const source = ragTab ? (DATA.rag_models||[]) : DATA.models;
+  const memTab = state.tab==='memory';
+  const vis = memTab ? (ALL_MEMORY||[]).filter(matchesRag)
+            : ragTab ? (ALL_RAG||[]).filter(matchesRag)
+            : filtered();
+  const source = memTab ? (DATA.memory_models||[]) : ragTab ? (DATA.rag_models||[]) : DATA.models;
   let html='';
   for (const m of source){
     const list=vis.filter(s=>s.slug===m.slug);
     if (!list.length) continue;
     const ms=ALL.filter(s=>s.slug===m.slug);
-    const allCmp = !ragTab && ms.length>0 && ms.every(s=>state.compared.has(s.id));
-    const cmp = ragTab ? '' : '<button type="button" class="compare-all'+(allCmp?' all-comparing':'')+'" data-model="'+esc(m.slug)+'" title="'+(allCmp?'Remove all setups of this model from the comparison':'Include all setups of this model in the comparison')+'">'+(allCmp ? 'Remove all' : 'Compare all')+'</button>';
+    const allCmp = !ragTab && !memTab && ms.length>0 && ms.every(s=>state.compared.has(s.id));
+    const cmp = (ragTab||memTab) ? '' : '<button type="button" class="compare-all'+(allCmp?' all-comparing':'')+'" data-model="'+esc(m.slug)+'" title="'+(allCmp?'Remove all setups of this model from the comparison':'Include all setups of this model in the comparison')+'">'+(allCmp ? 'Remove all' : 'Compare all')+'</button>';
     html+='<div class="model-block"><h2>'+esc(m.name)+' <span class="count">('+list.length+' setup'+(list.length>1?'s':'')+')</span>'+cmp+'</h2>';
     html+=list.map(renderSetup).join('');
     html+='</div>';
@@ -300,6 +345,18 @@ function renderCompare(){
   if (selected.length<2){
     document.getElementById('cmp-controls').innerHTML='';
     document.getElementById('cmp-table-wrap').innerHTML='<p class="muted">Select 2 or more setups with the compare boxes above.</p>';
+    return;
+  }
+  // Never compare closed-loop with open-loop numbers side by side (MB-B):
+  // open-loop TTFT includes scheduled queueing by design, so a mixed-mode
+  // table would compare different quantities. The refusal is enforced here,
+  // in the tool — not just in prose.
+  const arrivals=new Set(selected.map(s=>(s.meta&&s.meta.arrival)||'closed'));
+  if (arrivals.size>1){
+    document.getElementById('cmp-controls').innerHTML='<button type="button" id="cmp-clear" title="Deselect all setups from the comparison">Clear</button>';
+    document.getElementById('cmp-table-wrap').innerHTML='<p class="muted" style="color:var(--bad)">Mixed arrival modes selected — closed-loop and open-loop numbers are never compared side by side. ' +
+      'Open-loop runs (stamped <code>arrival: open-loop</code>) schedule requests at a fixed rate, so their TTFT includes server-side queueing that closed-loop runs do not measure. ' +
+      'Select setups of one mode only.</p>';
     return;
   }
   document.getElementById('cmp-controls').innerHTML=metricSel()+'<button type="button" id="cmp-clear" title="Deselect all setups from the comparison">Clear</button>';
@@ -367,6 +424,7 @@ function numSort(a,b){ return Number(a)-Number(b); }
 function setTab(which){
   document.getElementById('tab-models').classList.toggle('active', which==='models');
   document.getElementById('tab-rag').classList.toggle('active', which==='rag');
+  document.getElementById('tab-memory').classList.toggle('active', which==='memory');
 }
 // GPU filter presets.  PCAI is the default: it selects the PCIe PCAI
 // hardware (H200 PCIe + RTX PRO 6000).  Individual GPUs follow.
@@ -403,6 +461,7 @@ function initSelects(){
 function wire(){
   document.getElementById('tab-models').addEventListener('click',()=>{ state.tab='models'; setTab('models'); renderReport(); });
   document.getElementById('tab-rag').addEventListener('click',()=>{ state.tab='rag'; setTab('rag'); renderReport(); });
+  document.getElementById('tab-memory').addEventListener('click',()=>{ state.tab='memory'; setTab('memory'); renderReport(); });
   document.getElementById('f-model').addEventListener('change',e=>{state.model=e.target.value;renderReport();});
   document.getElementById('f-gpu').addEventListener('change',e=>{state.gpu=e.target.value;renderReport();});
   document.getElementById('f-engine').addEventListener('change',e=>{state.engine=e.target.value;renderReport();});
@@ -484,5 +543,6 @@ def build_html(data: dict, title: str) -> str:
     out = out.replace("__MODELS__", _esc_label(str(data.get("model_count", 0))))
     out = out.replace("__SETUPS__", _esc_label(str(data.get("setup_count", 0))))
     out = out.replace("__RAG__", _esc_label(str(data.get("rag_count", 0))))
+    out = out.replace("__MEMORY__", _esc_label(str(data.get("memory_count", 0))))
     out = out.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
     return out

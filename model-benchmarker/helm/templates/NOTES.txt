@@ -1,0 +1,35 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.security.existingSecret -}}
+
+ModelBenchmarker {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+The default page is the LLM memory estimator:  https://{{ .Values.ezua.virtualService.endpoint }}/
+Benchmark launchers (API-key gated):           https://{{ .Values.ezua.virtualService.endpoint }}/benchmark/chat
+                                               https://{{ .Values.ezua.virtualService.endpoint }}/benchmark/endpoint
+
+1. Web-app API key — the benchmark pages and the runs API require it.
+{{- if $secret }}
+
+   Provided by YOUR Secret "{{ $secret }}" (key {{ .Values.security.existingSecretApiKey }}).
+{{- else }}
+
+   Auto-generated on first install (the chart ships no key material).
+   Retrieve it:
+  kubectl -n {{ $ns }} get secret {{ $name }}-keys \
+    -o jsonpath='{.data.BENCH_API_KEYS}' | base64 -d; echo
+
+   Upgrades KEEP the generated value (never rotated under a running
+   deployment). To supply your own: --set security.apiKey=<key> (first
+   install) or --set security.existingSecret=<your-secret>. ROTATION (zero
+   downtime): the value is a comma-separated list of valid keys — append the
+   new one, move clients over, drop the old; the app re-reads it per request.
+{{- end }}
+
+2. Benchmarks — enabled ONLY against the configured allowlist
+   (bench.endpoints). An empty allowlist disables benchmarking (the estimator
+   keeps working). One benchmark per endpoint at a time: a second run against
+   a busy endpoint is refused with HTTP 409.
+
+3. The memory estimator page is PUBLIC (deterministic math, no secrets, no
+   cluster access). Everything under /benchmark/* and /api/runs* needs the key.

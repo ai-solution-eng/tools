@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPE Model Benchmarker — LLM Memory Estimator</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/app.css">
+<script type="text/html" id="hpe-logo-template"><svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 432 288" style="flex-shrink:0">
+      <path fill="#01a982" d="M126.617,109.327v15.861h55.218v-15.861H126.617z M178.384,121.737h-48.316v-8.959h48.316V121.737z"/>
+      <path fill="var(--text)" d="M136.668,158.173v1.93h-7.843v4.849h7.132v1.878h-7.132v5.279h7.843v1.929h-10.051v-15.864H136.668z
+        M142.123,174.037h-2.157v-11.676h2.03v2.184c0.837-1.473,2.183-2.438,3.909-2.438c2.716,0,4.315,1.776,4.315,4.442v7.487h-2.158
+        V166.6c0-1.547-0.812-2.462-2.614-2.462c-1.548,0-2.868,1.041-3.325,2.438V174.037z M159.051,174.291c-2.919,0-4.086-1.271-4.086-3.579
+        v-6.446h-2.462v-1.904h2.462v-3.02h2.157v3.02h3.325v1.904h-3.325v6.244c0,1.396,0.787,1.775,2.133,1.775c0.354,0,0.71-0.049,1.015-0.152
+        h0.177v1.904C160.117,174.163,159.659,174.291,159.051,174.291z M168.541,174.291c-3.883,0-6.345-2.284-6.345-5.965
+        c0-3.655,2.285-6.219,5.635-6.219c3.451,0,5.203,2.312,5.203,5.737v1.143h-8.604c0.305,2.282,1.929,3.35,4.137,3.35
+        c1.371,0,2.412-0.229,3.427-0.964h0.228v1.853C171.182,174.012,169.836,174.291,168.541,174.291z M164.456,167.285h6.472
+        c-0.077-2.131-1.193-3.273-3.071-3.273S164.735,165.383,164.456,167.285z M182.474,164.569c-0.305-0.15-0.762-0.254-1.243-0.254
+        c-1.372,0-2.463,0.967-2.919,2.538v7.184h-2.157v-11.676h2.03v2.514c0.686-1.904,1.929-2.691,3.325-2.691
+        c0.507,0,0.964,0.077,1.142,0.178v2.208H182.474z M186.965,172.133v6.193h-2.157v-15.965h2.03v2.006
+        c0.686-1.194,2.03-2.26,3.832-2.26c3.528,0,5.381,2.792,5.381,5.965c0,3.249-1.854,6.091-5.381,6.091
+        C188.996,174.163,187.676,173.25,186.965,172.133z M193.843,168.072c0-2.36-1.319-3.935-3.68-3.935c-1.395,0-2.512,0.737-3.197,2.006
+        v4.011c0.686,1.243,1.802,2.005,3.197,2.005C192.523,172.159,193.843,170.534,193.843,168.072z M205.619,164.569
+        c-0.305-0.15-0.762-0.254-1.244-0.254c-1.371,0-2.462,0.967-2.918,2.538v7.184h-2.157v-11.676h2.03v2.514
+        c0.685-1.904,1.929-2.691,3.324-2.691c0.508,0,0.965,0.077,1.143,0.178v2.208H205.619z M209.297,161.194
+        c-0.813,0-1.548-0.686-1.548-1.523c0-0.837,0.735-1.498,1.548-1.498c0.837,0,1.548,0.661,1.548,1.498
+        C210.845,160.509,210.135,161.194,209.297,161.194z M210.363,174.037h-2.157v-11.676h2.157V174.037z M213.865,171.27h0.204
+        c0.964,0.787,2.386,1.193,3.73,1.193c1.269,0,2.386-0.481,2.386-1.521c0-1.041-0.939-1.271-2.791-1.878
+        c-1.65-0.56-3.504-1.144-3.504-3.352c0-2.31,1.878-3.604,4.291-3.604c1.37,0,2.589,0.279,3.603,0.965v1.98h-0.228
+        c-0.914-0.686-2.005-1.117-3.351-1.117c-1.37,0-2.132,0.609-2.132,1.473c0,0.964,0.812,1.219,2.716,1.801
+        c1.699,0.56,3.579,1.219,3.579,3.427c0,2.412-1.981,3.655-4.543,3.655c-1.549,0-3.097-0.38-3.96-1.065V171.27z
+        M231.147,174.291c-3.883,0-6.345-2.284-6.345-5.965c0-3.655,2.284-6.219,5.635-6.219c3.453,0,5.204,2.312,5.204,5.737v1.143h-8.605
+        c0.305,2.282,1.929,3.35,4.139,3.35c1.369,0,2.41-0.229,3.426-0.964h0.228v1.853C233.787,174.012,232.442,174.291,231.147,174.291z
+        M227.062,167.285h6.473c-0.076-2.131-1.193-3.273-3.071-3.273C228.585,164.012,227.341,165.383,227.062,167.285z M139.942,135.543
+        v15.863h-3.452v-6.574h-6.421v6.574h-3.451v-15.863h3.451v6.269h6.421v-6.269H139.942z M149.306,151.686c-4.366,0-6.701-2.361-6.701-6.168
+        c0-3.807,2.436-6.32,5.964-6.32c3.807,0,5.711,2.386,5.711,5.965v1.344h-8.122c0.253,1.956,1.802,2.462,3.324,2.462
+        c1.372,0,2.437-0.177,3.555-0.784h0.38v2.486C152.402,151.406,150.778,151.686,149.306,151.686z M146.133,144.325h4.747
+        c-0.102-1.777-0.863-2.564-2.259-2.564C147.428,141.761,146.361,142.32,146.133,144.325z M158.339,151.406l-2.488-11.522v-0.406h3.198
+        l1.346,7.259l0.33,2.334l0.457-2.334l1.624-7.259h3.63l1.6,7.259l0.482,2.334l0.381-2.334l1.345-7.259h3.046v0.406l-2.513,11.522h-4.417
+        l-1.421-6.37l-0.406-2.386l-0.406,2.386l-1.396,6.37H158.339z M179.378,151.686c-2.538,0-3.807-1.167-3.807-3.884v-12.258h3.452v12.03
+        c0,0.838,0.355,1.117,1.167,1.117c0.254,0,0.661-0.076,0.914-0.151h0.051v2.867C180.774,151.534,180.038,151.686,179.378,151.686z
+        M188.87,151.686c-4.366,0-6.701-2.361-6.701-6.168c0-3.807,2.437-6.32,5.965-6.32c3.808,0,5.71,2.386,5.71,5.965v1.344h-8.122
+        c0.254,1.956,1.802,2.462,3.325,2.462c1.37,0,2.437-0.177,3.553-0.784h0.381v2.486C191.965,151.406,190.341,151.686,188.87,151.686z
+        M185.696,144.325h4.746c-0.101-1.777-0.862-2.564-2.258-2.564C186.991,141.761,185.925,142.32,185.696,144.325z M205.542,147.066
+        v-4.747h-5.051v4.594c0,1.219,0.406,1.776,1.549,1.776c0.33,0,0.761-0.102,0.989-0.202h0.331v2.842
+        c-0.458,0.152-1.143,0.355-2.158,0.355c-2.918,0-4.162-1.396-4.162-4.619v-4.747h-2.056v-2.842h2.056v-2.894h3.452v2.894h5.051
+        v-2.894h3.452v2.894h2.868v2.842h-2.868v4.594c0,1.219,0.406,1.776,1.548,1.776c0.33,0,0.762-0.102,0.99-0.202h0.33v2.842
+        c-0.457,0.152-1.142,0.355-2.157,0.355C206.787,151.686,205.542,150.289,205.542,147.066z M222.011,146.507v4.899h-3.425v-15.863h6.167
+        c3.503,0,5.812,1.929,5.812,5.507c0,3.527-2.31,5.456-5.812,5.456H222.011z M224.475,138.462h-2.464v5.127h2.464
+        c1.749,0,2.588-1.041,2.588-2.538C227.062,139.502,226.224,138.462,224.475,138.462z M239.345,149.63
+        c-0.71,1.32-2.005,1.904-3.604,1.904c-2.208,0-4.036-1.271-4.036-3.631c0-2.359,1.599-3.73,4.62-3.73c0.989,0,1.979,0.101,2.919,0.279
+        v-0.686c0-1.269-0.889-1.827-2.666-1.827c-1.32,0-2.411,0.279-3.324,0.735h-0.382v-2.589c0.915-0.481,2.539-0.888,4.112-0.888
+        c3.732,0,5.661,1.701,5.661,4.645v7.563h-3.301V149.63z M239.244,147.676v-1.523c-0.585-0.177-1.345-0.228-1.956-0.228
+        c-1.395,0-2.106,0.533-2.106,1.623c0,1.091,0.712,1.522,1.751,1.522C237.976,149.07,238.913,148.564,239.244,147.676z
+        M245.18,145.468c0-3.858,2.716-6.27,6.246-6.27c1.445,0,2.562,0.331,3.323,0.838v2.995h-0.355c-0.735-0.558-1.547-0.812-2.588-0.812
+        c-1.702,0-3.071,1.192-3.071,3.249c0,2.03,1.369,3.197,3.071,3.197c1.041,0,1.853-0.254,2.588-0.812h0.355v2.995
+        c-0.761,0.506-1.878,0.837-3.323,0.837C247.896,151.686,245.18,149.3,245.18,145.468z M260.864,145.619v5.787h-3.451v-15.863h3.451
+        v9.035l0.812-1.217l3.173-3.883h3.655v0.406l-4.416,5l4.416,6.115v0.407h-3.883l-2.945-4.366L260.864,145.619z M276.953,149.63
+        c-0.71,1.32-2.005,1.904-3.604,1.904c-2.208,0-4.036-1.271-4.036-3.631c0-2.359,1.599-3.73,4.62-3.73c0.989,0,1.979,0.101,2.919,0.279
+        v-0.686c0-1.269-0.889-1.827-2.665-1.827c-1.319,0-2.412,0.279-3.324,0.735h-0.381v-2.589c0.913-0.481,2.537-0.888,4.11-0.888
+        c3.732,0,5.661,1.701,5.661,4.645v7.563h-3.301V149.63z M276.853,147.676v-1.523c-0.585-0.177-1.345-0.228-1.954-0.228
+        c-1.396,0-2.106,0.533-2.106,1.623c0,1.091,0.71,1.522,1.751,1.522S276.521,148.564,276.853,147.676z M286.698,141.889
+        c0.636-1.777,1.98-2.539,3.35-2.539c0.459,0,0.839,0.127,0.991,0.203v3.274h-0.355c-0.354-0.177-0.71-0.28-1.193-0.28
+        c-1.371,0-2.36,0.635-2.64,1.98v6.878h-3.451v-11.929h3.299V141.889z M301.013,149.731c-0.787,1.243-2.032,1.954-3.579,1.954
+        c-3.249,0-5.254-2.615-5.254-6.218c0-3.63,2.005-6.27,5.254-6.27c1.446,0,2.64,0.635,3.427,1.726v-5.38h3.451v15.863h-3.299V149.731z
+        M300.86,147.523v-4.163c-0.635-0.914-1.498-1.346-2.487-1.346c-1.573,0-2.639,1.218-2.639,3.453c0,2.208,1.065,3.4,2.639,3.4
+        C299.362,148.868,300.226,148.437,300.86,147.523z"/>
+    </svg></script>
+</head>
+<body>
+<script>(function(){var t=localStorage.getItem('theme')||'light';if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();</script>
+<main>
+  <h1>LLM memory estimator</h1>
+  <p class="sub">
+    Deterministic serving math — will it fit, how many KV tokens, how many concurrent
+    N-token requests. Same math as the memory-estimate CLI; no load, no endpoint, no secrets.
+    Structure comes from the model's config.json (fetched from HF or pasted); serving
+    parameters come from you.
+  </p>
+
+  <div class="panel">
+    <!-- SECTION: Model -->
+    <h2 class="sect">Model</h2>
+    <div class="sect-list">
+      <div class="field">
+        <label for="m-model">Model</label>
+        <div class="combo">
+          <input id="m-model" autocomplete="off" placeholder="pick a catalog deployment or paste any repo id / path" spellcheck="false">
+          <button type="button" id="m-model-toggle" class="combo-toggle" aria-label="Catalog model suggestions">▾</button>
+          <div id="m-model-menu" class="combo-menu" hidden></div>
+        </div>
+        <details class="mini-details">
+          <summary>…or paste a config.json (works offline, no hub access)</summary>
+          <textarea id="m-config" rows="8" style="margin-top:8px" placeholder='{ "model_type": "llama", "hidden_size": 4096, ... }'></textarea>
+        </details>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="m-gpu">GPU</label>
+          <select id="m-gpu"></select>
+        </div>
+        <div class="field">
+          <label for="m-vram">or custom VRAM (GiB)</label>
+          <input id="m-vram" type="number" min="1" max="8192" step="1" placeholder="empty = selected GPU">
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: Weights -->
+    <h2 class="sect">Weights</h2>
+    <div class="sect-list">
+      <div class="field-row">
+        <div class="field">
+          <label for="m-runner">MoE runner backend <span class="mini">optional</span></label>
+          <select id="m-runner">
+            <option value="">none — as stored in the checkpoint</option>
+            <option value="flashinfer_mxfp4">flashinfer_mxfp4 (experts @ 4-bit)</option>
+            <option value="marlin">marlin (experts @ 4-bit)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="m-ep">Expert parallel (EP) <span class="mini">MoE only</span></label>
+          <input id="m-ep" type="number" min="1" max="64" value="1">
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: KV cache -->
+    <h2 class="sect">KV cache</h2>
+    <div class="sect-list">
+      <div class="field-row">
+        <div class="field">
+          <label for="m-kv">KV dtype</label>
+          <select id="m-kv">
+            <option value="">bf16 (auto)</option>
+            <option value="fp8_e4m3">fp8_e4m3</option>
+            <option value="fp8_e5m2">fp8_e5m2</option>
+            <option value="fp16">fp16</option>
+            <option value="bf16">bf16</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="m-spec" id="m-spec-label">Speculative (built-in MTP module)</label>
+          <label class="switch-field" id="m-spec-switch">
+            <input type="checkbox" id="m-spec" style="width:auto">
+            <span id="m-spec-text">off</span>
+          </label>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="m-hicache">HiCache L2 (host RAM)</label>
+          <select id="m-hicache">
+            <option value="">off — device pool only</option>
+            <option value="ratio">ratio × device pool</option>
+            <option value="size">explicit size (GiB)</option>
+          </select>
+        </div>
+        <div class="field" id="m-hcr-wrap" hidden>
+          <label for="m-hcr">L2 ratio (× device pool)</label>
+          <input id="m-hcr" type="number" min="0.1" max="100" step="0.5" value="2">
+        </div>
+        <div class="field" id="m-hcs-wrap" hidden>
+          <label for="m-hcs">L2 host RAM (GiB / replica)</label>
+          <input id="m-hcs" type="number" min="1" max="4096" step="8" value="128">
+        </div>
+        <div class="field" id="m-hcl3-wrap">
+          <label for="m-hcl3">HiCache L3 (backing tier, GiB / replica)</label>
+          <input id="m-hcl3" type="number" min="0" max="65536" step="16" value="0" placeholder="0 = off">
+        </div>
+      </div>
+      <div class="field" id="m-hclayout-wrap">
+        <label for="m-hclayout">L2 layout across TP ranks <span class="mini">auto is right for every family we know</span></label>
+        <select id="m-hclayout">
+          <option value="">auto — per model structure</option>
+          <option value="replicated">replicated (full stream on every rank)</option>
+          <option value="sharded">sharded (each rank holds its head-share)</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- SECTION: Deployment -->
+    <h2 class="sect">Deployment</h2>
+    <div class="sect-list">
+      <div class="field-row">
+        <div class="field"><label for="m-gpus">GPUs</label><input id="m-gpus" type="number" min="1" max="64" value="4"></div>
+        <div class="field"><label for="m-tp">Tensor parallel (TP)</label><input id="m-tp" type="number" min="1" max="64" value="4"></div>
+        <div class="field"><label for="m-mem">mem-fraction-static</label><input id="m-mem" type="number" min="0.1" max="1" step="0.05" value="0.9"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="m-over">Overhead (GiB/GPU)</label><input id="m-over" type="number" min="0" max="64" step="0.5" value="2"></div>
+        <div class="field" style="grid-column: span 2">
+          <label for="m-ctx">Contexts (comma-separated)</label>
+          <input id="m-ctx" value="4096,16384,65536,262144,1048576">
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:var(--text)">
+        <input type="checkbox" id="m-grid" style="width:auto"> TP sweep grid
+      </label>
+    </div>
+
+    <div style="margin-top:16px">
+      <button id="m-go">Estimate</button>
+      <span id="m-msg" class="muted" style="margin-left:8px"></span>
+    </div>
+  </div>
+
+  <div id="m-out"></div>
+
+  <div id="m-recent"></div>
+
+  <h2>Deployment sanity check (interactive page)</h2>
+  <p class="sub">
+    The fuller checklist version — launch arguments, HiCache tiering, seed catalog import —
+    lives in the standalone memory calculator page rendered by
+    <span class="mono">memory-estimate --calculator</span> (see the README, Part 3).
+  </p>
+
+  <footer>Hewlett Packard Enterprise · Model Benchmarker · estimates are capacity math, not performance predictions ·
+    calibrate the overhead knob against a live server's reported KV pool.
+  </footer>
+</main>
+<script src="/static/shared.js"></script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  fetch("/api/status").then(function (r) { return r.json(); }).then(function (s) {
+    MB.header("/");
+    MB.recentResults("m-recent", 5);
+  });
+
+  var catalogModels = [];
+  fetch("/api/catalog").then(function (r) { return r.json(); }).then(function (d) {
+    catalogModels = (d.models || []).map(function (m) {
+      return { name: m.label + " — " + m.gpu.toUpperCase() + " x" + m.gpus + " TP" + m.tp, url: m.repo || m.name, _meta: m };
+    });
+  }).catch(function () { /* catalog is optional */ });
+  MB.combobox("m-model", function () { return catalogModels; }, applyCatalogModel);
+
+  var currentSpec = null;      // speculative struct from the picked catalog entry
+  var currentRunner = "";      // --moe-runner-backend from the picked entry
+  var builtinMtp = 0;          // this model's built-in MTP layers (from estimate payload)
+
+  function applyCatalogModel(t) {
+    if (!t || !t._meta) return;
+    var m = t._meta;
+    if (m.gpus) $("m-gpus").value = m.gpus;
+    if (m.tp) $("m-tp").value = m.tp;
+    if (m.kv_dtype) $("m-kv").value = m.kv_dtype;
+    if (m.mem_fraction) $("m-mem").value = m.mem_fraction;
+    currentSpec = m.speculative || null;
+    currentRunner = m.moe_runner || "";
+    var bits = ["serving preset: " + m.gpu + " x" + m.gpus + " TP" + m.tp];
+    if (currentRunner) bits.push("MoE runner " + currentRunner);
+    if (currentSpec && currentSpec.algorithm) {
+      bits.push("speculative " + currentSpec.algorithm + (currentSpec.draft_model ? " (draft: " + currentSpec.draft_model.split("/").pop() + ")" : "") + (currentSpec.draft_tokens ? " x" + currentSpec.draft_tokens : ""));
+    }
+    $("m-msg").textContent = bits.join(" · ");
+  }
+
+  fetch("/api/gpus")
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      var sel = $("m-gpu");
+      sel.innerHTML = (data.gpus || [])
+        .map(function (g) { return '<option value="' + MB.esc(g.name) + '">' + MB.esc(g.name) + " — " + g.vram_gib + " GiB</option>"; })
+        .join("");
+      var h200 = (data.gpus || []).find(function (g) { return g.name === "NVIDIA H200 SXM"; });
+      if (h200) sel.value = h200.name;
+    })
+    .catch(function () {});
+
+  function readForm() {
+    return {
+      model: $("m-model").value.trim(),
+      config_json: $("m-config").value.trim(),
+      gpu: $("m-vram").value ? "" : $("m-gpu").value,
+      gpu_vram: $("m-vram").value || null,
+      gpus: $("m-gpus").value,
+      tp: $("m-tp").value,
+      kv_dtype: $("m-kv").value,
+      mem_fraction: $("m-mem").value,
+      ep: $("m-ep").value,
+      speculative: $("m-spec").value,
+      overhead: $("m-over").value,
+      contexts: $("m-ctx").value.split(",").map(function (x) { return parseInt(x, 10); }).filter(function (x) { return x > 0; }),
+      grid: $("m-grid").checked,
+      hicache: $("m-hicache").value,
+      hicache_ratio: $("m-hcr").value,
+      hicache_size: $("m-hcs").value,
+      hicache_l3: $("m-hcl3").value,
+      hicache_tp_layout: $("m-hclayout").value,
+      moe_runner: currentRunner || $("m-runner").value || undefined,
+      speculative: (function () {
+        var flip = $("m-spec").checked;
+        if (currentSpec && currentSpec.algorithm && !flip) return currentSpec; // catalog preset carries its own
+        if (!flip) return undefined;
+        // flip ON: auto-derive from the model's built-in module (server side)
+        // or carry the catalog's draft model/shape
+        return {
+          algorithm: (currentSpec && currentSpec.algorithm) || "",
+          draft_model: (currentSpec && currentSpec.draft_model) || "",
+          draft_tokens: (currentSpec && currentSpec.draft_tokens) || 0,
+          layers: (currentSpec && currentSpec.layers) || 0,
+        };
+      })(),
+    };
+  }
+
+  function kvTable(rows) {
+    return '<table><tbody>' + rows.map(function (r) {
+      return '<tr><td class="k">' + MB.esc(r[0]) + '</td><td>' + MB.esc(r[1]) + "</td></tr>";
+    }).join("") + "</tbody></table>";
+  }
+
+  // cache-tier table helpers
+  function maxCtx(d) {
+    var v = (d.config || []).filter(function (r) { return r[0] === "max context"; })[0];
+    return v ? parseInt(String(v[1]).replace(/,/g, ""), 10) || 0 : 0;
+  }
+  function maxCtxLabel(d) {
+    var c = maxCtx(d);
+    return c % 1048576 === 0 ? c / 1048576 + "M-ctx" : c % 1024 === 0 ? c / 1024 + "k-ctx" : c + "-ctx";
+  }
+
+  function render(d) {
+    var cls = d.fits === true ? "ok" : d.fits === false ? "bad" : "unknown";
+    var word = d.fits === true ? "FITS" : d.fits === false ? "DOES NOT FIT" : "UNKNOWN";
+    var html = '<div class="panel">';
+    html += '<div class="verdict ' + cls + '">' + word + "</div>";
+    html += '<p class="sub">' + MB.esc(d.status) + "</p>";
+    html += "<h2>Memory configuration</h2>" + kvTable(d.config);
+    html += "<h2>Model structure</h2>" + kvTable(d.structure);
+    if (d.scenarios && d.scenarios.length) {
+      html += "<h2>Deployment scenarios</h2>";
+      html += "<table><tbody>" + d.scenarios.map(function (s) {
+        var c = s.fits === true ? "ok" : s.fits === false ? "bad" : "";
+        return "<tr><td>" + MB.esc(s.label) + '</td><td><span class="badge ' + c + '">' + MB.esc(s.verdict) + "</span></td></tr>";
+      }).join("") + "</tbody></table>";
+    }
+    if (d.grid && d.grid.rows && d.grid.rows.length) {
+      html += "<h2>Capacity grid</h2><p class=\"sub\">Concurrent requests by context length:</p>";
+      html += "<table><thead><tr><th>Deployment</th><th class=\"num\">KV pool</th>";
+      d.grid.contexts.forEach(function (c) {
+        html += '<th class="num">' + (c % 1024 === 0 ? c / 1024 + "k" : c) + "</th>";
+      });
+      html += "</tr></thead><tbody>";
+      d.grid.rows.forEach(function (row) {
+        html += "<tr><td>" + MB.esc(row.label) + '</td><td class="num">' + MB.esc(row.kv) + "</td>";
+        row.cells.forEach(function (c) { html += '<td class="num">' + (c == null ? "-" : MB.fmtNum(c, 0)) + "</td>"; });
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+    }
+    if (d.kv_per_token_optimistic) {
+      html += '<div class="banner">Compressed-attention note: the headline prices the indexer\'s compressed K stream '
+        + "(conservative). The optimistic floor is <b>" + (d.kv_per_token_optimistic / 1024).toFixed(1)
+        + " KiB/token</b> if your engine does not keep it resident — compare a live server's "
+        + "max_total_num_tokens against both.</div>";
+    }
+    if (d.cache_tiers && d.cache_tiers.l2) {
+      var t = d.cache_tiers;
+      html += "<h2>Hierarchical cache tiers</h2>";
+      html += '<table><thead><tr><th>Tier</th><th class="num">Size</th><th class="num">Cached tokens</th><th class="num">Concurrency @ ' + maxCtxLabel(d) + "</th></tr></thead><tbody>";
+      if (t.device && t.device.tokens != null) {
+        html += '<tr><td>L1 · device (HBM)</td><td class="num">' + (t.device.pool_gib_per_replica ? MB.esc(t.device.pool_gib_per_replica + " GiB/replica") : "-") + "</td>"
+          + '<td class="num">' + MB.fmtNum(t.device.tokens, 0) + "</td>"
+          + '<td class="num">' + (maxCtx(d) ? MB.fmtNum(Math.floor(t.device.tokens / maxCtx(d)), 0) : "-") + "</td></tr>";
+      }
+      if (t.l2) {
+        html += '<tr><td>L2 · host RAM <span class="mini">' + MB.esc(t.l2.layout || "") + "</span></td>"
+          + '<td class="num">' + (t.l2.gib_per_replica ? MB.esc(t.l2.gib_per_replica + " GiB/replica") : "-") + "</td>"
+          + '<td class="num">' + (t.l2.tokens != null ? MB.fmtNum(t.l2.tokens, 0) : "-") + "</td>"
+          + '<td class="num">' + (t.l2.tokens != null && maxCtx(d) ? MB.fmtNum(Math.floor(t.l2.tokens / maxCtx(d)), 0) : "-") + "</td></tr>";
+      }
+      if (t.l3 && (t.l3.tokens != null || t.l3.requested_gib)) {
+        html += '<tr><td>L3 · backing tier</td>'
+          + '<td class="num">' + (t.l3.gib_per_replica ? MB.esc(t.l3.gib_per_replica + " GiB/replica") : "-") + "</td>"
+          + '<td class="num">' + (t.l3.tokens != null ? MB.fmtNum(t.l3.tokens, 0) : "-") + "</td>"
+          + '<td class="num">' + (t.l3.tokens != null && maxCtx(d) ? MB.fmtNum(Math.floor(t.l3.tokens / maxCtx(d)), 0) : "-") + "</td></tr>";
+      }
+      html += "</tbody></table>";
+      if (t.total_tokens != null) {
+        html += '<p class="sub"><b>' + MB.esc(t.total_tokens_label) + " tokens addressable</b> across all tiers (device pool + host tiers). "
+          + "Host tiers serve cold/prefix pages on fault — they extend what the deployment can HOLD, not the hot decode pool.</p>";
+      }
+      (t.notes || []).forEach(function (n) { html += '<p class="mini">' + MB.esc(n) + "</p>"; });
+    }
+    if (d.warnings && d.warnings.length) {
+      html += "<h2>Warnings &amp; notes</h2><ul>";
+      d.warnings.forEach(function (w) { html += "<li>" + MB.esc(w) + "</li>"; });
+      html += "</ul>";
+    }
+    html += "</div>";
+    $("m-out").innerHTML = html;
+  }
+
+  function updateSpecSwitch() {
+    var sw = $("m-spec-switch");
+    var txt = $("m-spec-text");
+    var on = $("m-spec").checked;
+    sw.classList.toggle("on", on);
+    if (on) txt.textContent = "on" + (builtinMtp ? " · built-in module: " + builtinMtp + " layer(s)" : "");
+    else txt.textContent = builtinMtp ? "off · model ships a " + builtinMtp + "-layer MTP module" : "off";
+  }
+  $("m-spec").addEventListener("change", updateSpecSwitch);
+
+  function updateHicacheFields() {
+    var mode = $("m-hicache").value;
+    $("m-hcr-wrap").hidden = mode !== "ratio";
+    $("m-hcs-wrap").hidden = mode !== "size";
+    $("m-hclayout-wrap").style.display = mode ? "" : "none";
+  }
+  $("m-hicache").addEventListener("change", updateHicacheFields);
+  updateHicacheFields();
+
+  $("m-go").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    $("m-msg").innerHTML = '<span class="spinner"></span>estimating…';
+    fetch("/api/estimate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(readForm()),
+    })
+      .then(function (r) {
+        return r.json().then(function (data) {
+          if (!r.ok) throw new Error(data && data.detail ? data.detail : "estimate failed");
+          return data;
+        });
+      })
+      .then(function (d) {
+        $("m-msg").textContent = "";
+        render(d);
+      })
+      .catch(function (e) {
+        $("m-msg").textContent = e.message;
+        $("m-out").innerHTML = "";
+      })
+      .finally(function () { btn.disabled = false; });
+  });
+})();
+</script>
+</body>
+</html>

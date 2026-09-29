@@ -109,40 +109,133 @@ _IGNORED_TOKENS = {"old", "hicache", "fp8", "fp8_e4m3", "bf16", "fp16"}
 # --------------------------------------------------------------------------
 
 
-def _parse_md_chat_row(stripped: str) -> dict | None:
+def _parse_md_chat_row(stripped: str, header: list[str] | None = None) -> dict | None:
     """One ``| ctx | users | task | failed | ... |`` Markdown table row.
 
     Returns the chat-row dict, or None for header / separator / junk rows.
-    A dash percentile group is allowed only for the TTFT-post columns (a
-    multiturn run where no turns 2+ were measured).
+
+    Column groups are identified by the HEADER NAMES (``TTFT turn1`` /
+    ``TTFT`` / ``TTFT-post`` / ``tokens/s`` / ``ITL`` / ``TPOT`` groups, each
+    four percentile columns wide), not by a fixed column count — so legacy
+    12/16-column files and newer files with ITL/TPOT groups all parse, and a
+    missing group reads back as None. Without a header (headerless row), a
+    dash group is allowed only where the legacy layout put TTFT-post
+    (columns 8–11 of a 16-column row).
     """
     cells = [c.strip() for c in stripped.strip("|").split("|")]
-    # 12 columns = single-turn (TTFT + tokens/s), 16 = multiturn (+ TTFT-post)
-    if len(cells) not in (12, 16):
-        return None
     try:
         ctx, users, failed = int(cells[0]), int(cells[1]), int(cells[3])
-    except ValueError:
+    except (ValueError, IndexError):
         return None
-    segs: list[list[float] | None] = []
-    for off in range(4, len(cells), 4):
-        group = cells[off : off + 4]
-        if all(t in ("-", "—") for t in group):
-            if off == 8 and len(cells) == 16:
-                segs.append(None)  # multiturn, no turns 2+ measured
+
+    def is_dash_group(group: list[str]) -> bool:
+        return bool(group) and all(t in ("-", "—") for t in group)
+
+    segs: dict[str, list[float] | None] = {}
+    if header:
+        # Header-driven: locate each known metric group by its header names.
+        # TWO layouts parse here: the legacy WIDE files (one column per
+        # percentile: "TTFT turn1 P50 (ms)" ... "TTFT turn1 P100 (ms)") and
+        # the COMPACT format the writer now emits (one column per metric
+        # holding all four percentiles slash-joined:
+        # "TTFT turn1 P50/P95/P99/P100 (ms)" -> "706.8 / 706.8 / 706.8 /
+        # 706.8"; compact fits GitHub's fixed-width table renderer without
+        # clipping the row header). Both produce identical row dicts.
+        groups: dict[str, list[int]] = {}
+        compact: dict[str, int] = {}
+        for i, h in enumerate(header):
+            hl = h.strip().lower()
+            # COMPACT headers FIRST: "TTFT turn1 P50/P95/P99/P100 (ms)" also
+            # matches the wide "P<digit>" prefix, so the compact test has to
+            # win the elif chain.
+            if re.match(r"^ttft( turn1)? p50/p95/p99/p100", hl):
+                compact.setdefault("ttft", i)
+            elif re.match(r"^ttft( turn1)? p\d", hl):
+                groups.setdefault("ttft", []).append(i)
+            elif re.match(r"^ttft-post p50/p95/p99/p100", hl):
+                compact.setdefault("ttft_post", i)
+            elif re.match(r"^ttft-post p\d", hl):
+                groups.setdefault("ttft_post", []).append(i)
+            elif re.match(r"^tokens/s p50/p95/p99/p100", hl):
+                compact.setdefault("tokens", i)
+            elif re.match(r"^tokens/s p\d", hl):
+                groups.setdefault("tokens", []).append(i)
+            elif re.match(r"^itl p50/p95/p99/p100", hl):
+                compact.setdefault("itl", i)
+            elif re.match(r"^itl p\d", hl):
+                groups.setdefault("itl", []).append(i)
+            elif re.match(r"^tpot p50/p95/p99/p100", hl):
+                compact.setdefault("tpot", i)
+            elif re.match(r"^tpot p\d", hl):
+                groups.setdefault("tpot", []).append(i)
+        if not groups and not compact:
+            return None
+        if "ttft" not in groups and "ttft" not in compact:
+            return None
+        if "tokens" not in groups and "tokens" not in compact:
+            return None
+        for name, idxs in groups.items():
+            group = [cells[i] if i < len(cells) else "-" for i in idxs]
+            if is_dash_group(group):
+                segs[name] = None
                 continue
-            return None
-        try:
-            segs.append([float(t) for t in group])
-        except ValueError:
-            return None
-    if len(segs) == 2:
-        ttft, tokens = segs
-        ttft_post = None
-    elif len(segs) == 3:
-        ttft, ttft_post, tokens = segs
+            try:
+                segs[name] = [float(t) for t in group]
+            except ValueError:
+                return None
+        # compact groups: one cell, four slash-joined percentiles ("-" cell =
+        # group absent). A file is either layout; compact wins when present.
+        for name, i in compact.items():
+            if name in segs:
+                continue  # mixed header: the wide group already parsed
+            raw = cells[i].strip() if i < len(cells) else "-"
+            if raw in ("-", "—", ""):
+                segs[name] = None
+                continue
+            try:
+                segs[name] = [float(t) for t in raw.split("/")]
+            except ValueError:
+                return None
     else:
-        return None
+        # No header context (fixed-width legacy rows feed this too): keep the
+        # historical reading — every 4-column block after the leading keys is
+        # a percentile group; a dash block is allowed only in the TTFT-post
+        # position of a 16-column (multiturn) row.
+        if len(cells) not in (12, 16, 20, 24):
+            return None
+        offs = list(range(4, len(cells), 4))
+        parsed: list[list[float] | None] = []
+        for off in offs:
+            group = cells[off : off + 4]
+            if is_dash_group(group):
+                if off == 8 and len(cells) == 16:
+                    parsed.append(None)  # multiturn, no turns 2+ measured
+                    continue
+                return None
+            try:
+                parsed.append([float(t) for t in group])
+            except ValueError:
+                return None
+        # Headerless layout order is the emission order: TTFT, [TTFT-post],
+        # tokens/s, [ITL], [TPOT]. 2 groups = legacy single-turn (ttft,
+        # tokens); 3 = legacy multiturn (ttft, ttft_post, tokens); 4/5 =
+        # extended (ttft, [ttft_post], tokens, itl[/tpot]).
+        if len(parsed) == 2:
+            segs = {"ttft": parsed[0], "tokens": parsed[1]}
+        elif len(parsed) == 3:
+            segs = {"ttft": parsed[0], "ttft_post": parsed[1], "tokens": parsed[2]}
+        elif len(parsed) == 4:
+            segs = {"ttft": parsed[0], "tokens": parsed[1], "itl": parsed[2], "tpot": parsed[3]}
+        else:
+            segs = {
+                "ttft": parsed[0],
+                "ttft_post": parsed[1],
+                "tokens": parsed[2],
+                "itl": parsed[3],
+                "tpot": parsed[4],
+            }
+    ttft = segs.get("ttft")
+    tokens = segs.get("tokens")
     if ttft is None or tokens is None:
         return None
     return {
@@ -151,8 +244,10 @@ def _parse_md_chat_row(stripped: str) -> dict | None:
         "task": cells[2],
         "failed": failed,
         "ttft": ttft,
-        "ttft_post": ttft_post,
+        "ttft_post": segs.get("ttft_post"),
         "tokens": tokens,
+        "itl": segs.get("itl"),
+        "tpot": segs.get("tpot"),
     }
 
 
@@ -172,11 +267,14 @@ def _parse_fixed_chat_row(ln: str) -> dict | None:
         failed = int(head[3])
     except ValueError:
         return None
-    segs = []
+    segs: list[list[float] | None] = []
     for seg in parts[1:]:
         toks = seg.split()
         if len(toks) != 4:
             return None
+        if all(t in ("-", "—") for t in toks):
+            segs.append(None)
+            continue
         try:
             segs.append([float(t) for t in toks])
         except ValueError:
@@ -196,6 +294,8 @@ def _parse_fixed_chat_row(ln: str) -> dict | None:
         "ttft": ttft,
         "ttft_post": ttft_post,
         "tokens": tokens,
+        "itl": None,
+        "tpot": None,
     }
 
 
@@ -205,8 +305,24 @@ def parse_chat_table(text: str) -> tuple[str, list[dict]]:
     Returns (mode, rows).  mode is "multiturn", "single" or "unknown"
     ("multiturn" is surfaced per setup as ``multiturn: True`` by the caller).
     Each row: {ctx, users, task, failed, ttft:[..4], post:[..4] or None,
-    tokens:[..4]}.
+    tokens:[..4], itl:[..4] or None, tpot:[..4] or None} — the ITL/TPOT
+    groups are present only in newer artifacts (MB-A) and read back as None
+    for legacy files.
+
+    Markdown rows are parsed header-driven: the ``| ctx | ... |`` header row
+    names each percentile group, so files with or without the newer column
+    groups both render (missing groups → None). Use ``parse_chat_table_full``
+    when the arrival mode stamp is needed.
     """
+    _mode, rows, _arrival = parse_chat_table_full(text)
+    return _mode, rows
+
+
+def parse_chat_table_full(text: str) -> tuple[str, list[dict], str]:
+    """parse_chat_table plus the arrival-mode stamp: returns (mode, rows,
+    arrival) with arrival "open" (the file's MODE line says ``arrival=open``
+    or its grammar token says open-loop), else "closed" (the default for
+    legacy files, which predate the stamp)."""
     lines = [ln.rstrip("\n") for ln in text.splitlines()]
     mode = "unknown"
     joined = "\n".join(lines)
@@ -215,16 +331,38 @@ def parse_chat_table(text: str) -> tuple[str, list[dict]]:
     elif "TTFT (ms)" in joined or "tokens/s" in joined:
         mode = "single"
 
+    arrival = "closed"
+    for ln in lines:
+        low = ln.lower()
+        if "mode: arrival=open" in low or "arrival_mode: open" in low:
+            arrival = "open"
+            break
+
     rows: list[dict] = []
+    header: list[str] | None = None
     for ln in lines:
         stripped = ln.strip()
         if stripped.startswith("|"):
-            row = _parse_md_chat_row(stripped)
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if _is_md_header_row(cells):
+                header = cells
+                continue
+            row = _parse_md_chat_row(stripped, header)
         else:
             row = _parse_fixed_chat_row(ln)
         if row is not None:
             rows.append(row)
-    return mode, rows
+    return mode, rows, arrival
+
+
+def _is_md_header_row(cells: list[str]) -> bool:
+    """True for the ``| ctx | users | task | failed | TTFT ... |`` header row
+    (key cells, non-numeric) as opposed to a data row."""
+    if len(cells) < 4:
+        return False
+    if cells[0].lower() != "ctx" or cells[1].lower() != "users":
+        return False
+    return not cells[0].lstrip("-").isdigit()
 
 
 def parse_rag_table(text: str) -> dict | None:
@@ -271,6 +409,65 @@ def parse_rag_table(text: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# Memory-estimate artifacts (memory_model.cli --output)
+# --------------------------------------------------------------------------
+
+
+def parse_memory_estimate(text: str) -> dict | None:
+    """Recognize a ``memory-estimate`` artifact (``tool: memory-estimate`` row).
+
+    Returns a small summary dict (config + status + scenarios + grid rows)
+    or None for other files.
+    """
+    if "tool | memory-estimate" not in text:
+        return None
+    summary: dict = {"config": {}, "structure": {}, "scenarios": [], "grid": []}
+    section = None
+    for ln in text.splitlines():
+        s = ln.strip()
+        up = s.upper()
+        if up.startswith("## MEMORY CONFIGURATION"):
+            section = "config"
+            continue
+        if up.startswith("## MODEL STRUCTURE"):
+            section = "structure"
+            continue
+        if up.startswith("## DEPLOYMENT SCENARIOS"):
+            section = "scenarios"
+            continue
+        if up.startswith("## CAPACITY GRID"):
+            section = "grid"
+            continue
+        if s.startswith("## "):
+            section = None
+            continue
+        if s.startswith("Status:"):
+            summary["status"] = s.split(":", 1)[1].strip()
+            continue
+        if s.startswith("# "):
+            summary["title"] = s.lstrip("# ").strip()
+            continue
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cells if c):
+            continue  # separator row
+        if section in ("config", "structure") and len(cells) == 2:
+            summary[section][cells[0]] = cells[1]
+        elif section == "scenarios" and len(cells) == 2:
+            if cells[0].lower() not in ("key", "label", "deployment"):
+                summary["scenarios"].append({"label": cells[0], "verdict": cells[1]})
+        elif section == "grid" and len(cells) >= 3 and not all(set(c) <= set("-: ") for c in cells):
+            if cells[0].lower() == "deployment":
+                pass
+            else:
+                summary["grid"].append(cells)
+    if not summary["config"]:
+        return None
+    return summary
+
+
+# --------------------------------------------------------------------------
 # Filename -> setup metadata
 # --------------------------------------------------------------------------
 
@@ -287,6 +484,7 @@ def parse_setup(stem: str) -> dict:
         "hicache": None,
         "replicas": 1,
         "obsolete": False,
+        "arrival": "closed",  # closed-loop (unmarked) | open-loop (_ol token)
         "hints": [],
     }
     if stem.startswith("OLD_"):
@@ -329,6 +527,10 @@ def parse_setup(stem: str) -> dict:
             continue
         if low in WEIGHT_LABELS:
             meta["weights"] = WEIGHT_LABELS[low]
+            continue
+        if low == "ol":
+            # Open-loop arrival stamp (MB-B): closed-loop files stay unmarked.
+            meta["arrival"] = "open"
             continue
         if low in _IGNORED_TOKENS:
             continue
@@ -483,35 +685,14 @@ def match_catalog(model_slug: str, meta: dict, catalog: list[dict]) -> dict | No
 # --------------------------------------------------------------------------
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results", default=None, help="Path to results/ dir (default: beside this script).")
-    ap.add_argument("--catalog", default=None, help="Path to Model-Downloader seed_catalog.json (auto-discovered).")
-    ap.add_argument("--output", default=None, help="Output HTML path (default: results/benchmark_report.html).")
-    ap.add_argument("--title", default="PCAI Model Benchmarks", help="Page title.")
-    ap.add_argument("--open", action="store_true", help="Open the report in the default browser.")
-    ap.add_argument(
-        "--results_label",
-        default="pcai-solutions/tools/model-benchmarker/results/",
-        help="How to display the results directory in the report (default: pcai-solutions/tools path).",
-    )
-    ap.add_argument(
-        "--catalog_label",
-        default="pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json",
-        help="How to display the catalog path in the report (default: pcai-solutions/tools path).",
-    )
-    args = ap.parse_args()
-
-    script_dir = Path(__file__).resolve().parent
-    results_dir = Path(args.results) if args.results else (script_dir.parent.parent / "results")
-    results_dir = results_dir.expanduser().resolve()
-    if not results_dir.is_dir():
-        print(f"error: results dir not found: {results_dir}", file=sys.stderr)
-        return 2
-
-    catalog_path = Path(args.catalog).expanduser() if args.catalog else None
-    if catalog_path is None:
-        catalog_path = discover_catalog()
+def collect_report_data(
+    results_dir: Path,
+    catalog_path: Path | None,
+    results_label: str = "pcai-solutions/tools/model-benchmarker/results/",
+    catalog_label: str | None = "pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json",
+) -> dict:
+    """Scan a results dir into the report's data payload (models / rag /
+    memory tabs). Refactored out of main() so the pipeline is testable."""
     catalog = load_catalog(catalog_path)
 
     models: list[dict[str, Any]] = []
@@ -534,10 +715,34 @@ def main() -> int:
             stem = fp.stem
             rag = parse_rag_table(text)
             mode, rows = parse_chat_table(text)
-            if not rows and rag is None:
+            mem = parse_memory_estimate(text)
+            if not rows and rag is None and mem is None:
                 continue
             meta = parse_setup(stem)
-            if rag is not None and not rows:
+            # MB-B: arrival stamp — the filename token wins, the file's MODE
+            # line fills it in for files whose name predates the token.
+            if meta.get("arrival") == "closed":
+                _m, _r, file_arrival = parse_chat_table_full(text)
+                meta["arrival"] = file_arrival
+            if mem is not None and not rows and rag is None:
+                # memory-estimate artifact: its own kind, minimal metadata
+                meta = {
+                    "gpu": None,
+                    "tier": None,
+                    "gpu_count": 1,
+                    "engine": None,
+                    "mtp": None,
+                    "weights": None,
+                    "hicache": None,
+                    "replicas": 1,
+                    "obsolete": False,
+                    "hints": [],
+                }
+                mode = "memory"
+                # skip chat-oriented catalog matching (mtp/engine) for
+                # memory estimates; their own tables carry the deployment
+                cat_entry = None
+            elif rag is not None and not rows:
                 # RAG scale-benchmark: not a chat-table result
                 meta = {
                     "gpu": None,
@@ -584,36 +789,39 @@ def main() -> int:
                 "mode": mode,
                 "rows": rows,
                 "multiturn": mode == "multiturn",
+                "arrival": meta.get("arrival", "closed"),
                 "catalog": cat_entry,
                 "catalog_source": None,  # filled in relative form below
             }
             if rag is not None:
                 setup["rag"] = rag
+            if mem is not None:
+                setup["memory"] = mem
             setups.append(setup)
         if setups:
             models.append({"slug": slug, "name": display, "setups": setups})
 
-    # Split into chat-model results (shown under "Models") and RAG
-    # scale-benchmarks (shown in a separate "RAG" tab) so RAG does not
-    # appear as a model in the "All models" view.
+    # Split into chat-model results (shown under "Models"), RAG
+    # scale-benchmarks (separate "RAG" tab), and memory estimates
+    # (separate "Memory" tab) so neither appears as a model in the
+    # "All models" view.
     chat_models: list[dict] = []
     rag_models: list[dict] = []
+    memory_models: list[dict] = []
     for mdl in models:
-        chat = [s for s in mdl["setups"] if "rag" not in s]
+        chat = [s for s in mdl["setups"] if "rag" not in s and "memory" not in s]
         rag_setups = [s for s in mdl["setups"] if "rag" in s]
+        mem_setups = [s for s in mdl["setups"] if "memory" in s]
         if chat:
             chat_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": chat})
         if rag_setups:
             rag_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": rag_setups})
-
-    output = Path(args.output) if args.output else (results_dir / "benchmark_report.html")
-    output = output.expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
+        if mem_setups:
+            memory_models.append({"slug": mdl["slug"], "name": mdl["name"], "setups": mem_setups})
 
     # Display paths are presented in the pcai-solutions/tools/ layout
-    # (hardcoded by default, override with the *_label flags).
-    results_label = args.results_label
-    catalog_label = args.catalog_label if catalog_path else None
+    # (see the function defaults; main() forwards its --*_label flags).
+    catalog_label = catalog_label if catalog_path else None
 
     for mdl in chat_models + rag_models:
         for s in mdl["setups"]:
@@ -627,9 +835,50 @@ def main() -> int:
         "model_count": len(chat_models),
         "setup_count": sum(len(m["setups"]) for m in chat_models),
         "rag_count": sum(len(m["setups"]) for m in rag_models),
+        "memory_count": sum(len(m["setups"]) for m in memory_models),
         "models": chat_models,
         "rag_models": rag_models,
+        "memory_models": memory_models,
     }
+    return data
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--results", default=None, help="Path to results/ dir (default: beside this script).")
+    ap.add_argument("--catalog", default=None, help="Path to Model-Downloader seed_catalog.json (auto-discovered).")
+    ap.add_argument("--output", default=None, help="Output HTML path (default: results/benchmark_report.html).")
+    ap.add_argument("--title", default="PCAI Model Benchmarks", help="Page title.")
+    ap.add_argument("--open", action="store_true", help="Open the report in the default browser.")
+    ap.add_argument(
+        "--results_label",
+        default="pcai-solutions/tools/model-benchmarker/results/",
+        help="How to display the results directory in the report (default: pcai-solutions/tools path).",
+    )
+    ap.add_argument(
+        "--catalog_label",
+        default="pcai-solutions/tools/model-downloader-web/src/model_downloader/app/seed_catalog.json",
+        help="How to display the catalog path in the report (default: pcai-solutions/tools path).",
+    )
+    args = ap.parse_args(argv)
+
+    script_dir = Path(__file__).resolve().parent
+    results_dir = Path(args.results) if args.results else (script_dir.parent.parent / "results")
+    results_dir = results_dir.expanduser().resolve()
+    if not results_dir.is_dir():
+        print(f"error: results dir not found: {results_dir}", file=sys.stderr)
+        return 2
+
+    catalog_path = Path(args.catalog).expanduser() if args.catalog else None
+    if catalog_path is None:
+        catalog_path = discover_catalog()
+
+    data = collect_report_data(
+        results_dir, catalog_path, results_label=args.results_label, catalog_label=args.catalog_label
+    )
+    output = Path(args.output) if args.output else (results_dir / "benchmark_report.html")
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(render_html(data, args.title), encoding="utf-8")
     print(f"Report written to {output}")
     print(f"  models: {data['model_count']}   setups: {data['setup_count']}")

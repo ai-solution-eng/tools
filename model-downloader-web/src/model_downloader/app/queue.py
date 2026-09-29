@@ -5,6 +5,11 @@ most `max_concurrency` downloads run at once; the rest wait. On startup the
 queue reconciles previously-created Jobs from Kubernetes so downloads submitted
 before a restart (or still running) reappear in the UI. State is otherwise held
 in-process.
+
+MD-B: PVC submissions pass through the preflight/quota gate (preflight.py)
+BEFORE the semaphore — a refusal (insufficient disk / namespace quota) raises
+there and never reaches Job creation. The gate is dependency-injected
+(``preflight=None`` keeps the old behavior, e.g. in tests).
 """
 
 import asyncio
@@ -121,7 +126,30 @@ class JobQueue:
         chat_template_path: str = "",
         chat_template_contents: str = "",
         cache_root: str = "",
+        preflight=None,
     ) -> JobRecord:
+        # MD-B preflight/quota gate runs BEFORE Job creation (and before the
+        # semaphore): a refused submission must never occupy a concurrency
+        # slot or create a half-configured record. preflight is the app's
+        # PreflightService (dependency-injected so the queue itself stays
+        # cluster-free); S3 submissions bypass it — disk/quota apply to the
+        # shared PVC only.
+        if preflight is not None and storage == "pvc":
+            report = await preflight.check(
+                namespace=namespace,
+                repo_id=model_name,
+                estimate_bytes=None,
+                pvc_name=self.pvc_name,
+                scan_root=self._scan_root_for(cache_root),
+                scan_image=getattr(preflight, "scan_image", "") or "",
+                jobs=list(self.jobs.values()),
+            )
+            # Charge the namespace for the accepted submission immediately
+            # (folded into cached usage; the next scanner refresh re-derives).
+            est = report.get("estimate_bytes")
+            if isinstance(est, int) and est > 0:
+                preflight.record_usage_delta(namespace, est)
+                preflight.record_pending(namespace, est)
         if self._sem is None:
             raise RuntimeError("queue not started")
         job_id = uuid.uuid4().hex[:12]
@@ -138,6 +166,17 @@ class JobQueue:
         self.jobs[job_id] = record
         asyncio.create_task(self._run(record, hf_token, chat_template_path, chat_template_contents))
         return record
+
+    def _scan_root_for(self, cache_root: str) -> str:
+        """The scanner root that covers this submission's cache location.
+
+        A custom cache_root may sit anywhere under /mnt; the usage scan
+        covers the model subpath root (the same scan the downloaded-models
+        listing uses), because per-namespace usage aggregates over ALL roots
+        via attribution. Returns the PVC subpath root (e.g. /mnt/large-models).
+        """
+        sub = f"/mnt/{self.pvc_subpath}"
+        return sub
 
     async def _run(
         self, record: JobRecord, hf_token: str, chat_template_path: str = "", chat_template_contents: str = ""

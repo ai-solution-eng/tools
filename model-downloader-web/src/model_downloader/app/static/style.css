@@ -585,6 +585,12 @@ tr.push-err td { background: var(--hpe-critical-tint); }
   border-color: var(--hpe-focus);
   color: var(--hpe-focus);
 }
+/* ModelScan verdict badge in the GC report (warn/unsafe verdicts). */
+.backend-scan-risk {
+  background: var(--hpe-skip-tint);
+  border-color: var(--hpe-warning);
+  color: var(--hpe-text-soft);
+}
 
 /* ---- Add-model modal ---- */
 .modal-wide { max-width: 720px; }

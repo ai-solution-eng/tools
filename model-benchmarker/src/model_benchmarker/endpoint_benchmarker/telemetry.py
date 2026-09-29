@@ -29,7 +29,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2
 
 from .stats import err_key
 
@@ -168,7 +168,7 @@ def _aggregate_scalar(series: list[dict], t_start: float, t_end: float) -> dict:
 
 
 async def query_range(
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     prom_url: str,
     promql: str,
     t_start: float,
@@ -198,7 +198,7 @@ async def capture_window(
         "prom_url": config.prom_url,
         "window": {"start_epoch": t_start, "end_epoch": t_end, "step": config.step},
     }
-    async with httpx.AsyncClient(verify=not config.insecure) as client:
+    async with httpx2.AsyncClient(verify=not config.insecure) as client:
         per_metric: dict[str, dict] = {}
         for metric in config.gpu_metrics:
             promql = _promql(metric, config.selector)

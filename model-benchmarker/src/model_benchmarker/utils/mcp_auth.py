@@ -27,20 +27,48 @@ Scope per server (fleet decision, 2026-09):
 * OPTIONAL auth: RAG-MCP, SQLhandler, searxng (read/search surfaces fronted
   by the gateway).
 
+Caller attribution (Wave 6, Item A1 — attribution-never-authorization):
+
+* ``capture_caller`` resolves WHO is calling for the audit trail: the
+  matched key's sha256 FINGERPRINT (never the key), the ASGI client
+  host:port, an optional per-request registry name (``<SERVER>_CLIENTS``),
+  and — only when the direct peer is on the trusted-CIDR list — the peer's
+  own ``X-MCP-Caller`` claim as ``via``. A trusted peer is infrastructure
+  (the gateway); an untrusted peer's header is IGNORED, not honored —
+  fail-closed. Attribution never unlocks anything anywhere: it names the
+  caller for audit, it is not a credential.
+* ``CALLER_CONTEXT`` / ``current_caller`` are the request-scoped slot the
+  capture middleware sets and the audit writer reads.
+
 This module is hardlinked into the fleet by pcai_utils machinery; keep it
 dependency-free (stdlib only) and import-agnostic (no relative imports, no
 sibling-module imports) so every consumer can import it from wherever its
 tree places it.
 """
 
+import hashlib
 import hmac
+import ipaddress
 import os
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 UNIVERSAL_API_KEYS_ENV = "MCP_API_KEYS"
 
 UNAUTHORIZED_BODY = b'{"error": "unauthorized: missing or invalid API key"}'
 
 DEFAULT_PUBLIC_PATHS = ("/health", "/healthz")
+
+DEFAULT_TRUSTED_CIDRS_ENV = "MCP_CALLER_TRUSTED_CIDRS"
+
+#: Maximum accepted length of an ``X-MCP-Caller`` value before sanitization
+#: (the cap is applied to the RAW header so a 1 MiB header cannot reach the
+#: sanitization step at all).
+CALLER_HEADER_MAX_LENGTH = 256
+
+#: Sanitized ``via`` values are capped again AFTER CR/LF stripping — audit
+#: JSON must stay one physical line no matter what a peer sends.
+CALLER_VIA_MAX_LENGTH = 200
 
 
 def configured_keys(env_names=("MCP_API_KEYS",)):
@@ -72,6 +100,214 @@ def presented_keys(scope):
         elif lowered == b"x-api-key":
             candidates.append(value.decode("latin-1").strip())
     return candidates
+
+
+def presented_keys_with_source(scope):
+    """``[(key, header_name), …]`` — the :func:`presented_keys` candidates
+    paired with the lowercased header that presented each one.
+
+    The pairing drives the D19 delegation precedence in
+    ``clients_registry.resolve_presented``: a key presented via
+    ``X-API-Key`` outranks a co-forwarded ``Authorization: Bearer`` token
+    (a gateway's own platform/admin token), so per-key delegation to a
+    registry identity is possible at all.  Only ``Bearer`` Authorization
+    headers count; Basic/Negotiate are ignored.
+    """
+    pairs = []
+    for name, value in scope.get("headers", []):
+        lowered = name.lower()
+        if lowered == b"authorization":
+            scheme, _, token = value.decode("latin-1").partition(" ")
+            if scheme.lower() == "bearer" and token.strip():
+                pairs.append((token.strip(), "authorization"))
+        elif lowered == b"x-api-key":
+            token = value.decode("latin-1").strip()
+            if token:
+                pairs.append((token, "x-api-key"))
+    return pairs
+
+
+@dataclass(frozen=True)
+class Caller:
+    """Resolved identity of one request's caller — audit-grade, non-secret.
+
+    ``key_fp`` is ``sha256:<12 hex>`` of the MATCHED configured key (or None
+    when anonymous/unmatched — never a would-be intruder's fingerprint);
+    ``client`` is the ASGI client host:port when known.
+
+    ``name`` is the per-request registry name (``<SERVER>_CLIENTS`` ->
+    ``name:key``) for the matched key — the human/service identity an
+    operator assigned. ``via`` is the caller-claim relayed by a TRUSTED
+    proxy peer in ``X-MCP-Caller`` (e.g. ``<subject>@gateway``) — None for
+    every direct/untrusted caller. ``via`` is metadata about WHO a trusted
+    intermediary says is on the other end; it is never consulted for any
+    authorization decision (attribution-never-authorization).
+
+    ``as_dict`` includes ``name``/``via`` ONLY when set, so audit lines for
+    deployments that do not configure the registry (or relay nothing)
+    serialize BYTE-IDENTICAL to the pre-attribution 2-key shape
+    ``{"key_fp": ..., "client": ...}`` — every existing reader keeps working.
+    """
+
+    key_fp: str | None
+    client: str | None
+    name: str | None = None
+    via: str | None = None
+
+    def as_dict(self) -> dict:
+        out = {"key_fp": self.key_fp, "client": self.client}
+        if self.name:
+            out["name"] = self.name
+        if self.via:
+            out["via"] = self.via
+        return out
+
+
+#: The request-scoped caller slot — set by each server's outermost capture
+#: middleware per request; read by the audit writer (``current_caller``).
+CALLER_CONTEXT: ContextVar = ContextVar("mcp_caller", default=None)
+
+
+def current_caller() -> Caller | None:
+    """The caller captured for the CURRENT request (None outside one)."""
+    return CALLER_CONTEXT.get()
+
+
+def _client_str(scope) -> str | None:
+    client = scope.get("client")
+    return f"{client[0]}:{client[1]}" if client else None
+
+
+def _sanitize_via(raw: str) -> str | None:
+    """Make a caller-claim safe for single-line JSONL audit: strip CR/LF and
+    control characters (header injection / log-forgery), then cap the
+    length. An empty result sanitizes to None."""
+    cleaned = "".join(ch for ch in raw if ch.isprintable() and ch not in "\r\n")
+    cleaned = cleaned.strip()
+    return cleaned[:CALLER_VIA_MAX_LENGTH] or None
+
+
+def _trusted_peer(scope, trusted_cidrs_env: str) -> bool:
+    """True only when the DIRECT peer address falls inside one of the
+    trusted CIDRs. An unset/empty env is fail-CLOSED: no peer is trusted,
+    so ``via`` is never honored (CIDRs are a deployment-tuned trust claim —
+    behind an Istio sidecar scope["client"] is the sidecar, so tune the list
+    per deployment; the default posture ignores the header everywhere)."""
+    raw = (os.environ.get(trusted_cidrs_env) or "").strip()
+    if not raw:
+        return False
+    client = scope.get("client")
+    if not client or not client[0]:
+        return False
+    try:
+        peer = ipaddress.ip_address(client[0])
+    except ValueError:
+        return False
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            if peer in ipaddress.ip_network(chunk, strict=False):
+                return True
+        except ValueError:
+            continue  # a malformed CIDR in operator config is skipped, never trusted
+    return False
+
+
+def _key_fingerprint(key: str) -> str:
+    """sha256 of the MATCHED configured key, first 12 hex chars — the fleet
+    caller-fingerprint convention (defined here so every consumer hashes
+    IDENTICALLY; the raw key never enters the result)."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _registry_names(clients_env: str | None) -> dict:
+    """Parse ``<clients_env>`` (``name:key;name:key;...``) into {key: name},
+    re-read PER REQUEST so a Secret rotation reaches a running pod. Malformed
+    entries are refused loudly and skipped — the registry can never widen
+    authentication (it only NAMES keys that configured_keys already matched;
+    an unparseable registry degrades attribution to fp-only, never auth)."""
+    names: dict = {}
+    if not clients_env:
+        return names
+    raw = (os.environ.get(clients_env) or "").strip()
+    if not raw:
+        return names
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            import sys
+
+            print(
+                f"[mcp_auth] WARNING: invalid client entry {chunk!r} in {clients_env} "
+                "(expected name:key) — entry skipped (registry only NAMES callers, "
+                "it never authenticates them)",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        name, key = parts[0].strip(), parts[1].strip()
+        if key not in names:
+            names[key] = name
+    return names
+
+
+def capture_caller(
+    scope,
+    env_names=("MCP_API_KEYS",),
+    clients_env: str | None = None,
+    trusted_cidrs_env: str = DEFAULT_TRUSTED_CIDRS_ENV,
+) -> Caller:
+    """Resolve WHO is calling — the one resolver servers' capture middlewares
+    call. Same inputs the auth middleware sees; attribution only, never a
+    gate (keep capture OUT of ApiKeyAuthMiddleware.__call__: the middleware
+    short-circuits non-protected paths, which would silently change
+    console-path audit shapes; each server keeps its thin outermost wrapper).
+
+    - ``key_fp``: constant-time match of the presented keys against
+      ``configured_keys(env_names)`` -> ``sha256:<12 hex>`` of the MATCHED
+      configured key. Unmatched/anonymous callers get None (never a
+      would-be intruder's fingerprint).
+    - ``client``: ASGI client host:port when known.
+    - ``name``: registry name from ``clients_env`` (``name:key;...``) for the
+      matched key — only when ``clients_env`` is configured AND the key is
+      registered. ``hmac.compare_digest`` semantics over the registry keys.
+    - ``via``: the peer's ``X-MCP-Caller`` claim, sanitized (CR/LF stripped,
+      ≤200 chars), ONLY when the direct peer IP is inside
+      ``trusted_cidrs_env`` (default ``MCP_CALLER_TRUSTED_CIDRS``). Empty or
+      unset CIDRs ⇒ ``via`` is ALWAYS None — fail-closed. http scopes only.
+    """
+    if scope.get("type") != "http":
+        return Caller(key_fp=None, client=_client_str(scope))
+    matched: str | None = None
+    keys = configured_keys(env_names)
+    if keys:
+        for candidate in presented_keys(scope):
+            for valid in keys:
+                if hmac.compare_digest(candidate.encode("utf-8"), valid.encode("utf-8")):
+                    matched = valid
+                    break
+            if matched:
+                break
+    key_fp = ("sha256:" + _key_fingerprint(matched)) if matched else None
+    name = None
+    if matched and clients_env:
+        registry = _registry_names(clients_env)
+        for reg_key, reg_name in registry.items():
+            if hmac.compare_digest(matched.encode("utf-8"), reg_key.encode("utf-8")):
+                name = reg_name
+                break
+    via = None
+    if _trusted_peer(scope, trusted_cidrs_env):
+        for hname, hvalue in scope.get("headers", []):
+            if hname.lower() == b"x-mcp-caller":
+                via = _sanitize_via(hvalue.decode("latin-1")[:CALLER_HEADER_MAX_LENGTH])
+                break
+    return Caller(key_fp=key_fp, client=_client_str(scope), name=name, via=via)
 
 
 class ApiKeyAuthMiddleware:

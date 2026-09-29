@@ -1,3 +1,11 @@
+# Job templates the app substitutes placeholders into and creates via the k8s
+# API. The PVC job template carries an optional provenance step (MD-A1):
+# when provenance.enabled is on, a successful download is followed by a
+# second python pass that pins the revision, hashes every downloaded file
+# (streamed 1MB reads) and writes manifest.json next to the cache dir —
+# atomically (.partial + os.replace) and idempotently (a backoffLimit re-run
+# re-hashes whatever is already on disk instead of failing). The scanner job
+# reports whether that manifest exists next to each models--* dir.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -48,13 +56,17 @@ data:
               export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
               mkdir -p "${CACHE_ROOT}"
               CACHE_ID="models--$(echo "${MODEL_NAME}" | sed 's|/|--|')"
-              REV_FILE="${CACHE_ROOT}/${CACHE_ID}/refs/main"
+              # Provenance: the revision this Job pins the download to
+              # (provenance.revision, default "main"). Drives both what
+              # snapshot_download fetches and what the manifest records.
+              PROV_REV="{{ .Values.provenance.revision | default "main" }}"
+              REV_FILE="${CACHE_ROOT}/${CACHE_ID}/refs/${PROV_REV}"
               echo "Completing HF cache for ${MODEL_NAME}"
               echo "Cache root (HUGGINGFACE_HUB_CACHE): ${CACHE_ROOT}"
               echo "Repo cache dir: ${CACHE_ROOT}/${CACHE_ID}"
               BEFORE_REV="none"
               if [ -f "${REV_FILE}" ]; then BEFORE_REV="$(cat "${REV_FILE}")"; fi
-              echo "refs/main before: ${BEFORE_REV}"
+              echo "refs/${PROV_REV} before: ${BEFORE_REV}"
               if [ -d "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" ]; then
                 echo "=== Existing snapshot contents ==="
                 ls -la "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" || true
@@ -78,16 +90,28 @@ data:
               import huggingface_hub.constants as _c
               _c.MAX_HTTP_DOWNLOAD_SIZE = 500 * 1000 * 1000 * 1000
               from huggingface_hub import snapshot_download
+              {{- if .Values.provenance.enabled }}
+              # Revision pinning rides the provenance gate: provenance off
+              # means the job downloads exactly as before (default branch,
+              # revision=None) and the manifest step is omitted entirely.
+              path = snapshot_download(
+                  os.environ['MODEL_NAME'],
+                  revision=os.environ['PROVENANCE_REVISION'] or None,
+                  cache_dir=os.environ['HUGGINGFACE_HUB_CACHE'],
+                  max_workers=8,
+              )
+              {{- else }}
               path = snapshot_download(
                   os.environ['MODEL_NAME'],
                   cache_dir=os.environ['HUGGINGFACE_HUB_CACHE'],
                   max_workers=8,
               )
+              {{- end }}
               print('Completed (full snapshot) at:', path)
               "
               AFTER_REV="$(cat "${REV_FILE}" 2>/dev/null || echo "${BEFORE_REV}")"
               SNAP_DIR="${CACHE_ROOT}/${CACHE_ID}/snapshots/${AFTER_REV}"
-              echo "=== Verifying resolved snapshot: ${SNAP_DIR} (refs/main=${AFTER_REV}) ==="
+              echo "=== Verifying resolved snapshot: ${SNAP_DIR} (refs/${PROV_REV}=${AFTER_REV}) ==="
               ls -la "${SNAP_DIR}"
               if [ -f "${SNAP_DIR}/config.json" ]; then
                 echo "SUCCESS: config.json is now present in the cache."
@@ -95,6 +119,300 @@ data:
                 echo "FAILURE: config.json still missing after download."
                 exit 1
               fi
+              {{- if .Values.provenance.enabled }}
+              # ---- Provenance manifest (MD-A1) ----
+              # Runs AFTER the SUCCESS check so a failed download never emits
+              # a manifest. Export the runtime vars the python pass needs
+              # (CACHE_ID/SNAP_DIR are plain shell vars, not env), then pin
+              # the revision, hash every snapshot file (streamed 1MB reads,
+              # following the cache's blobs/ symlinks) and write
+              # ${CACHE_ROOT}/${CACHE_ID}/manifest.json atomically
+              # (.partial + os.replace). Idempotent under backoffLimit re-runs:
+              # a retry finds the blobs already on disk and simply re-hashes
+              # and replaces the manifest.
+              export CACHE_ID SNAP_DIR
+              python3 - <<'PROV_EOF'
+              import hashlib
+              import json
+              import os
+              import time
+
+              cache_root = os.environ["CACHE_ROOT"]
+              cache_id = os.environ["CACHE_ID"]
+              snap_dir = os.environ["SNAP_DIR"]
+              repo = os.environ["MODEL_NAME"]
+              requested_ref = os.environ.get("PROVENANCE_REVISION") or "main"
+              job_id = os.environ.get("JOB_ID", "")
+              namespace = os.environ["JOB_NAMESPACE"]
+              submitted_by = os.environ.get("SUBMITTED_BY", "")
+
+              # ---- revision pinning: refs/<requested> -> resolved commit ----
+              refs_dir = os.path.join(cache_root, cache_id, "refs")
+              revision = ""
+              if os.path.isdir(refs_dir):
+                  for name in sorted(os.listdir(refs_dir)):
+                      if name.lower() == requested_ref.lower():
+                          with open(os.path.join(refs_dir, name)) as fh:
+                              revision = fh.read().strip()
+                          break
+              if not revision and os.path.isdir(snap_dir):
+                  # A commit-sha pin downloads into snapshots/<sha> without a
+                  # refs entry, so the snapshot dir is the only resolver —
+                  # but only when the REQUESTED ref is itself commit-like
+                  # (40-hex git sha1 / 64-hex sha256-class id). Pinning
+                  # "v2.1" must never adopt whatever snapshot a previous
+                  # run left behind.
+                  req = requested_ref.lower()
+                  if 40 <= len(req) <= 64 and all(c in "0123456789abcdef" for c in req):
+                      actual = os.path.basename(os.path.realpath(snap_dir))
+                      if actual.lower() == req:
+                          revision = actual
+              manifest_revision = revision or requested_ref
+              print("PROVENANCE: revision %s resolved to %s" % (requested_ref, manifest_revision))
+
+              # ---- Hub metadata cross-check (best effort, non-fatal) ----
+              # HfApi().model_info(files_metadata=True) exposes the Hub-side
+              # sha256 for LFS-backed blobs only; non-LFS files have no
+              # Hub-side digest, so their manifest entry carries the local
+              # hash alone (stated in the schema notes below).
+              lfs_shas = {}
+              hub_metadata_fetched = False
+              try:
+                  from huggingface_hub import HfApi
+                  info = HfApi().model_info(repo, files_metadata=True)
+                  for sibling in info.siblings or []:
+                      lfs = getattr(sibling, "lfs", None)
+                      if lfs and getattr(lfs, "sha256", None):
+                          lfs_shas[sibling.rfilename] = lfs.sha256
+                  hub_metadata_fetched = True
+                  print("PROVENANCE: Hub metadata fetched (%d files, %d LFS digests)" % (len(info.siblings or []), len(lfs_shas)))
+              except Exception as exc:
+                  print("PROVENANCE: Hub metadata unavailable (%s); lfs_sha256_verified omitted" % exc)
+
+              # ---- per-file sha256 + size (streamed 1MB reads) ----
+              def sha256_of(path):
+                  digest = hashlib.sha256()
+                  with open(path, "rb") as fh:
+                      for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  return digest.hexdigest()
+
+              files = []
+              for root, dirs, names in os.walk(snap_dir):
+                  dirs.sort()
+                  for name in sorted(names):
+                      full = os.path.join(root, name)
+                      # Snapshot entries are symlinks into blobs/ — follow
+                      # them (open/getsize do) but skip dangling links.
+                      if not os.path.exists(full) or not os.path.isfile(full):
+                          continue
+                      entry = {
+                          "path": os.path.relpath(full, snap_dir),
+                          "sha256": sha256_of(full),
+                          "size": os.path.getsize(full),
+                      }
+                      hub_sha = lfs_shas.get(entry["path"])
+                      if hub_sha:
+                          entry["lfs_sha256"] = hub_sha
+                          entry["lfs_sha256_verified"] = entry["sha256"] == hub_sha
+                      files.append(entry)
+
+              # ---- license: config.json first, then the model card front matter ----
+              license_id = ""
+              config_path = os.path.join(snap_dir, "config.json")
+              if os.path.isfile(config_path):
+                  try:
+                      with open(config_path) as fh:
+                          cfg = json.load(fh)
+                  except (OSError, ValueError):
+                      cfg = {}
+                  lic = cfg.get("license") or cfg.get("license_title") or cfg.get("license_name") or ""
+                  if isinstance(lic, str):
+                      license_id = lic.strip()
+              if not license_id:
+                  card_path = os.path.join(snap_dir, "README.md")
+                  if os.path.isfile(card_path):
+                      try:
+                          with open(card_path, errors="replace") as fh:
+                              head = [line.strip() for line in fh.read(8192).splitlines()]
+                      except OSError:
+                          head = []
+                      if head and head[0] == "---":
+                          for line in head[1:]:
+                              if line == "---":
+                                  break
+                              if line.lower().startswith("license:"):
+                                  license_id = line.split(":", 1)[1].strip().strip('"').strip("'")
+                                  break
+
+              manifest = {
+                  "schema": "model-downloader.provenance/1.0",
+                  "repo": repo,
+                  "revision": manifest_revision,
+                  "revision_requested": requested_ref,
+                  "revision_resolved": bool(revision),
+                  "files": files,
+                  "license": license_id,
+                  "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "job_id": job_id,
+                  "namespace": namespace,
+                  "submitted_by": submitted_by,
+                  "hub_metadata_fetched": hub_metadata_fetched,
+                  "notes": (
+                      "sha256 values are local hashes of the downloaded files. "
+                      "For LFS-backed files lfs_sha256 is the Hub-side digest "
+                      "and lfs_sha256_verified records the byte-for-byte match "
+                      "against it; non-LFS files have no Hub-side digest, so "
+                      "their integrity rests on the local hash alone."
+                  ),
+              }
+              manifest_dir = os.path.join(cache_root, cache_id)
+              os.makedirs(manifest_dir, exist_ok=True)
+              partial = os.path.join(manifest_dir, "manifest.json.partial")
+              final = os.path.join(manifest_dir, "manifest.json")
+              with open(partial, "w") as fh:
+                  json.dump(manifest, fh, indent=2, sort_keys=True)
+                  fh.write("\n")
+              os.replace(partial, final)
+              print("PROVENANCE: manifest written to %s (%d files)" % (final, len(files)))
+              PROV_EOF
+              {{- end }}
+              {{- if .Values.gate.enabled }}
+              # ---- ModelScan provenance gate (MD-A2) ----
+              # Scans the resolved snapshot for unsafe serialization
+              # formats (.bin/.pt/.pth/.ckpt + pickle-class files).
+              # safetensors needs no scan and is skipped by modelscan itself
+              # (unsupported extension -> skipped, not failed). GATE_MODE
+              # decides the outcome: warn records the verdict and proceeds;
+              # block exits 1 on an UNSAFE VERDICT so the Job fails and the
+              # reason surfaces in the Jobs table's Error column. A scanner
+              # ERROR (tool crash, exit 2) is always warn-only — a broken
+              # scanner must not take downloads down; only a positive unsafe
+              # verdict can block. The verdict is written into manifest.json
+              # (scan block) after the scan, so the PVC scanner's 6th column
+              # and the GC report pick it up.
+              export GATE_MODE="{{ .Values.gate.mode }}"
+              export GATE_THRESHOLD="{{ .Values.gate.threshold }}"
+              python3 - <<'GATE_EOF'
+              import fnmatch
+              import json
+              import os
+              import subprocess
+              import sys
+
+              snap_dir = os.environ["SNAP_DIR"]
+              # manifest sits next to the models--* dir:
+              #   SNAP_DIR = <cache_root>/<cache_id>/snapshots/<rev>
+              # so the cache dir is dirname(dirname(SNAP_DIR)).
+              cache_root = os.environ["CACHE_ROOT"]
+              cache_id = os.path.basename(os.path.dirname(os.path.dirname(snap_dir)))
+              manifest_path = os.path.join(cache_root, cache_id, "manifest.json")
+              mode = os.environ.get("GATE_MODE", "warn").strip().lower()
+              threshold = os.environ.get("GATE_THRESHOLD", "low").strip().lower()
+
+              UNSAFE_EXTS = (".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle", ".joblib", ".dill", ".dat", ".data", ".h5", ".pb", ".keras", ".npy")
+              SEVERITY_ORDER = ["low", "medium", "high", "critical"]
+
+              def max_severity(issues):
+                  worst = ""
+                  for sev in issues:
+                      s = str(sev).lower()
+                      if s in SEVERITY_ORDER and (not worst or SEVERITY_ORDER.index(s) > SEVERITY_ORDER.index(worst)):
+                          worst = s
+                  return worst
+
+              target_files = []
+              for root, dirs, names in os.walk(snap_dir):
+                  dirs.sort()
+                  for name in sorted(names):
+                      if name.lower().endswith(UNSAFE_EXTS):
+                          target_files.append(os.path.join(root, name))
+
+              if not target_files:
+                  verdict = "skipped"
+                  detail = "no unsafe-format files present (safetensors-only snapshot)"
+                  print("GATE: %s — %s" % (verdict, detail))
+              else:
+                  print("GATE: scanning %d unsafe-format file(s) with modelscan" % len(target_files))
+                  proc = subprocess.run(
+                      [sys.executable, "-m", "modelscan.cli", "scan", "-r", "json", "-p", snap_dir],
+                      capture_output=True, text=True, timeout=3600,
+                  )
+                  # modelscan's stdout mixes banner lines ("No settings file
+                  # ...", "Scanning ...") with the JSON report — take the
+                  # JSON object line, not the whole stream.
+                  findings = []
+                  report = None
+                  for line in reversed((proc.stdout or "").splitlines()):
+                      line = line.strip()
+                      if line.startswith("{"):
+                          try:
+                              report = json.loads(line)
+                              break
+                          except ValueError:
+                              continue
+                  if report is None:
+                      try:
+                          report = json.loads(proc.stdout or "{}")
+                      except ValueError:
+                          report = None
+                  if report is not None:
+                      for issue in report.get("issues", []):
+                          sev = issue.get("severity", "")
+                          desc = issue.get("description", issue.get("code", ""))
+                          src = issue.get("source", issue.get("filename", ""))
+                          findings.append((sev, src, desc))
+                  else:
+                      findings = [("error", "", (proc.stderr or "unparseable modelscan output")[:300])]
+                  worst = max_severity(s for s, _src, _d in findings)
+                  # threshold: severities AT OR BELOW the threshold downgrade
+                  # to clean (e.g. threshold=medium keeps LOW findings from
+                  # blocking); anything above keeps its level.
+                  below = worst in SEVERITY_ORDER and worst in SEVERITY_ORDER[: max(SEVERITY_ORDER.index(threshold), 0)] if threshold in SEVERITY_ORDER else False
+                  tool_error = proc.returncode == 2 or (proc.returncode not in (0, 1) and not report)
+                  if not findings:
+                      verdict = "clean"
+                      detail = "modelscan exit %s, no findings" % proc.returncode
+                  elif tool_error:
+                      verdict = "error"
+                      detail = "modelscan failed (exit %s): %s" % (proc.returncode, (proc.stderr or "")[:300])
+                  elif below:
+                      verdict = "clean"
+                      detail = "modelscan findings at or below threshold %s: %s" % (threshold, findings[:5])
+                  else:
+                      verdict = "suspicious"
+                      detail = "modelscan findings (max severity %s): %s" % (worst or "unknown", findings[:5])
+                  print("GATE: %s — %s" % (verdict, detail))
+
+              # Record the verdict in manifest.json (atomic replace, same
+              # pattern as the manifest writer). A manifest-less run (older
+              # provenance disabled) writes a small sidecar instead so the
+              # scanner still has a verdict to surface.
+              entry = {"verdict": verdict, "mode": mode, "threshold": threshold, "detail": detail}
+              if os.path.isfile(manifest_path):
+                  with open(manifest_path) as fh:
+                      manifest = json.load(fh)
+                  manifest["scan"] = entry
+                  partial = manifest_path + ".partial"
+                  with open(partial, "w") as fh:
+                      json.dump(manifest, fh, indent=2, sort_keys=True)
+                      fh.write("\n")
+                  os.replace(partial, manifest_path)
+                  print("GATE: verdict recorded in %s" % manifest_path)
+              else:
+                  # No manifest (provenance disabled): write the verdict
+                  # NEXT TO the cache dir (models--*/ level, where the
+                  # scanner looks), not inside the snapshot.
+                  sidecar = os.path.join(cache_root, cache_id, "scan-verdict.json")
+                  with open(sidecar, "w") as fh:
+                      json.dump(entry, fh, indent=2)
+                  print("GATE: no manifest present; verdict sidecar written to %s" % sidecar)
+
+              if verdict == "suspicious" and mode == "block":
+                  print("GATE: BLOCK MODE — failing the Job on unsafe scan verdict")
+                  sys.exit(1)
+              GATE_EOF
+              {{- end }}
               if [ -n "${CHAT_TEMPLATE_B64}" ]; then
                 CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_PATH}"
                 case "${CHAT_TEMPLATE_FILE}" in
@@ -141,6 +459,16 @@ data:
               value: {{ .Values.downloader.hf.enableHfTransfer | quote }}
             - name: HF_HUB_DISABLE_XET
               value: {{ .Values.downloader.hf.disableXet | quote }}
+            {{- if .Values.provenance.enabled }}
+            - name: PROVENANCE_REVISION
+              value: {{ .Values.provenance.revision | quote }}
+            - name: JOB_ID
+              value: "__JOB_ID__"
+            - name: JOB_NAMESPACE
+              value: __NAMESPACE__
+            - name: SUBMITTED_BY
+              value: "__SUBMITTED_BY__"
+            {{- end }}
             volumeMounts:
             - name: model-storage
               mountPath: /mnt/
@@ -452,12 +780,45 @@ data:
               # Glob those directly — no dependency on config.json or the
               # snapshot layout. The cache dir NAME is the true repo id
               # (the path above it is just where the user cached it).
+              # Column 4: whether a provenance manifest.json (MD-A1) sits
+              # next to the cache dir — the UI's future Verified badge and
+              # GC's ownership record key off this one field.
+              {{- if or .Values.preflight.enabled .Values.gate.enabled }}
+              # Column 5 (MD-B, chart >= 1.7): du -sb of the whole cache dir
+              # — per-dir used bytes. The app's preflight/quota sums these
+              # (attributed by namespace) and the GC report shows sizes.
+              # Column 6 (MD-A2, chart >= 1.7): the ModelScan verdict from
+              # the manifest's scan block ("clean"/"suspicious"/...; empty
+              # = not scanned). Read with python (the scanner image has no
+              # jq) guarded to a single small read per dir.
+              {{- end }}
               find "$ROOT" -type d -name 'models--*--*' 2>/dev/null | while IFS= read -r d; do
                 cache="${d##*/}"
                 model="$(printf '%s' "${cache#models--}" | sed 's|--|/|')"
                 [ -n "$model" ] || continue
                 mtime=$(stat -c %Y "$d" 2>/dev/null || echo 0)
-                printf '%s\t%s\t%s\n' "$model" "$mtime" "$d"
+                if [ -f "$d/manifest.json" ]; then manifest="true"; else manifest="false"; fi
+                {{- if or .Values.preflight.enabled .Values.gate.enabled }}
+                bytes=$(du -sb "$d" 2>/dev/null | awk '{print $1}')
+                scanned=""
+                if [ -f "$d/manifest.json" ]; then
+                  # Single small manifest read per dir; python (not jq — the
+                  # scanner image has none). One python -c with the body kept
+                  # at the shell block's indentation (col-0 lines would end
+                  # the YAML literal block).
+                  scanned=$(MODELSCAN_VERDICT_FILE="$d/manifest.json" python3 -c '
+                                            import json, os
+                                            try:
+                                                m = json.load(open(os.environ["MODELSCAN_VERDICT_FILE"]))
+                                                s = m.get("scan") if isinstance(m, dict) else None
+                                                print((s or {}).get("verdict", "") if isinstance(s, dict) else "")
+                                            except Exception:
+                                                print("")' 2>/dev/null)
+                fi
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$model" "$mtime" "$d" "$manifest" "$bytes" "$scanned"
+                {{- else }}
+                printf '%s\t%s\t%s\t%s\n' "$model" "$mtime" "$d" "$manifest"
+                {{- end }}
               done
             securityContext:
               runAsUser: 0

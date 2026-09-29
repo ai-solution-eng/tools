@@ -1,7 +1,8 @@
 # Model Downloader — SE G2 example site values (SANITIZED).
 # Shareable counterpart of the real per-site file (helm/local convention —
 # real credentials live only in helm/local/, which is gitignored,
-# hardlink-ignored and never packaged). Base chart: model-downloader 1.4.4.
+# hardlink-ignored and never packaged). Base chart: model-downloader 1.6.2
+# (image.tag v1.6.2).
 #
 # FULL VALUES — complete document; paste this whole file into the PCAI
 # "Helm Values" editor and adjust the '# SITE:' lines. See the top-level
@@ -14,7 +15,7 @@ fullnameOverride: ""
 # -- App image --------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.4.4
+  tag: v1.6.2
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
@@ -45,8 +46,8 @@ resources:
 
 # -- HPE corporate proxy ---------------------------------------------------------------------
 # g2: true — downloader Jobs must reach HuggingFace through the corporate
-# proxy. The app pod gets the same proxy env (chart >= 1.4.1) so the catalog
-# "Refresh from GitHub" fetch goes through hpeproxy too; its TLS verify is
+# proxy. The app pod gets the same proxy env so the catalog "Refresh from
+# GitHub" fetch goes through hpeproxy too; its TLS verify is
 # off here (hpe_proxies=true → skipTls, the Zscaler MITM cert is untrusted).
 hpe_proxies: true
 
@@ -114,6 +115,80 @@ downloader:
     enableHfTransfer: "0"
     disableXet: "1"
     # verifyTls follows hpe_proxies (true here → Zscaler MITM bypass).
+
+# -- Provenance manifest (MD-A1)  ----------------------------------------------------------
+provenance:
+  enabled: true
+  revision: "main"
+
+# -- ModelScan provenance gate (MD-A2) -----------------------------------------------------
+# SHOWCASE: enabled in warn mode — every download of an unsafe-format model
+# (.bin/.pt/.pth/.ckpt/pickle) is scanned and the verdict lands in
+# manifest.json + the UI's scan column, WITHOUT blocking customer downloads
+# (a positive unsafe verdict in block mode would exit-1 the Job). Flip
+# mode: block after a warn period on real downloads. Requires the rebuilt
+# downloader image (Dockerfile gains modelscan); on an old image the gate
+# records "error" verdicts and never blocks. Turn the feature off with
+# enabled: false.
+gate:
+  enabled: true
+  mode: warn          # demo the scan badge; flip to block after a warn period
+  threshold: low
+
+# -- PVC preflight + per-namespace quota (MD-B) --------------------------------------------
+# SHOWCASE: preflight refuses a submit only when the model provably would
+# not fit the target PVC's free space (422 naming bytes-needed vs
+# bytes-free) — pure safety, no demo downside. Unknown model sizes degrade
+# to warn-only, never a blind refusal. Turn it off with enabled: false.
+preflight:
+  enabled: true
+  mode: refuse
+  safetyMargin: 0
+  usageTtl: 120
+  sizeTtl: 300
+
+# Per-namespace byte quotas. default left EMPTY here (G2 is the internal
+# demo rig): quota.default is the fallback cap for namespaces without their
+# own entry (k8s quantities or plain bytes). Set a value to demo the
+# "used+requested vs quota" 422; per-team entries go under namespaces.
+# Turn the whole enforcement off with quota.mode: off (or preflight.enabled
+# above, which gates both).
+quota:
+  default: ""         # no cluster-wide default; namespace entries only
+  # SHOWCASE example — a generous demo cap; set default to demo the refusal:
+  #   default: 2Ti
+  # SITE: set real per-team quotas (k8s quantities or plain bytes).
+  # namespaces:
+  #   project-user-alice: 1Ti
+  #   project-user-bob: 500Gi
+  namespaces: {}
+  mode: refuse
+
+# -- TTL/GC eviction (MD-C) ------------------------------------------------------------------
+# OFF — dry-run-first discipline: GC deletes model cache dirs from
+# the shared PVC, and enabling deletion on a demo rig is a foot-gun. The
+# safe enable path is: (1) set enabled: true and leave
+# dryRun: true — the job evaluates + logs every verdict and the UI's
+# /api/gc/report section becomes the review surface, deleting nothing;
+# (2) only after the report looks right, flip dryRun: false and let
+# ttlDays age out stale caches. Deletion needs the three-key AND (manifest
+# present + no AIOLI row + no live job), so serving models are protected.
+# Turn the feature off again with enabled: false (nothing rendered).
+gc:
+  enabled: false
+  schedule: "0 3 * * *"
+  ttlDays: 30
+  dryRun: true        # the UI report is the review surface; flip only after review
+  minKeep: 0
+  protectedModels: []
+  concurrencyPolicy: Forbid
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi
 
 # -- Debug pod ("Launch debug pod" in the UI) -------------------------------------------------------------
 # Long-running shell on the same PVC at /mnt for cache inspection. A Job on

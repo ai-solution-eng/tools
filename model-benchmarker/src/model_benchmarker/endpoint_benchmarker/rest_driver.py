@@ -15,7 +15,7 @@ import logging
 import random
 import time
 
-import httpx
+import httpx2
 
 from .stats import BenchmarkStats, err_key
 from .targets import RestTarget
@@ -42,7 +42,7 @@ def _count_results(data: object) -> int:
 
 async def run_user_rest(
     user_id: int,
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     target: RestTarget,
     queries: list[str],
     duration: float,

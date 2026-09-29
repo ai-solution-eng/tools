@@ -12,13 +12,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git lfs install
 
 # Python deps: huggingface_hub with hf_transfer for parallel downloads,
-# hf_xet for large file support, requests for HTTP, boto3 for S3 uploads
+# hf_xet for large file support, requests for HTTP, boto3 for S3 uploads.
+# modelscan (MD-A2 provenance gate) scans unsafe serialization formats
+# (.bin/.pt/.ckpt/pickle) in-job after the download; safetensors is skipped.
+# NOTE: adding this dep changes the image — rebuild + redeploy
+# ghcr.io/ai-solution-eng/hf-downloader when adopting the gate.
 RUN pip install --no-cache-dir \
     "huggingface_hub[hf_transfer]>=0.25.0" \
     "requests>=2.31.0" \
     "hf_transfer>=0.1.8" \
     "hf_xet>=1.1.0" \
-    "boto3>=1.34.0"
+    "boto3>=1.34.0" \
+    "modelscan>=0.8.0"
 
 # Default to hf_transfer enabled (can be overridden at runtime)
 # Xet is NOT disabled — let huggingface_hub auto-detect large files

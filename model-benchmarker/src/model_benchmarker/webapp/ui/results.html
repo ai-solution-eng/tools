@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPE Model Benchmarker — Results</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/app.css">
+<script>(function(){var t=localStorage.getItem('theme')||'light';if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();</script>
+<style>
+  /* page-local: the compare view (everything else comes from app.css) */
+  .cmp-toolbar { position: sticky; top: 58px; z-index: 4; display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; margin: 10px 0; }
+  .cmp-hint { color: var(--muted); font-size: 12px; }
+  .cmp-card { flex: 1 1 220px; min-width: 200px; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; font-size: 12.5px; }
+  .cmp-card .cid { font-weight: 700; border-bottom: 3px solid var(--cmp-accent, var(--accent)); padding-bottom: 2px; display: inline-block; }
+  .cmp-card .row { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; }
+  .cmp-card .row .k { color: var(--muted); }
+  .cmp-card .row .v { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  .cmp-table td, .cmp-table th { white-space: nowrap; }
+  .cmp-table td.num { text-align: right; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+  .cmp-delta { display: block; font-size: 11px; color: var(--muted); }
+  .cmp-delta.better { color: var(--ok); }
+  .cmp-delta.worse { color: var(--bad); }
+  .cmp-run0 { --cmp-accent: #01a982; }
+  .cmp-run1 { --cmp-accent: #2563eb; }
+  .cmp-run2 { --cmp-accent: #d97706; }
+  .cmp-run3 { --cmp-accent: #9333ea; }
+  .cmp-ref-chip { display: inline-block; font-size: 10px; font-weight: 700; border: 1px solid var(--border);
+    border-radius: 999px; padding: 0 7px; margin-left: 6px; color: var(--muted); }
+  .cmp-cell-wrap { display: inline-block; text-align: right; }
+  td.cmp-ref-col { background: rgba(1, 169, 130, .05); }
+  .cmp-missing-cell { color: var(--muted); }
+</style>
+<script type="text/html" id="hpe-logo-template"><svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 432 288" style="flex-shrink:0">
+      <path fill="#01a982" d="M126.617,109.327v15.861h55.218v-15.861H126.617z M178.384,121.737h-48.316v-8.959h48.316V121.737z"/>
+      <path fill="var(--text)" d="M136.668,158.173v1.93h-7.843v4.849h7.132v1.878h-7.132v5.279h7.843v1.929h-10.051v-15.864H136.668z
+        M142.123,174.037h-2.157v-11.676h2.03v2.184c0.837-1.473,2.183-2.438,3.909-2.438c2.716,0,4.315,1.776,4.315,4.442v7.487h-2.158
+        V166.6c0-1.547-0.812-2.462-2.614-2.462c-1.548,0-2.868,1.041-3.325,2.438V174.037z M159.051,174.291c-2.919,0-4.086-1.271-4.086-3.579
+        v-6.446h-2.462v-1.904h2.462v-3.02h2.157v3.02h3.325v1.904h-3.325v6.244c0,1.396,0.787,1.775,2.133,1.775c0.354,0,0.71-0.049,1.015-0.152
+        h0.177v1.904C160.117,174.163,159.659,174.291,159.051,174.291z M168.541,174.291c-3.883,0-6.345-2.284-6.345-5.965
+        c0-3.655,2.285-6.219,5.635-6.219c3.451,0,5.203,2.312,5.203,5.737v1.143h-8.604c0.305,2.282,1.929,3.35,4.137,3.35
+        c1.371,0,2.412-0.229,3.427-0.964h0.228v1.853C171.182,174.012,169.836,174.291,168.541,174.291z M164.456,167.285h6.472
+        c-0.077-2.131-1.193-3.273-3.071-3.273S164.735,165.383,164.456,167.285z M182.474,164.569c-0.305-0.15-0.762-0.254-1.243-0.254
+        c-1.372,0-2.463,0.967-2.919,2.538v7.184h-2.157v-11.676h2.03v2.514c0.686-1.904,1.929-2.691,3.325-2.691
+        c0.507,0,0.964,0.077,1.142,0.178v2.208H182.474z M186.965,172.133v6.193h-2.157v-15.965h2.03v2.006
+        c0.686-1.194,2.03-2.26,3.832-2.26c3.528,0,5.381,2.792,5.381,5.965c0,3.249-1.854,6.091-5.381,6.091
+        C188.996,174.163,187.676,173.25,186.965,172.133z M193.843,168.072c0-2.36-1.319-3.935-3.68-3.935c-1.395,0-2.512,0.737-3.197,2.006
+        v4.011c0.686,1.243,1.802,2.005,3.197,2.005C192.523,172.159,193.843,170.534,193.843,168.072z M205.619,164.569
+        c-0.305-0.15-0.762-0.254-1.244-0.254c-1.371,0-2.462,0.967-2.918,2.538v7.184h-2.157v-11.676h2.03v2.514
+        c0.685-1.904,1.929-2.691,3.324-2.691c0.508,0,0.965,0.077,1.143,0.178v2.208H205.619z M209.297,161.194
+        c-0.813,0-1.548-0.686-1.548-1.523c0-0.837,0.735-1.498,1.548-1.498c0.837,0,1.548,0.661,1.548,1.498
+        C210.845,160.509,210.135,161.194,209.297,161.194z M210.363,174.037h-2.157v-11.676h2.157V174.037z M213.865,171.27h0.204
+        c0.964,0.787,2.386,1.193,3.73,1.193c1.269,0,2.386-0.481,2.386-1.521c0-1.041-0.939-1.271-2.791-1.878
+        c-1.65-0.56-3.504-1.144-3.504-3.352c0-2.31,1.878-3.604,4.291-3.604c1.37,0,2.589,0.279,3.603,0.965v1.98h-0.228
+        c-0.914-0.686-2.005-1.117-3.351-1.117c-1.37,0-2.132,0.609-2.132,1.473c0,0.964,0.812,1.219,2.716,1.801
+        c1.699,0.56,3.579,1.219,3.579,3.427c0,2.412-1.981,3.655-4.543,3.655c-1.549,0-3.097-0.38-3.96-1.065V171.27z
+        M231.147,174.291c-3.883,0-6.345-2.284-6.345-5.965c0-3.655,2.284-6.219,5.635-6.219c3.453,0,5.204,2.312,5.204,5.737v1.143h-8.605
+        c0.305,2.282,1.929,3.35,4.139,3.35c1.369,0,2.41-0.229,3.426-0.964h0.228v1.853C233.787,174.012,232.442,174.291,231.147,174.291z
+        M227.062,167.285h6.473c-0.076-2.131-1.193-3.273-3.071-3.273C228.585,164.012,227.341,165.383,227.062,167.285z M139.942,135.543
+        v15.863h-3.452v-6.574h-6.421v6.574h-3.451v-15.863h3.451v6.269h6.421v-6.269H139.942z M149.306,151.686c-4.366,0-6.701-2.361-6.701-6.168
+        c0-3.807,2.436-6.32,5.964-6.32c3.807,0,5.711,2.386,5.711,5.965v1.344h-8.122c0.253,1.956,1.802,2.462,3.324,2.462
+        c1.372,0,2.437-0.177,3.555-0.784h0.38v2.486C152.402,151.406,150.778,151.686,149.306,151.686z M146.133,144.325h4.747
+        c-0.102-1.777-0.863-2.564-2.259-2.564C147.428,141.761,146.361,142.32,146.133,144.325z M158.339,151.406l-2.488-11.522v-0.406h3.198
+        l1.346,7.259l0.33,2.334l0.457-2.334l1.624-7.259h3.63l1.6,7.259l0.482,2.334l0.381-2.334l1.345-7.259h3.046v0.406l-2.513,11.522h-4.417
+        l-1.421-6.37l-0.406-2.386l-0.406,2.386l-1.396,6.37H158.339z M179.378,151.686c-2.538,0-3.807-1.167-3.807-3.884v-12.258h3.452v12.03
+        c0,0.838,0.355,1.117,1.167,1.117c0.254,0,0.661-0.076,0.914-0.151h0.051v2.867C180.774,151.534,180.038,151.686,179.378,151.686z
+        M188.87,151.686c-4.366,0-6.701-2.361-6.701-6.168c0-3.807,2.437-6.32,5.965-6.32c3.808,0,5.71,2.386,5.71,5.965v1.344h-8.122
+        c0.254,1.956,1.802,2.462,3.325,2.462c1.37,0,2.437-0.177,3.553-0.784h0.381v2.486C191.965,151.406,190.341,151.686,188.87,151.686z
+        M185.696,144.325h4.746c-0.101-1.777-0.862-2.564-2.258-2.564C186.991,141.761,185.925,142.32,185.696,144.325z M205.542,147.066
+        v-4.747h-5.051v4.594c0,1.219,0.406,1.776,1.549,1.776c0.33,0,0.761-0.102,0.989-0.202h0.331v2.842
+        c-0.458,0.152-1.143,0.355-2.158,0.355c-2.918,0-4.162-1.396-4.162-4.619v-4.747h-2.056v-2.842h2.056v-2.894h3.452v2.894h5.051
+        v-2.894h3.452v2.894h2.868v2.842h-2.868v4.594c0,1.219,0.406,1.776,1.548,1.776c0.33,0,0.762-0.102,0.99-0.202h0.33v2.842
+        c-0.457,0.152-1.142,0.355-2.157,0.355C206.787,151.686,205.542,150.289,205.542,147.066z M222.011,146.507v4.899h-3.425v-15.863h6.167
+        c3.503,0,5.812,1.929,5.812,5.507c0,3.527-2.31,5.456-5.812,5.456H222.011z M224.475,138.462h-2.464v5.127h2.464
+        c1.749,0,2.588-1.041,2.588-2.538C227.062,139.502,226.224,138.462,224.475,138.462z M239.345,149.63
+        c-0.71,1.32-2.005,1.904-3.604,1.904c-2.208,0-4.036-1.271-4.036-3.631c0-2.359,1.599-3.73,4.62-3.73c0.989,0,1.979,0.101,2.919,0.279
+        v-0.686c0-1.269-0.889-1.827-2.666-1.827c-1.32,0-2.411,0.279-3.324,0.735h-0.382v-2.589c0.915-0.481,2.539-0.888,4.112-0.888
+        c3.732,0,5.661,1.701,5.661,4.645v7.563h-3.301V149.63z M239.244,147.676v-1.523c-0.585-0.177-1.345-0.228-1.956-0.228
+        c-1.395,0-2.106,0.533-2.106,1.623c0,1.091,0.712,1.522,1.751,1.522C237.976,149.07,238.913,148.564,239.244,147.676z
+        M245.18,145.468c0-3.858,2.716-6.27,6.246-6.27c1.445,0,2.562,0.331,3.323,0.838v2.995h-0.355c-0.735-0.558-1.547-0.812-2.588-0.812
+        c-1.702,0-3.071,1.192-3.071,3.249c0,2.03,1.369,3.197,3.071,3.197c1.041,0,1.853-0.254,2.588-0.812h0.355v2.995
+        c-0.761,0.506-1.878,0.837-3.323,0.837C247.896,151.686,245.18,149.3,245.18,145.468z M260.864,145.619v5.787h-3.451v-15.863h3.451
+        v9.035l0.812-1.217l3.173-3.883h3.655v0.406l-4.416,5l4.416,6.115v0.407h-3.883l-2.945-4.366L260.864,145.619z M276.953,149.63
+        c-0.71,1.32-2.005,1.904-3.604,1.904c-2.208,0-4.036-1.271-4.036-3.631c0-2.359,1.599-3.73,4.62-3.73c0.989,0,1.979,0.101,2.919,0.279
+        v-0.686c0-1.269-0.889-1.827-2.665-1.827c-1.319,0-2.412,0.279-3.324,0.735h-0.381v-2.589c0.913-0.481,2.537-0.888,4.11-0.888
+        c3.732,0,5.661,1.701,5.661,4.645v7.563h-3.301V149.63z M276.853,147.676v-1.523c-0.585-0.177-1.345-0.228-1.954-0.228
+        c-1.396,0-2.106,0.533-2.106,1.623c0,1.091,0.71,1.522,1.751,1.522S276.521,148.564,276.853,147.676z M286.698,141.889
+        c0.636-1.777,1.98-2.539,3.35-2.539c0.459,0,0.839,0.127,0.991,0.203v3.274h-0.355c-0.354-0.177-0.71-0.28-1.193-0.28
+        c-1.371,0-2.36,0.635-2.64,1.98v6.878h-3.451v-11.929h3.299V141.889z M301.013,149.731c-0.787,1.243-2.032,1.954-3.579,1.954
+        c-3.249,0-5.254-2.615-5.254-6.218c0-3.63,2.005-6.27,5.254-6.27c1.446,0,2.64,0.635,3.427,1.726v-5.38h3.451v15.863h-3.299V149.731z
+        M300.86,147.523v-4.163c-0.635-0.914-1.498-1.346-2.487-1.346c-1.573,0-2.639,1.218-2.639,3.453c0,2.208,1.065,3.4,2.639,3.4
+        C299.362,148.868,300.226,148.437,300.86,147.523z"/>
+    </svg></script>
+</head>
+<body>
+<main>
+  <h1>Benchmark results</h1>
+  <p class="sub">Every run persisted on the deployment's storage — status, artifacts, full reports, and side-by-side comparisons. Public: share links freely; only launching benchmarks needs the API key.</p>
+  <div class="panel" style="padding:10px 14px">
+    <input id="f-filter" placeholder="filter by target or kind…" style="width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:inherit" oninput="render()">
+  </div>
+  <div id="r-compare"></div>
+  <div id="r-compare-toolbar"></div>
+  <div id="r-list"><p class="muted"><span class="spinner"></span>loading runs…</p></div>
+  <div id="r-library"></div>
+  <div id="r-detail"></div>
+  <footer>Hewlett Packard Enterprise · Model Benchmarker · results are read-only artifacts of past runs</footer>
+</main>
+<script src="/static/shared.js"></script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var RUNS = [];
+  var SELECTED = [];        // compare selection, in pick order (max 4)
+  var CMP = null;           // loaded comparison payload (or null)
+  var CMP_DEEPLINKED = false;
+
+  var MAX_CMP = 4;
+  var METRIC_LABELS = {
+    rps: "requests/s", rps_per_user: "req/s per user",
+    lat_p50_ms: "latency P50 (ms)", lat_p95_ms: "latency P95 (ms)", lat_p99_ms: "latency P99 (ms)",
+    "lat_p99.9_ms": "latency P99.9 (ms)", lat_max_ms: "latency max (ms)",
+    success_rate_pct: "success %", gpu_util_mean: "GPU util mean %",
+    ttft_turn1_p50_ms: "TTFT turn1 P50 (ms)", ttft_turn1_p95_ms: "TTFT turn1 P95 (ms)",
+    ttft_post_p50_ms: "TTFT-post P50 (ms)", ttft_post_p95_ms: "TTFT-post P95 (ms)",
+    tokens_p50: "tokens/s P50", tokens_p95: "tokens/s P95", failed: "failed requests"
+  };
+  // direction per metric: "higher" = higher is better, "lower" = lower is
+  // better, "info" = descriptive (no delta). Mirrors the backend map.
+  var DIRECTIONS = {
+    rps: "higher", tokens_p50: "higher", ttft_turn1_p50_ms: "lower", ttft_post_p50_ms: "lower",
+    lat_p50_ms: "lower", lat_p99_ms: "lower", lat_max_ms: "lower", failed: "lower",
+    success_rate_pct: "higher", gpu_util_mean: "info"
+  };
+
+  MB.header("/results");
+
+  // deep-link: /results?run=<id> opens that run's detail directly;
+  // /results?compare=<id1>,<id2>[,<id3>,<id4>] opens the comparison view
+  var params = new URLSearchParams(location.search);
+  var deepRun = params.get("run");
+  var deepCmp = params.get("compare");
+  if (deepRun) {
+    fetch("/api/runs/" + encodeURIComponent(deepRun))
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("not found")); })
+      .then(function (d) { openRun(d.run_id); })
+      .catch(function () { /* fall through to the list */ });
+  }
+  if (deepCmp) {
+    deepCmp.split(",").forEach(function (id) {
+      id = id.trim();
+      if (id && SELECTED.indexOf(id) < 0 && SELECTED.length < MAX_CMP) SELECTED.push(id);
+    });
+    CMP_DEEPLINKED = true;
+  }
+
+  fetch("/api/results").then(function (r) { return r.json(); }).then(function (d) {
+    RUNS = d.runs || [];
+    render();
+    if (CMP_DEEPLINKED && SELECTED.length >= 2) loadCompare();
+  }).catch(function (e) {
+    $("r-list").innerHTML = '<div class="banner bad">could not load runs: ' + MB.esc(e.message) + "</div>";
+  });
+
+  function badge(s) {
+    var cls = s === "success" ? "ok" : s === "running" ? "run" : (s === "cancelled" || s === "interrupted") ? "idle" : "bad";
+    return '<span class="badge ' + cls + '">' + MB.esc(s) + "</span>";
+  }
+
+  function inSel(id) { return SELECTED.indexOf(id) >= 0; }
+
+  function toggleSelect(id) {
+    var i = SELECTED.indexOf(id);
+    if (i >= 0) SELECTED.splice(i, 1);
+    else if (SELECTED.length < MAX_CMP) SELECTED.push(id);
+    else return false; // full: ignore extra picks
+    render();
+    return true;
+  }
+
+  function render() {
+    var q = ($("f-filter").value || "").toLowerCase();
+    var runs = RUNS.filter(function (r) {
+      return !q || (r.target_url + " " + r.kind + " " + r.run_id).toLowerCase().indexOf(q) >= 0;
+    });
+    renderToolbar();
+    if (!runs.length) {
+      $("r-list").innerHTML = '<div class="banner">' + (RUNS.length ? "no runs match the filter" : "no benchmark runs yet — launch one from the benchmark pages") + "</div>";
+      renderLibrary();
+      return;
+    }
+    var html = '<div class="panel" style="padding:0;overflow:auto"><table><thead><tr>' +
+      '<th style="width:28px" title="pick 2–4 runs to compare"><span class="cmp-hint">cmp</span></th>' +
+      "<th>Run</th><th>Kind</th><th>Target</th><th>Status</th><th>Started</th><th class=\"num\">Artifacts</th><th></th></tr></thead><tbody>";
+    runs.forEach(function (r, idx) {
+      var checked = inSel(r.run_id);
+      var full = !checked && SELECTED.length >= MAX_CMP;
+      html += '<tr>' +
+        '<td><input type="checkbox" data-cmp="' + MB.esc(r.run_id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison"></td>' +
+        '<td class="mono">' + MB.esc(r.run_id.slice(0, 19)) + "</td>" +
+        "<td>" + MB.esc(r.kind) + "</td>" +
+        '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + MB.esc(r.target_url) + "</td>" +
+        "<td>" + badge(r.status) + "</td>" +
+        "<td>" + MB.esc((r.started_utc || "").replace("T", " ").slice(0, 19)) + "</td>" +
+        '<td class="num">' + (r.artifacts || []).length + "</td>" +
+        '<td><a href="#" data-detail="' + MB.esc(r.run_id) + '">open</a> · <a href="#" data-cmp-link="' + MB.esc(r.run_id) + '">' + (checked ? "unpick" : "compare") + "</a></td>" +
+        "</tr>";
+    });
+    html += "</tbody></table></div>";
+    $("r-list").innerHTML = html;
+    $("r-list").querySelectorAll("a[data-detail]").forEach(function (a) {
+      a.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        openRun(a.getAttribute("data-detail"));
+      });
+    });
+    $("r-list").querySelectorAll("a[data-cmp-link]").forEach(function (a) {
+      a.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        toggleSelect(a.getAttribute("data-cmp-link"));
+      });
+    });
+    $("r-list").querySelectorAll("input[data-cmp]").forEach(function (cb) {
+      cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
+    });
+    renderLibrary();
+  }
+
+  // ------------------------------------------------------------------
+  // Results library: the committed results/ tree (curated serving-setup
+  // baselines from the repo), rendered beneath the PVC run table. Its chat
+  // artifacts join the SAME compare flow via lib: ids — pick a baseline
+  // here and a fresh run from the table above.
+  var LIB = null;
+  function renderLibrary() {
+    var box = $("r-library");
+    if (!box) return;
+    if (LIB === null) {
+      box.innerHTML = '<p class="muted"><span class="spinner"></span>loading results library…</p>';
+      fetch("/api/library").then(function (r) { return r.json(); }).then(function (d) {
+        LIB = d; renderLibrary();
+      }).catch(function () { LIB = { models: [] }; renderLibrary(); });
+      return;
+    }
+    if (!(LIB.models || []).length) { box.innerHTML = ""; return; }
+    var q = ($("f-filter").value || "").toLowerCase();
+    var models = (LIB.models || []).filter(function (m) {
+      return !q || (m.slug + " " + JSON.stringify(m.setups)).toLowerCase().indexOf(q) >= 0;
+    });
+    if (!models.length) { box.innerHTML = ""; return; }
+    var html = '<div class="panel" style="padding:0;overflow:auto"><h2 style="margin:14px 18px 4px">Results library</h2>' +
+      '<p class="sub" style="margin:0 18px 8px">Committed baselines from the repo\u2019s results/ tree — chat artifacts join the comparison above via their checkbox (mix with runs from the table).</p>' +
+      "<table><thead><tr><th style=\"width:28px\"></th><th>Model</th><th>Setup</th><th>Kind</th><th>File</th><th>Status</th></tr></thead><tbody>";
+    models.forEach(function (m) {
+      m.setups.forEach(function (s) {
+        var checked = inSel(s.id);
+        var full = !checked && SELECTED.length >= MAX_CMP;
+        var comparable = s.kind === "chat";
+        html += "<tr" + (s.status === "partial" ? ' style="opacity:.6"' : "") + ">" +
+          "<td>" + (comparable ? '<input type="checkbox" data-cmp="' + MB.esc(s.id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ">" : '<span class="cmp-hint" title="capacity/latency record, not comparable">—</span>') + "</td>" +
+          "<td>" + MB.esc(m.name) + "</td>" +
+          '<td class="mono" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + MB.esc(s.setup || s.label) + '">' + MB.esc(s.setup || s.label) + "</td>" +
+          "<td>" + MB.esc(s.kind) + "</td>" +
+          '<td class="mono">' + MB.esc(s.file) + "</td>" +
+          "<td>" + (s.status === "partial" ? '<span class="badge idle">partial</span>' : '<span class="badge ok">complete</span>') + "</td>" +
+          "</tr>";
+      });
+    });
+    html += "</tbody></table></div>";
+    box.innerHTML = html;
+    box.querySelectorAll("input[data-cmp]").forEach(function (cb) {
+      cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
+    });
+  }
+
+  // sticky toolbar: appears once 2+ runs are picked
+  function renderToolbar() {
+    var n = SELECTED.length;
+    if (n === 0 && !CMP) { $("r-compare-toolbar").innerHTML = ""; return; }
+    var disabled = n < 2 ? " disabled" : "";
+    var over = n > MAX_CMP;
+    var html = '<div class="cmp-toolbar">' +
+      "<strong>Compare</strong> <span class=\"cmp-hint\">" + n + " of " + MAX_CMP + " selected" +
+      (n === 1 ? " — pick at least 2" : over ? " — too many" : "") + "</span>";
+    if (n || CMP) {
+      html += '<button id="cmp-go"' + disabled + ">Compare (" + n + ")</button>";
+      if (n) html += '<button id="cmp-clear" class="secondary">Clear</button>';
+    }
+    html += "</div>";
+    $("r-compare-toolbar").innerHTML = html;
+    var go = $("cmp-go");
+    if (go) go.addEventListener("click", loadCompare);
+    var clear = $("cmp-clear");
+    if (clear) clear.addEventListener("click", function () {
+      SELECTED = [];
+      CMP = null;
+      CMP_DEEPLINKED = false;
+      $("r-compare").innerHTML = "";
+      render();
+    });
+  }
+
+  function loadCompare() {
+    if (SELECTED.length < 2 || SELECTED.length > MAX_CMP) return;
+    $("r-compare").innerHTML = '<p class="muted"><span class="spinner"></span>building comparison…</p>';
+    MB.api("/api/results/compare?ids=" + encodeURIComponent(SELECTED.join(",")))
+      .then(function (d) { CMP = d; renderCompare(); })
+      .catch(function (e) {
+        $("r-compare").innerHTML = '<div class="banner bad">compare failed: ' + MB.esc(e.message) + "</div>";
+      });
+  }
+
+  function runById(id) {
+    for (var i = 0; i < RUNS.length; i++) if (RUNS[i].run_id === id) return RUNS[i];
+    return null;
+  }
+
+  function fmtMetric(metric, v) {
+    if (v == null || isNaN(v)) return "—";
+    if (metric === "failed") return String(v);
+    if (metric === "success_rate_pct") return Number(v).toFixed(1) + "%";
+    if (metric === "gpu_util_mean") return Number(v).toFixed(0) + "%";
+    return MB.fmtNum(v, v >= 100 ? 0 : 1);
+  }
+
+  function deltaCell(delta) {
+    if (delta == null || isNaN(delta)) return '<span class="cmp-delta">—</span>';
+    var better = delta > 0, cls = better ? "better" : "worse";
+    return '<span class="cmp-delta ' + cls + '">' + (delta > 0 ? "+" : "") + delta.toFixed(1) + "%</span>";
+  }
+
+  function renderCompare() {
+    if (!CMP) return;
+    var html = '<div class="panel" id="cmp-panel"><h2 style="margin-top:0">Run comparison ' +
+      '<a href="#" id="cmp-close" style="float:right;font-weight:400">✕ close</a></h2>';
+    html += '<p class="sub">Positive deltas are improvements against the reference run (first column). ' +
+      '<button id="cmp-csv" class="secondary" style="margin-left:8px">copy as CSV</button></p>';
+    // per-run header cards, colored by run index (matches the delta accents)
+    html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0">';
+    CMP.runs.forEach(function (r, idx) {
+      var isRef = CMP.sections.some(function (s) { return s.reference_run === r.run_id; });
+      html += '<div class="cmp-card cmp-run' + idx + '">' +
+        '<span class="cid mono">' + MB.esc(r.run_id.slice(0, 19)) + "</span>" +
+        (isRef ? '<span class="cmp-ref-chip">reference</span>' : "") +
+        '<div class="row"><span class="k">target</span><span class="v mono" title="' + MB.esc(r.target_url) + '">' + MB.esc(r.target_url) + "</span></div>" +
+        '<div class="row"><span class="k">status</span><span class="v">' + badge(r.status) + "</span></div>" +
+        '<div class="row"><span class="k">params</span><span class="v">' + MB.esc(r.params_label || "—") + "</span></div>" +
+        ((r.started_utc || "") ? '<div class="row"><span class="k">started</span><span class="v">' + MB.esc(r.started_utc.replace("T", " ").slice(0, 19)) + "</span></div>" : "") +
+        (r.error ? '<div class="row"><span class="k">note</span><span class="v">' + MB.esc(r.error) + "</span></div>" : "") +
+        (r.knee ? '<div class="row"><span class="k">knee</span><span class="v" title="' + MB.esc(r.knee.detail || "") + '">N=' + MB.esc(r.knee.concurrency) + " (" + MB.esc(r.knee.criterion) + ")</span></div>" : "") +
+        "</div>";
+    });
+    html += "</div>";
+    // one merged table per kind
+    CMP.sections.forEach(function (s) {
+      html += "<h2>" + MB.esc(s.kind) + " runs</h2>";
+      html += '<div style="overflow:auto"><table class="cmp-table"><thead><tr><th>Level</th>';
+      s.runs.forEach(function (rid, idx) {
+        var isRef = rid === s.reference_run;
+        html += '<th class="num cmp-run' + idx + '" style="color:var(--cmp-accent)">' + MB.esc(rid.slice(0, 19)) +
+          (isRef ? '<span class="cmp-ref-chip">ref</span>' : "") + "</th>";
+      });
+      html += "</tr></thead><tbody>";
+      s.rows.forEach(function (row) {
+        html += '<tr><td class="mono">' + MB.esc(row.label) + "</td>";
+        s.runs.forEach(function (rid, idx) {
+          var cellBits = [];
+          s.columns.forEach(function (metric) {
+            var v = (row.cells[metric] || {})[rid];
+            var d = (row.delta_vs_reference[metric] || {})[rid];
+            cellBits.push(
+              '<div class="' + (idx === 0 ? "cmp-ref-col" : "") + '" style="display:block' + (idx === 0 ? "" : "") + '">' +
+              '<span class="cmp-cell-wrap">' + fmtMetric(metric, v) +
+              (idx === 0 ? "" : deltaCell(d)) + "</span></div>"
+            );
+          });
+          if (!cellBits.length) cellBits = ['<span class="cmp-missing-cell">no data</span>'];
+          html += '<td class="num">' + cellBits.join("") + "</td>";
+        });
+        html += "</tr>";
+      });
+      html += "</tbody></table></div>";
+    });
+    // run-level config diffs (what was different about each run)
+    var cfgCols = CMP.runs;
+    html += "<h2>Run configuration</h2>";
+    html += '<div style="overflow:auto"><table class="cmp-table"><thead><tr><th>setting</th>';
+    cfgCols.forEach(function (r) { html += '<th class="num">' + MB.esc(r.run_id.slice(0, 19)) + "</th>"; });
+    html += "</tr></thead><tbody>";
+    var cfgKeys = [];
+    CMP.runs.forEach(function (r) {
+      Object.keys(r.config || {}).forEach(function (k) {
+        if (cfgKeys.indexOf(k) < 0) cfgKeys.push(k);
+      });
+    });
+    cfgKeys.sort();
+    cfgKeys.forEach(function (k) {
+      var vals = CMP.runs.map(function (r) { return (r.config || {})[k]; });
+      var differs = vals.some(function (v) { return v !== vals[0]; });
+      html += '<tr><td class="mono">' + MB.esc(k) + (differs ? "" : ' <span class="cmp-hint">(same)</span>') + "</td>";
+      vals.forEach(function (v) {
+        html += '<td class="num' + (v == null ? " cmp-missing-cell" : "") + '">' + (v == null ? "—" : MB.esc(String(v))) + "</td>";
+      });
+      html += "</tr>";
+    });
+    html += "</tbody></table></div></div>";
+    $("r-compare").innerHTML = html;
+    var close = $("cmp-close");
+    if (close) close.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      CMP = null;
+      $("r-compare").innerHTML = "";
+      render();
+    });
+    var csv = $("cmp-csv");
+    if (csv) csv.addEventListener("click", function () { copyCsv(); });
+    $("r-compare").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // client-side CSV of the merged tables (blob download, no server round-trip)
+  function copyCsv() {
+    if (!CMP) return;
+    var lines = [];
+    CMP.sections.forEach(function (s) {
+      var header = ["kind", "level", "metric"];
+      s.runs.forEach(function (rid) { header.push(rid); });
+      lines.push(header.join(","));
+      s.columns.forEach(function (metric) {
+        s.rows.forEach(function (row) {
+          var cells = [s.kind, row.label, metric];
+          s.runs.forEach(function (rid) {
+            var v = (row.cells[metric] || {})[rid];
+            cells.push(v == null ? "" : String(v));
+          });
+          lines.push(cells.join(","));
+        });
+      });
+      lines.push("");
+    });
+    var blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "compare.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+
+  function fmtBytes(n) {
+    if (n == null) return "-";
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+    return (n / 1048576).toFixed(2) + " MiB";
+  }
+
+  function openRun(id) {
+    fetch("/api/runs/" + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (d) {
+      var already = inSel(d.run_id);
+      var full = !already && SELECTED.length >= MAX_CMP;
+      var html = '<div class="panel"><h2 style="margin-top:0">Run ' + MB.esc(d.run_id) + " " + badge(d.status) + "</h2>";
+      html += '<div class="kv">' +
+        '<span class="k">kind</span><span>' + MB.esc(d.kind) + "</span>" +
+        '<span class="k">target</span><span class="mono">' + MB.esc(d.target_url) + "</span>" +
+        '<span class="k">started</span><span>' + MB.esc((d.started_utc || "").replace("T", " ").slice(0, 19)) + "</span>" +
+        (d.finished_utc ? '<span class="k">finished</span><span>' + MB.esc((d.finished_utc || "").replace("T", " ").slice(0, 19)) + "</span>" : "") +
+        (d.exit_code != null ? '<span class="k">exit code</span><span>' + MB.esc(d.exit_code) + "</span>" : "") +
+        "</div>";
+      html += '<p style="margin:10px 0 0"><button id="r-add-cmp"' + (already ? "" : full ? " disabled" : "") + ">" +
+        (already ? "✓ picked for comparison" : full ? "compare list full (max " + MAX_CMP + ")" : "+ add to compare") + "</button>" +
+        (SELECTED.length >= 2 ? ' <span class="cmp-hint">' + SELECTED.length + " runs picked — use the Compare button in the list</span>" : "") +
+        "</p>";
+      if (d.log_tail) html += "<details><summary>run log (tail)</summary><pre class=\"log\">" + MB.esc(d.log_tail) + "</pre></details>";
+      if ((d.artifacts || []).length) {
+        html += "<h2>Artifacts</h2><table><tbody>";
+        d.artifacts.forEach(function (a) {
+          html += '<tr><td><a href="/api/runs/' + encodeURIComponent(d.run_id) + "/artifacts/" + encodeURIComponent(a.name) + '" target="_blank">' + MB.esc(a.name) + "</a></td>" +
+            '<td class="num muted">' + fmtBytes(a.bytes) + "</td></tr>";
+        });
+        html += "</tbody></table>";
+      }
+      html += "</div>";
+      $("r-detail").innerHTML = html;
+      var add = $("r-add-cmp");
+      if (add) add.addEventListener("click", function () { toggleSelect(d.run_id); });
+      $("r-detail").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }).catch(function (e) {
+      $("r-detail").innerHTML = '<div class="banner bad">' + MB.esc(e.message) + "</div>";
+    });
+  }
+})();
+</script>
+</body>
+</html>

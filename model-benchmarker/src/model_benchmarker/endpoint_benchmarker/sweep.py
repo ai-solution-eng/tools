@@ -25,7 +25,7 @@ import random
 import time
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2
 
 from .mcp_driver import ResolvedTool, mcp_call_once, run_user_mcp
 from .rest_driver import run_user_rest
@@ -99,7 +99,7 @@ async def _gather_with_progress(tasks: list, stats: BenchmarkStats, label: str, 
 
 
 async def _warmup_rest(
-    client: httpx.AsyncClient, target: RestTarget, queries: list[str], n: int, call_timeout: float
+    client: httpx2.AsyncClient, target: RestTarget, queries: list[str], n: int, call_timeout: float
 ) -> None:
     async def one(i: int) -> None:
         query = random.Random(1_000_003 + i).choice(queries)
@@ -169,8 +169,8 @@ async def run_sweep(
             assert rest_target is not None  # narrowed: mode == "rest" iff a REST target was given
             # Pool sized to the level: ModelBenchmarker's connection-pool warning,
             # made structural — every level gets a pool that fits it.
-            limits = httpx.Limits(max_connections=n_users * 2 + 10, max_keepalive_connections=n_users)
-            async with httpx.AsyncClient(
+            limits = httpx2.Limits(max_connections=n_users * 2 + 10, max_keepalive_connections=n_users)
+            async with httpx2.AsyncClient(
                 limits=limits,
                 http2=rest_target.http2,
                 verify=not rest_target.insecure,

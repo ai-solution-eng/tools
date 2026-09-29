@@ -33,9 +33,11 @@ def setup_logging(verbose: bool = False, quiet: bool = False, log_file: str | No
             os.makedirs(parent, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(level=level, format=_FMT, datefmt=_DATEFMT, handlers=handlers, force=True)
-    # The MCP SDK / httpx log every wire request at INFO — keep them quiet
-    # unless the operator explicitly asked for verbose.
-    for noisy in ("httpx", "httpcore", "mcp", "asyncio", "httpx2", "aiohttp"):
+    # The MCP SDK / httpx(2) log every wire request at INFO — keep them quiet
+    # unless the operator explicitly asked for verbose.  Both the legacy
+    # ("httpx", "httpcore") and fork ("httpx2", "httpcore2") logger names are
+    # silenced; the legacy entries are harmless and cover stray plain httpx.
+    for noisy in ("httpx", "httpcore", "httpx2", "httpcore2", "mcp", "asyncio", "aiohttp"):
         logging.getLogger(noisy).setLevel(logging.DEBUG if verbose else logging.WARNING)
 
 

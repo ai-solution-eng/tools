@@ -35,7 +35,7 @@ def pct_label(p: float) -> str:
 
 # Error categories for the deep-dive report. Mapping is by the error key
 # shape the drivers produce: ``HTTP <code>: ...`` (REST non-2xx),
-# ``<ExceptionType>: <snippet>`` (httpx/MCP exception), ``Timeout (>Ns)``
+# ``<ExceptionType>: <snippet>`` (httpx2/MCP exception), ``Timeout (>Ns)``
 # and ``MCP connect: ...`` (MCP driver shortcuts).
 ERROR_CATEGORIES: tuple[str, ...] = ("http_error", "timeout", "connection", "other")
 
@@ -66,7 +66,7 @@ def categorize_errors(errors: dict[str, int]) -> dict[str, int]:
     """Bucket the bounded error keys into a few reportable categories.
 
     Keys look like ``HTTP 500: boom`` (REST non-2xx), ``ReadTimeout: ...`` /
-    ``ConnectError: ...`` (httpx exceptions), ``Timeout (>120s)`` and
+    ``ConnectError: ...`` (httpx2 exceptions), ``Timeout (>120s)`` and
     ``MCP connect: ...`` (MCP driver shortcuts). Anything unrecognised falls
     into ``other``. Returned in ERROR_CATEGORIES order, zero counts dropped.
     """

@@ -1,0 +1,328 @@
+{{- if .Values.gc.enabled }}
+# MD-C TTL/GC eviction CronJob. The deletion runs here — on the PVC — because
+# the app pod cannot mount models-pvc. The pod template copies the scanner
+# Job's admission pattern VERBATIM (scan-job.yaml): the pod is created by the
+# kube-system job-controller (CronJob -> Job -> Pod, the same admission path
+# as the downloader/debug/scan Jobs), carries hpe-ezua/app: mlis +
+# hpe-ezua/disable-sc + runAsUser 0, so the platformwide protect-models-pvc
+# Kyverno policy admits it (on hosted trials apply the documented
+# job-controller NotEquals platform-policy patch — see README).
+#
+# The pipeline mirrors src/model_downloader/app/gc.py (the report side):
+#   enumerate models--* dirs under the scan root (du bytes + mtime)
+#   -> TTL line (gc.ttlDays) + LRU floor (gc.minKeep)
+#   -> AIOLI cross-check: cache-dir name / repo id appearing in a
+#      packaged_models uri (NEVER exact path equality — custom cache roots)
+#      — via a strictly READ-ONLY psycopg2 SELECT
+#   -> live-job cross-check: managed Jobs carrying this cache root / model
+#      name (job TTLs erase finished evidence, so "no live job" is only ever
+#      one of three keys)
+#   -> THREE-KEY AND: delete ONLY if manifest.json present AND no AIOLI row
+#      AND no live job. Every verdict (keep and delete) is logged.
+#   -> gc.dryRun=true (chart default) logs the report and deletes NOTHING;
+#      flip gc.dryRun=false only after reviewing the /api/gc/report UI view.
+# Deletion removes the cache dir and its manifest together (they are one
+# unit: rm -rf of the models--* dir takes manifest.json with it).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-gc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+    app.kubernetes.io/managed-by: model-downloader-gc
+spec:
+  schedule: {{ .Values.gc.schedule | quote }}
+  concurrencyPolicy: {{ .Values.gc.concurrencyPolicy }}
+  # Keep the last successful + failed GC jobs around long enough for a human
+  # to read the deletion log (the audit surface for every delete decision).
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: "true"
+          labels:
+            hpe-ezua/app: mlis
+            app.kubernetes.io/managed-by: model-downloader-gc
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: gc
+            image: {{ .Values.downloadList.scanImage | quote }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              # Matches the app's scan_root ("/mnt/" + PVC_SUBPATH, hardcoded
+              # "large-models" in deployment.yaml) so the enumeration covers
+              # the same tree the report side scanned.
+              ROOT="/mnt/large-models"
+              TTL_DAYS="{{ .Values.gc.ttlDays }}"
+              DRY_RUN="{{ .Values.gc.dryRun }}"
+              MIN_KEEP="{{ .Values.gc.minKeep }}"
+              PROTECTED="{{ join "," .Values.gc.protectedModels }}"
+              AIOLI_HOST="{{ .Values.aioli.dbHost }}"
+              AIOLI_PORT="{{ .Values.aioli.dbPort }}"
+              AIOLI_DB="{{ .Values.aioli.dbName }}"
+              AIOLI_USER="{{ .Values.aioli.dbUser }}"
+              AIOLI_SECRET_NAME="{{ .Values.aioli.dbPasswordSecret.name }}"
+              AIOLI_SECRET_NS="{{ .Values.aioli.dbPasswordSecret.namespace }}"
+              AIOLI_SECRET_KEY="{{ .Values.aioli.dbPasswordSecret.key }}"
+              MANAGED_LABEL="app.kubernetes.io/managed-by"
+              CACHE_ROOT_ANNOTATION="model-downloader/cache-root"
+              MODEL_NAME_ANNOTATION="model-downloader/model-name"
+              # The gc pod reuses the downloader ServiceAccount; it needs the
+              # kubernetes python package the app image ships but the scanner
+              # image may not — probe once and degrade to the documented
+              # fail-safe (jobs unavailable -> nothing is deletable).
+              if ! python3 -c 'import kubernetes' 2>/dev/null; then
+                echo "JOBS: kubernetes python package not in this image — live-job cross-check unavailable (fail-safe keeps everything)" >&2
+              fi
+              if [ ! -d "$ROOT" ]; then
+                echo "GC ERROR: $ROOT not present in gc container (volume mount problem?)" >&2
+                exit 1
+              fi
+              echo "GC start: root=$ROOT ttl_days=$TTL_DAYS dry_run=$DRY_RUN min_keep=$MIN_KEEP protected=[$PROTECTED]"
+              # ---- live-job snapshot (k8s API from inside the pod) ----
+              # Uses the downloader ServiceAccount's batch/jobs list via a
+              # python pass; RBAC (jobs list) is already granted cluster-wide.
+              LIVE_JOBS_FILE="/tmp/live-jobs.json"
+              python3 - <<'JOBS_EOF'
+              import json
+              import os
+
+              try:
+                  from kubernetes import client, config
+                  try:
+                      config.load_incluster_config()
+                  except Exception:
+                      config.load_kube_config()
+                  batch = client.BatchV1Api()
+                  jobs = []
+                  selector = "app.kubernetes.io/managed-by in (model-downloader,model-downloader-debug,model-downloader-scan)"
+                  for j in batch.list_job_for_all_namespaces(label_selector=selector).items:
+                      ann = j.metadata.annotations or {}
+                      jobs.append({
+                          "namespace": j.metadata.namespace,
+                          "job_name": j.metadata.name,
+                          "model_name": ann.get("model-downloader/model-name", ""),
+                          "cache_root": (ann.get("model-downloader/cache-root", "") or "").rstrip("/"),
+                      })
+                  with open(os.environ["LIVE_JOBS_FILE"], "w") as fh:
+                      json.dump(jobs, fh)
+                  print("JOBS: %d live managed job(s)" % len(jobs))
+              except Exception as exc:
+                  # Fail-safe: no job list -> treat EVERY dir as job-protected
+                  with open(os.environ["LIVE_JOBS_FILE"], "w") as fh:
+                      json.dump({"error": str(exc)}, fh)
+                  print("JOBS: unavailable (%s) — fail-safe keeps everything" % exc)
+              JOBS_EOF
+              # ---- AIOLI packaged_models uris (READ-ONLY) ----
+              URIS_FILE="/tmp/aioli-uris.json"
+              python3 - <<'AIOLI_EOF'
+              import json
+              import os
+              import socket
+
+              def read_secret(ns, name, key):
+                  # minimal in-cluster Secret read via the k8s client already
+                  # proven above; psycopg2 needs the password only.
+                  from kubernetes import client, config
+                  try:
+                      config.load_incluster_config()
+                  except Exception:
+                      config.load_kube_config()
+                  core = client.CoreV1Api()
+                  sec = core.read_namespaced_secret(name=name, namespace=ns)
+                  import base64
+                  return base64.b64decode(sec.data[key]).decode()
+
+              try:
+                  import psycopg2
+                  password = read_secret(
+                      os.environ["AIOLI_SECRET_NS"],
+                      os.environ["AIOLI_SECRET_NAME"],
+                      os.environ["AIOLI_SECRET_KEY"],
+                  )
+                  # default_transaction_read_only=on — the superuser
+                  # connection is still unable to write anything.
+                  conn = psycopg2.connect(
+                      host=os.environ["AIOLI_HOST"],
+                      port=int(os.environ["AIOLI_PORT"]),
+                      dbname=os.environ["AIOLI_DB"],
+                      user=os.environ["AIOLI_USER"],
+                      password=password,
+                      connect_timeout=10,
+                      options="-c default_transaction_read_only=on",
+                  )
+                  try:
+                      with conn, conn.cursor() as cur:
+                          cur.execute("SELECT name, uri FROM packaged_models ORDER BY name")
+                          rows = [(str(name), uri or "") for name, uri in cur.fetchall()]
+                  finally:
+                      conn.close()
+                  with open(os.environ["URIS_FILE"], "w") as fh:
+                      json.dump(rows, fh)
+                  print("AIOLI: %d packaged_models row(s)" % len(rows))
+              except Exception as exc:
+                  # Fail-safe: no AIOLI read -> nothing is deletable today.
+                  with open(os.environ["URIS_FILE"], "w") as fh:
+                      json.dump({"error": str(exc)}, fh)
+                  print("AIOLI: unavailable (%s) — fail-safe keeps everything" % exc)
+              AIOLI_EOF
+              # ---- evaluate + (maybe) delete ----
+              export ROOT TTL_DAYS DRY_RUN MIN_KEEP PROTECTED LIVE_JOBS_FILE URIS_FILE
+              python3 - <<'GC_EOF'
+              import fnmatch
+              import json
+              import os
+              import re
+              import shutil
+              import subprocess
+              import time
+
+              root = os.environ["ROOT"]
+              ttl_days = float(os.environ["TTL_DAYS"] or 0)
+              dry_run = (os.environ.get("DRY_RUN", "true").strip().lower() == "true")
+              min_keep = int(os.environ.get("MIN_KEEP", "0") or 0)
+              protected = [p for p in os.environ.get("PROTECTED", "").split(",") if p.strip()]
+              now = time.time()
+              cache_dir_re = re.compile(r"^models--(.+)--(.+)$")
+
+              with open(os.environ["LIVE_JOBS_FILE"]) as fh:
+                  jobs_blob = json.load(fh)
+              jobs_unavailable = isinstance(jobs_blob, dict) and "error" in jobs_blob
+              live_jobs = [] if jobs_unavailable else jobs_blob
+              with open(os.environ["URIS_FILE"]) as fh:
+                  uris_blob = json.load(fh)
+              aioli_unavailable = isinstance(uris_blob, dict) and "error" in uris_blob
+              aioli_rows = [] if aioli_unavailable else uris_blob
+              aioli_uris = [uri for _name, uri in aioli_rows]
+
+              def uri_protects(uri, cache_dir):
+                  # NAME match, never exact path (custom cache roots).
+                  if not uri or not cache_dir:
+                      return False
+                  if cache_dir in uri:
+                      return True
+                  m = cache_dir_re.match(cache_dir)
+                  if not m:
+                      return False
+                  org, repo = m.group(1), m.group(2)
+                  return re.search(r"/" + re.escape(org) + r"/" + re.escape(repo) + r"(/|\?|$)", uri) is not None
+
+              def job_protects(cachepath, model_name):
+                  parent = cachepath.rsplit("/", 1)[0]
+                  for job in live_jobs:
+                      jroot = job.get("cache_root") or ""
+                      if jroot and parent and (parent == jroot or parent.startswith(jroot + "/")):
+                          return job
+                      if model_name and job.get("model_name") == model_name and not jroot:
+                          return job
+                  return None
+
+              def glob_hit(*names):
+                  for pat in protected:
+                      for n in names:
+                          if n and fnmatch.fnmatch(n, pat):
+                              return True
+                  return False
+
+              dirs = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for d in list(dirnames):
+                      if cache_dir_re.match(d):
+                          full = os.path.join(dirpath, d)
+                          try:
+                              st = os.stat(full)
+                              mtime = st.st_mtime
+                              du = subprocess.run(["du", "-sb", full], capture_output=True, text=True)
+                              size = int(du.stdout.split()[0]) if du.returncode == 0 and du.stdout else 0
+                          except OSError:
+                              continue
+                          dirs.append({"name": d, "path": full, "mtime": mtime, "bytes": size})
+                          # do not descend into a cache dir's guts
+                          dirnames.remove(d)
+
+              total = len(dirs)
+              deletes = []
+              keeps = []
+              for e in dirs:
+                  name = e["name"]
+                  model = "%s/%s" % (cache_dir_re.match(name).group(1), cache_dir_re.match(name).group(2))
+                  reasons = []
+                  if not os.path.isfile(os.path.join(e["path"], "manifest.json")):
+                      reasons.append("no manifest")
+                  if aioli_unavailable:
+                      reasons.append("AIOLI unavailable (fail-safe)")
+                  elif any(uri_protects(u, name) for u in aioli_uris):
+                      reasons.append("in AIOLI packaged_models")
+                  job = None if jobs_unavailable else job_protects(e["path"], model)
+                  if jobs_unavailable:
+                      reasons.append("live jobs unavailable (fail-safe)")
+                  elif job:
+                      reasons.append("live job %s/%s" % (job.get("namespace", ""), job.get("job_name", "")))
+                  if glob_hit(name, model):
+                      reasons.append("matches protectedModels glob")
+                  age_days = (now - e["mtime"]) / 86400.0
+                  if reasons:
+                      keeps.append((e, model, age_days, "; ".join(reasons)))
+                  elif ttl_days <= 0 or age_days <= ttl_days:
+                      keeps.append((e, model, age_days, "below TTL line" if ttl_days > 0 else "no TTL configured"))
+                  else:
+                      deletes.append((e, model, age_days))
+
+              # LRU floor: protect the newest min_keep delete candidates.
+              if min_keep > 0 and len(deletes) > 0:
+                  remaining = total - len(deletes)
+                  need = min_keep - remaining
+                  if need > 0:
+                      deletes.sort(key=lambda x: x[0]["mtime"], reverse=True)
+                      for e, model, age in deletes[:need]:
+                          keeps.append((e, model, age, "LRU min_keep=%d (newest kept)" % min_keep))
+                      deletes = deletes[need:]
+
+              delete_bytes = sum(e["bytes"] for e, _m, _a in deletes)
+              print("GC PLAN: %d cache dir(s), %d deletion candidate(s) (%d bytes), %d kept" % (total, len(deletes), delete_bytes, len(keeps)))
+              for e, model, age, reason in sorted(keeps, key=lambda k: k[0]["mtime"], reverse=True):
+                  print("KEEP    %-50s age=%6.1fd bytes=%12d — %s" % (model, age, e["bytes"], reason))
+              for e, model, age in sorted(deletes, key=lambda k: k[0]["mtime"]):
+                  print("DELETE  %-50s age=%6.1fd bytes=%12d — TTL %gd expired; manifest present; no AIOLI row; no live job" % (model, age, e["bytes"], ttl_days))
+
+              if dry_run:
+                  print("GC DRY RUN: no deletion performed (gc.dryRun=true). Review /api/gc/report, then flip gc.dryRun=false.")
+              else:
+                  for e, model, age in deletes:
+                      started = time.time()
+                      try:
+                          # The cache dir AND its manifest.json go together —
+                          # they are one unit (manifest sits INSIDE the
+                          # models--* dir's parent listing, i.e. inside it).
+                          shutil.rmtree(e["path"])
+                          print("DELETED %-50s age=%6.1fd bytes=%12d in %.1fs" % (model, age, e["bytes"], time.time() - started))
+                      except OSError as exc:
+                          print("FAILED  %-50s %s" % (model, exc))
+                  print("GC DONE: %d dir(s) deleted, %d bytes freed (dry_run=false)" % (len(deletes), delete_bytes))
+              GC_EOF
+              echo "GC complete"
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            resources:
+              {{- toYaml .Values.gc.resources | nindent 14 }}
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: {{ .Values.downloader.pvcName }}
+{{- end }}
