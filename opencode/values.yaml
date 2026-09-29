@@ -32,15 +32,15 @@ storage:
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
-  # @openchamber/web, uv and ttyd under /opt/opencode so pods stop installing
-  # everything at boot (see docker/user/Dockerfile +
+  # @openchamber/web, uv, ttyd and helm under /opt/opencode so pods stop
+  # installing everything at boot (see docker/user/Dockerfile +
   # scripts/build-user-image.sh). Rebuild and bump whenever opencode.version /
-  # openchamber.version / provisioning.aptPackages change — the router folds
-  # the tag into the pod-template version, so existing units re-stamp
-  # automatically on upgrade. Set both entries back to node:22-bookworm-slim
-  # to revert to install-on-boot behavior.
-  user: ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1
-  init: ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1
+  # openchamber.version / provisioning.aptPackages / provisioning.helmVersion
+  # change — the router folds the tag into the pod-template version, so
+  # existing units re-stamp automatically on upgrade. Set both entries back to
+  # node:22-bookworm-slim to revert to install-on-boot behavior.
+  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2
+  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2
   # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
   # Public ghcr.io packages pull anonymously (leave empty).
   pullSecret: ""
@@ -60,6 +60,11 @@ ui:
 
 provisioning:
   aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # Helm CLI version baked into the user image (docker/user/Dockerfile
+  # HELM_VERSION must mirror this; scripts/build-user-image.sh --helm-version
+  # overrides). Latest Helm 3 release — Helm 4 is out, but the chart and the
+  # platform-side install tooling are Helm 3.
+  helmVersion: "3.22.0"
   # Loading screen shown while a user's pod is being provisioned/assigned.
   # When disabled the router reverts to the original blocking behavior.
   loadingUI:

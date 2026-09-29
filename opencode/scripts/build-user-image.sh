@@ -10,7 +10,7 @@
 #   scripts/build-user-image.sh                                # build for
 #                              # linux/amd64, repo name derived from the
 #                              # versions in values.yaml, tag 0.0.1
-#   scripts/build-user-image.sh --tag 0.0.1 --push             # build + push
+#   scripts/build-user-image.sh --tag 0.0.2 --push             # build + push
 #   scripts/build-user-image.sh --values values-g2.yaml
 #
 # Sources of truth (kept in sync automatically):
@@ -24,20 +24,23 @@
 #                         image-only fixes
 #   - ttyd version:       --ttyd-version flag (default 1.7.7; must mirror the
 #                         ttydVersion const in templates/configmap-router.yaml)
+#   - helm version:       provisioning.helmVersion in the values file (default
+#                         3.22.0; --helm-version overrides)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 VALUES="values.yaml"
-TAG="0.0.1"
+# TAG="0.0.1" The tag is now specified below
 TTYD_VERSION="1.7.7"
+HELM_VERSION=""
 PLATFORM="linux/amd64"
 IMAGE_REPO=""
 PUSH=0
 LOAD=0
 
 usage() {
-  sed -n '2,26p' "$0"
+  sed -n '2,27p' "$0"
   exit 1
 }
 
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --tag) TAG="$2"; shift 2 ;;
     --values) VALUES="$2"; shift 2 ;;
     --ttyd-version) TTYD_VERSION="$2"; shift 2 ;;
+    --helm-version) HELM_VERSION="$2"; shift 2 ;;
     --platform) PLATFORM="$2"; shift 2 ;;
     --repo) IMAGE_REPO="$2"; shift 2 ;;
     --push) PUSH=1; shift ;;
@@ -102,12 +106,22 @@ if [ -z "$APT_PACKAGES" ] || [ -z "$OPENCODE_VERSION" ] || [ -z "$OPENCHAMBER_VE
   exit 1
 fi
 
-IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}}"
+# Helm CLI version: --helm-version flag wins, else provisioning.helmVersion
+# from the values file, else the script default.
+if [ -z "$HELM_VERSION" ]; then
+  HELM_VERSION="$(read_section_value provisioning helmVersion)"
+fi
+HELM_VERSION="${HELM_VERSION:-3.22.0}"
+
+# IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}}"
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-openchamber}"
+TAG="${TAG:-${OPENCODE_VERSION}-${OPENCHAMBER_VERSION}}"
 
 echo "==> values:          $VALUES"
 echo "==> opencode.version:   $OPENCODE_VERSION"
 echo "==> openchamber.version: $OPENCHAMBER_VERSION"
 echo "==> ttyd version:    $TTYD_VERSION"
+echo "==> helm version:    $HELM_VERSION"
 echo "==> apt packages:    $APT_PACKAGES"
 echo "==> image:           ${IMAGE_REPO}:${TAG} (${PLATFORM})"
 echo
@@ -117,6 +131,7 @@ BUILD_ARGS=(
   --build-arg "OPENCODE_VERSION=${OPENCODE_VERSION}"
   --build-arg "OPENCHAMBER_VERSION=${OPENCHAMBER_VERSION}"
   --build-arg "TTYD_VERSION=${TTYD_VERSION}"
+  --build-arg "HELM_VERSION=${HELM_VERSION}"
   --build-arg "APT_PACKAGES=${APT_PACKAGES}"
   -t "${IMAGE_REPO}:${TAG}"
 )

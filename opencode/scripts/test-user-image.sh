@@ -5,7 +5,7 @@
 #
 # Verifies, inside the image itself (default platform linux/amd64):
 #   1. the baked artifacts exist and match opencode.version /
-#      openchamber.version from the values file
+#      openchamber.version / provisioning.helmVersion from the values file
 #   2. replaying the router's REAL init guards (extracted from
 #      templates/configmap-router.yaml) against an EMPTY simulated state PVC
 #      takes the baked path — no npm install, no downloads, PVC aliases created
@@ -37,6 +37,8 @@ OPENCHAMBER_VERSION="$(read_section_value openchamber version)"
   echo "ERROR: could not parse opencode.version / openchamber.version from $VALUES" >&2
   exit 1
 }
+HELM_VERSION="$(read_section_value provisioning helmVersion)"
+HELM_VERSION="${HELM_VERSION:-3.22.0}"
 # Default image repo/tag follow the build script's convention:
 # repo encodes both app versions, tag is the image revision (0.0.1).
 IMAGE="${1:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}:0.0.1}"
@@ -60,7 +62,7 @@ if [ -z "$NODE" ]; then
 fi
 [ -n "$NODE" ] || { echo "ERROR: node CLI not found" >&2; exit 1; }
 
-echo "==> image: $IMAGE ($PLATFORM), opencode=$OPENCODE_VERSION openchamber=$OPENCHAMBER_VERSION"
+echo "==> image: $IMAGE ($PLATFORM), opencode=$OPENCODE_VERSION openchamber=$OPENCHAMBER_VERSION helm=$HELM_VERSION"
 
 # --- Extract the router's init guard commands from the chart source ---------
 # (avoids drift: the test replays exactly what production runs).
@@ -99,13 +101,15 @@ echo "$GUARDS" > "$SIM/guards.sh"
 
 echo
 echo "==> [1/4] baked artifacts present in the image"
-"$DOCKER" run --rm --platform "$PLATFORM" "$IMAGE" bash -ec '
+"$DOCKER" run --rm --platform "$PLATFORM" -e HELM_VERSION="$HELM_VERSION" "$IMAGE" bash -ec '
   echo "  opencode marker:  $(cat /opt/opencode/npm/.opencode-version)"
   echo "  openchamber marker: $(cat /opt/opencode/npm/.openchamber-version)"
   echo "  opencode bin:     $(command -v opencode)"
   echo "  openchamber bin:  $(command -v openchamber)"
   echo "  uv:               $(command -v uv) ($(uv --version 2>/dev/null | head -1))"
   echo "  ttyd:             $(command -v ttyd) ($(/opt/opencode/bin/ttyd --version 2>/dev/null | head -1))"
+  echo "  helm:             $(command -v helm) ($(helm version --short 2>/dev/null | head -1))"
+  case "$(helm version --short 2>/dev/null)" in "v${HELM_VERSION}"*) ;; *) echo "  FAIL: helm version mismatch (want v${HELM_VERSION})"; exit 1 ;; esac
   for c in bash curl git script tmux jq make python3 pip3 rg gh vim fd unzip zstd; do
     command -v "$c" >/dev/null || { echo "  MISSING: $c"; exit 1; }
   done

@@ -443,9 +443,10 @@ Design contract (see `docker/user/Dockerfile`):
 - Baked artifacts live under **`/opt/opencode`** (`/opt/opencode/npm`, `/opt/opencode/bin`) — never under `/var/opencode`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/opencode/data/npm`, `/var/opencode/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `opencode-startup.sh` is unchanged.
 - **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `opencode.version`/`openchamber.version` without rebuilding) and the old install-on-boot behavior resumes.
 - The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated + warm pool) onto the new image automatically.
+- The **Helm CLI** is baked under `/opt/opencode/bin/helm` (version pinned via `provisioning.helmVersion` — latest Helm 3 release; Helm 4 exists but the chart and the platform-side install tooling are Helm 3), so `helm package` / `helm lint` / `helm template` run from any pod terminal — e.g. packaging this chart itself from inside the app.
 - User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
 
-Build & push (single source of truth: the script reads `opencode.version`, `openchamber.version` and `provisioning.aptPackages` from the values file; the repo name embeds both app versions and the tag is the image revision):
+Build & push (single source of truth: the script reads `opencode.version`, `openchamber.version`, `provisioning.aptPackages` and `provisioning.helmVersion` from the values file; the repo name embeds both app versions and the tag is the image revision):
 
 ```sh
 docker buildx build --platform linux/amd64 \
