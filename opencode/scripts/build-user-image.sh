@@ -115,7 +115,7 @@ HELM_VERSION="${HELM_VERSION:-3.22.0}"
 
 # IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}}"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-openchamber}"
-TAG="${TAG:-${OPENCODE_VERSION}-${OPENCHAMBER_VERSION}}"
+TAG="${TAG:-${OPENCODE_VERSION}-${OPENCHAMBER_VERSION}}-dind"
 
 echo "==> values:          $VALUES"
 echo "==> opencode.version:   $OPENCODE_VERSION"

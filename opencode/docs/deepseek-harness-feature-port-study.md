@@ -130,7 +130,7 @@ All in `templates/configmap-router.yaml`:
   owner). A second, readable route `^\/([a-z0-9][a-z0-9-]{0,53})(\/.*)?$` serves
   `/{username}/…` — but a single-segment match that is *not* the caller's slug must
   **fall through** to the session-passthrough/login handling (never swallow
-  root-relative pod paths like `/terminal`, `/data_manager`). The per-request body is
+  root-relative pod paths like `/terminal`, `/data-manager`). The per-request body is
   factored into `serveUserPath(request, response, identity, prefix)`.
 - `redirectToPod` → `location: /${slug}`; `targetForUserPath(…, prefix)` now takes the
   browser-visible prefix (readable or legacy) for `forwardedPrefix`/`stripSlugPrefix`;

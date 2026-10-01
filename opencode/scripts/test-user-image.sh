@@ -110,6 +110,12 @@ echo "==> [1/4] baked artifacts present in the image"
   echo "  ttyd:             $(command -v ttyd) ($(/opt/opencode/bin/ttyd --version 2>/dev/null | head -1))"
   echo "  helm:             $(command -v helm) ($(helm version --short 2>/dev/null | head -1))"
   case "$(helm version --short 2>/dev/null)" in "v${HELM_VERSION}"*) ;; *) echo "  FAIL: helm version mismatch (want v${HELM_VERSION})"; exit 1 ;; esac
+  echo "  docker:           $(command -v docker) ($(docker --version 2>/dev/null | head -1))"
+  echo "  buildx:           $(docker buildx version 2>/dev/null | head -1)"
+  echo "  dockerbuild:      $(command -v dockerbuild)"
+  [ -x /usr/local/bin/docker ] || { echo "  FAIL: docker CLI missing"; exit 1; }
+  [ -x /usr/local/libexec/docker/cli-plugins/docker-buildx ] || { echo "  FAIL: buildx plugin missing from the cli-plugins dir"; exit 1; }
+  [ -x /usr/local/bin/dockerbuild ] || { echo "  FAIL: dockerbuild wrapper missing"; exit 1; }
   for c in bash curl git script tmux jq make python3 pip3 rg gh vim fd unzip zstd; do
     command -v "$c" >/dev/null || { echo "  MISSING: $c"; exit 1; }
   done

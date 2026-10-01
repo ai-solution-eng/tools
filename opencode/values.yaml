@@ -39,11 +39,52 @@ images:
   # change — the router folds the tag into the pod-template version, so
   # existing units re-stamp automatically on upgrade. Set both entries back to
   # node:22-bookworm-slim to revert to install-on-boot behavior.
-  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2
-  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2
+  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
+  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
   # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
   # Public ghcr.io packages pull anonymously (leave empty).
   pullSecret: ""
+
+# ============================================================
+# Docker-in-Docker sidecar (dockerize + push images from the pod terminal)
+# ============================================================
+# When enabled, every user pod gets a `dockerd` sidecar (clearwing-proven
+# recipe) and the user container gets DOCKER_HOST=tcp://127.0.0.1:2375, so
+# `docker build` / `docker push` work straight from the terminal. Notes:
+#   - The sidecar is privileged and runs as root (dockerd needs it; platform
+#     admission in project-user-* namespaces is beaten by explicit container-
+#     level overrides). Clusters that reject privileged containers must not
+#     enable this.
+#   - /var/lib/docker is an emptyDir on node-local disk: built images are
+#     ephemeral (survive pod restarts only until the pod is rescheduled).
+#     PUSH after building. A VAST-backed docker-data does NOT work (overlay2
+#     layer extraction fails on network volumes). Disk-capped via
+#     docker.diskSize — rendered as BOTH the emptyDir sizeLimit AND the
+#     sidecar's ephemeral-storage limit (the pairing is what makes the cap
+#     enforceable: kubelet evicts when either is exceeded).
+#   - On proxied clusters the daemon receives proxy.env (pulls/pushes) and
+#     the certificatesPolicy CA bundle (SSL_CERT_FILE) automatically; build
+#     RUN steps additionally need --network host + explicit proxy build-args
+#     — use the baked `dockerbuild` wrapper (see docker/user/Dockerfile).
+docker:
+  enabled: true
+  image: docker:28-dind
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits:   {cpu: "4", memory: 8Gi}
+  # DinD image-store sizing on node-local disk. diskSize caps the emptyDir
+  # and doubles as the sidecar's ephemeral-storage limit (see note above);
+  # diskRequest is the scheduler's ephemeral-storage reservation.
+  diskSize: 50Gi
+  diskRequest: 5Gi
+  # Platform units (project-user-* namespaces): the platform Kyverno policies
+  # deny privileged containers there (tr7: ezprojects-restrict-privileged-pods
+  # — with the sidecar present, the unit's Deployment POST fails with 400 and
+  # platform SSO breaks ENTIRELY). false = platform units get NO dind sidecar
+  # (classic + warm units in the release namespace still do). Set true ONLY
+  # after the platform team adds the Kyverno PolicyException for the
+  # chart-managed units (opencode-user-managed=true, kinds Deployment+Pod).
+  onPlatformUnits: false
 
 opencode:
   version: 1.18.11

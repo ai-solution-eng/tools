@@ -464,6 +464,81 @@ scripts/test-user-image.sh   # verifies baked artifacts + replays the router's r
 
 ---
 
+## Docker in Docker (1.2.6)
+
+Every user pod can carry a **`dockerd` sidecar** (values `docker.enabled`, on by default in `values-g2.yaml`), giving the terminal full `docker` power — build, run, tag, **push** — with no cluster-wide docker socket and no host mounts:
+
+- The **user container** gets `DOCKER_HOST=tcp://127.0.0.1:2375` and the baked **docker CLI + buildx plugin** (`/usr/local/bin/docker`).
+- The **sidecar** runs `dockerd` on a loopback-only TCP listener, privileged and explicitly root (dockerd cannot run as a non-root uid — the container-level `runAsUser: 0` override also beats the platform admission that forces the tenant uid into every container in `project-user-*` namespaces).
+- Its `/var/lib/docker` is **node-local `emptyDir`**: overlay2 layer extraction fails on VAST network volumes, so the image store is ephemeral — **push after building** (or `docker save` to the workspace).
+- The daemon is not a shared socket: it is private to your pod, so there is no cross-user or host exposure beyond the pod's own network namespace.
+
+### Proxied clusters (g2)
+
+The router forwards `proxy.env` to the daemon (pulls/pushes go through `hpeproxy`) and mounts the `certificatesPolicy` CA bundle with `SSL_CERT_FILE`, so the Go daemon trusts the corporate MITM TLS for `ghcr.io`/Docker Hub. **Build** `RUN` steps need two extra adjustments (both proven necessary on g2 via the clearwing + container-builder-mcp work) — use the baked wrapper instead of raw `docker build`:
+
+```sh
+cd /workspace/personal/my-app
+
+# RECOMMENDED: proxy-aware wrapper (adds --network host + explicit proxy
+# build-args only when a proxy is configured; plain passthrough otherwise)
+dockerbuild --platform linux/amd64 -t ghcr.io/<org>/my-app:0.0.1 --push .
+
+# Raw equivalent (proxy env assumed set in your shell):
+docker buildx build --platform linux/amd64 --network host \
+  --build-arg HTTP_PROXY="$HTTP_PROXY" --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
+  --build-arg NO_PROXY="$NO_PROXY" \
+  -t ghcr.io/<org>/my-app:0.0.1 --push .
+```
+
+Why: the daemon's default bridge network cannot reach `hpeproxy` (builds fail with connection errors), and Docker's *implicit* proxy build-arg forwarding does not reach the `RUN` steps' environment inside DinD — explicit `--build-arg`s do. `--network host` shares the pod network, where the proxy is reachable. `NO_PROXY` must contain `127.0.0.1` (the g2 values already do) so the CLI never proxies its own dial to the daemon.
+
+Pushing to a private registry needs credentials (pods ship none):
+
+```sh
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <username> --password-stdin
+dockerbuild -t ghcr.io/<org>/my-app:0.0.1 --push .   # build + push in one shot
+```
+
+### Caveats
+
+- **Bind mounts don't cross the DinD boundary**: `docker run -v /workspace/x:/x ...` resolves paths inside the *sidecar's* filesystem, not your PVC — the classic DinD limitation. Build contexts are fine (the CLI streams them to the daemon over the API).
+- Built images are ephemeral (node-local emptyDir, **disk-capped via values `docker.diskSize`, 50Gi by default** — rendered as both the volume `sizeLimit` and the sidecar's `ephemeral-storage` limit, since the pairing is what makes the cap enforceable; exceeding it evicts the pod and the build fails with `no space left on device` in that user's terminal, never node DiskPressure; `docker.diskRequest` tunes the scheduler reservation). Check usage with `docker system df`, reclaim with `docker system prune`. Everything is re-pulled/re-built after a pod reschedule; a `docker build` cache is likewise lost.
+- Each running build/container consumes the pod's resources — the sidecar requests 250m/512Mi with 4 CPU / 8Gi limits (values `docker.resources`).
+- **Platform units (`project-user-*`, SSO) do not carry the sidecar by default.** The platform Kyverno policies deny privileged containers in user namespaces (observed on tr7: `ezprojects-restrict-privileged-pods` — with the sidecar present, the unit's Deployment POST fails with 400 and **platform SSO breaks entirely**). Classic + warm units in the release namespace are unaffected and get the sidecar whenever `docker.enabled`. To give platform units docker too: have the platform team add a Kyverno `PolicyException` for the chart-managed units (`opencode-user-managed=true`, kinds Deployment+Pod, policy `ezprojects-restrict-privileged-pods`), then set `docker.onPlatformUnits: true`.
+- Enable/disable per environment with values `docker.enabled` (requires the cluster to admit privileged containers; off by default in the HT/devday values).
+
+Ready-made `PolicyException` for the platform team (one per `project-user-*` namespace; the two `any:` entries are ORed — dsh units carry `dsh-user-managed`, opencode units `opencode-user-managed`, never both):
+
+```yaml
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: dsh-opencode-dind-privileged
+  namespace: project-user-<name>
+spec:
+  background: true
+  exceptions:
+    - policyName: ezprojects-restrict-privileged-pods
+      ruleNames:
+        - autogen-restrict-privileged-pods-user-namespace
+        - restrict-privileged-pods-user-namespace
+  match:
+    any:
+      - resources:
+          kinds: [Pod, Deployment]
+          selector:
+            matchLabels:
+              dsh-user-managed: "true"
+      - resources:
+          kinds: [Pod, Deployment]
+          selector:
+            matchLabels:
+              opencode-user-managed: "true"
+```
+
+---
+
 ## Quick Reference
 
 ```bash
