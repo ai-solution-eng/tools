@@ -34,6 +34,12 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["gateways"]
   verbs: ["get"]
+- apiGroups: ["networking.k8s.io"]
+  # Per-user DinD broker isolation (docker.onPlatformUnits=false path): the
+  # broker's NetworkPolicy restricts the unauthenticated daemon port to the
+  # owning user's unit pod.
+  resources: ["networkpolicies"]
+  verbs: ["get", "create", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
