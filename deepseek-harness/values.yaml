@@ -49,11 +49,17 @@ images:
   pullSecret: ""
 
 # ============================================================
-# Docker-in-Docker sidecar (dockerize + push images from the pod terminal)
+# Docker-in-Docker (dockerize + push images from the pod terminal)
 # ============================================================
-# When enabled, every user pod gets a `dockerd` sidecar (clearwing-proven
-# recipe) and the user container gets DOCKER_HOST=tcp://127.0.0.1:2375, so
-# `docker build` / `docker push` work straight from the terminal. Notes:
+# SECURITY (2026-10-03 decision): docker is an SSO-IDENTITY capability.
+# The classic (non-SSO) login is a single shared credential and daemon
+# access is node-root-equivalent (privileged container + unauthenticated
+# API), so units resolved by a LOCAL session NEVER get a daemon — only
+# SSO-resolved units do: platform units via the per-user broker (default,
+# see below) or the in-pod sidecar with the Kyverno PolicyException
+# (onPlatformUnits), and SSO fallback units in the release namespace via
+# the in-pod sidecar (loopback). The docker CLI stays baked in the image
+# for everyone (harmless without a daemon). Notes:
 #   - The sidecar is privileged and runs as root (dockerd needs it; platform
 #     admission in project-user-* namespaces is beaten by explicit container-
 #     level overrides). Clusters that reject privileged containers must not

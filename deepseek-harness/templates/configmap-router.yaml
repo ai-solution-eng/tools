@@ -1549,7 +1549,7 @@ data:
       }
     }
 
-    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform }) {
+    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform, ssoUnit }) {
       slug = owner || (isWarmPool ? `warm-${poolId}` : slug)
       const manifestNs = unitNs || namespace
       const platformVolumesMounted = !!(platform && platform.volumesMounted)
@@ -1589,16 +1589,20 @@ data:
       ] : []
       // Data Manager platform roots: mounted → show; pending/off → hide.
       const platformRootsMode = platform ? (platformVolumesMounted ? 'mounted' : 'pending') : 'off'
-      // DinD placement for THIS unit (see the dockerEnabled note at the
-      // top of the file):
-      //   - release-namespace units: privileged sidecar IN the pod (loopback).
-      //   - platform units (project-user-*): the platform Kyverno policies
-      //     deny privileged there, so by default the daemon runs in a
-      //     per-user BROKER pod in the release namespace and the unit dials
-      //     it cross-namespace (docker.brokerForPlatformUnits); with the
-      //     platform team's Kyverno PolicyException, docker.onPlatformUnits
-      //     moves the daemon back into the pod (loopback).
-      const dockerSidecarHere = dockerEnabled && (manifestNs === namespace || dockerOnPlatformUnits)
+      // DinD placement for THIS unit (see the dockerEnabled note at the top
+      // of the file). SECURITY (2026-10-03 decision): docker is an
+      // SSO-identity capability — the classic login is a SINGLE SHARED
+      // credential (values auth block) and daemon access is node-root-
+      // equivalent (privileged container + unauthenticated API), so units
+      // resolved by a local session NEVER get a daemon:
+      //   - SSO + platform namespace: per-user BROKER pod in the release
+      //     namespace (docker.brokerForPlatformUnits), or the in-pod
+      //     sidecar with the Kyverno PolicyException (onPlatformUnits).
+      //   - SSO + release-namespace fallback unit: in-pod sidecar (loopback,
+      //     reachable solely through the authenticated session).
+      //   - local (shared-credential) session: no daemon anywhere.
+      const unitIsSso = !!platform || !!ssoUnit
+      const dockerSidecarHere = dockerEnabled && unitIsSso && (manifestNs === namespace || dockerOnPlatformUnits)
       const dockerBrokerHere = dockerEnabled && !dockerSidecarHere && manifestNs !== namespace && dockerBrokerForPlatformUnits
       const dockerHostForUnit = dockerSidecarHere
         ? 'tcp://127.0.0.1:2375'
@@ -2217,7 +2221,7 @@ data:
       return prev.then(() => release)
     }
 
-    async function claimWarmForUser(slug, legacySlug) {
+    async function claimWarmForUser(slug, legacySlug, isSsoUser = false) {
       // Bounded retries: re-verify ownership inside the per-pool lock so two
       // concurrent claims can never both PATCH the same warm unit (which would
       // overwrite the owner and strand one user on a pod that authenticates the
@@ -2269,7 +2273,7 @@ data:
             continue
           }
           const names = warmNamesForPoolId(poolId)
-          const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug, isWarmPool: true, poolId, owner: slug })
+          const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug, isWarmPool: true, poolId, owner: slug, ssoUnit: isSsoUser })
           await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`, {
             metadata: { labels: manifest.metadata.labels },
             spec: { template: manifest.spec.template },
@@ -2550,6 +2554,17 @@ data:
       const slug = slugForUser(userId)
       const legacySlug = legacySlugForUser(userId)
       const names = namesForSlug(slug)
+      // Docker is an SSO-identity capability (see the placement note in
+      // userDeploymentManifest): derive the session type from the registry
+      // (trackSsoIdentity stamps sso: true on every SSO login). An
+      // unreadable registry fails CLOSED — no daemon.
+      let isSsoUser = false
+      try {
+        const users = await loadUserRegistry()
+        isSsoUser = !!users[userId]?.sso
+      } catch {
+        isSsoUser = false
+      }
       // Sticky: if the user already has a dedicated (non-warm) environment, keep
       // serving them there. Prevents a user who fell back to a dedicated
       // deployment during a pool shortage from being silently moved to a warm
@@ -2560,7 +2575,7 @@ data:
         await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
         await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
         await ensureService(names.service, slug)
-        await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug)
+        await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names }
       }
       // Platform (Option B) — only for users WITHOUT an existing
@@ -2591,7 +2606,7 @@ data:
         await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, legacyNames.virtualService)
         await ensureLease(`dsh-user-${slug}`)
         await ensureService(names.service, slug)
-        await ensureDeployment(names.deployment, legacyNames.workspaceClaim, legacyNames.stateClaim, slug)
+        await ensureDeployment(names.deployment, legacyNames.workspaceClaim, legacyNames.stateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names: { ...names, workspaceClaim: legacyNames.workspaceClaim, stateClaim: legacyNames.stateClaim } }
       }
       if (warmPoolEnabled && warmPoolSize > 0) {
@@ -2603,7 +2618,7 @@ data:
           // to a dedicated pod (bounded: worst case ~6s, vs minutes of cold
           // provisioning).
           for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
-            claimed = await claimWarmForUser(slug, legacySlug)
+            claimed = await claimWarmForUser(slug, legacySlug, isSsoUser)
             if (!claimed && attempt < 2) {
               await new Promise((resolve) => setTimeout(resolve, 2000))
             }
@@ -2621,7 +2636,7 @@ data:
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
       await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
       await ensureService(names.service, slug)
-      await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug)
+      await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { ssoUnit: isSsoUser })
       return { slug, names }
     }
 
