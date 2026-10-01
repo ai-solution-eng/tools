@@ -1,8 +1,12 @@
+# syntax=docker/dockerfile:1
 # Baked DeepSeek Harness user image.
 #
 # Everything that used to be installed at user-pod-creation time — the apt
 # toolchain, the @deepseek-ai/dsh npm package, uv, ttyd and helm — is baked
-# into this image so a fresh user pod reaches Ready in seconds instead of minutes.
+# into this image so a fresh user pod reaches Ready in seconds instead of
+# minutes. The docker CLI + buildx plugin are baked too so the terminal can
+# drive the chart's optional Docker-in-Docker sidecar (`docker:` values; see
+# the dockerbuild wrapper below).
 #
 # Build (canonical invocation, also wrapped by scripts/build-user-image.sh
 # which defaults the tag to dsh.version from values.yaml):
@@ -38,7 +42,7 @@ ARG APT_PACKAGES="bash ca-certificates curl dnsutils fd-find gh git jq less make
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 LABEL org.opencontainers.image.title="deepseek-harness user unit" \
-      org.opencontainers.image.description="Baked user-pod image for the dsh-web-helm chart: apt toolchain + @deepseek-ai/dsh + uv + ttyd + helm preinstalled" \
+      org.opencontainers.image.description="Baked user-pod image for the dsh-web-helm chart: apt toolchain + @deepseek-ai/dsh + uv + ttyd + helm + docker CLI/buildx preinstalled" \
       org.opencontainers.image.base.name="node:22-bookworm-slim"
 
 # --- apt toolchain + the /usr/local/bin aliases dsh-startup.sh recreates ---
@@ -127,3 +131,89 @@ RUN arch="$(uname -m)" \
  && install -m 0755 "/tmp/${helm_asset}/helm" /opt/dsh/bin/helm \
  && rm -rf /tmp/helm.tgz "/tmp/${helm_asset}" \
  && ln -sf /opt/dsh/bin/helm /usr/local/bin/helm
+
+# --- docker CLI + buildx plugin under /opt/dsh/bin (DinD client) -------------
+# The chart can add a docker-in-docker SIDECAR to user pods (values `docker:`);
+# this client is the terminal half: it talks to the sidecar over
+# DOCKER_HOST=tcp://127.0.0.1:2375 (set by the chart). Static binaries from
+# download.docker.com — there is NO Debian `docker-cli` package ("Unable to
+# locate package docker-cli"; the distro `docker.io` would drag the daemon
+# in). Versions pinned to the clearwing-proven pair (client 27.5.1 against
+# the docker:28-dind daemon). Plugin path: the CLI scans
+# /usr/local/libexec/docker/cli-plugins (system path, not $HOME — the state
+# PVC would shadow it); the artifact itself lives under /opt/dsh per the
+# baked-artifacts rule.
+ARG DOCKER_VERSION=27.5.1
+ARG BUILDX_VERSION=0.37.1
+RUN arch="$(uname -m)" \
+ && case "$arch" in \
+      x86_64|amd64) docker_arch=x86_64 ;; \
+      aarch64|arm64) docker_arch=aarch64 ;; \
+      *) echo "unsupported architecture for docker: $arch" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL --retry 3 \
+      "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_VERSION}.tgz" \
+      | tar -xz -C /tmp docker/docker \
+ && install -m 0755 /tmp/docker/docker /opt/dsh/bin/docker \
+ && rm -rf /tmp/docker \
+ && ln -sf /opt/dsh/bin/docker /usr/local/bin/docker \
+ && mkdir -p /usr/local/libexec/docker/cli-plugins \
+ && case "$docker_arch" in \
+      x86_64) buildx_asset=buildx-v${BUILDX_VERSION}.linux-amd64 ;; \
+      aarch64) buildx_asset=buildx-v${BUILDX_VERSION}.linux-arm64 ;; \
+    esac \
+ && curl -fsSL --retry 3 \
+      "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/${buildx_asset}" \
+      -o /opt/dsh/bin/docker-buildx \
+ && chmod 0755 /opt/dsh/bin/docker-buildx \
+ && ln -sf /opt/dsh/bin/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx \
+ && /opt/dsh/bin/docker --version \
+ && /opt/dsh/bin/docker buildx version
+
+# Belt-and-braces: route plain `docker build` in the terminal through
+# BuildKit too (CLI 27 defaults to it; plugin discovery uses the system
+# /usr/local/libexec/docker/cli-plugins path, independent of HOME).
+ENV DOCKER_BUILDKIT=1
+
+# --- dockerbuild: DinD-aware buildx wrapper ----------------------------------
+# On proxied clusters two adjustments are REQUIRED for `docker build` inside
+# DinD (proven live on the g2 cluster via clearwing + container-builder-mcp):
+#   1. --network host — the daemon's default bridge network cannot reach the
+#      corporate proxy; sharing the pod network makes proxy-dependent RUN
+#      steps (apt/pip/curl) work.
+#   2. explicit proxy build-args — Docker's implicit forwarding of the
+#      HTTP_PROXY family does NOT reach the RUN steps' environment inside
+#      DinD (observed: pip Errno 101 / TLS failures; daemon-level pulls kept
+#      working because the daemon env carries the proxy).
+# NO_PROXY additionally gains 127.0.0.1,::1,localhost so buildx's own gRPC
+# dial to the daemon is never proxied. Without a proxy configured the
+# wrapper is a plain passthrough to `docker buildx build`.
+COPY <<'EOF' /opt/dsh/bin/dockerbuild
+#!/usr/bin/env bash
+# DinD-aware `docker buildx build` wrapper (see the Dockerfile header for the
+# why). Usage: dockerbuild [buildx args] <context-dir>
+set -euo pipefail
+args=()
+http="${HTTP_PROXY:-${http_proxy:-}}"
+https="${HTTPS_PROXY:-${https_proxy:-}}"
+if [ -n "$http" ] || [ -n "$https" ]; then
+  np="${NO_PROXY:-${no_proxy:-}}"
+  for extra in 127.0.0.1 ::1 localhost; do
+    case ",${np}," in
+      *",${extra},"*) ;;                          # already listed
+      *) np="${np:+${np},}${extra}" ;;
+    esac
+  done
+  if [ -n "$http" ]; then
+    args+=(--build-arg "HTTP_PROXY=${http}" --build-arg "http_proxy=${http}")
+  fi
+  if [ -n "$https" ]; then
+    args+=(--build-arg "HTTPS_PROXY=${https}" --build-arg "https_proxy=${https}")
+  fi
+  args+=(--build-arg "NO_PROXY=${np}" --build-arg "no_proxy=${np}")
+  args+=(--network host)
+fi
+exec docker buildx build "${args[@]}" "$@"
+EOF
+RUN chmod 0755 /opt/dsh/bin/dockerbuild \
+ && ln -sf /opt/dsh/bin/dockerbuild /usr/local/bin/dockerbuild

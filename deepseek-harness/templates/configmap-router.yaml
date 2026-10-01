@@ -86,7 +86,11 @@ data:
     // 31 (0.4.14): /data_manager renamed to /data-manager (nginx locations +
     // preview SPA/API; legacy underscore path aliased in-app by
     // data_manager.mjs, proxied as-is — no 301, POST bodies must survive).
-    const RUNTIME_REV = '31'
+    // 32 (0.4.16): optional Docker-in-Docker sidecar (values docker.enabled) —
+    // the dsh-web container gains DOCKER_HOST and the pod a dockerd sidecar +
+    // docker-data volume; existing units re-stamp so the terminal can drive
+    // the daemon immediately.
+    const RUNTIME_REV = '32'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -101,7 +105,24 @@ data:
       const tag = String(userInstanceImage || '').split('@')[0].split(':').pop() || ''
       return (tag.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 32)) || 'untagged'
     })()
-    const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${[...new Set([userDshVersion, userImageRev])].join('-')}`
+    // Docker-in-Docker (values docker.*): the privileged dind sidecar can
+    // only be ADMITTED where the platform Kyverno policies allow privileged
+    // containers. tr7's ezprojects-restrict-privileged-pods denies them in
+    // project-user-* namespaces (release-namespace units are unaffected), so
+    // the sidecar is RUNTIME-GATED per unit:
+    //   - release-namespace units (classic + warm pool): sidecar when
+    //     docker.enabled.
+    //   - platform units (project-user-*): sidecar only when
+    //     docker.onPlatformUnits is ALSO true — which requires the platform
+    //     team's Kyverno PolicyException for the chart-managed units
+    //     (dsh-user-managed=true); otherwise the Deployment POST dies with
+    //     400 and platform SSO breaks entirely.
+    // The state participates in the convergence contract so flipping any of
+    // it re-stamps existing units.
+    const dockerEnabled = {{ if and .Values.docker .Values.docker.enabled }}true{{ else }}false{{ end }}
+    const dockerOnPlatformUnits = {{ if and .Values.docker .Values.docker.onPlatformUnits }}true{{ else }}false{{ end }}
+    const dockerSidecar = dockerEnabled ? (dockerOnPlatformUnits ? 'dind-platform' : 'dind-classic') : 'nodind'
+    const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${dockerSidecar}-${[...new Set([userDshVersion, userImageRev])].join('-')}`
     const ttydVersion = '1.7.7'
     const userPullSecret = process.env.USER_IMAGE_PULL_SECRET || ''
     const usernameHeader = 'x-auth-request-preferred-username'
@@ -1284,6 +1305,11 @@ data:
       ] : []
       // Data Manager platform roots: mounted → show; pending/off → hide.
       const platformRootsMode = platform ? (platformVolumesMounted ? 'mounted' : 'pending') : 'off'
+      // DinD admission gate for THIS unit (see the dockerEnabled note):
+      // release-namespace units carry the privileged sidecar whenever
+      // docker.enabled; platform units (project-user-*) only when
+      // docker.onPlatformUnits is also set (Kyverno PolicyException).
+      const dockerSidecarHere = dockerEnabled && (manifestNs === namespace || dockerOnPlatformUnits)
       // Platform PVC volumes — mounted BY REFERENCE (claimName) into the
       // unit's namespace. Never labeled, never owner-referenced, never
       // deleted by DSH: they belong to the platform (EzProject).
@@ -1544,6 +1570,12 @@ data:
                     { name: 'XDG_CONFIG_HOME', value: '/var/dsh/home/.config' },
                     { name: 'XDG_STATE_HOME', value: '/var/dsh/state' },
                     { name: 'XDG_CACHE_HOME', value: '/var/dsh/cache' },
+                    // Docker CLI (baked in the user image) -> DinD sidecar
+                    // (release-ns units; absent on platform units unless
+                    // docker.onPlatformUnits). The baked `dockerbuild`
+                    // wrapper is the proxy-aware way to run builds (see
+                    // docker/user/Dockerfile).
+                    ...(dockerSidecarHere ? [{ name: 'DOCKER_HOST', value: 'tcp://127.0.0.1:2375' }] : []),
                     { name: 'DSH_CONFIG_PATH', value: '/var/dsh/home/.dsh/settings.yaml' },
                     // Match the supervisor's safe watch defaults: config FILES
                     // only. NEVER watch the profiles/web DIRECTORY — dsh writes
@@ -1679,6 +1711,89 @@ data:
                     { name: 'state', mountPath: '/var/dsh', readOnly: true },
                   ],
                 },
+                // ---- Docker-in-Docker sidecar (values docker.*) ----
+                // RUNTIME-GATED per unit (see the dockerEnabled note at the
+                // top): the privileged daemon cannot be admitted into
+                // project-user-* namespaces unless the platform Kyverno
+                // PolicyException exists, so platform units carry it only
+                // with docker.onPlatformUnits. Proven recipe (clearwing
+                // chart + container-builder-mcp): dockerd listens on
+                // tcp://0.0.0.0:2375 (no unix socket when -H is passed, so
+                // the probes dial DOCKER_HOST explicitly), no TLS on the
+                // loopback-only listener. securityContext is the FULL root
+                // triple: dockerd cannot run as a non-root uid, and platform
+                // admission forces the tenant uid into every container of
+                // project-user-* namespaces (v30 note above) — the
+                // container-level overrides below beat both the forced uid
+                // and the run-as-non-root policy (both hit live on this
+                // cluster class). Proxy env -> daemon-level pulls/pushes go
+                // through the corporate proxy; the certificatesPolicy
+                // combined CA bundle (SSL_CERT_FILE) makes the Go daemon
+                // trust its MITM TLS. docker-data is emptyDir/node-local on
+                // purpose: overlay2 layer extraction fails on VAST network
+                // volumes, so the image store is ephemeral (push after build).
+                ...(dockerSidecarHere ? [
+                {
+                  name: 'docker-dind',
+                  image: '{{ .Values.docker.image | default "docker:28-dind" }}',
+                  imagePullPolicy: 'IfNotPresent',
+                  command: ['dockerd', '--host=tcp://0.0.0.0:2375', '--tls=false'],
+                  env: [
+                    { name: 'DOCKER_TLS_CERTDIR', value: '' },
+                    // The probes exec `docker info` inside this container;
+                    // with -H passed dockerd binds no unix socket, so point
+                    // the local CLI at the TCP listener.
+                    { name: 'DOCKER_HOST', value: 'tcp://127.0.0.1:2375' },
+                    {{- if and .Values.proxy .Values.proxy.enabled }}
+                    {{- range .Values.proxy.env }}
+                    { name: '{{ .name }}', value: '{{ .value }}' },
+                    {{- end }}
+                    {{- end }}
+                    {{- if and .Values.no_proxy .Values.no_proxy.enabled }}
+                    {{- range .Values.no_proxy.env }}
+                    { name: '{{ .name }}', value: '{{ .value }}' },
+                    {{- end }}
+                    {{- end }}
+                    {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+                    {{- range .Values.certificatesPolicy.env }}
+                    { name: '{{ .name }}', value: '{{ .value }}' },
+                    {{- end }}
+                    {{- end }}
+                  ],
+                  securityContext: {
+                    privileged: true,
+                    runAsUser: 0,
+                    runAsNonRoot: false,
+                  },
+                  readinessProbe: {
+                    exec: { command: ['docker', 'info'] },
+                    initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6,
+                  },
+                  livenessProbe: {
+                    exec: { command: ['docker', 'info'] },
+                    initialDelaySeconds: 30, periodSeconds: 30, timeoutSeconds: 5, failureThreshold: 3,
+                  },
+                  resources: {
+                    // The ephemeral-storage limit is what makes the emptyDir
+                    // sizeLimit enforceable (kubelet evicts when either is
+                    // exceeded): a runaway build dies with ENOSPC in the
+                    // user's terminal instead of filling the node disk.
+                    // Sizing is values-driven: docker.diskRequest (scheduler
+                    // reservation) + docker.diskSize (cap, reused as the
+                    // sizeLimit of the docker-data volume below).
+                    requests: { cpu: '{{ .Values.docker.resources.requests.cpu | default "250m" }}', memory: '{{ .Values.docker.resources.requests.memory | default "512Mi" }}', 'ephemeral-storage': '{{ .Values.docker.diskRequest | default "5Gi" }}' },
+                    limits: { cpu: '{{ .Values.docker.resources.limits.cpu | default "4" }}', memory: '{{ .Values.docker.resources.limits.memory | default "8Gi" }}', 'ephemeral-storage': '{{ .Values.docker.diskSize | default "50Gi" }}' },
+                  },
+                  volumeMounts: [
+                    { name: 'docker-data', mountPath: '/var/lib/docker' },
+                    {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+                    {{- range .Values.certificatesPolicy.volumeMounts }}
+                    { name: '{{ .name }}', mountPath: '{{ .mountPath }}'{{ if .subPath }}, subPath: '{{ .subPath }}'{{ end }}{{ if hasKey . "readOnly" }}, readOnly: {{ .readOnly }}{{ end }} },
+                    {{- end }}
+                    {{- end }}
+                  ],
+                },
+                ] : []),
               ],
               volumes: [
                 { name: 'personal-workspace', persistentVolumeClaim: { claimName: workspaceClaim } },
@@ -1687,6 +1802,11 @@ data:
                 { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
                 { name: 'preview-config', configMap: { name: '{{ .Release.Name }}-preview-config', defaultMode: 365 } },
+                ...(dockerSidecarHere ? [
+                // DinD image store — node-local emptyDir (overlay2 fails on
+                // VAST network volumes; see the docker-dind sidecar note).
+                { name: 'docker-data', emptyDir: { sizeLimit: '{{ .Values.docker.diskSize | default "50Gi" }}' } },
+                ] : []),
                 // Non-root-safe nginx sidecar scratch dirs (see container above)
                 { name: 'nginx-cache', emptyDir: {} },
                 { name: 'nginx-logs', emptyDir: {} },

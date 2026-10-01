@@ -87,7 +87,7 @@ if [ -z "$DSH_VERSION" ]; then
   echo "ERROR: could not parse dsh.version from $VALUES" >&2
   exit 1
 fi
-TAG="${TAG:-$DSH_VERSION}"
+TAG="${TAG:-$DSH_VERSION}-dind"
 
 echo "==> values:        $VALUES"
 echo "==> dsh.version:   $DSH_VERSION"
