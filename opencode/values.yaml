@@ -80,11 +80,17 @@ docker:
   # Platform units (project-user-* namespaces): the platform Kyverno policies
   # deny privileged containers there (tr7: ezprojects-restrict-privileged-pods
   # — with the sidecar present, the unit's Deployment POST fails with 400 and
-  # platform SSO breaks ENTIRELY). false = platform units get NO dind sidecar
-  # (classic + warm units in the release namespace still do). Set true ONLY
-  # after the platform team adds the Kyverno PolicyException for the
-  # chart-managed units (opencode-user-managed=true, kinds Deployment+Pod).
+  # platform SSO breaks ENTIRELY). So platform units get their daemon OUT-OF-
+  # POD by default: a per-user privileged dind Deployment + Service +
+  # NetworkPolicy (ingress restricted to the owning unit) in THIS release
+  # namespace, reached cross-namespace via DOCKER_HOST (brokerForPlatformUnits).
   onPlatformUnits: false
+  # false = platform units carry NO docker at all. true (default) = the
+  # per-user broker described above. Setting onPlatformUnits: true INSTEAD
+  # runs the daemon inside the platform pod — only do that after the platform
+  # team adds the Kyverno PolicyException (opencode-user-managed=true, kinds
+  # Deployment+Pod).
+  brokerForPlatformUnits: true
 
 opencode:
   version: 1.18.11

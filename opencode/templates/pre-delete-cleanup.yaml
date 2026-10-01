@@ -73,6 +73,10 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["virtualservices"]
   verbs: ["get", "list", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  # Per-user DinD broker isolation policies (release namespace only).
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "delete"]
 {{- if .Values.platformIntegration.enabled }}
 ---
 # Platform integration: units may live inside the users' platform project
@@ -361,11 +365,15 @@ spec:
                 deleteByLabel('/api/v1/namespaces/' + ns + '/configmaps', um, 'configmaps', ns),
               ])
             }
-            // Release-namespace-only resources (registry, leases, VS).
+            // Release-namespace-only resources (registry, leases, VS,
+            // per-user DinD broker NetworkPolicies — the broker deployments
+            // and services are swept by the opencode-user-managed label
+            // above).
             await Promise.all([
               deleteByLabel('/api/v1/namespaces/' + namespace + '/secrets', um, 'secrets', namespace),
               deleteByLabel('/apis/coordination.k8s.io/v1/namespaces/' + namespace + '/leases', um, 'leases', namespace),
               deleteByLabel('/apis/networking.istio.io/v1/namespaces/' + namespace + '/virtualservices', um, 'virtualservices', namespace),
+              deleteByLabel('/apis/networking.k8s.io/v1/namespaces/' + namespace + '/networkpolicies', um, 'networkpolicies', namespace),
             ])
 
             console.log('Phase 2: wait for user pods to terminate (releases PVC mounts)')
