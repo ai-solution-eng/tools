@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +84,14 @@ def _page(name: str) -> str:
     path = _UI_DIR / name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="page missing")
-    return path.read_text(encoding="utf-8")
+    html = path.read_text(encoding="utf-8")
+    # Cache-bust static assets per app version: a browser that cached the
+    # previous deploy's shared.js (statics went out with no Cache-Control, so
+    # browsers heuristically kept the old copy for hours) would run old JS
+    # against the new page — an init TypeError there silently killed the
+    # launch button. A per-release ?v=<version> gives every asset a fresh URL
+    # on each version bump.
+    return re.sub(r"/static/[A-Za-z0-9._-]+", lambda m: m.group(0) + "?v=" + __version__, html)
 
 
 def _status_payload() -> dict:
@@ -114,6 +122,19 @@ def create_app(work_dir: str | None = None) -> Any:
 
     if (_UI_DIR / "app.css").is_file():
         app.mount("/static", StaticFiles(directory=_UI_DIR), name="static")
+
+    @app.middleware("http")
+    async def _cache_headers(request: Request, call_next: Any) -> Any:
+        """Explicit cache policy: pages always revalidate (stale HTML + fresh
+        JS — or the reverse — is what bricked the launcher), statics are
+        short-cached (per-version URLs from _page make a version bump bust)."""
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith("/static/"):
+            response.headers.setdefault("Cache-Control", "public, max-age=300")
+        elif request.method == "GET" and response.headers.get("content-type", "").startswith("text/html"):
+            response.headers.setdefault("Cache-Control", "no-cache")
+        return response
 
     # ------------------------------------------------------------------ public
 

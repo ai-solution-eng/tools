@@ -96,7 +96,7 @@
       </div>
     </div>
     <label style="margin:12px 0 0;display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer">
-      <input type="checkbox" id="e-local" style="width:auto">
+      <input type="checkbox" id="e-local" style="width:auto" checked>
       <span>In-cluster address (<span class="mono">.svc.cluster.local</span>) — the pcai-model-classes LOCAL/REMOTE switch:
       rewrites <span class="mono">.serving.</span> URLs in-cluster; other URLs pass through unchanged.</span>
     </label>
@@ -194,6 +194,9 @@
   var pollTimer = null;
 
   MB.header("/benchmark/endpoint");
+  // optional enhancement — a browser-cached stale shared.js must not brick the
+  // page init (that took the launch button down with it once)
+  if (MB.wireLogFullscreen) MB.wireLogFullscreen("e-run");
 
   var endpointTargets = [];
   MB.api("/api/targets").then(function (d) {
@@ -271,6 +274,8 @@
   }
 
   function renderRun(d) {
+    var view = MB.logView ? MB.logView("e-run") // capture before the poll's innerHTML swap
+      : { open: true, expanded: false, atBottom: true, top: 0, apply: function () {} };
     var html = '<div class="panel"><h2 style="margin-top:0">Run ' + MB.esc(d.run_id) + " " + badge(d.status) + "</h2>";
     html += '<div class="kv">' +
       '<span class="k">endpoint</span><span>' + MB.esc(d.endpoint) + "</span>" +
@@ -279,7 +284,9 @@
       (d.finished_utc ? '<span class="k">finished</span><span>' + MB.esc(d.finished_utc) + "</span>" : "") +
       (d.exit_code != null ? '<span class="k">exit code</span><span>' + MB.esc(d.exit_code) + "</span>" : "") +
       "</div>";
-    if (d.log_tail) html += "<details open><summary>run log (tail)</summary><pre class=\"log\">" + MB.esc(d.log_tail) + "</pre></details>";
+    if (d.log_tail) html += '<details' + (view.open ? " open" : "") + '><summary>run log (tail)'
+      + '<button type="button" class="log-fs">' + (view.expanded ? "\u2715 exit full screen" : "\u26F6 full screen") + "</button></summary>"
+      + '<pre class="log">' + MB.esc(d.log_tail) + "</pre></details>";
     if (d.artifacts && d.artifacts.length) {
       html += "<h2>Artifacts</h2><table><tbody>";
       d.artifacts.forEach(function (a) {
@@ -293,6 +300,7 @@
     }
     html += "</div>";
     $("e-run").innerHTML = html;
+    view.apply(); // restore scroll / details-open / full-screen across the poll swap
     var cancel = document.getElementById("e-cancel");
     if (cancel) cancel.addEventListener("click", function () {
       MB.api("/api/runs/" + encodeURIComponent(currentRun) + "/cancel", { method: "POST" })

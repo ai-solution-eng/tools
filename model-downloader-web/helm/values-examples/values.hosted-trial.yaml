@@ -22,12 +22,12 @@ fullnameOverride: ""
 # Tags are packaged with the chart — change only if you build your own images.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.6.2
-  # Always: re-pull on every pod creation, so overwriting this tag in the
-  # registry is enough — just `kubectl rollout restart` afterwards.
-  # (IfNotPresent would silently keep a node-cached image when the same
-  # tag is overwritten, which is how a "rebuilt" deploy serves stale JS.)
-  pullPolicy: Always
+  tag: v1.6.3
+  # IfNotPresent (fleet default): releases ship NEW image tags (bump_version.sh
+  # keeps tag/Chart.yaml in lockstep), so node-cached images stay fresh.
+  # (pullPolicy: Always re-pulls on every pod start — only useful for a
+  # deliberate rebuild-same-tag lab flow, which then needs a rollout restart.)
+  pullPolicy: IfNotPresent
 
 # -- Download behavior --------------------------------------------------------------
 # Max concurrent model downloads; extras are queued in-process.

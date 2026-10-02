@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-benchmarker"
-version = "0.4.5"
+version = "0.6.0"
 description = "PCAI model benchmarking app: universal endpoint load benchmarker (REST/MCP + GPU scaling curves), chat streaming benchmarker (TTFT / tokens-per-second), deterministic memory estimation, and a deployable web app (memory estimator + API-key-gated benchmark launchers)."
 readme = "README.md"
 requires-python = ">=3.12"

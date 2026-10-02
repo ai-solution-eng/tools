@@ -316,9 +316,61 @@
       .catch(function () { box.innerHTML = ""; });
   }
 
+  // --- run-log view state ------------------------------------------------------
+  // renderRun() replaces the panel's innerHTML on every 3s poll, which snaps
+  // the log back to the top and re-opens a collapsed <details>. MB.logView
+  // captures that state BEFORE the swap and .apply() restores it AFTER; while
+  // the viewer is parked at the bottom it stays pinned there (log-follower).
+  function logView(runBoxId) {
+    var box = document.getElementById(runBoxId);
+    var det = box ? box.querySelector("details") : null;
+    var pre = box ? box.querySelector("pre.log") : null;
+    return {
+      open: det ? det.open : true,
+      expanded: !!(det && det.classList.contains("log-full")),
+      atBottom: pre ? pre.scrollHeight - pre.scrollTop - pre.clientHeight < 8 : true,
+      top: pre ? pre.scrollTop : 0,
+      apply: function () {
+        var b = document.getElementById(runBoxId);
+        var d = b ? b.querySelector("details") : null;
+        var p = b ? b.querySelector("pre.log") : null;
+        if (d) { d.open = this.open; d.classList.toggle("log-full", this.expanded); }
+        if (p) p.scrollTop = this.atBottom ? p.scrollHeight : this.top;
+      },
+    };
+  }
+
+  function setLogFull(runBoxId, on) {
+    var box = document.getElementById(runBoxId);
+    var det = box ? box.querySelector("details") : null;
+    if (!det) return;
+    det.classList.toggle("log-full", !!on);
+    var btn = det.querySelector(".log-fs");
+    if (btn) btn.textContent = on ? "\u2715 exit full screen" : "\u26F6 full screen";
+  }
+
+  // one-time wiring per page: delegated click on the full-screen button (the
+  // click must not toggle the surrounding <summary>) + Escape exits.
+  function wireLogFullscreen(runBoxId) {
+    document.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("#" + runBoxId + " .log-fs");
+      if (!btn) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      var det = btn.closest("details");
+      setLogFull(runBoxId, !det.classList.contains("log-full"));
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Escape") return;
+      var det = document.querySelector("#" + runBoxId + " details.log-full");
+      if (det) setLogFull(runBoxId, false);
+    });
+  }
+
   window.MB = { recentRuns: recentRuns, recentResults: recentResults,
     combobox: combobox,
     api: api, esc: esc, header: header, getKey: getKey, setKey: setKey,
     fmtBytes: fmtBytes, fmtNum: fmtNum, downloadArtifact: downloadArtifact, toggleTheme: toggleTheme,
+    logView: logView, setLogFull: setLogFull, wireLogFullscreen: wireLogFullscreen,
   };
 })();

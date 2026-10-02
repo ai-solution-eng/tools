@@ -15,7 +15,7 @@ fullnameOverride: ""
 # The FastAPI service that serves the UI and submits Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.6.2
+  tag: v1.6.3
   # Always: re-pull on every pod creation, so overwriting this tag in the
   # registry is enough — just `kubectl rollout restart` afterwards.
   # (IfNotPresent would silently keep a node-cached image when the same
@@ -30,7 +30,7 @@ image:
   # 1.6.2: scanner gained the du -sb size column, but a 1.6.0-era ConfigMap
   # kept the "Downloaded models" Size column at "—" until the chart was
   # upgraded and the pod restarted).
-  pullPolicy: Always
+  pullPolicy: IfNotPresent  # fleet default: releases ship new tags (bump_version.sh lockstep)
 
 # -- Download behavior --------------------------------------------------------------
 # Max concurrent model downloads; extras are queued in-process.

@@ -392,6 +392,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "there). If omitted, --url is required and --api_key is optional "
         "(endpoints that don't require auth can omit it).",
     )
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Model id sent in the request payload, overriding the "
+        "endpoint's auto-discovered name. Needed for endpoints that serve "
+        "multiple models (e.g. the PCAI LLM gateway), where discovery "
+        "picks an arbitrary one.",
+    )
     parser.add_argument("--url", default="", help="OpenAI-compatible base URL (root, no /v1).")
     parser.add_argument(
         "--api_key",
@@ -694,7 +702,11 @@ def build_model(args: argparse.Namespace):
     if args.remote:
         model.remote()
 
-    if not model.model_name:
+    if args.model:
+        # Explicit override wins (multi-model endpoints, e.g. the PCAI LLM
+        # gateway, where auto-discovery picks an arbitrary model).
+        model.model_name = args.model
+    elif not model.model_name:
         model.model_name = model._discover_model_name() or ""
         if not model.model_name:
             print("Warning: could not auto-discover the model name; using an empty model id.")

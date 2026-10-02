@@ -217,9 +217,9 @@ If you see either message on a hosted trial, it is the customer's platform polic
 
 ## Deployment targets
 
-### SE G2
+### Proxied corporate site
 
-The internal HPE "G2" PCAI cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`):
+A proxied corporate PCAI site (example values use placeholder addresses):
 
 - Proxied corporate egress: `proxy.http`/`proxy.https` point at the corporate proxy with the site's `no_proxy` list; `downloader.hf.verifyTls: false` is set explicitly because the MITM cert is untrusted (also applies to the catalog's GitHub fetch via `catalog.githubVerifyTls`, or leave it and accept the per-fetch default — the example sets the downloader knob).
 - Storage: both backends — the shared `models-pvc` (default) and MinIO at `http://minio.minio.svc.cluster.local:9000`, bucket `mlis-models`, prefix `large-models`.

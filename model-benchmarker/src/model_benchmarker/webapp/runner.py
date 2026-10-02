@@ -492,6 +492,14 @@ def build_chat_argv(
     users = _int_list(params, "number_users", 1, MAX_USERS) or [1]
     argv += ["--number_users", ",".join(str(u) for u in users)]
 
+    model_id = _capped_str(params, "model", 200)
+    if model_id:
+        # wider than _TOKEN_RE: gateway ids may be HF-style (org/name) or
+        # contain @,+,~ — anything but whitespace/control chars and quotes
+        if not re.fullmatch(r"[A-Za-z0-9_.:@+~/-]{1,200}", model_id):
+            raise BenchError("model: use the model id as the endpoint serves it (e.g. qwen3-32b)")
+        argv += ["--model", model_id]
+
     rpu = _int_in(params, "requests_per_user", 1, 100)
     if rpu is not None:
         argv += ["--requests_per_user", str(rpu)]

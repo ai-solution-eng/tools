@@ -494,3 +494,34 @@ class TestQueueSubmitGate:
             assert svc.pending == [("ns", 4321)]
 
         asyncio.run(go())
+
+    def test_submit_passes_dicts_not_jobrecords_to_preflight(self):
+        """Regression: with a tracked job in the map, the next submit handed
+        preflight raw JobRecord objects, and usage_by_namespace died on
+        job.get("namespace") — 'JobRecord' object has no attribute 'get'."""
+
+        class CapturingService:
+            def __init__(self):
+                self.captured = None
+
+            async def check(self, **kwargs):
+                self.captured = kwargs.get("jobs")
+                return {"estimate_bytes": None}
+
+            def record_usage_delta(self, *a, **k):
+                pass
+
+            def record_pending(self, *a, **k):
+                pass
+
+        async def go():
+            q = self._queue()
+            svc = CapturingService()
+            first = await q.submit("ns", "acme/M", "tok", preflight=svc)
+            assert first.id in q.jobs  # a tracked live job is what triggers it
+            await q.submit("ns", "acme/M2", "tok", preflight=svc)
+            assert svc.captured
+            assert all(isinstance(j, dict) for j in svc.captured)
+            assert svc.captured[0]["model_name"] == "acme/M"
+
+        asyncio.run(go())

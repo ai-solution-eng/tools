@@ -18,7 +18,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
-  tag: v0.4.5
+  tag: v0.6.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

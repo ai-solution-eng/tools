@@ -127,6 +127,19 @@ def test_chat_builder_open_requires_rate(tmp_path):
         R.build_chat_argv(_url(), {"arrival_mode": "open"}, tmp_path)
 
 
+def test_chat_builder_model_override(tmp_path):
+    argv, _, _ = R.build_chat_argv(_url(), {"model": "Qwen/Qwen3-32B"}, tmp_path)
+    assert "--model Qwen/Qwen3-32B" in " ".join(argv)
+    # absent param -> no flag (auto-discovery keeps working)
+    argv2, _, _ = R.build_chat_argv(_url(), {}, tmp_path)
+    assert "--model" not in argv2
+
+
+def test_chat_builder_model_rejects_shell_junk(tmp_path):
+    with pytest.raises(R.BenchError, match="model"):
+        R.build_chat_argv(_url(), {"model": "x; rm -rf /"}, tmp_path)
+
+
 def test_chat_builder_task_whitelist(tmp_path):
     with pytest.raises(R.BenchError, match="unknown task"):
         R.build_chat_argv(_url(), {"tasks": "coding;rm -rf"}, tmp_path)
