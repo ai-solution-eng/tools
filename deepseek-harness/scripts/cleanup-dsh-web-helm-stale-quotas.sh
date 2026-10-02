@@ -1,51 +1,47 @@
 #!/bin/sh
-# cleanup-opencode-web-helm-stale-quotas.sh
+# cleanup-dsh-web-helm-stale-quotas.sh
 #
-# Clears stale VAST quotas left behind by repeated opencode-web-helm installs.
+# Clears stale VAST quotas left behind by repeated dsh-web-helm installs.
 #
 # Background:
 #   The VAST CSI driver truncates volume/quota names at 64 chars
 #   (csi:<namespace>:<pvc-name>:pvc-<uid>), which can cut off the unique PVC-UID
 #   suffix. Leftover quotas from previous installs then collide with new
 #   CreateVolume calls ("Quota name must be unique per tenant"), leaving PVCs
-#   Pending and opencode warm-pool pods unschedulable.
+#   Pending and dsh warm-pool pods unschedulable.
 #
 # What this script does:
 #   1. Reads the VMS endpoint + credentials from the gl4f-csi/gl4f-mgmt secret
 #      (works from any node with kubectl access to the cluster).
 #   2. Lists BOUND PVCs in the target namespace -> protects their quotas.
-#   3. Deletes every VAST quota under 'csi:<namespace>:' that belongs to an
-#      opencode-web-helm-managed PVC but does not belong to a currently Bound
-#      PVC (and optionally the legacy 'csi:opencode-web-helm:*' quotas from a
-#      namespace that no longer exists).
-#   4. Optionally deletes Pending (unbound) PVCs so the opencode-web-helm
-#      controller recreates them fresh.
+#   3. Deletes every VAST quota under 'csi:<namespace>:' that does not belong
+#      to a currently Bound PVC (and optionally the legacy 'csi:dsh-web-helm:*'
+#      quotas from a namespace that no longer exists).
+#   4. Optionally deletes Pending (unbound) PVCs so the dsh-web controller
+#      recreates them fresh.
 #
 # SAFETY:
 #   - Dry run by default. Nothing is deleted without --apply.
-#   - Chart-scope allowlist: only quotas whose PVC-name segment starts with
-#     'opencode' (opencode-v2-*, opencode-web-helm-shared-pvc, warm-pool
-#     units, ...) are deletion candidates. Quotas of anything else in the
-#     namespace (platform PVCs like user-pvc, default-notebook-*, kubeflow-*)
-#     are SKIPPED and printed, never deleted — even when their names are
-#     truncated so hard that ownership cannot be proven.
+#   - Only quotas whose name starts with the exact target prefixes are touched.
+#     Quotas of every other namespace (project-user-*, monitoring, ...) are
+#     never matched.
 #   - Quotas of Bound PVCs are always protected, including truncated names
 #     (matched by prefix against the full expected quota name).
 #
 # Requirements: sh (POSIX), kubectl, curl, jq, network access to VMS :443.
 #
 # Usage:
-#   ./cleanup-opencode-web-helm-stale-quotas.sh                 # dry run
-#   ./cleanup-opencode-web-helm-stale-quotas.sh --apply         # delete
-#   ./cleanup-opencode-web-helm-stale-quotas.sh --apply --reset-pvcs
-#   ./cleanup-opencode-web-helm-stale-quotas.sh --namespace opencode-web-helm
+#   ./cleanup-dsh-web-helm-stale-quotas.sh                 # dry run
+#   ./cleanup-dsh-web-helm-stale-quotas.sh --apply         # delete
+#   ./cleanup-dsh-web-helm-stale-quotas.sh --apply --reset-pvcs
+#   ./cleanup-dsh-web-helm-stale-quotas.sh --namespace dsh-web-helm
 
 set -eu
 
-NS=opencode-web-helm
+NS=dsh-web-helm
 SECRET_NS=gl4f-csi
 SECRET=gl4f-mgmt
-LEGACY_PREFIX='csi:opencode-web-helm:'
+LEGACY_PREFIX='csi:dsh-web-helm:'
 APPLY=0
 RESET_PVCS=0
 SKIP_LEGACY=0
@@ -59,9 +55,9 @@ usage() {
     cat <<EOF
 usage: $0 [options]
   --apply            actually delete stale quotas (default: dry run)
-  --namespace NS     target k8s namespace (default: opencode-web-helm)
+  --namespace NS     target k8s namespace (default: dsh-web-helm)
   --reset-pvcs       after cleanup, delete Pending PVCs so they are recreated
-  --skip-legacy      do not touch legacy 'csi:opencode-web-helm:*' quotas
+  --skip-legacy      do not touch legacy 'csi:dsh-web-helm:*' quotas
   -h, --help         this help
 EOF
     exit 1
@@ -141,7 +137,7 @@ fetch_quotas > "$QUOTA_FILE"
 # Everything else under the target prefix is stale — BUT only if the quota's
 # PVC segment belongs to a chart this script manages (see allowlist below).
 # The chart-scope guard exists so that quota names this script cannot map to
-# an opencode PVC (e.g. platform PVCs like user-pvc, default-notebook-*,
+# a dsh/opencode PVC (e.g. platform PVCs like user-pvc, default-notebook-*,
 # whose truncation can even hide the uid entirely) are NEVER deletion
 # candidates, regardless of Bound/Pending state.
 awk -F'\t' -v ns="$NS" '
@@ -160,11 +156,11 @@ awk -F'\t' -v ns="$NS" '
         if (index(name, "csi:" ns ":") != 1) next
         # Chart-scope allowlist: the quota is only eligible for deletion when
         # its PVC-name segment (between the second and third ":") starts with
-        # the chart-managed prefix. Everything else (platform PVCs, notebooks,
-        # anything foreign to opencode) is skipped and reported as SKIPPED.
+        # a chart-managed prefix. Everything else (platform PVCs, notebooks,
+        # anything foreign to dsh/opencode) is skipped and reported as SKIPPED.
         rest = name; sub(/^csi:[^:]*:/, "", rest)
         pvcseg = rest; sub(/:.*/, "", pvcseg)
-        if (pvcseg !~ /^opencode(-|$)/) {
+        if (pvcseg !~ /^(dsh|opencode)(-|$)/) {
             print "SKIPPED\t" name > "/dev/stderr"
             next
         }
@@ -177,15 +173,15 @@ awk -F'\t' -v ns="$NS" '
     }
 ' "$BOUND_FILE" "$QUOTA_FILE" > "$STALE_FILE"
 
-# Legacy 'csi:opencode-web-helm:*' quotas (legacy namespace no longer exists).
+# Legacy 'csi:dsh-web-helm:*' quotas (legacy namespace no longer exists).
 # Same chart-scope rule applies: only delete when the PVC segment looks like a
-# chart-managed claim (opencode-v2-* / opencode-web-helm-shared-pvc style).
-if [ "$SKIP_LEGACY" != "1" ] && [ "$NS" != "opencode-web-helm" ]; then
+# chart-managed claim (dsh-v2-* / dsh-web-helm-shared-pvc style names).
+if [ "$SKIP_LEGACY" != "1" ] && [ "$NS" != "dsh-web-helm" ]; then
     awk -F'\t' '
-        $2 ~ /^csi:opencode-web-helm:/ {
+        $2 ~ /^csi:dsh-web-helm:/ {
             rest = $2; sub(/^csi:[^:]*:/, "", rest)
             pvcseg = rest; sub(/:.*/, "", pvcseg)
-            if (pvcseg ~ /^opencode(-|$)/) print $1 "\t" $2
+            if (pvcseg ~ /^(dsh|opencode)(-|$)/) print $1 "\t" $2
         }
     ' "$QUOTA_FILE" >> "$STALE_FILE"
 fi
@@ -224,7 +220,7 @@ if [ "$RESET_PVCS" = "1" ]; then
         | jq -r '.items[] | select(.spec.volumeName == null or .spec.volumeName == "") | .metadata.name' || true)
     if [ -n "$PENDING" ]; then
         echo
-        echo "==> Deleting Pending PVCs (opencode-web-helm controller recreates them):"
+        echo "==> Deleting Pending PVCs (dsh-web controller recreates them):"
         echo "$PENDING"
         echo "$PENDING" | xargs kubectl -n "$NS" delete pvc
     fi

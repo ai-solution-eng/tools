@@ -15,8 +15,8 @@ data:
 {{ $content | toString | indent 4 }}
   {{- end }}
 {{- end }}
-  # Seed script for PER-NAMESPACE shared PVCs (platform integration:
-  # each SSO user's unit mounts its own <release>-shared-pvc inside
+  # Seed script for PER-NAMESPACE shared PVCs (platform integration, Option
+  # B: each SSO user's unit mounts its own <release>-shared-pvc inside
   # project-user-<name>; the unit init runs this script against the mirrored
   # copy of this ConfigMap). Rendered at helm time so the configmap-key →
   # path mapping (dots → dirs) stays exact. cp -n = seed-once: user edits in
@@ -24,7 +24,7 @@ data:
   seed.sh: |
     #!/bin/sh
     set -e
-    SEED_SRC="${1:-/opencode-shared-seed}"
+    SEED_SRC="${1:-/dsh-shared-seed}"
     SEED_DST="${2:-/workspace/shared}"
     mkdir -p "$SEED_DST"
 {{- range $path, $_ := .Files.Glob "shared/**" }}

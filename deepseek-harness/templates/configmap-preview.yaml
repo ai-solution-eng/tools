@@ -8,6 +8,9 @@ metadata:
     hpe-ezua/app: {{ .Chart.Name }}
 data:
   nginx.conf: |
+    # Non-root-safe (admission-forced tenant uid on some clusters): pid file
+    # and temp paths under /tmp (pid), everything else is emptyDir-mounted.
+    pid /tmp/nginx.pid;
     worker_processes 1;
     events {
       worker_connections 1024;
@@ -21,6 +24,14 @@ data:
         listen 8082;
         server_name _;
 
+        # All redirects issued here (e.g. `return 302 /__dsh_boot`) must stay
+        # RELATIVE: with absolute_redirect on (the default) nginx expands
+        # them into http://<host>:8082/..., a port unreachable from outside
+        # the pod (the gateway terminates TLS on 443 and the router proxies
+        # to 8082). Relative Locations keep the browser on the public origin.
+        absolute_redirect off;
+        port_in_redirect off;
+
         # --- Single in-pod entry point -------------------------------------
         # Every request to this pod (UI, terminal, data manager, previews) is
         # gated by the signed session cookie validated by the in-pod auth
@@ -29,9 +40,9 @@ data:
 
         # Unauthenticated / expired session on a pod host -> send to the main
         # login page instead of showing an error.
-        error_page 401 = @oc_login;
-        location @oc_login {
-        # $host = the host the user came in on (the main opencode host in
+        error_page 401 = @dsh_login;
+        location @dsh_login {
+        # $host = the host the user came in on (the main dsh host in
         # every user-facing routing context). Deliberately NOT tied to the
         # ezua.virtualService.endpoint value: it ships as a platform-pipeline
         # placeholder, which breaks hand-applied ConfigMaps (nginx fails on
@@ -47,8 +58,8 @@ data:
           proxy_set_header Cookie $http_cookie;
         }
 
-        # UI port: OpenChamber on 3000 (chamber mode) or opencode web on 4096.
-        set $ui_port {{ if eq .Values.ui.mode "openchamber" }}3000{{ else }}4096{{ end }};
+        # UI port: dsh web on 3080 (loopback) behind the in-pod nginx.
+        set $ui_port {{ .Values.dsh.port | default 3080 }};
 
         # --- UI ------------------------------------------------------------
         location ^~ /terminal {
@@ -78,10 +89,19 @@ data:
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_buffering off;
         }
-        # Legacy underscore path: redirect pre-rename bookmarks to the new route.
+        # Legacy /data_manager (underscore) — renamed to /data-manager in
+        # 0.4.14. Proxied AS-IS (no 301): a redirect would rewrite POST→GET
+        # and corrupt upload/archive/mkdir/delete/rename calls still coming
+        # from browser-cached SPA copies. data_manager.mjs aliases the
+        # legacy prefix in-app instead.
         location ^~ /data_manager {
-          rewrite ^/data_manager(/.*)$ /data-manager$1 permanent;
-          return 301 /data-manager;
+          proxy_pass http://127.0.0.1:7682;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_buffering off;
         }
         location ~ ^/__preview/(?<preview_port>[0-9]+)(?<preview_rest>.*)$ {
           if ($preview_port !~ '^[1-9][0-9]{3,4}$') {
@@ -106,21 +126,59 @@ data:
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection $connection_upgrade;
-          proxy_set_header Authorization "Basic {{ printf "%s:%s" .Values.auth.username .Values.auth.password | b64enc }}";
+          proxy_intercept_errors on;
+          # dsh web requires its per-process launch-token cookie. The platform
+          # session cookie was already validated by auth_request above, so a
+          # first-time navigation that dsh answers with 401 is redirected to
+          # /__dsh_boot, which exchanges the token server-side. API/XHR calls
+          # (Accept: application/json) surface the 401 as-is.
+          error_page 401 = @dsh_boot;
           proxy_buffering off;
           proxy_read_timeout 660s;
           proxy_send_timeout 660s;
+        }
+
+        # Launch-token exchange: the auth validator (7684) holds the dsh web
+        # token captured by the supervisor, performs the exchange SERVER-SIDE
+        # (capturing dsh's session cookie) and redirects the browser straight
+        # into /<slug>/ — the unit root — fully authenticated.
+        location = /__dsh_boot {
+          proxy_pass http://127.0.0.1:7684/boot;
+          proxy_pass_request_body off;
+          proxy_set_header Content-Length "";
+          proxy_set_header Cookie $http_cookie;
+          proxy_set_header Host $host;
+        }
+        # Named handler for `error_page 401 = @dsh_boot` in location /:
+        # bounce the browser to the exchange endpoint above (a normal
+        # location, so auth_request re-validates the platform session).
+        location @dsh_boot {
+          return 302 /__dsh_boot;
+        }
+
+        # Readiness probe target. dsh web answers 401 for cookieless requests
+        # (its index is auth-gated), so the probe cannot hit dsh directly;
+        # instead the auth validator performs the check server-side — it
+        # knows the current launch token and fetches dsh's token URL itself:
+        # 200 = dsh web accepting connections, 503 = booting/crashed. No
+        # secrets are exposed (status codes only).
+        location = /healthz {
+          auth_request off;
+          proxy_pass http://127.0.0.1:7684/dsh-health;
+          proxy_connect_timeout 2s;
+          proxy_read_timeout 4s;
         }
       }
     }
   auth_validator.mjs: |
     import http from 'node:http'
     import crypto from 'node:crypto'
+    import fs from 'node:fs'
 
     const PORT = Number(process.env.AUTH_VALIDATOR_PORT || '7684')
     const SECRET = process.env.SESSION_KEY || ''
     const MY_SLUG = process.env.USER_SLUG || ''
-    const COOKIE = 'oc_sess'
+    const COOKIE = 'dsh_sess'
 
     function readCookie(req) {
       const header = req.headers.cookie || ''
@@ -155,7 +213,143 @@ data:
       return true
     }
 
-    http.createServer((req, res) => {
+    // dsh web prints its one-time launch URL on stdout; the supervisor
+    // extracts it and hands it over via DSH_BOOT_URL. /boot validates the
+    // PLATFORM session first, then performs the token exchange SERVER-SIDE
+    // (capturing dsh's session cookie) and 302s the browser straight into
+    // /<slug>/ — fully authenticated, no main-host detour.
+    const BOOT_STATE_FILE = process.env.DSH_BOOT_STATE_FILE || '/var/dsh/state/dsh-boot-url'
+    const BOOT_PATH = process.env.AUTH_BOOT_PATH || '/boot'
+    // Readiness endpoint: cookieless (kube-probe), performs a server-side
+    // fetch of dsh's token URL — 200 when dsh's HTTP stack accepts
+    // connections, 503 while booting or crashed. No secrets exposed.
+    const DSH_HEALTH_PATH = process.env.AUTH_DSH_HEALTH_PATH || '/dsh-health'
+
+    function bootUrl() {
+      if (!fs) return ''
+      try {
+        return fs.readFileSync(BOOT_STATE_FILE, 'utf8').trim()
+      } catch {
+        return ''
+      }
+    }
+
+    function isJsonRequest(req) {
+      return /application\/json|text\/event-stream/i.test(req.headers.accept || '')
+    }
+
+    const server = http.createServer((req, res) => {
+      if (req.url === DSH_HEALTH_PATH) {
+        // Cookieless readiness check for the kubelet: verify dsh web is
+        // accepting connections by fetching its token URL server-side (any
+        // HTTP response — 302 exchange redirect, 401, whatever — proves the
+        // stack is up; connection errors mean still booting or crashed).
+        const url = bootUrl()
+        if (!url) {
+          res.writeHead(503, { 'content-type': 'text/plain' })
+          res.end('dsh boot URL not available yet')
+          return
+        }
+        fetch(url, { signal: AbortSignal.timeout(2500) })
+          .then((resp) => {
+            res.writeHead(200, { 'content-type': 'text/plain' })
+            res.end(`dsh web up (status ${resp.status})`)
+          })
+          .catch((err) => {
+            res.writeHead(503, { 'content-type': 'text/plain' })
+            res.end(`dsh web not accepting connections: ${err.message}`)
+          })
+        return
+      }
+      if (req.url === BOOT_PATH) {
+        // Only page navigations may consume the boot redirect; API calls get
+        // a plain 401 so clients never follow the token exchange.
+        if (!valid(req)) {
+          res.writeHead(401, { 'content-type': 'text/plain' })
+          res.end('unauthorized')
+          return
+        }
+        const url = bootUrl()
+        if (!url) {
+          res.writeHead(503, { 'content-type': 'text/plain' })
+          res.end('dsh boot URL not available yet')
+          return
+        }
+        if (isJsonRequest(req)) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'dsh session missing; reload the page' }))
+          return
+        }
+        // Exchange the launch token SERVER-SIDE (the same mechanism the
+        // readiness probe uses), capture dsh's session cookie, and redirect
+        // the browser straight into the unit's prefixed path. The old flow
+        // bounced the browser through /?token=... on the MAIN host, where
+        // dsh's own post-exchange redirect to / landed on the ROUTER's login
+        // menu — so the first login after logout always stranded the user one
+        // click away ("Open your environment") even though the session was
+        // already live. Landing on /<slug>/ keeps the entire boot flow inside
+        // the unit. dsh prints its launch URL with the canonical loopback
+        // host (http://127.0.0.1:3080/...), unreachable from the browser;
+        // only the path+query carry the token — which is exactly what this
+        // server-side exchange consumes. (An empty USER_SLUG never reaches
+        // here: valid() fail-closes on it above.)
+        //
+        // Two hard-won constraints:
+        //  1. The exchange must carry the PUBLIC Host (nginx forwards $host
+        //     onto /__dsh_boot) — dsh validates it against DSH_TRUSTED_HOSTS
+        //     and refuses a loopback Host (observed live: 403, no cookie).
+        //  2. dsh answers the exchange with 303 See Other (NOT 302) — do not
+        //     status-match strictly; follow the redirect chain (max 3 hops)
+        //     and stop as soon as any response carries Set-Cookie. If the
+        //     chain ends without a cookie, fail VISIBLY (503) — a cookieless
+        //     redirect into the unit would bounce straight back here forever.
+        const exchangeStart = new URL(url)
+        const exchangeHost = req.headers.host || exchangeStart.host
+        const exchangeGet = (current) => new Promise((resolve, reject) => {
+          const r = http.request({
+            host: '127.0.0.1',
+            port: current.port || '3080',
+            path: current.pathname + current.search,
+            method: 'GET',
+            headers: { host: exchangeHost, 'x-forwarded-proto': 'https' },
+          }, resolve)
+          r.on('error', reject)
+          r.setTimeout(5000, () => r.destroy(new Error('exchange timeout')))
+          r.end()
+        })
+        ;(async () => {
+          try {
+            let current = exchangeStart
+            const cookies = []
+            let lastStatus = 0
+            for (let hop = 0; hop < 3; hop++) {
+              const resp = await exchangeGet(current)
+              lastStatus = resp.statusCode
+              if (resp.headers['set-cookie']?.length) {
+                cookies.push(...resp.headers['set-cookie'])
+                break // dsh set its session cookie — the browser takes it from here
+              }
+              const loc = resp.headers.location
+              if (loc && [301, 302, 303, 307, 308].includes(resp.statusCode)) {
+                current = new URL(loc, current)
+                continue
+              }
+              break
+            }
+            if (!cookies.length) {
+              res.writeHead(503, { 'content-type': 'text/plain' })
+              res.end(`token exchange failed (dsh answered ${lastStatus}, no session cookie); reload to retry`)
+              return
+            }
+            res.writeHead(302, { location: `/${MY_SLUG}/`, 'set-cookie': cookies })
+            res.end()
+          } catch {
+            res.writeHead(503, { 'content-type': 'text/plain' })
+            res.end('dsh web did not accept the token exchange; reload to retry')
+          }
+        })()
+        return
+      }
       if (valid(req)) {
         res.writeHead(200, { 'content-type': 'text/plain' })
         res.end('ok')
@@ -163,7 +357,8 @@ data:
         res.writeHead(401, { 'content-type': 'text/plain' })
         res.end('unauthorized')
       }
-    }).listen(PORT, '127.0.0.1', () => {
+    })
+    server.listen(PORT, '127.0.0.1', () => {
       console.log(`[auth_validator] listening on 127.0.0.1:${PORT} slug=${MY_SLUG}`)
     })
   port_watcher.mjs: |
@@ -172,7 +367,7 @@ data:
 
     const domain = process.env.PREVIEW_DOMAIN_SUFFIX || '{{ .Values.previewDomain }}'
     const userSlug = process.env.PREVIEW_USER_SLUG || 'shared'
-    const stateFile = process.env.PREVIEW_STATE_FILE || '/var/opencode/state/preview-ports.txt'
+    const stateFile = process.env.PREVIEW_STATE_FILE || '/var/dsh/state/preview-ports.txt'
     const minPort = Number(process.env.PREVIEW_MIN_PORT || '3000')
     const maxPort = Number(process.env.PREVIEW_MAX_PORT || '9999')
     const exclude = new Set(
@@ -184,15 +379,14 @@ data:
 
     function url(port) {
       // Build the URL from the host the UI is actually served on: the chart's
-      // VirtualService endpoint (PREVIEW_UI_HOST, e.g. opencode.<domain>).
-      // The old hardcoded `opencode.` prefix broke deployments whose endpoint
-      // moved off opencode.<domain>. opencode.<domain suffix> remains the
+      // VirtualService endpoint (PREVIEW_UI_HOST, e.g. deepseekharness.<domain>).
+      // The old hardcoded `dsh.` prefix broke deployments whose endpoint moved
+      // off dsh.<domain> (g2 claims it). dsh.<domain suffix> remains the
       // fallback when PREVIEW_UI_HOST is unset. Never render the Helm value
       // into this template literal: ezua.virtualService.endpoint ships as a
       // platform-pipeline placeholder and must stay runtime-configurable.
-      const host = process.env.PREVIEW_UI_HOST || `opencode.${domain}`
-      // Per-user prefix is the readable slug (the username); legacy
-      // /u-<hash> bookmarks are handled by the router, not here.
+      const host = process.env.PREVIEW_UI_HOST || `dsh.${domain}`
+      // Per-user prefix is the readable slug since v0.3.5 (was /u-<hash>).
       return `https://${host}/${userSlug}/__preview/${port}/`
     }
 
@@ -284,9 +478,9 @@ data:
     #!/bin/sh
     DOMAIN="${PREVIEW_DOMAIN_SUFFIX:-}"
     # Canonical public UI host (the chart's VirtualService endpoint, e.g.
-    # opencode.<domain>). Falls back to opencode.<domain> when unset.
-    UI_HOST="${PREVIEW_UI_HOST:-opencode.${DOMAIN}}"
-    STATE_FILE="${PREVIEW_STATE_FILE:-/var/opencode/state/preview-ports.txt}"
+    # deepseekharness.<domain>). Falls back to dsh.<domain> when unset.
+    UI_HOST="${PREVIEW_UI_HOST:-dsh.${DOMAIN}}"
+    STATE_FILE="${PREVIEW_STATE_FILE:-/var/dsh/state/preview-ports.txt}"
     USER_SLUG="${PREVIEW_USER_SLUG:-shared}"
 
     if [ "$#" -gt 1 ]; then
@@ -311,17 +505,36 @@ data:
     fi
 
     echo "No active preview ports detected."
-  opencode_supervisor.mjs: |
+  dsh_supervisor.mjs: |
     import { spawn } from 'node:child_process'
     import fs from 'node:fs'
     import net from 'node:net'
     import path from 'node:path'
+    import { createRequire } from 'node:module'
 
-    const primaryConfigPath = process.env.OPENCODE_CONFIG || process.env.OPENCODE_CONFIG_PATH || '/var/opencode/home/.config/opencode/opencode.json'
+    // dsh web binds loopback only (the CLI refuses --host 0.0.0.0); the
+    // in-pod nginx terminates user traffic and proxies to 127.0.0.1:$uiPort.
+    // The public hostname is passed via --trusted-host so dsh's Host/Origin
+    // browser-trust fence accepts proxied requests, and --no-open prevents
+    // the headless container from trying to launch a browser.
+    const primaryConfigPath = process.env.DSH_CONFIG || process.env.DSH_CONFIG_PATH || '/var/dsh/home/.dsh/settings.yaml'
     const configDir = path.dirname(primaryConfigPath)
+    // `.env` is a launch-environment layer: dsh reads it only when the
+    // process starts, so edits require a dsh restart to take effect —
+    // watching it here gives that automatically (same UX as settings.yaml).
+    //
+    // Watch model (v0.3.0): config FILES only — settings.yaml, .env, the
+    // web profile's cordis.patch.yml and dsh.profile manifest. Do NOT watch
+    // the profile tree: dsh writes session/runtime state into it
+    // continuously, and restarting on our own output is an endless loop
+    // (kills every session ~15s after it opens). Plugin add/remove changes
+    // dsh.profile (watched); deep plugin-file edits need a manual
+    // `pkill -f "dsh web"`. skills/ is not watched either — dsh
+    // hot-refreshes skills natively.
     const watchedConfigFiles = [
       ...new Set(
-        (process.env.OPENCODE_WATCH_CONFIG_FILES || 'opencode.json,config.json,opencode.jsonc')
+        (process.env.DSH_WATCH_CONFIG_FILES ||
+          'settings.yaml,.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile')
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean)
@@ -330,25 +543,31 @@ data:
     ]
     const watchedConfigDirs = [
       ...new Set(
-        (process.env.OPENCODE_WATCH_CONFIG_DIRS || 'skills,agents')
+        (process.env.DSH_WATCH_CONFIG_DIRS || '')
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean),
       ),
     ]
-    const uiMode = process.env.OPENCODE_UI_MODE || 'opencode'
-    const isChamber = uiMode === 'openchamber'
-    const webPort = Number(process.env.OPENCODE_WEB_PORT || process.env.OPENCODE_SERVER_PORT || '4096')
-    const webHost = process.env.OPENCODE_WEB_HOST || '0.0.0.0'
-    const portCheckHost = process.env.OPENCODE_WEB_CHECK_HOST || '127.0.0.1'
-    const chamberPort = Number(process.env.OPENCHAMBER_PORT || '3000')
-    const opencodeArgs = isChamber
-      ? ['--print-logs', 'serve', '--port', String(webPort), '--hostname', '127.0.0.1']
-      : ['--print-logs', 'web', '--port', String(webPort), '--hostname', webHost]
+    // dsh writes into profiles/web while booting; without a settle window
+    // the watcher restarts dsh mid-boot forever (2/3 pods, no token line).
+    const BOOT_SETTLE_MS = Number(process.env.DSH_BOOT_SETTLE_MS || '90000')
+    const uiPort = Number(process.env.DSH_UI_PORT || '3080')
+    const portCheckHost = process.env.DSH_UI_CHECK_HOST || '127.0.0.1'
+    const trustedHosts = (process.env.DSH_TRUSTED_HOSTS || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+    const BOOT_STATE_FILE = process.env.DSH_BOOT_STATE_FILE || '/var/dsh/state/dsh-boot-url'
+    const dshArgs = [
+      'web',
+      '--no-open',
+      '--port', String(uiPort),
+      ...trustedHosts.flatMap((host) => ['--trusted-host', host]),
+    ]
 
     let child = null
-    let chamberChild = null
-    let chamberBackoffMs = 1000
+    let lastStartAt = 0
     let restartTimer = null
     let restartInProgress = false
     let stopping = false
@@ -374,6 +593,7 @@ data:
 
     function readDirectorySignature(dirPath) {
       const entries = []
+
 
       function walk(currentPath, relativePath = '') {
         let dirEntries = []
@@ -416,12 +636,59 @@ data:
         .map((key) => key.replace(/^file:/, '').replace(/^dir:/, ''))
     }
 
+    // Validate the config before restarting dsh on change. settings.yaml is
+    // YAML (dsh's native format), NOT JSON — mirror opencode's JSON.parse
+    // validator with a real YAML parse instead of a textual guess. dsh bundles
+    // js-yaml (^4.2.0) in its install tree, so resolve it from there at
+    // runtime; if the parser is unavailable (fresh or broken install window),
+    // fall back to the non-empty sanity check. dsh itself tolerates and
+    // re-reads this file per request; a restart on change is a convenience,
+    // so a broken file simply skips the restart and dsh keeps running on the
+    // previous in-memory settings.
+    let yamlParser
+    function loadYamlParser() {
+      if (yamlParser !== undefined) return yamlParser
+      yamlParser = null
+      try {
+        const jsYaml = createRequire('/var/dsh/data/npm/lib/node_modules/@deepseek-ai/dsh/package.json')('js-yaml')
+        // Cordis patch files legitimately carry !!js expressions that dsh
+        // evaluates with its own loader; plain js-yaml rejects the unknown
+        // tag ("unknown tag tag:yaml.org,2002:js") and would permanently
+        // refuse every patch change. Register a permissive scalar type so
+        // validation stays STRUCTURAL — JS-expression correctness remains
+        // dsh's domain (it fails closed at boot with a clear error).
+        const JsTag = new jsYaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', resolve: () => true })
+        const patchAwareSchema = new jsYaml.Schema({ include: [jsYaml.DEFAULT_SCHEMA], explicit: [JsTag] })
+        yamlParser = { load: (text) => jsYaml.load(text, { schema: patchAwareSchema }) }
+      } catch (error) {
+        console.error(`[dsh] YAML validation unavailable (js-yaml not resolvable from the dsh install): ${error.message}`)
+      }
+      return yamlParser
+    }
     function isPrimaryConfigValid() {
       try {
-        JSON.parse(fs.readFileSync(primaryConfigPath, 'utf8'))
+        const content = fs.readFileSync(primaryConfigPath, 'utf8')
+        if (!content.trim()) {
+          console.error(`[dsh] skipping restart: ${primaryConfigPath} is empty`)
+          return false
+        }
+        const yaml = loadYamlParser()
+        if (yaml) {
+          try {
+            yaml.load(content)
+          } catch (error) {
+            console.error(`[dsh] skipping restart: ${primaryConfigPath} is not valid YAML: ${error.message}`)
+            return false
+          }
+        }
         return true
       } catch (error) {
-        console.error(`[opencode] skipping restart: ${primaryConfigPath} is invalid JSON: ${error.message}`)
+        if (error.code === 'ENOENT') {
+          // File removed — treat as "no settings yet"; restart is harmless
+          // and lets dsh regenerate defaults.
+          return true
+        }
+        console.error(`[dsh] skipping restart: cannot read ${primaryConfigPath}: ${error.message}`)
         return false
       }
     }
@@ -432,7 +699,7 @@ data:
 
     function isPortOpen() {
       return new Promise((resolve) => {
-        const socket = net.createConnection({ host: portCheckHost, port: webPort })
+        const socket = net.createConnection({ host: portCheckHost, port: uiPort })
         const finish = (open) => {
           socket.removeAllListeners()
           socket.destroy()
@@ -519,19 +786,19 @@ data:
     function canKillPortOwner(owner) {
       const command = owner.command.toLowerCase()
       if (!command) return false
-      if (command.includes('opencode_supervisor') || command.includes('port_watcher')) return false
-      if (command.includes('opencode')) return true
-      if ((command.includes('node') || command.includes('bun')) && command.includes(`--port ${webPort}`)) return true
+      if (command.includes('dsh_supervisor') || command.includes('port_watcher')) return false
+      if (command.includes('dsh')) return true
+      if ((command.includes('node') || command.includes('bun')) && command.includes(`--port ${uiPort}`)) return true
       return false
     }
 
     function signalPortOwners(signal) {
-      const owners = portOwnerProcesses(webPort)
+      const owners = portOwnerProcesses(uiPort)
       const eligible = owners.filter(canKillPortOwner)
 
       if (owners.length > 0) {
         console.log(
-          `[opencode] port ${webPort} owners: ${owners
+          `[dsh] port ${uiPort} owners: ${owners
             .map((owner) => `${owner.pid} ${owner.command || '<unknown>'}`)
             .join('; ')}`,
         )
@@ -539,10 +806,10 @@ data:
 
       for (const owner of eligible) {
         try {
-          console.log(`[opencode] sending ${signal} to port ${webPort} owner pid=${owner.pid}`)
+          console.log(`[dsh] sending ${signal} to port ${uiPort} owner pid=${owner.pid}`)
           process.kill(owner.pid, signal)
         } catch (error) {
-          console.error(`[opencode] failed to signal port ${webPort} owner pid=${owner.pid}`, error)
+          console.error(`[dsh] failed to signal port ${uiPort} owner pid=${owner.pid}`, error)
         }
       }
 
@@ -568,11 +835,11 @@ data:
       while (await isPortOpen()) {
         const elapsed = Date.now() - start
         if (cleanupOwners && !cleanupAttempted && elapsed >= timeoutMs) {
-          console.log(`[opencode] port ${webPort} is still busy after ${timeoutMs}ms; checking for orphaned web process`)
+          console.log(`[dsh] port ${uiPort} is still busy after ${timeoutMs}ms; checking for orphaned web process`)
           cleanupAttempted = true
           await cleanupPortOwner()
         } else if (elapsed >= timeoutMs && Date.now() - lastLogAt >= 10000) {
-          console.log(`[opencode] port ${webPort} is still busy after ${timeoutMs}ms; waiting`)
+          console.log(`[dsh] port ${uiPort} is still busy after ${timeoutMs}ms; waiting`)
           lastLogAt = Date.now()
         }
         await sleep(500)
@@ -589,108 +856,64 @@ data:
       }
     }
 
-    function opencodeServerEnv() {
-      if (!isChamber) return process.env
-      const env = { ...process.env }
-      delete env.OPENCODE_SERVER_PASSWORD
-      delete env.OPENCODE_SERVER_USERNAME
-      return env
-    }
-
-    function startChamber() {
-      console.log('[opencode] starting openchamber process')
-      const args = ['serve', '--port', String(chamberPort), '--host', '0.0.0.0', '--foreground']
-      const chamberEnv = {
-        ...process.env,
-        OPENCODE_HOST: `http://127.0.0.1:${webPort}`,
-        OPENCODE_SKIP_START: 'true',
-      }
-      const proc = spawn('/usr/local/bin/openchamber', args, {
-        detached: true,
-        stdio: 'inherit',
-        env: chamberEnv,
-      })
-      chamberChild = proc
-
-      proc.on('error', (error) => {
-        console.error(`[opencode] failed to spawn openchamber: ${error.message}`)
-        if (chamberChild === proc) chamberChild = null
-        if (!stopping && !restartInProgress) {
-          const delay = chamberBackoffMs
-          chamberBackoffMs = Math.min(chamberBackoffMs * 2, 15000)
-          setTimeout(() => {
-            if (chamberChild === null) startChamber()
-          }, delay)
-        }
-      })
-
-      proc.on('exit', (code, signal) => {
-        if (chamberChild === proc) chamberChild = null
-        if (!stopping && !restartInProgress) {
-          const delay = chamberBackoffMs
-          chamberBackoffMs = Math.min(chamberBackoffMs * 2, 15000)
-          console.log(`[opencode] openchamber exited code=${code} signal=${signal}; restarting in ${delay}ms`)
-          setTimeout(() => {
-            if (chamberChild === null) startChamber()
-          }, delay)
-        }
-      })
-
-      setTimeout(() => {
-        if (chamberChild === proc) chamberBackoffMs = 1000
-      }, 10000)
-    }
-
-    function stopChamber() {
-      return new Promise((resolve) => {
-        if (!chamberChild) {
-          resolve()
-          return
-        }
-
-        const proc = chamberChild
-        let done = false
-        const finish = () => {
-          if (done) return
-          done = true
-          if (chamberChild === proc) chamberChild = null
-          resolve()
-        }
-
-        const timeout = setTimeout(() => {
-          signalProcessGroup(proc, 'SIGKILL')
-        }, 5000)
-
-        proc.once('exit', finish)
-
-        try {
-          signalProcessGroup(proc, 'SIGTERM')
-        } catch {
-          finish()
-        }
-      })
-    }
-
-    async function startOpencode() {
+    async function startDsh() {
       await waitForPortFree(30000, true)
       if (stopping || child) return
 
-      console.log('[opencode] starting web process')
-      const proc = spawn('/usr/local/bin/opencode', opencodeArgs, {
+      console.log('[dsh] starting dsh web process')
+      // Strip the corporate proxy from dsh's environment: the pod-level
+      // HTTP(S)_PROXY (set for apt/npm installs) would route dsh's model
+      // requests through Zscaler, whose DNS cannot resolve in-cluster
+      // service names — dsh's proxy resolution applies HTTPS_PROXY globally
+      // and does NOT honor NO_PROXY, so '.svc.cluster.local' model
+      // endpoints died with "502 DNS error". Model baseURLs are in-cluster
+      // service URLs; direct egress is the correct path. Opt back in with
+      // DSH_KEEP_PROXY=1 if a deployment ever needs proxied egress for dsh.
+      const dshEnv = { ...process.env }
+      if (process.env.DSH_KEEP_PROXY !== '1') {
+        for (const key of ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
+          delete dshEnv[key]
+        }
+      }
+      const proc = spawn('/usr/local/bin/dsh', dshArgs, {
         detached: true,
-        stdio: 'inherit',
-        env: opencodeServerEnv(),
+        stdio: ['ignore', 'pipe', 'inherit'],
+        cwd: '/workspace/personal',
+        env: dshEnv,
       })
       child = proc
+      lastStartAt = Date.now()
+      let outBuf = ''
+      proc.stdout.on('data', (chunk) => {
+        const text = chunk.toString()
+        // dsh prints its one-time launch URL (with ?token=...) on stdout;
+        // pass it to the auth validator via the state file so the in-pod
+        // nginx /__dsh_boot endpoint can exchange it for new browsers.
+        process.stdout.write(text)
+        outBuf += text
+        const match = outBuf.match(/https?:\/\/[^\s'"<>]*token=[^\s'"<>]+/)
+        if (match) {
+          const url = match[0]
+          try {
+            fs.mkdirSync(path.dirname(BOOT_STATE_FILE), { recursive: true })
+            fs.writeFileSync(BOOT_STATE_FILE, url)
+          } catch (error) {
+            console.error('[dsh] failed to persist boot URL', error)
+          }
+          outBuf = ''
+        } else if (outBuf.length > 64 * 1024) {
+          outBuf = outBuf.slice(-4096)
+        }
+      })
 
       proc.on('exit', (code, signal) => {
         if (child === proc) child = null
         if (!stopping && !restartInProgress) {
           const delay = restartBackoffMs
           restartBackoffMs = Math.min(restartBackoffMs * 2, 15000)
-          console.log(`[opencode] web process exited code=${code} signal=${signal}; restarting in ${delay}ms`)
+          console.log(`[dsh] web process exited code=${code} signal=${signal}; restarting in ${delay}ms`)
           setTimeout(() => {
-            startOpencode().catch((error) => console.error('[opencode] restart failed', error))
+            startDsh().catch((error) => console.error('[dsh] restart failed', error))
           }, delay)
         }
       })
@@ -700,7 +923,7 @@ data:
       }, 10000)
     }
 
-    function stopOpencode() {
+    function stopDsh() {
       return new Promise((resolve) => {
         if (!child) {
           resolve()
@@ -738,31 +961,64 @@ data:
       restartTimer = setTimeout(async () => {
         if (restartInProgress) return
         restartInProgress = true
-        console.log(`[opencode] ${reason}; restarting web process`)
-        await stopOpencode()
-        if (!stopping) await startOpencode()
+        console.log(`[dsh] ${reason}; restarting web process`)
+        await stopDsh()
+        if (!stopping) await startDsh()
         restartInProgress = false
       }, 750)
     }
 
+    // User FILE edits (settings.yaml/.env) detected during the boot settle
+    // window are QUEUED here and fire as soon as the window ends — never
+    // dropped. dir:profiles/web churn (dsh's own boot writes) stays absorbed.
+    let pendingRestart = null
+
     function maybeRestart() {
       const nextSignature = readConfigSignature()
       const changedFiles = changedConfigFiles(nextSignature)
-      if (changedFiles.length === 0) return
       lastConfigSignature = nextSignature
+      const inGrace = Date.now() - lastStartAt < BOOT_SETTLE_MS
+      const userFileEdits = changedFiles.filter((key) => key.startsWith('file:'))
+      if (inGrace) {
+        if (userFileEdits.length) pendingRestart = userFileEdits.join(', ')
+        if (changedFiles.length || pendingRestart) {
+          console.log(`[dsh] ignoring changes during boot settle window: ${[...new Set([...changedFiles, ...(pendingRestart ? [pendingRestart] : [])])].join(', ')}`)
+        }
+        return
+      }
+      const reason = [...new Set([...(pendingRestart ? [pendingRestart] : []), ...changedFiles])].filter(Boolean).join(', ')
+      pendingRestart = null
+      if (!reason) return
       if (!isPrimaryConfigValid()) return
-      scheduleRestart(`config changed: ${changedFiles.join(', ')}`)
+      // Changed YAML files (e.g. profiles/web/cordis.patch.yml) must parse
+      // before dsh sees them: booting on a broken patch fails dsh startup
+      // and puts the supervisor into a restart loop. Same js-yaml as
+      // settings.yaml; skipped when the parser is unavailable (the fresh/
+      // broken-install fallback), matching isPrimaryConfigValid's posture.
+      for (const changedFile of changedFiles) {
+        if (changedFile === path.basename(primaryConfigPath) || !/\.ya?ml$/.test(changedFile)) continue
+        const yaml = loadYamlParser()
+        if (!yaml) break
+        try {
+          yaml.load(fs.readFileSync(path.join(configDir, changedFile), 'utf8'))
+        } catch (error) {
+          console.error(`[dsh] skipping restart: ${changedFile} is not valid YAML: ${error.message}`)
+          return
+        }
+      }
+      scheduleRestart(`config changed: ${reason}`)
     }
 
     try {
-      fs.watch(configDir, (_event, filename) => {
-        const changedFile = filename?.toString()
-        if (!changedFile || watchedConfigFiles.includes(changedFile)) {
-          setTimeout(() => maybeRestart(), 250)
-        }
+      // Instant trigger for top-level files (settings.yaml, .env). Deeper
+      // changes (profiles/web tree) are caught by the 3s signature poll —
+      // fs.watch is non-recursive on Linux. Extra triggers are cheap:
+      // maybeRestart diffs signatures and no-ops when nothing watched moved.
+      fs.watch(configDir, () => {
+        setTimeout(() => maybeRestart(), 250)
       })
     } catch (error) {
-      console.error('[opencode] config watch setup failed', error)
+      console.error('[dsh] config watch setup failed', error)
     }
 
     setInterval(() => maybeRestart(), 3000)
@@ -770,18 +1026,15 @@ data:
     async function shutdown(signal) {
       stopping = true
       clearTimeout(restartTimer)
-      console.log(`[opencode] received ${signal}; stopping web process`)
-      await stopOpencode()
-      await stopChamber()
+      console.log(`[dsh] received ${signal}; stopping web process`)
+      await stopDsh()
       process.exit(0)
     }
 
     process.on('SIGINT', () => shutdown('SIGINT'))
     process.on('SIGTERM', () => shutdown('SIGTERM'))
 
-    startOpencode().then(() => {
-      if (isChamber) startChamber()
-    }).catch((error) => console.error('[opencode] start failed', error))
+    startDsh().catch((error) => console.error('[dsh] start failed', error))
 
   data_manager.mjs: |
     import http from 'node:http'
@@ -793,6 +1046,12 @@ data:
     const PORT = parseInt(process.env.DATA_MANAGER_PORT || '7682', 10)
     const HOST = '0.0.0.0'
     const BASE = '/data-manager'
+    // Legacy alias — the endpoint was renamed from /data_manager (underscore
+    // seen badly in URLs, chart 0.4.14). Normalized in-app in handleRequest
+    // (NOT via nginx 301, which would corrupt POST bodies from stale cached
+    // SPA copies): bookmarks and old cached pages keep working on either
+    // spelling. Filenames (data_manager.mjs/.html) intentionally unchanged.
+    const LEGACY_BASE = '/data_manager'
     const USER_SLUG = process.env.PREVIEW_USER_SLUG || ''
     const MAX_TEXT_SIZE = 5 * 1024 * 1024
     const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '1024', 10) * 1024 * 1024
@@ -800,11 +1059,13 @@ data:
     const BASE_ROOTS = [
       { key: 'personal', label: 'Personal', path: '/workspace/personal', navigable: true, shared: false },
       { key: 'shared', label: 'Shared', path: '/workspace/shared', navigable: true, shared: true },
-      { key: 'config', label: 'Config', path: '/var/opencode/home/.config', navigable: true, shared: false },
-      { key: 'state', label: 'State', path: '/var/opencode', navigable: false, shared: false },
+      // dsh home: settings.yaml, skills/, sessions — the opencode chart
+      // browsed ~/.config/opencode; the dsh equivalent is $DSH_HOME.
+      { key: 'config', label: 'DSH Home', path: '/var/dsh/home/.dsh', navigable: true, shared: false },
+      { key: 'state', label: 'State', path: '/var/dsh', navigable: false, shared: false },
     ]
 
-    // Platform volumes (PCAI/Kubeflow integration): mounted BY REFERENCE
+    // Platform volumes (integration study Option B): mounted BY REFERENCE
     // into SSO users' units from their platform project namespace. Their
     // write permissions are the PLATFORM's unix permissions — the unit
     // process runs as the project identity (uid parity with notebooks), so
@@ -820,8 +1081,8 @@ data:
     // 'off'     — classic units / local users (no platform roots, ever)
     // 'pending' — SSO unit whose platform workspace is not provisioned yet
     // 'mounted' — SSO unit with the platform volumes attached
-    const PLATFORM_ROOTS_MODE = (process.env.OPENCODE_PLATFORM_ROOTS || 'off').toLowerCase()
-    const PLATFORM_ROOTS_READONLY = (process.env.OPENCODE_PLATFORM_ROOTS_READONLY || 'false') === 'true'
+    const PLATFORM_ROOTS_MODE = (process.env.DSH_PLATFORM_ROOTS || 'off').toLowerCase()
+    const PLATFORM_ROOTS_READONLY = (process.env.DSH_PLATFORM_ROOTS_READONLY || 'false') === 'true'
 
     let ROOTS = []
     let NAVIGABLE_ROOTS = []
@@ -850,7 +1111,7 @@ data:
       const root = PLATFORM_ROOTS.find((r) => safePath === r.path || safePath.startsWith(r.path + path.sep))
       return root ? 'Platform volumes are mounted read-only (platformIntegration.readOnly=true)' : null
     }
-
+    
     let storageCache = null
     let storageCacheTime = 0
     const STORAGE_CACHE_MS = 2000
@@ -1082,6 +1343,11 @@ data:
         sendError(res, 403, 'Forbidden path')
         return
       }
+      const blocked = platformWriteBlocked(safePath)
+      if (blocked) {
+        sendError(res, 403, blocked)
+        return
+      }
     
       const contentType = req.headers['content-type'] || ''
       const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/)
@@ -1117,11 +1383,6 @@ data:
         const safeFilePath = await resolveSafe(filePath)
         if (!safeFilePath) {
           uploaded.push({ name: part.filename, error: 'Forbidden path' })
-          continue
-        }
-        const blocked = platformWriteBlocked(safeFilePath)
-        if (blocked) {
-          uploaded.push({ name: part.filename, error: blocked })
           continue
         }
         await fsp.mkdir(path.dirname(safeFilePath), { recursive: true })
@@ -1324,23 +1585,27 @@ data:
     }
     
     let spaHtml = null
-    
+
     async function handleRequest(req, res) {
       const url = new URL(req.url, 'http://internal')
-      const pathname = url.pathname
-    
+      let pathname = url.pathname
+
+      if (pathname.startsWith(LEGACY_BASE)) {
+        pathname = BASE + pathname.slice(LEGACY_BASE.length)
+      }
+
       if (!pathname.startsWith(BASE)) {
         sendError(res, 404, 'Not found')
         return
       }
-    
+
       const subPath = pathname.slice(BASE.length)
     
       if (subPath === '' || subPath === '/' || subPath === '/index.html') {
         if (!spaHtml) {
           spaHtml = loadSpaHtml()
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
-            .replace('__OPENCODE_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
+            .replace('__DSH_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(spaHtml)
@@ -1794,7 +2059,7 @@ data:
         <button class="theme-emoji-btn" id="themeDark" aria-label="Dark mode">🌙</button>
       </div>
       <a class="btn" href="/" target="_blank">To Login</a>
-      <a class="btn" href="__OPENCODE_HOME__" target="_blank">OpenCode</a>
+      <a class="btn" href="__DSH_HOME__" target="_blank">DeepSeek Harness</a>
       <a class="btn" href="/terminal" target="_blank">Terminal</a>
     </header>
     
@@ -2738,9 +3003,9 @@ data:
       > "${tty_conf}"
     if ! command -v tmux >/dev/null 2>&1; then
       printf '\n[terminal] tmux is not installed in this container; starting a plain shell.\n[terminal] Tab sessions will not persist and the toolchain install retries on the next container restart.\n\n' >&2
-      exec /var/opencode/bin/opencode-login-shell
+      exec /var/dsh/bin/dsh-login-shell
     fi
-    exec tmux -u new -A -s "$name" /var/opencode/bin/opencode-login-shell
+    exec tmux -u new -A -s "$name" /var/dsh/bin/dsh-login-shell
   terminal_manager.js: |
     import http from 'node:http'
     import fs from 'node:fs'
@@ -2816,7 +3081,7 @@ data:
         if (!spaHtml) {
           spaHtml = loadSpaHtml()
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
-            .replace('__OPENCODE_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
+            .replace('__DSH_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(spaHtml)
@@ -2862,7 +3127,7 @@ data:
     <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode Terminals</title>
+    <title>DeepSeek Harness Terminals</title>
     <link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAiLMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEREREREREREAAAAAAAAAEQAAAAAAAAARAAAAAAAAABEREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//wAA//8AAP//AAD//wAA//8AAAAAAAB//gAAf/4AAH/+AAAAAAAA//8AAP//AAD//wAA//8AAP//AAD//wAA">
     <script>
     (function() {
@@ -3035,7 +3300,7 @@ data:
         </svg>
         <div class="hpe-brand">
           <div class="hpe-brand-name">Hewlett Packard Enterprise</div>
-          <div class="hpe-brand-title">OpenCode Terminals</div>
+          <div class="hpe-brand-title">DeepSeek Harness Terminals</div>
           <div class="hpe-brand-sub">Multi-tab terminal sessions for your environment</div>
         </div>
       </div>
@@ -3049,7 +3314,7 @@ data:
         <button class="theme-emoji-btn" id="themeDark" aria-label="Dark mode">🌙</button>
       </div>
       <a class="btn" href="/" target="_blank">To Login</a>
-      <a class="btn" href="__OPENCODE_HOME__" target="_blank">OpenCode</a>
+      <a class="btn" href="__DSH_HOME__" target="_blank">DeepSeek Harness</a>
       <a class="btn" href="/data-manager" target="_blank">Data Manager</a>
     </header>
     

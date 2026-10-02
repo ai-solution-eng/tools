@@ -1,0 +1,347 @@
+# ============================================================
+# EZUA settings
+# ============================================================
+ezua:
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "deepseekharness.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# ============================================================
+# General configuration
+# ============================================================
+previewDomain: "${DOMAIN_NAME}"
+
+# Session cookie signing secret (also used by each user pod to validate the
+# session cookie that gates access to that pod's UI/terminal/previews).
+sessionSecret: "4nK8wQ2vR7pT3kL1mX9yB5dF3hJ6cZ0aG"
+
+storageClass: gl4f-filesystem
+storage:
+  sharedSize: 20Gi
+  workspaceSize: 5Gi
+  # Version suffix for per-user PVC names. Bump to provision fresh volumes and
+  # avoid colliding with orphaned VAST quotas (when VAST volume deletion is not
+  # enabled). v1 is the first versioned scheme of this chart; no user data
+  # exists yet to migrate.
+  nameVersion: v1
+  keepPvcOnDelete: true
+  stateSize: 2Gi
+
+images:
+  # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
+  # and helm (offline packaging) under /opt/dsh so pods stop installing
+  # everything at boot (see docker/user/Dockerfile + scripts/build-user-image.sh). Rebuild and bump
+  # the tag whenever dsh.version or provisioning.aptPackages change — the
+  # router folds the tag into the pod-template version, so existing units
+  # re-stamp automatically on upgrade. Set both entries back to
+  # node:22-bookworm-slim to revert to install-on-boot behavior.
+  user: ghcr.io/ai-solution-eng/deepseek-harness:0.2.0-rc.1-dind
+  init: ghcr.io/ai-solution-eng/deepseek-harness:0.2.0-rc.1-dind
+  # The router itself only needs node; keep it on the slim base.
+  router: node:22-bookworm-slim
+  # Optional: name of an imagePullSecret when the registry requires auth
+  # (e.g. a PRIVATE ghcr.io package — public packages pull anonymously).
+  # Applied to every user pod (init + dsh-web + dsh-auth).
+  pullSecret: ""
+
+# ============================================================
+# Docker-in-Docker sidecar (dockerize + push images from the pod terminal)
+# ============================================================
+# When enabled, every user pod gets a `dockerd` sidecar (clearwing-proven
+# recipe) and the user container gets DOCKER_HOST=tcp://127.0.0.1:2375, so
+# `docker build` / `docker push` work straight from the terminal. Notes:
+#   - The sidecar is privileged and runs as root (dockerd needs it; platform
+#     admission in project-user-* namespaces is beaten by explicit container-
+#     level overrides). Clusters that reject privileged containers must not
+#     enable this.
+#   - /var/lib/docker is an emptyDir on node-local disk: built images are
+#     ephemeral (survive pod restarts only until the pod is rescheduled).
+#     PUSH after building. A VAST-backed docker-data does NOT work (overlay2
+#     layer extraction fails on network volumes). Disk-capped via
+#     docker.diskSize — rendered as BOTH the emptyDir sizeLimit AND the
+#     sidecar's ephemeral-storage limit (the pairing is what makes the cap
+#     enforceable: kubelet evicts when either is exceeded).
+#   - On proxied clusters the daemon receives proxy.env (pulls/pushes) and
+#     the certificatesPolicy CA bundle (SSL_CERT_FILE) automatically; build
+#     RUN steps additionally need --network host + explicit proxy build-args
+#     — use the baked `dockerbuild` wrapper (see docker/user/Dockerfile).
+docker:
+  enabled: true
+  image: docker:28-dind
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits:   {cpu: "4", memory: 8Gi}
+  # DinD image-store sizing on node-local disk. diskSize caps the emptyDir
+  # and doubles as the sidecar's ephemeral-storage limit (see note above);
+  # diskRequest is the scheduler's ephemeral-storage reservation.
+  diskSize: 50Gi
+  diskRequest: 5Gi
+  # Platform units (project-user-* namespaces): the platform Kyverno policies
+  # deny privileged containers there (tr7: ezprojects-restrict-privileged-pods
+  # — with the sidecar present, the unit's Deployment POST fails with 400 and
+  # platform SSO breaks ENTIRELY). So platform units get their daemon OUT-OF-
+  # POD by default: a per-user privileged dind Deployment + Service +
+  # NetworkPolicy (ingress restricted to the owning unit) in THIS release
+  # namespace, reached cross-namespace via DOCKER_HOST (brokerForPlatformUnits).
+  onPlatformUnits: false
+  # false = platform units carry NO docker at all. true (default) = the
+  # per-user broker described above. Setting onPlatformUnits: true INSTEAD
+  # runs the daemon inside the platform pod — only do that after the platform
+  # team adds the Kyverno PolicyException (dsh-user-managed=true, kinds
+  # Deployment+Pod).
+  brokerForPlatformUnits: true
+
+# ============================================================
+# DeepSeek Harness
+# ============================================================
+# dsh web is the ONLY browser-facing UI in this chart (there is no
+# OpenChamber equivalent). It always binds to loopback (the CLI refuses
+# --host 0.0.0.0), so the in-pod nginx terminates all user traffic and
+# proxies it to 127.0.0.1:dsh.port.
+dsh:
+  # npm package version of @deepseek-ai/dsh installed into each user's
+  # state PVC at first start. 0.1.7-rc.2 = npm dist-tag "next" (the newest
+  # 0.1.7 build; "latest" is 0.1.5-rc.3, a downgrade from 0.1.6-alpha.2).
+  version: "0.2.0-rc.1"
+  # Loopback port the dsh web server listens on (dsh web --port).
+  port: 3080
+
+provisioning:
+  aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # Loading screen shown while a user's pod is being provisioned/assigned.
+  # When disabled the router reverts to the original blocking behavior.
+  loadingUI:
+    enabled: true
+    heading: "Setting up your account\u2026"
+    subtext: "Usually ready in under a minute. Please wait."
+
+# ============================================================
+# Warm pool: pre-provisioned, always-ready per-user units.
+# Same semantics as the opencode chart: the router keeps `size`
+# fully-initialized user pods warm so a new user's first launch
+# proxies in ~seconds instead of waiting for the per-user install
+# (npm install of @deepseek-ai/dsh, uv, ttyd). A warm unit = its own
+# Deployment + Service + workspace PVC + state PVC (the state PVC
+# holds the installed toolchain, so claiming only restarts the pod).
+#
+# Tradeoff: each warm unit is an idle user pod consuming resources
+# (up to the per-user limits). Set size: 0 or enabled: false to keep
+# the on-demand cold spin-up behavior.
+# ============================================================
+warmPool:
+  enabled: false
+  size: 2
+  refreshIntervalSeconds: 15
+
+auth:
+  username: dsh
+  password: "2vF6mQ4xKp8tL1nR7wY5cB9hDz3sUa0N"
+
+# Admin console credentials (admin page to create/delete user accounts).
+admin:
+  username: admin-user
+  password: "admin-password"
+
+# ============================================================
+# dsh settings ($DSH_HOME/settings.yaml)
+# ============================================================
+# Seeded into each user's state volume at first start and hot-reloaded by
+# the in-pod supervisor on change (dsh adapters re-read settings.yaml on
+# the next request, so no pod restart is needed).
+#
+# The default below wires dsh's pi-ai adapter to MLIS endpoints served on
+# the cluster (OpenAI Chat Completions protocol), with the compat switches
+# most self-hosted gateways need, and disables dsh's default-on DeepSeek
+# session-log upload and OTel export (never send tenant sessions off
+# platform). Replace the baseURLs/apiKeyEnv entries with your environment's
+# MLIS service names; keys resolve via apiKeyEnv from the pod env — seed
+# them with `dshEnv` (writes $DSH_HOME/.env) or the Settings→Models UI.
+dshSettings: |
+    # =============================================================================
+    # DSH settings — This is a legacy file. 
+    # Please refer to ~/.dsh/profile/web/cordis.patch.yml
+    # =============================================================================
+
+# Seed a .env file into each user's $DSH_HOME on FIRST start (the same
+# launch-env layer a laptop .env provides; dsh reads it when the process
+# starts). Seed-once: user edits in the Data Manager afterwards are never
+# overwritten. The supervisor watches .env and restarts dsh on change.
+# Replace the CHANGEME values with real keys after first login (Data
+# Manager → DSH Home → .env), or here before install for shared deploys.
+dshEnv: |
+    PCAI_LLM_KEY=CHANGEME
+    MCP_BEARER_TOKEN=CHANGEME
+
+
+dshCordisPatch: |
+    # =============================================================================
+    # Profile patch layer for the "web" profile.
+    # Applied after every bundle layer.  `!!js` expressions are evaluated at load
+    # time so personal / env-specific values come from environment variables.
+    #
+    # Internal RAG / MCP endpoints are committed (private repo).
+    # Personal dataset name & password come from .env.
+    # =============================================================================
+
+    # --- MCP client integrations -------------------------------------------------
+    - insert:
+        - id: mcp-pcai-llm-gateway
+          name: '@deepseek-ai/dsh-mcp-client'
+          config:
+            transport: streamable-http
+            serverName: pcai-llm-gateway
+            url: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/mcp
+            headers:
+              Authorization: !!js ('Bearer ' + (process.env.PCAI_LLM_KEY || ''))
+            toolCallTimeoutMs: 600000
+
+    # --- Disables -----------------------------------------------------------------
+    # The built-in DeepSeek (api.deepseek.com) endpoint is not used in this setup.
+    - id: llm-deepseek
+      disabled: true
+
+    - id: web
+      config:
+        fetchProvider: http
+    - id: llm-pi-ai
+      name: "@deepseek-ai/dsh-llm-pi-ai"
+      config:
+        providers:
+          pcai-model-endpoint:
+            apiKeyEnv: PCAI_LLM_KEY
+            api: openai-completions
+            baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
+            headers:
+              X-PCAI-Execute-Tools: "1"
+            reasoning: max
+            models:
+              - id: auto
+                name: PCAI_LLM_FALLBACK_FLOW
+                contextWindow: 1048576
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                maxTokens: 262144
+              - id: GLM-5.3-Flash
+                name: GLM-5.3-Flash
+                contextWindow: 1048576
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                maxTokens: 262144
+              - id: Qwen3.8-27B
+                name: Qwen3.8-27B
+                input:
+                  - text
+                  - image
+                reasoningEfforts:
+                  off: off
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+    - id: agent-default-model
+      name: "@deepseek-ai/dsh-agent-default-model"
+      config:
+        provider: pcai-model-endpoint
+        model: GLM-5.3-Flash
+        reasoningEffort: max
+    - id: session-log-deepseek
+      name: "@deepseek-ai/dsh-session-log-deepseek"
+      config:
+        enabled: false
+    - id: ui-settings-general
+      name: "@deepseek-ai/dsh-client-ui-settings-general"
+      config:
+        welcomeNoticeVersion: 2026-09-28.1
+
+router:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# ============================================================
+# Pre-delete cleanup hook (removes dynamically-created per-user
+# resources on helm uninstall so the namespace and shared PVC
+# don't hang in Terminating)
+# ============================================================
+cleanup:
+  image: node:22-bookworm-slim
+  podTimeout: 180  # seconds to wait for user pods to terminate
+  pvcTimeout: 120  # seconds to wait for user PVCs to be deleted
+
+# ============================================================
+# Certificate policy (for clusters with private/internal CA)
+# ============================================================
+
+certificatesPolicy:
+  enabled: false
+
+
+# ============================================================
+# Proxy configuration
+# ============================================================
+proxy:
+  enabled: false
+
+# ============================================================
+no_proxy:
+  enabled: false
+
+# ============================================================
+# Platform (PCAI/Kubeflow) workspace integration — study Option B
+# ============================================================
+# When enabled AND the endpoint is SSO-gated, SSO users get their DSH unit
+# deployed INSIDE their platform project namespace (project-user-<username>)
+# with the platform volumes kubeflow-shared-pvc (/mnt/shared, cluster-wide
+# shared) and user-pvc (/mnt/user, personal project volume) mounted
+# read-write, and the unit process running as the project's unix identity
+# (uid/gid from the project-info ConfigMap) so file ownership on the
+# platform volumes matches notebook-written files exactly.
+#
+# Enabling this renders a cross-namespace ClusterRole for the router and
+# cleanup service accounts (see README "Platform volumes for SSO users").
+# Local (non-SSO) users keep the classic single-namespace behavior.
+platformIntegration:
+  enabled: false
+  # Platform project namespace prefix (ezprojects-operator:
+  # EZPROJECTS_NAMESPACE_NAME=project-{{ .EzProjectName }}, private projects
+  # are named user-<username>).
+  namespacePrefix: "project-user-"
+  volumes:
+    shared:
+      claim: "kubeflow-shared-pvc"
+      mountPath: "/mnt/shared"
+    user:
+      claim: "user-pvc"
+      mountPath: "/mnt/user"
+  # Monitor-only deployments: mount the platform volumes but expose them
+  # read-only in the Data Manager (unix permissions stay the real
+  # enforcement regardless).
+  readOnly: false
+
+# ============================================================
+# Shared workspace content (populates the shared PVC)
+# ============================================================
+sharedContent:
+  enabled: true

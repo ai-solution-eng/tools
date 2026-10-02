@@ -16,11 +16,18 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}
-        opencode-role: router
+        dsh-role: router
         hpe-ezua/app: {{ .Chart.Name }}
         hpe-ezua/type: vendor-service
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap-router.yaml") . | sha256sum }}
+        # The router talks to the Kubernetes API directly and is reached only
+        # through the gateway's oauth2-proxy CUSTOM policy. A mesh sidecar on
+        # this pod would additionally enforce namespace-level Authorization
+        # Policies on the gateway->router hop (rendered as "RBAC: access
+        # denied" when the namespace is Istio-injected), so opt out
+        # explicitly instead of relying on the namespace label.
+        sidecar.istio.io/inject: "false"
     spec:
       serviceAccountName: {{ .Release.Name }}-router
 {{- $hasInitContainers := or (and .Values.certificatesPolicy .Values.certificatesPolicy.enabled) (and .Values.sharedContent .Values.sharedContent.enabled) }}
@@ -64,7 +71,9 @@ spec:
 {{- end }}
       containers:
         - name: {{ .Release.Name }}-router
-          image: {{ .Values.images.user }}
+          # The router only needs node — stay on the slim base even when the
+          # user pods run the baked toolchain image (images.user).
+          image: {{ .Values.images.router | default "node:22-bookworm-slim" }}
           imagePullPolicy: Always
           command:
             - node
@@ -74,16 +83,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: OPENCODE_SERVER_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-auth
-                  key: OPENCODE_SERVER_USERNAME
-            - name: OPENCODE_SERVER_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-auth
-                  key: OPENCODE_SERVER_PASSWORD
             - name: SESSION_SECRET
               valueFrom:
                 secretKeyRef:
@@ -106,7 +105,7 @@ spec:
             # Public host the UI is actually reached on (the chart's
             # VirtualService endpoint). Forwarded to user pods as
             # PREVIEW_UI_HOST so the port watcher prints preview URLs against
-            # the deployed host instead of a hardcoded opencode. subdomain.
+            # the deployed host instead of a hardcoded dsh. subdomain.
             - name: UI_ENDPOINT_HOST
               value: {{ .Values.ezua.virtualService.endpoint }}
             - name: SHARED_WORKSPACE_CLAIM
@@ -132,26 +131,34 @@ spec:
               value: {{ .Values.images.init }}
             - name: USER_IMAGE_PULL_SECRET
               value: {{ .Values.images.pullSecret | default "" | quote }}
-            - name: USER_INSTANCE_OPENCODE_VERSION
-              value: {{ .Values.opencode.version }}
-            - name: USER_INSTANCE_OPENCHAMBER_VERSION
-              value: {{ .Values.openchamber.version | quote }}
-            - name: USER_INSTANCE_OPENCODE_UI_MODE
-              value: {{ .Values.ui.mode | quote }}
+            - name: USER_INSTANCE_DSH_VERSION
+              value: {{ .Values.dsh.version }}
+            - name: USER_INSTANCE_DSH_PORT
+              value: {{ .Values.dsh.port | quote }}
             - name: PREVIEW_DOMAIN_SUFFIX
               value: {{ .Values.previewDomain }}
+            - name: WARM_POOL_ENABLED
+              value: {{ .Values.warmPool.enabled | quote }}
+            - name: WARM_POOL_SIZE
+              value: {{ .Values.warmPool.size | default 0 | toString | quote }}
+            - name: WARM_REFRESH_INTERVAL_MS
+              value: {{ mul (.Values.warmPool.refreshIntervalSeconds | default 15) 1000 | quote }}
+            - name: SETUP_UI_ENABLED
+              value: {{ .Values.provisioning.loadingUI.enabled | default true | quote }}
+            - name: SETUP_STATUS_PATH
+              value: /__dsh_setup_status
+            - name: SETUP_HEADING
+              value: {{ .Values.provisioning.loadingUI.heading | default "Setting up your account…" | quote }}
+            - name: SETUP_SUBTEXT
+              value: {{ .Values.provisioning.loadingUI.subtext | default "This usually takes a few minutes on first launch. Please wait." | quote }}
 {{- if .Values.platformIntegration }}
-            # --- Platform (PCAI/Kubeflow) workspace integration ---
+            # --- Platform (PCAI/Kubeflow) workspace integration (Option B) ---
             # SSO users: unit inside project-user-<username> with the platform
             # volumes mounted read-write under the project's unix identity.
             - name: PLATFORM_INTEGRATION_ENABLED
               value: {{ .Values.platformIntegration.enabled | default false | quote }}
             - name: PLATFORM_NAMESPACE_PREFIX
               value: {{ .Values.platformIntegration.namespacePrefix | default "project-user-" | quote }}
-            # Comma-separated namespace naming patterns ({username} placeholder,
-            # optional trailing * wildcard). Overrides namespacePrefix when set.
-            - name: PLATFORM_NAMESPACE_PATTERNS
-              value: {{ .Values.platformIntegration.namespacePatterns | default "" | quote }}
             - name: PLATFORM_SHARED_CLAIM
               value: {{ .Values.platformIntegration.volumes.shared.claim | default "kubeflow-shared-pvc" | quote }}
             - name: PLATFORM_SHARED_MOUNT
@@ -163,20 +170,6 @@ spec:
             - name: PLATFORM_VOLUMES_READONLY
               value: {{ .Values.platformIntegration.readOnly | default false | quote }}
 {{- end }}
-            - name: WARM_POOL_ENABLED
-              value: {{ .Values.warmPool.enabled | quote }}
-            - name: WARM_POOL_SIZE
-              value: {{ .Values.warmPool.size | default 0 | toString | quote }}
-            - name: WARM_REFRESH_INTERVAL_MS
-              value: {{ mul (.Values.warmPool.refreshIntervalSeconds | default 15) 1000 | quote }}
-            - name: SETUP_UI_ENABLED
-              value: {{ .Values.provisioning.loadingUI.enabled | default true | quote }}
-            - name: SETUP_STATUS_PATH
-              value: /__oc_setup_status
-            - name: SETUP_HEADING
-              value: {{ .Values.provisioning.loadingUI.heading | default "Setting up your account…" | quote }}
-            - name: SETUP_SUBTEXT
-              value: {{ .Values.provisioning.loadingUI.subtext | default "This usually takes a few minutes on first launch. Please wait." | quote }}
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
 {{- range .Values.certificatesPolicy.env }}
             - name: {{ .name }}

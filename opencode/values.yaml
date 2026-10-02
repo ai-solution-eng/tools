@@ -27,11 +27,70 @@ storage:
   # avoid colliding with orphaned VAST quotas (when VAST volume deletion is not
   # enabled). v2 is the first versioned scheme; no user data exists yet to migrate.
   nameVersion: v2
+  keepPvcOnDelete: true
   stateSize: 2Gi
 
 images:
-  user: node:22-bookworm-slim
-  init: node:22-bookworm-slim
+  # Baked user image: carries the apt toolchain, opencode-ai,
+  # @openchamber/web, uv, ttyd and helm under /opt/opencode so pods stop
+  # installing everything at boot (see docker/user/Dockerfile +
+  # scripts/build-user-image.sh). Rebuild and bump whenever opencode.version /
+  # openchamber.version / provisioning.aptPackages / provisioning.helmVersion
+  # change — the router folds the tag into the pod-template version, so
+  # existing units re-stamp automatically on upgrade. Set both entries back to
+  # node:22-bookworm-slim to revert to install-on-boot behavior.
+  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
+  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
+  # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
+  # Public ghcr.io packages pull anonymously (leave empty).
+  pullSecret: ""
+
+# ============================================================
+# Docker-in-Docker sidecar (dockerize + push images from the pod terminal)
+# ============================================================
+# When enabled, every user pod gets a `dockerd` sidecar (clearwing-proven
+# recipe) and the user container gets DOCKER_HOST=tcp://127.0.0.1:2375, so
+# `docker build` / `docker push` work straight from the terminal. Notes:
+#   - The sidecar is privileged and runs as root (dockerd needs it; platform
+#     admission in project-user-* namespaces is beaten by explicit container-
+#     level overrides). Clusters that reject privileged containers must not
+#     enable this.
+#   - /var/lib/docker is an emptyDir on node-local disk: built images are
+#     ephemeral (survive pod restarts only until the pod is rescheduled).
+#     PUSH after building. A VAST-backed docker-data does NOT work (overlay2
+#     layer extraction fails on network volumes). Disk-capped via
+#     docker.diskSize — rendered as BOTH the emptyDir sizeLimit AND the
+#     sidecar's ephemeral-storage limit (the pairing is what makes the cap
+#     enforceable: kubelet evicts when either is exceeded).
+#   - On proxied clusters the daemon receives proxy.env (pulls/pushes) and
+#     the certificatesPolicy CA bundle (SSL_CERT_FILE) automatically; build
+#     RUN steps additionally need --network host + explicit proxy build-args
+#     — use the baked `dockerbuild` wrapper (see docker/user/Dockerfile).
+docker:
+  enabled: true
+  image: docker:28-dind
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits:   {cpu: "4", memory: 8Gi}
+  # DinD image-store sizing on node-local disk. diskSize caps the emptyDir
+  # and doubles as the sidecar's ephemeral-storage limit (see note above);
+  # diskRequest is the scheduler's ephemeral-storage reservation.
+  diskSize: 50Gi
+  diskRequest: 5Gi
+  # Platform units (project-user-* namespaces): the platform Kyverno policies
+  # deny privileged containers there (tr7: ezprojects-restrict-privileged-pods
+  # — with the sidecar present, the unit's Deployment POST fails with 400 and
+  # platform SSO breaks ENTIRELY). So platform units get their daemon OUT-OF-
+  # POD by default: a per-user privileged dind Deployment + Service +
+  # NetworkPolicy (ingress restricted to the owning unit) in THIS release
+  # namespace, reached cross-namespace via DOCKER_HOST (brokerForPlatformUnits).
+  onPlatformUnits: false
+  # false = platform units carry NO docker at all. true (default) = the
+  # per-user broker described above. Setting onPlatformUnits: true INSTEAD
+  # runs the daemon inside the platform pod — only do that after the platform
+  # team adds the Kyverno PolicyException (opencode-user-managed=true, kinds
+  # Deployment+Pod).
+  brokerForPlatformUnits: true
 
 opencode:
   version: 1.18.11
@@ -48,6 +107,11 @@ ui:
 
 provisioning:
   aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # Helm CLI version baked into the user image (docker/user/Dockerfile
+  # HELM_VERSION must mirror this; scripts/build-user-image.sh --helm-version
+  # overrides). Latest Helm 3 release — Helm 4 is out, but the chart and the
+  # platform-side install tooling are Helm 3.
+  helmVersion: "3.22.0"
   # Loading screen shown while a user's pod is being provisioned/assigned.
   # When disabled the router reverts to the original blocking behavior.
   loadingUI:
@@ -200,6 +264,47 @@ proxy:
 # ============================================================ 
 no_proxy:
   enabled: false
+
+# ============================================================
+# Platform (PCAI/Kubeflow) workspace integration
+# ============================================================
+# When enabled AND the endpoint is SSO-gated, SSO users get their unit
+# deployed INSIDE their platform project namespace (project-user-<username>)
+# with the platform volumes kubeflow-shared-pvc (/mnt/shared, cluster-wide
+# shared) and user-pvc (/mnt/user, personal project volume) mounted
+# read-write, and the unit process running as the project's unix identity
+# (uid/gid from the project-info ConfigMap) so file ownership on the
+# platform volumes matches notebook-written files exactly.
+#
+# Enabling this renders a cross-namespace ClusterRole for the router and
+# cleanup service accounts (see README "Platform volumes for SSO users").
+# Local (non-SSO) users keep the classic single-namespace behavior.
+platformIntegration:
+  enabled: false
+  # Platform project namespace prefix (ezprojects-operator:
+  # EZPROJECTS_NAMESPACE_NAME=project-{{ .EzProjectName }}, private projects
+  # are named user-<username>).
+  namespacePrefix: "project-user-"
+  # Candidate naming patterns for a user's platform project namespace —
+  # comma-separated templates with a {username} placeholder (the sanitized
+  # username). A trailing * acts as a wildcard: any namespace whose name
+  # starts with the expanded prefix becomes a candidate (ownership is
+  # verified through the project-info user field). The first candidate that
+  # verifies (namespace exists + project-info carries uid/gid) wins.
+  # Example: "project-user-{username},user-{username},{username}-slug"
+  # When empty, the legacy single-prefix behavior applies (namespacePrefix).
+  namespacePatterns: ""
+  volumes:
+    shared:
+      claim: "kubeflow-shared-pvc"
+      mountPath: "/mnt/shared"
+    user:
+      claim: "user-pvc"
+      mountPath: "/mnt/user"
+  # Monitor-only deployments: mount the platform volumes but expose them
+  # read-only in the Data Manager (unix permissions stay the real
+  # enforcement regardless).
+  readOnly: false
 
 # ============================================================
 # Shared workspace content (populates the shared PVC)

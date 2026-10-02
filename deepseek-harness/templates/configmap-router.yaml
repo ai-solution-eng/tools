@@ -20,12 +20,9 @@ data:
     const previewDomainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX || '{{ .Values.previewDomain }}'
     const userInstanceImage = process.env.USER_INSTANCE_IMAGE || '{{ .Values.images.user }}'
     const userInitImage = process.env.USER_INIT_IMAGE || '{{ .Values.images.init }}'
-    const userOpencodeVersion = process.env.USER_INSTANCE_OPENCODE_VERSION || '{{ .Values.opencode.version }}'
-    const userOpenChamberVersion = process.env.USER_INSTANCE_OPENCHAMBER_VERSION || '{{ .Values.openchamber.version }}'
-    const userUiMode = process.env.USER_INSTANCE_OPENCODE_UI_MODE || '{{ .Values.ui.mode }}'
-    const userIsChamber = userUiMode === 'openchamber'
-    const userChamberPort = Number(process.env.USER_INSTANCE_OPENCHAMBER_PORT || '{{ .Values.ui.chamberPort }}')
-    const userServerPort = Number(process.env.USER_INSTANCE_OPENCODE_SERVER_PORT || '{{ .Values.ui.serverPort }}')
+    const userDshVersion = process.env.USER_INSTANCE_DSH_VERSION || '{{ .Values.dsh.version }}'
+    const userDshPort = Number(process.env.USER_INSTANCE_DSH_PORT || '{{ .Values.dsh.port }}')
+    const userUiHost = process.env.USER_INSTANCE_UI_HOST || 'dsh'
     const workspaceSize = process.env.PERSONAL_WORKSPACE_SIZE || '{{ .Values.storage.workspaceSize }}'
     const stateSize = process.env.PERSONAL_STATE_SIZE || '{{ .Values.storage.stateSize }}'
     // PVC-survival contract (KEEP_PVC_ON_DELETE=true, the default): user data
@@ -35,24 +32,75 @@ data:
     // first re-SSO re-binds the exact same volumes. Manual `kubectl delete
     // pvc` remains the deliberate purge path.
     const keepPvcOnDelete = (process.env.KEEP_PVC_ON_DELETE || 'true') !== 'false'
+    // Rolls existing user deployments whenever the pod template meaningfully
+    // changes (config layout, nginx/validator/supervisor code, ports). Bump
+    // RUNTIME_REV on every chart change to per-user runtime behavior; dsh
+    // npm upgrades additionally flow through the version below.
+    // v22: warm-unit watcher env fixed — watch profile-config FILES only
+    // (settings.yaml, .env, cordis.patch.yml, dsh.profile), never the whole
+    // profiles/web directory dsh writes runtime state into (restart loop
+    // kills live sessions); and the supervisor now YAML-validates settings.
+    // v23: user pods get PREVIEW_UI_HOST (the VirtualService endpoint) so
+    // the port watcher prints preview URLs against the deployed host
+    // instead of the hardcoded dsh. subdomain.
+    // v24: readable user slugs — the per-user URL prefix becomes the
+    // sanitized username (e.g. /francesco-caliva/) instead of the opaque
+    // sha256 prefix (/u-af5a35ed08b8/); pods re-template to the new
+    // USER_SLUG/SESSION_KEY values on their next resolve (pre-0.3.5
+    // /u-{hash} URLs keep working).
+    // v25: platform integration (study Option B) — SSO users' units deploy
+    // inside project-user-<username> with the platform PVCs mounted and the
+    // process running under the project's unix identity (USER_INFO_* env
+    // from the project-info ConfigMap; init chowns the DSH volumes; the
+    // startup drops privileges via setpriv).
+    // v26: baked user image support — the image carries the apt toolchain,
+    // @deepseek-ai/dsh, uv and ttyd under /opt/dsh; init prefers the baked
+    // artifacts (guarded symlinks on the state PVC) and skips the
+    // install-on-boot chain when they match the requested versions. The
+    // image tag joins userTemplateVersion so existing units re-stamp when
+    // the image changes; user pods pull with IfNotPresent (immutable tags).
+    // v27: boot flow keeps the user inside the unit — the in-pod auth
+    // validator now performs the launch-token exchange SERVER-SIDE (same
+    // mechanism as its /dsh-health probe), captures dsh's session cookie,
+    // and 302s straight into /<slug>/. The old main-host /?token= hop made
+    // dsh's own post-exchange redirect to / land on the router's login
+    // menu, stranding the first login after every logout one click away
+    // ("Open your environment") even though the session was already live.
+    // v28: the server-side exchange presents the PUBLIC Host (nginx-forwards
+    // $host) instead of the launch URL's loopback host — dsh validates the
+    // exchange against DSH_TRUSTED_HOSTS and refused the loopback one, which
+    // produced a /__dsh_boot <-> /<slug>/ redirect loop. The exchange is now
+    // a raw http.request carrying req.headers.host, and a cookieless
+    // exchange answer fails visibly (503) instead of redirecting.
+    // v29: real dsh answers the exchange with 303 See Other (not 302) — the
+    // strict status match rejected dsh's VALID exchange (with its session
+    // cookie) and surfaced "token exchange failed (dsh answered 303)". The
+    // validator now follows the exchange redirect chain (max 3 hops) and
+    // stops as soon as any response carries Set-Cookie; status-agnostic.
+    // v30: tr211 compatibility — platform admission (EzProject/Kyverno)
+    // forces the tenant uid/gid into every pod of project-user-* namespaces.
+    // Startup script: full PATH (sbin included) + skip groupadd/useradd/setpriv
+    // when the container is ALREADY the forced tenant uid. Init container:
+    // RUN_AS_USER/chown block only as root. nginx sidecar: emptyDir cache/log
+    // mounts + pid in /tmp so the forced non-root nginx starts cleanly.
+    // 31 (0.4.14): /data_manager renamed to /data-manager (nginx locations +
+    // preview SPA/API; legacy underscore path aliased in-app by
+    // data_manager.mjs, proxied as-is — no 301, POST bodies must survive).
+    // 32 (0.4.16): optional Docker-in-Docker sidecar (values docker.enabled) —
+    // the dsh-web container gains DOCKER_HOST and the pod a dockerd sidecar +
+    // docker-data volume; existing units re-stamp so the terminal can drive
+    // the daemon immediately.
+    const RUNTIME_REV = '32'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
     //                    probes, env); bump on every such chart change
-    //   app versions   — opencode.version / openchamber.version in values
-    //                    (covers the version-bumped-without-image-rebuild
-    //                    case: runtime install fills in)
-    //   userImageRev   — the baked image tag (see docker/user/Dockerfile).
-    //                    The tag is folded in so existing units re-stamp when
-    //                    the image changes; user pods pull with IfNotPresent
-    //                    (immutable tags).
-    // v8→v10: readable user slugs (v9) + baked user image support (v10).
-    // v10→v11: data-manager route renamed /data_manager → /data-manager (in-pod
-    // nginx location + data_manager.mjs BASE + in-app links roll with the re-stamp).
-    // v11→v12: optional Docker-in-Docker sidecar (values docker.enabled) — the
-    // user container gains DOCKER_HOST and the pod a dockerd sidecar +
-    // docker-data volume; existing units re-stamp so the terminal can drive
-    // the daemon immediately.
+    //   userDshVersion — dsh.version in values (covers the version-bumped-
+    //                    without-image-rebuild case: runtime install fills in)
+    //   userImageRev   — the baked image tag (tag == dsh.version by
+    //                    convention, so the two usually dedupe to one slot;
+    //                    they BOTH appear only while they disagree — exactly
+    //                    the drift window the convergence must cover)
     const userImageRev = (() => {
       const tag = String(userInstanceImage || '').split('@')[0].split(':').pop() || ''
       return (tag.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 32)) || 'untagged'
@@ -67,8 +115,8 @@ data:
     //   - platform units (project-user-*): sidecar only when
     //     docker.onPlatformUnits is ALSO true — which requires the platform
     //     team's Kyverno PolicyException for the chart-managed units
-    //     (opencode-user-managed=true); otherwise the Deployment POST dies
-    //     with 400 and platform SSO breaks entirely.
+    //     (dsh-user-managed=true); otherwise the Deployment POST dies with
+    //     400 and platform SSO breaks entirely.
     // The state participates in the convergence contract so flipping any of
     // it re-stamps existing units.
     const dockerEnabled = {{ if and .Values.docker .Values.docker.enabled }}true{{ else }}false{{ end }}
@@ -82,13 +130,12 @@ data:
     // units — requires the Kyverno PolicyException) / nodind. The broker
     // mode (docker.brokerForPlatformUnits) is NOT part of this marker — the
     // broker pod lives outside the unit pod template; broker flips converge
-    // via the unit pod's opencode-web-helm/docker annotation (DOCKER_HOST
-    // state).
+    // via the unit pod's dsh-web-helm/docker annotation (DOCKER_HOST state).
     const dockerSidecar = dockerEnabled
       ? (dockerOnPlatformUnits ? 'dind-platform' : 'dind-classic')
       : 'nodind'
     const dindBrokerVersion = `${dockerSidecar}-${(dockerImage.split(':').pop() || 'untagged')}-${dockerDiskSize}`
-    const userTemplateVersion = `terminal-tab-v12-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    const userTemplateVersion = `dsh-web-v${RUNTIME_REV}-${dockerSidecar}-${[...new Set([userDshVersion, userImageRev])].join('-')}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -97,7 +144,7 @@ data:
     // dial DOCKER_HOST explicitly), no TLS. securityContext is the FULL root
     // triple: dockerd cannot run as a non-root uid, and platform admission
     // forces the tenant uid into every container of project-user-* namespaces
-    // — container-level overrides beat both the forced uid and the
+    // (v30 note) — container-level overrides beat both the forced uid and the
     // run-as-non-root policy (both hit live on this cluster class). Proxy env
     // -> daemon-level pulls/pushes through the corporate proxy; the
     // certificatesPolicy combined CA bundle (SSL_CERT_FILE) makes the Go
@@ -182,11 +229,11 @@ data:
     // namespace — where privileged vendor deployments are admitted — and the
     // unit reaches it cross-namespace via DOCKER_HOST. Lifecycle is bound to
     // the user: created on unit provision/convergence, deleted on user
-    // delete, and swept by the uninstall hook (opencode-user-managed=true
-    // label). Ingress is restricted to the owning unit's pod via
-    // NetworkPolicy; the docker API on 2375 is UNAUTHENTICATED, so if the
-    // cluster CNI ignores NetworkPolicy the exposure widens to the cluster
-    // (keep docker.brokerForPlatformUnits=false where that is unacceptable).
+    // delete, and swept by the uninstall hook (dsh-user-managed=true label).
+    // Ingress is restricted to the owning unit's pod via NetworkPolicy; the
+    // docker API on 2375 is UNAUTHENTICATED, so if the cluster CNI ignores
+    // NetworkPolicy the exposure widens to the cluster (keep
+    // docker.brokerForPlatformUnits=false where that is unacceptable).
     function dindBrokerNames(slug) {
       // Cap the slug portion so every broker name (plus its -svc/-netpol
       // suffixes) stays a valid DNS-1123 label (<= 63). Truncated slugs get
@@ -196,22 +243,22 @@ data:
         ? `${slug.slice(0, 33)}-${crypto.createHash('sha256').update(slug).digest('hex').slice(0, 6)}`
         : slug
       return {
-        deployment: `opencode-dind-${brokerSlug}`,
-        service: `opencode-dind-${brokerSlug}-svc`,
-        netpol: `opencode-dind-${brokerSlug}-netpol`,
+        deployment: `dsh-dind-${brokerSlug}`,
+        service: `dsh-dind-${brokerSlug}-svc`,
+        netpol: `dsh-dind-${brokerSlug}-netpol`,
       }
     }
     function dindBrokerDeploymentManifest(slug) {
       const names = dindBrokerNames(slug)
-      // NOT opencode-user-slug: that label means "I am the user's unit" to
-      // the router's discovery paths — a broker must never be mistaken for
-      // the unit. It carries its own opencode-dind-slug for service/policy
-      // selection instead.
+      // NOT dsh-user-slug: that label means "I am the user's unit" to the
+      // router's discovery paths (conversation-clear target lookup, cleanup
+      // pod pinning) — a broker must never be mistaken for the unit. It
+      // carries its own dsh-dind-slug for service/policy selection instead.
       const labels = {
         app: '{{ .Chart.Name }}',
-        'opencode-user-managed': 'true',
-        'opencode-dind-broker': 'true',
-        'opencode-dind-slug': slug,
+        'dsh-user-managed': 'true',
+        'dsh-dind-broker': 'true',
+        'dsh-dind-slug': slug,
       }
       return {
         apiVersion: 'apps/v1',
@@ -220,13 +267,13 @@ data:
         spec: {
           replicas: 1,
           strategy: { type: 'Recreate' },
-          selector: { matchLabels: { 'opencode-dind-broker': 'true', 'opencode-dind-slug': slug } },
+          selector: { matchLabels: { 'dsh-dind-broker': 'true', 'dsh-dind-slug': slug } },
           template: {
             metadata: {
               labels,
               annotations: {
                 'sidecar.istio.io/inject': 'false',
-                'opencode-web-helm/dind-template-version': dindBrokerVersion,
+                'dsh-web-helm/dind-template-version': dindBrokerVersion,
               },
             },
             spec: {
@@ -250,14 +297,14 @@ data:
           namespace,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
-            'opencode-dind-broker': 'true',
-            'opencode-dind-slug': slug,
+            'dsh-user-managed': 'true',
+            'dsh-dind-broker': 'true',
+            'dsh-dind-slug': slug,
           },
         },
         spec: {
           type: 'ClusterIP',
-          selector: { 'opencode-dind-broker': 'true', 'opencode-dind-slug': slug },
+          selector: { 'dsh-dind-broker': 'true', 'dsh-dind-slug': slug },
           ports: [
             { name: 'docker', protocol: 'TCP', port: 2375, targetPort: 2375 },
           ],
@@ -274,13 +321,13 @@ data:
           namespace,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
-            'opencode-dind-broker': 'true',
-            'opencode-dind-slug': slug,
+            'dsh-user-managed': 'true',
+            'dsh-dind-broker': 'true',
+            'dsh-dind-slug': slug,
           },
         },
         spec: {
-          podSelector: { matchLabels: { 'opencode-dind-broker': 'true', 'opencode-dind-slug': slug } },
+          podSelector: { matchLabels: { 'dsh-dind-broker': 'true', 'dsh-dind-slug': slug } },
           policyTypes: ['Ingress'],
           ingress: [
             {
@@ -290,7 +337,7 @@ data:
               from: [
                 {
                   namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': unitNs } },
-                  podSelector: { matchLabels: { 'opencode-user-slug': slug } },
+                  podSelector: { matchLabels: { 'dsh-user-slug': slug } },
                 },
               ],
               ports: [{ port: 2375, protocol: 'TCP' }],
@@ -306,7 +353,7 @@ data:
         const depManifest = dindBrokerDeploymentManifest(slug)
         const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`)
         if (existing) {
-          const version = existing.spec?.template?.metadata?.annotations?.['opencode-web-helm/dind-template-version']
+          const version = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/dind-template-version']
           if (version !== dindBrokerVersion) {
             await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`, { spec: { template: depManifest.spec.template } })
           }
@@ -364,7 +411,6 @@ data:
     const kubePort = process.env.KUBERNETES_SERVICE_PORT_HTTPS || '443'
     const serviceAccountToken = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/token', 'utf8').trim()
     const serviceAccountCa = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt')
-    const basicAuth = `Basic ${Buffer.from(`${process.env.OPENCODE_SERVER_USERNAME}:${process.env.OPENCODE_SERVER_PASSWORD}`).toString('base64')}`
     const activePtyUpgrades = new Map()
     let tunnelSeq = 0
     const warmPoolEnabled = process.env.WARM_POOL_ENABLED === 'true'
@@ -376,7 +422,7 @@ data:
     const poolLocks = new Map() // poolId -> promise chain (per-unit claim mutex)
     const warmStuckSince = new Map() // warm deployment name -> first-seen-not-ready timestamp
     const setupUiEnabled = process.env.SETUP_UI_ENABLED === 'true'
-    const setupStatusPath = process.env.SETUP_STATUS_PATH || '/__oc_setup_status'
+    const setupStatusPath = process.env.SETUP_STATUS_PATH || '/__dsh_setup_status'
     const setupHeading = process.env.SETUP_HEADING || 'Setting up your account\u2026'
     const setupSubtext = process.env.SETUP_SUBTEXT || 'This usually takes a few minutes on first launch. Please wait.'
     const provisionTasks = new Map() // deployment name -> { promise, error }
@@ -386,13 +432,12 @@ data:
     // Public host the UI is actually served on (the chart's VirtualService
     // endpoint). Rendered ONLY as an env fallback — never into JS template
     // literals — because the platform pipeline ships it as a literal
-    // "${DOMAIN_NAME}" placeholder. Forwarded to user pods as PREVIEW_UI_HOST
-    // so the port watcher prints preview URLs against the deployed host
-    // instead of a hardcoded opencode. subdomain.
-    const uiEndpointHost = process.env.UI_ENDPOINT_HOST || 'opencode.${DOMAIN_NAME}'
+    // "${DOMAIN_NAME}" placeholder (see port_watcher.mjs). Forwarded to user
+    // pods as PREVIEW_UI_HOST so preview URLs match the deployed host.
+    const uiEndpointHost = process.env.UI_ENDPOINT_HOST || 'deepseekharness.${DOMAIN_NAME}'
     const registrySecretName = process.env.USER_REGISTRY_SECRET || '{{ .Release.Name }}-users'
     const sessionSecret = process.env.SESSION_SECRET || ''
-    const sessionCookieName = 'oc_sess'
+    const sessionCookieName = 'dsh_sess'
     const sessionTtlSeconds = 7 * 24 * 60 * 60
     const adminUsername = process.env.ADMIN_USERNAME || ''
     const adminPassword = process.env.ADMIN_PASSWORD || ''
@@ -403,29 +448,15 @@ data:
     const pvcNameVersion = process.env.PVC_NAME_VERSION || '{{ .Values.storage.nameVersion }}'
     const sharedWorkspaceSize = process.env.SHARED_WORKSPACE_SIZE || '{{ .Values.storage.sharedSize }}'
 
-    // --- Platform (PCAI/Kubeflow) workspace integration --------------------
+    // --- Platform (PCAI/Kubeflow) workspace integration (Option B) ---------
     // SSO users whose platform project (EzProject -> namespace
     // project-user-<username>, created by the ezprojects-operator on first
-    // platform login) already exists get their unit deployed INSIDE that
+    // platform login) already exists get their DSH unit deployed INSIDE that
     // namespace, with the platform volumes mounted and the process running
-    // under the project's unix identity. See the README "Platform volumes for
-    // SSO users".
+    // under the project's unix identity. See
+    // docs/platform-pvc-integration-study.md.
     const platformEnabled = process.env.PLATFORM_INTEGRATION_ENABLED === 'true'
     const platformNsPrefix = process.env.PLATFORM_NAMESPACE_PREFIX || 'project-user-'
-    // Candidate naming patterns for a user's platform project namespace —
-    // comma-separated templates with a {username} placeholder (the sanitized
-    // username). A trailing `*` acts as a wildcard: any namespace whose name
-    // starts with the expanded prefix becomes a candidate (resolved via a
-    // cached namespace-list scan and verified for OWNERSHIP through the
-    // project-info user field, since one user's prefix can collide with
-    // another user's name). When unset, the legacy single-prefix behavior
-    // applies (PLATFORM_NAMESPACE_PREFIX + username). The first candidate
-    // that verifies (namespace exists + project-info carries uid/gid) wins.
-    const platformNsPatterns = (process.env.PLATFORM_NAMESPACE_PATTERNS || '')
-      .split(',')
-      .map((pattern) => pattern.trim())
-      .filter(Boolean)
-    const platformNsListCache = { at: 0, names: [] }
     const platformSharedClaim = process.env.PLATFORM_SHARED_CLAIM || 'kubeflow-shared-pvc'
     const platformSharedMount = process.env.PLATFORM_SHARED_MOUNT || '/mnt/shared'
     const platformUserClaim = process.env.PLATFORM_USER_CLAIM || 'user-pvc'
@@ -452,14 +483,13 @@ data:
     // tracked under its exact lowercased header value), so the slug can simply
     // be the URL-safe username itself: SSO user "francesco-caliva" is served
     // at /francesco-caliva/ instead of the opaque /u-<sha256-prefix>/ of
-    // earlier releases.
-    const slugMaxLength = 54 // "opencode-user-" + slug stays well under the DNS name limits
+    // pre-0.3.5 releases.
+    const slugMaxLength = 54 // "dsh-user-" + slug must stay a valid DNS-1123 label (<= 63 chars)
     // Slugs that would shadow router control paths or in-pod root-relative app
-    // routes (nginx serves /terminal, /term, /data-manager) keep the legacy
-    // hash slug instead. "data_manager" slugifies to "data-manager", so the
-    // hyphenated form must be reserved since the endpoint rename (the old
-    // underscore path could never collide with a slug).
-    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u', 'data-manager'])
+    // routes (nginx serves /terminal, /term, /data-manager — the legacy
+    // /data_manager spelling stays aliased in-app) keep the legacy
+    // hash slug instead.
+    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u'])
     function slugifyUsername(userId) {
       const cleaned = (userId || '')
         .toLowerCase()
@@ -475,8 +505,8 @@ data:
       }
       return cleaned
     }
-    // Pre-readable-slug one-way-hash slug; kept for bookmark compatibility, as
-    // the degenerate-name fallback, and to find/migrate earlier environments.
+    // Pre-0.3.5 one-way-hash slug; kept for bookmark compatibility, as the
+    // degenerate-name fallback, and to find/migrate pre-0.3.5 environments.
     function legacySlugForUser(userId) {
       return crypto.createHash('sha256').update(userId.toLowerCase()).digest('hex').slice(0, 12)
     }
@@ -489,35 +519,36 @@ data:
     }
 
     function namesForSlug(slug, unitNs) {
-      // Per-user claim names embed the nameVersion AND the volume kind EARLY
-      // (`opencode-<ver>-ws-<slug>` / `opencode-<ver>-st-<slug>`): VAST quota
-      // names are `csi:<ns>:<pvc>` truncated to 64 chars — with a long unit
-      // namespace (platform units live in project-user-<username>) a version
-      // SUFFIX would be invisible to VAST and re-provisions would collide
-      // with orphaned quotas. Deployment/service names are unchanged.
-      // EXISTING units keep the claims they already mount (resolved from the
-      // deployment spec) — only fresh environments use these names.
-      const base = `opencode-${pvcNameVersion}`
+      // Per-user PVC names embed the nameVersion AND the volume kind EARLY:
+      // VAST quota names are `csi:<ns>:<pvc>` truncated to 64 chars — with a
+      // long namespace (e.g. project-user-alejandro-morales-martinez) only
+      // the first ~20 chars of the PVC name survive. A version SUFFIX was
+      // invisible to VAST (re-provisions collided with orphaned quotas), and
+      // even `-workspace-`/`-state-` must sit INSIDE that window — otherwise
+      // a user's own workspace and state quotas collide with each other.
+      // `dsh-<ver>-ws-<slug>` / `dsh-<ver>-st-<slug>` differ at char 8 and
+      // version at char 5 — safe for namespaces up to ~51 chars.
+      // Deployment/service names are unchanged.
+      const base = `dsh-${pvcNameVersion}`
       return {
-        deployment: `opencode-user-${slug}`,
-        service: `opencode-user-${slug}-svc`,
+        deployment: `dsh-user-${slug}`,
+        service: `dsh-user-${slug}-svc`,
         workspaceClaim: `${base}-ws-${slug}`,
         stateClaim: `${base}-st-${slug}`,
-        virtualService: `opencode-user-vs-${slug}`,
+        virtualService: `dsh-user-vs-${slug}`,
         // The namespace the unit lives in: the release namespace (classic
-        // shape) or the user's platform project namespace (platform
-        // integration).
+        // shape) or the user's platform project namespace (Option B).
         namespace: unitNs || namespace,
       }
     }
 
     // --- Admin console ------------------------------------------------
-    const adminCookieName = 'oc_admin'
+    const adminCookieName = 'dsh_admin'
     const adminSessionTtlSeconds = 8 * 60 * 60
-    // Set by /__oc_logout so the auto-SSO landing flow does not immediately
+    // Set by /__dsh_logout so the auto-SSO landing flow does not immediately
     // sign a user who explicitly logged out back in. Cleared by an explicit
     // SSO login.
-    const ssoLogoutMarkerName = 'oc_sso_out'
+    const ssoLogoutMarkerName = 'dsh_sso_out'
 
     function ssoLogoutMarkerCookie(set) {
       return [
@@ -623,19 +654,18 @@ data:
     }
 
     // --- Conversation cleanup -------------------------------------------
-    // Deletes opencode chat history from a user's state PVC via a short-lived
-    // Job: the SQLite conversation database (opencode.db, holding sessions/
-    // messages since opencode ~1.2) plus any legacy storage/ subtrees, then
+    // Deletes dsh session history from a user's state PVC via a short-lived
+    // Job: dsh's persisted session/agent stores under $DSH_HOME, then
     // rolls the user's pod so the running server recreates a fresh database.
     // Only conversation data is removed: workspace files,
-    // opencode.json/agents/skills and auth.json (model keys) survive, and the
+    // settings.yaml/agents/skills and auth.json (model keys) survive, and the
     // user's session cookie stays valid.
     function deploymentForSlug(deployments, slug, legacySlug) {
       for (const dep of deployments) {
         const labels = dep.metadata?.labels || {}
-        if (labels['opencode-user-slug'] === slug) return dep
-        if (labels['opencode-user-warmpool'] === 'true'
-          && (labels['opencode-user-owner'] === slug || (legacySlug && labels['opencode-user-owner'] === legacySlug))) return dep
+        if (labels['dsh-user-slug'] === slug) return dep
+        if (labels['dsh-user-warmpool'] === 'true'
+          && (labels['dsh-user-owner'] === slug || (legacySlug && labels['dsh-user-owner'] === legacySlug))) return dep
       }
       return null
     }
@@ -647,11 +677,11 @@ data:
     }
 
     async function podForSlug(slug, legacySlug, ns = namespace) {
-      const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
+      const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       let fallback = null
       for (const pod of (result && result.items) || []) {
         const labels = pod.metadata?.labels || {}
-        const podSlug = labels['opencode-user-slug'] || (labels['opencode-user-warmpool'] === 'true' ? labels['opencode-user-owner'] : null)
+        const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
         if ((podSlug !== slug && (!legacySlug || podSlug !== legacySlug)) || !pod.spec?.nodeName) continue
         if (pod.status?.phase === 'Running') {
           return { phase: 'Running', nodeName: pod.spec.nodeName }
@@ -676,10 +706,9 @@ data:
       return null
     }
 
-    // Distinct namespaces opencode units live in: the release namespace plus
-    // every unit namespace recorded in the registry (platform integration:
-    // units inside the users' project-user-<name> namespaces). Used by the
-    // cleanup sweeps and the admin snapshot paths.
+    // Distinct namespaces DSH units live in: the release namespace plus every
+    // unit namespace recorded in the registry (platform integration, Option
+    // B). Used by the cleanup sweeps and the admin snapshot paths.
     async function knownUnitNamespaces() {
       const namespaces = new Set([namespace])
       try {
@@ -702,11 +731,11 @@ data:
       const namespaces = await knownUnitNamespaces()
       for (const ns of namespaces) {
         try {
-          const result = await k8sRequest('GET', `/apis/batch/v1/namespaces/${ns}/jobs?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
+          const result = await k8sRequest('GET', `/apis/batch/v1/namespaces/${ns}/jobs?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
           const cutoff = Date.now() - 5 * 60 * 1000
           for (const job of (result && result.items) || []) {
             const name = job.metadata?.name || ''
-            if (!name.startsWith('opencode-clear-')) continue
+            if (!name.startsWith('dsh-clear-')) continue
             const createdAt = Date.parse(job.metadata?.creationTimestamp || '')
             if (!Number.isFinite(createdAt) || createdAt > cutoff) continue
             console.log(`[admin] sweeping stale cleanup job ${name} in ${ns}`)
@@ -729,7 +758,7 @@ data:
           const podCutoff = Date.now() - 5 * 60 * 1000
           for (const pod of (podResult && podResult.items) || []) {
             const podName = pod.metadata?.name || ''
-            if (!podName.startsWith('opencode-clear-')) continue
+            if (!podName.startsWith('dsh-clear-')) continue
             const podCreatedAt = Date.parse(pod.metadata?.creationTimestamp || '')
             if (!Number.isFinite(podCreatedAt) || podCreatedAt > podCutoff) continue
             console.log(`[admin] sweeping stale cleanup pod ${podName} in ${ns}`)
@@ -764,14 +793,14 @@ data:
       for (const ns of namespaces) {
         let result = null
         try {
-          result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
+          result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
         } catch (error) {
           if (error.statusCode !== 403 && error.statusCode !== 404) throw error
           continue
         }
         for (const pod of (result && result.items) || []) {
           const labels = pod.metadata?.labels || {}
-          const podSlug = labels['opencode-user-slug'] || (labels['opencode-user-warmpool'] === 'true' ? labels['opencode-user-owner'] : null)
+          const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
           if (!podSlug || !pod.spec?.nodeName) continue
           const phase = pod.status?.phase || 'Unknown'
           const existing = podBySlug.get(podSlug)
@@ -790,8 +819,8 @@ data:
       const deployment = deploymentForSlug(deployments, slug, legacySlug)
       if (!deployment) return { username, slug, status: 'no environment' }
       // The unit (and its state claim) may live in the user's platform
-      // project namespace (platform integration) — every object below targets
-      // the deployment's own namespace.
+      // project namespace (Option B) — every object below targets the
+      // deployment's own namespace.
       const deploymentNs = deployment.metadata?.namespace || namespace
       const claimName = stateClaimForDeployment(deployment)
       if (!claimName) return { username, slug, status: 'failed: state claim not found on deployment' }
@@ -801,7 +830,7 @@ data:
       const pod = snapshot
         ? (snapshot.podBySlug.get(slug) || snapshot.podBySlug.get(legacySlug))
         : await podForSlug(slug, legacySlug, deploymentNs)
-      const jobName = `opencode-clear-${slug}-${Date.now().toString(36)}`
+      const jobName = `dsh-clear-${slug}-${Date.now().toString(36)}`
       const manifest = {
         apiVersion: 'batch/v1',
         kind: 'Job',
@@ -810,8 +839,8 @@ data:
           namespace: deploymentNs,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
-            'opencode-user-slug': slug,
+            'dsh-user-managed': 'true',
+            'dsh-user-slug': slug,
           },
         },
         spec: {
@@ -821,9 +850,9 @@ data:
           template: {
             metadata: {
               labels: {
-                app: 'opencode-user',
-                'opencode-user-managed': 'true',
-                'opencode-user-slug': slug,
+                app: 'dsh-user',
+                'dsh-user-managed': 'true',
+                'dsh-user-slug': slug,
               },
             },
             spec: {
@@ -831,12 +860,16 @@ data:
               ...(pod?.nodeName ? { nodeName: pod.nodeName } : {}),
               containers: [
                 {
-                  name: 'clear-opencode-storage',
+                  name: 'clear-dsh-storage',
                   image: 'alpine:3.20',
                   imagePullPolicy: 'IfNotPresent',
-                  command: ['/bin/sh', '-c', 'rm -rf /var/opencode/data/opencode/opencode.db /var/opencode/data/opencode/opencode.db-shm /var/opencode/data/opencode/opencode.db-wal /var/opencode/data/opencode/storage /var/opencode/data/opencode/project/*/storage'],
+                  // dsh persists sessions/agent logs under $DSH_HOME
+                  // (~/.dsh inside the mounted state volume); the workspace
+                  // and settings.yaml / credentials live on the same volume
+                  // but outside the session subdirectories.
+                  command: ['/bin/sh', '-c', 'rm -rf /var/dsh/home/.dsh/sessions /var/dsh/home/.dsh/agent /var/dsh/home/.dsh/logs'],
                   volumeMounts: [
-                    { name: 'state', mountPath: '/var/opencode' },
+                    { name: 'state', mountPath: '/var/dsh' },
                   ],
                 },
               ],
@@ -864,9 +897,9 @@ data:
           if (!job) {
             return { username, slug, status: 'failed: cleanup job disappeared' }
           }
-          const podPhase = await jobPodPhase(jobName, deploymentNs)
+          const podPhase = await jobPodPhase(jobName)
           if ((job.status?.succeeded || 0) >= 1 || podPhase === 'Succeeded') {
-            // The running opencode server keeps the deleted database open (WAL
+            // The running dsh process keeps deleted session files open (WAL
             // mode), so roll the pod to make the fresh, empty database take
             // effect immediately. Recreate strategy swaps the pod cleanly.
             if (pod) {
@@ -898,10 +931,11 @@ data:
       }
     }
 
-    // Safety tripwire (uninstall contract): never delete a PVC owned by the
-    // platform (ezprojects), even if it somehow ended up in a target set.
-    // Platform PVCs carry ezprojects.hpe.com/* labels; chart-created PVCs
-    // never do. Unreadable PVCs fail safe (treated as platform-owned).
+    // Safety tripwire (integration study §7.6 — uninstall contract): never
+    // delete a PVC owned by the platform (ezprojects), even if it somehow
+    // ended up in a target set. Platform PVCs carry ezprojects.hpe.com/*
+    // labels; DSH-created PVCs never do. Unreadable PVCs fail safe (treated
+    // as platform-owned).
     async function isPlatformOwnedClaim(ns, claimName) {
       try {
         const pvc = await k8sRequest('GET', `/api/v1/namespaces/${ns}/persistentvolumeclaims/${claimName}`)
@@ -919,18 +953,19 @@ data:
     }
 
     // Discover the namespace(s) hosting a user's unit WITHOUT relying on the
-    // registry: the ownership anchors (`opencode-anchor-<slug>`, chart-
-    // labeled) are the durable truth. The registry is only a hint — the entry
-    // can already be deleted or stale, and either case previously orphaned
-    // the unit in the project namespace.
+    // registry: the ownership anchors (`dsh-anchor-<slug>`, DSH-labeled) are
+    // the durable truth. The registry is only a hint — the entry can already
+    // be deleted or stale, and either case previously orphaned the unit in
+    // the project namespace (observed on g2: an uninstall cleaned the release
+    // namespace but never visited project-user-<name>).
     async function anchorNamespacesForSlug(slug) {
       const found = new Set()
       try {
-        const result = await k8sRequest('GET', `/api/v1/configmaps?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
+        const result = await k8sRequest('GET', `/api/v1/configmaps?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
         for (const cm of (result && result.items) || []) {
           const meta = cm.metadata || {}
-          if (!String(meta.name || '').startsWith('opencode-anchor-')) continue
-          if ((meta.labels || {})['opencode-user-slug'] !== slug) continue
+          if (!String(meta.name || '').startsWith('dsh-anchor-')) continue
+          if ((meta.labels || {})['dsh-user-slug'] !== slug) continue
           if (meta.namespace && meta.namespace !== namespace) found.add(meta.namespace)
         }
       } catch (error) {
@@ -941,13 +976,13 @@ data:
     }
 
     async function deleteUserEnvironment(slug, legacySlug) {
-      // A user may own resources under the readable slug and/or the legacy
-      // hash slug (e.g. deleted before their first post-upgrade login), so
-      // both candidates are cleaned up.
+      // A user may own resources under the readable slug and/or a pre-0.3.5
+      // legacy-hash slug (e.g. deleted before their first post-upgrade login),
+      // so both candidates are cleaned up.
       const candidates = [...new Set([slug, legacySlug].filter(Boolean))]
       const names = namesForSlug(candidates[0])
-      // Platform unit namespaces: the registry (when the entry still exists)
-      // UNION the cluster-wide anchor scan (durable truth).
+      // Platform (Option B) unit namespaces: the registry (when the entry
+      // still exists) UNION the cluster-wide anchor scan (durable truth).
       const unitNsSet = new Set()
       try {
         const users = await loadUserRegistry()
@@ -972,12 +1007,12 @@ data:
         }
       }
       // Delete the ownership anchors first: the Kubernetes GC cascades every
-      // chart-created object in those namespaces (deployment, service, chart
-      // PVCs, mirrored ConfigMaps). The platform PVCs are never
-      // owner-referenced, so the GC is structurally unable to touch them.
+      // DSH-created object in those namespaces (deployment, service, DSH PVCs,
+      // mirrored ConfigMaps). The platform PVCs are never owner-referenced, so
+      // the GC is structurally unable to touch them.
       for (const ns of unitNsSet) {
         for (const candidate of candidates) {
-          await deleteK8s(`/api/v1/namespaces/${ns}/configmaps`, `opencode-anchor-${candidate}`)
+          await deleteK8s(`/api/v1/namespaces/${ns}/configmaps`, `dsh-anchor-${candidate}`)
         }
       }
       // Explicit belt-and-braces cleanup (independent of the GC path), swept
@@ -995,16 +1030,16 @@ data:
       outer: for (const candidate of candidates) {
         for (const dep of deployments) {
           const labels = dep.metadata?.labels || {}
-          if (labels['opencode-user-warmpool'] === 'true' && labels['opencode-user-owner'] === candidate) {
-            warm = warmNamesForPoolId(Number(labels['opencode-user-pool-id']))
+          if (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === candidate) {
+            warm = warmNamesForPoolId(Number(labels['dsh-user-pool-id']))
             break outer
           }
         }
       }
       // Prefer the environment that actually exists and derive its claim
-      // names from the deployment spec: an adopted pre-readable-slug
-      // environment mounts legacy-named claims that a name-derived lookup
-      // would miss (leaking VAST quotas).
+      // names from the deployment spec: an adopted pre-0.3.5 environment
+      // mounts legacy-named claims that a name-derived lookup would miss
+      // (leaking VAST quotas).
       let target = null
       if (warm) {
         // Warm units only exist in the release namespace.
@@ -1026,7 +1061,7 @@ data:
               ns,
               workspaceClaim: volumeClaims.get('personal-workspace') || candidateNames.workspaceClaim,
               stateClaim: volumeClaims.get('state') || candidateNames.stateClaim,
-              // The chart-level shared PVC is per-namespace (and
+              // The DSH-level shared PVC is per-namespace (and
               // owner-anchored) for platform units, but release-level and
               // helm-managed for classic units — only delete it when the
               // unit does NOT live in the release namespace.
@@ -1051,7 +1086,7 @@ data:
       for (const candidate of candidates) {
         const candidateNames = namesForSlug(candidate)
         await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, candidateNames.virtualService)
-        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `opencode-user-${candidate}`)
+        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `dsh-user-${candidate}`)
         // The per-user DinD broker lives in the release namespace (not
         // owner-anchored — cross-namespace ownerReferences are invalid) and
         // is therefore deleted explicitly alongside the VS/lease.
@@ -1173,7 +1208,7 @@ data:
           name: registrySecretName,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
+            'dsh-user-managed': 'true',
           },
         },
         stringData: {
@@ -1333,7 +1368,7 @@ data:
           namespace,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
+            'dsh-user-managed': 'true',
           },
         },
         spec: {
@@ -1349,12 +1384,16 @@ data:
       }
     }
 
-    async function ensurePersistentVolumeClaim(name, size, ns = namespace, ownerRefs = null, accessModes = ['ReadWriteOnce']) {
+    async function ensurePersistentVolumeClaim(name, size, ns = namespace, ownerRefs = null) {
       const path = `/api/v1/namespaces/${ns}/persistentvolumeclaims/${name}`
       const existing = await k8sRequest('GET', path)
       if (existing) {
         return
       }
+      // The DSH-level shared claim is a "shared" volume by name and role —
+      // provision it RWX (per-namespace shared PVCs, platform units) so the
+      // access mode matches the release-level shared PVC it mirrors.
+      const accessModes = name === sharedWorkspaceClaim ? ['ReadWriteMany'] : ['ReadWriteOnce']
       const manifest = {
         apiVersion: 'v1',
         kind: 'PersistentVolumeClaim',
@@ -1363,7 +1402,7 @@ data:
           namespace: ns,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
+            'dsh-user-managed': 'true',
           },
           ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
@@ -1398,9 +1437,10 @@ data:
     }
 
     function userServiceManifest(name, slug, ns = namespace, ownerRefs = null) {
-      const spec = serviceSpec(userIsChamber ? userChamberPort : userServerPort)
+      // 8082 = the in-pod nginx entry point (dsh web itself is loopback-only).
+      const spec = serviceSpec(8082)
       spec.selector = {
-        'opencode-user-slug': slug,
+        'dsh-user-slug': slug,
       }
       return {
         apiVersion: 'v1',
@@ -1409,9 +1449,9 @@ data:
           name,
           namespace: ns,
           labels: {
-            app: 'opencode-user',
-            'opencode-user-managed': 'true',
-            'opencode-user-slug': slug,
+            app: 'dsh-user',
+            'dsh-user-managed': 'true',
+            'dsh-user-slug': slug,
           },
           ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
@@ -1429,19 +1469,19 @@ data:
           name,
           namespace,
           labels: {
-            app: 'opencode-user',
-            'opencode-user-managed': 'true',
-            'opencode-user-warmpool': 'true',
-            'opencode-user-pool-id': poolIdStr,
+            app: 'dsh-user',
+            'dsh-user-managed': 'true',
+            'dsh-user-warmpool': 'true',
+            'dsh-user-pool-id': poolIdStr,
           },
         },
         spec: {
           type: 'ClusterIP',
           selector: {
-            'opencode-user-pool-id': poolIdStr,
+            'dsh-user-pool-id': poolIdStr,
           },
           ports: [
-            { name: 'http', protocol: 'TCP', port: 8080, targetPort: userIsChamber ? userChamberPort : userServerPort },
+            { name: 'http', protocol: 'TCP', port: 8080, targetPort: 8082 },
             { name: 'http-preview', protocol: 'TCP', port: 8082, targetPort: 8082 },
             { name: 'ttyd', protocol: 'TCP', port: 7681, targetPort: 7681 },
             { name: 'data-manager', protocol: 'TCP', port: 7682, targetPort: 7682 },
@@ -1455,7 +1495,7 @@ data:
       return {
         type: 'ClusterIP',
         selector: {
-          'opencode-user-slug': 'PLACEHOLDER',
+          'dsh-user-slug': 'PLACEHOLDER',
         },
         ports: [
           { name: 'http', protocol: 'TCP', port: 8080, targetPort: appPort },
@@ -1499,7 +1539,7 @@ data:
     }
 
     function warmNamesForPoolId(poolId) {
-      const base = `opencode-user-warm-${poolId}`
+      const base = `dsh-user-warm-${poolId}`
       return {
         deployment: base,
         service: `${base}-svc`,
@@ -1509,43 +1549,43 @@ data:
       }
     }
 
-    async function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform }) {
+    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform }) {
       slug = owner || (isWarmPool ? `warm-${poolId}` : slug)
       const manifestNs = unitNs || namespace
       const platformVolumesMounted = !!(platform && platform.volumesMounted)
       const matchLabels = isWarmPool
-        ? { 'opencode-user-pool-id': String(poolId) }
-        : { 'opencode-user-slug': slug }
+        ? { 'dsh-user-pool-id': String(poolId) }
+        : { 'dsh-user-slug': slug }
       const podLabels = {
-        app: 'opencode-user',
-        'opencode-user-managed': 'true',
-        'opencode-role': 'preview',
+        app: 'dsh-user',
+        'dsh-user-managed': 'true',
+        'dsh-role': 'preview',
         ...matchLabels,
-        ...(isWarmPool ? { 'opencode-user-warmpool': 'true' } : {}),
-        ...(platformVolumesMounted ? { 'opencode-platform-unit': 'true' } : {}),
+        ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
+        ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
       }
       const deploymentLabels = {
-        app: 'opencode-user',
-        'opencode-user-managed': 'true',
+        app: 'dsh-user',
+        'dsh-user-managed': 'true',
         ...matchLabels,
-        ...(isWarmPool ? { 'opencode-user-warmpool': 'true' } : {}),
-        ...(platformVolumesMounted ? { 'opencode-platform-unit': 'true' } : {}),
+        ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
+        ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
       }
       if (owner) {
-        podLabels['opencode-user-owner'] = owner
-        deploymentLabels['opencode-user-owner'] = owner
+        podLabels['dsh-user-owner'] = owner
+        deploymentLabels['dsh-user-owner'] = owner
       }
-      // Identity env (platform integration): the project's unix attributes
-      // from the platform project-info ConfigMap. Consumed by the init
-      // container (volume chown + installs under the identity) and by the
-      // startup (setpriv drop for the whole service stack). Absent for
-      // classic units — everything then behaves exactly as before.
+      // Identity env (Option B): the project's unix attributes from the
+      // platform project-info ConfigMap. Consumed by the init container
+      // (volume chown + installs under the identity) and by the startup
+      // (setpriv drop for the whole service stack). Absent for classic
+      // units — everything then behaves exactly as before.
       const platformIdentityEnv = platform && platform.identity ? [
         { name: 'USER_INFO_UID', value: String(platform.identity.uid) },
         { name: 'USER_INFO_GID', value: String(platform.identity.gid) },
         { name: 'USER_INFO_USERNAME', value: platform.identity.user || '' },
         { name: 'USER_INFO_GROUP', value: platform.identity.group || '' },
-        { name: 'USER_INFO_HOMEDIR', value: platform.identity.homedir || '/var/opencode/home' },
+        { name: 'USER_INFO_HOMEDIR', value: platform.identity.homedir || '/var/dsh/home' },
       ] : []
       // Data Manager platform roots: mounted → show; pending/off → hide.
       const platformRootsMode = platform ? (platformVolumesMounted ? 'mounted' : 'pending') : 'off'
@@ -1565,7 +1605,7 @@ data:
         : (dockerBrokerHere ? `tcp://${dindBrokerNames(slug).service}.${namespace}.svc.cluster.local:2375` : null)
       // Platform PVC volumes — mounted BY REFERENCE (claimName) into the
       // unit's namespace. Never labeled, never owner-referenced, never
-      // deleted by the chart: they belong to the platform (EzProject).
+      // deleted by DSH: they belong to the platform (EzProject).
       const platformVolumes = platformVolumesMounted ? [
         { name: 'platform-shared', persistentVolumeClaim: { claimName: platformSharedClaim } },
         { name: 'platform-user', persistentVolumeClaim: { claimName: platformUserClaim } },
@@ -1574,107 +1614,128 @@ data:
         { name: 'platform-shared', mountPath: platformSharedMount },
         { name: 'platform-user', mountPath: platformUserMount },
       ] : []
-      // npm packages (opencode-ai + @openchamber/web): when the image ships
-      // baked copies under /opt/opencode/npm whose version markers match
-      // OPENCODE_VERSION and OPENCHAMBER_VERSION, alias the PVC prefix to
-      // them (fresh state PVCs only — an existing /var/opencode/data/npm
-      // keeps the user's installed copies) and skip the installs entirely.
-      // Version mismatch or a vanilla image falls back to the original
-      // install-into-the-state-PVC behavior; the openchamber fallback install
-      // only fires when OPENCHAMBER_INSTALL=true is stamped (chamber mode, as
-      // before). PATH keeps working because the .bashrc entry
-      // /var/opencode/data/npm/bin resolves through the alias.
-      const npmBakedGuardCommand = '$RUN_AS_USER sh -c \'if [ -f /opt/opencode/npm/.opencode-version ] && [ "$(cat /opt/opencode/npm/.opencode-version 2>/dev/null)" = "${OPENCODE_VERSION}" ] && [ -f /opt/opencode/npm/.openchamber-version ] && [ "$(cat /opt/opencode/npm/.openchamber-version 2>/dev/null)" = "${OPENCHAMBER_VERSION}" ]; then if [ ! -e /var/opencode/data/npm ]; then ln -sfn /opt/opencode/npm /var/opencode/data/npm; fi; ln -sf /opt/opencode/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true; else if [ ! -f /var/opencode/data/npm/bin/opencode ] || [ "$(cat /var/opencode/.opencode-version 2>/dev/null)" != "${OPENCODE_VERSION}" ]; then HOME=/var/opencode/home npm install -g "opencode-ai@${OPENCODE_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCODE_VERSION}" > /var/opencode/.opencode-version && (ln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true); fi; if [ -n "$OPENCHAMBER_INSTALL" ] && { [ ! -f /var/opencode/data/npm/bin/openchamber ] || [ "$(cat /var/opencode/.openchamber-version 2>/dev/null)" != "${OPENCHAMBER_VERSION}" ]; }; then HOME=/var/opencode/home npm install -g "@openchamber/web@${OPENCHAMBER_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCHAMBER_VERSION}" > /var/opencode/.openchamber-version && (ln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true); fi; fi\''
       const initCommandParts = [
-        'mkdir -p /workspace/personal /workspace/shared /var/opencode/home/.config/opencode/agents /var/opencode/home/.config/opencode/skills /var/opencode/data /var/opencode/state /var/opencode/cache /var/opencode/bin',
-        // --- Platform identity (platform integration): when USER_INFO_* is
-        // stamped (SSO unit inside the project namespace), all VOLUME content
-        // work runs as the project unix identity so file ownership matches
-        // the platform. Chart-owned volumes are chowned ONLY when their root
-        // owner differs (fresh volume) — never a blanket recursive chown on
-        // every boot, and NEVER the platform volumes (/mnt/shared, /mnt/user):
-        // those keep their platform ownership; access is enforced by unix
-        // permissions against the identity, exactly like a notebook.
-        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/opencode/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/opencode /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
-        '$RUN_AS_USER ln -sfn /workspace /var/opencode/home/workspace',
+        'mkdir -p /workspace/personal /workspace/shared /var/dsh/home/.dsh/skills /var/dsh/data /var/dsh/state /var/dsh/cache /var/dsh/bin',
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
+        // --- Platform identity (Option B): when USER_INFO_* is stamped (SSO
+        // unit inside the project namespace), all VOLUME content work runs as
+        // the project unix identity so file ownership matches the platform.
+        // DSH-owned volumes are chowned ONLY when their root owner differs
+        // (fresh volume) — never a blanket recursive chown on every boot, and
+        // NEVER the platform volumes (/mnt/shared, /mnt/user): those keep
+        // their platform ownership; access is enforced by unix permissions
+        // against the identity, exactly like a notebook.
+        // The ROOT guard matters on clusters whose platform admission webhook
+        // (EzProject/Kyverno, observed on tr211) FORCES the tenant uid/gid into
+        // every pod of project-user-* namespaces: there the init container is
+        // NOT root, chown/setpriv cannot work, and the platform has already
+        // applied the identity — so RUN_AS_USER degrades to "" and every step
+        // runs directly as the (already correct) forced identity.
+        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ] && [ "$(id -u)" = "0" ]; then export HOME=/var/dsh/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/dsh /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
+        '$RUN_AS_USER ln -sfn /workspace /var/dsh/home/workspace',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/home/.config/opencode/opencode.json ]; then if [ -f /var/opencode/config/opencode/opencode.json ]; then cp /var/opencode/config/opencode/opencode.json /var/opencode/home/.config/opencode/opencode.json; else cp /opt/opencode-defaults/opencode.json /var/opencode/home/.config/opencode/opencode.json; fi; fi\'',
-        "$RUN_AS_USER sh -c 'legacy_agents=/tmp/opencode-legacy-AGENTS.md; printf \"%s\n%s\n%s\n\" \"# HPE AI Essentials (AIE) Platform Assistant\" \"You are an expert AIE/PCAI platform engineer and advisor. You have access to live Kubernetes cluster tools, indexed product documentation, and web search.\" \"Your mission: **Think deeply. Act decisively. Anticipate what the user needs before they ask.**\" > \"$legacy_agents\"; if [ -f /var/opencode/home/.config/opencode/AGENTS.md ] && cmp -s \"$legacy_agents\" /var/opencode/home/.config/opencode/AGENTS.md; then rm /var/opencode/home/.config/opencode/AGENTS.md; fi; rm -f \"$legacy_agents\"' || true",
-        {{- range .Values.opencodeSkills }}
-        '$RUN_AS_USER sh -c \'mkdir -p /var/opencode/home/.config/opencode/skills/{{ .name }} && if [ ! -f /var/opencode/home/.config/opencode/.seeded-skill-{{ .name }} ]; then if [ ! -f /var/opencode/home/.config/opencode/skills/{{ .name }}/SKILL.md ]; then cp /opt/opencode-defaults/skill-{{ .name }}.md /var/opencode/home/.config/opencode/skills/{{ .name }}/SKILL.md; fi; touch /var/opencode/home/.config/opencode/.seeded-skill-{{ .name }}; fi\' || true',
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/settings.yaml ]; then if [ -f /var/dsh/config/dsh/settings.yaml ]; then cp /var/dsh/config/dsh/settings.yaml /var/dsh/home/.dsh/settings.yaml; elif [ -f /opt/dsh-defaults/settings.yaml ]; then cp /opt/dsh-defaults/settings.yaml /var/dsh/home/.dsh/settings.yaml; fi; fi\'',
+        // AGENTS.md seeding is best-effort: the file is user-managed now
+        // (dshInstructions was removed from the chart), so both sources may
+        // legitimately be absent — a failed cp must NOT kill the init
+        // container (that would crash-loop every new pod).
+        '$RUN_AS_USER sh -c \'if [ ! -f /workspace/personal/AGENTS.md ]; then if [ -f /var/dsh/config/dsh/AGENTS.md ]; then cp /var/dsh/config/dsh/AGENTS.md /workspace/personal/AGENTS.md; elif [ -f /opt/dsh-defaults/AGENTS.md ]; then cp /opt/dsh-defaults/AGENTS.md /workspace/personal/AGENTS.md; fi; fi || true\'',
+        // Seed $DSH_HOME/.env from chart values (dshEnv) — the same launch-
+        // env layer a laptop .env provides. Seed-once semantics like
+        // settings.yaml: user edits afterwards are never overwritten. The
+        // supervisor watches .env and restarts dsh on change. Transport is
+        // base64: values content must survive the values→JS→shell quoting
+        // layers byte-exact (a printf format string would corrupt %/$).
+        {{- if and .Values.dshEnv (ne (trim .Values.dshEnv) "") }}
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/.env ]; then printf %s {{ .Values.dshEnv | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/.env; fi\'',
         {{- end }}
-        {{- range .Values.opencodeAgents }}
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/home/.config/opencode/.seeded-agent-{{ .name }} ]; then if [ ! -f /var/opencode/home/.config/opencode/agents/{{ .name }}.md ]; then cp /opt/opencode-defaults/agent-{{ .name }}.md /var/opencode/home/.config/opencode/agents/{{ .name }}.md; fi; touch /var/opencode/home/.config/opencode/.seeded-agent-{{ .name }}; fi\' || true',
+        // Seed the web profile's patch layer from chart values
+        // (dshCordisPatch) — MCP integrations, session content search,
+        // title-service caps. Seed-once like settings.yaml: user edits
+        // afterwards are never overwritten (re-seed by deleting
+        // profiles/web/cordis.patch.yml on the unit's state PVC, or bump
+        // storage.nameVersion for fresh volumes). The supervisor watches
+        // this file and YAML-validates it before restarting dsh on change.
+        {{- if and .Values.dshCordisPatch (ne (trim .Values.dshCordisPatch) "") }}
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/profiles/web/cordis.patch.yml ]; then mkdir -p /var/dsh/home/.dsh/profiles/web && printf %s {{ .Values.dshCordisPatch | b64enc | quote }} | base64 -d > /var/dsh/home/.dsh/profiles/web/cordis.patch.yml; fi\'',
         {{- end }}
+        // Skills are user-managed: drop SKILL.md trees into
+        // /var/dsh/home/.dsh/skills/ (Data Manager or terminal) — dsh
+        // hot-refreshes them natively, no chart seeding, no watcher restart.
 {{- range $path, $_ := $.Files.Glob "personal/**" }}
 {{- if not (hasPrefix "." (base $path)) }}
         '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
 {{- end }}
 {{- end }}
 {{- range $path, $_ := $.Files.Glob "create-server.sh" }}
-        '$RUN_AS_USER sh -c \'cp /personal-templates/create-server.sh /var/opencode/bin/create-server.sh && chmod 0755 /var/opencode/bin/create-server.sh\' || true',
+        '$RUN_AS_USER sh -c \'cp /personal-templates/create-server.sh /var/dsh/bin/create-server.sh && chmod 0755 /var/dsh/bin/create-server.sh\' || true',
 {{- end }}
         // NOTE: the printf format strings below stay SINGLE-quoted in the
         // shell so $HOME/$PATH/$@ are written into the files as literals and
         // expand at login time. $RUN_AS_USER prefixes each so the files are
-        // created under the project identity where possible (a plain root
-        // printf into a uid-owned directory would leave root-owned,
-        // non-editable files — reconciled by the root chown below).
-        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/opencode/home/.bashrc",
-        "$RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/opencode/home/.bash_profile",
-        '$RUN_AS_USER cp /var/opencode/home/.bash_profile /var/opencode/home/.profile',
-        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/opencode/bin/opencode-bashrc",
-        "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/opencode/bin/opencode-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/opencode/bin/opencode-login-shell",
+        // created owned by the project identity (a plain root printf into a
+        // uid-owned directory would leave root-owned, non-editable files).
+        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/home/.bashrc",
+        "$RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/dsh/home/.bash_profile",
+        '$RUN_AS_USER cp /var/dsh/home/.bash_profile /var/dsh/home/.profile',
+        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/bin/dsh-bashrc",
+        "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/dsh/bin/dsh-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/dsh/bin/dsh-login-shell",
         // ROOT chmod + ownership reconciliation: the `>` redirections above
         // are performed by the ROOT shell (setpriv only wraps the command
         // itself), so those files land root-owned — a $RUN_AS_USER chmod on
-        // them hits EPERM (observed on g2 with the dsh chart: the login shell
-        // stayed 644 → the tmux pane couldn't exec → every terminal
-        // [exited]). Root performs the chmod and hands the files to the
-        // project identity instead.
-        'chmod 0755 /var/opencode/bin/opencode-login-shell',
-        'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then chown -f "$USER_INFO_UID:$USER_INFO_GID" /var/opencode/home/.bashrc /var/opencode/home/.bash_profile /var/opencode/home/.profile /var/opencode/bin/opencode-bashrc /var/opencode/bin/opencode-login-shell /var/opencode/bin/create-server.sh || true; fi',
+        // them hits EPERM (observed on g2: dsh-login-shell stayed 644 → the
+        // tmux pane couldn't exec → every terminal [exited]). Root performs
+        // the chmod and hands the files to the project identity instead.
+        'chmod 0755 /var/dsh/bin/dsh-login-shell',
+        'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then chown -f "$USER_INFO_UID:$USER_INFO_GID" /var/dsh/home/.bashrc /var/dsh/home/.bash_profile /var/dsh/home/.profile /var/dsh/bin/dsh-bashrc /var/dsh/bin/dsh-login-shell /var/dsh/bin/create-server.sh || true; fi',
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
-        '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/bin/opencode-bashrc\'',
+        '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc\'',
 {{- end }}
-        // uv: prefer the baked copy (/opt/opencode/bin, baked user image) when
+        // uv: prefer the baked copy (/opt/dsh/bin, baked user image) when
         // present; only download when neither the state PVC nor the image
         // ships one. Keeps the old install-on-boot behavior as the fallback.
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/bin/uv ] && [ ! -f /opt/opencode/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/opencode/bin sh; fi\' || true',
-        '$RUN_AS_USER sh -c \'ln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true; ln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\' || true',
-        npmBakedGuardCommand,
-        '$RUN_AS_USER sh -c \'if [ ! -x /var/opencode/bin/ttyd ] && [ ! -x /opt/opencode/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/opencode/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/opencode/bin/ttyd; fi\'',
-        // Compat symlinks on the state PVC: the startup execs
-        // /var/opencode/bin/ttyd directly (and PATH carries /var/opencode/bin),
-        // so alias any baked binary into /var/opencode/bin when the PVC copy
-        // is missing or not executable (partial download recovery). PVC
-        // copies always win when present so existing volumes keep their
-        // behavior.
-        '$RUN_AS_USER sh -c \'for b in uv uvx ttyd; do if [ -e "/opt/opencode/bin/$b" ]; then if [ ! -e "/var/opencode/bin/$b" ] || [ ! -x "/var/opencode/bin/$b" ]; then ln -sfn "/opt/opencode/bin/$b" "/var/opencode/bin/$b" || true; fi; fi; done\' || true',
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/bin/uv ] && [ ! -f /opt/dsh/bin/uv ]; then curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/var/dsh/bin sh; fi\' || true',
+        '$RUN_AS_USER sh -c \'ln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true; ln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\' || true',
+        // The dsh npm install runs under the project identity when stamped:
+        // version bumps then never re-create root-owned files on the state
+        // volume (which would be unwritable for the unit process).
+        // dsh npm package: when the image ships a baked copy under
+        // /opt/dsh/npm whose version matches DSH_VERSION, alias the PVC path
+        // to it (fresh state PVCs only — an existing /var/dsh/data/npm keeps
+        // the user's installed copy) and skip the npm install entirely.
+        // Version mismatch or a vanilla image falls back to the original
+        // install-into-the-state-PVC behavior. PATH keeps working because
+        // the .bashrc entry /var/dsh/data/npm/bin resolves through the alias.
+        '$RUN_AS_USER sh -c \'if [ -f /opt/dsh/npm/.dsh-version ] && [ "$(cat /opt/dsh/npm/.dsh-version 2>/dev/null)" = "${DSH_VERSION}" ]; then if [ ! -e /var/dsh/data/npm ]; then ln -sfn /opt/dsh/npm /var/dsh/data/npm; fi; ln -sf /opt/dsh/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true; elif [ ! -f /var/dsh/data/npm/bin/dsh ] || [ "$(cat /var/dsh/.dsh-version 2>/dev/null)" != "${DSH_VERSION}" ]; then HOME=/var/dsh/home npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --prefix /var/dsh/data/npm && echo "${DSH_VERSION}" > /var/dsh/.dsh-version && (ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true); fi\'',
+        '$RUN_AS_USER sh -c \'if [ ! -x /var/dsh/bin/ttyd ] && [ ! -x /opt/dsh/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/dsh/bin/ttyd; fi\'',
+        // Compat symlinks on the state PVC: dsh-startup.sh execs
+        // /var/dsh/bin/ttyd directly (and PATH carries /var/dsh/bin), so
+        // alias any baked binary into /var/dsh/bin when the PVC copy is
+        // missing or not executable (partial download recovery). PVC copies
+        // always win when present so existing volumes keep their behavior.
+        '$RUN_AS_USER sh -c \'for b in uv uvx ttyd; do if [ -e "/opt/dsh/bin/$b" ]; then if [ ! -e "/var/dsh/bin/$b" ] || [ ! -x "/var/dsh/bin/$b" ]; then ln -sfn "/opt/dsh/bin/$b" "/var/dsh/bin/$b" || true; fi; fi; done\' || true',
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
         // Per-namespace shared PVC seeding (platform units each get their own
         // <release>-shared-pvc; classic units seed here too — cp -n makes it
         // seed-once, so user edits in the shared workspace survive restarts).
-        '$RUN_AS_USER sh -c \'if [ -f /opencode-shared-seed/seed.sh ]; then sh /opencode-shared-seed/seed.sh /opencode-shared-seed /workspace/shared; fi\' || true',
+        '$RUN_AS_USER sh -c \'if [ -f /dsh-shared-seed/seed.sh ]; then sh /dsh-shared-seed/seed.sh /dsh-shared-seed /workspace/shared; fi\' || true',
 {{- end }}
         // The service stack (ttyd, port watcher, data manager, terminal
-        // manager, opencode supervisor) is wrapped in start_services(); the
-        // startup execs it via setpriv under the project identity
-        // (USER_INFO_*), so every user-facing service — and every file it
-        // writes, on the chart volumes AND on the platform volumes — runs as
-        // the platform unix identity, byte-identical to a Kubeflow notebook.
-        // Without identity (classic local units) it runs as root, exactly as
-        // before.
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
-        "chmod 0755 /var/opencode/bin/opencode-startup.sh",
+        // manager, dsh supervisor) is wrapped in start_services(); the
+        // startup execs it via setpriv under the project identity (USER_INFO_*),
+        // so every user-facing service — and every file it writes, on the DSH
+        // volumes AND on the platform volumes — runs as the platform unix
+        // identity, byte-identical to a Kubeflow notebook. Without identity
+        // (classic local units) it runs as root, exactly as before.
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\nstart_services() {\n  /var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/dsh_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): already the tenant uid — setpriv is a\n  # no-op requirement and groupadd/useradd cannot run as non-root.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-dshuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/dsh/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-dshuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/dsh/bin/dsh-startup.sh",
+        "chmod 0755 /var/dsh/bin/dsh-startup.sh",
         '$RUN_AS_USER sh -c \'rm -rf /workspace/personal/shared\' || true',
       ]
       const initCommand = initCommandParts.join(' && ')
 
       const appCommand = [
-        'cp /var/opencode/bin/create-server.sh /workspace/create-server.sh 2>/dev/null || true',
-        '/var/opencode/bin/opencode-startup.sh',
+        'cp /var/dsh/bin/create-server.sh /workspace/create-server.sh 2>/dev/null || true',
+        '/var/dsh/bin/dsh-startup.sh',
       ].join(' && ')
 
       const manifest = {
@@ -1701,23 +1762,32 @@ data:
               labels: podLabels,
               annotations: {
                 'sidecar.istio.io/inject': 'false',
-                'opencode-web-helm/user-template-version': userTemplateVersion,
+                'dsh-web-helm/user-template-version': userTemplateVersion,
                 // Docker placement state (DOCKER_HOST value or 'none'):
                 // flips of docker.enabled / brokerForPlatformUnits /
                 // onPlatformUnits converge here without a marker bump.
-                'opencode-web-helm/docker': dockerHostForUnit || 'none',
+                'dsh-web-helm/docker': dockerHostForUnit || 'none',
                 // Convergence key for the platform mounts: when the
                 // platform state changes (pending -> mounted), the router
                 // re-stamps the unit so the pod restarts with the volumes.
-                'opencode-web-helm/platform-mounts': platformVolumesMounted ? 'mounted' : (platform ? 'pending' : 'off'),
+                'dsh-web-helm/platform-mounts': platformVolumesMounted ? 'mounted' : (platform ? 'pending' : 'off'),
+                // Convergence key for the claim names: a storage.nameVersion
+                // bump must reach EXISTING units (fresh VAST quota names —
+                // the documented escape hatch for orphaned-quota collisions;
+                // observed with long usernames on g2, where the VAST quota
+                // name is csi:<ns>:<pvc> truncated to 64 chars). Old claims
+                // are left behind and can be label-deleted manually.
+                'dsh-web-helm/claims': `${workspaceClaim},${stateClaim},${sharedWorkspaceClaim}`,
               },
             },
             spec: {
-              ...(userPullSecret ? { imagePullSecrets: [{ name: userPullSecret }] } : {}),
               securityContext: {
                 fsGroup: 1000,
                 fsGroupChangePolicy: 'OnRootMismatch',
               },
+              // Optional pull secret for private registries (e.g. a private
+              // ghcr.io package): images.pullSecret -> USER_IMAGE_PULL_SECRET.
+              ...(userPullSecret ? { imagePullSecrets: [{ name: userPullSecret }] } : {}),
               initContainers: [
                 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                 {
@@ -1733,17 +1803,18 @@ data:
                 },
                 {{- end }}
                 {
-                  name: 'init-opencode-storage',
+                  name: 'init-dsh-storage',
                   image: userInitImage,
-                  imagePullPolicy: 'Always',
+                  // IfNotPresent: user images are immutable tags (the baked
+                  // user image and node:22-bookworm-slim). Avoids a registry
+                  // round-trip on every pod start; image changes roll pods
+                  // via the userTemplateVersion convergence instead.
+                  imagePullPolicy: 'IfNotPresent',
                   command: ['/bin/sh', '-lc', initCommand],
                   env: [
-                    { name: 'OPENCODE_VERSION', value: userOpencodeVersion },
+                    { name: 'DSH_VERSION', value: userDshVersion },
                     { name: 'TTYD_VERSION', value: ttydVersion },
-                    { name: 'OPENCHAMBER_VERSION', value: userOpenChamberVersion },
-                    // Gate for the openchamber runtime-install fallback in the
-                    // npm guard above (chamber mode only, as before).
-                    ...(userIsChamber ? [{ name: 'OPENCHAMBER_INSTALL', value: 'true' }] : []),
+                    { name: 'DSH_UI_PORT', value: String(userDshPort) },
                     ...platformIdentityEnv,
                     {{- if and .Values.proxy .Values.proxy.enabled }}
                     {{- range .Values.proxy.env }}
@@ -1759,11 +1830,11 @@ data:
                   volumeMounts: [
                     { name: 'personal-workspace', mountPath: '/workspace/personal' },
                     { name: 'shared-workspace', mountPath: '/workspace/shared' },
-                    { name: 'state', mountPath: '/var/opencode' },
-                    { name: 'project-config', mountPath: '/opt/opencode-defaults', readOnly: true },
+                    { name: 'state', mountPath: '/var/dsh' },
+                    { name: 'project-config', mountPath: '/opt/dsh-defaults', readOnly: true },
                     { name: 'personal-content', mountPath: '/personal-templates', readOnly: true },
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
-                    { name: 'shared-content-seed', mountPath: '/opencode-shared-seed', readOnly: true },
+                    { name: 'shared-content-seed', mountPath: '/dsh-shared-seed', readOnly: true },
 {{- end }}
                     ...platformVolumeMounts,
                   ],
@@ -1771,10 +1842,12 @@ data:
               ],
               containers: [
                 {
-                  name: 'opencode-web',
+                  name: 'dsh-web',
                   image: userInstanceImage,
-                  imagePullPolicy: 'Always',
-                  workingDir: '/workspace',
+                  // See the init container note: immutable tags +
+                  // IfNotPresent; template convergence handles upgrades.
+                  imagePullPolicy: 'IfNotPresent',
+                  workingDir: '/workspace/personal',
                   command: ['/bin/sh', '-lc', appCommand],
                   stdin: true,
                   tty: true,
@@ -1782,61 +1855,49 @@ data:
                     capabilities: { add: ['SYS_PTRACE'] },
                   },
                   env: [
-                    { name: 'HOME', value: '/var/opencode/home' },
+                    { name: 'HOME', value: '/var/dsh/home' },
+                    { name: 'DSH_HOME', value: '/var/dsh/home/.dsh' },
                     { name: 'SHELL', value: '/usr/bin/bash' },
                     { name: 'TERM', value: 'xterm-256color' },
                     { name: 'COLORTERM', value: 'truecolor' },
                     { name: 'LANG', value: 'C.UTF-8' },
                     { name: 'LC_ALL', value: 'C.UTF-8' },
                     { name: 'LC_CTYPE', value: 'C.UTF-8' },
-                    { name: 'XDG_DATA_HOME', value: '/var/opencode/data' },
-                    { name: 'XDG_CONFIG_HOME', value: '/var/opencode/home/.config' },
-                    { name: 'XDG_STATE_HOME', value: '/var/opencode/state' },
-                    { name: 'XDG_CACHE_HOME', value: '/var/opencode/cache' },
+                    { name: 'XDG_DATA_HOME', value: '/var/dsh/data' },
+                    { name: 'XDG_CONFIG_HOME', value: '/var/dsh/home/.config' },
+                    { name: 'XDG_STATE_HOME', value: '/var/dsh/state' },
+                    { name: 'XDG_CACHE_HOME', value: '/var/dsh/cache' },
                     // Docker CLI (baked in the user image) -> the DinD daemon
                     // for THIS unit: loopback sidecar (release-ns units) or
                     // the per-user broker pod cross-namespace (platform
                     // units). The baked `dockerbuild` wrapper is the
                     // proxy-aware way to run builds (see docker/user/Dockerfile).
                     ...(dockerHostForUnit ? [{ name: 'DOCKER_HOST', value: dockerHostForUnit }] : []),
-                    { name: 'OPENCODE_CONFIG_PATH', value: '/var/opencode/home/.config/opencode/opencode.json' },
-                    { name: 'OPENCODE_WATCH_CONFIG_FILES', value: 'opencode.json,config.json,opencode.jsonc' },
-                    { name: 'OPENCODE_WATCH_CONFIG_DIRS', value: 'skills,agents' },
-                    {
-                      name: 'OPENCODE_SERVER_USERNAME',
-                      valueFrom: {
-                        secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
-                          key: 'OPENCODE_SERVER_USERNAME',
-                        },
-                      },
-                    },
-                    {
-                      name: 'OPENCODE_SERVER_PASSWORD',
-                      valueFrom: {
-                        secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
-                          key: 'OPENCODE_SERVER_PASSWORD',
-                        },
-                      },
-                    },
+                    { name: 'DSH_CONFIG_PATH', value: '/var/dsh/home/.dsh/settings.yaml' },
+                    // Match the supervisor's safe watch defaults: config FILES
+                    // only. NEVER watch the profiles/web DIRECTORY — dsh writes
+                    // session/runtime state into it continuously, and restarting
+                    // on our own output kills every live session (the opencode
+                    // chart's 'skills,agents' dirs have no dsh equivalent; dsh
+                    // hot-refreshes skills natively).
+                    { name: 'DSH_WATCH_CONFIG_FILES', value: 'settings.yaml,.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile' },
+                    { name: 'DSH_WATCH_CONFIG_DIRS', value: '' },
                     { name: 'PREVIEW_DOMAIN_SUFFIX', value: previewDomainSuffix },
                     // Canonical public UI host for preview URL construction
                     // (the VirtualService endpoint). port_watcher.mjs /
-                    // preview-url fall back to opencode.<PREVIEW_DOMAIN_SUFFIX>
-                    // when unset (pre-UI_HOST behavior).
+                    // preview-url fall back to dsh.<PREVIEW_DOMAIN_SUFFIX>
+                    // when unset (pre-0.3.3 behavior).
                     { name: 'PREVIEW_UI_HOST', value: uiEndpointHost },
-                    { name: 'PREVIEW_STATE_FILE', value: '/var/opencode/state/preview-ports.txt' },
+                    { name: 'PREVIEW_STATE_FILE', value: '/var/dsh/state/preview-ports.txt' },
                     { name: 'PREVIEW_MIN_PORT', value: '3000' },
                     { name: 'PREVIEW_MAX_PORT', value: '9999' },
-                    { name: 'PREVIEW_EXCLUDE_PORTS', value: '3000,4096,8082,7681,7682,7683,7684' },
-                    { name: 'OPENCODE_VERSION', value: userOpencodeVersion },
+                    { name: 'PREVIEW_EXCLUDE_PORTS', value: '3080,8082,7681,7682,7683,7684' },
+                    { name: 'DSH_VERSION', value: userDshVersion },
                     { name: 'TTYD_VERSION', value: ttydVersion },
-                    { name: 'OPENCODE_UI_MODE', value: userUiMode },
-                    { name: 'OPENCHAMBER_VERSION', value: userOpenChamberVersion },
-                    { name: 'OPENCHAMBER_PORT', value: String(userChamberPort) },
-                    { name: 'OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN', value: 'true' },
-                    { name: 'OPENCODE_SERVER_PORT', value: String(userServerPort) },
+                    { name: 'DSH_UI_PORT', value: String(userDshPort) },
+                    { name: 'DSH_UI_HOST', value: userUiHost },
+                    { name: 'DSH_BOOT_STATE_FILE', value: '/var/dsh/state/dsh-boot-url' },
+                    { name: 'DSH_TRUSTED_HOSTS', value: `${previewDomainSuffix.split('.').slice(-2).join('.')},dsh.${previewDomainSuffix},dsh-web.${previewDomainSuffix},deepseekharness.${previewDomainSuffix},deepseek-harness.${previewDomainSuffix}` },
                     { name: 'PREVIEW_USER_SLUG', value: slug },
                     { name: 'TTYD_DOMAIN', value: previewDomainSuffix },
                     { name: 'TTYD_SLUG', value: slug },
@@ -1852,8 +1913,8 @@ data:
                     {{- end }}
                     {{- end }}
                     ...platformIdentityEnv,
-                    { name: 'OPENCODE_PLATFORM_ROOTS', value: platformRootsMode },
-                    { name: 'OPENCODE_PLATFORM_ROOTS_READONLY', value: platformReadOnly ? 'true' : 'false' },
+                    { name: 'DSH_PLATFORM_ROOTS', value: platformRootsMode },
+                    { name: 'DSH_PLATFORM_ROOTS_READONLY', value: platformReadOnly ? 'true' : 'false' },
                     {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                     {{- range .Values.certificatesPolicy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
@@ -1861,22 +1922,25 @@ data:
                     {{- end }}
                   ],
                   ports: [
-                    { name: 'http', containerPort: userIsChamber ? userChamberPort : userServerPort, protocol: 'TCP' },
-                    ...(userIsChamber ? [{ name: 'server', containerPort: userServerPort, protocol: 'TCP' }] : []),
+                    { name: 'http', containerPort: 8082, protocol: 'TCP' },
                     { name: 'ttyd', containerPort: 7681, protocol: 'TCP' },
                     { name: 'data-manager', containerPort: 7682, protocol: 'TCP' },
                     { name: 'term-mgr', containerPort: 7683, protocol: 'TCP' },
                   ],
                   readinessProbe: {
-                    tcpSocket: { port: userIsChamber ? userChamberPort : userServerPort },
-                    initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 6,
+                    // Gate Ready on dsh web itself (loopback :3080), not just
+                    // the nginx entry (:8082): nginx starts seconds before
+                    // the dsh process finishes booting, and claiming a unit
+                    // on nginx-only readiness served 502s during the window.
+                    httpGet: { path: '/healthz', port: 8082 },
+                    initialDelaySeconds: 10, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 60,
                   },
                   livenessProbe: {
-                    tcpSocket: { port: userIsChamber ? userChamberPort : userServerPort },
+                    tcpSocket: { port: 8082 },
                     initialDelaySeconds: 30, periodSeconds: 20, timeoutSeconds: 3, failureThreshold: 3,
                   },
                   startupProbe: {
-                    tcpSocket: { port: userIsChamber ? userChamberPort : userServerPort },
+                    tcpSocket: { port: 8082 },
                     periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 18,
                   },
                   resources: {
@@ -1886,11 +1950,11 @@ data:
                   volumeMounts: [
                     { name: 'personal-workspace', mountPath: '/workspace/personal' },
                     { name: 'shared-workspace', mountPath: '/workspace/shared' },
-                    { name: 'state', mountPath: '/var/opencode' },
-                    { name: 'project-config', mountPath: '/opt/opencode-defaults', readOnly: true },
+                    { name: 'state', mountPath: '/var/dsh' },
+                    { name: 'project-config', mountPath: '/opt/dsh-defaults', readOnly: true },
                     { name: 'preview-config', mountPath: '/usr/local/bin/preview-url', subPath: 'preview-url' },
                     { name: 'preview-config', mountPath: '/opt/preview/port_watcher.mjs', subPath: 'port_watcher.mjs' },
-                    { name: 'preview-config', mountPath: '/opt/preview/opencode_supervisor.mjs', subPath: 'opencode_supervisor.mjs' },
+                    { name: 'preview-config', mountPath: '/opt/preview/dsh_supervisor.mjs', subPath: 'dsh_supervisor.mjs' },
                     { name: 'preview-config', mountPath: '/opt/preview/data_manager.mjs', subPath: 'data_manager.mjs' },
                     { name: 'preview-config', mountPath: '/opt/preview/data_manager.html', subPath: 'data_manager.html' },
                     { name: 'preview-config', mountPath: '/opt/preview/terminal_manager.js', subPath: 'terminal_manager.js' },
@@ -1905,30 +1969,43 @@ data:
                   ],
                 },
                 {
-                  name: 'opencode-preview-proxy',
+                  name: 'dsh-preview-proxy',
                   image: 'nginx:1.27-alpine',
                   imagePullPolicy: 'IfNotPresent',
-                  ports: [
-                    { name: 'http-preview', containerPort: 8082, protocol: 'TCP' },
-                  ],
+                  // No ports[] here: the dsh-web container already declares
+                  // containerPort 8082 (kubelet warns on duplicates), and
+                  // the Service targets the pod on that port regardless.
+                  // Non-root-safe (platform admission webhooks — EzProject on
+                  // tr211 — force the tenant uid into every pod of project
+                  // namespaces): nginx's default cache/log dirs are root-owned
+                  // image paths; emptyDir over them keeps them writable by any
+                  // uid. Harmless no-op when the pod runs as root.
                   volumeMounts: [
                     { name: 'preview-config', mountPath: '/etc/nginx/nginx.conf', subPath: 'nginx.conf' },
+                    { name: 'nginx-cache', mountPath: '/var/cache/nginx' },
+                    { name: 'nginx-logs', mountPath: '/var/log/nginx' },
                   ],
                 },
                 {
-                  name: 'opencode-auth',
+                  name: 'dsh-auth',
                   image: userInstanceImage,
-                  imagePullPolicy: 'Always',
+                  // Same image as dsh-web; IfNotPresent for the same reason.
+                  imagePullPolicy: 'IfNotPresent',
                   command: ['node', '/opt/preview/auth_validator.mjs'],
                   env: [
                     { name: 'SESSION_KEY', value: crypto.createHmac('sha256', sessionSecret).update(slug).digest('hex') },
                     { name: 'USER_SLUG', value: slug },
+                    { name: 'DSH_BOOT_STATE_FILE', value: '/var/dsh/state/dsh-boot-url' },
                   ],
                   ports: [
                     { name: 'auth', containerPort: 7684, protocol: 'TCP' },
                   ],
                   volumeMounts: [
                     { name: 'preview-config', mountPath: '/opt/preview/auth_validator.mjs', subPath: 'auth_validator.mjs' },
+                    // Read access to the boot-state file written by the
+                    // supervisor container (dsh launch-token URL) on the
+                    // shared state volume.
+                    { name: 'state', mountPath: '/var/dsh', readOnly: true },
                   ],
                 },
                 // ---- Docker-in-Docker sidecar (release-ns units; the spec
@@ -1946,6 +2023,9 @@ data:
                 // DinD image store — node-local emptyDir (overlay2 fails on
                 // VAST network volumes; see the docker-dind sidecar note).
                 ...(dockerSidecarHere ? [{ name: 'docker-data', emptyDir: { sizeLimit: dockerDiskSize } }] : []),
+                // Non-root-safe nginx sidecar scratch dirs (see container above)
+                { name: 'nginx-cache', emptyDir: {} },
+                { name: 'nginx-logs', emptyDir: {} },
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
                 { name: 'shared-content-seed', configMap: { name: '{{ .Release.Name }}-shared-content' } },
 {{- end }}
@@ -1967,21 +2047,24 @@ data:
       const ns = manifest.metadata.namespace || namespace
       const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`)
       if (existing) {
-        const version = existing.spec?.template?.metadata?.annotations?.['opencode-web-helm/user-template-version']
-        // Also converge the rollout strategy on deployments created before
-        // Recreate was introduced (RWO volumes + RollingUpdate deadlock).
+        const version = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/user-template-version']
         const needsStrategy = existing.spec?.strategy?.type !== 'Recreate'
         // Platform-mount state is part of the convergence contract: a unit
         // provisioned while the platform workspace was pending must be
         // re-stamped once the platform PVCs become available.
-        const mounts = existing.spec?.template?.metadata?.annotations?.['opencode-web-helm/platform-mounts']
-        const desiredMounts = manifest.spec.template.metadata.annotations['opencode-web-helm/platform-mounts']
+        const mounts = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/platform-mounts']
+        const desiredMounts = manifest.spec.template.metadata.annotations['dsh-web-helm/platform-mounts']
+        // Claim names are part of the convergence contract too: a
+        // storage.nameVersion bump (fresh VAST quota names) must reach
+        // EXISTING units, not only newly-provisioned ones.
+        const claims = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/claims']
+        const desiredClaims = manifest.spec.template.metadata.annotations['dsh-web-helm/claims']
         // Docker placement (DOCKER_HOST / 'none') is part of the convergence
         // contract too: docker.enabled / brokerForPlatformUnits /
-        // onPlatformUnits flips roll units like any other key.
-        const dockerHost = existing.spec?.template?.metadata?.annotations?.['opencode-web-helm/docker']
-        const desiredDockerHost = manifest.spec.template.metadata.annotations['opencode-web-helm/docker']
-        if (version !== userTemplateVersion || needsStrategy || mounts !== desiredMounts || dockerHost !== desiredDockerHost) {
+        // onPlatformUnits flips roll platform units like any other key.
+        const dockerHost = existing.spec?.template?.metadata?.annotations?.['dsh-web-helm/docker']
+        const desiredDockerHost = manifest.spec.template.metadata.annotations['dsh-web-helm/docker']
+        if (version !== userTemplateVersion || needsStrategy || mounts !== desiredMounts || claims !== desiredClaims || dockerHost !== desiredDockerHost) {
           await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`, {
             metadata: { labels: manifest.metadata.labels },
             spec: { strategy: { type: 'Recreate' }, template: manifest.spec.template },
@@ -2018,7 +2101,7 @@ data:
     }
 
     async function listUserDeployments(ns = namespace) {
-      const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
+      const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       return (result && result.items) || []
     }
 
@@ -2029,9 +2112,9 @@ data:
         const deployments = await listUserDeployments()
         for (const dep of deployments) {
           const labels = dep.metadata?.labels || {}
-          const owner = labels['opencode-user-owner']
+          const owner = labels['dsh-user-owner']
           if (!owner) continue
-          const poolId = Number(labels['opencode-user-pool-id'])
+          const poolId = Number(labels['dsh-user-pool-id'])
           if (Number.isFinite(poolId) && poolId > 0) ownerMap.set(owner, poolId)
         }
         console.log(`[warmpool] recovered ${ownerMap.size} owned warm unit(s)`)
@@ -2042,14 +2125,14 @@ data:
 
     function warmUnitState(dep) {
       const labels = dep.metadata?.labels || {}
-      const poolId = Number(labels['opencode-user-pool-id'])
+      const poolId = Number(labels['dsh-user-pool-id'])
       const ready = (dep.status?.availableReplicas || 0) >= 1 && (dep.status?.updatedReplicas || 0) >= 1
       return {
         labels,
-        isWarm: labels['opencode-user-warmpool'] === 'true',
+        isWarm: labels['dsh-user-warmpool'] === 'true',
         poolId,
         ready,
-        owned: !!labels['opencode-user-owner'],
+        owned: !!labels['dsh-user-owner'],
       }
     }
 
@@ -2067,7 +2150,7 @@ data:
         const initialWarm = initial
           .map((dep) => warmUnitState(dep))
           .filter((state) => state.isWarm && Number.isFinite(state.poolId))
-        await Promise.all(initialWarm.map((state) => ensureWarmDeployment(state.poolId, state.owned ? state.labels['opencode-user-owner'] : undefined)))
+        await Promise.all(initialWarm.map((state) => ensureWarmDeployment(state.poolId, state.owned ? state.labels['dsh-user-owner'] : undefined)))
 
         const deployments = await listUserDeployments()
         let maxPoolId = 0
@@ -2147,11 +2230,11 @@ data:
         for (const dep of deployments) {
           const state = warmUnitState(dep)
           if (!state.isWarm) continue
-          if (state.owned && (state.labels['opencode-user-owner'] === slug
-            || (legacySlug && state.labels['opencode-user-owner'] === legacySlug))) {
-            // Owns it under the readable slug or the legacy hash (the claim
-            // below re-templates the unit with the readable slug, rolling the
-            // pod while its volumes — and the user's data — stay).
+          if (state.owned && (state.labels['dsh-user-owner'] === slug
+            || (legacySlug && state.labels['dsh-user-owner'] === legacySlug))) {
+            // Owns it under the readable slug or the pre-0.3.5 legacy hash
+            // (the claim below re-templates the unit with the readable slug,
+            // rolling the pod while its volumes — and the user's data — stay).
             if (mine === null || state.poolId < mine) mine = state.poolId
           } else if (!state.owned) {
             // Ready units are preferred, but a unit that is still starting
@@ -2236,15 +2319,14 @@ data:
       // The MAP KEY includes the namespace (platform units get their own
       // task slot) — but the watch must pass the namespace separately:
       // embedding it into the deployment name builds a malformed API path
-      // (observed as a 403 + router crash on the first platform login in the
-      // dsh chart).
+      // (observed as a 403 + router crash on the first platform login).
       const key = `${ns}/${names.deployment}`
       const existing = provisionTasks.get(key)
       if (existing) return existing
       const task = { promise: null, error: null }
       // The promise must NEVER reject: with the setup UI enabled nothing
       // awaits it, and an unhandled rejection would crash the router.
-      // Failures are recorded on the task for the setup-status page to show.
+      // Failures are recorded on the task for /__dsh_setup_status to show.
       task.promise = waitForDeployment(names.deployment, 300000, ns).then(
         () => { task.error = null },
         (error) => {
@@ -2260,120 +2342,42 @@ data:
       await startProvisionWatch(names).promise
     }
 
-    // --- Platform environment resolution (PCAI/Kubeflow integration) --------
+    // --- Platform environment resolution (Option B) -------------------------
     // The EzProject name derives from the SSO username with the platform's
     // own sanitization (dots/underscores -> dashes) — the same shape as
     // slugifyUsername. The candidate namespace is always VERIFIED against
     // the live project-info ConfigMap, so a sanitization mismatch or a
     // not-yet-provisioned workspace degrades safely to the classic
     // release-namespace unit instead of guessing wrong.
-    // Ordered platform-namespace candidates for a user: static patterns in
-    // the listed order first (deterministic, cheapest), then wildcard
-    // matches. Each entry carries `wildcard` so the verifier knows which
-    // candidates need the ownership check.
-    async function platformNamespaceCandidates(userId) {
+    function platformNamespaceForUser(userId) {
+      if (!platformEnabled) return null
       const sanitized = slugifyUsername(userId)
-      if (!sanitized || !platformEnabled) return []
-      let patterns = platformNsPatterns.slice()
-      if (patterns.length === 0) {
-        // Legacy configuration: single prefix, username appended.
-        patterns = [`${platformNsPrefix}{username}`]
-      }
-      const staticNames = []
-      const wildcardPrefixes = []
-      for (const pattern of patterns) {
-        const expanded = pattern.split('{username}').join(sanitized)
-        if (expanded.endsWith('*')) {
-          const prefix = expanded.slice(0, -1)
-          if (prefix) wildcardPrefixes.push(prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-        } else {
-          staticNames.push(expanded)
-        }
-      }
-      if (wildcardPrefixes.length === 0) {
-        return [...new Set(staticNames)].map((name) => ({ name, wildcard: false }))
-      }
-      // Wildcard patterns need the namespace list (names only, cached 60s).
-      const now = Date.now()
-      if (now - platformNsListCache.at > 60000) {
-        try {
-          const result = await k8sRequest('GET', '/api/v1/namespaces')
-          platformNsListCache.names = ((result && result.items) || [])
-            .map((item) => item.metadata?.name || '')
-            .filter(Boolean)
-            .sort()
-          platformNsListCache.at = Date.now()
-        } catch (error) {
-          console.error(`[platform] namespace list failed: ${error.message}`)
-          platformNsListCache.names = []
-          platformNsListCache.at = Date.now()
-        }
-      }
-      const matches = []
-      for (const prefix of wildcardPrefixes) {
-        const rex = new RegExp('^' + prefix)
-        matches.push(...platformNsListCache.names.filter((name) => rex.test(name)))
-      }
-      const seen = new Set()
-      const candidates = []
-      for (const { name, wildcard } of [...staticNames.map((name) => ({ name, wildcard: false })), ...matches.map((name) => ({ name, wildcard: true }))]) {
-        if (seen.has(name) || name === namespace) continue
-        seen.add(name)
-        candidates.push({ name, wildcard })
-      }
-      return candidates
+      if (!sanitized) return null
+      return `${platformNsPrefix}${sanitized}`
     }
 
     async function fetchPlatformContext(userId) {
-      // Candidate order: the registry-recorded unitNs first (sticky across
-      // pattern changes), then the configured patterns in order.
-      const candidates = []
-      try {
-        const users = await loadUserRegistry()
-        const recorded = users[userId]?.unitNs
-        if (recorded && recorded !== namespace) candidates.push({ name: recorded, wildcard: false })
-      } catch {
-        // Registry unreadable — pattern candidates still apply.
+      const unitNs = platformNamespaceForUser(userId)
+      if (!unitNs || unitNs === namespace) return null
+      const info = await k8sRequest('GET', `/api/v1/namespaces/${unitNs}/configmaps/project-info`)
+      if (!info?.data?.uid || !info?.data?.gid) return null
+      const identity = {
+        uid: info.data.uid,
+        gid: info.data.gid,
+        user: info.data.user || '',
+        group: info.data.group || '',
+        homedir: info.data.homedir || '',
       }
-      candidates.push(...await platformNamespaceCandidates(userId))
-      const seen = new Set()
-      for (const { name: unitNs, wildcard } of candidates) {
-        if (seen.has(unitNs)) continue
-        seen.add(unitNs)
-        let info = null
-        try {
-          info = await k8sRequest('GET', `/api/v1/namespaces/${unitNs}/configmaps/project-info`)
-        } catch (error) {
-          if (error.statusCode === 404) continue // candidate not provisioned → next pattern
-          throw error // 403 (RBAC) or transient — surface it like the single-prefix path did
-        }
-        if (!info?.data?.uid || !info?.data?.gid) continue // exists, project not provisioned yet
-        // Wildcard candidates cannot be trusted by name alone (one user's
-        // prefix can collide with another user's name) — verify OWNERSHIP
-        // through the project-info user field before adopting.
-        if (wildcard) {
-          const owner = slugifyUsername(info.data.user || '')
-          if (!owner || owner !== slugifyUsername(userId)) continue
-        }
-        const identity = {
-          uid: info.data.uid,
-          gid: info.data.gid,
-          user: info.data.user || '',
-          group: info.data.group || '',
-          homedir: info.data.homedir || '',
-        }
-        const [sharedPvc, userPvc] = await Promise.all([
-          k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformSharedClaim}`).catch(() => null),
-          k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformUserClaim}`).catch(() => null),
-        ])
-        const bound = (pvc) => !!pvc && pvc.status?.phase === 'Bound'
-        return {
-          unitNamespace: unitNs,
-          identity,
-          volumesMounted: bound(sharedPvc) && bound(userPvc),
-        }
+      const [sharedPvc, userPvc] = await Promise.all([
+        k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformSharedClaim}`).catch(() => null),
+        k8sRequest('GET', `/api/v1/namespaces/${unitNs}/persistentvolumeclaims/${platformUserClaim}`).catch(() => null),
+      ])
+      const bound = (pvc) => !!pvc && pvc.status?.phase === 'Bound'
+      return {
+        unitNamespace: unitNs,
+        identity,
+        volumesMounted: bound(sharedPvc) && bound(userPvc),
       }
-      return null
     }
 
     async function platformContextForUser(userId) {
@@ -2398,22 +2402,22 @@ data:
         apiVersion: 'v1',
         kind: 'ConfigMap',
         metadata: {
-          name: `opencode-anchor-${slug}`,
+          name: `dsh-anchor-${slug}`,
           namespace: unitNs,
           labels: {
             app: '{{ .Chart.Name }}',
-            'opencode-user-managed': 'true',
-            'opencode-user-slug': slug,
+            'dsh-user-managed': 'true',
+            'dsh-user-slug': slug,
           },
-          // Ownership anchor: the unit's Deployment, Service and mirrored
-          // ConfigMaps reference this anchor via ownerReferences. Deleting it
-          // (admin user-delete or helm uninstall) cascades the unit compute —
-          // and ONLY the compute: the platform PVCs and the user data PVCs
-          // (ws/st/shared) are never owner-referenced, so the GC is
-          // structurally unable to touch them.
-          annotations: { 'opencode-web-helm/anchor': 'true' },
+          // Ownership anchor (integration study §7.6): the unit's
+          // Deployment, Service and mirrored ConfigMaps reference this anchor
+          // via ownerReferences. Deleting it (admin user-delete or helm
+          // uninstall) cascades the unit compute — and ONLY the compute: the
+          // platform PVCs and the user data PVCs (ws/st/shared) are never
+          // owner-referenced, so the GC is structurally unable to touch them.
+          annotations: { 'dsh-web-helm/anchor': 'true' },
         },
-        data: { note: 'opencode unit ownership anchor. Deleting it deletes the opencode unit compute resources in this namespace (deployment, service, mirrored configmaps); it never deletes the platform PVCs (kubeflow-shared-pvc / user-pvc) nor the user data PVCs (opencode-*-ws-*/-st-* / opencode-web-helm-shared-pvc) — those survive and must be deleted manually.' },
+        data: { note: 'DSH unit ownership anchor. Deleting it deletes the DSH unit compute resources in this namespace (deployment, service, mirrored configmaps); it never deletes the platform PVCs (kubeflow-shared-pvc / user-pvc) nor the user data PVCs (dsh-*-ws-*/-st-* / dsh-web-helm-shared-pvc) — those survive and must be deleted manually.' },
       }
     }
 
@@ -2453,7 +2457,7 @@ data:
         const desiredData = src.data || {}
         const desiredLabels = {
           app: '{{ .Chart.Name }}',
-          'opencode-user-managed': 'true',
+          'dsh-user-managed': 'true',
         }
         const existing = await k8sRequest('GET', `/api/v1/namespaces/${unitNs}/configmaps/${cmName}`)
         if (!existing) {
@@ -2488,83 +2492,25 @@ data:
       if (now - last < 60000) return
       mirrorSyncCache.set(unitNs, now)
       await syncUnitConfigMaps(unitNs, ownerRefs)
-      await syncUnitSecrets(unitNs, ownerRefs)
     }
 
-    // The unit pod template also references the release auth Secret
-    // (OPENCODE_SERVER_USERNAME/PASSWORD via secretKeyRef). For platform
-    // units (pod in the project namespace) Kubernetes cannot resolve a
-    // cross-namespace secretRef, so the router mirrors a FILTERED copy of
-    // that secret into the unit namespace — ONLY the keys the pod template
-    // references. SESSION_SECRET/ADMIN_* deliberately stay
-    // release-namespace-only (the project namespace is user-readable, and
-    // SESSION_SECRET would allow forging any user's session cookie). The
-    // image pull secret (private registries) is mirrored the same way.
-    // The router never reads a mirror back: create, then strategic-merge
-    // patch on 409 — the platform ClusterRole therefore grants NO secret
-    // read, preserving the "never touches platform secrets" contract.
-    const unitAuthSecretName = '{{ .Release.Name }}-auth'
-    const unitAuthSecretKeys = ['OPENCODE_SERVER_USERNAME', 'OPENCODE_SERVER_PASSWORD']
-
-    async function mirrorSecretIntoUnitNs(unitNs, secretName, keys, ownerRefs) {
-      const src = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/secrets/${secretName}`)
-      if (!src?.data) return
-      const desiredData = {}
-      if (keys) {
-        for (const key of keys) {
-          if (src.data[key] !== undefined) desiredData[key] = src.data[key]
-        }
-      } else {
-        Object.assign(desiredData, src.data)
-      }
-      try {
-        await k8sRequest('POST', `/api/v1/namespaces/${unitNs}/secrets`, {
-          apiVersion: 'v1',
-          kind: 'Secret',
-          metadata: {
-            name: secretName,
-            namespace: unitNs,
-            labels: {
-              app: '{{ .Chart.Name }}',
-              'opencode-user-managed': 'true',
-            },
-            ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
-          },
-          type: src.type || 'Opaque',
-          data: desiredData,
-        })
-      } catch (error) {
-        if (error.statusCode !== 409) throw error
-        // Exists: strategic-merge patch refreshes the mirrored keys (no
-        // read-back — the platform ClusterRole grants no secret `get`).
-        await k8sRequest('PATCH', `/api/v1/namespaces/${unitNs}/secrets/${secretName}`, { data: desiredData })
-      }
-    }
-
-    async function syncUnitSecrets(unitNs, ownerRefs) {
-      await mirrorSecretIntoUnitNs(unitNs, unitAuthSecretName, unitAuthSecretKeys, ownerRefs)
-      if (userPullSecret) {
-        // Full copy (dockerconfigjson) — pull-only registry credentials for
-        // the unit's own image; required for private ghcr packages on
-        // platform units (imagePullSecrets resolve in the pod's namespace).
-        await mirrorSecretIntoUnitNs(unitNs, userPullSecret, null, ownerRefs)
-      }
-    }
-
-    // The platform environment: unit Deployment/Service/chart PVCs in the
-    // user's project namespace, all owner-anchored, with the platform PVCs
-    // mounted BY REFERENCE and the identity stamped into the pod.
+    // The platform (Option B) environment: unit Deployment/Service/DSH PVCs
+    // in the user's project namespace, all owner-anchored, with the platform
+    // PVCs mounted BY REFERENCE and the identity stamped into the pod.
     async function resolvePlatformEnvironment(userId, slug, platform) {
       const unitNs = platform.unitNamespace
-      const names = { ...namesForSlug(slug, unitNs), unitSharedClaim: sharedWorkspaceClaim }
+      const names = { ...namesForSlug(slug, unitNs), dshSharedClaim: sharedWorkspaceClaim }
       const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${unitNs}/deployments/${names.deployment}`)
       const anchor = await ensureUnitAnchor(unitNs, slug)
       const ownerRefs = ownerRefToAnchor(anchor)
       await syncUnitConfigMapsRateLimited(unitNs, ownerRefs)
       if (existing) {
+        // PVCs are deliberately NOT owner-anchored (keepPvcOnDelete): they
+        // must survive anchor deletion / helm uninstall so a re-SSO re-binds
+        // the exact same volumes.
         await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs)
         await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs)
-        await ensurePersistentVolumeClaim(names.unitSharedClaim, sharedWorkspaceSize, unitNs, null, ['ReadWriteMany'])
+        await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs)
         await ensureService(names.service, slug, unitNs, ownerRefs)
         await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
         await ensureDindBroker(slug, unitNs)
@@ -2576,13 +2522,13 @@ data:
       // provisioned while the platform PVCs were not Bound yet is re-stamped
       // (pod restart) once they are — see the platform-mounts annotation.
       console.log(`[platform] provisioning unit for ${userId} in ${unitNs} (mounts=${platform.volumesMounted ? 'platform+own' : 'own only; platform PVCs not Bound yet'})`)
-      await ensureLease(`opencode-user-${slug}`)
+      await ensureLease(`dsh-user-${slug}`)
       // PVCs are deliberately NOT owner-anchored (keepPvcOnDelete): they must
       // survive anchor deletion / helm uninstall so a re-SSO re-binds the
       // exact same volumes.
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize, unitNs)
       await ensurePersistentVolumeClaim(names.stateClaim, stateSize, unitNs)
-      await ensurePersistentVolumeClaim(names.unitSharedClaim, sharedWorkspaceSize, unitNs, null, ['ReadWriteMany'])
+      await ensurePersistentVolumeClaim(names.dshSharedClaim, sharedWorkspaceSize, unitNs)
       await ensureService(names.service, slug, unitNs, ownerRefs)
       await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { unitNs, ownerRefs, platform })
       await ensureDindBroker(slug, unitNs)
@@ -2610,25 +2556,14 @@ data:
       // unit later when the pool recovers.
       const existingDedicated = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`)
       if (existingDedicated) {
-        // Data-preserving adoption: mount the claims the deployment ALREADY
-        // uses (units provisioned before the VAST-safe claim-name scheme
-        // carry legacy-named claims — renaming would strand the user's data
-        // on the old volumes).
-        const volumeClaims = new Map(
-          (existingDedicated.spec?.template?.spec?.volumes || [])
-            .filter((v) => v.persistentVolumeClaim?.claimName)
-            .map((v) => [v.name, v.persistentVolumeClaim.claimName]),
-        )
-        const workspaceClaim = volumeClaims.get('personal-workspace') || names.workspaceClaim
-        const stateClaim = volumeClaims.get('state') || names.stateClaim
-        await ensureLease(`opencode-user-${slug}`)
-        await ensurePersistentVolumeClaim(workspaceClaim, workspaceSize)
-        await ensurePersistentVolumeClaim(stateClaim, stateSize)
+        await ensureLease(`dsh-user-${slug}`)
+        await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
+        await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
         await ensureService(names.service, slug)
-        await ensureDeployment(names.deployment, workspaceClaim, stateClaim, slug)
-        return { slug, names: { ...names, workspaceClaim, stateClaim } }
+        await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug)
+        return { slug, names }
       }
-      // Platform integration — only for users WITHOUT an existing
+      // Platform (Option B) — only for users WITHOUT an existing
       // release-namespace unit (sticky semantics preserved: nobody is
       // silently moved or reset). A fresh install therefore provisions every
       // SSO user inside their platform project namespace; an upgraded
@@ -2639,34 +2574,25 @@ data:
           return await resolvePlatformEnvironment(userId, slug, platform)
         }
       }
-      // One-time readable-slug migration: a dedicated environment provisioned
-      // by a pre-readable-slug release lives under the legacy hash slug.
-      // Re-home it under the readable slug while KEEPING the user's volumes:
-      // PVCs cannot be renamed, so the new deployment mounts the legacy
-      // claims (resolved from the legacy deployment's spec) and the legacy
-      // deployment/service/lease are retired (the legacy deployment is
-      // deleted first so its RWO volumes detach before the new pod binds
-      // them).
+      // One-time v0.3.5 migration: a dedicated environment provisioned by a
+      // pre-readable-slug release lives under the legacy hash slug. Re-home it
+      // under the readable slug while KEEPING the user's volumes: PVCs cannot
+      // be renamed, so the new deployment mounts the legacy claims and the
+      // legacy deployment/service/lease are retired (the legacy deployment is
+      // deleted first so its RWO volumes detach before the new pod binds them).
       const legacyNames = namesForSlug(legacySlug)
       const legacyDedicated = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${legacyNames.deployment}`)
       if (legacyDedicated) {
-        const legacyVolumeClaims = new Map(
-          (legacyDedicated.spec?.template?.spec?.volumes || [])
-            .filter((v) => v.persistentVolumeClaim?.claimName)
-            .map((v) => [v.name, v.persistentVolumeClaim.claimName]),
-        )
-        const legacyWorkspaceClaim = legacyVolumeClaims.get('personal-workspace') || legacyNames.workspaceClaim
-        const legacyStateClaim = legacyVolumeClaims.get('state') || legacyNames.stateClaim
         console.log(`[migration] adopting legacy environment of ${userId}: ${legacyNames.deployment} -> ${names.deployment}`)
         await deleteK8s(`/apis/apps/v1/namespaces/${namespace}/deployments`, legacyNames.deployment)
         await waitForDeploymentGone(legacyNames.deployment)
         await deleteK8s(`/api/v1/namespaces/${namespace}/services`, legacyNames.service)
-        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `opencode-user-${legacySlug}`)
+        await deleteK8s(`/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`, `dsh-user-${legacySlug}`)
         await deleteK8s(`/apis/networking.istio.io/v1/namespaces/${namespace}/virtualservices`, legacyNames.virtualService)
-        await ensureLease(`opencode-user-${slug}`)
+        await ensureLease(`dsh-user-${slug}`)
         await ensureService(names.service, slug)
-        await ensureDeployment(names.deployment, legacyWorkspaceClaim, legacyStateClaim, slug)
-        return { slug, names: { ...names, workspaceClaim: legacyWorkspaceClaim, stateClaim: legacyStateClaim } }
+        await ensureDeployment(names.deployment, legacyNames.workspaceClaim, legacyNames.stateClaim, slug)
+        return { slug, names: { ...names, workspaceClaim: legacyNames.workspaceClaim, stateClaim: legacyNames.stateClaim } }
       }
       if (warmPoolEnabled && warmPoolSize > 0) {
         let claimed = null
@@ -2691,7 +2617,7 @@ data:
           return claimed
         }
       }
-      await ensureLease(`opencode-user-${slug}`)
+      await ensureLease(`dsh-user-${slug}`)
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
       await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
       await ensureService(names.service, slug)
@@ -2703,7 +2629,6 @@ data:
       return {
         host: `${names.service}.${names.namespace || namespace}.svc.cluster.local`,
         port: 8082,
-        injectBasicAuth: false,
         preserveHost: true,
         path,
         forwardedPrefix: prefix,
@@ -2714,15 +2639,14 @@ data:
       return {
         host: `${names.service}.${names.namespace || namespace}.svc.cluster.local`,
         port: 8082,
-        injectBasicAuth: false,
         preserveHost: true,
         path,
       }
     }
 
     // `prefix` is the browser-visible per-user URL prefix: readable
-    // `/{username-slug}` (readable-slug releases) or legacy `/u-{hash}`. It is
-    // stripped before the proxy hop (the pod nginx serves at root).
+    // `/{username-slug}` (v0.3.5+) or legacy `/u-{hash}`. It is stripped
+    // before the proxy hop (the pod nginx serves at root).
     function stripSlugPrefix(requestUrl, prefix) {
       if (!requestUrl.startsWith(prefix)) return requestUrl
       const rest = requestUrl.slice(prefix.length)
@@ -2740,9 +2664,6 @@ data:
       if (request.socket?.remoteAddress) {
         const prior = headers['x-forwarded-for']
         headers['x-forwarded-for'] = prior ? `${prior}, ${request.socket.remoteAddress}` : request.socket.remoteAddress
-      }
-      if (target.injectBasicAuth) {
-        headers.authorization = basicAuth
       }
       if (target.forwardedPrefix) {
         headers['x-forwarded-prefix'] = target.forwardedPrefix
@@ -3126,8 +3047,8 @@ data:
         ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
             <div style="display:flex;gap:14px;">
-              <a href="/__oc_start" style="color:var(--accent);">Open your environment</a>
-              <a href="/__oc_logout" style="color:var(--text-muted);">Log out</a>
+              <a href="/__dsh_start" style="color:var(--accent);">Open your environment</a>
+              <a href="/__dsh_logout" style="color:var(--text-muted);">Log out</a>
             </div>
           </div>`
         : ''
@@ -3136,7 +3057,7 @@ data:
     <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode + OpenChamber</title>
+    <title>DeepSeek Harness</title>
     <link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAiLMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEREREREREREAAAAAAAAAEQAAAAAAAAARAAAAAAAAABEREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//wAA//8AAP//AAD//wAA//8AAAAAAAB//gAAf/4AAH/+AAAAAAAA//8AAP//AAD//wAA//8AAP//AAD//wAA">
     <script>
     (function() {
@@ -3218,7 +3139,7 @@ data:
           </svg>
           <div class="hpe-brand">
             <div class="hpe-brand-name">Hewlett Packard Enterprise</div>
-            <div class="hpe-brand-title">OpenCode + OpenChamber</div>
+            <div class="hpe-brand-title">DeepSeek Harness</div>
             <div class="hpe-brand-sub">Sign in to your personal environment</div>
           </div>
         </div>
@@ -3272,7 +3193,7 @@ data:
       var btn = this;
       btn.disabled = true;
       try {
-        var res = await fetch('/__oc_sso', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        var res = await fetch('/__dsh_sso', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
         var data = null; try { data = await res.json(); } catch (e) {}
         if (data && data.redirect) { window.location = data.redirect; return; }
         showSso((data && data.error) || ('Error ' + res.status));
@@ -3303,7 +3224,7 @@ data:
       if (!p) { aerr.style.display = 'block'; aerr.textContent = 'admin password required'; return; }
       btn.disabled = true;
       try {
-        var res = await fetch('/__oc_admin_login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: p }) });
+        var res = await fetch('/__dsh_admin_login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: p }) });
         var data = null; try { data = await res.json(); } catch (e2) {}
         if (data && data.redirect) { window.location = data.redirect; return; }
         aerr.style.display = 'block';
@@ -3313,7 +3234,7 @@ data:
     });` : ''}
     document.getElementById('submit-btn').addEventListener('click', function (e) {
       e.preventDefault();
-      post('/__oc_login', { username: document.getElementById('username').value, password: document.getElementById('password').value });
+      post('/__dsh_login', { username: document.getElementById('username').value, password: document.getElementById('password').value });
     });
     document.getElementById('form').addEventListener('submit', function (e) { e.preventDefault(); });
     document.getElementById('show-pass').addEventListener('change', function () {
@@ -3385,7 +3306,7 @@ data:
     <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode Admin</title>
+    <title>DeepSeek Harness Admin</title>
     <style>
     :root { --bg: #0d1117; --bg-panel: #161b22; --border: #30363d; --text: #e6edf3; --text-muted: #7d8590; --accent: #2f81f7; --danger: #f85149; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -3416,7 +3337,7 @@ data:
     </head>
     <body>
     <a class="back" href="/">&larr; back to login</a>
-    <span style="float:right;"><a class="back" href="/__oc_admin_logout">Log out</a></span>
+    <span style="float:right;"><a class="back" href="/__dsh_admin_logout">Log out</a></span>
     <h1>Admin</h1>
     <div class="sub">Create or delete user accounts.</div>
 
@@ -3502,11 +3423,11 @@ data:
         if (modalMode === 'reset') {
           var pass = document.getElementById('modal-pass').value;
           if (!pass) throw new Error('password required');
-          await api('/__oc_admin/api/reset-password', 'POST', { username: modalUser, password: pass });
+          await api('/__dsh_admin/api/reset-password', 'POST', { username: modalUser, password: pass });
         } else {
           var nu = document.getElementById('modal-username').value.trim();
           if (!nu) throw new Error('new username required');
-          await api('/__oc_admin/api/rename', 'POST', { username: modalUser, newUsername: nu });
+          await api('/__dsh_admin/api/rename', 'POST', { username: modalUser, newUsername: nu });
         }
         closeModal();
         await loadUsers();
@@ -3520,14 +3441,14 @@ data:
     });
     async function loadUsers() {
       try {
-        var data = await api('/__oc_admin/api/users');
+        var data = await api('/__dsh_admin/api/users');
         var users = data.users || [];
         if (users.length === 0) {
           listEl.innerHTML = '<div class="empty">No users.</div>';
           syncPoll(users);
           return;
         }
-        listEl.innerHTML = '<table><thead><tr><th>Username</th><th>Source</th><th>Slug</th><th>Namespace</th><th>Last login</th><th>Status</th><th></th></tr></thead><tbody>' +
+        listEl.innerHTML = '<table><thead><tr><th>Username</th><th>Source</th><th>Slug</th><th>Last login</th><th>Status</th><th></th></tr></thead><tbody>' +
           users.map(function (u) {
             var source = u.source === 'sso' ? '<span class="badge">SSO</span>'
               : u.source === 'unknown' ? '<span class="badge dim">?</span>'
@@ -3547,8 +3468,7 @@ data:
             } else {
               actions += '<button class="danger" data-act="delete" data-slug="' + u.slug + '" style="padding:6px 10px;font-size:12px;">Delete</button>';
             }
-            var nsCell = u.namespace && u.namespace !== '' ? '<code>' + u.namespace + '</code>' : '&mdash;';
-            return '<tr><td>' + nameCell + '</td><td>' + source + '</td><td><code>' + u.slug + '</code></td><td>' + nsCell + '</td><td>' + lastLogin + '</td><td>' + statusHtml(u) + '</td>' +
+            return '<tr><td>' + nameCell + '</td><td>' + source + '</td><td><code>' + u.slug + '</code></td><td>' + lastLogin + '</td><td>' + statusHtml(u) + '</td>' +
               '<td style="white-space:nowrap;">' + actions + '</td></tr>';
           }).join('') + '</tbody></table>';
         syncPoll(users);
@@ -3562,7 +3482,7 @@ data:
             if (act === 'reset') { openModal('reset', u); return; }
             b.disabled = true;
             b.innerHTML = '&hellip;';
-            try { await api('/__oc_admin/api/delete', 'POST', slug ? { slug: slug } : { username: u }); } catch (e) { alert(e.message); }
+            try { await api('/__dsh_admin/api/delete', 'POST', slug ? { slug: slug } : { username: u }); } catch (e) { alert(e.message); }
             await loadUsers();
           });
         });
@@ -3591,7 +3511,7 @@ data:
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>Creating&hellip;';
       try {
-        await api('/__oc_admin/api/create', 'POST', { username: u, password: p });
+        await api('/__dsh_admin/api/create', 'POST', { username: u, password: p });
         msg('create-msg', 'created ' + u, true);
         document.getElementById('u').value = '';
         document.getElementById('p').value = '';
@@ -3629,7 +3549,7 @@ data:
         return
       }
 
-      if (pathname === '/__oc_login' && method === 'POST') {
+      if (pathname === '/__dsh_login' && method === 'POST') {
         const body = await readJsonBody(request).catch(() => null)
         const identity = (body?.username || '').trim().toLowerCase()
         const password = body?.password || ''
@@ -3641,11 +3561,11 @@ data:
           json(response, 401, { error: 'invalid username or password' })
           return
         }
-        jsonWithCookie(response, 200, { ok: true, redirect: '/__oc_start' }, sessionCookieHeader(identity, false))
+        jsonWithCookie(response, 200, { ok: true, redirect: '/__dsh_start' }, sessionCookieHeader(identity, false))
         return
       }
 
-      if (pathname === '/__oc_register' && method === 'POST') {
+      if (pathname === '/__dsh_register' && method === 'POST') {
         const body = await readJsonBody(request).catch(() => null)
         const identity = (body?.username || '').trim().toLowerCase()
         const password = body?.password || ''
@@ -3663,28 +3583,28 @@ data:
           json(response, error.statusCode || 500, { error: error.message })
           return
         }
-        jsonWithCookie(response, 200, { ok: true, redirect: '/__oc_start' }, sessionCookieHeader(identity, false))
+        jsonWithCookie(response, 200, { ok: true, redirect: '/__dsh_start' }, sessionCookieHeader(identity, false))
         return
       }
 
-      if (pathname === '/__oc_sso' && method === 'POST') {
+      if (pathname === '/__dsh_sso' && method === 'POST') {
         const ssoIdentity = (userFromHeaders(request.headers) || '').trim().toLowerCase()
         if (!ssoIdentity) {
-          console.log('[auth] /__oc_sso rejected: no SSO identity headers present')
+          console.log('[auth] /__dsh_sso rejected: no SSO identity headers present')
           json(response, 401, { error: 'not authenticated via SSO' })
           return
         }
         await trackSsoIdentity(ssoIdentity)
         console.log(`[auth] sso login slug=${slugForUser(ssoIdentity)}`)
         // Explicit SSO login clears the logout suppress marker.
-        jsonWithCookie(response, 200, { ok: true, redirect: '/__oc_start' }, [
+        jsonWithCookie(response, 200, { ok: true, redirect: '/__dsh_start' }, [
           sessionCookieHeader(ssoIdentity, false),
           ssoLogoutMarkerCookie(false),
         ])
         return
       }
 
-      if (pathname === '/__oc_logout' && (method === 'GET' || method === 'POST')) {
+      if (pathname === '/__dsh_logout' && (method === 'GET' || method === 'POST')) {
         response.writeHead(302, {
           location: '/',
           'set-cookie': [
@@ -3697,7 +3617,7 @@ data:
       }
 
       // Admin console (basic-auth gated)
-      if (pathname === '/__oc_admin_login' && method === 'POST') {
+      if (pathname === '/__dsh_admin_login' && method === 'POST') {
         if (!adminUsername || !adminPassword) {
           json(response, 401, { error: 'admin login is not configured' })
           return
@@ -3709,27 +3629,27 @@ data:
         const u = (body?.username || adminUsername).trim()
         const p = body?.password || ''
         if (u === adminUsername && p === adminPassword) {
-          jsonWithCookie(response, 200, { ok: true, redirect: '/__oc_admin' }, adminSessionCookieHeader())
+          jsonWithCookie(response, 200, { ok: true, redirect: '/__dsh_admin' }, adminSessionCookieHeader())
           return
         }
         json(response, 401, { error: 'invalid admin credentials' })
         return
       }
-      if (pathname === '/__oc_admin_logout' && (method === 'GET' || method === 'POST')) {
+      if (pathname === '/__dsh_admin_logout' && (method === 'GET' || method === 'POST')) {
         response.writeHead(302, { location: '/', 'set-cookie': [clearAdminCookieHeader()] })
         response.end()
         return
       }
-      if (pathname === '/__oc_admin' && method === 'GET') {
+      if (pathname === '/__dsh_admin' && method === 'GET') {
         if (!isAdmin(request)) {
-          response.writeHead(401, { 'www-authenticate': 'Basic realm="opencode-admin"' })
+          response.writeHead(401, { 'www-authenticate': 'Basic realm="dsh-admin"' })
           response.end()
           return
         }
         serveAdminPage(response)
         return
       }
-      if (pathname === '/__oc_admin/api/users' && method === 'GET') {
+      if (pathname === '/__dsh_admin/api/users' && method === 'GET') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3743,16 +3663,16 @@ data:
           let dep = null
           let unitNs = namespace
           if (record.unitNs && record.unitNs !== namespace) {
-            // Platform unit — lives in the user's project namespace, look it
-            // up there directly.
+            // Platform (Option B) unit — lives in the user's project
+            // namespace, look it up there directly.
             unitNs = record.unitNs
             dep = await k8sRequest('GET', `/apis/apps/v1/namespaces/${unitNs}/deployments/${namesForSlug(slug, unitNs).deployment}`).catch(() => null)
           } else {
             dep = deployments.find((d) => {
               const labels = d.metadata?.labels || {}
-              return labels['opencode-user-slug'] === slug
-                || (labels['opencode-user-warmpool'] === 'true'
-                  && (labels['opencode-user-owner'] === slug || labels['opencode-user-owner'] === legacy))
+              return labels['dsh-user-slug'] === slug
+                || (labels['dsh-user-warmpool'] === 'true'
+                  && (labels['dsh-user-owner'] === slug || labels['dsh-user-owner'] === legacy))
             }) || null
           }
           return {
@@ -3770,15 +3690,15 @@ data:
         // the slug is a one-way hash, so only the slug can be shown; these
         // rows can still be deleted by slug.
         const knownSlugs = new Set(list.map((u) => u.slug))
-        // A user's pre-readable-slug environment still carries the legacy hash
-        // as its owner until their first post-upgrade login migrates it — do
-        // not list it as an unknown row in the meantime.
+        // A user's pre-0.3.5 environment still carries the legacy hash as its
+        // owner until their first post-upgrade login migrates it — do not list
+        // it as an unknown row in the meantime.
         for (const username of Object.keys(users)) knownSlugs.add(legacySlugForUser(username))
         for (const d of deployments) {
           const labels = d.metadata?.labels || {}
-          const slug = labels['opencode-user-warmpool'] === 'true'
-            ? labels['opencode-user-owner']
-            : labels['opencode-user-slug']
+          const slug = labels['dsh-user-warmpool'] === 'true'
+            ? labels['dsh-user-owner']
+            : labels['dsh-user-slug']
           if (!slug || knownSlugs.has(slug)) continue
           knownSlugs.add(slug)
           list.push({
@@ -3793,7 +3713,7 @@ data:
         json(response, 200, { users: list })
         return
       }
-      if (pathname === '/__oc_admin/api/create' && method === 'POST') {
+      if (pathname === '/__dsh_admin/api/create' && method === 'POST') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3824,7 +3744,7 @@ data:
         json(response, 200, { ok: true, username: identity })
         return
       }
-      if (pathname === '/__oc_admin/api/delete' && method === 'POST') {
+      if (pathname === '/__dsh_admin/api/delete' && method === 'POST') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3852,7 +3772,7 @@ data:
         }
         return
       }
-      if (pathname === '/__oc_admin/api/reset-password' && method === 'POST') {
+      if (pathname === '/__dsh_admin/api/reset-password' && method === 'POST') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3875,7 +3795,7 @@ data:
         json(response, 200, { ok: true, username: identity })
         return
       }
-      if (pathname === '/__oc_admin/api/rename' && method === 'POST') {
+      if (pathname === '/__dsh_admin/api/rename' && method === 'POST') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3916,7 +3836,7 @@ data:
         json(response, 200, { ok: true, username: newName })
         return
       }
-      if (pathname === '/__oc_admin/api/sessions/clear' && method === 'POST') {
+      if (pathname === '/__dsh_admin/api/sessions/clear' && method === 'POST') {
         if (!isAdmin(request)) {
           json(response, 401, { error: 'unauthorized' })
           return
@@ -3939,7 +3859,7 @@ data:
           json(response, 200, { ok: true, results: [] })
           return
         }
-        console.log(`[admin] clearing opencode chat history for ${targets.length} user(s)`)
+        console.log(`[admin] clearing dsh session history for ${targets.length} user(s)`)
         const snapshot = await fetchEnvironmentSnapshot()
         const results = []
         const concurrency = 5
@@ -3966,10 +3886,10 @@ data:
 
       // Provisioning entry point: after login/register/sso. Ensures the user's
       // pod, shows the loading page while it comes up, then redirects to the pod.
-      if (pathname === '/__oc_start') {
+      if (pathname === '/__dsh_start') {
         const identity = readSessionIdentity(request)
         if (!identity) {
-          console.log('[auth] /__oc_start without a valid session, redirecting to /')
+          console.log('[auth] /__dsh_start without a valid session, redirecting to /')
           response.writeHead(302, { location: '/' })
           response.end()
           return
@@ -3995,8 +3915,8 @@ data:
 
       // Path-based per-user routing -> that user's pod nginx (:8082). Two URL
       // forms are served, both only for the signed-in user's own slug:
-      //   /{username-slug}/...  readable slug, e.g. /francesco-caliva/
-      //   /u-{12-hex}/...       legacy one-way-hash slug (older bookmarks)
+      //   /{username-slug}/...  readable slug (v0.3.5+), e.g. /francesco-caliva/
+      //   /u-{12-hex}/...       legacy one-way-hash slug (pre-0.3.5 bookmarks)
       const legacyPathMatch = pathname.match(/^\/u-([a-f0-9]{12})(\/.*)?$/)
       if (legacyPathMatch) {
         const pathSlug = legacyPathMatch[1]
@@ -4023,10 +3943,15 @@ data:
       }
 
       // Session-keyed passthrough: any other path on the main host is served to the
-      // signed-in user's pod so in-pod apps that emit root-relative URLs (openchamber,
-      // data manager, terminal) keep working without a /{slug}/ prefix.
+      // signed-in user's pod so in-pod apps that emit root-relative URLs (dsh web,
+      // data manager, terminal) keep working without a /u-{slug}/ prefix.
+      // `/?token=...` is dsh web's one-time launch-token exchange and MUST
+      // reach the user's pod even though its pathname is `/`: dsh answers it
+      // with its own signed session cookie. Everything else on `/` stays the
+      // router's login page.
       const sessionIdentity = readSessionIdentity(request)
-      if (sessionIdentity && pathname !== '/') {
+      const isDshTokenExchange = pathname === '/' && url.searchParams.has('token')
+      if (sessionIdentity && (pathname !== '/' || isDshTokenExchange)) {
         try {
           const environment = await resolveUserEnvironment(sessionIdentity)
           // Deep links with a valid session must also see the loading screen
@@ -4051,7 +3976,7 @@ data:
       // (x-auth-request headers injected by the gateway) and no local session
       // exists yet, sign the user in automatically: a portal deep-link then
       // lands in the normal provisioning flow instead of requiring a second
-      // click on "Continue with SSO". /__oc_logout plants a suppress marker so
+      // click on "Continue with SSO". /__dsh_logout plants a suppress marker so
       // users who explicitly log out are not bounced straight back in.
       if (!sessionIdentity && pathname === '/' && method === 'GET') {
         const headerIdentity = userFromHeaders(request.headers)
@@ -4063,7 +3988,7 @@ data:
             console.log(`[auth] auto-sso login slug=${slugForUser(identity)}`)
             await trackSsoIdentity(identity)
             response.writeHead(302, {
-              location: '/__oc_start',
+              location: '/__dsh_start',
               'set-cookie': [
                 sessionCookieHeader(identity, false),
                 ssoLogoutMarkerCookie(false),
@@ -4138,7 +4063,7 @@ data:
     })
 
     server.listen(8080, '0.0.0.0', () => {
-      console.log('opencode router listening on 0.0.0.0:8080')
+      console.log('dsh router listening on 0.0.0.0:8080')
     })
 
     recoverOwnerPool()

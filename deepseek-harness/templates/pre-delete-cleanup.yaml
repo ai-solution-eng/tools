@@ -7,12 +7,12 @@
   stranded (the shared PVC hangs in Terminating and the namespace never
   completes deletion).
 
-  UNINSTALL CONTRACT:
-  Only chart-created objects (label `opencode-user-managed=true`) are
-  deleted, in the release namespace AND in each unit namespace recorded in
-  the user registry (platform integration: units inside
+  UNINSTALL CONTRACT (docs/platform-pvc-integration-study.md §7.6):
+  Only DSH-created objects (label `dsh-user-managed=true`) are deleted, in
+  the release namespace AND in each unit namespace recorded in the user
+  registry (platform integration Option B: units inside
   project-user-<name>). Platform PVCs (kubeflow-shared-pvc / user-pvc) are
-  NEVER deleted: they carry no chart label, and a belt-and-braces skip-assert
+  NEVER deleted: they carry no DSH label, and a belt-and-braces skip-assert
   refuses any PVC carrying an `ezprojects.hpe.com/*` label (or an unreadable
   PVC). Namespaces are never deleted by this hook.
 
@@ -79,10 +79,11 @@ rules:
   verbs: ["get", "list", "delete"]
 {{- if .Values.platformIntegration.enabled }}
 ---
-# Platform integration: units may live inside the users' platform project
-# namespaces — the cleanup needs the same kinds cross-namespace. Deletion
-# stays bound to the `opencode-user-managed=true` label contract plus the
-# ezprojects.hpe.com/* skip-assert; namespaces themselves are never deleted.
+# Platform integration (study Option B): units may live inside the users'
+# platform project namespaces — the cleanup needs the same kinds
+# cross-namespace. Deletion stays bound to the `dsh-user-managed=true`
+# label contract plus the ezprojects.hpe.com/* skip-assert; namespaces
+# themselves are never deleted.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -96,9 +97,7 @@ metadata:
     hpe-ezua/app: {{ .Chart.Name }}
 rules:
 - apiGroups: [""]
-  # secrets: the mirrored per-unit auth/pull secrets (labels
-  # opencode-user-managed=true) are cleaned with the unit on uninstall.
-  resources: ["pods", "persistentvolumeclaims", "services", "configmaps", "secrets"]
+  resources: ["pods", "persistentvolumeclaims", "services", "configmaps"]
   verbs: ["get", "list", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
@@ -240,7 +239,7 @@ spec:
 
           function isPlatformOwned(meta) {
             // Uninstall-contract tripwire: platform (EzProject) objects carry
-            // ezprojects.hpe.com/* labels; chart-created objects never do.
+            // ezprojects.hpe.com/* labels; DSH-created objects never do.
             const labels = (meta && meta.labels) || {}
             return Object.keys(labels).some((l) => l.startsWith('ezprojects.hpe.com/'))
           }
@@ -311,23 +310,23 @@ spec:
           }
 
           async function main() {
-            const um = 'opencode-user-managed=true'
-            const pods = 'app=opencode-user'
-            const routerLabel = 'opencode-role=router'
+            const um = 'dsh-user-managed=true'
+            const pods = 'app=dsh-user'
+            const routerLabel = 'dsh-role=router'
             const routerDeployment = process.env.RELEASE_NAME || ''
             const nsList = await unitNamespaces()
-
             console.log('=== Helm pre-delete cleanup ===')
             console.log('namespaces: ' + nsList.join(', '))
 
-            // Orphan-proof discovery: the registry is only a HINT. Sweep
-            // cluster-wide for chart-labeled objects and add every namespace
-            // hosting one — catches units whose registry entry is already
-            // gone (deleted earlier, or an older chart revision's hook ran).
-            // Deletion safety is unchanged: only `opencode-user-managed=true`
-            // objects are ever touched, and the ezprojects.hpe.com/*
-            // skip-assert still refuses platform PVCs.
-            console.log('Phase 0b: cluster-wide discovery of chart-labeled unit namespaces')
+            // Orphan-proof discovery (0.4.2): the registry is only a HINT.
+            // Sweep cluster-wide for DSH-labeled objects and add every
+            // namespace hosting one — catches units whose registry entry is
+            // already gone (deleted earlier, or an older chart revision's
+            // hook ran; observed on g2 as an orphaned unit in
+            // project-user-<name>). Deletion safety is unchanged: only
+            // `dsh-user-managed=true` objects are ever touched, and the
+            // ezprojects.hpe.com/* skip-assert still refuses platform PVCs.
+            console.log('Phase 0b: cluster-wide discovery of DSH-labeled unit namespaces')
             const scans = [
               '/api/v1/configmaps',
               '/apis/apps/v1/deployments',
@@ -340,7 +339,7 @@ spec:
                 for (const item of items) {
                   const ns = item.metadata && item.metadata.namespace
                   if (ns && !nsList.includes(ns)) {
-                    console.log('  discovered chart resources in namespace: ' + ns)
+                    console.log('  discovered DSH resources in namespace: ' + ns)
                     nsList.push(ns)
                   }
                 }
@@ -367,8 +366,7 @@ spec:
             }
             // Release-namespace-only resources (registry, leases, VS,
             // per-user DinD broker NetworkPolicies — the broker deployments
-            // and services are swept by the opencode-user-managed label
-            // above).
+            // and services are swept by the dsh-user-managed label above).
             await Promise.all([
               deleteByLabel('/api/v1/namespaces/' + namespace + '/secrets', um, 'secrets', namespace),
               deleteByLabel('/apis/coordination.k8s.io/v1/namespaces/' + namespace + '/leases', um, 'leases', namespace),
