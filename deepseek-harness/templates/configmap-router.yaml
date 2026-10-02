@@ -90,7 +90,11 @@ data:
     // the dsh-web container gains DOCKER_HOST and the pod a dockerd sidecar +
     // docker-data volume; existing units re-stamp so the terminal can drive
     // the daemon immediately.
-    const RUNTIME_REV = '32'
+    // 33 (0.4.17): data manager fixes — archive anchoring moved to the
+    // deepest common parent of the selection (a single file/folder download
+    // no longer embeds the chain from the navigable root), and the editor
+    // dialog grows to 96vw x 94vh (was capped at 1000x700px).
+    const RUNTIME_REV = '33'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
