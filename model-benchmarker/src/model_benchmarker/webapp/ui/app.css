@@ -209,3 +209,20 @@ body {
 .combo-item-id { display: block; font-size: 13px; color: var(--text); }
 .combo-item-name { display: block; font-size: 11px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
 .combo-empty { padding: 10px; color: var(--muted); font-style: italic; font-size: 12px; }
+
+/* run-log full screen — the button lives inside the <summary> (clicking it must
+   not toggle the details; shared.js preventDefaults). A CSS-class overlay, not
+   the Fullscreen API, so it also works when the app is embedded in an iframe. */
+.log-fs {
+  margin-left: 10px; padding: 1px 9px; font-size: 11.5px;
+  background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; vertical-align: 1px;
+}
+.log-fs:hover { color: var(--text); border-color: var(--accent2); background: var(--panel2); }
+details.log-full {
+  position: fixed; inset: 0; z-index: 90; margin: 0; border-radius: 0;
+  background: var(--bg); padding: 12px 18px 16px;
+  display: flex; flex-direction: column;
+}
+details.log-full summary { flex: 0 0 auto; }
+details.log-full pre.log { flex: 1 1 auto; max-height: none; }

@@ -71,9 +71,10 @@ CATALOG_PATH = os.environ.get("CATALOG_PATH", "/mnt/catalog/catalog.json")
 # "Refresh from GitHub" button: raw URL of the catalog JSON on GitHub
 # (e.g. https://raw.githubusercontent.com/<org>/<repo>/<branch>/seed_catalog.json).
 CATALOG_GITHUB_URL = os.environ.get("CATALOG_GITHUB_URL", "")
-# TLS verification for that fetch. On HPE clusters the Zscaler MITM proxy
-# presents an untrusted cert, so hpe_proxies-style deployments verify=off
-# (chart wires this from the same skipTls logic the downloader Jobs use).
+# TLS verification for that fetch. Env-var driven: the chart wires
+# CATALOG_GITHUB_VERIFY_TLS from catalog.githubVerifyTls, which defaults to
+# verify-on; behind a corporate MITM proxy with an untrusted cert a site
+# sets it false explicitly.
 CATALOG_GITHUB_VERIFY_TLS = os.environ.get("CATALOG_GITHUB_VERIFY_TLS", "true").strip().lower() == "true"
 # Namespace dropdown search on the front page: only namespaces with this
 # prefix are offered (empty prefix offers every namespace).

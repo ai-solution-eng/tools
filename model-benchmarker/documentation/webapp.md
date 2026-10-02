@@ -136,6 +136,8 @@ window -- the hosted-trial scaling curve -- exactly as the CLI's --prom-url.
 | security.apiKey | Inline seed for the auto-managed release Secret (first install). |
 | persistence.* | Run-artifact PVC (kept on release delete: resource-policy: keep). |
 | extraEnv | Pass-through: BENCH_MAX_CONCURRENT_RUNS, BENCH_MAX_RUN_SECONDS. |
+| proxy.http/.https/.noProxy | Per-key corporate-proxy wiring for the estimator's outbound fetches — each key injected only when non-empty; `proxy: {}` = direct egress, nothing rendered. |
+| pcai.enabled | PCAI feature gate; defaults to false — set it explicitly (it no longer follows proxy config). |
 
 ## Runs and artifacts
 

@@ -16,7 +16,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
   # Packaged with the chart -- kept in lockstep by ./bump_version.sh.
-  tag: v0.4.1
+  tag: v0.6.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE.
@@ -37,7 +37,7 @@ bench:
   #     url: http://rag-mcp-server-api.rag.svc.cluster.local
   #     kind: endpoint
   #   - name: deepseek-v4-flash
-  #     url: http://deepseek-v4-flash.project-user-andrew.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+  #     url: http://deepseek-v4-flash.project-user-<USERNAME>.serving.<cluster-domain>
   #     kind: chat
 
   # Per-endpoint API keys for the TARGETS (JSON object name -> key). SECRET
@@ -65,7 +65,8 @@ bench:
   # Optional Prometheus for the GPU-telemetry join (the scaling curve).
   # OPERATOR-configured -- the browser never picks the scrape target. Leave
   # empty for latency-only benchmarks.
-  # G2 default: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+  # Example (in-cluster Prometheus):
+  #   http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
   prometheusUrl: ""
 
 # -- Run storage ----------------------------------------------------------------------
@@ -76,8 +77,8 @@ persistence:
   enabled: true
   mountPath: /data
   size: 10Gi
-  # "" = cluster default StorageClass. G2: gl4f-filesystem (RWX) supports
-  # replicaCount > 1; a RWO class pins one replica.
+  # "" = cluster default StorageClass. An RWX class (e.g. a filesystem
+  # class) supports replicaCount > 1; a RWO class pins one replica.
   storageClass: ""
   accessModes:
     - ReadWriteOnce
@@ -113,24 +114,25 @@ resources:
   limits:
     memory: 1Gi
 
-# -- HPE corporate proxy (hpeproxy.its.hpecorp.net + Zscaler MITM) -----------------------
+# -- Corporate egress proxy (per-key wiring) ------------------------------------------------
 # Controls the proxy / no_proxy env vars for the estimator's outbound fetches
 # (huggingface.co config.json for seed-catalog models). Mirrors the
-# ModelDownloader convention:
+# ModelDownloader convention: each key is injected only when non-empty; a
+# direct-egress site leaves proxy: {} and everything renders off.
 #
-#   hpe_proxies: true    proxy env injected (HPE PCAI default)
-#   hpe_proxies: false   no proxy env vars
-#
-# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
-# so kyverno stays off here by default (static vendor labels suffice) and ezua
-# renders the VirtualService by default.
-hpe_proxies: true
+# kyverno and ezua are NOT controlled by proxy config — this is an HPE PCAI
+# app, so kyverno stays off here by default (static vendor labels suffice) and
+# ezua renders the VirtualService by default.
+proxy: {}
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
+# -- PCAI feature gate --------------------------------------------------------------------------
+# Set explicitly — PCAI features no longer follow proxy config.
 pcai:
-  # Leave `enabled` unset to fall back to the hpe_proxies flag; force it
-  # explicitly only to override.
-  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+  enabled: false
 
 # -- Extra env (pass-through: BENCH_MAX_CONCURRENT_RUNS, BENCH_MAX_RUN_SECONDS,
 #    BENCH_CATALOG_PATH, HF_TOKEN for gated repos like CohereLabs, ...)
@@ -158,7 +160,7 @@ ezua:
     timeout: 60s
     longTimeout: 7200s
   authorizationPolicy:
-    # SITE: false on SE G2 (HPE SSO at the gateway centrally). Set true (+
+    # SITE: false where SSO is applied centrally at the gateway. Set true (+
     # provider oauth2-proxy) on customer PCAI clusters.
     enabled: false
     namespace: istio-system

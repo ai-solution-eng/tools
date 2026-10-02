@@ -185,11 +185,12 @@
       <div class="field-row">
         <div class="field"><label for="m-gpus">GPUs</label><input id="m-gpus" type="number" min="1" max="64" value="4"></div>
         <div class="field"><label for="m-tp">Tensor parallel (TP)</label><input id="m-tp" type="number" min="1" max="64" value="4"></div>
-        <div class="field"><label for="m-mem">mem-fraction-static</label><input id="m-mem" type="number" min="0.1" max="1" step="0.05" value="0.9"></div>
+        <div class="field"><label for="m-pp">Pipeline parallel (PP) <span class="mini">1 = off</span></label><input id="m-pp" type="number" min="1" max="64" value="1"></div>
       </div>
       <div class="field-row">
+        <div class="field"><label for="m-mem">mem-fraction-static</label><input id="m-mem" type="number" min="0.1" max="1" step="0.05" value="0.9"></div>
         <div class="field"><label for="m-over">Overhead (GiB/GPU)</label><input id="m-over" type="number" min="0" max="64" step="0.5" value="2"></div>
-        <div class="field" style="grid-column: span 2">
+        <div class="field">
           <label for="m-ctx">Contexts (comma-separated)</label>
           <input id="m-ctx" value="4096,16384,65536,262144,1048576">
         </div>
@@ -234,7 +235,7 @@
   var catalogModels = [];
   fetch("/api/catalog").then(function (r) { return r.json(); }).then(function (d) {
     catalogModels = (d.models || []).map(function (m) {
-      return { name: m.label + " — " + m.gpu.toUpperCase() + " x" + m.gpus + " TP" + m.tp, url: m.repo || m.name, _meta: m };
+      return { name: m.label + " — " + m.gpu.toUpperCase() + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : ""), url: m.repo || m.name, _meta: m };
     });
   }).catch(function () { /* catalog is optional */ });
   MB.combobox("m-model", function () { return catalogModels; }, applyCatalogModel);
@@ -248,11 +249,12 @@
     var m = t._meta;
     if (m.gpus) $("m-gpus").value = m.gpus;
     if (m.tp) $("m-tp").value = m.tp;
+    if (m.pp) $("m-pp").value = m.pp;
     if (m.kv_dtype) $("m-kv").value = m.kv_dtype;
     if (m.mem_fraction) $("m-mem").value = m.mem_fraction;
     currentSpec = m.speculative || null;
     currentRunner = m.moe_runner || "";
-    var bits = ["serving preset: " + m.gpu + " x" + m.gpus + " TP" + m.tp];
+    var bits = ["serving preset: " + m.gpu + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : "")];
     if (currentRunner) bits.push("MoE runner " + currentRunner);
     if (currentSpec && currentSpec.algorithm) {
       bits.push("speculative " + currentSpec.algorithm + (currentSpec.draft_model ? " (draft: " + currentSpec.draft_model.split("/").pop() + ")" : "") + (currentSpec.draft_tokens ? " x" + currentSpec.draft_tokens : ""));
@@ -280,6 +282,7 @@
       gpu_vram: $("m-vram").value || null,
       gpus: $("m-gpus").value,
       tp: $("m-tp").value,
+      pp: $("m-pp").value,
       kv_dtype: $("m-kv").value,
       mem_fraction: $("m-mem").value,
       ep: $("m-ep").value,

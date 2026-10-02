@@ -142,7 +142,11 @@ class JobQueue:
                 pvc_name=self.pvc_name,
                 scan_root=self._scan_root_for(cache_root),
                 scan_image=getattr(preflight, "scan_image", "") or "",
-                jobs=list(self.jobs.values()),
+                # Attribution in preflight/gc (usage_by_namespace, matching_job)
+                # speaks plain dicts: job.get("namespace") etc. Hand it the
+                # serialized history — JobRecord is a dataclass, and passing the
+                # live objects blew up AttributeError on the second submit.
+                jobs=[r.to_dict() for r in self.jobs.values()],
             )
             # Charge the namespace for the accepted submission immediately
             # (folded into cached usage; the next scanner refresh re-derives).

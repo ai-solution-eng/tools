@@ -435,19 +435,25 @@ data:
               value: "__CHAT_TEMPLATE_B64__"
             - name: CHAT_TEMPLATE_PATH
               value: "__CHAT_TEMPLATE_PATH__"
-            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
             - name: no_proxy
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
             - name: NO_PROXY
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
             - name: https_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTPS_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
             - name: http_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTP_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: USER
               value: {{ .Values.downloader.user | quote }}
@@ -611,19 +617,25 @@ data:
             - name: AWS_SECRET_ACCESS_KEY
               value: {{ .Values.s3.secretAccessKey | quote }}
             {{- end }}
-            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
             - name: no_proxy
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
             - name: NO_PROXY
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
             - name: https_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTPS_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
             - name: http_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTP_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: USER
               value: {{ .Values.downloader.user | quote }}
@@ -704,19 +716,25 @@ data:
             {{- toYaml . | nindent 14 }}
             {{- end }}
             env:
-            {{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
             - name: no_proxy
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
             - name: NO_PROXY
-              value: {{ .Values.pcai.noProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
             - name: https_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTPS_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
             - name: http_proxy
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
             - name: HTTP_PROXY
-              value: {{ .Values.pcai.httpsProxy | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: USER
               value: {{ .Values.debugPod.user | quote }}

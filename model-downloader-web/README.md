@@ -6,7 +6,7 @@
 
 ## What problem(s) it solves
 
-- **Pulling HF models into air-gapped / proxied PCAI clusters.** Downloader Jobs and the app pod get the HPE corporate proxy (`hpeproxy.its.hpecorp.net:8080`) and `no_proxy` environment via `hpe_proxies`, together with the httpx TLS-verification bypass needed to get through the Zscaler MITM proxy, which presents an untrusted certificate. Outbound GitHub fetches (catalog refresh) follow the same rule.
+- **Pulling HF models into air-gapped / proxied PCAI clusters.** A per-key `proxy:` dict (`proxy.http` / `proxy.https` / `proxy.noProxy`) wires the corporate proxy and `no_proxy` environment into downloader Jobs, debug pods and the app pod — each key is injected only when non-empty, so a direct-egress site leaves `proxy: {}` and nothing renders. Where the egress proxy is a MITM (untrusted cert), `downloader.hf.verifyTls: false` opts the httpx client out of TLS verification — explicitly, never by default. Outbound GitHub fetches (catalog refresh) have their own verify knob (`catalog.githubVerifyTls`, default verify-on).
 - **A shared `models-pvc` workflow without cluster access for end users.** End users never touch `kubectl`: they submit a download from the UI, the Job runs in their `project-user-*` namespace, writes the HF cache on the PVC every project namespace already mounts, and shows the resulting `pvc://models-pvc/large-models/<model>?containerPath=/mnt/models` URL in the Jobs table.
 - **Model catalog management + push to MLIS.** A GPU-tier-grouped catalog (seeded from a bundled JSON, refreshable from GitHub, extendable in the UI or by pasting JSON) can push model configurations straight into the AIOLI/MLIS `packaged_models` table — the step that makes models appear in MLIS model serving.
 - **Debug pods for cache inspection.** A one-click long-running debug shell mounts the same PVC at `/mnt`, so you can inspect/repair the model cache with `huggingface-cli` instead of submitting probe downloads. It is deliberately created as a Job so platform Kyverno admission admits it (see [Kyverno on hosted trial systems](#kyverno-on-hosted-trial-systems--read-before-deploying)).
@@ -33,7 +33,7 @@ All of the following are implemented in `src/model_downloader/` and wired by `he
 
 ## Deploying on PCAI
 
-PCAI users **never** run `helm install` or `kubectl apply`. The chart is imported into PCAI once (the packaged chart, e.g. `model-downloader-1.6.2.tar.gz`), and from then on deployments are just values: edit the chart's `values.yaml` in the PCAI **Helm Values** editor (or via the PCAI API) and apply. PCAI resolves `${DOMAIN_NAME}` itself before rendering, so leave those placeholders as-is.
+PCAI users **never** run `helm install` or `kubectl apply`. The chart is imported into PCAI once (the packaged chart, e.g. `model-downloader-1.7.0.tar.gz`), and from then on deployments are just values: edit the chart's `values.yaml` in the PCAI **Helm Values** editor (or via the PCAI API) and apply. PCAI resolves `${DOMAIN_NAME}` itself before rendering, so leave those placeholders as-is.
 
 **Before you start** (cluster-side prerequisites, not chart values):
 
@@ -70,7 +70,8 @@ PCAI users **never** run `helm install` or `kubectl apply`. The chart is importe
 - `preflight.*` + `quota.*` — PVC preflight + per-namespace quota. Before a downloader Job is created the app checks (a) disk fit — model size from the Hub API vs PVC `status.capacity` minus used bytes (a `du -sb` pass in the scanner Job; both TTL-cached, with in-flight submissions charged between scans) and (b) the namespace's byte quota (`quota.namespaces.<ns>` map + `quota.default`; values accept `500Gi`-style quantities). `mode: refuse` (default) returns a 422 naming bytes-needed vs bytes-free / used vs quota; `warn` reports without refusing; `off` skips the check. `preflight.enabled: false` also drops the read-only `persistentvolumeclaims` get/list RBAC addition. Refusals and warnings surface in the UI's submit error path verbatim. Tuning: `preflight.safetyMargin` (default `0`, k8s quantity or bytes) is headroom subtracted from free space before the fit check, covering writes the `du` snapshot can't see yet; `preflight.usageTtl` (default `120`s) caches the used-bytes census; `preflight.sizeTtl` (default `300`s) caches Hub size estimates. (Env vars are injected only when a value differs from its default — the defaults are compiled into the app.)
 - `gc.*` — TTL/GC eviction (default **off**). `enabled: true` renders a CronJob (`schedule` default nightly `0 3 * * *`, pod template = the scanner Job's admission pattern verbatim) plus the UI's **Storage GC (dry-run report)** section. Deletion rule — three-key AND, all three must hold: `manifest.json` present next to the models--* dir, **no** AIOLI `packaged_models` row referencing the model (matched by cache-dir name / repo id appearing in the uri — never exact path equality; custom cache roots), and **no** live managed job pinning the cache root. Each signal alone is unreliable (job TTLs erase evidence; paths vary; MLIS rows go stale) — hence the AND. `dryRun: true` is the default: the job logs every verdict and deletes nothing; the `/api/gc/report` view (cached, `?force=1` rebuilds) is the review surface. `ttlDays` (default 30) is the age line, `minKeep` an LRU floor, `protectedModels` a glob list never to delete, and an unreachable AIOLI/jobs API fail-safes to *keep everything*. The GC job's AIOLI access is a strictly read-only `SELECT` (`default_transaction_read_only=on`); S3 eviction is out of scope. `gc.concurrencyPolicy` (default `Forbid`) keeps two GC pods from ever running at once — leave it alone unless you have a reason.
 - `debugPod.*` — `enabled`, `image` (`repository`, `tag`, `pullPolicy`), `pvcName` (override), `disableSecurityContext`/`securityContext`, `user`, `cachePath`, `ttlSecondsAfterFinished`.
-- `hpe_proxies` + `pcai.httpsProxy` / `pcai.noProxy` — proxy env on downloader Jobs and the app pod, plus the Zscaler TLS bypass. `true` only behind the HPE corporate proxy. `pcai.enabled` is usually left unset: it then falls back to the `hpe_proxies` flag; set it explicitly only to force proxy env on/off independently of `hpe_proxies`.
+- `proxy.http` / `proxy.https` / `proxy.noProxy` — per-key proxy wiring: each key is injected into downloader Jobs, debug pods and the app pod only when non-empty (a direct-egress site leaves `proxy: {}`). The former `hpe_proxies` flag is gone — see [Migrating from `hpe_proxies`](#migrating-from-hpe_proxies).
+- `pcai.enabled` — the PCAI feature gate for the ezua/kyverno-style integration defaults; **defaults to false now** — set it explicitly. (`kyverno.enabled` / `ezua.enabled` remain the per-feature switches for this app's own PCAI integration.)
 - `catalog.*` — `enabled`, `size`, `storageClassName`, `githubUrl` (enables **Refresh from GitHub**), `githubVerifyTls`.
 - `kyverno.enabled` — keep `true` on any PCAI cluster (see next section).
 - `ezua.*` — `domainName`, `virtualService.endpoint` / `.istioGateway` / `.timeout`, `authorizationPolicy.namespace` / `.providerName`.
@@ -85,8 +86,8 @@ Every key in [helm/values.yaml](helm/values.yaml), with the default from the cha
 | `maxConcurrency` | `4` | Max model downloads running at once; extras queue in-process. |
 | `defaultNamespace` | `project-user-<your-username>` (override it) | Namespace pre-filled in the submit form — set it to a `project-user-*` namespace that owns `models-pvc`. |
 | `service.type` / `service.port` | `ClusterIP` / `8000` | Cluster-internal exposure of the UI; the Istio VirtualService routes to this port. |
-| `hpe_proxies` | `false` | Master proxy flag: proxy/no_proxy env on downloader Jobs, debug pods and the app pod + the httpx TLS-verification bypass for the Zscaler MITM. Does NOT control `kyverno`/`ezua`. |
-| `pcai.httpsProxy` / `pcai.noProxy` | `http://hpeproxy.its.hpecorp.net:8080` / long cluster-local list | Proxy endpoints used only when proxying is on. `pcai.enabled` (unset by default) forces them on/off independently of `hpe_proxies`. |
+| `proxy.http` / `proxy.https` / `proxy.noProxy` | `{}` (all keys empty) | Per-key corporate-proxy wiring into downloader Jobs, debug pods and the app pod. Each key renders only when non-empty; `proxy: {}` = direct egress, nothing rendered. |
+| `pcai.enabled` | `false` | PCAI feature gate for the ezua/kyverno-style integration defaults. Defaults to false; set explicitly. Does NOT follow proxy config. |
 | `storage.backend` / `storage.default` | `both` / `pvc` | Which backends users can pick; which is preselected. `backend: pvc` removes all S3 env from the app. |
 | `s3.*` | MinIO defaults, demo credentials | `endpointUrl`, `bucket` (must exist), `prefix` (objects land at `s3://<bucket>/<prefix>/<org>/<Model>/`), `accessKeyId`, `secretAccessKey` — injected only when the backend includes `s3`. |
 | `downloadList.enabled` | `true` | Master switch for the Downloaded-models list. |
@@ -119,7 +120,7 @@ Every key in [helm/values.yaml](helm/values.yaml), with the default from the cha
 | `downloader.user` | `<your-username>` (override it) | `USER` env var in the Job — HF request headers / logging. Set it to your own username. |
 | `downloader.hf.downloadTimeout` / `.etagTimeout` | `"300"` / `"30"` | `HF_HUB_DOWNLOAD_TIMEOUT` / `HF_HUB_ETAG_TIMEOUT`. |
 | `downloader.hf.enableHfTransfer` / `.disableXet` | `"0"` / `"1"` | `HF_HUB_ENABLE_HF_TRANSFER` / `HF_HUB_DISABLE_XET`. |
-| `downloader.hf.verifyTls` | unset → follows `hpe_proxies` | Explicit TLS-verify override for the downloader (true = verify). |
+| `downloader.hf.verifyTls` | unset → `true` (verify) | Explicit TLS-verify override for the downloader (`false` = bypass — set it ONLY behind a corporate MITM proxy with an untrusted cert). |
 | `debugPod.enabled` | `true` | Enables the UI's Launch-debug-pod section. |
 | `debugPod.pvcName` | `""` → `downloader.pvcName` | Mount a different PVC than the downloader's. |
 | `debugPod.disableSecurityContext` | `true` | Same `hpe-ezua/disable-sc` opt-out as the downloader Jobs. |
@@ -128,7 +129,7 @@ Every key in [helm/values.yaml](helm/values.yaml), with the default from the cha
 | `catalog.enabled` | `true` | Renders the catalog PVC and mounts it at `/mnt/catalog`. |
 | `catalog.size` / `catalog.storageClassName` | `100Mi` / `""` (default class) | Catalog PVC capacity / storage class. |
 | `catalog.githubUrl` | tools-repo seed JSON | Enables **Refresh from GitHub** (button hidden when empty). |
-| `catalog.githubVerifyTls` | unset → follows the downloader's TLS rule | Override for that fetch (true = verify). |
+| `catalog.githubVerifyTls` | unset → `true` (verify) | Override for that fetch (`false` = bypass — set it ONLY behind a corporate MITM proxy with an untrusted cert). |
 | `aioli.dbHost` / `.dbPort` / `.dbName` / `.dbUser` | MLIS service defaults | AIOLI/MLIS database connection for Push to MLIS and the GC cross-check. |
 | `aioli.dbPasswordSecret.name` / `.namespace` / `.key` | `aioli-db-password` / `mlis` / `password` | Where the database password Secret lives and which key holds it. |
 | `kyverno.enabled` | `true` | Pre-install ClusterPolicy stamping `hpe-ezua` vendor labels on the app Deployment/Service (EZUA discovery). |
@@ -216,11 +217,11 @@ If you see either message on a hosted trial, it is the customer's platform polic
 
 ## Deployment targets
 
-### SE G2
+### Proxied corporate site
 
-The internal HPE "G2" PCAI cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`):
+A proxied corporate PCAI site (example values use placeholder addresses):
 
-- `hpe_proxies: true` — downloader Jobs and the app pod go through `hpeproxy.its.hpecorp.net:8080` with the internal `no_proxy` list; TLS verification is bypassed because the Zscaler MITM cert is untrusted (also applies to the catalog's GitHub fetch).
+- Proxied corporate egress: `proxy.http`/`proxy.https` point at the corporate proxy with the site's `no_proxy` list; `downloader.hf.verifyTls: false` is set explicitly because the MITM cert is untrusted (also applies to the catalog's GitHub fetch via `catalog.githubVerifyTls`, or leave it and accept the per-fetch default — the example sets the downloader knob).
 - Storage: both backends — the shared `models-pvc` (default) and MinIO at `http://minio.minio.svc.cluster.local:9000`, bucket `mlis-models`, prefix `large-models`.
 - `defaultNamespace: project-user-<USERNAME>`; Kyverno works out of the box.
 - Sanitized example: [helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml).
@@ -230,7 +231,7 @@ The internal HPE "G2" PCAI cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.n
 A customer-hosted PCAI system:
 
 - Everything ingress-related uses `${DOMAIN_NAME}` placeholders (`ezua.domainName`, `ezua.virtualService.endpoint` = `model-downloader.${DOMAIN_NAME}`) — PCAI substitutes the real domain before rendering. The UI is then served at `https://model-downloader.<customer-domain>` behind oauth2-proxy SSO.
-- `hpe_proxies: false` unless the cluster egresses via the HPE corporate proxy.
+- Direct egress is the norm: leave `proxy: {}` unless the cluster egresses through a corporate proxy (then wire `proxy.http`/`proxy.https`/`proxy.noProxy` and, only for a MITM proxy with an untrusted cert, `downloader.hf.verifyTls: false`).
 - The Kyverno requirements in [the section above](#kyverno-on-hosted-trial-systems--read-before-deploying) are the main risk: the customer's platform `protect-models-pvc` policy must admit the labeled downloader/debug/scanner Jobs (and the GC CronJob pod, when `gc.enabled: true` — same job-controller admission path, same labels), and `kyverno.enabled` must stay `true`.
 - Sanitized example: [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
 
@@ -253,3 +254,20 @@ A customer-hosted PCAI system:
 | [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml) | Sanitized **hosted-trial** site values — full paste-ready document. |
 
 Per-site values with real credentials live in `helm/local/` (repo-only: gitignored, hardlink-ignored, never packaged — see `helm/local/README.md` in the source repo). The files under `helm/values-examples/` are the shareable counterparts of those.
+
+## Migrating from `hpe_proxies`
+
+The `hpe_proxies` flag is **removed** (fleet-wide deprecation). What changed and what to do:
+
+- **Proxy env** used to be a single boolean; it is now the per-key `proxy:` dict — `proxy.http`, `proxy.https`, `proxy.noProxy`. Each key is wired into the pods (downloader Jobs, debug pods, the app pod) **only when non-empty**; a direct-egress site leaves `proxy: {}` and everything renders off:
+  ```yaml
+  proxy:
+    http: http://proxy.corp.example:8080
+    https: http://proxy.corp.example:8080
+    noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+  ```
+- **`pcai.enabled` no longer falls back to the proxy flag** — it **defaults to `false`**. PCAI features (ezua/kyverno-style integration defaults) no longer follow proxy config: set `pcai.enabled: true` explicitly where you want them.
+- **`downloader.hf.verifyTls` now defaults to VERIFY ON.** The old default turned the httpx TLS-verification bypass on together with the proxy flag; the bypass now happens **only** with an explicit `downloader.hf.verifyTls: false` — set that ONLY behind a corporate MITM proxy with an untrusted cert. `catalog.githubVerifyTls` likewise defaults to verify-on.
+- `kyverno.enabled` / `ezua.enabled` are unchanged (they never followed the flag).
+
+`helm/values-examples/values.g2.yaml` shows a full migrated proxied-site document (placeholder addresses, explicit `pcai.enabled: true` and `verifyTls: false`).

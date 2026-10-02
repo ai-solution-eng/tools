@@ -1,15 +1,13 @@
 {{/*
-  Fleet helper pair (ModelDownloader convention):
-  - hpeProxiesEnabled: .Values.hpe_proxies when present, else TRUE (HPE PCAI
-    default: proxy env on — HPE clusters reach the internet through
-    hpeproxy.its.hpecorp.net).
-  - pcaiEnabled: .Values.pcai.enabled when explicitly set, else falls back to
-    hpeProxiesEnabled — force pcai.enabled only to override the flag.
+  Fleet helper pair (SECURE defaults):
+  - pcaiEnabled: .Values.pcai.enabled when explicitly set, else FALSE. PCAI
+    features (ezua/kyverno-style integration) no longer follow proxy config —
+    sites must set pcai.enabled explicitly.
+  - Proxy env is wired per-key from the top-level proxy: dict (proxy.http /
+    proxy.https / proxy.noProxy) — each key is injected only when non-empty; a
+    direct-egress site leaves proxy: {} and no proxy env renders anywhere.
+    There is no proxy-detection flag anymore.
 */}}
-{{- define "model-benchmarker.hpeProxiesEnabled" -}}
-{{- if hasKey .Values "hpe_proxies" }}{{ .Values.hpe_proxies }}{{ else }}true{{ end -}}
-{{- end -}}
-
 {{- define "model-benchmarker.pcaiEnabled" -}}
-{{- if and .Values.pcai (hasKey .Values.pcai "enabled") }}{{ .Values.pcai.enabled }}{{ else }}{{ include "model-benchmarker.hpeProxiesEnabled" . }}{{ end -}}
+{{- if and .Values.pcai (hasKey .Values.pcai "enabled") }}{{ .Values.pcai.enabled }}{{ else }}false{{ end -}}
 {{- end -}}

@@ -728,3 +728,73 @@ def test_library_endpoint_public(monkeypatch, tmp_path, library_root):
     status, body = _call(app, "GET", "/api/library")  # no key header
     assert status == 200
     assert json.loads(body)["models"][0]["slug"] == "mymodel"
+
+
+# ---------------------------------------------------------------------------
+# library seeding: image carries results/, PVC gets a one-time copy
+# ---------------------------------------------------------------------------
+
+
+def test_seed_copies_tree_once(tmp_path, monkeypatch):
+    """First launch copies the seed tree into <work>/results; later launches
+    are a no-op (the PVC copy is authoritative and survives upgrades)."""
+
+    from model_benchmarker.webapp import library as LIB
+
+    seed = tmp_path / "seed"
+    (seed / "mymodel").mkdir(parents=True)
+    (seed / "mymodel" / "H200.md").write_text(
+        "# run\n\nStatus: complete\n\n| ctx | users |\n|---|---|\n| 0 | 1 |\n", encoding="utf-8"
+    )
+    (seed / "report.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.delenv(LIB.RESULTS_DIR_ENV, raising=False)
+    monkeypatch.setenv(LIB.SEED_DIR_ENV, str(seed))
+
+    work = tmp_path / "work"
+    root = LIB.seed_results_into_workdir(work)
+    assert root == work / "results"
+    assert (root / "mymodel" / "H200.md").is_file()
+    assert not (root / "report.html").exists()  # generated reports never seed
+
+    # second call: no-op, the existing PVC copy wins (mutate it to prove it)
+    (root / "mymodel" / "H200.md").write_text("PVC copy", encoding="utf-8")
+    again = LIB.seed_results_into_workdir(work)
+    assert again == root
+    assert (again / "mymodel" / "H200.md").read_text(encoding="utf-8") == "PVC copy"
+
+
+def test_seed_noop_without_seed_dir(tmp_path, monkeypatch):
+    from model_benchmarker.webapp import library as LIB
+
+    monkeypatch.delenv(LIB.RESULTS_DIR_ENV, raising=False)
+    monkeypatch.delenv(LIB.SEED_DIR_ENV, raising=False)
+    work = tmp_path / "work"
+    assert LIB.seed_results_into_workdir(work) is None
+    assert not (work / "results").exists()
+
+
+def test_create_app_seeds_and_sets_env(tmp_path, monkeypatch):
+    """create_app wires the seed into startup: after building the app with a
+    fresh work dir and a seed tree present, BENCH_RESULTS_DIR points at the
+    seeded PVC copy and /api/library serves from it."""
+    import os
+    import shutil as _sh
+
+    from model_benchmarker.webapp import library as LIB
+    from model_benchmarker.webapp.app import create_app
+
+    seed = tmp_path / "seed"
+    (seed / "mymodel").mkdir(parents=True)
+    (seed / "mymodel" / "H200.md").write_text(
+        "# run\n\nStatus: complete\n\n| ctx | users | task | failed | TTFT turn1 P50 (ms) | TTFT turn1 P95 (ms) | TTFT turn1 P99 (ms) | TTFT turn1 P100 (ms) | TTFT-post P50 (ms) | TTFT-post P95 (ms) | TTFT-post P99 (ms) | TTFT-post P100 (ms) | tokens/s P50 | tokens/s P95 | tokens/s P99 | tokens/s P100 |\n|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| 0 | 1 | coding | 0 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(LIB.RESULTS_DIR_ENV, raising=False)
+    monkeypatch.setenv(LIB.SEED_DIR_ENV, str(seed))
+    monkeypatch.setenv("BENCH_WORK_DIR", str(tmp_path / "work"))
+
+    create_app()
+    env_after = os.environ.get(LIB.RESULTS_DIR_ENV)
+    assert env_after == str(tmp_path / "work" / "results")
+    assert (tmp_path / "work" / "results" / "mymodel" / "H200.md").is_file()
+    _sh.rmtree(tmp_path / "seed")  # seed must not be needed again

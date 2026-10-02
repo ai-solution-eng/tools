@@ -34,3 +34,6 @@ def setup_logger(string_logger: bool = True, log_path: str | None = None, level:
         handlers=handler,
         force=True,
     )
+
+
+

@@ -189,7 +189,7 @@
       downloader job pods (mlis label + security-context opt-outs — a directly-created pod is denied
       by the platformwide Kyverno policy). Then
       <code>kubectl exec -it $(kubectl get pods -n &lt;ns&gt; -l job-name=&lt;job&gt; -o jsonpath='{{ '{{' }}.items[0].metadata.name{{ '}}' }}') -- bash</code>.
-      The proxy / no_proxy env vars follow the chart's <code>hpe_proxies</code> setting.
+      The proxy / no_proxy env vars follow the chart's <code>proxy.http/https/noProxy</code> settings (each key wired only when non-empty).
     </p>
     <form id="debug-form" autocomplete="off" data-default-ns="{{ default_namespace }}">
       <label>

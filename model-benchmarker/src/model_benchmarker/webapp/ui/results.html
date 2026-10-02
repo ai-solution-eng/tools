@@ -32,6 +32,31 @@
   .cmp-cell-wrap { display: inline-block; text-align: right; }
   td.cmp-ref-col { background: rgba(1, 169, 130, .05); }
   .cmp-missing-cell { color: var(--muted); }
+  /* --- comparison charts (PDF-style scaling curves) --- */
+  .cmp-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; margin: 14px 0; }
+  .cmp-chart { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 6px; position: relative; }
+  .cmp-chart h3 { margin: 0 0 2px; font-size: 13px; font-weight: 600; }
+  .cmp-chart .cmp-chart-sub { color: var(--muted); font-size: 11.5px; margin: 0 0 6px; }
+  .cmp-chart svg { display: block; width: 100%; height: auto; }
+  .cmp-chart .axis { stroke: var(--border); stroke-width: 1; }
+  .cmp-chart .gridline { stroke: var(--border); stroke-width: .5; opacity: .5; stroke-dasharray: 2 3; }
+  .cmp-chart .tick-label { fill: var(--muted); font-size: 10px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .cmp-chart .axis-title { fill: var(--text); font-size: 11px; }
+  .cmp-chart .series { fill: none; stroke-width: 2; }
+  .cmp-chart .series-dot { stroke: var(--panel2); stroke-width: 1.5; }
+  .cmp-chart .hover-line { stroke: var(--muted); stroke-width: 1; opacity: .6; }
+  .cmp-chart .cmp-chart-tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 9px; font-size: 11.5px; font-family: ui-monospace, Menlo, Consolas, monospace;
+    box-shadow: 0 4px 14px rgba(0,0,0,.35); z-index: 30; white-space: nowrap; display: none; }
+  .cmp-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; }
+  .cmp-legend .lg { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text); }
+  .cmp-legend .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  .cmp-legend .chip { display: inline-block; font-size: 9.5px; border: 1px solid var(--border); border-radius: 999px;
+    padding: 0 5px; color: var(--muted); margin-left: 4px; }
+  .cmp-tabs { display: inline-flex; gap: 4px; margin-left: 10px; vertical-align: middle; }
+  .cmp-tabs button { font: inherit; font-size: 12px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  .cmp-tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 </style>
 <script type="text/html" id="hpe-logo-template"><svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 432 288" style="flex-shrink:0">
       <path fill="#01a982" d="M126.617,109.327v15.861h55.218v-15.861H126.617z M178.384,121.737h-48.316v-8.959h48.316V121.737z"/>
@@ -245,7 +270,16 @@
       }).catch(function () { LIB = { models: [] }; renderLibrary(); });
       return;
     }
-    if (!(LIB.models || []).length) { box.innerHTML = ""; return; }
+    if (!(LIB.models || []).length) {
+      // say WHY instead of rendering nothing: root=null means no results
+      // tree is configured/reachable in this deployment (BENCH_RESULTS_DIR
+      // unset or the directory absent) — an operator-visible condition.
+      var why = LIB.root
+        ? "no machine-readable artifacts in the results tree (" + LIB.root + ")"
+        : "no results tree configured — set BENCH_RESULTS_DIR to a directory of <model>/<setup>.md artifacts (or kubectl cp your results/ tree onto the pod)";
+      box.innerHTML = '<p class="muted" style="margin-top:10px">Results library unavailable: ' + MB.esc(why) + "</p>";
+      return;
+    }
     var q = ($("f-filter").value || "").toLowerCase();
     var models = (LIB.models || []).filter(function (m) {
       return !q || (m.slug + " " + JSON.stringify(m.setups)).toLowerCase().indexOf(q) >= 0;
@@ -332,18 +366,271 @@
     return '<span class="cmp-delta ' + cls + '">' + (delta > 0 ? "+" : "") + delta.toFixed(1) + "%</span>";
   }
 
+  // =====================================================================
+  // comparison charts — the PDF-style scaling curves, inline SVG (no deps)
+  // =====================================================================
+
+  var METRIC_META = {
+    ttft_turn1_p50_ms: { label: "TTFT turn-1 (P50)", unit: "ms", better: "lower" },
+    ttft_turn1_p95_ms: { label: "TTFT turn-1 (P95)", unit: "ms", better: "lower" },
+    ttft_post_p50_ms: { label: "TTFT cached-prefix (P50)", unit: "ms", better: "lower" },
+    ttft_post_p95_ms: { label: "TTFT cached-prefix (P95)", unit: "ms", better: "lower" },
+    tokens_p50: { label: "tokens/s (P50)", unit: "tok/s", better: "higher" },
+    tokens_p95: { label: "tokens/s (P95)", unit: "tok/s", better: "higher" },
+    lat_p50_ms: { label: "latency (P50)", unit: "ms", better: "lower" },
+    lat_p99_ms: { label: "latency (P99)", unit: "ms", better: "lower" },
+    rps: { label: "requests/s", unit: "req/s", better: "higher" },
+    failed: { label: "failed", unit: "", better: "lower" }
+  };
+
+  // label -> structured level: chat rows carry ctx/users/task; endpoint rows N=
+  function parseLevel(label) {
+    var ctx = /ctx=(\d+)/.exec(label), users = /users=(\d+)/.exec(label), n = /N=(\d+)/.exec(label);
+    var task = null;
+    if (!n) { var parts = label.trim().split(/\s+/); task = parts[parts.length - 1]; }
+    return {
+      x: n ? +n[1] : (users ? +users[1] : null),   // the sweep variable
+      ctx: ctx ? +ctx[1] : null,
+      users: users ? +users[1] : null,
+      n: n ? +n[1] : null,
+      task: task
+    };
+  }
+
+  function seriesName(run, idx) {
+    // the run card carries params; show the DISTINGUISHING part, not the id
+    var bits = [];
+    var pl = run.params_label || "";
+    if (pl) {
+      pl.split(/\s+/).forEach(function (tok) {
+        if (!/^(users|ctx)=/.test(tok)) bits.push(tok);  // sweep vars are the x axis
+      });
+    }
+    if (!bits.length) bits.push(run.kind === "chat" ? "run " + (idx + 1) : run.run_id.slice(0, 12));
+    return bits.join(" ");
+  }
+
+  function niceCeil(v) {
+    if (v <= 0) return 1;
+    var exp = Math.floor(Math.log(v) / Math.LN10), f = v / Math.pow(10, exp);
+    var nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
+    return nf * Math.pow(10, exp);
+  }
+
+  function fmtAxis(v) {
+    if (v == null) return "";
+    if (v >= 1e6) return (v / 1e6).toFixed(v % 1e6 ? 1 : 0).replace(/\.0$/, "") + "M";
+    if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 || v % 1e3 === 0 ? 1 : 1).replace(/\.0$/, "") + "k";
+    if (v >= 10) return String(Math.round(v));
+    return String(Math.round(v * 10) / 10);
+  }
+
+  // Build one line chart as an SVG string. series: [{name, color, points:
+  // [{x, y}]}] with x ascending; refIdx highlights the reference series.
+  function lineChart(opts) {
+    var W = 460, H = 260, PADL = 46, PADR = 12, PADT = 14, PADB = 34;
+    var iw = W - PADL - PADR, ih = H - PADT - PADB;
+    var xs = [], ys = [];
+    opts.series.forEach(function (s) { s.points.forEach(function (p) { if (p.x != null && p.y != null) { xs.push(p.x); ys.push(p.y); } }); });
+    if (!xs.length || !ys.length) return null;
+    var xmin = Math.min.apply(null, xs), xmax = Math.max.apply(null, xs);
+    var ymax = niceCeil(Math.max.apply(null, ys) * 1.08);
+    if (xmin === xmax) { xmin -= 1; xmax += 1; }
+    var X = function (v) { return PADL + (v - xmin) / (xmax - xmin) * iw; };
+    var Y = function (v) { return PADT + ih - v / ymax * ih; };
+    var out = ['<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="' + MB.esc(opts.title) + '">'];
+    // y gridlines (4) + labels
+    for (var g = 0; g <= 4; g++) {
+      var gy = PADT + ih - g / 4 * ih, gv = ymax * g / 4;
+      out.push('<line class="gridline" x1="' + PADL + '" y1="' + gy + '" x2="' + (W - PADR) + '" y2="' + gy + '"/>');
+      out.push('<text class="tick-label" x="' + (PADL - 6) + '" y="' + (gy + 3) + '" text-anchor="end">' + fmtAxis(gv) + "</text>");
+    }
+    // x ticks: the union of sweep x values (categorical-ish), subset if crowded
+    var allx = [];
+    opts.series.forEach(function (s) { s.points.forEach(function (p) { if (allx.indexOf(p.x) < 0) allx.push(p.x); }); });
+    allx.sort(function (a, b) { return a - b; });
+    var step = Math.ceil(allx.length / 8);
+    for (var i = 0; i < allx.length; i += step) {
+      out.push('<text class="tick-label" x="' + X(allx[i]) + '" y="' + (H - PADB + 14) + '" text-anchor="middle">' + fmtAxis(allx[i]) + "</text>");
+    }
+    out.push('<line class="axis" x1="' + PADL + '" y1="' + (PADT + ih) + '" x2="' + (W - PADR) + '" y2="' + (PADT + ih) + '"/>');
+    out.push('<line class="axis" x1="' + PADL + '" y1="' + PADT + '" x2="' + PADL + '" y2="' + (PADT + ih) + '"/>');
+    out.push('<text class="axis-title" x="' + (PADL + iw / 2) + '" y="' + (H - 4) + '" text-anchor="middle">' + MB.esc(opts.xLabel) + "</text>");
+    out.push('<text class="axis-title" transform="rotate(-90)" x="' + -(PADT + ih / 2) + '" y="12" text-anchor="middle">' + MB.esc(opts.yLabel) + "</text>");
+    // series polylines + dots
+    opts.series.forEach(function (s) {
+      var pts = s.points.filter(function (p) { return p.x != null && p.y != null; });
+      if (!pts.length) return;
+      var d = pts.map(function (p, j) { return (j ? "L" : "M") + X(p.x).toFixed(1) + " " + Y(p.y).toFixed(1); }).join(" ");
+      out.push('<path class="series" stroke="' + s.color + '" d="' + d + '"/>');
+      pts.forEach(function (p) {
+        out.push('<circle class="series-dot" fill="' + s.color + '" cx="' + X(p.x).toFixed(1) + '" cy="' + Y(p.y).toFixed(1) + '" r="' + (s.ref ? 4 : 3) + '"/>');
+      });
+      // per-point hover targets carry the data the tooltip shows
+      pts.forEach(function (p, j) {
+        out.push('<circle class="hit" fill="transparent" cx="' + X(p.x).toFixed(1) + '" cy="' + Y(p.y).toFixed(1) + '" r="9"' +
+          ' data-tip="' + MB.esc(s.name + " · " + opts.xLabel + "=" + fmtAxis(p.x) + ": " + MB.fmtNum(p.y, p.y >= 100 ? 0 : 1) + " " + (opts.yUnit || "")) + '"/>');
+      });
+    });
+    out.push("</svg>");
+    return out.join("");
+  }
+
+  function attachChartTips(container) {
+    var tip = document.createElement("div");
+    tip.className = "cmp-chart-tip";
+    container.appendChild(tip);
+    container.addEventListener("mousemove", function (ev) {
+      var t = ev.target;
+      if (t.classList && t.classList.contains("hit")) {
+        tip.textContent = t.getAttribute("data-tip");
+        tip.style.display = "block";
+        var rect = container.getBoundingClientRect();
+        var x = ev.clientX - rect.left + 12, y = ev.clientY - rect.top + 12;
+        if (x + 180 > rect.width) x = ev.clientX - rect.left - 190;
+        tip.style.left = x + "px";
+        tip.style.top = y + "px";
+      } else {
+        tip.style.display = "none";
+      }
+    });
+    container.addEventListener("mouseleave", function () { tip.style.display = "none"; });
+  }
+
+  var CMP_CHART_MODE = "curves"; // curves | summary
+
+  // The chart set for one comparison section. Chat data: one scaling-curve
+  // panel per (task x context), TTFT and tokens/s side by side — the PDF
+  // figures. Endpoint data: latency/throughput vs N. Summary tab: one bar
+  // per level x metric for quick worst/best reading.
+  function buildCharts(section) {
+    var runs = section.runs.map(function (rid, idx) {
+      return { rid: rid, idx: idx, name: seriesName(CMP.runs.find(function (r) { return r.run_id === rid; }) || {}, idx), ref: rid === section.reference_run };
+    });
+    var charts = [];
+    if (section.kind === "chat") {
+      // group rows by (task, ctx)
+      var groups = {};
+      section.rows.forEach(function (row) {
+        var lv = parseLevel(row.label);
+        var key = (lv.task || "?") + " @ ctx=" + (lv.ctx == null ? "?" : (lv.ctx === 0 ? "0 (cold)" : fmtAxis(lv.ctx)));
+        (groups[key] = groups[key] || []).push({ lv: lv, row: row });
+      });
+      Object.keys(groups).sort().forEach(function (key) {
+        var levels = groups[key];
+        var xvals = [];
+        levels.forEach(function (l) { if (l.lv.x != null && xvals.indexOf(l.lv.x) < 0) xvals.push(l.lv.x); });
+        xvals.sort(function (a, b) { return a - b; });
+        if (xvals.length < 2) return;  // a single user level is a table job, not a chart
+        ["ttft_turn1_p50_ms", "tokens_p50"].forEach(function (metric) {
+          var meta = METRIC_META[metric];
+          var series = runs.map(function (r) {
+            var pts = xvals.map(function (x) {
+              var row = levels.find(function (l) { return l.lv.x === x && (row = l.row) });
+              var m = null;
+              for (var i = 0; i < levels.length; i++) {
+                if (levels[i].lv.x === x) { m = (levels[i].row.cells[metric] || {})[r.rid]; break; }
+              }
+              return { x: x, y: m };
+            });
+            return { name: r.name, color: RUN_COLORS[r.idx], ref: r.ref, points: pts };
+          });
+          if (series.every(function (s) { return !s.points.some(function (p) { return p.y != null; }); })) return;
+          charts.push({ title: meta.label + " — " + key, xLabel: "concurrent users", yLabel: meta.unit, yUnit: meta.unit, series: series, metric: metric });
+        });
+      });
+    } else {
+      var xvals2 = [];
+      section.rows.forEach(function (row) { var lv = parseLevel(row.label); if (lv.x != null && xvals2.indexOf(lv.x) < 0) xvals2.push(lv.x); });
+      xvals2.sort(function (a, b) { return a - b; });
+      ["lat_p50_ms", "lat_p99_ms", "rps", "tokens_p50"].forEach(function (metric) {
+        if (section.columns.indexOf(metric) < 0) return;
+        var meta = METRIC_META[metric];
+        var series = runs.map(function (r) {
+          var pts = xvals2.map(function (x) {
+            var row = section.rows.find(function (rw) { return parseLevel(rw.label).x === x; });
+            return { x: x, y: row ? (row.cells[metric] || {})[r.rid] : null };
+          });
+          return { name: r.name, color: RUN_COLORS[r.idx], ref: r.ref, points: pts };
+        });
+        if (series.every(function (s) { return !s.points.some(function (p) { return p.y != null; }); })) return;
+        charts.push({ title: meta.label + " vs concurrency", xLabel: "N (concurrent requests)", yLabel: meta.unit, yUnit: meta.unit, series: series, metric: metric });
+      });
+    }
+    return charts;
+  }
+
+  var RUN_COLORS = ["#01a982", "#2563eb", "#d97706", "#9333ea"];
+
+  function renderChartGrid(charts) {
+    var grid = '<div class="cmp-charts">';
+    charts.forEach(function (c) {
+      var svg = lineChart(c);
+      if (!svg) return;
+      grid += '<div class="cmp-chart"><h3>' + MB.esc(c.title) + '</h3>' +
+        '<p class="cmp-chart-sub">' + (METRIC_META[c.metric] && METRIC_META[c.metric].better === "lower" ? "lower is better" : "higher is better") + "</p>" + svg;
+      grid += '<div class="cmp-legend">' + c.series.map(function (s) {
+        return '<span class="lg"><span class="swatch" style="background:' + s.color + '"></span>' + MB.esc(s.name) + (s.ref ? '<span class="chip">ref</span>' : "") + "</span>";
+      }).join("") + "</div></div>";
+    });
+    grid += "</div>";
+    return grid;
+  }
+
+  // summary bars: per metric, a horizontal bar per run per level (min/max
+  // normalized inside the metric) — the quick worst/best read across levels.
+  function renderSummaryBars(section) {
+    var metrics = section.columns.filter(function (m) { return METRIC_META[m] && m !== "failed"; });
+    var html = '<div class="cmp-charts">';
+    metrics.slice(0, 6).forEach(function (metric) {
+      var meta = METRIC_META[metric];
+      var rows = section.rows.filter(function (r) { return section.runs.some(function (rid) { return (r.cells[metric] || {})[rid] != null; }); });
+      if (!rows.length) return;
+      var html2 = '<div class="cmp-chart"><h3>' + MB.esc(meta.label) + '</h3><p class="cmp-chart-sub">' +
+        (meta.better === "lower" ? "lower is better" : "higher is better") + " · per level</p>";
+      html2 += '<table class="cmp-table" style="width:100%"><tbody>';
+      rows.forEach(function (row) {
+        html2 += '<tr><td class="mono" style="width:34%">' + MB.esc(row.label.replace(/ users=(\d+)/, " u$1")) + "</td><td>";
+        var vals = section.runs.map(function (rid) { return (row.cells[metric] || {})[rid]; });
+        var finite = vals.filter(function (v) { return v != null && !isNaN(v); });
+        var mx = Math.max.apply(null, finite), mn = Math.min.apply(null, finite);
+        section.runs.forEach(function (rid, idx) {
+          var v = (row.cells[metric] || {})[rid];
+          if (v == null) { html2 += '<div style="color:var(--muted);font-size:11px">—</div>'; return; }
+          var span = mx > mn ? (mx - mn) : 1;
+          var frac = mx > mn ? 0.08 + 0.92 * (v - mn) / span : 1;
+          var best = (meta.better === "lower" ? v === mn : v === mx) && finite.length > 1;
+          html2 += '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+            '<div style="flex:1;background:var(--border);border-radius:3px;height:12px;overflow:hidden">' +
+            '<div style="width:' + (frac * 100).toFixed(0) + "%;height:100%;background:" + RUN_COLORS[idx] + '"></div></div>' +
+            '<span class="mono" style="font-size:11px;min-width:52px;text-align:right' + (best ? ";font-weight:700" : "") + '">' + MB.fmtNum(v, v >= 100 ? 0 : 1) + "</span></div>";
+        });
+        html2 += "</td></tr>";
+      });
+      html2 += "</tbody></table>";
+      html2 += '<div class="cmp-legend">' + section.runs.map(function (rid, idx) {
+        var run = CMP.runs.find(function (r) { return r.run_id === rid; }) || {};
+        return '<span class="lg"><span class="swatch" style="background:' + RUN_COLORS[idx] + '"></span>' + MB.esc(seriesName(run, idx)) + "</span>";
+      }).join("") + "</div></div>";
+      html += html2;
+    });
+    html += "</div>";
+    return html;
+  }
+
   function renderCompare() {
     if (!CMP) return;
     var html = '<div class="panel" id="cmp-panel"><h2 style="margin-top:0">Run comparison ' +
       '<a href="#" id="cmp-close" style="float:right;font-weight:400">✕ close</a></h2>';
     html += '<p class="sub">Positive deltas are improvements against the reference run (first column). ' +
       '<button id="cmp-csv" class="secondary" style="margin-left:8px">copy as CSV</button></p>';
-    // per-run header cards, colored by run index (matches the delta accents)
+    // per-run header cards, colored by run index (matches the chart series)
     html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0">';
     CMP.runs.forEach(function (r, idx) {
       var isRef = CMP.sections.some(function (s) { return s.reference_run === r.run_id; });
       html += '<div class="cmp-card cmp-run' + idx + '">' +
-        '<span class="cid mono">' + MB.esc(r.run_id.slice(0, 19)) + "</span>" +
+        '<span class="cid mono">' + MB.esc(seriesName(r, idx)) + "</span>" +
+        '<span class="cmp-ref-chip mono" title="' + MB.esc(r.run_id) + '">' + MB.esc(r.run_id.slice(0, 12)) + "</span>" +
         (isRef ? '<span class="cmp-ref-chip">reference</span>' : "") +
         '<div class="row"><span class="k">target</span><span class="v mono" title="' + MB.esc(r.target_url) + '">' + MB.esc(r.target_url) + "</span></div>" +
         '<div class="row"><span class="k">status</span><span class="v">' + badge(r.status) + "</span></div>" +
@@ -354,35 +641,52 @@
         "</div>";
     });
     html += "</div>";
-    // one merged table per kind
+    // per kind: charts first (the actual comparison), table collapsed below
     CMP.sections.forEach(function (s) {
-      html += "<h2>" + MB.esc(s.kind) + " runs</h2>";
+      var runIdx = {};
+      s.runs.forEach(function (rid, idx) { runIdx[rid] = idx; });
+      // section header: run names, not truncated ids
+      var nameBits = s.runs.map(function (rid, idx) {
+        var run = CMP.runs.find(function (r) { return r.run_id === rid; }) || {};
+        return seriesName(run, idx) + (rid === s.reference_run ? " (ref)" : "");
+      }).join("  vs  ");
+      var charts = buildCharts(s);
+      html += "<h2>" + MB.esc(s.kind) + " runs — " + MB.esc(nameBits) +
+        '<span class="cmp-tabs" data-section="' + MB.esc(s.kind) + '">' +
+        '<button data-mode="curves" class="' + (CMP_CHART_MODE === "curves" ? "active" : "") + '">curves</button>' +
+        '<button data-mode="summary" class="' + (CMP_CHART_MODE === "summary" ? "active" : "") + '">summary</button>' +
+        "</span></h2>";
+      if (charts.length) {
+        html += '<div class="cmp-chartwrap" data-kind="' + MB.esc(s.kind) + '">' +
+          (CMP_CHART_MODE === "curves" ? renderChartGrid(charts) : renderSummaryBars(s)) + "</div>";
+      }
+      // compact merged table: metric COLUMNS per run (transpose of the old
+      // 16-row stack), same-level rows only, key metrics first
+      var keyCols = ["ttft_turn1_p50_ms", "ttft_post_p50_ms", "tokens_p50", "failed"].filter(function (m) { return s.columns.indexOf(m) >= 0; });
+      var restCols = s.columns.filter(function (m) { return keyCols.indexOf(m) < 0; });
+      var tableCols = keyCols.concat(restCols).slice(0, 8);
+      html += '<details style="margin:6px 0 14px"><summary style="cursor:pointer;color:var(--muted);font-size:12.5px">full number table (' + s.rows.length + " levels × " + tableCols.length + " metrics)</summary>";
       html += '<div style="overflow:auto"><table class="cmp-table"><thead><tr><th>Level</th>';
-      s.runs.forEach(function (rid, idx) {
-        var isRef = rid === s.reference_run;
-        html += '<th class="num cmp-run' + idx + '" style="color:var(--cmp-accent)">' + MB.esc(rid.slice(0, 19)) +
-          (isRef ? '<span class="cmp-ref-chip">ref</span>' : "") + "</th>";
+      tableCols.forEach(function (metric) {
+        html += "<th>" + MB.esc(METRIC_META[metric] ? METRIC_META[metric].label : metric) + "</th>";
       });
       html += "</tr></thead><tbody>";
       s.rows.forEach(function (row) {
         html += '<tr><td class="mono">' + MB.esc(row.label) + "</td>";
-        s.runs.forEach(function (rid, idx) {
-          var cellBits = [];
-          s.columns.forEach(function (metric) {
+        tableCols.forEach(function (metric) {
+          html += "<td>";
+          s.runs.forEach(function (rid, idx) {
             var v = (row.cells[metric] || {})[rid];
             var d = (row.delta_vs_reference[metric] || {})[rid];
-            cellBits.push(
-              '<div class="' + (idx === 0 ? "cmp-ref-col" : "") + '" style="display:block' + (idx === 0 ? "" : "") + '">' +
-              '<span class="cmp-cell-wrap">' + fmtMetric(metric, v) +
-              (idx === 0 ? "" : deltaCell(d)) + "</span></div>"
-            );
+            html += '<div class="' + (idx === 0 ? "cmp-ref-col" : "") + '"><span class="cmp-cell-wrap">' +
+              '<span class="mono" style="color:' + RUN_COLORS[idx] + '">' + fmtMetric(metric, v) + "</span>" +
+              (idx === 0 ? "" : deltaCell(d)) + "</span></div>";
           });
-          if (!cellBits.length) cellBits = ['<span class="cmp-missing-cell">no data</span>'];
-          html += '<td class="num">' + cellBits.join("") + "</td>";
+          html += "</td>";
         });
         html += "</tr>";
       });
-      html += "</tbody></table></div>";
+      html += "</tbody></table></div></details>";
     });
     // run-level config diffs (what was different about each run)
     var cfgCols = CMP.runs;
@@ -417,6 +721,15 @@
     });
     var csv = $("cmp-csv");
     if (csv) csv.addEventListener("click", function () { copyCsv(); });
+    // tooltips on every chart's hover targets
+    document.querySelectorAll("#r-compare .cmp-chart").forEach(function (box) { attachChartTips(box); });
+    // curves/summary tabs re-render the chart wrap only
+    document.querySelectorAll("#r-compare .cmp-tabs button").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        CMP_CHART_MODE = btn.getAttribute("data-mode");
+        renderCompare();
+      });
+    });
     $("r-compare").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 

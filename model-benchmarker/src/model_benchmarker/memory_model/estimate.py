@@ -3,12 +3,17 @@ many tokens fit, how many concurrent N-token requests are supported.
 
 The math (all deterministic, no throughput predictions):
 
-    weights_per_gpu     = weight_bytes / tp_size
+    weights_per_gpu     = weight_bytes / tp_size / pp_size
     usable_per_gpu      = vram_gib x 1024^3 x mem_fraction - overhead_bytes
     kv_pool_per_gpu     = usable - weights_per_gpu
     kv_tokens_total     = sum over GPUs of (kv_pool_per_gpu / kv_bytes_per_token)
     concurrency(ctx)    = floor(kv_tokens_total / ctx)
 
+PP (pipeline parallel) splits the LAYERS across ``pp`` stage groups, so
+weights shrink by another ``pp`` factor. The KV cache does not get cheaper
+per token (each token's KV lives once, on the stage owning that layer), so
+the token pool divides the full stream across the TP x PP group exactly
+once — the same rule as TP — and extra replicas beyond tp*pp multiply.
 """
 
 from __future__ import annotations
@@ -97,6 +102,7 @@ class EstimateRequest:
     gpu: GpuSpec
     gpu_count: int = 1
     tp_size: int = 1
+    pp_size: int = 1
     weight_dtype: str | None = None
     kv_dtype: str | None = None
     mem_fraction: float = 0.9
@@ -113,6 +119,7 @@ class EstimateRequest:
 
     def __post_init__(self) -> None:
         self.tp_size = min(self.tp_size, self.gpu_count)  # TP cannot exceed the GPU count
+        self.pp_size = min(self.pp_size, self.gpu_count)  # PP cannot exceed the GPU count
 
 
 @dataclass
@@ -174,18 +181,25 @@ def _expert_param_share(cfg: ModelConfig) -> float:
 def _weights_per_gpu(wbytes: float, req: EstimateRequest) -> float:
     """Per-GPU weight footprint under the parallelism split.
 
-    Pure TP shards every weight ``tp``-ways. MoE checkpoints deployed with
-    expert parallelism shard the *experts* across all GPUs while attention
-    shards by TP only — when ``req.ep_size`` divides the GPU count, experts
-    go ep-ways and the rest tp-ways (the PCAI MoE serving shape, e.g.
-    GLM-5.2 742B at TP4/EP8 on 8 GPUs).
+    Pure TP shards every weight ``tp``-ways. PP additionally stages the
+    layers across ``pp`` pipeline groups, so per-GPU weight bytes shrink by
+    another ``pp`` factor (the KV cache does NOT: every token's KV lives on
+    exactly one pipeline stage — the layer-owning rank — so the pool math
+    divides the whole-model stream across the TP x PP group exactly once,
+    same as TP). MoE checkpoints deployed with expert parallelism shard the
+    *experts* across all GPUs while attention shards by TP only — when
+    ``req.ep_size`` divides the GPU count, experts go ep-ways and the rest
+    tp-ways (the PCAI MoE serving shape, e.g. GLM-5.2 742B at TP4/PP2/EP8
+    on 8 GPUs). PP combines with TP/EP the same way it does in the engines:
+    it multiplies the stage split (weights/GPU = bytes / tp / pp).
     """
+    stage = max(1, req.tp_size * req.pp_size)
     if req.ep_size > 1 and req.ep_size <= req.gpu_count and req.cfg.is_moe:
         share = _expert_param_share(req.cfg)
         ep_bytes = wbytes * share / req.ep_size
-        dense_bytes = wbytes * (1 - share) / req.tp_size
+        dense_bytes = wbytes * (1 - share) / stage
         return ep_bytes + dense_bytes
-    return wbytes / req.tp_size
+    return wbytes / stage
 
 
 def _tp_replicated_kv(cfg: ModelConfig, tp_size: int) -> bool:
@@ -298,6 +312,15 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
     wbytes, wdetails = weight_bytes_estimate(cfg, req.weight_dtype, req.moe_runner)
     kv_bpt, kvdetails = kv_bytes_per_token(cfg, req.kv_dtype)
     warnings: list[str] = wdetails.get("notes", [])
+    if kvdetails.get("note"):
+        # family notes (e.g. the linear-attention per-sequence state pool)
+        # ride the warnings block -- they qualify the headline number
+        warnings.append(str(kvdetails["note"]))
+    if req.pp_size > 1:
+        warnings.append(
+            f"pipeline parallel PP{req.pp_size}: weights stage-split (x{req.pp_size} lighter per GPU); "
+            "the KV pool shards across the TP x PP group exactly once (each token's KV lives on its layer's stage)"
+        )
 
     spec = req.speculative
     draft_weights_bytes: float | None = None
@@ -484,6 +507,7 @@ def grid(
     moe_runner: str | None = None,
     hicache: HicacheSpec | None = None,
     ep_size: int = 1,
+    pp_size: int = 1,
 ) -> list[GridCell]:
     """Cross-product of (gpus, tp, context) -> capacity cells, ordered."""
     cells: list[GridCell] = []
@@ -508,6 +532,7 @@ def grid(
                     moe_runner=moe_runner,
                     hicache=hicache or HicacheSpec.off(),
                     ep_size=ep_size,
+                    pp_size=pp_size,
                 )
             )
             for ctx in contexts:
@@ -525,6 +550,8 @@ def resolve_dtype_weight(cfg: ModelConfig, explicit: str | None) -> str | None:
 def summary_line(res: EstimateResult) -> str:
     """One-line human verdict, e.g. ``fits: yes | KV pool: 1.42M tokens | 43 x 32k-ctx requests``."""
     name = f"{res.request.tp_size}x{res.request.gpu.name}" if res.request.tp_size > 1 else res.request.gpu.name
+    if res.request.pp_size > 1:
+        name += f" PP{res.request.pp_size}"
     if res.fits is None:
         return f"{name}: unknown weights size (dtype?) · KV/token {res.kv_bytes_per_token / 1024:.1f} KiB"
     if not res.fits:

@@ -18,7 +18,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
-  tag: v0.4.1
+  tag: v0.6.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -70,12 +70,20 @@ resources:
   limits:
     memory: 1Gi
 
-# SITE: customer clusters usually have their OWN egress path — flip to true
-# ONLY if this PCAI reaches the internet through the HPE corporate proxy.
-hpe_proxies: false
+# SITE: customer clusters usually have their OWN egress path — keep proxy: {}
+# (direct egress, nothing rendered). Fill the keys ONLY if this PCAI reaches
+# the internet through a corporate proxy:
+#
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+proxy: {}
+
+# -- PCAI feature gate --------------------------------------------------------------------------
+# Set explicitly — PCAI features no longer follow proxy config.
 pcai:
-  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+  enabled: true
 
 extraEnv: {}
 

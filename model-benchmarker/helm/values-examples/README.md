@@ -6,11 +6,14 @@ Credentials are always role-named fillers (`<BENCH_API_KEY>` style).
 
 | File | Target |
 |---|---|
-| `values.g2.yaml` | SE G2 (HPE internal cluster, HPE SSO at the gateway) |
+| `values.g2.yaml` | Proxied corporate PCAI site (placeholder addresses; HPE SSO at the gateway) |
 | `values.hosted-trial.yaml` | customer PCAI (oauth2-proxy + kyverno pre-install hook) |
 
 Both files are FULL copies of this chart's values.yaml (not override
-snippets) with site-specific lines marked `# SITE:`. See the MultimodalRAG
+snippets) with site-specific lines marked `# SITE:`. The proxy env is wired
+per-key from the top-level `proxy:` dict (`http`/`https`/`noProxy` — each key
+only when non-empty; direct egress keeps `proxy: {}`), and `pcai.enabled` is
+set explicitly (it no longer follows proxy config). See the MultimodalRAG
 chart's values-examples/README.md for the shared placeholder convention.
 
 # The one required decision: the benchmark pages' API key

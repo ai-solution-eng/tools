@@ -33,20 +33,18 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 
 {{/*
-Single-source HPE proxy detection. .Values.hpe_proxies is a boolean:
-  - true  (default): corporate proxy + no_proxy env and the httpx TLS bypass
-                     needed for the HPE Zscaler MITM proxy.
-  - false          : no proxy env vars, TLS verification intact.
+Fleet-convention helpers (SECURE defaults):
 
-It does NOT control kyverno/ezua — those are PCAI app features that are on by
-default and toggled via .Values.kyverno.enabled / .Values.ezua.enabled.
+- pcaiEnabled: .Values.pcai.enabled when explicitly set, else FALSE. PCAI
+  features (ezua/kyverno-style integration) no longer follow proxy config —
+  sites must set pcai.enabled explicitly.
+- Proxy env is wired per-key from the top-level proxy: dict (proxy.http /
+  proxy.https / proxy.noProxy) — each key is injected only when non-empty; a
+  direct-egress site leaves proxy: {} and no proxy env renders anywhere.
+  There is no proxy-detection flag anymore.
 */}}
-{{- define "model-downloader.hpeProxiesEnabled" -}}
-{{- if hasKey .Values "hpe_proxies" }}{{ .Values.hpe_proxies }}{{ else }}true{{ end -}}
-{{- end -}}
-
 {{- define "model-downloader.pcaiEnabled" -}}
-{{- if and .Values.pcai (hasKey .Values.pcai "enabled") }}{{ .Values.pcai.enabled }}{{ else }}{{ include "model-downloader.hpeProxiesEnabled" . }}{{ end -}}
+{{- if and .Values.pcai (hasKey .Values.pcai "enabled") }}{{ .Values.pcai.enabled }}{{ else }}false{{ end -}}
 {{- end -}}
 
 {{- define "model-downloader.kyvernoEnabled" -}}
@@ -58,19 +56,20 @@ default and toggled via .Values.kyverno.enabled / .Values.ezua.enabled.
 {{- end -}}
 
 {{/*
-True when the downloader should patch httpx to skip TLS verification (HPE Zscaler
-MITM with untrusted certs). Can be disabled via .Values.downloader.hf.verifyTls.
+True when the downloader should patch httpx to skip TLS verification. SECURE
+default: verify ON (false) — TLS verification is bypassed only with an
+explicit downloader.hf.verifyTls: false, which a site should set false ONLY
+behind a corporate MITM proxy with an untrusted cert.
 */}}
 {{- define "model-downloader.skipTlsVerification" -}}
-{{- if and .Values.downloader.hf (hasKey .Values.downloader.hf "verifyTls") }}{{ not .Values.downloader.hf.verifyTls }}{{ else }}{{ include "model-downloader.hpeProxiesEnabled" . }}{{ end -}}
+{{- if and .Values.downloader.hf (hasKey .Values.downloader.hf "verifyTls") }}{{ not .Values.downloader.hf.verifyTls }}{{ else }}false{{ end -}}
 {{- end -}}
 
 {{/*
 TLS verification for the app pod's catalog refresh-from-GitHub fetch.
-Default: same rule as the downloader (skip verification when hpe_proxies is
-on — the Zscaler MITM presents an untrusted cert). Override explicitly with
-catalog.githubVerifyTls (boolean) — true verifies, false bypasses.
+SECURE default: true (verify) when catalog.githubVerifyTls is unset. Set
+false ONLY behind a corporate MITM proxy with an untrusted cert.
 */}}
 {{- define "model-downloader.catalogGithubVerifyTls" -}}
-{{- if and .Values.catalog (hasKey .Values.catalog "githubVerifyTls") }}{{ .Values.catalog.githubVerifyTls }}{{ else }}{{ not (eq (include "model-downloader.skipTlsVerification" .) "true") }}{{ end -}}
+{{- if and .Values.catalog (hasKey .Values.catalog "githubVerifyTls") }}{{ .Values.catalog.githubVerifyTls }}{{ else }}true{{ end -}}
 {{- end -}}
