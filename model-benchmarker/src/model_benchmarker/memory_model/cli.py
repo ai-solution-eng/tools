@@ -150,6 +150,9 @@ def _args_from_catalog(entry: dict, args: argparse.Namespace) -> None:
     if args.tp is None:
         tp = opt("--tp-size")
         args.tp = int(tp) if tp and tp.isdigit() else args.gpu_count
+    if args.pp is None:
+        pp = opt("--pp-size")
+        args.pp = int(pp) if pp and pp.isdigit() else 1
     if args.kv_dtype is None:
         args.kv_dtype = opt("--kv-cache-dtype")
     if args.mem_fraction is None:
@@ -213,6 +216,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
 
     gpus = args.gpu_count if args.gpu_count is not None else 1
     tp = args.tp if args.tp is not None else gpus
+    pp = args.pp if args.pp is not None else 1
     kv_dtype = args.kv_dtype
     mem_fraction = args.mem_fraction if args.mem_fraction is not None else 0.9
     contexts = sorted({int(c) for c in (args.context or DEFAULT_CONTEXTS)})
@@ -221,6 +225,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
         _args_from_catalog(entry, args)
         gpus = args.gpu_count or gpus
         tp = args.tp or tp
+        pp = args.pp or pp
         kv_dtype = args.kv_dtype
         mem_fraction = args.mem_fraction if args.mem_fraction is not None else mem_fraction
         if not args.gpu:
@@ -243,6 +248,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
         gpu=gpu,
         gpu_count=gpus,
         tp_size=tp,
+        pp_size=pp,
         weight_dtype=weight_dtype,
         kv_dtype=kv_dtype,
         mem_fraction=mem_fraction,
@@ -268,7 +274,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
         ("attention", str(kvd.get("arch", "?"))),
         ("kv formula", str(kvd.get("formula", "?"))),
         ("kv per token", f"{res.kv_bytes_per_token / 1024:.1f} KiB @ {dtype_label(kv_dtype)}"),
-        ("kv per layer", f"{kvd.get('per_layer_bytes', 0) / 1024:.1f} KiB"),
+        ("kv per layer", f"{kvd.get('per_layer_bytes', 0) / 1024:.1f} KiB (whole-model stream)"),
         ("layers", str(kvd.get("layer_mix").label()) if kvd.get("layer_mix") else "?"),
         ("config source", source),
     ]
@@ -294,6 +300,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
                     gpu=gpu,
                     gpu_count=g,
                     tp_size=t,
+                    pp_size=pp,
                     weight_dtype=weight_dtype,
                     kv_dtype=kv_dtype,
                     mem_fraction=mem_fraction,
@@ -307,7 +314,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
             warnings.extend(w for w in r.warnings if w not in warnings)
             scenarios.append(
                 {
-                    "label": f"{gpu.name} x{g} TP{t}",
+                    "label": f"{gpu.name} x{g} TP{t}" + (f" PP{pp}" if pp > 1 else ""),
                     "verdict": summary_line(r),
                     "fits": r.fits,
                     "kv_tokens": r.kv_tokens_total,
@@ -340,7 +347,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
         "config": [
             ("tool", "memory-estimate"),
             ("model", args.model),
-            ("gpu", f"{gpu.name} x{gpus} (TP{tp})"),
+            ("gpu", f"{gpu.name} x{gpus} (TP{tp}" + (f", PP{pp}" if pp > 1 else "") + ")"),
             ("weight dtype", dtype_label(weight_dtype) or "?"),
             ("kv dtype", kv_label_str),
             ("mem fraction", f"{mem_fraction:g}"),
@@ -372,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gpu-vram", type=float, help="override VRAM in GiB (unknown GPUs)")
     ap.add_argument("--gpus", dest="gpu_count", type=int, help="number of GPUs (default 1)")
     ap.add_argument("--tp", type=int, help="tensor-parallel size (default: all GPUs)")
+    ap.add_argument("--pp", type=int, help="pipeline-parallel size (default 1; weights stage-split x PP, "
+                                            "KV pool unchanged — the GLM-5.2 TP4/PP2 shape)")
     ap.add_argument("--weight-dtype", help="weights dtype (default: from quantization_config/torch_dtype)")
     ap.add_argument("--kv-dtype", help="KV cache dtype (fp16/bf16 default; fp8_e4m3 etc.)")
     ap.add_argument("--mem-fraction", type=float, help="engine mem-fraction-static (default 0.9)")

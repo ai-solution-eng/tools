@@ -17,6 +17,7 @@ read-only by construction — there is no write path here.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +31,49 @@ RESULTS_DIR_ENV = "BENCH_RESULTS_DIR"
 def results_root() -> Path | None:
     """The committed results/ tree: BENCH_RESULTS_DIR override, else the
     repo-root results/ beside the package (dev tree). None when absent --
-    deployed images carry no results/ tree and the page hides the section.
-    An EXPLICIT override that does not exist disables the library (the
-    operator turned it off; falling back to the image's copy would ignore
-    them)."""
+    the page hides the section. An EXPLICIT override that does not exist
+    disables the library (the operator turned it off; falling back to the
+    image's copy would ignore them)."""
     env = (os.environ.get(RESULTS_DIR_ENV) or "").strip()
     if env:
         p = Path(env)
         return p if p.is_dir() else None
     c = Path(__file__).resolve().parents[3] / "results"
     return c if c.is_dir() else None
+
+
+# The image seeds BENCH_RESULTS_DIR with the committed tree on startup: the
+# first launch copies /app/results into the PVC work dir (persisted, survives
+# upgrades) when the PVC copy does not exist yet. Later upgrades do NOT
+# overwrite the PVC copy — publishing is kubectl cp (or a reseed below).
+SEED_DIR_ENV = "BENCH_SEED_RESULTS_DIR"
+
+
+def seed_results_into_workdir(work_dir: Path) -> Path | None:
+    """Copy the image's committed results/ tree into <work_dir>/results on
+    first launch (no-op when that directory already exists — the PVC copy is
+    then authoritative and survives image upgrades). Idempotent, cheap
+    (~100 KB). Returns the effective library root, or None when there is
+    nothing to seed and no override.
+
+    The dev-tree fallback (repo-root results/ beside the package) is
+    deliberately NOT a seed source: seeding only happens when the deployment
+    carries an explicit BENCH_SEED_RESULTS_DIR (the Dockerfile sets it), so
+    a dev checkout never scatters copies into work dirs."""
+    target = work_dir / "results"
+    if target.is_dir():
+        return target
+    seed = os.environ.get(SEED_DIR_ENV) or ""
+    if not seed:
+        return None
+    seed_path = Path(seed)
+    if seed_path.is_dir() and any(seed_path.iterdir()):
+        try:
+            shutil.copytree(seed_path, target, ignore=shutil.ignore_patterns("*.html"))
+            return target
+        except OSError:
+            return seed_path  # read-only work dir: fall back to the image copy
+    return None
 
 
 def _setup_label(meta: dict[str, Any]) -> str:

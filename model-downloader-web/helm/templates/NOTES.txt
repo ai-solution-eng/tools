@@ -1,6 +1,6 @@
 HF Model Downloader installed in namespace "{{ .Release.Namespace }}".
 
-HPE proxy env:  {{ include "model-downloader.pcaiEnabled" . }}
+Proxy env (per-key):  {{ if .Values.proxy }}WIRED{{ else }}NOT CONFIGURED (proxy: {}){{ end }}
 Kyverno policy: {{ include "model-downloader.kyvernoEnabled" . }}
 Ezua ingress:   {{ include "model-downloader.ezuaEnabled" . }}
 Storage:        {{ .Values.storage.backend }} (default: {{ .Values.storage.default }})
@@ -12,15 +12,15 @@ Port-forward to use the UI:
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "model-downloader.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
   open http://localhost:{{ .Values.service.port }}
 
-{{- if eq (include "model-downloader.pcaiEnabled" .) "true" }}
-PCAI proxy env vars on downloader Jobs: ENABLED
+{{- if .Values.proxy }}
+Proxy env vars on downloader Jobs / debug pods / the app pod: WIRED
 {{- else }}
-PCAI proxy env vars on downloader Jobs: DISABLED
+Proxy env vars on downloader Jobs / debug pods / the app pod: NOT CONFIGURED
 {{- end }}
 
 The downloader Job manifest is rendered from a ConfigMap
 ({{ include "model-downloader.fullname" . }}-job-template). To change the Job
-definition, edit .Values.downloader.* / .Values.pcai.* / .Values.s3.* and
+definition, edit .Values.downloader.* / .Values.proxy / .Values.s3.* and
 re-run helm upgrade.
 
 NOTE: queue state is in-process memory. If the app pod restarts, queued/running

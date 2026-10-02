@@ -1,11 +1,13 @@
 # =============================================================================
-# ModelBenchmarker -- SE G2 deployment values (sanitized) -- single-replica.
+# ModelBenchmarker -- proxied corporate PCAI site values (sanitized,
+# placeholder addresses) -- single-replica.
 #
-# SE G2: the ezaf-gateway applies HPE SSO centrally, so the chart does not
-# create its own AuthorizationPolicy, and the web-app API key still gates the
-# benchmark pages (belt-and-suspenders: the key also gates non-SSO access).
+# The ezaf-gateway applies HPE SSO centrally at sites like this, so the chart
+# does not create its own AuthorizationPolicy, and the web-app API key still
+# gates the benchmark pages (belt-and-suspenders: the key also gates non-SSO
+# access).
 #
-# Sanitized G2 deployment: real (non-secret) serving URLs are examples; ALL
+# Sanitized deployment: all serving URLs are placeholder-addressed; ALL
 # credentials are fillers. This folder is hardlinked to the public delivery
 # repo -- never put real credentials here. Real per-site values live in
 # helm/local/ (gitignored + hardlink-ignored + never packaged).
@@ -22,7 +24,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
-  tag: v0.4.1
+  tag: v0.4.5
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -34,22 +36,23 @@ imagePullSecrets: []
 # endpoint origin at a time (a second run against a busy origin is refused).
 bench:
   suggestions:
-    # Chat models (SE-G2 shared serving endpoints, MLIS) — kind: chat
+    # Chat models (shared serving endpoints, MLIS) — kind: chat
+    # PLACEHOLDER addresses — substitute the site's real serving URLs.
     - name: qwen-38-27b (chat)
-      url: https://qwen-38-27b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      url: https://qwen-38-27b.project-user-<USERNAME>.serving.<cluster-domain>
       kind: chat
     - name: glm-53-flash (chat)
-      url: https://glm-53-flash.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      url: https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>
       kind: chat
     # Retrieval / RAG pipeline endpoints — kind: endpoint
     - name: qwen3-vl-embedding-8b
-      url: https://qwen3-vl-embedding-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      url: https://qwen3-vl-embedding-8b.project-user-<USERNAME>.serving.<cluster-domain>
       kind: endpoint
     - name: qwen3-vl-reranker-8b
-      url: https://qwen3-vl-reranker-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      url: https://qwen3-vl-reranker-8b.project-user-<USERNAME>.serving.<cluster-domain>
       kind: endpoint
     - name: cohere-transcribe
-      url: https://cohere-transcribe-03-2026.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+      url: https://cohere-transcribe-03-2026.project-user-<USERNAME>.serving.<cluster-domain>
       kind: any
     # MCP fleet servers (in-cluster addresses, as registered in the gateway —
     # in-cluster preferred over the public serving URLs; each needs the fleet
@@ -87,8 +90,8 @@ bench:
   # server URL you benchmark. Chat models take their platform JWTs. This block
   # is KEY MATERIAL: fillers only in this file (real values live in helm/local/).
   endpointApiKeys:
-    "https://qwen-38-27b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net": "<QWEN_API_KEY>"
-    "https://glm-53-flash.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net": "<GLM_API_KEY>"
+    "https://qwen-38-27b.project-user-<USERNAME>.serving.<cluster-domain>": "<QWEN_API_KEY>"
+    "https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>": "<GLM_API_KEY>"
     "http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp": "<MCP_FLEET_KEY>"
 
 # -- Run storage --------------------------------------------------------------
@@ -97,7 +100,7 @@ persistence:
   mountPath: /data
   # SITE: size to your artifact volume
   size: 10Gi
-  # SITE: RWX class on G2 enables replicaCount > 1
+  # SITE: RWX class (if the site has one) enables replicaCount > 1
   storageClass: gl4f-filesystem
   accessModes:
     - ReadWriteMany
@@ -125,18 +128,25 @@ resources:
   limits:
     memory: 1Gi
 
-# HPE corporate proxy — ON for G2 (hpeproxy.its.hpecorp.net). The estimator's
-# huggingface.co config fetches traverse it; in-cluster targets stay in noProxy.
-hpe_proxies: true
+# Corporate egress proxy — proxied corporate site: the estimator's
+# huggingface.co config fetches traverse it; in-cluster targets stay in
+# noProxy. Addresses are PLACEHOLDERS — substitute the site's real values.
+proxy:
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost
+
+# -- PCAI feature gate --------------------------------------------------------------------------
+# Set explicitly — PCAI features no longer follow proxy config.
 pcai:
-  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost
+  enabled: true
 
 extraEnv: {}
 
 # -- Vendor labels / Kyverno -------------------------------------------------------------
-# G2 needs no Kyverno stamping: the vendor labels are rendered statically on
-# the Deployment/Service (that is what makes the EZUA card "Ready").
+# This site needs no Kyverno stamping: the vendor labels are rendered
+# statically on the Deployment/Service (that is what makes the EZUA card
+# "Ready").
 kyverno:
   enabled: false
 
@@ -144,13 +154,13 @@ kyverno:
 ezua:
   enabled: true
   virtualService:
-    # SITE: SE-G2 cluster domain (literal)
-    endpoint: model-benchmarker.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    # SITE: the cluster's literal EZUA domain (e.g. model-benchmarker.<cluster-domain>)
+    endpoint: model-benchmarker.<cluster-domain>
     istioGateway: istio-system/ezaf-gateway
     timeout: 60s
     longTimeout: 7200s
   authorizationPolicy:
-    # false on SE G2 -- HPE SSO is applied centrally at the ezaf-gateway.
+    # false at this site -- HPE SSO is applied centrally at the ezaf-gateway.
     enabled: false
     namespace: istio-system
     providerName: oauth2-proxy

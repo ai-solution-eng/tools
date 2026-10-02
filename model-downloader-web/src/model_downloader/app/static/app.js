@@ -32,6 +32,10 @@ chatTemplateCheckbox.addEventListener('change', syncTemplateFields);
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = Object.fromEntries(new FormData(form));
+  // HuggingFace repo ids never contain whitespace; a paste from prose or a
+  // trailing autofill space otherwise reaches the server intact and comes back
+  // as "model_name must be 'org/Repo-Name'". Strip all whitespace up front.
+  if (body.model_name) body.model_name = body.model_name.replace(/\s+/g, '');
   // Never send s3_path unless S3 is the selected backend: on PVC-only
   // deployments the S3-destination input stays in the DOM (hidden) and would
   // otherwise be submitted with its template prefill ("s3:///"), which the
@@ -330,7 +334,9 @@ document.addEventListener('click', (e) => {
 function applyUrlPreset() {
   const preset = new URLSearchParams(window.location.search).get('model');
   if (!preset) return;
-  const id = decodeURIComponent(preset);
+  // URL presets arrive from shared links; %20-encoded spaces (or stray
+  // whitespace around the id) must not flow into a submission.
+  const id = decodeURIComponent(preset).replace(/\s+/g, '');
   modelInput.value = id;
   const m = knownModels.find(x => extractModelId(x) === id);
   if (m && m.chat_template_path) applyTemplate(m.chat_template_path);

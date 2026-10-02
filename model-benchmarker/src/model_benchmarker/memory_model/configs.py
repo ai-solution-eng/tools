@@ -61,11 +61,16 @@ class ModelConfig:
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
-    # sparse attention (DeepSeek-V4 CSA/HCA, GLM DSA)
+    # sparse attention (DeepSeek-V4 CSA/HCA, GLM DSA, Qwen lightning indexer)
     index_topk: int | None = None
     compress_rates: dict | None = None
     index_n_heads: int | None = None
     index_head_dim: int | None = None
+    # lightning indexer (Qwen3-Next / qwen4_exp families): a small compressed
+    # key stream kept alongside the GQA KV for token selection
+    indexer_head_dim: int | None = None
+    indexer_n_heads: int | None = None
+    indexer_kv_heads: int | None = None
 
     # linear attention (Qwen3-Next gated deltanet and friends)
     linear_key_head_dim: int | None = None
@@ -146,6 +151,16 @@ def config_from_dict(d: dict) -> ModelConfig:
     quant_bits = quant.get("bits") if isinstance(quant, dict) else None
     if quant_method and not quant_bits:
         quant_bits = {"fp8": 8, "nvfp4": 4, "gptq": 4, "awq": 4, "compressed-tensors": 8}.get(str(quant_method).lower())
+    # modelopt (NVIDIA TensorRT-LLM / ModelOpt checkpoint format): quant_method
+    # is the literal "modelopt" and the real width lives in config_groups'
+    # weights.num_bits (4 = NVFP4). Store a synthetic "modelopt4"/"modelopt8"
+    # method the weight-dtype table can map.
+    if str(quant_method).lower() == "modelopt" and isinstance(quant.get("config_groups"), dict):
+        for _g in quant["config_groups"].values():
+            if isinstance(_g, dict) and _g.get("weights", {}).get("num_bits") in (4, 8):
+                quant_method = f"modelopt{_g['weights']['num_bits']}"
+                quant_bits = int(_g["weights"]["num_bits"])
+                break
 
     cfg = ModelConfig(
         model_type=str(d.get("model_type") or ""),
@@ -169,6 +184,9 @@ def config_from_dict(d: dict) -> ModelConfig:
         compress_rates=d.get("compress_rates") if isinstance(d.get("compress_rates"), dict) else None,
         index_n_heads=_first("index_n_heads"),
         index_head_dim=_first("index_head_dim"),
+        indexer_head_dim=_first("indexer_head_dim"),
+        indexer_n_heads=_first("indexer_n_heads"),
+        indexer_kv_heads=_first("indexer_kv_heads"),
         linear_key_head_dim=_first("linear_key_head_dim"),
         linear_value_head_dim=_first("linear_value_head_dim"),
         linear_num_key_heads=_first("linear_num_key_heads"),
@@ -184,7 +202,9 @@ def config_from_dict(d: dict) -> ModelConfig:
         mlp_only_layers=d.get("mlp_only_layers") if isinstance(d.get("mlp_only_layers"), list) else None,
         mlp_layer_types=d.get("mlp_layer_types") if isinstance(d.get("mlp_layer_types"), list) else None,
         num_local_experts=_first("num_local_experts"),
-        num_nextn_predict_layers=_first("num_nextn_predict_layers"),
+        num_nextn_predict_layers=_first(
+            "num_nextn_predict_layers", "mtp_num_hidden_layers"
+        ),  # qwen4_exp names the built-in MTP module mtp_num_hidden_layers
         quant_method=str(quant_method) if quant_method else None,
         quant_bits=quant_bits,
         raw=dict(d),
@@ -210,8 +230,12 @@ def load_config_json(model_ref: str | os.PathLike) -> tuple[ModelConfig, str]:
     """Load config.json for a local dir / HF repo id. Returns (config, source).
 
     Resolution order: directory containing config.json -> HF cache
-    (~/.cache/huggingface) -> huggingface_hub download (if importable).
-    Raises FileNotFoundError with a self-describing message otherwise.
+    (~/.cache/huggingface) -> plain HTTPS fetch of the repo's config.json
+    (stdlib, always available -- a config.json is a ~2-50 KB JSON file and
+    the resolve endpoint redirects to the CDN) -> huggingface_hub download
+    (if importable; the proper path when HF_TOKEN auth or a proxy is
+    needed). Raises FileNotFoundError with a self-describing message
+    otherwise.
     """
     ref = str(model_ref).strip()
     p = Path(ref).expanduser()
@@ -223,7 +247,7 @@ def load_config_json(model_ref: str | os.PathLike) -> tuple[ModelConfig, str]:
         candidates += [Path(c) for c in _mirror_candidates(ref) if Path(c).is_file()]
     if not p.is_file() and "/" in ref:
         # HF repo id: check the local cache first, then try the hub.
-        hub = Path.home() / ".cache" / "huggingface" / "hub"
+        hub = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))) / "hub"
         safe = "models--" + ref.replace("/", "--")
         candidates += sorted((hub / safe / "snapshots").glob("*/config.json"))
     for cand in candidates:
@@ -233,9 +257,15 @@ def load_config_json(model_ref: str | os.PathLike) -> tuple[ModelConfig, str]:
             except (OSError, ValueError) as e:
                 raise ValueError(f"cannot parse {cand}: {e}") from e
             return config_from_dict(data), str(cand)
-    # last resort: let huggingface_hub fetch it (if installed and online)
+    # network fetches (repo ids only). First a plain stdlib HTTPS GET of the
+    # resolve endpoint -- zero dependencies, works in the slim serving image
+    # where huggingface_hub is not installed; then the hub library (proper
+    # auth/proxy handling) when importable.
     last_hub_error = ""
     if "/" in ref and not ref.startswith((".", "/", "~")):
+        data, url, fetch_err = _https_fetch_config(ref)
+        if data is not None:
+            return config_from_dict(data), url
         try:
             from huggingface_hub import hf_hub_download
         except ImportError:
@@ -250,8 +280,84 @@ def load_config_json(model_ref: str | os.PathLike) -> tuple[ModelConfig, str]:
     raise FileNotFoundError(
         f"config.json not found for {ref!r}: pass a local model directory "
         "(containing config.json), an HF repo id, or --structure overrides"
+        + (f" [https fetch: {fetch_err}]" if "/" in ref and not ref.startswith((".", "/", "~")) else "")
         + (last_hub_error if last_hub_error else "")
     )
+
+
+_HF_RESOLVE_URL = "/{repo}/resolve/main/config.json"
+
+
+def _ca_bundle_candidates() -> list[str]:
+    """Trust-store paths to try, most-authoritative first: the operator's
+    explicit env (REQUESTS_CA_BUNDLE / SSL_CERT_FILE — the standard way to
+    inject a corporate TLS-intercept root), then certifi's bundle when the
+    package ships (a Python whose default verify paths are stale — the
+    conda/python3.14 pattern — still verifies correctly through certifi)."""
+    out: list[str] = []
+    for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        v = os.environ.get(var)
+        if v and Path(v).is_file():
+            out.append(v)
+    try:
+        import certifi
+
+        out.append(certifi.where())
+    except ImportError:
+        pass
+    return out
+
+
+def _https_fetch_config(repo_id: str, timeout: float = 15.0) -> tuple[dict | None, str, str]:
+    """Stdlib HTTPS GET of a repo's config.json (no huggingface_hub needed).
+
+    Trust ladder: default verify paths -> REQUESTS_CA_BUNDLE/SSL_CERT_FILE ->
+    certifi -> (last resort, config.json is a public, non-sensitive JSON
+    document and no token is ever sent on this path) unverified TLS with an
+    explicit marker in the returned source so the artifact stays honest.
+    Returns (data_dict | None, source_url, error). Honors HF_ENDPOINT for
+    mirror deployments and HF_TOKEN / HUGGING_FACE_HUB_TOKEN for gated repos.
+    """
+    base = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+    if not base.startswith("https://"):
+        return None, "", "HF_ENDPOINT must be an https:// URL"
+    url = base + _HF_RESOLVE_URL.format(repo=repo_id)
+    try:
+        import ssl
+        import urllib.request
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+        headers = {"User-Agent": "model-benchmarker/0.4"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        attempts: list[tuple[str, ssl.SSLContext | None]] = [("system default", None)]
+        for ca in _ca_bundle_candidates():
+            bundle_ctx = ssl.create_default_context(cafile=ca)
+            attempts.append((f"CA bundle {ca}", bundle_ctx))
+        # last resort: public metadata, no credentials on the wire, marked
+        attempts.append(("unverified TLS (no CA bundle verified the chain)", ssl._create_unverified_context()))
+
+        last_err = ""
+        for label, attempt_ctx in attempts:
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(
+                    req, timeout=timeout, context=attempt_ctx
+                ) as resp:  # https pinned by the guard above
+                    charset = resp.headers.get_content_charset() or "utf-8"
+                    payload = resp.read().decode(charset, errors="replace")
+                data = json.loads(payload)
+            except Exception as exc:
+                last_err = f"{type(exc).__name__}: {exc}"[:200]
+                continue  # next trust rung
+            if isinstance(data, dict):
+                verified = label.startswith(("system", "CA"))
+                return data, url if verified else url + " (unverified TLS)", ""
+            return None, url, "not a JSON object"
+        return None, url, last_err or "fetch failed"
+    except Exception as exc:  # env/guard errors surface in the final message
+        return None, url, f"{type(exc).__name__}: {exc}"[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +541,8 @@ def unmodeled_structural_fields(cfg: ModelConfig, details: dict) -> list[str]:
         ("index_head_dim", "sparse-index key stream"),
         ("index_topk", "sparse top-k selection"),
         ("kv_lora_rank", "MLA compressed latent"),
+        ("indexer_head_dim", "lightning-indexer key stream"),
+        ("indexer_budget", "lightning-indexer selection budget"),
         ("linear_key_head_dim", "linear-attention state"),
         ("dspark_block_size", "DSPARK speculative state"),
     ):
@@ -451,6 +559,17 @@ def _linear_state_bytes_per_seq(cfg: ModelConfig, bytes_per_elem: float) -> floa
     if not (khd and vhd and vh):
         return 0.0
     return vh * vhd * khd * bytes_per_elem
+
+
+def _ssm_bytes_per_elem(cfg: ModelConfig) -> float:
+    """Bytes per element of the linear-attention recurrent state: the
+    config's mamba_ssm_dtype when present (qwen4_exp ships float32), else
+    the KV dtype guess (2 B)."""
+    raw = cfg.raw.get("text_config", cfg.raw)
+    ssm = str(raw.get("mamba_ssm_dtype") or "").lower()
+    return {"float32": 4.0, "fp32": 4.0, "bfloat16": 2.0, "bf16": 2.0, "float16": 2.0, "fp16": 2.0, "float8": 1.0}.get(
+        ssm, 2.0
+    )
 
 
 def kv_bytes_per_token(cfg: ModelConfig, kv_dtype: str | None) -> tuple[float, dict]:
@@ -479,6 +598,21 @@ def kv_bytes_per_token(cfg: ModelConfig, kv_dtype: str | None) -> tuple[float, d
             layer_mix=mix,
             _consumed_fields={"kv_lora_rank", "qk_rope_head_dim"},
         )
+        if "dsa" in mt and cfg.index_head_dim:
+            # GLM DSA (glm_moe_dsa): the sparse selector keeps its own small
+            # index-K stream per FULL layer alongside the latent. Priced per
+            # the GLM-5 family paper: the selection reads the index keys
+            # compressed at the DSA token-granularity, one index_head_dim
+            # entry per token per layer (the index_*_heads count projection
+            # heads, not stored streams). Only makes the estimate MORE
+            # conservative; engines reading less make real capacity better.
+            idx = cfg.index_head_dim * bpe
+            per_layer += idx
+            details["per_layer_bytes"] = per_layer
+            details["indexer_bytes_per_layer"] = idx
+            details["formula"] += f" + DSA index {cfg.index_head_dim} x {bpe:g} B"
+            details["arch"] += " + index-K stream"
+            details["_consumed_fields"] |= {"index_head_dim", "index_n_heads", "index_topk"}
         return per_layer * mix.kv_layers, details
 
     # --- shared-KV MQA + compressed sparse attention ------------------------
@@ -522,6 +656,39 @@ def kv_bytes_per_token(cfg: ModelConfig, kv_dtype: str | None) -> tuple[float, d
         layer_mix=mix,
         _consumed_fields={"sliding_window", "layer_types"},
     )
+    if mix.linear:
+        # linear-attention layers carry NO per-token KV, but each keeps a
+        # recurrent state PER SEQUENCE per layer (SGLang's mamba/KDA pool —
+        # a separate concurrency ceiling, not part of the per-token figure).
+        state = _linear_state_bytes_per_seq(cfg, _ssm_bytes_per_elem(cfg))
+        details["_consumed_fields"] |= {
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        }
+        if state:
+            details["linear_state_bytes_per_seq"] = state
+            details["note"] = (
+                f"linear-attention layers: ~{state * mix.linear / 1024**2:.0f} MiB recurrent state per "
+                "concurrent sequence (all linear layers; SGLang mamba/KDA pool — a separate "
+                "concurrency ceiling on top of the KV pool, not priced per token)"
+            )
+    if cfg.indexer_head_dim and mix.full:
+        # lightning indexer (Qwen3-Next / qwen4_exp): full-attention layers
+        # keep ONE small compressed key stream per token for token selection
+        # (fp8-quantizable; priced at the KV dtype — conservative). The
+        # indexer_*_heads count projection heads, not stored streams.
+        idx = cfg.indexer_head_dim * bpe
+        per_layer_full = per_layer + idx
+        details["indexer_bytes_per_layer"] = idx
+        details["per_layer_bytes"] = per_layer_full
+        details["formula"] += f" + indexer K {cfg.indexer_head_dim} x {bpe:g} B (full layers)"
+        details["arch"] += " + lightning indexer"
+        details["_consumed_fields"] |= {"indexer_head_dim", "indexer_n_heads", "indexer_kv_heads", "indexer_budget"}
+        if mix.sliding:
+            return per_layer_full * mix.full + per_layer * mix.sliding, details
+        return per_layer_full * mix.full, details
     if mix.sliding:
         details["note"] = (
             "sliding-window layers are budgeted at full per-token cost "
@@ -673,7 +840,7 @@ def default_weight_dtype(cfg: ModelConfig) -> str | None:
     """Weights dtype guess: quantization_config first, else torch_dtype."""
     if cfg.quant_method:
         q = normalize_dtype(cfg.quant_method)
-        if q in ("fp8", "nvfp4", "fp4", "int4", "gptq", "awq", "int8"):
+        if q in ("fp8", "nvfp4", "fp4", "int4", "gptq", "awq", "int8", "modelopt4", "modelopt8"):
             return q
     td = cfg.raw.get("torch_dtype") or cfg.raw.get("dtype")
     return normalize_dtype(str(td)) if td else None

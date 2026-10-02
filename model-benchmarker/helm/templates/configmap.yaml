@@ -19,15 +19,19 @@ data:
   {{ $key }}: {{ $val | quote }}
   {{- end }}
 
-{{- /* HPE corporate proxy env (ModelDownloader convention): rendered ONLY when
-   pcaiEnabled — hpe_proxies: false (or pcai.enabled: false) renders nothing.
-   NO_PROXY pre-seeds the in-cluster ranges so benchmark traffic never
-   traverses the proxy. */ -}}
-{{- if eq (include "model-benchmarker.pcaiEnabled" .) "true" }}
-  no_proxy: {{ .Values.pcai.noProxy | quote }}
-  NO_PROXY: {{ .Values.pcai.noProxy | quote }}
-  https_proxy: {{ .Values.pcai.httpsProxy | quote }}
-  HTTPS_PROXY: {{ .Values.pcai.httpsProxy | quote }}
-  http_proxy: {{ .Values.pcai.httpsProxy | quote }}
-  HTTP_PROXY: {{ .Values.pcai.httpsProxy | quote }}
+{{- /* Corporate egress proxy env (ModelDownloader convention): wired per-key
+   from the top-level proxy: dict — each key renders only when non-empty;
+   proxy: {} (direct egress) renders nothing. NO_PROXY pre-seeds the
+   in-cluster ranges so benchmark traffic never traverses the proxy. */ -}}
+{{- with .Values.proxy }}
+{{- with .noProxy }}
+  no_proxy: {{ . | quote }}
+  NO_PROXY: {{ . | quote }}
+{{- end }}
+{{- with .https }}
+  https_proxy: {{ . | quote }}
+  HTTPS_PROXY: {{ . | quote }}
+  http_proxy: {{ . | quote }}
+  HTTP_PROXY: {{ . | quote }}
+{{- end }}
 {{- end }}

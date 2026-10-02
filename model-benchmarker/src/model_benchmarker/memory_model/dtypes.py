@@ -36,6 +36,11 @@ _WEIGHT_DTYPE_BYTES: dict[str, float] = {
     "int4": 0.5,
     "awq": 0.5,
     "gptq": 0.5,  # 4-bit weight quant families
+    # modelopt (NVIDIA ModelOpt/TensorRT-LLM checkpoints): the width is
+    # resolved from quantization_config.config_groups -> synthetic
+    # modelopt4/modelopt8 names (see configs.config_from_dict)
+    "modelopt4": 0.5,
+    "modelopt8": 1.0,
 }
 
 # bytes per element for KV-cache dtypes
@@ -88,4 +93,6 @@ def dtype_label(dtype: str | None) -> str:
     d = normalize_dtype(dtype)
     if not d:
         return "?"
-    return {"fp8_e4m3": "FP8 (e4m3)", "fp8_e5m2": "FP8 (e5m2)", "fp8": "FP8"}.get(d, d.upper())
+    return {"fp8_e4m3": "FP8 (e4m3)", "fp8_e5m2": "FP8 (e5m2)", "fp8": "FP8", "modelopt4": "NVFP4 (modelopt)", "modelopt8": "FP8 (modelopt)"}.get(
+        d, d.upper()
+    )

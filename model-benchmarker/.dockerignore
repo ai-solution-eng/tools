@@ -28,8 +28,11 @@ __pycache__
 .ruff_cache
 .pytest_cache
 
-# Not part of the image: results artifacts, deployment + dev trees
-results/
+# Results ARTIFACTS ship (the curated committed tree is the /results page's
+# library baseline — see docker/Dockerfile BENCH_RESULTS_DIR). Only the
+# generated HTML reports and runtime junk stay out: they're rebuilt, and the
+# deepseek-*.md note files are dev scratch.
+results/*.html
 helm*
 documentation/
 tests/

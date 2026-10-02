@@ -7,9 +7,10 @@ safe to publish:
 
 - **No secrets.** Credentials are role-named placeholders (`<MINIO_ACCESS_KEY>`,
   `<MINIO_PASSWORD>`); usernames/namespaces are `<USERNAME>`,
-  `project-user-<USERNAME>`. Site endpoints and
-  domains (e.g. `hpeproxy.its.hpecorp.net`, the SE G2 cluster domain) are kept
-  because they are not secrets.
+  `project-user-<USERNAME>`. Site endpoints/domains and internal hostnames are
+  NOT published here — the proxy targets are placeholders
+  (`proxy.corp.example`), and the proxied-corporate-site example describes a
+  generic corporate egress proxy, not a named HPE cluster.
 - **Real per-site values live in `helm/local/`** (repo-only: gitignored via
   `helm*/local/*`, hardlink-ignored via `helm*/local`, never packaged via
   `helm/.helmignore`). See `helm/local/README.md` in the source repo for that
@@ -27,13 +28,13 @@ values.
 
 | File | Target | Highlights |
 |---|---|---|
-| [`values.g2.yaml`](values.g2.yaml) | HPE internal SE G2 PCAI cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`) | `hpe_proxies: true` (corporate proxy + Zscaler TLS bypass), PVC + MinIO (`mlis-models` bucket), `project-user-*` namespaces. |
-| [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | Customer-hosted PCAI (hosted trial) | `${DOMAIN_NAME}` placeholders for EZUA ingress, `hpe_proxies: false`, storage backend choice, Kyverno gate called out in the header. |
+| [`values.g2.yaml`](values.g2.yaml) | Proxied corporate PCAI site (placeholder addresses) | `proxy:` dict wired (corporate egress proxy + `noProxy`), PVC + MinIO (`mlis-models` bucket), `project-user-*` namespaces, `downloader.hf.verifyTls: false` (MITM proxy with an untrusted cert — secure default is verify-on), `pcai.enabled: true` explicit. |
+| [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | Customer-hosted PCAI (hosted trial) | `${DOMAIN_NAME}` placeholders for EZUA ingress, direct egress (`proxy: {}`), storage backend choice, Kyverno gate called out in the header. |
 
 ## Using a file on PCAI
 
 1. **Import the chart once** into PCAI (the packaged chart, e.g.
-   `model-downloader-1.6.2.tar.gz`). PCAI users never run `helm install` /
+   `model-downloader-1.7.0.tar.gz`). PCAI users never run `helm install` /
    `kubectl apply` — deployment is values-only after the import.
 2. **Open the chart's Helm Values editor** in PCAI and paste the whole file
    (both files are *full values* documents — they stand alone and do not

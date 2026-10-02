@@ -331,6 +331,7 @@ def _args(tmp_path: Path, **over):
         gpu_vram=None,
         gpu_count=1,
         tp=None,
+        pp=None,
         weight_dtype=None,
         kv_dtype="fp8",
         mem_fraction=0.9,
@@ -653,3 +654,274 @@ def test_summary_line_includes_tiers():
     )
     line = E.summary_line(res)
     assert "HiCache" in line and "L2" in line
+
+
+# ---------------------------------------------------------------------------
+# pipeline parallel (PP) — the GLM-5.2 TP4/PP2 shape on 8x H200
+# ---------------------------------------------------------------------------
+
+
+def glm52_fp8() -> dict:
+    """GLM-5.2-FP8 shape (glm_moe_dsa): MLA + DSA, 256 experts, MTP=1."""
+    return {
+        "model_type": "glm_moe_dsa",
+        "hidden_size": 6144,
+        "num_hidden_layers": 78,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "index_topk": 2048,
+        "vocab_size": 154624,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048,
+        "first_k_dense_replace": 3,
+        "num_nextn_predict_layers": 1,
+        "quantization_config": {"quant_method": "fp8"},
+    }
+
+
+def test_pp_shards_weights_kv_pool_unchanged():
+    """PP2 halves per-GPU weights; the KV token pool is NOT re-divided by pp."""
+    cfg = C.config_from_dict(_gqa_cfg())
+    base = E.run_estimate(E.EstimateRequest(cfg=cfg, gpu=H200, gpu_count=8, tp_size=4, weight_dtype="bf16"))
+    with_pp = E.run_estimate(
+        E.EstimateRequest(cfg=cfg, gpu=H200, gpu_count=8, tp_size=4, pp_size=2, weight_dtype="bf16")
+    )
+    assert with_pp.weights_per_gpu == pytest.approx(base.weights_per_gpu / 2)
+    assert with_pp.fits and base.fits
+    # 8 GPUs hold one TP4xPP2 group: same total token pool as the TP4 base
+    # (weights freed by PP become KV pool, on every GPU of the group:
+    # delta = 8 x (w/2/8) / bpt = w_total/8... -> total weights / bpt)
+    assert with_pp.kv_tokens_total == pytest.approx(base.kv_tokens_total + base.weights_per_gpu * 4 / base.kv_bytes_per_token)
+    assert any("PP2" in w for w in with_pp.warnings)
+
+
+def test_pp_clamped_to_gpu_count():
+    cfg = C.config_from_dict(_gqa_cfg())
+    res = E.run_estimate(E.EstimateRequest(cfg=cfg, gpu=H200, gpu_count=2, tp_size=2, pp_size=8, weight_dtype="bf16"))
+    assert res.request.pp_size == 2
+
+
+def test_glm52_tp4pp2_fits_on_8x_h200():
+    """The exact seed-catalog shape: TP4 + PP2 on 8 GPUs must FIT.
+
+    Regression: before PP support this computed weights/4 = 172.9 GiB/GPU
+    and returned DOES NOT FIT for a deployment that ran in production.
+    """
+    cfg = C.config_from_dict(glm52_fp8())
+    res = E.run_estimate(
+        E.EstimateRequest(
+            cfg=cfg,
+            gpu=H200,
+            gpu_count=8,
+            tp_size=4,
+            pp_size=2,
+            weight_dtype="fp8",
+            kv_dtype="fp8_e4m3",
+            mem_fraction=0.8,
+            context=786432,
+        )
+    )
+    assert res.fits, f"GLM-5.2 TP4/PP2 must fit, got {res.weights_per_gpu / 1024**3:.1f} GiB/GPU"
+    assert res.weights_per_gpu == pytest.approx(691.6 / 4 / 2 * 1024**3, rel=0.02)
+    assert res.kv_tokens_total and res.kv_tokens_total > 786432  # at least one 768k request
+    assert E.summary_line(res).startswith("4xNVIDIA H200 SXM PP2:")
+
+
+def test_glm52_pure_tp4_does_not_fit():
+    """Sanity on the same model WITHOUT pp: TP4 on 4 GPUs really is too big."""
+    cfg = C.config_from_dict(glm52_fp8())
+    res = E.run_estimate(
+        E.EstimateRequest(cfg=cfg, gpu=H200, gpu_count=4, tp_size=4, weight_dtype="fp8", kv_dtype="fp8_e4m3")
+    )
+    assert res.fits is False
+
+
+def test_dsa_index_stream_priced():
+    """glm_moe_dsa adds the sparse-index key stream (index_head_dim) per layer."""
+    cfg = C.config_from_dict(glm52_fp8())
+    _, details = C.kv_bytes_per_token(cfg, "fp8_e4m3")
+    assert details.get("indexer_bytes_per_layer") == 128 * 1.0
+    assert "DSA index" in details["formula"]
+    # 512 + 64 latent + 128 index = 704 B/token/layer at fp8
+    assert details["per_layer_bytes"] == pytest.approx(704.0)
+    # unmodeled-fields warning must NOT fire for fields this family now prices
+    consumed = details.get("_consumed_fields", set())
+    assert "index_head_dim" in consumed and "index_n_heads" in consumed
+
+
+# ---------------------------------------------------------------------------
+# qwen4_exp — lightning indexer, num_experts/mtp_num_hidden_layers aliases
+# ---------------------------------------------------------------------------
+
+
+def qwen38_flash_next() -> dict:
+    """Qwen3.8-Flash-Next text stack (qwen4_exp): hybrid GQA+linear, 512
+    experts keyed num_experts, lightning indexer, mtp_num_hidden_layers=1."""
+    return {
+        "model_type": "qwen4_exp_text",
+        "hidden_size": 2560,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "indexer_head_dim": 128,
+        "indexer_n_heads": 4,
+        "indexer_kv_heads": 1,
+        "indexer_budget": 2048,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 640,
+        "shared_expert_intermediate_size": 640,
+        "mtp_num_hidden_layers": 1,
+        "mamba_ssm_dtype": "float32",
+        "vocab_size": 248320,
+    }
+
+
+def test_qwen4_exp_aliases_and_indexer():
+    cfg = C.config_from_dict(qwen38_flash_next())
+    assert cfg.experts == 512, "num_experts must resolve as the MoE expert count"
+    assert cfg.num_nextn_predict_layers == 1, "mtp_num_hidden_layers must alias the MTP module"
+    assert cfg.indexer_head_dim == 128
+    bpt, details = C.kv_bytes_per_token(cfg, "bf16")
+    # per full layer: 2 x 2 x 256 x 2 B (KV) + 128 x 2 B (indexer K) = 2304 B
+    # per linear layer: 0 -> total = 12 full layers x 2304 B
+    assert details["per_layer_bytes"] == pytest.approx(2304.0)
+    assert bpt == pytest.approx(12 * 2304.0)
+    assert "lightning indexer" in details["arch"]
+    # the linear-attention state must be reported per sequence, not per token
+    assert details.get("linear_state_bytes_per_seq") == pytest.approx(48 * 128 * 128 * 4.0)
+    assert "mamba/KDA pool" in str(details.get("note", ""))
+
+
+def test_qwen4_exp_experts_counted_in_weights():
+    """512 routed experts (num_experts key) must show up in the param count."""
+    cfg = C.config_from_dict(qwen38_flash_next())
+    params, _ = C.count_parameters(cfg)
+    # the config carries no first_k_dense_replace/mlp_layer_types -> all 48
+    # layers are MoE by the config's own statement: 48 x 512 x 3 x 2560 x 640
+    moe_idx = C._moe_layer_indices(cfg)
+    assert len(moe_idx) == 48
+    expert_params = 48 * 512 * 3 * 2560 * 640
+    assert params > expert_params, "expert weights must dominate the count"
+    # a no-expert variant must be far smaller (router-only difference check)
+    d = qwen38_flash_next()
+    d["num_experts"] = 1
+    params_dense, _ = C.count_parameters(C.config_from_dict(d))
+    assert params - params_dense == pytest.approx(expert_params, rel=0.01)
+
+
+def test_https_fetch_config_mirrors_hf(tmp_path, monkeypatch):
+    """The stdlib fallback: hits the resolve URL, parses JSON. Offline envs
+    get a clean error; the message carries the fetch error verbatim."""
+    from model_benchmarker.memory_model.configs import _https_fetch_config
+
+    data, url, err = _https_fetch_config("Qwen/Qwen3-8B")
+    if err:  # offline CI: fail soft, but the error must be self-describing
+        assert data is None and "huggingface.co" not in err or "URLError" in err or "HTTP" in err
+        return
+    assert data and data.get("model_type") == "qwen3"
+    assert url.endswith("/resolve/main/config.json")
+
+
+def test_https_fetch_bad_repo_error_message(monkeypatch):
+    """A nonexistent repo surfaces the HTTP error in load_config_json's message."""
+    from model_benchmarker.memory_model import configs as CFG
+
+    monkeypatch.setattr(CFG, "_mirror_candidates", lambda ref: [])
+    with pytest.raises(FileNotFoundError) as ei:
+        CFG.load_config_json("org-does-not-exist-xyz/no-such-model-xyz")
+    msg = str(ei.value)
+    assert "config.json not found" in msg
+    assert "https fetch:" in msg
+
+
+def test_hf_endpoint_guard():
+    from model_benchmarker.memory_model.configs import _https_fetch_config
+
+    monkey = None
+    import os
+
+    old = os.environ.get("HF_ENDPOINT")
+    try:
+        os.environ["HF_ENDPOINT"] = "http://insecure.example.com"
+        data, _url, err = _https_fetch_config("a/b")
+        assert data is None and "https" in err
+    finally:
+        if old is None:
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = old
+    _ = monkey
+
+
+# ---------------------------------------------------------------------------
+# modelopt (NVIDIA ModelOpt) quantization_config -> weight dtype
+# ---------------------------------------------------------------------------
+
+
+def test_modelopt4_weights_resolve():
+    """nvidia/Qwen3.8-Flash-Next-NVFP4 shape: quant_method=modelopt with
+    config_groups weights.num_bits=4 -> NVFP4 pricing (0.5 B/param)."""
+    cfg = C.config_from_dict(
+        {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "config_groups": {
+                    "group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}
+                },
+            },
+        }
+    )
+    assert cfg.quant_method == "modelopt4" and cfg.quant_bits == 4
+    wd = C.default_weight_dtype(cfg)
+    assert wd == "modelopt4"
+    _wbytes, details = C.weight_bytes_estimate(cfg, wd)
+    assert details["bytes_per_param"] == 0.5
+    # and the pipeline end-to-end: modelopt4 is accepted by the estimate path
+    res = E.run_estimate(E.EstimateRequest(cfg=cfg, gpu=H200, weight_dtype=None))
+    assert res.weights_bytes is not None
+    assert res.details["weights"]["bytes_per_param"] == 0.5
+
+
+def test_modelopt8_weights_resolve():
+    cfg = C.config_from_dict(
+        {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "vocab_size": 1024,
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "config_groups": {"g": {"weights": {"num_bits": 8}}},
+            },
+        }
+    )
+    assert cfg.quant_method == "modelopt8"
+    assert C.weight_bytes_estimate(cfg, "modelopt8")[1]["bytes_per_param"] == 1.0
+
+
+def test_dtype_label_modelopt():
+    from model_benchmarker.memory_model.dtypes import dtype_label
+
+    assert dtype_label("modelopt4") == "NVFP4 (modelopt)"
+    assert dtype_label("modelopt8") == "FP8 (modelopt)"

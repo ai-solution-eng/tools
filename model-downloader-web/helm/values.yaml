@@ -55,25 +55,23 @@ resources:
     cpu: "1"
     memory: 512Mi
 
-# -- HPE corporate proxy (hpeproxy.its.hpecorp.net + Zscaler MITM) -----------------------
-# This flag controls ONLY the proxy / no_proxy env vars on downloader Jobs and
-# the httpx TLS-verification bypass needed to get through the Zscaler proxy.
-#
-#   hpe_proxies: true    proxy env + TLS bypass
-#   hpe_proxies: false   no proxy env vars, TLS verification intact
-#
-# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
-# so they are installed by default. When deploying to a generic cluster set
-# hpe_proxies: false plus kyverno.enabled: false plus ezua.enabled: false in
-# the values overlay.
-hpe_proxies: false
+# -- Corporate egress proxy (per-key wiring) ------------------------------------------------
+# Each key is wired into the pods (downloader Jobs, debug pods, the app pod)
+# only when non-empty; a direct-egress site leaves proxy: {} and everything
+# renders off. There is no proxy flag anymore.
+proxy: {}
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
-# Proxy endpoints (used only when hpe_proxies: true).
+# -- PCAI (HPE Ezmeral Unified Analytics) feature gate ----------------------------------------
+# PCAI features (ezua/kyverno-style integration) no longer follow proxy
+# config: pcai.enabled defaults to FALSE — set it explicitly. Keep
+# kyverno.enabled / ezua.enabled as the per-feature switches for this app's
+# own PCAI integration (they default to true; see their blocks below).
 pcai:
-  # Leave `enabled` unset to fall back to the hpe_proxies flag; force it
-  # explicitly only to override.
-  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost
+  enabled: false
 
 # -- Download storage backend --------------------------------------------------------------
 storage:
@@ -276,9 +274,8 @@ downloader:
     etagTimeout: "30"
     enableHfTransfer: "0"
     disableXet: "1"
-    # TLS verification for the downloader. Controlled by `hpe_proxies` (true =
-    # bypass Zscaler MITM / verifyTls=false, false = TLS intact / verifyTls=true).
-    # Override explicitly with downloader.hf.verifyTls in the values overlay.
+    # TLS verification for the downloader. Unset → true (verify; set false
+    # only behind a MITM proxy with an untrusted cert).
     # verifyTls: false
 
 # -- Debug pod ("Launch debug pod" in the UI) ------------------------------------------------------
@@ -293,8 +290,8 @@ downloader:
 # "Insufficient authorization to set the 'hpe-ezua/app' label to 'mlis'"),
 # while job-controller-created pods with the same labels are admitted.
 #
-# Proxy env vars follow hpe_proxies / pcai (see pcaiEnabled helper), exactly
-# like the downloader Jobs.
+# Proxy env vars follow the top-level proxy: dict (per-key; see proxy:),
+# exactly like the downloader Jobs.
 debugPod:
   enabled: true
   image:
@@ -331,9 +328,8 @@ catalog:
   # "Refresh from GitHub" button: raw URL of the seed catalog JSON on the
   # tools repo. The button is hidden when this is empty.
   githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
-  # TLS verification for that fetch. Default (unset): follows the downloader's
-  # skipTls rule — verified unless hpe_proxies is on (the Zscaler MITM proxy
-  # presents an untrusted cert). Force explicitly with true/false if needed.
+  # TLS verification for that fetch. Default (unset): true (verify). Set
+  # false ONLY behind a corporate MITM proxy with an untrusted cert.
   # githubVerifyTls: true
 
 # -- AIOLI / MLIS database connection (pushing model configs) ------------------------------------------

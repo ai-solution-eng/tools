@@ -53,24 +53,21 @@ resources:
     cpu: "1"
     memory: 512Mi
 
-# -- HPE corporate proxy (hpeproxy.its.hpecorp.net + Zscaler MITM) -----------------------
-# SITE: hosted trials are usually NOT behind the HPE corporate proxy — keep
-# false. Set true only when the cluster egresses via hpeproxy (proxy env +
-# Zscaler TLS bypass on downloader Jobs and the app pod).
+# -- Corporate egress proxy (per-key wiring) --------------------------------------------------
+# SITE: hosted trials are usually NOT behind a corporate proxy — keep
+# proxy: {} (no proxy env renders anywhere, TLS verification intact). Fill
+# the keys only when the cluster egresses through a proxy (each key is wired
+# only when non-empty; TLS stays verified unless you also set
+# downloader.hf.verifyTls: false — the secure default is verify-on).
 #
-#   hpe_proxies: true    proxy env + TLS bypass
-#   hpe_proxies: false   no proxy env vars, TLS verification intact
-#
-# kyverno and ezua are NOT controlled by this flag — this is an HPE PCAI app,
-# so they are installed by default.
-hpe_proxies: false
+# kyverno and ezua are NOT controlled by proxy config — this is an HPE PCAI
+# app, so they are installed by default.
+proxy: {}
 
-# Proxy endpoints (used only when hpe_proxies: true).
+# -- PCAI feature gate --------------------------------------------------------------------------
+# Set explicitly — PCAI features no longer follow proxy config.
 pcai:
-  # Leave `enabled` unset to fall back to the hpe_proxies flag; force it
-  # explicitly only to override.
-  httpsProxy: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,192.0.0.0/8,localhost
+  enabled: true
 
 # SITE: storage backend choice — "pvc" | "s3" | "both" (which backends users
 # can pick in the UI); "default" is the preselected option. A pvc-only trial
@@ -138,7 +135,9 @@ downloader:
     etagTimeout: "30"
     enableHfTransfer: "0"
     disableXet: "1"
-    # verifyTls follows hpe_proxies (false here → TLS verification intact).
+    # Unset → true (verify). Set false ONLY behind a MITM proxy with an
+    # untrusted cert.
+    # verifyTls: false
 
 # -- Provenance manifest (MD-A1)  ----------------------------------------------------------
 provenance:

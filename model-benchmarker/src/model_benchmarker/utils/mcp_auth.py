@@ -89,6 +89,13 @@ def presented_keys(scope):
 
     Accepts ``Authorization: Bearer <key>`` and ``X-API-Key: <key>``; both are
     collected so clients can use whichever header their MCP client exposes.
+
+    D21: also accepts ``X-Auth-Request-Access-Token`` — the auth-proxy
+    (oauth2-proxy) forwarded OIDC access token.  The header is an ENVELOPE,
+    not a trust grant: whatever arrives in it is still fully verified
+    (RS256 signature, iss/aud/exp) by the OIDC resolver before it can
+    resolve any identity, so spoofing it gains nothing.  An optional
+    ``Bearer `` prefix is tolerated (some proxies set it).
     """
     candidates = []
     for name, value in scope.get("headers", []):
@@ -99,6 +106,12 @@ def presented_keys(scope):
                 candidates.append(token.strip())
         elif lowered == b"x-api-key":
             candidates.append(value.decode("latin-1").strip())
+        elif lowered == b"x-auth-request-access-token":
+            token = value.decode("latin-1").strip()
+            if token[:7].lower() == "bearer ":
+                token = token[7:].strip()
+            if token:
+                candidates.append(token)
     return candidates
 
 
@@ -112,6 +125,12 @@ def presented_keys_with_source(scope):
     (a gateway's own platform/admin token), so per-key delegation to a
     registry identity is possible at all.  Only ``Bearer`` Authorization
     headers count; Basic/Negotiate are ignored.
+
+    D21: ``X-Auth-Request-Access-Token`` candidates carry the source label
+    ``"forwarded"`` — NOT ``"x-api-key"`` — so a proxy-forwarded JWT can
+    never outrank an explicit delegated ``X-API-Key`` (D19 unchanged); with
+    no ``X-API-Key`` candidate present it resolves through the normal
+    fall-through (that is exactly the browser SSO case).
     """
     pairs = []
     for name, value in scope.get("headers", []):
@@ -124,6 +143,12 @@ def presented_keys_with_source(scope):
             token = value.decode("latin-1").strip()
             if token:
                 pairs.append((token, "x-api-key"))
+        elif lowered == b"x-auth-request-access-token":
+            token = value.decode("latin-1").strip()
+            if token[:7].lower() == "bearer ":
+                token = token[7:].strip()
+            if token:
+                pairs.append((token, "forwarded"))
     return pairs
 
 

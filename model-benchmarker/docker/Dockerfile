@@ -37,6 +37,14 @@ RUN uv pip install --system -r requirements.txt
 
 COPY src/ ./src/
 
+# The committed results tree ships in the image: BENCH_SEED_RESULTS_DIR tells
+# the webapp to copy it into <work-dir>/results (the PVC) on FIRST launch —
+# one-time seeding; the PVC copy is then authoritative and survives image
+# upgrades. Publishing new runs afterwards = kubectl cp onto <work>/results
+# (or reseed by deleting the PVC copy).
+COPY results/ ./results/
+ENV BENCH_SEED_RESULTS_DIR=/app/results
+
 # THE credential boundary, enforced by the build itself: if pcai_models.py (or
 # any archive) ever reaches the context again — a .dockerignore edit, a new
 # subtree, an ignore-pattern regression — the build FAILS here, loudly, instead

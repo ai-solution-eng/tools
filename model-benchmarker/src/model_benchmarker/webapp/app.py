@@ -56,7 +56,15 @@ from ..memory_model.gpus import DEFAULT_GPU, GPU_DB, GpuSpec, resolve_gpu
 from ..utils import mcp_auth as _mcp_auth
 from . import runner as R
 from .compare import MAX_COMPARE_RUNS, finalize_comparison  # results-page compare feature
-from .library import LIB_PREFIX, library_entry, scan_library  # committed results/ tree
+from .library import (
+    LIB_PREFIX,
+    library_entry,
+    scan_library,
+    seed_results_into_workdir,
+)  # committed results/ tree
+from .library import (
+    RESULTS_DIR_ENV as R__RESULTS_ENV,
+)
 from .runner import BenchError, BusyEndpointError, MaxRunsError, RunManager, manager_from_env
 
 _UI_DIR = Path(__file__).parent / "ui"
@@ -92,6 +100,17 @@ def _status_payload() -> dict:
 def create_app(work_dir: str | None = None) -> Any:
     app = FastAPI(title="ModelBenchmarker", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     manager: RunManager = manager_from_env(work_dir)
+
+    # Library seeding: images that ship the committed results/ tree point
+    # BENCH_RESULTS_DIR at it; deployments that instead keep the library on
+    # the PVC get a one-time seed into <work_dir>/results (skipped when the
+    # PVC copy already exists — publishing is kubectl cp). Also covers the
+    # broken-in-practice v0.4.3 shape: tree copied but the ENV lost in the
+    # build — the seed derivation below re-points the env when it applies.
+    if not os.environ.get(R__RESULTS_ENV):
+        seeded = seed_results_into_workdir(manager.work_dir)
+        if seeded is not None:
+            os.environ[R__RESULTS_ENV] = str(seeded)
 
     if (_UI_DIR / "app.css").is_file():
         app.mount("/static", StaticFiles(directory=_UI_DIR), name="static")
@@ -443,12 +462,13 @@ def _catalog_payload() -> dict:
         gpu = str(entry.get("tier") or "?")
         gpu_count = entry.get("resource_request_gpu") or 1
         tp = _arg_value(a, "--tp-size") or gpu_count
+        pp = _arg_value(a, "--pp-size") or 1
         kv = _arg_value(a, "--kv-cache-dtype")
         mem = _arg_value(a, "--mem-fraction-static")
         # engine variants of the SAME model on the SAME tier differ by their
         # runner/speculative launch flags (sglang DFLASH vs vllm MTP) — keep
         # both, they benchmark differently
-        key = f"{served_name or repo}|{gpu}|{gpu_count}|{tp}|{_arg_value(a, '--moe-runner-backend') or ''}|{(_arg_value(a, '--speculative-algorithm') or _json_arg_field(_arg_value(a, '--speculative-config'), 'method') or '')}"
+        key = f"{served_name or repo}|{gpu}|{gpu_count}|{tp}|{pp}|{_arg_value(a, '--moe-runner-backend') or ''}|{(_arg_value(a, '--speculative-algorithm') or _json_arg_field(_arg_value(a, '--speculative-config'), 'method') or '')}"
         if key in seen:
             continue
         seen.add(key)
@@ -461,6 +481,7 @@ def _catalog_payload() -> dict:
                 "gpu": gpu,
                 "gpus": gpu_count,
                 "tp": tp,
+                "pp": int(pp) if str(pp).isdigit() else 1,
                 "kv_dtype": kv or "",
                 "mem_fraction": mem or "",
                 "moe_runner": _arg_value(a, "--moe-runner-backend") or "",
@@ -692,6 +713,7 @@ def _run_estimate_api(payload: dict) -> dict:
     gpu = _resolve_gpu(payload)
     gpu_count = _int_field(payload, "gpus", 1, 1, 64)
     tp = _int_field(payload, "tp", gpu_count, 1, gpu_count)
+    pp = _int_field(payload, "pp", 1, 1, gpu_count)
     ep = _int_field(payload, "ep", 1, 1, gpu_count)
     mem_fraction_raw = payload.get("mem_fraction")
     overhead_raw = payload.get("overhead")
@@ -774,6 +796,7 @@ def _run_estimate_api(payload: dict) -> dict:
                 gpu=gpu,
                 gpu_count=g,
                 tp_size=t,
+                pp_size=pp,
                 weight_dtype=weight_dtype,
                 kv_dtype=kv_dtype,
                 mem_fraction=mem_fraction,
@@ -856,7 +879,7 @@ def _run_estimate_api(payload: dict) -> dict:
             "notes": tiers.notes,
         }
 
-    primary_label = f"{gpu.name} x{gpu_count} TP{tp}"
+    primary_label = f"{gpu.name} x{gpu_count} TP{tp}" + (f" PP{pp}" if pp > 1 else "")
     grid_rows = [
         {
             "label": primary_label,
@@ -878,7 +901,7 @@ def _run_estimate_api(payload: dict) -> dict:
         "status": status,
         "config": [
             ["model", model or "(pasted config)"],
-            ["gpu", f"{gpu.name} x{gpu_count} (TP{tp})"],
+            ["gpu", f"{gpu.name} x{gpu_count} (TP{tp}" + (f", PP{pp}" if pp > 1 else "") + ")"],
             ["weight dtype", dtype_label(weight_dtype) or "?"],
             ["kv dtype", kv_label],
             ["mem fraction", f"{mem_fraction:g}"],
