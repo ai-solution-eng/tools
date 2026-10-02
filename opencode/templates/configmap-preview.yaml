@@ -1051,7 +1051,21 @@ data:
         return
       }
     
-      const relPaths = safePaths.map((p) => path.relative(root.path, p))
+      // Anchor the archive at the DEEPEST COMMON PARENT of the selection —
+      // not at the navigable root. One file → an archive whose root IS that
+      // file; one folder → an archive whose root IS that folder; several
+      // items in one directory → plain basenames. The old root-relative
+      // anchoring embedded the full personal/<user>/<...> chain from the
+      // navigable root into every archive.
+      let anchor = path.dirname(safePaths[0])
+      for (const p of safePaths.slice(1)) {
+        while (!(p === anchor || p.startsWith(anchor + path.sep))) {
+          const up = path.dirname(anchor)
+          if (up === anchor) break // '/' guard (unreachable: same-root check below)
+          anchor = up
+        }
+      }
+      const relPaths = safePaths.map((p) => path.relative(anchor, p))
       const ext = format === 'tar.gz' ? '.tar.gz' : '.zip'
       const contentType = format === 'tar.gz' ? 'application/gzip' : 'application/zip'
     
@@ -1061,8 +1075,8 @@ data:
       })
     
       const cmd = format === 'tar.gz'
-        ? spawn('tar', ['czf', '-', ...relPaths], { cwd: root.path })
-        : spawn('zip', ['-rq', '-', ...relPaths], { cwd: root.path })
+        ? spawn('tar', ['czf', '-', ...relPaths], { cwd: anchor })
+        : spawn('zip', ['-rq', '-', ...relPaths], { cwd: anchor })
     
       cmd.stdout.pipe(res)
       cmd.stderr.on('data', (d) => console.error('[data_manager] archive stderr:', d.toString()))
@@ -1746,7 +1760,7 @@ data:
     }
 
     /* Editor dialog */
-    #edit-dialog { width: 80vw; max-width: 1000px; height: 80vh; max-height: 700px; }
+    #edit-dialog { width: 96vw; height: 94vh; max-width: none; max-height: none; }
     #edit-dialog .dlg-body { padding: 0; flex: 1; overflow: hidden; display: flex; flex-direction: column; }
     #editor-container { flex: 1; overflow: hidden; min-height: 300px; }
     #editor-textarea {
@@ -1858,6 +1872,7 @@ data:
     <dialog id="download-dialog">
       <div class="dlg-header">Download</div>
       <div class="dlg-body">
+        <div id="dl-hint" style="display:none;font-size:12px;color:var(--text-muted);margin-bottom:10px;"></div>
         <div class="dlg-field">
           <label>Filename (without extension)</label>
           <input type="text" id="dl-name" value="archive">
@@ -2346,14 +2361,31 @@ data:
     };
     
     async function checkSingleFile(filePath) {
-      // If it's a directory, we need to archive it
-      // Try direct download first — backend returns 400 if not a file
+      // Probe the entry type BEFORE showing the dialog: /api/list answers
+      // 200 for a directory and 400 for a file. A FILE downloads AS-IS (raw
+      // byte stream — no archive wrapper); a FOLDER archives, with the
+      // tar.gz/zip choice surfaced. (The old flow hid the format field for
+      // both and discovered directories via a failed download round-trip.)
       const name = filePath.split('/').pop();
       document.getElementById('dl-name').value = name;
-      document.getElementById('dl-format-field').classList.add('hidden');
-      document.getElementById('download-dialog').dataset.singleFile = filePath;
-      document.getElementById('download-dialog').dataset.multi = '';
-      document.getElementById('download-dialog').showModal();
+      let isDir = false;
+      try {
+        const res = await fetch(API + '/list?path=' + encodeURIComponent(filePath));
+        isDir = res.ok;
+      } catch {
+        isDir = false;
+      }
+      document.getElementById('dl-format-field').classList.toggle('hidden', !isDir);
+      const hint = document.getElementById('dl-hint');
+      hint.textContent = isDir
+        ? 'Archives "' + name + '" — the folder itself is the archive root.'
+        : 'Downloads "' + name + '" as-is — no archive.';
+      hint.style.display = 'block';
+      const dlg = document.getElementById('download-dialog');
+      dlg.dataset.singleFile = filePath;
+      dlg.dataset.singleDir = isDir ? '1' : '';
+      dlg.dataset.multi = '';
+      dlg.showModal();
     }
     
     function showDownloadDialog(paths, isMulti) {
@@ -2374,21 +2406,21 @@ data:
       dlg.close();
     
       if (singleFile) {
-        // Try direct download — if it's a dir, fall back to archive
-        try {
-          const res = await fetch(API + '/download?path=' + encodeURIComponent(singleFile) + '&name=' + encodeURIComponent(name), { method: 'GET' });
-          if (res.status === 400) {
-            // It's a directory — archive it
-            await downloadArchive([singleFile], name, format);
-          } else if (!res.ok) {
-            throw new Error('Download failed');
-          } else {
+        if (dlg.dataset.singleDir === '1') {
+          // Folder — archive it (anchored at its parent: the archive root IS
+          // the folder). The format selector was surfaced in the dialog.
+          await downloadArchive([singleFile], name, format);
+        } else {
+          // File — download as-is: a raw byte stream, no archive wrapper.
+          try {
+            const res = await fetch(API + '/download?path=' + encodeURIComponent(singleFile) + '&name=' + encodeURIComponent(name), { method: 'GET' });
+            if (!res.ok) throw new Error('Download failed (' + res.status + ')');
             const blob = await res.blob();
             triggerDownload(blob, name);
             toast('Downloaded ' + name, 'success');
+          } catch (e) {
+            toast('Download failed: ' + e.message, 'error');
           }
-        } catch (e) {
-          toast('Download failed: ' + e.message, 'error');
         }
       } else if (multi) {
         const paths = JSON.parse(multi);

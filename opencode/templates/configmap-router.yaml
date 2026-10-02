@@ -88,7 +88,7 @@ data:
       ? (dockerOnPlatformUnits ? 'dind-platform' : 'dind-classic')
       : 'nodind'
     const dindBrokerVersion = `${dockerSidecar}-${(dockerImage.split(':').pop() || 'untagged')}-${dockerDiskSize}`
-    const userTemplateVersion = `terminal-tab-v12-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    const userTemplateVersion = `terminal-tab-v13-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
