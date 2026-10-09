@@ -221,12 +221,13 @@ Then `helm upgrade` (the values files already point at the matching tag).
 
 ## Docker in Docker (0.4.17)
 
-Every user pod can carry a **`dockerd` sidecar** (values `docker.enabled`, on by default in `values-g2.yaml`), giving the terminal full `docker` power — build, run, tag, **push** — with no cluster-wide docker socket and no host mounts:
+**Docker is an SSO-identity capability** (security decision 2026-10-03: the classic login is a *shared* credential and daemon access is node-root-equivalent, so units resolved by a local session never get a daemon). SSO units get full `docker` power — build, run, tag, **push** — with no cluster-wide docker socket and no host mounts:
 
-- The **dsh-web container** gets `DOCKER_HOST=tcp://127.0.0.1:2375` and the baked **docker CLI + buildx plugin** (`/usr/local/bin/docker`).
-- The **sidecar** runs `dockerd` on a loopback-only TCP listener, privileged and explicitly root (dockerd cannot run as a non-root uid — the container-level `runAsUser: 0` override also beats the platform admission that forces the tenant uid into every container in `project-user-*` namespaces, the v30 note).
+- **SSO + platform namespace (`project-user-*`, the default SSO path):** the daemon runs in a **per-user broker pod** in the release namespace (below); the unit's `dsh-web` container gets `DOCKER_HOST=tcp://dsh-dind-<user>-svc.<release-ns>.svc.cluster.local:2375` and the baked **docker CLI + buildx plugin**.
+- **SSO + release-namespace fallback unit** (no platform project yet): the daemon is an **in-pod sidecar** on a loopback-only listener (`DOCKER_HOST=tcp://127.0.0.1:2375`) — reachable solely through the authenticated session.
+- **Local (non-SSO) units: no daemon** — the CLI is present but `docker` reports "Cannot connect to the Docker daemon". Deliberate, not a bug.
 - Its `/var/lib/docker` is **node-local `emptyDir`**: overlay2 layer extraction fails on VAST network volumes, so the image store is ephemeral — **push after building** (or `docker save` to the workspace).
-- The daemon is not a shared socket: it is private to your pod, so there is no cross-user or host exposure beyond the pod's own network namespace.
+- The daemon is not a shared socket: the in-pod sidecar is private to the unit's network namespace; the broker is private to the owning user's unit via the per-user NetworkPolicy.
 
 ### Proxied clusters (g2)
 
