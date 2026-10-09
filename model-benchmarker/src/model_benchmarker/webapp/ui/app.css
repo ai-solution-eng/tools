@@ -225,4 +225,17 @@ details.log-full {
   display: flex; flex-direction: column;
 }
 details.log-full summary { flex: 0 0 auto; }
-details.log-full pre.log { flex: 1 1 auto; max-height: none; }
+/* The log <pre> is NOT a direct flex item: <details> wraps its non-summary
+   children in an anonymous block whose automatic min-height (min-content of
+   the log) refuses to shrink — flex:1 alone lets the log grow past the
+   viewport with no scrollbar anywhere. Size it explicitly instead; .log's own
+   overflow:auto then scrolls, and log-follower keeps the bottom pinned.
+   60px ≈ summary row (~22px) + overlay padding (28px) + slack. dvh first,
+   vh fallback for older browsers. */
+details.log-full pre.log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  height: calc(100vh - 60px);
+  height: calc(100dvh - 60px);
+}

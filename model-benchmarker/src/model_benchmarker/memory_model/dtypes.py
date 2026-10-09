@@ -32,6 +32,7 @@ _WEIGHT_DTYPE_BYTES: dict[str, float] = {
     "int8": 1.0,
     "nvfp4": 0.5,
     "fp4": 0.5,
+    "mxfp4": 0.5,  # MXFP4 block-scaled fp4 (Kimi / DeepSeek expert checkpoints)
     "nvfp4a16": 0.5,
     "int4": 0.5,
     "awq": 0.5,
@@ -93,6 +94,10 @@ def dtype_label(dtype: str | None) -> str:
     d = normalize_dtype(dtype)
     if not d:
         return "?"
-    return {"fp8_e4m3": "FP8 (e4m3)", "fp8_e5m2": "FP8 (e5m2)", "fp8": "FP8", "modelopt4": "NVFP4 (modelopt)", "modelopt8": "FP8 (modelopt)"}.get(
-        d, d.upper()
-    )
+    return {
+        "fp8_e4m3": "FP8 (e4m3)",
+        "fp8_e5m2": "FP8 (e5m2)",
+        "fp8": "FP8",
+        "modelopt4": "NVFP4 (modelopt)",
+        "modelopt8": "FP8 (modelopt)",
+    }.get(d, d.upper())

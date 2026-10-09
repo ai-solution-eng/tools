@@ -42,6 +42,7 @@ Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicac
 |---|---|
 | `deepseek_v4_flash_0731/H200Sx4_hicachex2.md` | DeepSeek-V4-Flash-0731, 4× H200, HiCache ×2 |
 | `deepseek_v4_flash_0731/RTXPRO6000x2_hicachex16.md` | 2× RTX PRO 6000 (memory-tight), HiCache ×16 |
+| `deepseek_v41_flash/H200x4_engram_offload.md` | DeepSeek-V4.1-Flash, 4× H200, weight/ expert-offload serving (webapp run 20261004T193334Z, fused with its two resume-source attempts) |
 | `qwen_38_27b/H200.md` | Qwen3.8-27B, 1× H200 |
 | `qwen_38_27b/H200_sglang_dflash2_hicachex1.md` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×1 |
 | `qwen_38_27b/H200_sglang_dflash2_hicachex3.md` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×3 |

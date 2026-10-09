@@ -171,6 +171,15 @@
       <button id="c-go">Launch benchmark</button>
       <span id="c-msg" class="muted" style="margin-left:8px"></span>
     </div>
+    <div id="c-resume-row" class="grid g2" style="margin-top:12px;display:none">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:var(--text)">
+        <input type="checkbox" id="c-resume" style="width:auto"> resume — skip tests already in the picked run's report
+      </label>
+      <div id="c-resume-src-wrap">
+        <label for="c-resume-src">Resume from (run id — prefilled from the most recent timeout/failure of this target)</label>
+        <input id="c-resume-src" autocomplete="off" placeholder="run id, e.g. 20261002T160051Z-4b8e48bc" spellcheck="false">
+      </div>
+    </div>
   </div>
 
   <div id="c-run"></div>
@@ -221,6 +230,10 @@
     if ($("c-thinking").value) params.thinking = $("c-thinking").value;
     if ($("c-tlevel").value) params.thinking_level = $("c-tlevel").value;
     if ($("c-prompt").value.trim()) params.prompt = $("c-prompt").value;
+    if ($("c-resume").checked) {
+      params.resume = true;
+      params.resume_run = $("c-resume-src").value.trim();
+    }
     return params;
   }
 
@@ -290,6 +303,57 @@
     MB.recentRuns("c-recent", openRun);
   }
   refreshRecent();
+
+  // --- resume suggestion (MB-E) -------------------------------------------
+  // When the picked target's most recent chat run did NOT succeed, reveal the
+  // resume row pre-checked with that run id: the common post-timeout flow
+  // ("relaunch and don't re-pay finished levels") is then the DEFAULT. A
+  // successful last run (or no history) keeps the row hidden — fresh run.
+  var RESUME_ELIGIBLE = { timeout: 1, failed: 1, cancelled: 1, interrupted: 1 };
+  var lastRunForTarget = "";
+  function suggestResume() {
+    var target = $("c-target").value.trim();
+    if (!target || target === lastRunForTarget) return;
+    lastRunForTarget = target;
+    // Normalize the TYPED url through the server's alias map first: records
+    // store the RESOLVED in-cluster origin (local toggle is the deployed
+    // default) while the combobox carries the SERVING form — matching the
+    // raw typed string never fired (adversarial-review bug 2). If the
+    // alias endpoint is unavailable, fall back to raw matching (still
+    // correct for remote-usage records).
+    MB.api("/api/target-aliases?url=" + encodeURIComponent(target)).then(function (a) {
+      return (a && a.aliases && a.aliases.length ? a.aliases : [target]);
+    }).catch(function () { return [target]; }).then(function (needles) {
+      needles = needles.map(function (u) { return String(u || "").replace(/\/+$/, "").toLowerCase(); });
+      return MB.api("/api/results").then(function (d) {
+        function matches(r) {
+          if (r.kind !== "chat") return false;
+          var aliases = (r.target_aliases && r.target_aliases.length ? r.target_aliases : [r.target_url]);
+          for (var i = 0; i < aliases.length; i++) {
+            var norm = String(aliases[i] || "").replace(/\/+$/, "").toLowerCase();
+            if (norm && needles.indexOf(norm) >= 0) return true;
+          }
+          return false;
+        }
+        var hit = null;
+        (d.runs || []).forEach(function (r) {
+          if (!matches(r)) return;
+          if (!hit || (r.started_utc || "") > (hit.started_utc || "")) hit = r;
+        });
+        if (hit && RESUME_ELIGIBLE[hit.status] && (hit.artifacts || []).some(function (a) { return a.name === "report.md"; })) {
+          $("c-resume-src").value = hit.run_id;
+          $("c-resume").checked = true;
+          $("c-resume-row").style.display = "";
+        } else {
+          $("c-resume").checked = false;
+          $("c-resume-src").value = "";
+          $("c-resume-row").style.display = "none";
+        }
+      });
+    }).catch(function () { /* history unavailable: leave the default (hidden) */ });
+  }
+  $("c-target").addEventListener("change", suggestResume);
+  $("c-target").addEventListener("blur", suggestResume);
 
   $("c-go").addEventListener("click", function () {
     var btn = this;

@@ -89,9 +89,11 @@ if TYPE_CHECKING:
     try:
         from multimodal_rag.utils.clients_registry import Identity  # RAG-native path
     except ImportError:  # standalone (pcai_utils source tree / other consumers)
-        Identity = object  # type: ignore[misc,assignment] — annotations only
+        # annotations only
+        Identity = object  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
+
 
 def _sibling(mod_name: str, *, required: bool = True):
     """Import a pcai_utils sibling module from wherever THIS file was imported.
@@ -291,20 +293,22 @@ def _fetch_jwks(url: str, timeout: float) -> dict[str, tuple[int, int]]:
     import urllib.parse
 
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "multimodal-rag"})
-    opener_kwargs: dict = {}
+    handlers: list = []
     ca_bundle = os.environ.get("REMOTE_CA_BUNDLE", "").strip()
     if url.lower().startswith("https://") and ca_bundle and os.path.exists(ca_bundle):
         try:
-            opener_kwargs["handlers"] = [urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle))]
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle)))
         except Exception:
             pass  # unusable bundle → default verification (fail closed as usual)
     host = urllib.parse.urlparse(url).hostname or ""
     if host.endswith((".svc", ".svc.cluster.local", ".local")) or host == "localhost":
         # in-cluster: never route through an ambient proxy
-        opener_kwargs.setdefault("handlers", [])
-        opener_kwargs["handlers"] = [urllib.request.ProxyHandler({})] + opener_kwargs["handlers"]
-    if opener_kwargs:
-        with urllib.request.build_opener(**opener_kwargs).open(req, timeout=timeout) as resp:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if handlers:
+        # build_opener takes handlers POSITIONALLY (*handlers) — the
+        # handlers= kwarg raised TypeError on every fetch, killing the
+        # whole D21/D22 JWT path (found live on G2, 2026-10-02).
+        with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
             payload = json.loads(resp.read(_JWKS_MAX_BYTES).decode("utf-8"))
     else:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -429,33 +433,41 @@ def verify_and_decode(token: str) -> dict | None:
     logs a short reason code; token material is never logged or stored.
     """
     if not oidc_enabled() or not is_jwt_format(token):
-        return _fail("disabled-or-format")
+        _fail("disabled-or-format")
+        return None
     header, payload_segment, signature_segment = token.split(".")
     header_doc = _b64url_json(header)
     claims = _b64url_json(payload_segment)
     if header_doc is None or claims is None:
-        return _fail("format")
+        _fail("format")
+        return None
     alg = header_doc.get("alg")
     if alg != "RS256":
-        return _fail("alg", f"rejected alg {alg!r} (RS256 only — alg-confusion guard)")
+        _fail("alg", f"rejected alg {alg!r} (RS256 only — alg-confusion guard)")
+        return None
     kid = header_doc.get("kid")
     if not isinstance(kid, str) or not kid:
-        return _fail("kid", "header carries no kid")
+        _fail("kid", "header carries no kid")
+        return None
     try:
         signature = _b64url_bytes(signature_segment)
     except ValueError:
-        return _fail("format")
+        _fail("format")
+        return None
     keys = _jwks_keys(_jwks_url())
     if not keys:
-        return _fail("jwks", "no usable JWKS (fetch failed or negative-cached)")
+        _fail("jwks", "no usable JWKS (fetch failed or negative-cached)")
+        return None
     key = keys.get(kid)
     if key is None:
         # Unknown kid: ONE immediate refetch before failing (rotation pickup).
         key = (_jwks_keys(_jwks_url(), force=True) or {}).get(kid)
     if key is None:
-        return _fail("kid")
+        _fail("kid")
+        return None
     if not _verify_rs256(f"{header}.{payload_segment}".encode("ascii"), signature, key):
-        return _fail("signature")
+        _fail("signature")
+        return None
     if not _claims_valid(claims):
         return None
     return claims
@@ -476,22 +488,26 @@ def _identity_name(claims: dict) -> str | None:
     """
     admin_registry = _sibling("admin_registry", required=False)
     if admin_registry is None:
-        return _fail("registry", "no registry module ships with this consumer")
+        _fail("registry", "no registry module ships with this consumer")
+        return None
 
     claim_name = _env_str(IDENTITY_CLAIM_ENV) or DEFAULT_IDENTITY_CLAIM
     primary = claims.get(claim_name)
     if isinstance(primary, str) and primary.strip():
         name = primary.strip()
         if not admin_registry.valid_name(name):
-            return _fail("identity", f"{claim_name} value does not satisfy the registry name rules")
+            _fail("identity", f"{claim_name} value does not satisfy the registry name rules")
+            return None
         return name
     sub = claims.get(_FALLBACK_CLAIM)
     if isinstance(sub, str) and sub.strip():
         name = sub.strip()
         if not admin_registry.valid_name(name):
-            return _fail("identity", "sub value does not satisfy the registry name rules")
+            _fail("identity", "sub value does not satisfy the registry name rules")
+            return None
         return name
-    return _fail("identity", f"neither {claim_name} nor {_FALLBACK_CLAIM} is a usable string")
+    _fail("identity", f"neither {claim_name} nor {_FALLBACK_CLAIM} is a usable string")
+    return None
 
 
 def _overlay_entry_for(jwt_name: str) -> tuple[str, dict | None]:
@@ -534,7 +550,8 @@ def resolve_jwt(token: str) -> "Identity | None":  # noqa: UP037 — lazy-import
     if clients_registry is None:
         # Verification-only consumer: no registry package ships here, so no
         # identity can resolve — fail CLOSED (None -> 401), never raise.
-        return _fail("registry", "no registry module ships with this consumer")
+        _fail("registry", "no registry module ships with this consumer")
+        return None
     claims = verify_and_decode(token)
     if claims is None:
         return None
@@ -543,11 +560,17 @@ def resolve_jwt(token: str) -> "Identity | None":  # noqa: UP037 — lazy-import
         return None
     name, entry = _overlay_entry_for(jwt_name)
     if entry is not None and entry.get("blocked") is True:
-        return _fail("blocked")
-    datasets = clients_registry.dataset_acls().get(name, frozenset())
-    identity = clients_registry.Identity(kind="client", name=name, datasets=frozenset(datasets))
+        _fail("blocked")
+        return None
+    grants = clients_registry.dataset_acls().get(name, {})
+    identity = clients_registry.Identity(
+        kind="client",
+        name=name,
+        datasets=frozenset(grants),
+        grants=dict(grants),
+    )
     record_observed(name)
-    logger.debug("OIDC JWT resolved to registry identity '%s' (%d dataset(s))", name, len(datasets))
+    logger.debug("OIDC JWT resolved to registry identity '%s' (%d dataset(s))", name, len(grants))
     return identity
 
 

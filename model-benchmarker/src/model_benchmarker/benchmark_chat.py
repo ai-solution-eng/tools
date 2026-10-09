@@ -62,7 +62,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 import numpy as np
 
@@ -615,6 +615,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "leaves the completed levels on disk. E.g. --output "
         "results/qwen_38_27b/H200x4.md.",
     )
+    parser.add_argument(
+        "--resume-from",
+        default="",
+        help="Resume a timed-out/interrupted sweep: FILE is a previous "
+        "--output artifact whose completed (ctx, users, task) tests are "
+        "skipped, and its measurements are copied into this run's --output "
+        "so the final file is the union. Refuses loudly on model/url/"
+        "run-shape mismatch with FILE's header (or a 'Status: complete' "
+        "FILE); --resume-force overrides and re-runs everything. The "
+        "atomize.py decomposition of FILE decides what counts as done.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Shorthand for --resume-from <the --output file>: continue that "
+        "file in place (skip its completed tests, rewrite it as the union).",
+    )
+    parser.add_argument(
+        "--resume-force",
+        action="store_true",
+        help="With --resume/--resume-from: ignore the previous artifact's "
+        "completed levels and guardrail checks (model/url/run-shape) — "
+        "re-run every level fresh.",
+    )
     return parser.parse_args(argv)
 
 
@@ -631,6 +655,177 @@ def resolve_api_key(args: argparse.Namespace) -> str:
         if key:
             return key
     return os.environ.get("PCAI_API_KEY", "")
+
+
+# ---------------------------------------------------------------------------
+# Resume (MB-E): skip (ctx, users, task) tests whose atoms already exist in
+# the --output file. The atoms layer (atomize.py) is the source of truth for
+# "which tests did this run complete" — the same decomposition that feeds
+# /api/results/atoms and the results page.
+# ---------------------------------------------------------------------------
+
+
+def _resume_atoms(text: str) -> list[dict]:
+    """report.md text -> deduped atoms via the shared atom layer. Local
+    import: atomize imports results_to_html lazily too; keeps module import
+    cheap and cycles impossible."""
+    from model_benchmarker import atomize
+
+    return atomize.latest_occurrences(atomize.atomize_chat_report(text, source="--output", meta={}))
+
+
+def _load_resume_state(path: str, *, force: bool) -> dict[tuple, set[str]]:
+    """Existing atoms from the --output file, keyed (ctx, users) -> tasks.
+
+    Refuses (SystemExit) instead of guessing when the file cannot be trusted:
+    unreadable, status "complete" without --resume-force, or empty after
+    parsing (nothing to resume from; a fresh run is the honest behavior).
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"--resume: cannot read {path!r}: {exc}") from None
+    if not force and re.search(r"^Status: complete", text, re.MULTILINE):
+        raise SystemExit(
+            f"--resume: {path!r} is marked complete — nothing to resume. "
+            "Use --resume-force to re-run every level into a fresh file."
+        )
+    atoms = _resume_atoms(text)
+    if not atoms:
+        raise SystemExit(f"--resume: no completed test rows in {path!r} — run without --resume (nothing to skip).")
+    state: dict[tuple, set[str]] = {}
+    for a in atoms:
+        t = a.get("test") or {}
+        try:
+            key = (int(t.get("ctx", 0)), int(t.get("users", 0)))
+        except (TypeError, ValueError):
+            continue
+        state.setdefault(key, set()).add(str(t.get("task")))
+    return state
+
+
+def _resume_config_fingerprint(args: argparse.Namespace) -> str:
+    """The run-shape flags that make resumed numbers comparable to the
+    skipped ones (arrival mechanics + task mix + sampling overrides). Model
+    identity is compared separately (it is the 'this model' part of the
+    atom); url is compared as-is."""
+    parts = [
+        f"arrival={args.arrival_mode}",
+        f"rpu={args.requests_per_user}",
+        f"tasks={','.join(t.name for t in resolve_tasks(args))}",
+        # request-semantics flags: a resumed run MUST match these or the
+        # mixed numbers compare turn-1 prefill against cache-warm turns
+        f"multiturn={args.multiturn}",
+        f"no_nonce={args.no_nonce}",
+        f"separate_tasks={args.separate_tasks}",
+    ]
+    if args.arrival_mode == "open":
+        parts.append(f"rate={args.request_rate}")
+        parts.append(f"level_duration={args.level_duration}")
+    if args.max_tokens is not None:
+        parts.append(f"max_tokens={args.max_tokens}")
+    if args.temperature is not None:
+        parts.append(f"temperature={args.temperature}")
+    if args.top_p is not None:
+        parts.append(f"top_p={args.top_p}")
+    return "|".join(parts)
+
+
+def _resume_header_values(text: str) -> dict:
+    """Pull model / url / config fingerprint out of a report header's bullets
+    ('- Model: ...', '- URL: ...' style bullets written by write_results_file
+    from run_header — the first bullet list in the file)."""
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s.startswith("- "):
+            continue
+        for key, pattern in (
+            ("model", r"^- Model: \S+ name='([^']*)'"),
+            ("url", r"^- URL: (\S+)"),
+            ("config", r"^- Resume fingerprint: (.+)$"),
+        ):
+            m = re.match(pattern, s)
+            if m:
+                out[key] = m.group(1)
+        if s.startswith("- Status"):
+            break
+    return out
+
+
+def _resume_seed_rows(text: str) -> list[LevelRow]:
+    """Existing atoms -> LevelRow list so the resumed run's --output file is
+    the UNION of the old measurements and the new ones (every intermediate
+    rewrite preserves the skipped levels; the final table shows the whole
+    sweep). Percentile dicts rebuild positionally ([P50, P95, P99, P100]);
+    aggregates the atoms do not carry (itl_mean, n_requests, goodput) default
+    — the table cells the artifacts render are all preserved."""
+    atoms = _resume_atoms(text)
+    rows: list[LevelRow] = []
+    for a in atoms:
+        m = a.get("metrics") or {}
+        test = a.get("test") or {}
+
+        def pct(block: Any) -> dict[str, float] | None:
+            if not isinstance(block, dict):
+                return None
+            out = {}
+            for i, p in enumerate(("P50", "P95", "P99", "P100")):
+                v = block.get(p.lower())
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    return None
+                out[p] = float(v)
+            return out
+
+        ttft = pct(m.get("ttft_ms"))
+        tps = pct(m.get("tokens_per_s"))
+        if ttft is None or tps is None:
+            continue
+        rows.append(
+            LevelRow(
+                ctx=int(test.get("ctx", 0)),
+                users=int(test.get("users", 0)),
+                task=str(test.get("task", "")),
+                failed=int(m.get("failed") or 0),
+                ttft=ttft,
+                ttft_post=pct(m.get("ttft_post_ms")),
+                tps=tps,
+                itl=pct(m.get("itl_ms")),
+                tpot=pct(m.get("tpot_ms")),
+                arrival=str(a.get("arrival") or "closed"),
+            )
+        )
+    return rows
+
+
+def _resume_check(args: argparse.Namespace, src_path: str | None = None) -> dict[tuple, set[str]]:
+    """Full resume gate on ``src_path`` (the artifact whose completed levels
+    to skip; defaults to --output): load its atoms and refuse mismatches
+    loudly. Returns the skip map for the sweep loop."""
+    src_path = src_path or args.output
+    state = _load_resume_state(src_path, force=args.resume_force)
+    text = Path(src_path).read_text(encoding="utf-8")
+    header = _resume_header_values(text)
+    if header.get("model"):
+        requested = args.model or "auto"
+        if requested != "auto" and header["model"] != requested:
+            raise SystemExit(
+                f"--resume: model mismatch — {src_path!r} holds {header['model']!r}, "
+                f"--model {args.model!r} requested. Use --resume-force to override."
+            )
+    url_now = (args.url or "").rstrip("/")
+    if header.get("url") and header["url"].rstrip("/") != url_now:
+        raise SystemExit(
+            f"--resume: target mismatch — {src_path!r} benchmarked {header['url']!r}, "
+            f"--url {args.url!r} requested. Use --resume-force to override."
+        )
+    if header.get("config") and header["config"] != _resume_config_fingerprint(args):
+        raise SystemExit(
+            f"--resume: run-shape mismatch — {src_path!r} was produced with "
+            f"[{header['config']}], the requested run is [{_resume_config_fingerprint(args)}]. "
+            "Use --resume-force to override."
+        )
+    return state
 
 
 def resolve_tasks(args: argparse.Namespace) -> list[Task]:
@@ -1844,6 +2039,11 @@ async def main() -> None:
         "TPOT = (stream_end − first_token)/(tokens−1); burst-guarded requests "
         "(single-burst responses) are flagged, their TPOT is approximate."
     )
+    if (args.resume or args.resume_from) and not args.resume_force:
+        # stamp the run-shape fingerprint + url into every rewrite of the
+        # artifact so a LATER resume of THIS file re-validates the same way
+        header_lines.append(f"URL: {args.url}")
+        header_lines.append(f"Resume fingerprint: {_resume_config_fingerprint(args)}")
     header_lines.append("")
     for line in header_lines:
         print(line)
@@ -1896,6 +2096,23 @@ async def main() -> None:
         except OSError as exc:
             print(f"Warning: could not write intermediate table to {args.output}: {exc}")
 
+    # MB-E resume: parse the source artifact's atoms BEFORE the sweep; tests
+    # already present are skipped (unless --resume-force). Two entry forms:
+    # --resume (source = the --output file, in-place continue) and
+    # --resume-from FILE (source = FILE; the webapp emits ONLY this form).
+    # The gate must accept BOTH — gate-checking args.resume alone made the
+    # entire webapp resume flow dead code (found by adversarial review).
+    resume_state: dict[tuple, set[str]] = {}
+    resumed_skipped = 0
+    resume_active = bool((args.resume or args.resume_from) and not args.resume_force)
+    if resume_active and (args.output or args.resume_from):
+        resume_src = args.resume_from or args.output
+        resume_text = Path(resume_src).read_text(encoding="utf-8")
+        resume_state = _resume_check(args, resume_src)
+        rows = _resume_seed_rows(resume_text)  # the file's measurements join rows up front
+        skipped_desc = ", ".join(f"ctx={c} N={u}: {sorted(ts)}" for (c, u), ts in sorted(resume_state.items()))
+        print(f"RESUME: skipping completed tests from {resume_src}: {skipped_desc}")
+
     if open_loop:
         total_levels = len(ctx_levels) * len(user_levels) * (len(tasks) if args.separate_tasks else 1)
     else:
@@ -1913,6 +2130,14 @@ async def main() -> None:
                     # run their turns on just this task back-to-back, so each task
                     # gets a clean turn-1 (prefill) vs turns 2+ (prefix reuse) split.
                     for task in tasks:
+                        done = resume_state.get((ctx, n_users), set())
+                        if task.name in done:
+                            resumed_skipped += 1
+                            print(
+                                f"RESUME: skip ctx={ctx} N={n_users} {task.name} "
+                                "(already in --output; --resume-force to re-run)"
+                            )
+                            continue
                         await _run_level(
                             model,
                             [task],
@@ -1927,9 +2152,26 @@ async def main() -> None:
                         completed_levels += 1
                         update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
                 else:
+                    done = resume_state.get((ctx, n_users), set())
+                    skipped = [t.name for t in tasks if t.name in done]
+                    live_tasks = [t for t in tasks if t.name not in done]
+                    if skipped and not live_tasks:
+                        resumed_skipped += 1
+                        print(
+                            f"RESUME: skip ctx={ctx} N={n_users} ({', '.join(skipped)} "
+                            "already in --output; --resume-force to re-run)"
+                        )
+                        continue
+                    if skipped:
+                        print(
+                            f"RESUME: ctx={ctx} N={n_users} re-running only "
+                            f"{', '.join(t.name for t in live_tasks)} ({', '.join(skipped)} already done)"
+                        )
+                    if not live_tasks:
+                        continue
                     await _run_level(
                         model,
-                        tasks,
+                        live_tasks,
                         n_users,
                         ctx,
                         args,
@@ -1942,6 +2184,11 @@ async def main() -> None:
                     update_output(f"in progress — {completed_levels}/{total_levels} levels completed")
 
         if not rows:
+            # every configured level was already done — the resume is a no-op
+            if resumed_skipped and not args.resume_force:
+                status = f"complete — all {total_levels} levels were already in --output (nothing to run)"
+                print(f"RESUME: {status}")
+                return
             raise SystemExit("No successful requests; nothing to report.")
 
         print(summary_head)

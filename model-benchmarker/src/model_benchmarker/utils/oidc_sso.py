@@ -49,6 +49,7 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
+
 def _sibling(mod_name: str):
     """Import a pcai_utils sibling module from wherever THIS file was imported.
 
@@ -166,11 +167,7 @@ def sso_enabled() -> bool:
         return False
     oidc_identity = _sibling("oidc_identity")
 
-    return (
-        bool(_env_str(CLIENT_SECRET_ENV))
-        and bool(redirect_uri())
-        and oidc_identity.oidc_enabled()
-    )
+    return bool(_env_str(CLIENT_SECRET_ENV)) and bool(redirect_uri()) and oidc_identity.oidc_enabled()
 
 
 def warn_if_misconfigured(server_label: str) -> bool:
@@ -282,7 +279,7 @@ def _urlopen(req, timeout: float):
         except Exception:
             ssl_ctx = None
     if _is_private_target(target):
-        handlers = [urllib.request.ProxyHandler({})]
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
         if ssl_ctx is not None:
             handlers.append(urllib.request.HTTPSHandler(context=ssl_ctx))
         opener = urllib.request.build_opener(*handlers)

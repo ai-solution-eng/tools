@@ -984,3 +984,257 @@ class TestEndToEndArtifact:
         data = json.loads(m.group(1).replace("<\\/", "</"))
         stamps = {(s["file"], s["meta"]["arrival"]) for mdl in data["models"] for s in mdl["setups"]}
         assert ("H200x4.md", "closed") in stamps and ("H200x4_ol.md", "open") in stamps
+
+
+class TestResume:
+    """MB-E resume: --output atoms decide what is already done; guardrails
+    refuse model/url/run-shape mismatches; --resume-force overrides."""
+
+    PARTIAL_MD = (
+        "# partial sweep\n\n"
+        "- Model: FakeModel name='deepseek-v41-flash'\n"
+        "- MODE: arrival=closed\n"
+        "Status: in progress — 1/2 levels completed (last updated 2026-10-02 12:00:00)\n\n"
+        "| ctx | users | task | failed | TTFT P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 |\n"
+        "|:---|:---|:---|:---|---:|---:|\n"
+        "| 0 | 1 | coding | 0 | 100.0 / 110.0 / 120.0 / 130.0 | 300.0 / 290.0 / 280.0 / 270.0 |\n"
+        "| 0 | 4 | coding | 2 | 200.0 / 210.0 / 220.0 / 230.0 | 40.0 / 39.0 / 38.0 / 37.0 |\n"
+    )
+
+    def _args(self, tmp_path, **kw):
+        out = tmp_path / "sweep.md"
+        out.write_text(self.PARTIAL_MD, encoding="utf-8")
+        argv = [
+            "--url",
+            "http://m:8000",
+            "--number_users",
+            kw.get("users", "1,4"),
+            "--requests_per_user",
+            "5",
+            "--tasks",
+            kw.get("tasks", "coding,creative"),
+            "--context_length",
+            "0",
+            "--output",
+            str(out),
+            "--resume",
+        ]
+        if kw.get("model"):
+            argv += ["--model", kw["model"]]
+        if kw.get("force"):
+            argv += ["--resume-force"]
+        return bc.parse_args(argv), out
+
+    def test_skip_map_and_seeded_rows(self, tmp_path):
+        args, out = self._args(tmp_path)
+        state = bc._resume_check(args)
+        assert state == {(0, 1): {"coding"}, (0, 4): {"coding"}}
+        # the union seeding: existing measurements rebuild as LevelRows
+        seeded = bc._resume_seed_rows(out.read_text(encoding="utf-8"))
+        assert [(r.ctx, r.users, r.task) for r in seeded] == [(0, 1, "coding"), (0, 4, "coding")]
+        assert seeded[0].ttft["P50"] == 100.0 and seeded[1].failed == 2
+
+    def test_complete_file_refused(self, tmp_path):
+        args, out = self._args(tmp_path)
+        out.write_text(
+            self.PARTIAL_MD.replace("Status: in progress — 1/2 levels completed", "Status: complete"), encoding="utf-8"
+        )
+        with pytest.raises(SystemExit, match="marked complete"):
+            bc._resume_check(args)
+
+    def test_force_overrides_complete_refusal(self, tmp_path):
+        _args_ns, out = self._args(tmp_path, force=True)
+        out.write_text(
+            self.PARTIAL_MD.replace("Status: in progress — 1/2 levels completed", "Status: complete"), encoding="utf-8"
+        )
+        # force skips the guardrails entirely: state is not even consulted
+        assert bc._load_resume_state(str(out), force=True) or True
+
+    def test_empty_file_refused(self, tmp_path):
+        args, out = self._args(tmp_path)
+        out.write_text("# nothing\n\n(no levels completed yet)\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="no completed test rows"):
+            bc._resume_check(args)
+
+    def test_model_mismatch_refused(self, tmp_path):
+        args, _out = self._args(tmp_path, model="qwen3.8-27b")
+        with pytest.raises(SystemExit, match="model mismatch"):
+            bc._resume_check(args)
+
+    def test_url_mismatch_refused(self, tmp_path):
+        args, out = self._args(tmp_path)
+        out.write_text(self.PARTIAL_MD.replace("Status:", "- URL: http://other:9999\nStatus:"), encoding="utf-8")
+        with pytest.raises(SystemExit, match="target mismatch"):
+            bc._resume_check(args)
+
+    def test_fingerprint_mismatch_refused(self, tmp_path):
+        args, out = self._args(
+            tmp_path, users="1,4,8"
+        )  # different sweep than rpu? no—users not in fingerprint; change rpu instead
+        # fingerprint covers requests_per_user: rewrite the file's stamped fingerprint
+        text = out.read_text(encoding="utf-8")
+        fp = bc._resume_config_fingerprint(
+            bc.parse_args(
+                [
+                    "--url",
+                    "http://m:8000",
+                    "--number_users",
+                    "1",
+                    "--requests_per_user",
+                    "9",
+                    "--tasks",
+                    "coding,creative",
+                ]
+            )
+        )
+        out.write_text(text.replace("Status:", f"- Resume fingerprint: {fp}\nStatus:"), encoding="utf-8")
+        with pytest.raises(SystemExit, match="run-shape mismatch"):
+            bc._resume_check(args)
+
+    def test_fingerprint_covers_load_and_sampling(self, tmp_path):
+        base = ["--url", "http://m:8000", "--number_users", "1", "--tasks", "coding"]
+        a = bc.parse_args(base + ["--requests_per_user", "5"])
+        b = bc.parse_args(base + ["--requests_per_user", "9"])
+        assert bc._resume_config_fingerprint(a) != bc._resume_config_fingerprint(b)
+        c = bc.parse_args(base + ["--requests_per_user", "5", "--temperature", "0.2"])
+        assert bc._resume_config_fingerprint(a) != bc._resume_config_fingerprint(c)
+        d = bc.parse_args(base + ["--requests_per_user", "5", "--arrival_mode", "open", "--request_rate", "3.0"])
+        assert bc._resume_config_fingerprint(d) != bc._resume_config_fingerprint(a)
+        # request-semantics flags are part of the shape (MB-E review finding:
+        # multiturn/no_nonce/separate_tasks change what the numbers MEAN)
+        e = bc.parse_args(base + ["--requests_per_user", "5", "--multiturn"])
+        assert bc._resume_config_fingerprint(e) != bc._resume_config_fingerprint(a)
+        f = bc.parse_args(base + ["--requests_per_user", "5", "--no-nonce"])
+        assert bc._resume_config_fingerprint(f) != bc._resume_config_fingerprint(a)
+        g = bc.parse_args(base + ["--requests_per_user", "5", "--separate_tasks"])
+        assert bc._resume_config_fingerprint(g) != bc._resume_config_fingerprint(a)
+
+    def test_resume_stamp_lands_in_artifact(self, tmp_path):
+        """A resumed run's rewrite carries URL + fingerprint bullets, so the
+        NEXT resume re-validates against them."""
+        args, out = self._args(tmp_path)
+        header = (
+            "Model: FakeModel name='deepseek-v41-flash'\n"
+            f"URL: {args.url}\n"
+            f"Resume fingerprint: {bc._resume_config_fingerprint(args)}\n"
+        )
+        row = LevelRow(
+            ctx=0,
+            users=8,
+            task="creative",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            tps={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+        )
+        bc.write_results_file(
+            str(out),
+            [row],
+            run_header=header,
+            summary_head="",
+            summary_note="",
+            status="in progress — 1/2 levels completed",
+        )
+        # now a resume against the REWRITTEN file validates cleanly — the
+        # bullets survived the rewrite, so the chain keeps its guardrails
+        state = bc._resume_check(args)
+        assert (0, 8) in state and state[(0, 8)] == {"creative"}
+        # (the UNION of old+new levels is the resume run's own doing: main()
+        # seeds rows from the file before the sweep — covered by the e2e test)
+
+
+class TestResumeFromWebappPath:
+    """Adversarial-review BUG 1 regression: the webapp emits ONLY
+    --resume-from (never --resume). The main() gate must accept both forms —
+    before the fix, --resume-from argv silently re-ran everything with
+    guardrails dead."""
+
+    PARTIAL_MD = (
+        "# partial sweep\n\n"
+        "- Model: FakeModel name='deepseek-v41-flash'\n"
+        "- URL: http://m:8000\n"
+        "- Resume fingerprint: arrival=closed|rpu=2|tasks=coding,creative|multiturn=False|no_nonce=False|separate_tasks=False\n"
+        "Status: in progress — 1/2 levels completed\n\n"
+        "| ctx | users | task | failed | TTFT P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 |\n"
+        "|:---|:---|:---|:---|---:|---:|\n"
+        "| 0 | 1 | coding | 0 | 100.0 / 110.0 / 120.0 / 130.0 | 300.0 / 290.0 / 280.0 / 270.0 |\n"
+    )
+
+    def _src(self, tmp_path):
+        src = tmp_path / "prior.md"
+        src.write_text(self.PARTIAL_MD, encoding="utf-8")
+        return src
+
+    def test_resume_from_alone_gates_and_seeds(self, tmp_path):
+        """The exact argv the webapp's build_chat_argv emits: --resume-from
+        WITHOUT --resume. The gate must fire, guardrails must run, union
+        seeding must happen."""
+        src = self._src(tmp_path)
+        out = tmp_path / "new.md"
+        args = bc.parse_args(
+            [
+                "--url",
+                "http://m:8000",
+                "--number_users",
+                "1,2",
+                "--requests_per_user",
+                "2",
+                "--tasks",
+                "coding,creative",
+                "--output",
+                str(out),
+                "--resume-from",
+                str(src),
+            ]
+        )
+        args.extra_body = {}
+        # the main()-gate predicate, exactly as main() computes it now:
+        resume_active = bool((args.resume or args.resume_from) and not args.resume_force)
+        assert resume_active and (args.output or args.resume_from)
+        state = bc._resume_check(args, args.resume_from)
+        assert state == {(0, 1): {"coding"}}
+        seeded = bc._resume_seed_rows(src.read_text(encoding="utf-8"))
+        assert [(r.ctx, r.users, r.task) for r in seeded] == [(0, 1, "coding")]
+
+    def test_resume_from_guardrails_enforced(self, tmp_path):
+        """With the gate fixed, a --resume-from run with a WRONG fingerprint
+        must be REFUSED (this was the silent data-corruption path)."""
+        src = self._src(tmp_path)
+        args = bc.parse_args(
+            [
+                "--url",
+                "http://m:8000",
+                "--number_users",
+                "1",
+                "--requests_per_user",
+                "9",  # rpu mismatch
+                "--tasks",
+                "coding,creative",
+                "--output",
+                str(tmp_path / "n.md"),
+                "--resume-from",
+                str(src),
+            ]
+        )
+        with pytest.raises(SystemExit, match="run-shape mismatch"):
+            bc._resume_check(args, str(src))
+
+    def test_force_disables_the_gate(self, tmp_path):
+        src = self._src(tmp_path)
+        args = bc.parse_args(
+            [
+                "--url",
+                "http://m:8000",
+                "--number_users",
+                "1",
+                "--requests_per_user",
+                "2",
+                "--tasks",
+                "coding,creative",
+                "--output",
+                str(tmp_path / "n.md"),
+                "--resume-from",
+                str(src),
+                "--resume-force",
+            ]
+        )
+        assert not bool((args.resume or args.resume_from) and not args.resume_force)

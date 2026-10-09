@@ -35,6 +35,13 @@ from .gpus import GpuSpec
 # activation + CUDA/graph working-set reserve per GPU (calibrate via phase 2)
 DEFAULT_OVERHEAD_GIB = 2.0
 
+# Host-RAM the engine itself needs on top of the engram tables when
+# SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 pins them in host memory. Measured
+# on the live seed deployment: 207 GiB container working set - 183.1 GiB
+# tables = ~24 GiB (tokenizer, schedulers, host-side KV/HiCache bookkeeping,
+# the SGLang process itself). Used ONLY for the host-budget adequacy check.
+ENGRAM_HOST_RUNTIME_GIB = 24.0
+
 
 @dataclass
 class HicacheSpec:
@@ -73,6 +80,34 @@ class HicacheSpec:
 
 
 @dataclass
+class EngramSpec:
+    """DeepSeek-V4.1 engram (n-gram memory) table placement.
+
+    The checkpoint ships one fp8 lookup table per engram layer (rows x
+    engram_head_dim). SGLang rows-shards them across the TP group on GPU by
+    DEFAULT; ``SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`` pins them in host
+    RAM instead, freeing HBM for the KV pool (layout knob
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = shared | per_rank; either way
+    the host holds the full table -- 'shared' one copy all ranks read,
+    'per_rank' one shard per rank).
+
+    mode: "" (tables are VRAM weights, the default layout)
+        | "host" (host-table offload: out of HBM, into the host-RAM budget)
+    dtype: table storage dtype (None = the checkpoint's fp8)
+    host_gib: host-RAM budget for the tables (0 = no budget check) -- the
+        deployment's container memory limit is the natural value.
+    """
+
+    mode: str = ""  # "" (VRAM default layout) | "host"
+    dtype: str | None = None
+    host_gib: float = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self.mode in ("", "host")
+
+
+@dataclass
 class SpeculativeSpec:
     """Speculative-decoding shape (the engines' --speculative-* semantics).
 
@@ -95,6 +130,33 @@ class SpeculativeSpec:
 
 
 @dataclass
+class MambaSpec:
+    """The mamba/KDA recurrent-state pool knobs (linear-attention models:
+    Qwen3-Next / qwen4_exp, GLM-5.3-Flash's KDA layers, DeepSeek sparse
+    hybrids). The state pool is a SEPARATE concurrency ceiling on top of
+    the KV pool: SGLang splits device memory between them.
+
+    full_memory_ratio: --mamba-full-memory-ratio — the fraction of the
+        (mem-fraction) device budget the mamba pool may occupy when the KV
+        pool is under pressure. Default ~0.15-0.3 engine-side for hybrid
+        models; sized up only for mamba-heavy serving. The state needed is
+        bytes_per_seq x layers x concurrent sequences: a deployment aiming
+        at C concurrent x L-token requests needs ratio >=
+        (state_per_seq x C) / (mem_fraction x vram) — the estimator warns
+        when the configured ratio cannot carry the requested concurrency.
+    ssm_dtype: --mamba-ssm-dtype (float32 | bfloat16) — the state storage
+        width; float32 doubles per-sequence state vs bfloat16.
+    """
+
+    full_memory_ratio: float | None = None  # None = engine default, no split modeled
+    ssm_dtype: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.full_memory_ratio is not None
+
+
+@dataclass
 class EstimateRequest:
     """One estimation scenario."""
 
@@ -103,23 +165,53 @@ class EstimateRequest:
     gpu_count: int = 1
     tp_size: int = 1
     pp_size: int = 1
+    # the model ref the config came from (HF repo id / local dir) -- enables
+    # the checkpoint-size lookup (model.safetensors.index.json)
+    model_ref: str = ""
     weight_dtype: str | None = None
     kv_dtype: str | None = None
+    # compressed-state storage dtype (DeepSeek families: the deployment's
+    # SGLANG_DSV4_COMPRESS_STATE_DTYPE env -- fp4 checkpoint default vs bf16)
+    state_dtype: str | None = None
+    # linear-attention recurrent-state dtype (mamba float32 vs bfloat16;
+    # default from the config's mamba_ssm_dtype). CANONICAL home: the same
+    # knob also exists as MambaSpec.ssm_dtype (the engine's
+    # --mamba-ssm-dtype lives with the other mamba flags); __post_init__
+    # reconciles the two so either spelling prices identically.
+    ssm_dtype: str | None = None
     mem_fraction: float = 0.9
     overhead_gib: float = DEFAULT_OVERHEAD_GIB
     context: int = 32768
     # speculative decoding: DFLASH draft model / MTP-family draft layers
     speculative: SpeculativeSpec | None = None
+    # engram n-gram memory tables (DeepSeek-V4.1): VRAM (default layout) or host
+    engram: EngramSpec = field(default_factory=EngramSpec)
+    # mamba/KDA recurrent-state pool split + dtype (linear-attention models)
+    mamba: MambaSpec = field(default_factory=MambaSpec)
+    # concurrent sequences the mamba pool must carry (default: the context
+    # concurrency) — used only for the ratio adequacy warning
+    mamba_concurrency: int = 0  # 0 = check against the KV-pool concurrency
     # hierarchical KV cache tiers (L2 host RAM / L3 backing store)
     hicache: HicacheSpec = field(default_factory=HicacheSpec.off)
     # expert-parallel size: experts shard ep-ways (attention stays TP)
     ep_size: int = 1
     # MoE runner backend (flashinfer_mxfp4/marlin store experts at 4-bit)
     moe_runner: str | None = None
+    # advisory notes populated during the estimate (e.g. EP/PP cap warnings);
+    # merged into the result warnings by run_estimate
+    notes_ep: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.tp_size = min(self.tp_size, self.gpu_count)  # TP cannot exceed the GPU count
         self.pp_size = min(self.pp_size, self.gpu_count)  # PP cannot exceed the GPU count
+        # ONE SSM-state dtype, two spellings (EstimateRequest.ssm_dtype and
+        # MambaSpec.ssm_dtype). Reconcile here so every consumer -- including
+        # the mamba-pool adequacy check -- sees the same value regardless of
+        # which spelling the caller used.
+        if self.ssm_dtype and not self.mamba.ssm_dtype:
+            self.mamba.ssm_dtype = self.ssm_dtype
+        elif self.mamba.ssm_dtype and not self.ssm_dtype:
+            self.ssm_dtype = self.mamba.ssm_dtype
 
 
 @dataclass
@@ -198,26 +290,47 @@ def _weights_per_gpu(wbytes: float, req: EstimateRequest) -> float:
         share = _expert_param_share(req.cfg)
         ep_bytes = wbytes * share / req.ep_size
         dense_bytes = wbytes * (1 - share) / stage
+        if req.ep_size > max(1, req.gpu_count // max(req.pp_size, 1)):
+            # experts shard ep-ways GLOBALLY; when PP stages the layers, each
+            # stage group only spans gpu_count/pp GPUs -- an ep_size beyond
+            # that cannot be realized (the engines cap ep at the stage width)
+            req.notes_ep = req.notes_ep or []
+            req.notes_ep.append(
+                f"EP{req.ep_size} exceeds the PP{req.pp_size} stage width "
+                f"({max(1, req.gpu_count // req.pp_size)} GPUs/stage) -- engines cap EP there; "
+                "the estimate below assumes the full EP split and is optimistic"
+            )
         return ep_bytes + dense_bytes
     return wbytes / stage
 
 
-def _tp_replicated_kv(cfg: ModelConfig, tp_size: int) -> bool:
-    """True when the device KV layout is TP-REPLICATED: the pool cannot shard
-    because the per-token stream lives once per rank (MQA/MLA latent streams).
+def kv_replication_factor(cfg: ModelConfig, tp_size: int) -> int:
+    """How many TP ranks jointly store each token's KV stream (>=1).
 
-    The two structural cases:
-    - ``kv_heads < tp`` (MQA on wide TP): a single KV head cannot shard, so
-      engines replicate it on every rank.
-    - MLA families: the compressed latent is ONE stream per token (the
-      config's ``num_key_value_heads`` counts projection heads, not latent
-      streams), so the latent is replicated across TP ranks regardless of tp.
+    The layout is a spectrum, not binary:
+    - ``kv_heads >= tp``: heads shard cleanly, the group stores ONE copy of
+      each token (factor 1).
+    - ``1 < kv_heads < tp``: heads cannot shard tp-ways, so each head is
+      REPLICATED across tp/kv_heads ranks (e.g. Qwen3.8-27B hybrid,
+      kv_heads=4 on TP8: every head lives on 2 ranks). The group stores
+      tp/kv_heads copies — the old binary rule called this "replicated" and
+      undercounted pool capacity by kv_heads x.
+    - ``kv_heads == 1`` (MQA) / MLA latent streams: every rank holds the
+      FULL stream (factor tp) — wide TP adds speed, not tokens.
     """
     mt = cfg.model_type or ""
-    if mt.startswith(("deepseek_v2", "deepseek_v3")) or "dsa" in mt:
-        return True  # MLA latent stream: one per token per rank
+    if mt.startswith(("deepseek_v2", "deepseek_v3", "deepseek_v4")) or "dsa" in mt:
+        return max(tp_size, 1)  # MLA latent / V4-family MQA store: one per rank
     kv_heads = cfg.num_key_value_heads if cfg.num_key_value_heads is not None else cfg.num_attention_heads
-    return (kv_heads or 1) < tp_size
+    return max(1, tp_size // max(kv_heads or 1, 1))
+
+
+def _tp_replicated_kv(cfg: ModelConfig, tp_size: int) -> bool:
+    """True when the device KV layout is TP-REPLICATED: the pool cannot shard
+    because the per-token stream lives once per rank (MQA/MLA latent streams,
+    or kv_heads that do not reach the TP width). See
+    :func:`kv_replication_factor` for the partial-shard spectrum."""
+    return kv_replication_factor(cfg, tp_size) > 1
 
 
 def _cache_tiers(
@@ -247,15 +360,20 @@ def _cache_tiers(
         return CacheTiers()
 
     replicas = max(1, req.gpu_count // req.tp_size) if req.tp_size >= 1 else 1
-    tp_replicated = _tp_replicated_kv(req.cfg, req.tp_size) if h.l2_tp_replicated is None else h.l2_tp_replicated
+    rep_factor = (
+        kv_replication_factor(req.cfg, req.tp_size)
+        if h.l2_tp_replicated is None
+        else (req.tp_size if h.l2_tp_replicated else 1)
+    )
     notes: list[str] = []
 
     pool_gib = (kv_pool_per_gpu or 0.0) / 1024**3
     if h.l2_mode == "ratio":
         # per-replica L2 bytes: ratio x the device pool, in the engine's layout
         # (sharded: every rank's pool = ratio x that rank's device pool;
-        #  replicated/MLA: write-back dedupes to one copy = one rank's pool)
-        l2_gib = pool_gib * h.l2_ratio * (1 if tp_replicated else req.tp_size)
+        #  replicated: each rank's pool holds the full stream, but write-back
+        #  dedupes to one copy per tp/rep-factor ranks = one rank's pool)
+        l2_gib = pool_gib * h.l2_ratio * (rep_factor / req.tp_size if rep_factor > 1 else req.tp_size)
         if h.l2_ratio > 0:
             notes.append(f"L2 = hicache-ratio {h.l2_ratio:g} x the {pool_gib:.1f} GiB/GPU device pool")
     elif h.l2_mode == "size":
@@ -280,10 +398,13 @@ def _cache_tiers(
         notes.append(
             f"{replicas} replicas x {req.tp_size} GPUs: the host pool is allocated PER REPLICA (instance-private)"
         )
-    if tp_replicated:
-        notes.append(
+    if rep_factor > 1:
+        note = (
             "MLA/MQA layout: host tier stores ONE deduplicated stream per token (per-rank pools hold the full stream; write-back dedupes)"
+            if rep_factor == req.tp_size
+            else f"partial-shard layout: kv_heads replicate x{rep_factor} across TP{req.tp_size}; host tier dedupes to one stream per {rep_factor} ranks"
         )
+        notes.append(note)
     else:
         notes.append(f"TP{req.tp_size} layout: each rank's host pool holds its 1/{req.tp_size} share of each token")
 
@@ -309,13 +430,55 @@ def _cache_tiers(
 def run_estimate(req: EstimateRequest) -> EstimateResult:
     """Run one estimation scenario."""
     cfg = req.cfg
-    wbytes, wdetails = weight_bytes_estimate(cfg, req.weight_dtype, req.moe_runner)
-    kv_bpt, kvdetails = kv_bytes_per_token(cfg, req.kv_dtype)
+    # mamba ssm dtype: the MambaSpec carries the --mamba-ssm-dtype value;
+    # the standalone ssm_dtype field stays as the manual override
+    ssm_dtype_eff = req.ssm_dtype or req.mamba.ssm_dtype
+    # engram tables first (they ride INSIDE the checkpoint index total and
+    # are lifted out of the weight figure; placed separately below)
+    engram_bytes_total: float | None = None
+    engram_details: dict = {}
+    es = req.engram
+    try:
+        from .configs import checkpoint_total_bytes, engram_table_bytes
+
+        engram_bytes_total, engram_details = engram_table_bytes(cfg, es.dtype)
+        # the EXACT stored checkpoint size (model.safetensors.index.json
+        # metadata.total_size) -- authoritative for mixed-dtype checkpoints
+        # (MoE fp4 + attention fp8, Kimi-style mxfp4 experts). Falls back to
+        # the shape-derived bytes/param figure when the index is absent.
+        ckpt_bytes, ckpt_source = checkpoint_total_bytes(req.model_ref or "")
+    except Exception:  # pragma: no cover — never break an estimate on the engram path
+        engram_details = {"present": True, "parse_ok": False}
+        ckpt_bytes, ckpt_source = None, ""
+    wbytes, wdetails = weight_bytes_estimate(
+        cfg,
+        req.weight_dtype,
+        req.moe_runner,
+        int(ckpt_bytes) if ckpt_bytes else None,
+        int(engram_bytes_total) if engram_bytes_total else None,
+    )
+    kv_bpt, kvdetails = kv_bytes_per_token(cfg, req.kv_dtype, req.state_dtype, ssm_dtype_eff)
+    if ckpt_bytes:
+        wdetails["checkpoint_bytes_total"] = float(ckpt_bytes)
+        wdetails["checkpoint_source"] = ckpt_source
+        wdetails["notes"] = list(wdetails.get("notes", [])) + [
+            f"weights = the checkpoint's exact stored size ({ckpt_bytes / 1024**3:.1f} GiB total, "
+            + (
+                f"engram tables {engram_bytes_total / 1024**3:.1f} GiB placed separately, "
+                if engram_bytes_total
+                else ""
+            )
+            + "per model.safetensors.index.json)"
+        ]
     warnings: list[str] = wdetails.get("notes", [])
     if kvdetails.get("note"):
         # family notes (e.g. the linear-attention per-sequence state pool)
         # ride the warnings block -- they qualify the headline number
         warnings.append(str(kvdetails["note"]))
+    for csa2w in kvdetails.get("csa2_structure_warnings") or []:
+        # schedule-structure deviations (e.g. decoder layer count not a
+        # multiple of the report's group size) qualify the stored-layer model
+        warnings.append(f"CSA2 schedule structure: {csa2w} — the stored-layer count assumes the report's grouping")
     if req.pp_size > 1:
         warnings.append(
             f"pipeline parallel PP{req.pp_size}: weights stage-split (x{req.pp_size} lighter per GPU); "
@@ -369,12 +532,83 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
             kvdetails["speculative_draft_tokens"] = spec.draft_tokens
 
     usable_per_gpu = req.gpu.vram_bytes * req.mem_fraction - req.overhead_gib * 1024**3
+
+    # --- engram (n-gram memory) tables: placement ---------------------------
+    # (engram_bytes_total was computed at the top of run_estimate and lifted
+    # out of the checkpoint weight figure; here it is PLACED: the default
+    # SGLang layout rows-shards the tables across TP on GPU — added back to
+    # weights_per_gpu — while the host-table offload keeps them out of HBM
+    # entirely, a host-RAM requirement instead.)
+    es = req.engram
+    if engram_bytes_total is not None:
+        eb = float(engram_bytes_total)
+        if es.mode == "host":
+            engram_details["mode"] = "host"
+            engram_details["host_bytes"] = eb
+            warnings.append(
+                f"engram host table: {eb / 1024**3:.1f} GiB of fp8 n-gram tables pinned in host RAM "
+                "(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1) — freed HBM goes to the KV pool; "
+                "no HiCache tier is added (engram tables are weights, not tokens)"
+            )
+            # The pod must hold the TABLES **plus** the engine's own runtime
+            # (measured ~24 GiB on the seed V4.1-Flash deployment: 183.1 GiB
+            # tables + ~24 GiB = 207 GiB working set). Comparing the budget
+            # against the tables alone would pass a 190 GiB limit that OOMs.
+            need = eb + ENGRAM_HOST_RUNTIME_GIB * 1024**3
+            engram_details["host_runtime_gib"] = ENGRAM_HOST_RUNTIME_GIB
+            engram_details["host_need_gib"] = need / 1024**3
+            if es.host_gib and need > es.host_gib * 1024**3:
+                warnings.append(
+                    f"engram host offload needs ~{need / 1024**3:.0f} GiB host RAM "
+                    f"({eb / 1024**3:.1f} GiB tables + ~{ENGRAM_HOST_RUNTIME_GIB:.0f} GiB engine runtime) "
+                    f"but the budget is {es.host_gib:.0f} GiB — raise the pod memory limit or turn the offload off"
+                )
+        else:
+            # default layout: row-sharded across the TP group on GPU
+            engram_details["mode"] = "vram"
+            engram_details["vram_bytes_per_gpu"] = eb / max(req.tp_size, 1)
+            warnings.append(
+                f"engram tables: {eb / 1024**3:.1f} GiB counted as VRAM weights (default row-sharded "
+                f"across TP{req.tp_size}); SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 would free them"
+            )
+        warnings.append(f"engram table size assumption: {engram_details.get('assumption', 'rows x head_dim x 1B')}")
+        kvdetails["_consumed_fields"] = set(kvdetails.get("_consumed_fields") or set()) | {
+            "engram_layer_ids",
+            "engram_num_embeddings",
+            "engram_head_dim",
+        }
+
     weights_per_gpu = _weights_per_gpu(wbytes, req) if wbytes is not None else None
+    warnings.extend(list(req.notes_ep or []))
+    if weights_per_gpu is not None and engram_bytes_total is not None and req.engram.mode != "host":
+        # default layout: the tables shard across TP like any weight
+        weights_per_gpu = weights_per_gpu + engram_bytes_total / max(req.tp_size, 1)
     if weights_per_gpu is not None and draft_weights_bytes is not None:
         # the DFLASH draft model is fully resident alongside the target
         weights_per_gpu = weights_per_gpu + draft_weights_bytes / req.tp_size
         warnings.append(f"draft weights add {draft_weights_bytes / req.tp_size / 1024**3:.1f} GiB/GPU (TP-shared)")
     kv_pool_per_gpu = usable_per_gpu - weights_per_gpu if weights_per_gpu is not None else None
+
+    # --- mamba/KDA state pool: it SPLITs the post-weights device budget ----
+    # (--mamba-full-memory-ratio: the mamba pool may claim up to ratio x the
+    # mem-fraction budget when KV is under pressure, shrinking the KV pool
+    # correspondingly; the engine sizes it by demand, we model the cap.)
+    mamba_details: dict = {}
+    ms = req.mamba
+    if ms.active and kv_pool_per_gpu is not None and ms.full_memory_ratio is not None:
+        ratio = ms.full_memory_ratio
+        budget_per_gpu = usable_per_gpu - (weights_per_gpu or 0.0)
+        mamba_pool_per_gpu = min(ratio * usable_per_gpu, max(budget_per_gpu, 0.0))
+        kv_pool_per_gpu = max(budget_per_gpu - mamba_pool_per_gpu, 0.0)
+        mamba_details = {
+            "full_memory_ratio": ms.full_memory_ratio,
+            "pool_bytes_per_gpu": mamba_pool_per_gpu,
+        }
+        warnings.append(
+            f"mamba state pool: --mamba-full-memory-ratio {ratio:g} reserves "
+            f"~{mamba_pool_per_gpu / 1024**3:.1f} GiB/GPU for the recurrent-state pool; "
+            "the KV pool is what remains"
+        )
 
     kv_tokens_total: float | None = None
     kv_tokens_per_gpu: float | None = None
@@ -383,39 +617,31 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
 
     if kv_pool_per_gpu is not None:
         # TP x KV-heads interaction (the subtle one). A TP group of P GPUs
-        # jointly holds ONE copy of each token's KV when the layout shards,
-        # so sharded capacity = (summed pool) / (full-model bytes/token):
-        #     tokens = pool_per_gpu x gpus / bpt
-        # Toy check: 2xTP, 100B full-stream, 1000B/GPU pool -> 2000/100 = 20
-        # tokens (each rank stores 50B x 20 = its whole 1000B pool; dividing
-        # the summed pool by the per-rank 50B would claim 40).
+        # jointly holds r copies of each token's KV, where
+        # r = kv_replication_factor(cfg, tp): 1 when heads shard cleanly,
+        # tp/kv_heads when each head is replicated across ranks, tp for
+        # single-stream layouts (MQA kv_heads=1 / MLA latents). So
+        #     tokens = (summed pool) / (bpt x r),
+        # and each additional replica (gpu_count // tp) adds one pool.
+        # Toy check: 2xTP sharded, 100B full-stream, 1000B/GPU pool -> 2000/100
+        # = 20 tokens (each rank stores 50B x 20 = its whole 1000B pool;
+        # dividing the summed pool by the per-rank 50B would claim 40).
         # Classic check: Llama-70B 8xA100 TP8 mf0.9 -> ~1.41M tokens, the
         # engines' reported figure (dividing by bpt/tp claims 11.3M).
-        # Replicated layouts (MQA on wide TP / MLA latent streams) hold the
-        # full stream on EVERY rank: one replica = pool/bpt tokens, and each
-        # additional replica (gpu_count // tp) adds one pool's worth.
-        replicated = _tp_replicated_kv(cfg, req.tp_size)
-        if not replicated:
-            # sharded: the TP group jointly stores ONE copy of each token
-            # (bpt/tp on every rank), and each replica adds its own pool.
-            # capacity = (summed pool) / (full-stream bytes/token).
-            # Toy check: 2xTP, 100B full-stream, 1000B/GPU pool -> 2000/100
-            # = 20 tokens (each rank stores 50B x 20 = its whole 1000B pool;
-            # dividing the summed pool by the per-rank 50B would claim 40).
-            # Classic check: Llama-70B 8xA100 TP8 mf0.9 -> ~1.41M tokens (the
-            # engines' reported figure; the prior bpt/tp divisor said 11.3M).
-            kv_tokens_total = kv_pool_per_gpu * req.gpu_count / kv_bpt
-            kv_tokens_per_gpu = kv_tokens_total / req.gpu_count
-        else:
-            # replicated (MQA on wide TP / MLA latent): every rank of a
-            # replica holds the full stream -- wide TP adds speed, not
-            # tokens; additional replicas each add one pool's worth.
-            # kv_tokens_per_gpu stays the replica total: EVERY rank can
-            # address the whole pool (that is what replication means).
-            # Validated: DeepSeek-V4-Flash (kv_heads=1) on 4xH200 TP4 @
-            # mf0.8 -> 3.76M vs the engine's 3.67M (2.4% = DSPARK draft KV).
-            kv_tokens_total = kv_pool_per_gpu * max(1, req.gpu_count // req.tp_size) / kv_bpt
-            kv_tokens_per_gpu = kv_tokens_total
+        # Partial-shard check: kv_heads=4 on TP8 -> r=2 (each head on 2
+        # ranks). At the SAME per-GPU pool TP8 holds the SAME tokens as
+        # sharded TP4 (2x the bytes, 2x the copies); with real pools TP8
+        # adds a little (weights shard 8-ways). The old binary rule called
+        # TP8 fully replicated and undercounted it by 4x.
+        # Fully-replicated check: DeepSeek-V4-Flash (kv_heads=1) on 4xH200
+        # TP4 @ mf0.8 -> 3.76M vs the engine's 3.67M (2.4% = DSPARK draft KV).
+        rep_factor = kv_replication_factor(cfg, req.tp_size)
+        kv_tokens_total = kv_pool_per_gpu * req.gpu_count / (kv_bpt * rep_factor)
+        # per-GPU figure is the replica total when fully replicated (every
+        # rank addresses the whole pool) and the sharded share otherwise
+        kv_tokens_per_gpu = (
+            kv_tokens_total * rep_factor / req.gpu_count if rep_factor > 1 else kv_tokens_total / req.gpu_count
+        )
         fits = kv_pool_per_gpu >= 0
         concurrency = math.floor(kv_tokens_total / req.context) if fits and kv_tokens_total is not None else 0
         if not fits and weights_per_gpu is not None:
@@ -429,6 +655,37 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
                 f"KV pool holds {kv_tokens_total:,.0f} tokens but one request needs "
                 f"{req.context:,} — increase TP/GPUs or reduce context"
             )
+
+    # --- mamba state adequacy: can the reserved pool carry the target ------
+    # concurrency? (state is PER SEQUENCE: bytes_per_seq x layers x C must
+    # fit the reserved pool -- a separate ceiling from the KV-token pool.)
+    if mamba_details and fits:
+        try:
+            from .configs import _linear_state_bytes_per_seq, _ssm_bytes_per_elem, state_bytes_per_elem
+
+            mix0 = kvdetails.get("layer_mix")
+            n_linear = mix0.linear if mix0 else 0
+            # use the RECONCILED dtype (ssm_dtype_eff), not ms.ssm_dtype:
+            # a caller who set only EstimateRequest.ssm_dtype must not have
+            # this check silently fall back to the config default
+            per_seq = _linear_state_bytes_per_seq(cfg, state_bytes_per_elem(ssm_dtype_eff) or _ssm_bytes_per_elem(cfg))
+            if n_linear and per_seq:
+                pool = mamba_details["pool_bytes_per_gpu"] * max(1, req.gpu_count // req.tp_size)
+                target_c = req.mamba_concurrency or (concurrency or 0)
+                need = per_seq * n_linear * max(target_c, 1)
+                mamba_details["state_bytes_per_seq"] = per_seq
+                mamba_details["linear_layers"] = n_linear
+                mamba_details["seqs_supported"] = pool / (per_seq * n_linear) if per_seq else None
+                if need > pool:
+                    carried = int(pool / (per_seq * n_linear))
+                    warnings.append(
+                        f"mamba pool too small for {target_c} concurrent sequences: "
+                        f"{per_seq * n_linear / 1024**2:.0f} MiB/seq x {n_linear} layers x {target_c} = "
+                        f"{need / 1024**3:.1f} GiB needed vs {pool / 1024**3:.1f} GiB reserved "
+                        f"(--mamba-full-memory-ratio carries ~{carried} sequences)"
+                    )
+        except Exception:  # pragma: no cover — advisory check must never break an estimate
+            pass
 
     tiers = _cache_tiers(
         req,
@@ -472,7 +729,7 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
         kv_tokens_per_gpu=kv_tokens_per_gpu,
         fits=fits,
         concurrency=concurrency,
-        details={"weights": wdetails, "kv": kvdetails},
+        details={"weights": wdetails, "kv": kvdetails, "engram": engram_details, "mamba": mamba_details},
         warnings=warnings,
         tiers=tiers,
     )

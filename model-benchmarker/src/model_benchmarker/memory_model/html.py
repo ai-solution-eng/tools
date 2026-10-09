@@ -112,6 +112,12 @@ def model_to_flat(cfg: ModelConfig, name: str, source: str, approximate: bool = 
         "qk_nope_head_dim": cfg.qk_nope_head_dim,
         "qk_rope_head_dim": cfg.qk_rope_head_dim,
         "v_head_dim": cfg.v_head_dim,
+        # compressed-attention families (deepseek_v4/v41 CSA/CSA2): the
+        # per-generation storage model needs the schedule + indexer width
+        "compress_ratios": (cfg.raw.get("text_config", cfg.raw) or {}).get("compress_ratios")
+        if isinstance(cfg.raw, dict)
+        else None,
+        "index_head_dim": cfg.index_head_dim,
         "linear_key_head_dim": cfg.linear_key_head_dim,
         "linear_value_head_dim": cfg.linear_value_head_dim,
         "linear_num_key_heads": cfg.linear_num_key_heads,
@@ -412,10 +418,34 @@ function kvPerLayer(m, kvB){
     return {bytes:(m.kv_lora_rank + m.qk_rope_head_dim) * kvB, arch:'MLA' + (String(m.model_type).includes('dsa') ? ' + sparse (DSA)' : ''),
             formula:`(kv_lora_rank ${m.kv_lora_rank} + qk_rope_head_dim ${m.qk_rope_head_dim}) x ${kvB} B`};
   }
+  if (String(m.model_type).startsWith('deepseek_v41')){
+    // CSA2 (mirrors configs._csa2_stored_layers + FP4+scales entry): only
+    // Full Mode layers store global KV (encoder groups of 6 -> ceil(n/6)
+    // stored at m=2; decoder -> 1 stored at m=1); entries are FP4 + one
+    // E4M3 scale per 16 channels for the latent AND the indexer K.
+    const dims = m.head_dim || 0, idx = m.index_head_dim || 0;
+    const ratios = m.compress_ratios || [];
+    const nEnc = ratios.filter(r => r === 2).length, nDec = ratios.filter(r => r === 1).length;
+    const entry = dims * 0.5 + dims / 16, indexer = idx * 0.5 + idx / 16;
+    let bpt = 0;
+    if (nEnc) bpt += Math.max(1, Math.ceil(nEnc / 6)) * (entry + indexer) / 2;
+    if (nDec) bpt += (entry + indexer);
+    if (!ratios.length) bpt = dims * kvB;  // no schedule: plain MQA store
+    return {bytes:bpt, arch:'MQA + CSA2 compressed sparse attention',
+            formula:`CSA2: Full-mode layers x (FP4 entry ${entry.toFixed(0)}B + indexer ${indexer.toFixed(0)}B) / m`};
+  }
   if (String(m.model_type).startsWith('deepseek_v4')){
-    const rope = (m.head_dim && m.qk_rope_head_dim && m.head_dim < 256) ? m.qk_rope_head_dim : 0;
-    return {bytes:(m.head_dim + rope) * Math.max(m.num_key_value_heads||1,1) * kvB, arch:'MQA + sparse (CSA/HCA)',
-            formula:`(head_dim ${m.head_dim} + rope ${rope}) x kv_heads ${m.num_key_value_heads||1} x ${kvB} B`};
+    // CSA/HCA hybrid (mirrors _compressed_attn_bytes_per_gpu): every layer
+    // stores; mixed-precision entry (RoPE dims BF16, rest FP8 by default),
+    // CSA dual-stream + indexer over m=4, HCA single stream over m'=128.
+    const dims = m.head_dim || 0, idx = m.index_head_dim || 0, rope = m.qk_rope_head_dim || 0;
+    const ratios = m.compress_ratios || [];
+    if (!ratios.length) return {bytes:dims * kvB, arch:'MQA (no schedule)', formula:`head_dim ${dims} x ${kvB} B`};
+    const entry = (dims - rope) * 1.0 + rope * 2.0;
+    const nCsa = ratios.filter(r => r === 4).length, nHca = ratios.filter(r => r !== 0 && r !== 1 && r !== 4).length;
+    const bpt = nCsa * (2 * entry + idx * 1.0) / 4 + nHca * entry / 128;
+    return {bytes:bpt, arch:'MQA + compressed sparse attention (CSA/HCA)',
+            formula:`CSA dual-stream + indexer / m=4, HCA / m'=128 -- every layer stores (FP8 state default)`};
   }
   const kvH = m.num_key_value_heads ?? m.num_attention_heads;
   const hd = m.head_dim || (m.hidden_size / m.num_attention_heads);
@@ -426,7 +456,12 @@ function kvBytesPerToken(m, kvDtype){
   const kvB = KB[normDtype(kvDtype)] ?? 2;
   const mix = layerMix(m);
   const pl = kvPerLayer(m, kvB);
-  let bpt = pl.bytes * (mix.full + mix.sliding);
+  const mt = String(m.model_type);
+  // deepseek_v4 families return the WHOLE-STACK per-GPU bytes/token from
+  // kvPerLayer (their compression model is per-generation, not per-layer
+  // x layer-count) — do NOT multiply by the layer count like GQA/MLA.
+  const isCompressedFamily = mt.startsWith('deepseek_v4') && (m.compress_ratios || []).length > 0;
+  let bpt = isCompressedFamily ? pl.bytes : pl.bytes * (mix.full + mix.sliding);
   const notes = [];
   if (mix.sliding) notes.push('sliding-window layers budgeted at full per-token cost (conservative; engine window reuse only frees memory)');
   if (mix.linear){

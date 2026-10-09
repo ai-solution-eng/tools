@@ -1,20 +1,23 @@
-# =============================================================================
-# ModelBenchmarker -- proxied corporate PCAI site values (sanitized,
-# placeholder addresses) -- single-replica.
-#
+# ============================================================================
+# ModelBenchmarker — proxied corporate PCAI site values (SANITIZED) —
+# placeholder addresses, single replica.
 # The ezaf-gateway applies HPE SSO centrally at sites like this, so the chart
-# does not create its own AuthorizationPolicy, and the web-app API key still
-# gates the benchmark pages (belt-and-suspenders: the key also gates non-SSO
-# access).
-#
-# Sanitized deployment: all serving URLs are placeholder-addressed; ALL
-# credentials are fillers. This folder is hardlinked to the public delivery
-# repo -- never put real credentials here. Real per-site values live in
-# helm/local/ (gitignored + hardlink-ignored + never packaged).
-#
-# PCAI usage: import the packaged chart once, paste this whole file into the
-# release's Helm Values editor, adjust the '# SITE:' lines, apply.
-# =============================================================================
+# creates no AuthorizationPolicy; the web-app API key still gates the pages.
+# All serving URLs are placeholder-addressed and ALL credentials are fillers —
+# real per-site values live in helm/local/ (gitignored, never packaged).
+
+#  ### REQUIRED ### — key material lives in a Secret YOU manage, NOT in values
+#   1. security.existingSecret — Secret `bench-platform-keys` carrying
+#      BENCH_API_KEYS; build it with kubectl (see README.md).
+#   2. bench.endpointApiKeys — SECRET target keys; fillers here, real values
+#      only in helm/local/.
+#   3. ezua.virtualService.endpoint — RENDER FAILS without it while ezua.enabled.
+
+#  ### OPTIONAL ###
+#   Run storage: persistence.* (an RWX class enables replicaCount > 1)
+#   Targets: bench.suggestions (the UI combobox) / bench.prometheusUrl
+#   Egress: proxy.* — proxied site; in-cluster targets stay in noProxy
+#   PCAI: pcai.enabled / kyverno.enabled (off here) / ezua.authorizationPolicy
 
 replicaCount: 1
 
@@ -24,27 +27,28 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
-  tag: v0.6.0
+  tag: v0.8.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 
-# -- Benchmark targets ------------------------------------------------------------
-# SITE: the target suggestions below populate the UI's searchable combobox
-# (chat models + the MCP fleet's in-cluster addresses). They are ADVICE ONLY —
-# any http(s) URL stays typeable by hand. Contention rule: one benchmark per
-# endpoint origin at a time (a second run against a busy origin is refused).
+# ============================================================================
+# Benchmark targets
+# ============================================================================
+
+# The target suggestions below populate the UI's searchable combobox — ADVICE
+# ONLY, any http(s) URL stays typeable by hand. One run per origin at a time.
 bench:
+
   suggestions:
-    # Chat models (shared serving endpoints, MLIS) — kind: chat
-    # PLACEHOLDER addresses — substitute the site's real serving URLs.
+    # Chat models (shared serving endpoints) — PLACEHOLDER addresses.
     - name: qwen-38-27b (chat)
       url: https://qwen-38-27b.project-user-<USERNAME>.serving.<cluster-domain>
       kind: chat
     - name: glm-53-flash (chat)
       url: https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>
       kind: chat
-    # Retrieval / RAG pipeline endpoints — kind: endpoint
+    # Retrieval / RAG pipeline endpoints.
     - name: qwen3-vl-embedding-8b
       url: https://qwen3-vl-embedding-8b.project-user-<USERNAME>.serving.<cluster-domain>
       kind: endpoint
@@ -54,9 +58,7 @@ bench:
     - name: cohere-transcribe
       url: https://cohere-transcribe-03-2026.project-user-<USERNAME>.serving.<cluster-domain>
       kind: any
-    # MCP fleet servers (in-cluster addresses, as registered in the gateway —
-    # in-cluster preferred over the public serving URLs; each needs the fleet
-    # MCP key even in-cluster, see endpointApiKeys below) — kind: endpoint
+    # MCP fleet servers (in-cluster addresses, as registered in the gateway).
     - name: mm-rag (MCP)
       url: http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp
       kind: endpoint
@@ -86,81 +88,87 @@ bench:
       kind: endpoint
 
   # Keys for targets that need auth (exact URL -> key; trailing slash ignored).
-  # The fleet MCP servers all accept the SAME shared fleet key — repeat it per
-  # server URL you benchmark. Chat models take their platform JWTs. This block
-  # is KEY MATERIAL: fillers only in this file (real values live in helm/local/).
+  # KEY MATERIAL: fillers here, real values only in helm/local/.
   endpointApiKeys:
     "https://qwen-38-27b.project-user-<USERNAME>.serving.<cluster-domain>": "<QWEN_API_KEY>"
     "https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>": "<GLM_API_KEY>"
     "http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp": "<MCP_FLEET_KEY>"
 
-# -- Run storage --------------------------------------------------------------
+# ============================================================================
+# Run storage
+# ============================================================================
+
 persistence:
   enabled: true
   mountPath: /data
-  # SITE: size to your artifact volume
+  # Size to your artifact volume.
   size: 10Gi
-  # SITE: RWX class (if the site has one) enables replicaCount > 1
+  # An RWX class (if the site has one) enables replicaCount > 1.
   storageClass: gl4f-filesystem
-  accessModes:
-    - ReadWriteMany
+  accessModes: [ReadWriteMany]
 
-# -- Web-app auth --------------------------------------------------------------
+# ============================================================================
+# Web-app auth
+# ============================================================================
+
 security:
-  # SITE (P0-7): key material lives in a Secret YOU manage -- the chart
-  # renders no BENCH_API_KEYS into its own Secret when existingSecret is set.
-  #   kubectl -n <ns> create secret generic bench-platform-keys \
-  #     --from-literal=BENCH_API_KEYS='<key1>,<key2>'
+  # Key material lives in a Secret YOU manage; with existingSecret set the
+  # chart renders no BENCH_API_KEYS into its own Secret.
   existingSecret: "bench-platform-keys"
   existingSecretApiKey: BENCH_API_KEYS
   apiKey: ""
 
-# -- Service / resources --------------------------------------------------------
+# ============================================================================
+# Service + Resources
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 80
   targetPort: 8000
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    memory: 1Gi
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 1Gi}
 
-# Corporate egress proxy — proxied corporate site: the estimator's
-# huggingface.co config fetches traverse it; in-cluster targets stay in
-# noProxy. Addresses are PLACEHOLDERS — substitute the site's real values.
+# Proxied corporate site: the estimator's huggingface.co fetches traverse it,
+# in-cluster targets stay direct. Addresses are PLACEHOLDERS — substitute the real ones.
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
   noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost
 
-# -- PCAI feature gate --------------------------------------------------------------------------
+# ============================================================================
+# PCAI Feature Gate
+# ============================================================================
+
 # Set explicitly — PCAI features no longer follow proxy config.
 pcai:
   enabled: true
 
 extraEnv: {}
 
-# -- Vendor labels / Kyverno -------------------------------------------------------------
-# This site needs no Kyverno stamping: the vendor labels are rendered
-# statically on the Deployment/Service (that is what makes the EZUA card
-# "Ready").
+# ============================================================================
+# PCAI Integration
+# ============================================================================
+
+# No Kyverno stamping needed here: the vendor labels are rendered statically on
+# the Deployment/Service (that is what makes the EZUA card "Ready").
 kyverno:
   enabled: false
 
-# -- PCAI integration -------------------------------------------------------------
 ezua:
   enabled: true
+
   virtualService:
-    # SITE: the cluster's literal EZUA domain (e.g. model-benchmarker.<cluster-domain>)
+    # The site's literal EZUA domain.
     endpoint: model-benchmarker.<cluster-domain>
     istioGateway: istio-system/ezaf-gateway
     timeout: 60s
     longTimeout: 7200s
+
   authorizationPolicy:
-    # false at this site -- HPE SSO is applied centrally at the ezaf-gateway.
+    # false at this site — HPE SSO is applied centrally at the ezaf-gateway.
     enabled: false
     namespace: istio-system
     providerName: oauth2-proxy

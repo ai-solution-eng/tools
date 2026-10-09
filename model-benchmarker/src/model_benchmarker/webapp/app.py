@@ -45,9 +45,11 @@ from ..memory_model.configs import load_config_json
 from ..memory_model.dtypes import dtype_label
 from ..memory_model.estimate import (
     DEFAULT_OVERHEAD_GIB,
+    EngramSpec,
     EstimateRequest,
     EstimateResult,
     HicacheSpec,
+    MambaSpec,
     SpeculativeSpec,
     resolve_dtype_weight,
     run_estimate,
@@ -66,6 +68,7 @@ from .library import (
 from .library import (
     RESULTS_DIR_ENV as R__RESULTS_ENV,
 )
+from .measured import active_params_summary, find_measured
 from .runner import BenchError, BusyEndpointError, MaxRunsError, RunManager, manager_from_env
 
 _UI_DIR = Path(__file__).parent / "ui"
@@ -158,6 +161,21 @@ def create_app(work_dir: str | None = None) -> Any:
         """Public-safe index of every run on the PVC (no params, no logs)."""
         return JSONResponse({"runs": manager.public_index()})
 
+    @app.get("/api/target-aliases")
+    async def target_aliases_route(request: Request) -> JSONResponse:
+        """Every URL form naming the same backend as the given target — the
+        local/remote rewrite + origin forms (MB-E suggester support). The JS
+        normalizes the TYPED url through this so serving-form combobox picks
+        match records stored under their in-cluster origin (the deployed
+        default flow: the local toggle is on)."""
+        target = str(request.query_params.get("url") or "").strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="url is required")
+        try:
+            return JSONResponse({"aliases": R.target_aliases(target)})
+        except R.BenchError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
     @app.get("/api/results/compare")
     async def results_compare(request: Request) -> JSONResponse:
         """Side-by-side comparison of 2..4 runs (public read-only, like the
@@ -201,6 +219,76 @@ def create_app(work_dir: str | None = None) -> Any:
             )
         return JSONResponse(finalize_comparison(runs_data, requested))
 
+    @app.get("/api/results/atoms")
+    async def results_atoms(request: Request) -> JSONResponse:
+        """Atomic test records ("this model ran this test") decomposed from
+        past runs' artifacts — one entry per (model, ctx, users, task, ...)
+        measurement. Public read-only like the rest of the /results surface.
+        ids: comma-separated run ids (unknown ids skipped, reported under
+        "missing"). Empty ids -> every run in the public index."""
+        raw = request.query_params.get("ids")
+        if raw is None or not str(raw).strip():
+            requested = [r["run_id"] for r in manager.public_index()]
+        else:
+            requested = [rid.strip() for rid in str(raw).split(",") if rid.strip()]
+        atoms: list[dict] = []
+        missing: list[str] = []
+        for rid in requested:
+            try:
+                atoms.extend(manager.atoms_data(rid)["atoms"])
+            except KeyError:
+                missing.append(rid)
+        return JSONResponse({"count": len(atoms), "atoms": atoms, "missing": missing})
+
+    @app.get("/api/store")
+    async def store_summary() -> JSONResponse:
+        """The measurement store's summary (MB-DB): row count, distinct
+        models, distinct runs. Public read-only like the results surface."""
+        from model_benchmarker import store
+
+        return JSONResponse(store.stats(manager._store_path()))
+
+    @app.get("/api/store/facets")
+    async def store_facets() -> JSONResponse:
+        """The faceted navigation tree for the atom browser: models -> serving
+        setups -> available tests, with multiturn/open counts per setup.
+        Public read-only like the rest of the store surface."""
+        from model_benchmarker import store
+
+        return JSONResponse(store.facets(manager._store_path()))
+
+    @app.get("/api/store/query")
+    async def store_query(request: Request) -> JSONResponse:
+        """Measurement rows for the atom browser / store panel. Read-only
+        SELECT against the store with a conservative column projection and a
+        row cap. Filters (bound, whitelisted — never interpolated): model,
+        kind, run_id, task, arrival, mode, gpu, engine, mtp, weights, ctx,
+        users, hicache, replicas. limit <= 1000."""
+        from model_benchmarker import store
+
+        qp = request.query_params
+        try:
+            limit = min(max(int(qp.get("limit") or 500), 1), 1000)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="limit must be an integer") from None
+        flat = {k: qp.get(k) for k in store.FILTER_COLUMNS}
+        where, params = store.build_filters(flat)
+        sql = (
+            "SELECT kind, run_id, source, run_status, started_utc, target_url, model, gpu, gpu_count, engine,"
+            " mtp, weights, hicache, replicas, ctx, users, task, arrival, mode, requests_per_user, request_rate,"
+            " level_duration_s, failed, ttft_p50_ms, ttft_p95_ms, ttft_post_p50_ms, ttft_post_p95_ms,"
+            " tps_p50, tps_p95, tps_p100, lat_p50_ms, lat_p99_ms, success_rate_pct"
+            " FROM measurements"
+        )
+        if where:
+            sql += " WHERE " + where
+        sql += " ORDER BY started_utc DESC, id DESC LIMIT ?"
+        rows = store.query(manager._store_path(), sql, tuple(params) + (limit,))
+        # total = the FILTERED count (what the browser is looking at); the
+        # unfiltered summary lives at /api/store
+        total = store.count(manager._store_path(), where or None, tuple(params))
+        return JSONResponse({"rows": rows, "total": total, "limit": limit})
+
     @app.get("/api/library")
     async def results_library() -> JSONResponse:
         """The committed results/ tree (curated serving-setup baselines),
@@ -215,6 +303,20 @@ def create_app(work_dir: str | None = None) -> Any:
         """GPU catalog for the memory page's select (static DB, no auth: pure
         reference data, no cluster access)."""
         return JSONResponse({"gpus": [{"name": s.name, "vram_gib": s.vram_gib} for _k, s in GPU_DB]})
+
+    @app.get("/api/models/search")
+    async def model_search(q: str = "", limit: int = 10) -> JSONResponse:
+        """HuggingFace hub model search for the memory page's autocomplete
+        (public read-only like the estimate endpoint: it fetches public hub
+        METADATA only — no weights, no cluster access). Fails soft offline."""
+        q = (q or "").strip()
+        if len(q) < 2:
+            return JSONResponse({"models": [], "query": q})
+        try:
+            limit = max(1, min(int(limit), 30))
+        except (TypeError, ValueError):
+            limit = 10
+        return JSONResponse({**_hf_search_models(q, limit), "query": q})
 
     @app.get("/unlock", response_class=HTMLResponse)
     async def unlock_page() -> HTMLResponse:
@@ -506,6 +608,12 @@ def _catalog_payload() -> dict:
                 "kv_dtype": kv or "",
                 "mem_fraction": mem or "",
                 "moe_runner": _arg_value(a, "--moe-runner-backend") or "",
+                "engram": _catalog_engram_mode(entry),
+                "engram_host_gib": _catalog_host_gib(entry),
+                "compress_state_dtype": _catalog_env(entry, "SGLANG_DSV4_COMPRESS_STATE_DTYPE") or "",
+                "mamba_full_memory_ratio": _arg_value(a, "--mamba-full-memory-ratio") or "",
+                "mamba_ssm_dtype": _arg_value(a, "--mamba-ssm-dtype") or "",
+                "mamba_concurrency": 0,
                 "speculative": {
                     "algorithm": (
                         _arg_value(a, "--speculative-algorithm")
@@ -569,6 +677,31 @@ def _catalog_served_name(entry: dict) -> str | None:
     return _arg_value(entry.get("arguments") or [], "--served-model-name")
 
 
+def _catalog_env(entry: dict, key: str) -> str | None:
+    env = entry.get("environment") or {}
+    v = env.get(key)
+    return str(v) if v is not None else None
+
+
+def _catalog_engram_mode(entry: dict) -> str:
+    """Engram placement a catalog entry implies: 'host' when its environment
+    sets SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE (the V4.1-Flash offload
+    deployment), else 'auto' (the estimator resolves VRAM-vs-host itself)."""
+    v = (_catalog_env(entry, "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE") or "").strip().lower()
+    return "host" if v in ("1", "true", "yes") else "auto"
+
+
+def _catalog_host_gib(entry: dict) -> float:
+    """The entry's pod memory limit in GiB (the engram host budget), 0 when absent."""
+    lim = str(entry.get("resource_limit_memory") or "").strip()
+    if lim.lower().endswith("gi"):
+        try:
+            return float(lim[:-2])
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 _GPU_CHOICES = [{"name": spec.name, "vram_gib": spec.vram_gib} for _keys, spec in GPU_DB]
 
 
@@ -598,6 +731,68 @@ def _int_field(payload: dict, key: str, default: int, lo: int, hi: int) -> int:
     if not lo <= n <= hi:
         raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
     return n
+
+
+def _float_field(payload: dict, key: str, default: float, lo: float, hi: float) -> float:
+    """A bounded float form field (calibration knobs: decode BW efficiency,
+    prefill MFU). Missing/empty -> default; out-of-band -> 400 (a math tool
+    never silently clamps a number the caller asked for)."""
+    v = payload.get(key)
+    if v is None or v == "":
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key} must be a number") from None
+    if not lo <= f <= hi:
+        raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+    return f
+
+
+def _https_fetch_json_url(url: str, timeout: float = 10.0) -> tuple[dict | None, str]:
+    """Stdlib HTTPS GET of a small public JSON API response, reusing the
+    memory_model trust ladder (system verify -> certifi -> marked-unverified
+    last resort for public metadata). Returns (data | None, error)."""
+    from ..memory_model.configs import _https_fetch_json
+
+    data, _source, err = _https_fetch_json(url, timeout=timeout)
+    return data, err
+
+
+def _hf_search_models(query: str, limit: int = 10) -> dict:
+    """Search the HF hub's public model-list API for text-generation models.
+
+    GET https://huggingface.co/api/models?search=<q>&limit=<n>&filter=text-generation
+    Honors HF_ENDPOINT for mirror deployments. Fails SOFT: offline/blocked
+    networks return {"models": [], "error": ...} — the UI keeps the catalog
+    dropdown and free-text entry working.
+    """
+    base = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+    if not base.startswith("https://"):
+        return {"models": [], "error": "HF_ENDPOINT must be an https:// URL"}
+    from urllib.parse import quote as _q
+
+    url = (
+        f"{base}/api/models?search={_q(query)}&limit={min(int(limit), 30)}"
+        "&filter=text-generation&sort=downloads&direction=-1"
+    )
+    data, err = _https_fetch_json_url(url)
+    if not isinstance(data, list):
+        return {"models": [], "error": err or "hub search unavailable"}
+    models = []
+    for row in data[:limit]:
+        repo = str(row.get("modelId") or row.get("id") or "").strip()
+        if not repo or "/" not in repo:
+            continue
+        models.append(
+            {
+                "repo": repo,
+                "downloads": int(row.get("downloads") or 0),
+                "likes": int(row.get("likes") or 0),
+                "pipeline_tag": str(row.get("pipeline_tag") or ""),
+            }
+        )
+    return {"models": models, "source": base}
 
 
 def _mirror_config(model_ref: str) -> Path | None:
@@ -765,6 +960,49 @@ def _run_estimate_api(payload: dict) -> dict:
         # legacy integer form: MTP-family draft layers
         spec = SpeculativeSpec(algorithm="MTP", layers=int(legacy_speculative))
     hicache = _hicache_from_payload(payload)
+
+    # Engram (DeepSeek-V4.1 n-gram memory tables): 'auto' resolves like the
+    # CLI (host only when a config/catalog signal says so; here the explicit
+    # payload wins, default auto -> VRAM layout), 'host' moves the tables to
+    # host RAM, 'off' ignores them. dtype/budget are the layout knobs.
+    engram_raw = str(payload.get("engram") or "auto").strip().lower()
+    if engram_raw not in ("auto", "vram", "host", "off"):
+        raise HTTPException(status_code=400, detail="engram must be '', auto, vram, host or off") from None
+    if engram_raw == "auto":
+        engram_raw = ""  # VRAM default layout inside the estimator
+    engram_dtype = str(payload.get("engram_dtype") or "").strip() or None
+    try:
+        engram_host_gib = float(payload.get("engram_host_gib") or 0.0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="engram_host_gib must be a number (GiB)") from None
+    engram = EngramSpec(
+        mode="host" if engram_raw == "host" else "",
+        dtype=engram_dtype,
+        host_gib=engram_host_gib if engram_raw == "host" else 0.0,
+    )
+    # dtype knobs the deployments actually set
+    compress_state_dtype = str(payload.get("compress_state_dtype") or "").strip() or None
+    # ONE linear-attention state dtype, two accepted spellings (legacy API
+    # clients send ssm_dtype, the engine flag spelling is mamba_ssm_dtype);
+    # either lands in MambaSpec, which EstimateRequest reconciles so both
+    # the KV figure and the mamba-pool adequacy check agree.
+    ssm_dtype = str(payload.get("mamba_ssm_dtype") or "").strip() or str(payload.get("ssm_dtype") or "").strip() or None
+    # mamba/KDA pool knobs (--mamba-full-memory-ratio / --mamba-ssm-dtype)
+    try:
+        mamba_ratio_raw = payload.get("mamba_full_memory_ratio")
+        mamba_ratio = float(mamba_ratio_raw) if mamba_ratio_raw not in (None, "", 0) else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="mamba_full_memory_ratio must be a number") from None
+    if mamba_ratio is not None and not 0 < mamba_ratio <= 8:
+        raise HTTPException(status_code=400, detail="mamba_full_memory_ratio must be in (0, 8]") from None
+    mamba = MambaSpec(
+        full_memory_ratio=mamba_ratio,
+        ssm_dtype=ssm_dtype,
+    )
+    try:
+        mamba_conc = int(payload.get("mamba_concurrency") or 0)
+    except (TypeError, ValueError):
+        mamba_conc = 0
     kv_dtype = payload.get("kv_dtype") or None
     weight_dtype = resolve_dtype_weight(cfg, payload.get("weight_dtype") or None)
     contexts_raw = payload.get("contexts")
@@ -814,17 +1052,23 @@ def _run_estimate_api(payload: dict) -> dict:
         return run_estimate(
             EstimateRequest(
                 cfg=cfg,  # type: ignore[arg-type]
+                model_ref=str(payload.get("model") or ""),
                 gpu=gpu,
                 gpu_count=g,
                 tp_size=t,
                 pp_size=pp,
                 weight_dtype=weight_dtype,
                 kv_dtype=kv_dtype,
+                state_dtype=compress_state_dtype,
+                ssm_dtype=ssm_dtype,
                 mem_fraction=mem_fraction,
                 overhead_gib=overhead,
                 context=contexts[-1],
                 speculative=spec,
                 hicache=hicache,
+                engram=engram,
+                mamba=mamba,
+                mamba_concurrency=mamba_conc,
                 moe_runner=moe_runner,
                 ep_size=ep,
             )
@@ -862,6 +1106,29 @@ def _run_estimate_api(payload: dict) -> dict:
         ["layers", str(kvd.get("layer_mix").label()) if kvd.get("layer_mix") else "?"],
         ["config source", source],
     ]
+    ed = res.details.get("engram") or {}
+    if ed.get("present") and ed.get("parse_ok"):
+        structure.append(
+            [
+                "engram tables",
+                f"{ed.get('layers', 0)} layer(s), {ed.get('rows', 0):,} rows x {ed.get('head_dim', 0)} dims"
+                f" @ {ed.get('dtype', '?')} = {ed.get('bytes', 0) / 1024**3:.1f} GiB"
+                + (" (host-table offload)" if engram.mode == "host" else " (VRAM, row-sharded)"),
+            ]
+        )
+    if compress_state_dtype:
+        structure.append(["compress state", compress_state_dtype])
+    # ONE row for the single SSM-state knob (either spelling resolved above)
+    if ssm_dtype:
+        structure.append(["ssm state dtype", ssm_dtype])
+    if mamba.full_memory_ratio is not None:
+        structure.append(["mamba full-memory ratio", f"{mamba.full_memory_ratio:g}"])
+    # active parameters per token: an architecture fact (which weights a token
+    # actually reads), NOT a throughput prediction — kept now the roofline is
+    # gone, because it explains MoE sparsity to the reader
+    _ap = active_params_summary(cfg)
+    if _ap:
+        structure.append(["active params / token", f"{_ap['params_b']:.1f}B — {_ap['note']}"])
 
     def _m_tokens(v: float | None) -> str:
         return f"{v / 1e6:.2f}M" if v is not None else "-"
@@ -917,6 +1184,20 @@ def _run_estimate_api(payload: dict) -> dict:
             f" | KV pool {res.kv_tokens_total / 1e6:.2f}M tokens | {res.concurrency or 0} x {contexts[-1] // 1024}k"
         )
 
+    # --- measured benchmarks (when the results library has a matching run) ---
+    # The estimator deliberately does NOT predict tokens/second: a roofline
+    # over-predicted this fleet's real numbers by 3-5x, and a wrong throughput
+    # figure is worse than none in a capacity tool. Instead we surface the
+    # MEASURED rows from a committed baseline for the same model + GPU shape
+    # when one exists, with its provenance; when nothing matches, the panel is
+    # simply absent.
+    measured = find_measured(
+        model_ref=str(payload.get("model") or ""),
+        gpu_name=gpu.name,
+        gpu_count=gpu_count,
+        tp=tp,
+    )
+
     return {
         "model": model.rsplit("/", 1)[-1] if model else "(pasted config)",
         "status": status,
@@ -944,6 +1225,7 @@ def _run_estimate_api(payload: dict) -> dict:
             ["max context", f"{contexts[-1]:,}"],
         ],
         "structure": structure,
+        "measured_benchmarks": measured,
         "cache_tiers": cache_tiers,
         "scenarios": scenarios,
         "grid": {"contexts": contexts, "rows": grid_rows},
@@ -954,13 +1236,5 @@ def _run_estimate_api(payload: dict) -> dict:
         "gpus": _GPU_CHOICES,
         # estimator-form introspection: does THIS model ship a built-in MTP module?
         "builtin_mtp_layers": cfg.num_nextn_predict_layers or 0,
-        # compressed-attention bounds (when the family carries an indexer):
-        # the headline prices the indexer conservatively; this floor is the
-        # engine-dependent optimistic bound
-        "kv_per_token_optimistic": (
-            res.details["kv"].get("per_layer_optimistic", 0) * res.details["kv"]["layer_mix"].kv_layers
-            if res.details["kv"].get("per_layer_optimistic")
-            else None
-        ),
         "speculative_applied": spec if isinstance(spec, dict) or spec is None else None,
     }

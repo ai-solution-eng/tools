@@ -129,7 +129,7 @@
   <div id="r-compare"></div>
   <div id="r-compare-toolbar"></div>
   <div id="r-list"><p class="muted"><span class="spinner"></span>loading runs…</p></div>
-  <div id="r-library"></div>
+  <div id="r-atoms"></div>
   <div id="r-detail"></div>
   <footer>Hewlett Packard Enterprise · Model Benchmarker · results are read-only artifacts of past runs</footer>
 </main>
@@ -208,30 +208,75 @@
 
   function render() {
     var q = ($("f-filter").value || "").toLowerCase();
+    function hits(text) { return !q || String(text || "").toLowerCase().indexOf(q) >= 0; }
     var runs = RUNS.filter(function (r) {
-      return !q || (r.target_url + " " + r.kind + " " + r.run_id).toLowerCase().indexOf(q) >= 0;
+      return hits((r.model || "") + " " + r.target_url + " " + r.kind + " " + r.run_id);
     });
     renderToolbar();
-    if (!runs.length) {
-      $("r-list").innerHTML = '<div class="banner">' + (RUNS.length ? "no runs match the filter" : "no benchmark runs yet — launch one from the benchmark pages") + "</div>";
-      renderLibrary();
+    renderAtoms();
+    // ONE pane: webapp runs + committed-results baselines in the same table
+    // (the compare flow already joins both via run ids and lib: ids).
+    var libRows = [];
+    (LIB && LIB.models || []).forEach(function (m) {
+      (m.setups || []).forEach(function (s) {
+        if (hits(m.slug + " " + (s.setup || s.label) + " " + s.file + " " + s.kind)) {
+          libRows.push({ model: m, s: s });
+        }
+      });
+    });
+    if (!runs.length && !libRows.length) {
+      $("r-list").innerHTML = '<div class="banner">' + (RUNS.length || (LIB && LIB.models || []).length
+        ? "no runs match the filter"
+        : "no benchmark runs yet — launch one from the benchmark pages") + "</div>";
       return;
     }
     var html = '<div class="panel" style="padding:0;overflow:auto"><table><thead><tr>' +
-      '<th style="width:28px" title="pick 2–4 runs to compare"><span class="cmp-hint">cmp</span></th>' +
-      "<th>Run</th><th>Kind</th><th>Target</th><th>Status</th><th>Started</th><th class=\"num\">Artifacts</th><th></th></tr></thead><tbody>";
-    runs.forEach(function (r, idx) {
+      '<th style="width:28px" title="pick 2–4 to compare"><span class="cmp-hint">cmp</span></th>' +
+      "<th>Model</th><th>Run / baseline</th><th>Kind</th><th>Target / setup</th><th>Status</th><th>Started</th><th class=\"num\">Artifacts</th><th></th></tr></thead><tbody>";
+    runs.forEach(function (r) {
       var checked = inSel(r.run_id);
       var full = !checked && SELECTED.length >= MAX_CMP;
+      var fused = r.fused_from && r.fused_from.length
+        ? ' <span class="cmp-hint" title="fused with: ' + MB.esc(r.fused_from.join(", ")) + '">+' + r.fused_from.length + " fused</span>"
+        : "";
       html += '<tr>' +
         '<td><input type="checkbox" data-cmp="' + MB.esc(r.run_id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison"></td>' +
-        '<td class="mono">' + MB.esc(r.run_id.slice(0, 19)) + "</td>" +
+        '<td class="mono" title="model identity from the run report">' + MB.esc(r.model || "—") + "</td>" +
+        '<td class="mono">' + MB.esc(r.run_id.slice(0, 19)) + fused + "</td>" +
         "<td>" + MB.esc(r.kind) + "</td>" +
         '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + MB.esc(r.target_url) + "</td>" +
         "<td>" + badge(r.status) + "</td>" +
         "<td>" + MB.esc((r.started_utc || "").replace("T", " ").slice(0, 19)) + "</td>" +
         '<td class="num">' + (r.artifacts || []).length + "</td>" +
         '<td><a href="#" data-detail="' + MB.esc(r.run_id) + '">open</a> · <a href="#" data-cmp-link="' + MB.esc(r.run_id) + '">' + (checked ? "unpick" : "compare") + "</a></td>" +
+        "</tr>";
+      // absorbed runs: one muted line per fused source, each still openable
+      (r.fused_from || []).forEach(function (fid) {
+        html += '<tr style="opacity:.55"><td></td>' +
+          '<td class="mono">' + MB.esc(r.model || "—") + "</td>" +
+          '<td class="mono" style="padding-left:26px">↳ ' + MB.esc(fid.slice(0, 19)) + "</td>" +
+          '<td colspan="4" class="muted" style="font-size:11.5px">fused into ' + MB.esc(r.run_id.slice(0, 19)) + " — its completed levels are represented there (resume source)</td>" +
+          "<td></td>" +
+          '<td><a href="#" data-detail="' + MB.esc(fid) + '">open</a></td>' +
+          "</tr>";
+      });
+    });
+    libRows.forEach(function (e) {
+      var s = e.s, m = e.model;
+      var checked = inSel(s.id);
+      var full = !checked && SELECTED.length >= MAX_CMP;
+      var comparable = s.kind === "chat";
+      html += '<tr' + (s.status === "partial" ? ' style="opacity:.6"' : "") + '>' +
+        "<td>" + (comparable
+          ? '<input type="checkbox" data-cmp="' + MB.esc(s.id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison">'
+          : '<span class="cmp-hint" title="capacity/latency record, not comparable">—</span>') + "</td>" +
+        '<td class="mono">' + MB.esc(s.model || m.name) + "</td>" +
+        '<td class="mono" title="committed baseline: ' + MB.esc(s.id) + '">' + MB.esc(m.name) + "</td>" +
+        "<td>" + MB.esc(s.kind) + '</td><td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + MB.esc(s.setup || s.label) + '">' + MB.esc(s.setup || s.label) + "</td>" +
+        "<td>" + (s.status === "partial" ? '<span class="badge idle">partial</span>' : '<span class="badge ok">complete</span>') + "</td>" +
+        "<td>—</td>" +
+        '<td class="num">—</td>' +
+        "<td>" + (comparable ? '<a href="#" data-cmp-link="' + MB.esc(s.id) + '">' + (checked ? "unpick" : "compare") + "</a>" : "") + "</td>" +
         "</tr>";
     });
     html += "</tbody></table></div>";
@@ -251,64 +296,220 @@
     $("r-list").querySelectorAll("input[data-cmp]").forEach(function (cb) {
       cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
     });
-    renderLibrary();
   }
 
-  // ------------------------------------------------------------------
-  // Results library: the committed results/ tree (curated serving-setup
-  // baselines from the repo), rendered beneath the PVC run table. Its chat
-  // artifacts join the SAME compare flow via lib: ids — pick a baseline
-  // here and a fresh run from the table above.
-  var LIB = null;
-  function renderLibrary() {
-    var box = $("r-library");
+  // Test atoms → faceted atom BROWSER (MB-DB): the store is the source of
+  // truth — models → serving setups → tests via cascading dropdowns, so
+  // "all models we have results for" is the entry point, not a flat dump.
+  // The raw flat table remains behind a "show all rows" toggle.
+  var ATOMS = null;       // flat fallback rows (legacy /api/results/atoms)
+  var FACETS = null;      // /api/store/facets tree
+  var ATOMSEL = { model: "", setup: "", test: "", showAll: false };
+  function fmtNum1(v) {
+    if (v == null || isNaN(v)) return "—";
+    return MB.fmtNum(v, v >= 100 ? 0 : 1);
+  }
+  function setupText(s) {
+    var bits = [];
+    if (s.gpu) bits.push(String(s.gpu) + (s.gpu_count > 1 ? " x" + s.gpu_count : ""));
+    if (s.engine) bits.push(String(s.engine));
+    if (s.mtp) bits.push(String(s.mtp));
+    if (s.hicache) bits.push("HiCache x" + s.hicache);
+    if (s.replicas > 1) bits.push(s.replicas + " replicas");
+    return bits.join(" · ");
+  }
+  function renderAtoms() {
+    var box = $("r-atoms");
     if (!box) return;
-    if (LIB === null) {
-      box.innerHTML = '<p class="muted"><span class="spinner"></span>loading results library…</p>';
-      fetch("/api/library").then(function (r) { return r.json(); }).then(function (d) {
-        LIB = d; renderLibrary();
-      }).catch(function () { LIB = { models: [] }; renderLibrary(); });
+    if (FACETS === null && ATOMS === null) {
+      box.innerHTML = '<p class="muted"><span class="spinner"></span>loading atom browser…</p>';
+      MB.api("/api/store/facets").then(function (f) {
+        FACETS = f || { models: [], total: 0 };
+        if (!(FACETS.models || []).length) {
+          // store empty (nothing recorded/backfilled yet): fall back to the
+          // legacy flat atoms payload so the panel is never a dead end
+          return MB.api("/api/results/atoms").then(function (d) { ATOMS = d; }).catch(function () { ATOMS = { count: 0, atoms: [] }; });
+        }
+      }).catch(function () {
+        return MB.api("/api/results/atoms").then(function (d) { ATOMS = d; }).catch(function () { ATOMS = { count: 0, atoms: [] }; });
+      }).then(function () { renderAtoms(); });
       return;
     }
-    if (!(LIB.models || []).length) {
-      // say WHY instead of rendering nothing: root=null means no results
-      // tree is configured/reachable in this deployment (BENCH_RESULTS_DIR
-      // unset or the directory absent) — an operator-visible condition.
-      var why = LIB.root
-        ? "no machine-readable artifacts in the results tree (" + LIB.root + ")"
-        : "no results tree configured — set BENCH_RESULTS_DIR to a directory of <model>/<setup>.md artifacts (or kubectl cp your results/ tree onto the pod)";
-      box.innerHTML = '<p class="muted" style="margin-top:10px">Results library unavailable: ' + MB.esc(why) + "</p>";
-      return;
-    }
-    var q = ($("f-filter").value || "").toLowerCase();
-    var models = (LIB.models || []).filter(function (m) {
-      return !q || (m.slug + " " + JSON.stringify(m.setups)).toLowerCase().indexOf(q) >= 0;
-    });
-    if (!models.length) { box.innerHTML = ""; return; }
-    var html = '<div class="panel" style="padding:0;overflow:auto"><h2 style="margin:14px 18px 4px">Results library</h2>' +
-      '<p class="sub" style="margin:0 18px 8px">Committed baselines from the repo\u2019s results/ tree — chat artifacts join the comparison above via their checkbox (mix with runs from the table).</p>' +
-      "<table><thead><tr><th style=\"width:28px\"></th><th>Model</th><th>Setup</th><th>Kind</th><th>File</th><th>Status</th></tr></thead><tbody>";
-    models.forEach(function (m) {
-      m.setups.forEach(function (s) {
-        var checked = inSel(s.id);
-        var full = !checked && SELECTED.length >= MAX_CMP;
-        var comparable = s.kind === "chat";
-        html += "<tr" + (s.status === "partial" ? ' style="opacity:.6"' : "") + ">" +
-          "<td>" + (comparable ? '<input type="checkbox" data-cmp="' + MB.esc(s.id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ">" : '<span class="cmp-hint" title="capacity/latency record, not comparable">—</span>') + "</td>" +
-          "<td>" + MB.esc(m.name) + "</td>" +
-          '<td class="mono" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + MB.esc(s.setup || s.label) + '">' + MB.esc(s.setup || s.label) + "</td>" +
-          "<td>" + MB.esc(s.kind) + "</td>" +
-          '<td class="mono">' + MB.esc(s.file) + "</td>" +
-          "<td>" + (s.status === "partial" ? '<span class="badge idle">partial</span>' : '<span class="badge ok">complete</span>') + "</td>" +
-          "</tr>";
+    var html = '<div class="panel" style="padding:0;overflow:auto"><h2 style="margin:14px 18px 4px">Test atoms</h2>';
+    if (FACETS && (FACETS.models || []).length) {
+      // ---- faceted browser -------------------------------------------
+      if (!ATOMSEL.model) {
+        html += '<p class="sub" style="margin:0 18px 8px">' + MB.fmtNum(FACETS.total, 0) +
+          " recorded measurements across " + FACETS.models.length + " model(s) — pick a model to browse.</p>";
+      }
+      html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin:6px 18px 10px">';
+      // model select
+      html += '<div><label style="font-size:11px">Model</label><select id="ab-model" style="min-width:220px">' +
+        '<option value="">— all models (' + FACETS.models.length + ") —</option>";
+      FACETS.models.forEach(function (m) {
+        html += '<option value="' + MB.esc(m.model) + '"' + (ATOMSEL.model === m.model ? " selected" : "") + ">" +
+          MB.esc(m.model) + " (" + m.count + ")</option>";
       });
-    });
-    html += "</tbody></table></div>";
-    box.innerHTML = html;
-    box.querySelectorAll("input[data-cmp]").forEach(function (cb) {
-      cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
+      html += "</select></div>";
+      var chosenModel = FACETS.models.find(function (m) { return m.model === ATOMSEL.model; });
+      if (chosenModel) {
+        // setup select
+        html += '<div><label style="font-size:11px">GPU / setup</label><select id="ab-setup" style="min-width:260px">' +
+          '<option value="">— all setups (' + chosenModel.setups.length + ") —</option>";
+        chosenModel.setups.forEach(function (s, i) {
+          var label = setupText(s) || "(setup unstamped)";
+          html += '<option value="' + i + '"' + (ATOMSEL.setup === String(i) ? " selected" : "") + ">" +
+            MB.esc(label) + " (" + s.count + ")</option>";
+        });
+        html += "</select></div>";
+        var chosenSetup = ATOMSEL.setup !== "" ? chosenModel.setups[+ATOMSEL.setup] : null;
+        if (chosenSetup) {
+          // test select
+          html += '<div><label style="font-size:11px">Test</label><select id="ab-test" style="min-width:220px">' +
+            '<option value="">— all tests (' + chosenSetup.tests.length + ") —</option>";
+          chosenSetup.tests.forEach(function (t, i) {
+            var label = "ctx=" + (t.ctx == null ? "?" : t.ctx) + " u=" + (t.users == null ? "?" : t.users) + " " + (t.task || "");
+            if (t.arrival) label += " [" + t.arrival + "]";
+            html += '<option value="' + i + '"' + (ATOMSEL.test === String(i) ? " selected" : "") + ">" + MB.esc(label) + "</option>";
+          });
+          html += "</select></div>";
+        }
+      }
+      html += '<div style="display:flex;align-items:flex-end"><button id="ab-reset" class="secondary" style="padding:6px 12px;font-size:12px">reset</button></div>';
+      html += "</div>";
+      box.innerHTML = html + '<div id="ab-results"></div></div>';
+      // dropdown wiring
+      $("ab-model").addEventListener("change", function () {
+        ATOMSEL = { model: this.value, setup: "", test: "", showAll: ATOMSEL.showAll };
+        renderAtoms();
+      });
+      var abSetup = $("ab-setup");
+      if (abSetup) abSetup.addEventListener("change", function () {
+        ATOMSEL.setup = this.value; ATOMSEL.test = "";
+        renderAtoms();
+      });
+      var abTest = $("ab-test");
+      if (abTest) abTest.addEventListener("change", function () {
+        ATOMSEL.test = this.value;
+        renderAtoms();
+      });
+      $("ab-reset").addEventListener("click", function () {
+        ATOMSEL = { model: "", setup: "", test: "", showAll: false };
+        renderAtoms();
+      });
+      renderAtomResults();
+      return;
+    }
+    // ---- fallback: legacy flat table (store empty) ---------------------
+    renderAtomsFlat(box, html);
+  }
+
+  function renderAtomResults() {
+    var out = $("ab-results");
+    if (!out) return;
+    var chosenModel = FACETS.models.find(function (m) { return m.model === ATOMSEL.model; });
+    var chosenSetup = (chosenModel && ATOMSEL.setup !== "") ? chosenModel.setups[+ATOMSEL.setup] : null;
+    var chosenTest = (chosenSetup && ATOMSEL.test !== "") ? chosenSetup.tests[+ATOMSEL.test] : null;
+    // build the query from the selection depth
+    var qp = [];
+    if (ATOMSEL.model) qp.push("model=" + encodeURIComponent(ATOMSEL.model));
+    if (chosenSetup) {
+      [["gpu", chosenSetup.gpu], ["gpu_count", chosenSetup.gpu_count], ["engine", chosenSetup.engine],
+       ["mtp", chosenSetup.mtp], ["weights", chosenSetup.weights], ["hicache", chosenSetup.hicache],
+       ["replicas", chosenSetup.replicas]].forEach(function (kv) {
+        if (kv[1] != null) qp.push(kv[0] + "=" + encodeURIComponent(kv[1]));
+      });
+    }
+    if (chosenTest) {
+      if (chosenTest.ctx != null) qp.push("ctx=" + chosenTest.ctx);
+      if (chosenTest.users != null) qp.push("users=" + chosenTest.users);
+      if (chosenTest.task) qp.push("task=" + encodeURIComponent(chosenTest.task));
+      if (chosenTest.arrival) qp.push("arrival=" + encodeURIComponent(chosenTest.arrival));
+    }
+    var qs = qp.length ? "?" + qp.join("&") + "&limit=300" : "?limit=300";
+    var q = ($("f-filter").value || "").toLowerCase();
+    MB.api("/api/store/query" + qs).then(function (d) {
+      var rows = (d.rows || []).filter(function (r) {
+        return !q || ((r.model || "") + " " + (r.task || "") + " " + (r.engine || "") + " " + (r.run_id || "")).toLowerCase().indexOf(q) >= 0;
+      });
+      if (!rows.length) { out.innerHTML = '<p class="muted" style="margin:0 18px 12px">no measurements match.</p>'; return; }
+      var h = '<p class="sub" style="margin:0 18px 8px">' + MB.fmtNum(d.total, 0) + " matching measurement(s)" +
+        (d.total > rows.length ? " — showing " + rows.length : "") + '.</p>';
+      h += atomsTable(rows, true);
+      out.innerHTML = h;
+    }).catch(function (e) {
+      out.innerHTML = '<div class="banner bad" style="margin:0 18px 12px">store query failed: ' + MB.esc(e.message) + "</div>";
     });
   }
+
+  function atomsTable(rows, withSetup) {
+    var h = '<div style="overflow:auto;max-height:520px"><table><thead><tr><th>Model</th>';
+    if (withSetup) h += "<th>GPU / setup</th>";
+    h += '<th class="num">ctx</th><th class="num">users</th><th>Task</th>' +
+      '<th class="num">failed</th><th class="num">TTFT p50 (ms)</th><th class="num">TTFT p95 (ms)</th>' +
+      '<th class="num">tok/s p50</th><th class="num">tok/s p95</th><th>Flags</th><th>Run</th></tr></thead><tbody>';
+    rows.forEach(function (r) {
+      var runId = String(r.run_id || "");
+      var flags = [];
+      if (r.mode === "multiturn") flags.push("multiturn");
+      if (r.arrival) flags.push(r.arrival);
+      h += "<tr>" +
+        "<td>" + MB.esc(r.model || "unknown") + "</td>" +
+        (withSetup ? '<td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          MB.esc(setupText(r) || "—") + "</td>" : "") +
+        '<td class="num">' + MB.esc(r.ctx == null ? "—" : r.ctx) + "</td>" +
+        '<td class="num">' + MB.esc(r.users == null ? "—" : r.users) + "</td>" +
+        "<td>" + MB.esc(r.task || "") + "</td>" +
+        '<td class="num">' + fmtNum1(r.failed) + "</td>" +
+        '<td class="num">' + fmtNum1(r.ttft_p50_ms) + "</td>" +
+        '<td class="num">' + fmtNum1(r.ttft_p95_ms) + "</td>" +
+        '<td class="num">' + fmtNum1(r.tps_p50) + "</td>" +
+        '<td class="num">' + fmtNum1(r.tps_p95) + "</td>" +
+        "<td>" + MB.esc(flags.join(" · ")) + "</td>" +
+        '<td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          (runId ? '<a href="/results?run=' + encodeURIComponent(runId) + '" title="' + MB.esc(runId) + '">' + MB.esc(runId.slice(0, 19)) + "</a>" : "—") +
+          (r.run_status ? ' <span class="muted">' + MB.esc(r.run_status) + "</span>" : "") + "</td>" +
+        "</tr>";
+    });
+    h += "</tbody></table></div>";
+    return h;
+  }
+
+  function renderAtomsFlat(box, html) {
+    var atoms = ((ATOMS && ATOMS.atoms) || []).filter(function (a) { return a.kind === "chat"; });
+    if (!atoms.length) { box.innerHTML = ""; return; }
+    html += '<p class="sub" style="margin:0 18px 8px">The measurement store is empty — showing the flat decomposition of webapp runs. '
+      + 'Backfill the committed tree with <span class="mono">atomize --db</span> to get the faceted browser.</p>';
+    // reuse the store row shape where possible
+    var rows = atoms.map(function (a) {
+      var m = a.metrics || {};
+      return {
+        model: a.model, run_id: a.run_id, run_status: a.status,
+        ctx: (a.test || {}).ctx, users: (a.test || {}).users, task: (a.test || {}).task,
+        failed: m.failed, ttft_p50_ms: (m.ttft_ms || {}).p50, ttft_p95_ms: (m.ttft_ms || {}).p95,
+        tps_p50: (m.tokens_per_s || {}).p50, tps_p95: (m.tokens_per_s || {}).p95,
+        arrival: a.arrival, mode: a.mode,
+      };
+    });
+    var q = ($("f-filter").value || "").toLowerCase();
+    rows = rows.filter(function (r) {
+      return !q || ((r.model || "") + " " + (r.task || "") + " " + (r.run_id || "")).toLowerCase().indexOf(q) >= 0;
+    });
+    html += atomsTable(rows, false);
+    box.innerHTML = html;
+  }
+
+  // Results library: the committed results/ tree (curated baselines).
+  // Rendered INSIDE the unified run table by render() — same pane, same
+  // compare flow (lib: ids). This block only owns loading the payload.
+  var LIB = null;
+  function loadLibrary() {
+    fetch("/api/library").then(function (r) { return r.json(); }).then(function (d) {
+      LIB = d;
+      render();
+    }).catch(function () { LIB = { models: [] }; render(); });
+  }
+  loadLibrary();
 
   // sticky toolbar: appears once 2+ runs are picked
   function renderToolbar() {
@@ -397,17 +598,53 @@
     };
   }
 
+  // Per-run display labels, user-editable: the GPU/serve configuration is
+  // knowledge the HUMAN has (the run only knows a URL), so the compare cards
+  // offer an inline edit; the label persists for the session.
+  var RUN_LABELS = {};   // run_id -> user-edited setup label
   function seriesName(run, idx) {
-    // the run card carries params; show the DISTINGUISHING part, not the id
-    var bits = [];
+    // Composed of PHRASES, not tokens: model first, then the user-edited
+    // setup label, then whatever remains distinctive in params_label.
+    // params_label arrives in two dialects — the library's "phrase · phrase"
+    // form and the run label's space-token form — so split on " · " when
+    // present, else fall back to token filtering (drop sweep vars + bare
+    // task lists + arrival stamps: they label the X axis or nothing).
+    var model = run.model || "";
+    var setup = RUN_LABELS[run.run_id] || "";
     var pl = run.params_label || "";
-    if (pl) {
+    var rest = [];
+    if (pl.indexOf(" · ") >= 0) {
+      pl.split(" · ").forEach(function (phrase) {
+        var p = phrase.trim();
+        if (!p) return;
+        if (model && p.toLowerCase() === model.toLowerCase()) return;   // already first
+        if (setup) return;  // the user's label replaces the whole setup text
+        if (/^(users|ctx)=/.test(p)) return;                            // sweep vars are the x axis
+        rest.push(p);
+      });
+    } else {
       pl.split(/\s+/).forEach(function (tok) {
-        if (!/^(users|ctx)=/.test(tok)) bits.push(tok);  // sweep vars are the x axis
+        if (!tok) return;
+        if (/^(users|ctx)=/.test(tok)) return;
+        if (/^(coding|creative|mixed|custom)$/.test(tok)) return;
+        if (/^arrival=/.test(tok)) return;
+        if (model && tok.toLowerCase() === model.toLowerCase()) return;
+        if (setup && tok.toLowerCase() === setup.toLowerCase()) return;
+        rest.push(tok);
       });
     }
-    if (!bits.length) bits.push(run.kind === "chat" ? "run " + (idx + 1) : run.run_id.slice(0, 12));
-    return bits.join(" ");
+    var bits = [];
+    if (model) bits.push(model);
+    if (setup) bits.push(setup);
+    bits = bits.concat(rest);
+    if (!bits.length) {
+      bits.push(run.kind === "chat" ? "run " + (idx + 1) : run.run_id.slice(0, 12));
+    } else if (!setup && rest.length === 0) {
+      // model alone: two runs of one model would be indistinguishable in the
+      // legend — append a short id tail
+      bits.push(String(run.run_id || "").slice(-6));
+    }
+    return bits.join(" · ");
   }
 
   function niceCeil(v) {
@@ -435,8 +672,17 @@
     if (!xs.length || !ys.length) return null;
     var xmin = Math.min.apply(null, xs), xmax = Math.max.apply(null, xs);
     var ymax = niceCeil(Math.max.apply(null, ys) * 1.08);
-    if (xmin === xmax) { xmin -= 1; xmax += 1; }
-    var X = function (v) { return PADL + (v - xmin) / (xmax - xmin) * iw; };
+    // LOG-X when the sweep spans enough orders of magnitude (concurrency
+    // levels are geometric: 1,4,32,64,128 — linear crushes the low end).
+    // All x must be > 0; fallback to linear for degenerate spans.
+    var LOGX = xmin > 0 && xmax > 0 && Math.log10(xmax / xmin) >= 0.6 && xmin !== xmax;
+    function X(v) {
+      if (LOGX) {
+        var lv = Math.log10(v), lmin = Math.log10(xmin), lmax = Math.log10(xmax);
+        return PADL + (lv - lmin) / (lmax - lmin) * iw;
+      }
+      return PADL + (v - xmin) / (xmax - xmin) * iw;
+    }
     var Y = function (v) { return PADT + ih - v / ymax * ih; };
     var out = ['<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="' + MB.esc(opts.title) + '">'];
     // y gridlines (4) + labels
@@ -451,7 +697,9 @@
     allx.sort(function (a, b) { return a - b; });
     var step = Math.ceil(allx.length / 8);
     for (var i = 0; i < allx.length; i += step) {
-      out.push('<text class="tick-label" x="' + X(allx[i]) + '" y="' + (H - PADB + 14) + '" text-anchor="middle">' + fmtAxis(allx[i]) + "</text>");
+      var tx = X(allx[i]);
+      if (LOGX && i > 0 && tx - X(allx[i - step]) < 30) continue;  // no overlap on log
+      out.push('<text class="tick-label" x="' + tx + '" y="' + (H - PADB + 14) + '" text-anchor="middle">' + fmtAxis(allx[i]) + "</text>");
     }
     out.push('<line class="axis" x1="' + PADL + '" y1="' + (PADT + ih) + '" x2="' + (W - PADR) + '" y2="' + (PADT + ih) + '"/>');
     out.push('<line class="axis" x1="' + PADL + '" y1="' + PADT + '" x2="' + PADL + '" y2="' + (PADT + ih) + '"/>');
@@ -498,6 +746,10 @@
   }
 
   var CMP_CHART_MODE = "curves"; // curves | summary
+  // MB-E compare filters: the chart grid over a 30-label section is noise —
+  // these facets shrink it to what you asked for (task, ctx, mode, and
+  // suppression of sparse series like a just-started run's single dot).
+  var CMP_FILTER = { task: "", ctx: "", hideSparse: true, hideRef: false };
 
   // The chart set for one comparison section. Chat data: one scaling-curve
   // panel per (task x context), TTFT and tokens/s side by side — the PDF
@@ -509,10 +761,12 @@
     });
     var charts = [];
     if (section.kind === "chat") {
-      // group rows by (task, ctx)
+      // group rows by (task, ctx) — honoring the facet filters
       var groups = {};
       section.rows.forEach(function (row) {
         var lv = parseLevel(row.label);
+        if (CMP_FILTER.task && (lv.task || "") !== CMP_FILTER.task) return;
+        if (CMP_FILTER.ctx !== "" && String(lv.ctx) !== String(CMP_FILTER.ctx)) return;
         var key = (lv.task || "?") + " @ ctx=" + (lv.ctx == null ? "?" : (lv.ctx === 0 ? "0 (cold)" : fmtAxis(lv.ctx)));
         (groups[key] = groups[key] || []).push({ lv: lv, row: row });
       });
@@ -536,6 +790,12 @@
             return { name: r.name, color: RUN_COLORS[r.idx], ref: r.ref, points: pts };
           });
           if (series.every(function (s) { return !s.points.some(function (p) { return p.y != null; }); })) return;
+          if (CMP_FILTER.hideSparse) {
+            // a series with ONE point is a dot, not a curve (a just-started
+            // run mid-sweep) — hiding it keeps the comparison readable
+            series = series.filter(function (s) { return s.ref || s.points.filter(function (p) { return p.y != null; }).length >= 2; });
+          }
+          if (!series.length) return;
           charts.push({ title: meta.label + " — " + key, xLabel: "concurrent users", yLabel: meta.unit, yUnit: meta.unit, series: series, metric: metric });
         });
       });
@@ -634,6 +894,9 @@
         (isRef ? '<span class="cmp-ref-chip">reference</span>' : "") +
         '<div class="row"><span class="k">target</span><span class="v mono" title="' + MB.esc(r.target_url) + '">' + MB.esc(r.target_url) + "</span></div>" +
         '<div class="row"><span class="k">status</span><span class="v">' + badge(r.status) + "</span></div>" +
+        '<div class="row"><span class="k">gpu / setup</span><span class="v">' +
+          '<input class="cmp-setup-edit mono" data-setup-run="' + MB.esc(r.run_id) + '" value="' + MB.esc(RUN_LABELS[r.run_id] || "") + '" placeholder="e.g. H200 x4 · HiCache x2 (edit)" style="max-width:240px;font-size:12px;padding:3px 6px">' +
+        "</span></div>" +
         '<div class="row"><span class="k">params</span><span class="v">' + MB.esc(r.params_label || "—") + "</span></div>" +
         ((r.started_utc || "") ? '<div class="row"><span class="k">started</span><span class="v">' + MB.esc(r.started_utc.replace("T", " ").slice(0, 19)) + "</span></div>" : "") +
         (r.error ? '<div class="row"><span class="k">note</span><span class="v">' + MB.esc(r.error) + "</span></div>" : "") +
@@ -641,6 +904,32 @@
         "</div>";
     });
     html += "</div>";
+    // facet bar: shrink the chart grid to the asked-for slice. Options are
+    // derived from the union of section rows (task / ctx), so the bar only
+    // ever offers choices that exist in THIS comparison.
+    var taskSet = [], ctxSet = [];
+    CMP.sections.forEach(function (s) {
+      s.rows.forEach(function (row) {
+        var lv = parseLevel(row.label);
+        if (lv.task && taskSet.indexOf(lv.task) < 0) taskSet.push(lv.task);
+        if (lv.ctx != null && ctxSet.indexOf(lv.ctx) < 0) ctxSet.push(lv.ctx);
+      });
+    });
+    ctxSet.sort(function (a, b) { return a - b; });
+    html += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:4px 0 10px" class="cmp-facets">' +
+      '<div><label style="font-size:11px">Task</label><select id="cf-task" style="min-width:130px">' +
+      '<option value="">all tasks</option>' +
+      taskSet.map(function (t) { return '<option value="' + MB.esc(t) + '"' + (CMP_FILTER.task === t ? " selected" : "") + ">" + MB.esc(t) + "</option>"; }).join("") +
+      "</select></div>" +
+      '<div><label style="font-size:11px">Context</label><select id="cf-ctx" style="min-width:130px">' +
+      '<option value="">all ctx</option>' +
+      ctxSet.map(function (c) { return '<option value="' + c + '"' + (String(CMP_FILTER.ctx) === String(c) ? " selected" : "") + ">" + (c === 0 ? "0 (cold)" : fmtAxis(c)) + "</option>"; }).join("") +
+      "</select></div>" +
+      '<div><label style="font-size:11px">Curves</label><select id="cf-sparse" style="min-width:170px">' +
+      '<option value="hide"' + (CMP_FILTER.hideSparse ? " selected" : "") + '>hide single-point series</option>' +
+      '<option value="show"' + (!CMP_FILTER.hideSparse ? " selected" : "") + ">show everything</option>" +
+      "</select></div>" +
+      "</div>";
     // per kind: charts first (the actual comparison), table collapsed below
     CMP.sections.forEach(function (s) {
       var runIdx = {};
@@ -712,6 +1001,18 @@
     });
     html += "</tbody></table></div></div>";
     $("r-compare").innerHTML = html;
+    document.querySelectorAll(".cmp-setup-edit").forEach(function (inp) {
+      inp.addEventListener("change", function () {
+        RUN_LABELS[inp.getAttribute("data-setup-run")] = inp.value.trim();
+        renderCompare();  // re-render: series names + legends pick the label up
+      });
+    });
+    var cfTask = $("cf-task");
+    if (cfTask) cfTask.addEventListener("change", function () { CMP_FILTER.task = this.value; renderCompare(); });
+    var cfCtx = $("cf-ctx");
+    if (cfCtx) cfCtx.addEventListener("change", function () { CMP_FILTER.ctx = this.value; renderCompare(); });
+    var cfSparse = $("cf-sparse");
+    if (cfSparse) cfSparse.addEventListener("change", function () { CMP_FILTER.hideSparse = this.value === "hide"; renderCompare(); });
     var close = $("cmp-close");
     if (close) close.addEventListener("click", function (ev) {
       ev.preventDefault();
@@ -805,6 +1106,11 @@
       $("r-detail").innerHTML = '<div class="banner bad">' + MB.esc(e.message) + "</div>";
     });
   }
+
+  // The filter input is wired with an inline oninput="render()" attribute,
+  // which resolves `render` in GLOBAL scope; without this export every
+  // keystroke throws a silent ReferenceError and no panel re-filters.
+  window.render = render;
 })();
 </script>
 </body>

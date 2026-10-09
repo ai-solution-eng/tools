@@ -1,91 +1,104 @@
+# ============================================================================
 # Model Downloader — SE G2 example site values (SANITIZED).
-# Shareable counterpart of the real per-site file (helm/local convention —
-# real credentials live only in helm/local/, which is gitignored,
-# hardlink-ignored and never packaged). Base chart: model-downloader 1.7.0
-# (image.tag v1.6.2).
-#
-# FULL VALUES — complete document; paste this whole file into the PCAI
-# "Helm Values" editor and adjust the '# SITE:' lines. See the top-level
-# README (Deployment targets → SE G2) for context.
+# Shareable counterpart of the real per-site file: real credentials live only
+# in helm/local/ (gitignored, hardlink-ignored, never packaged).
+# Full values document — paste it into the PCAI Helm Values editor.
 
-# -- Naming overrides (rarely needed) -------------------------------------------
+#  ### REQUIRED ### — fill these for the site; key material stays out of values
+#   1. defaultNamespace — a project-user namespace that owns `models-pvc`.
+#   2. s3.accessKeyId / s3.secretAccessKey — MinIO credentials (real ones only
+#      in helm/local/values.g2.yaml).
+#   3. aioli.dbPasswordSecret — name/namespace/key of an EXISTING Secret:
+#      kubectl -n mlis create secret generic aioli-db-password \
+#        --from-literal=password=<aioli-db-password>
+#   4. ezua.virtualService.endpoint — RENDER FAILS without it while ezua.enabled.
+
+#  ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Storage: storage.backend (pvc|s3|both) / downloader.s3Work* / catalog.*
+#   Gates: provenance / gate (ModelScan) / preflight + quota / gc
+#   Egress: proxy.http|https|noProxy — each key wired only when non-empty
+#   PCAI: pcai.enabled / kyverno.enabled / ezua.authorizationPolicy
+
+# ============================================================================
+# Application
+# ============================================================================
+
 nameOverride: ""
 fullnameOverride: ""
 
-# -- App image --------------------------------------------------------------------
+# FastAPI service that serves the UI and submits downloader Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
   tag: v1.6.3
-  # IfNotPresent (fleet default): releases ship NEW image tags (bump_version.sh
-  # keeps tag/Chart.yaml in lockstep), so node-cached images stay fresh.
-  # (pullPolicy: Always re-pulls on every pod start — only useful for a
-  # deliberate rebuild-same-tag lab flow, which then needs a rollout restart.)
+  # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
+  # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
 
-# -- Download behavior ---------------------------------------------------------------
+# Max concurrent model downloads; extras queue in-process.
 maxConcurrency: 4
 
-# SITE: your project-user namespace (owns the models-pvc the Jobs mount).
-# Namespace pre-filled in the download form (project namespaces own the
-# models-pvc the downloader Jobs mount).
+# Namespace pre-filled in the download form; must own `models-pvc`.
 defaultNamespace: project-user-<USERNAME>
 
-# -- Service exposure -------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 8000
 
-# -- Resources -----------------------------------------------------------------------------
-resources:
-  requests:
-    cpu: "200m"
-    memory: 256Mi
-  limits:
-    cpu: "1"
-    memory: 512Mi
+# ============================================================================
+# Resources
+# ============================================================================
 
-# -- Corporate egress proxy (per-key wiring) --------------------------------------------------
-# Proxied corporate site example: the downloader Jobs must reach HuggingFace
-# through the corporate proxy, and the app pod gets the same proxy env so the
-# catalog "Refresh from GitHub" fetch goes through the proxy too. Each key is
-# wired only when non-empty; a direct-egress site leaves proxy: {}.
-# Addresses below are PLACEHOLDERS — substitute the site's real proxy/no_proxy.
+resources:
+  requests: {cpu: "200m", memory: 256Mi}
+  limits: {cpu: "1", memory: 512Mi}
+
+# Proxied corporate site — the addresses below are PLACEHOLDERS, substitute the
+# real ones. Each key is wired only when non-empty; direct egress leaves proxy: {}.
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
-  # Keep cluster-internal traffic (MinIO, MLIS/AIOLI DB, kube API) off the
-  # proxy. Standard cluster-local entries only in this shareable example.
+  # Keep cluster-internal traffic (MinIO, MLIS/AIOLI DB, kube API) off the proxy.
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
-# -- PCAI feature gate --------------------------------------------------------------------------
+# ============================================================================
+# PCAI Feature Gate
+# ============================================================================
+
 # Set explicitly — PCAI features no longer follow proxy config.
 pcai:
   enabled: true
 
-# -- Download storage backend -------------------------------------------------------------------
+# ============================================================================
+# Download storage
+# ============================================================================
+
 storage:
   backend: both
   default: pvc
 
-# -- S3-compatible backend (MinIO) ----------------------------------------------------------------
-# SITE: real MinIO credentials — never publish them; on G2 they live only in
-# helm/local/values.g2.yaml.
+# Real MinIO credentials — never publish them; on G2 they live only in helm/local/.
 s3:
   endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL
-  bucket: "mlis-models"         # bucket must already exist
-  prefix: "large-models"       # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
-  accessKeyId: "<MINIO_ACCESS_KEY>"      # MinIO access key (required for MinIO)
-  secretAccessKey: "<MINIO_PASSWORD>"  # MinIO secret key (required for MinIO)
+  bucket: "mlis-models"  # bucket must already exist
+  prefix: "large-models"  # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
+  accessKeyId: "<MINIO_ACCESS_KEY>"  # MinIO access key
+  secretAccessKey: "<MINIO_PASSWORD>"  # MinIO secret key
 
-# -- "Downloaded models" list -----------------------------------------------------------------------
+# Lists models physically present on the PVC (scanner Job) and/or S3. One row per model.
 downloadList:
   enabled: true
   pvcScanEnabled: false
   pvcRefreshInterval: 60
   scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
 
-# -- Downloader Job definition -------------------------------------------------------------------------
+# ============================================================================
+# Jobs
+# ============================================================================
+
+# Rendered into a ConfigMap the app reads and substitutes per-submission placeholders in.
 downloader:
+
   image:
     repository: ghcr.io/ai-solution-eng/hf-downloader
     tag: v1.0
@@ -95,58 +108,45 @@ downloader:
   s3WorkPvcName: ""
   s3WorkSize: 20Gi
   s3WorkPath: "/mnt/s3work"
-  # The HF cache lives on the shared PVC, so a retried Job resumes the
-  # partial download instead of starting over.
+  # Retries before the Job is marked Failed; a retry resumes the partial HF cache.
   backoffLimit: 2
-  # Opt out of the platform security-context mutation so the Job can run as
-  # root and mount the shared model PVC.
+  # Root + platform security-context opt-out (hpe-ezua/disable-sc); HPE PCAI only.
   disableSecurityContext: true
+
   securityContext:
     runAsUser: 0
     runAsGroup: 0
+
   resources:
-    requests:
-      cpu: "2"
-      memory: 4Gi
-    limits:
-      cpu: "4"
-      memory: 8Gi
+    requests: {cpu: "2", memory: 4Gi}
+    limits: {cpu: "4", memory: 8Gi}
   ttlSecondsAfterFinished: 3600
-  # SITE: your username (HF request headers / logging).
+  # Your HF username (request headers / logging).
   user: <USERNAME>
+
   hf:
     downloadTimeout: "300"
     etagTimeout: "30"
     enableHfTransfer: "0"
     disableXet: "1"
-    # Corporate MITM proxy presents an untrusted cert — verification bypassed
-    # deliberately; the secure default is verify-on (unset → true).
+    # MITM proxy presents an untrusted cert — bypassed deliberately; default is verify-on.
     verifyTls: false
 
-# -- Provenance manifest (MD-A1)  ----------------------------------------------------------
+# ============================================================================
+# Download integrity + GC
+# ============================================================================
+
 provenance:
   enabled: true
   revision: "main"
 
-# -- ModelScan provenance gate (MD-A2) -----------------------------------------------------
-# SHOWCASE: enabled in warn mode — every download of an unsafe-format model
-# (.bin/.pt/.pth/.ckpt/pickle) is scanned and the verdict lands in
-# manifest.json + the UI's scan column, WITHOUT blocking customer downloads
-# (a positive unsafe verdict in block mode would exit-1 the Job). Flip
-# mode: block after a warn period on real downloads. Requires the rebuilt
-# downloader image (Dockerfile gains modelscan); on an old image the gate
-# records "error" verdicts and never blocks. Turn the feature off with
-# enabled: false.
+# ModelScan scans unsafe formats (.bin/.pt/.pth/.ckpt/pickle); needs the rebuilt image.
 gate:
   enabled: true
-  mode: warn          # demo the scan badge; flip to block after a warn period
+  mode: warn  # demo the scan badge; flip to block after a warn period
   threshold: low
 
-# -- PVC preflight + per-namespace quota (MD-B) --------------------------------------------
-# SHOWCASE: preflight refuses a submit only when the model provably would
-# not fit the target PVC's free space (422 naming bytes-needed vs
-# bytes-free) — pure safety, no demo downside. Unknown model sizes degrade
-# to warn-only, never a blind refusal. Turn it off with enabled: false.
+# Submit-time gate before the Job is created; unknown model size degrades to warn-only.
 preflight:
   enabled: true
   mode: refuse
@@ -154,110 +154,94 @@ preflight:
   usageTtl: 120
   sizeTtl: 300
 
-# Per-namespace byte quotas. default left EMPTY here (G2 is the internal
-# demo rig): quota.default is the fallback cap for namespaces without their
-# own entry (k8s quantities or plain bytes). Set a value to demo the
-# "used+requested vs quota" 422; per-team entries go under namespaces.
-# Turn the whole enforcement off with quota.mode: off (or preflight.enabled
-# above, which gates both).
+# Per-namespace byte quotas, enforced submit-time (see preflight.mode).
 quota:
-  default: ""         # no cluster-wide default; namespace entries only
-  # SHOWCASE example — a generous demo cap; set default to demo the refusal:
-  #   default: 2Ti
-  # SITE: set real per-team quotas (k8s quantities or plain bytes).
-  # namespaces:
-  #   project-user-alice: 1Ti
-  #   project-user-bob: 500Gi
+  default: ""  # no cluster-wide default; namespace entries only
+  # Per-team overrides go under namespaces (k8s quantities or plain bytes).
   namespaces: {}
   mode: refuse
 
-# -- TTL/GC eviction (MD-C) ------------------------------------------------------------------
-# OFF — dry-run-first discipline: GC deletes model cache dirs from
-# the shared PVC, and enabling deletion on a demo rig is a foot-gun. The
-# safe enable path is: (1) set enabled: true and leave
-# dryRun: true — the job evaluates + logs every verdict and the UI's
-# /api/gc/report section becomes the review surface, deleting nothing;
-# (2) only after the report looks right, flip dryRun: false and let
-# ttlDays age out stale caches. Deletion needs the three-key AND (manifest
-# present + no AIOLI row + no live job), so serving models are protected.
-# Turn the feature off again with enabled: false (nothing rendered).
+# OFF — dry-run-first discipline: GC deletes model cache dirs from the shared PVC,
+# so the safe path is enabled: true + dryRun: true, review /api/gc/report, then flip.
 gc:
   enabled: false
   schedule: "0 3 * * *"
   ttlDays: 30
-  dryRun: true        # the UI report is the review surface; flip only after review
+  dryRun: true  # the UI report is the review surface; flip only after review
   minKeep: 0
   protectedModels: []
   concurrencyPolicy: Forbid
-  resources:
-    requests:
-      cpu: "100m"
-      memory: 128Mi
-    limits:
-      cpu: "500m"
-      memory: 256Mi
 
-# -- Debug pod ("Launch debug pod" in the UI) -------------------------------------------------------------
-# Long-running shell on the same PVC at /mnt for cache inspection. A Job on
-# purpose: job-controller-created pods pass the platformwide
-# `protect-models-pvc` Kyverno admission path that denies bare Pods.
+  resources:
+    requests: {cpu: "100m", memory: 128Mi}
+    limits: {cpu: "500m", memory: 256Mi}
+
+# Long-running shell on the same PVC at /mnt for cache inspection, rendered as
+# a Job so job-controller creates the Pod; scheduling follows downloader.
 debugPod:
   enabled: true
+
   image:
     repository: andrewbydlon/basic-ubuntu-essentials
     tag: v1.0
     pullPolicy: IfNotPresent
   pvcName: ""
   disableSecurityContext: true
+
   securityContext:
     runAsUser: 0
     runAsGroup: 0
-  # SITE: your username.
+  # Your HF username (USER env var inside the pod).
   user: <USERNAME>
   cachePath: /mnt/large-models
   ttlSecondsAfterFinished: 86400
 
-# -- Model catalog (a small PVC) ----------------------------------------------------------------------------
+# ============================================================================
+# Model catalog
+# ============================================================================
+
 catalog:
   enabled: true
   size: 100Mi
   storageClassName: ""
   githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
-  # Corporate MITM proxy presents an untrusted cert — verification bypassed
-  # deliberately; the secure default is verify-on (unset → true).
+  # MITM proxy presents an untrusted cert — bypassed deliberately; default is verify-on.
   githubVerifyTls: false
 
-# -- AIOLI / MLIS database connection -------------------------------------------------------------------------
+# ============================================================================
+# MLIS database
+# ============================================================================
+
 aioli:
   dbHost: aioli-db-service-hpe-mlis.mlis.svc.cluster.local
   dbPort: 5432
   dbName: aioli
   dbUser: postgres
+
   dbPasswordSecret:
     name: aioli-db-password
     namespace: mlis
     key: password
 
-# -- Kyverno vendor-app labels ----------------------------------------------------------------------------------
-# Keep enabled: the chart's pre-install ClusterPolicy stamps the EZUA vendor
-# labels (hpe-ezua/type: app-service-core) in the release namespace; the
-# downloader/debug Jobs carry hpe-ezua/app: mlis and are admitted by the
-# platform's protect-models-pvc policy on G2 out of the box.
+# ============================================================================
+# PCAI integration
+# ============================================================================
+
+# Stamps vendor-app labels (hpe-ezua/type, hpe-ezua/app) onto the release via a pre-install hook.
 kyverno:
   enabled: true
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------------------------
-# On PCAI, ${DOMAIN_NAME} is resolved by the platform before rendering, so the
-# UI is served at:
-#   https://model-downloader.${DOMAIN_NAME}
-# (behind oauth2-proxy SSO via the ezaf-gateway).
+# On PCAI, ${DOMAIN_NAME} is resolved by the platform before rendering; the UI is
+# served at https://model-downloader.${DOMAIN_NAME} behind oauth2-proxy SSO.
 ezua:
   enabled: true
-  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+  domainName: "${DOMAIN_NAME}"  # informational only — no template reads it
+
   virtualService:
     endpoint: "model-downloader.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 300s
+
   authorizationPolicy:
     namespace: "istio-system"
     providerName: "oauth2-proxy"

@@ -50,8 +50,13 @@ import hashlib
 import hmac
 import ipaddress
 import os
+from collections.abc import Awaitable, Callable, Iterable, MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mcp.server.transport_security import TransportSecuritySettings  # lazy at runtime
 
 UNIVERSAL_API_KEYS_ENV = "MCP_API_KEYS"
 
@@ -71,10 +76,10 @@ CALLER_HEADER_MAX_LENGTH = 256
 CALLER_VIA_MAX_LENGTH = 200
 
 
-def configured_keys(env_names=("MCP_API_KEYS",)):
+def configured_keys(env_names: Iterable[str] = ("MCP_API_KEYS",)) -> list[str]:
     """Union of comma-separated keys from the given env vars (order kept,
     duplicates dropped). Env is read on every call — rotation without restart."""
-    keys: list = []
+    keys: list[str] = []
     for name in env_names:
         raw = os.environ.get(name, "")
         for k in raw.split(","):
@@ -84,7 +89,7 @@ def configured_keys(env_names=("MCP_API_KEYS",)):
     return keys
 
 
-def presented_keys(scope):
+def presented_keys(scope: MutableMapping[str, Any]) -> list[str]:
     """Candidate keys from raw ASGI headers (names must already be lowercase).
 
     Accepts ``Authorization: Bearer <key>`` and ``X-API-Key: <key>``; both are
@@ -97,7 +102,7 @@ def presented_keys(scope):
     resolve any identity, so spoofing it gains nothing.  An optional
     ``Bearer `` prefix is tolerated (some proxies set it).
     """
-    candidates = []
+    candidates: list[str] = []
     for name, value in scope.get("headers", []):
         lowered = name.lower()
         if lowered == b"authorization":
@@ -115,7 +120,7 @@ def presented_keys(scope):
     return candidates
 
 
-def presented_keys_with_source(scope):
+def presented_keys_with_source(scope: MutableMapping[str, Any]) -> list[tuple[str, str]]:
     """``[(key, header_name), …]`` — the :func:`presented_keys` candidates
     paired with the lowercased header that presented each one.
 
@@ -132,7 +137,7 @@ def presented_keys_with_source(scope):
     no ``X-API-Key`` candidate present it resolves through the normal
     fall-through (that is exactly the browser SSO case).
     """
-    pairs = []
+    pairs: list[tuple[str, str]] = []
     for name, value in scope.get("headers", []):
         lowered = name.lower()
         if lowered == b"authorization":
@@ -179,8 +184,8 @@ class Caller:
     name: str | None = None
     via: str | None = None
 
-    def as_dict(self) -> dict:
-        out = {"key_fp": self.key_fp, "client": self.client}
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"key_fp": self.key_fp, "client": self.client}
         if self.name:
             out["name"] = self.name
         if self.via:
@@ -190,7 +195,7 @@ class Caller:
 
 #: The request-scoped caller slot — set by each server's outermost capture
 #: middleware per request; read by the audit writer (``current_caller``).
-CALLER_CONTEXT: ContextVar = ContextVar("mcp_caller", default=None)
+CALLER_CONTEXT: ContextVar[Caller | None] = ContextVar("mcp_caller", default=None)
 
 
 def current_caller() -> Caller | None:
@@ -198,7 +203,7 @@ def current_caller() -> Caller | None:
     return CALLER_CONTEXT.get()
 
 
-def _client_str(scope) -> str | None:
+def _client_str(scope: MutableMapping[str, Any]) -> str | None:
     client = scope.get("client")
     return f"{client[0]}:{client[1]}" if client else None
 
@@ -212,7 +217,7 @@ def _sanitize_via(raw: str) -> str | None:
     return cleaned[:CALLER_VIA_MAX_LENGTH] or None
 
 
-def _trusted_peer(scope, trusted_cidrs_env: str) -> bool:
+def _trusted_peer(scope: MutableMapping[str, Any], trusted_cidrs_env: str) -> bool:
     """True only when the DIRECT peer address falls inside one of the
     trusted CIDRs. An unset/empty env is fail-CLOSED: no peer is trusted,
     so ``via`` is never honored (CIDRs are a deployment-tuned trust claim —
@@ -247,13 +252,13 @@ def _key_fingerprint(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
-def _registry_names(clients_env: str | None) -> dict:
+def _registry_names(clients_env: str | None) -> dict[str, str]:
     """Parse ``<clients_env>`` (``name:key;name:key;...``) into {key: name},
     re-read PER REQUEST so a Secret rotation reaches a running pod. Malformed
     entries are refused loudly and skipped — the registry can never widen
     authentication (it only NAMES keys that configured_keys already matched;
     an unparseable registry degrades attribution to fp-only, never auth)."""
-    names: dict = {}
+    names: dict[str, str] = {}
     if not clients_env:
         return names
     raw = (os.environ.get(clients_env) or "").strip()
@@ -282,8 +287,8 @@ def _registry_names(clients_env: str | None) -> dict:
 
 
 def capture_caller(
-    scope,
-    env_names=("MCP_API_KEYS",),
+    scope: MutableMapping[str, Any],
+    env_names: Iterable[str] = ("MCP_API_KEYS",),
     clients_env: str | None = None,
     trusted_cidrs_env: str = DEFAULT_TRUSTED_CIDRS_ENV,
 ) -> Caller:
@@ -358,14 +363,20 @@ class ApiKeyAuthMiddleware:
         everything except the probes is protected).
     """
 
-    def __init__(self, app, env_names=("MCP_API_KEYS",), protected=None, public_paths=None):
+    def __init__(
+        self,
+        app: Any,
+        env_names: Iterable[str] = ("MCP_API_KEYS",),
+        protected: Callable[[str], bool] | None = None,
+        public_paths: Iterable[str] | None = None,
+    ) -> None:
         self.app = app
         self._env_names = tuple(env_names) or (UNIVERSAL_API_KEYS_ENV,)
         self._protected = protected
         self._public = frozenset(public_paths if public_paths is not None else DEFAULT_PUBLIC_PATHS)
 
     @property
-    def routes(self):
+    def routes(self) -> Any:
         """Pass-through so callers/tests can introspect the wrapped app."""
         return self.app.routes
 
@@ -374,7 +385,12 @@ class ApiKeyAuthMiddleware:
             return self._protected(path)
         return path not in self._public
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(
+        self,
+        scope: MutableMapping[str, Any],
+        receive: Callable[[], Awaitable[MutableMapping[str, Any]]],
+        send: Callable[[MutableMapping[str, Any]], Awaitable[None]],
+    ) -> None:
         if scope["type"] != "http" or not self._needs_auth(scope.get("path", "")):
             await self.app(scope, receive, send)
             return
@@ -396,7 +412,7 @@ class ApiKeyAuthMiddleware:
         await send({"type": "http.response.body", "body": UNAUTHORIZED_BODY})
 
 
-def warn_if_open(server_label: str, env_names=("MCP_API_KEYS",)) -> bool:
+def warn_if_open(server_label: str, env_names: Iterable[str] = ("MCP_API_KEYS",)) -> bool:
     """Loud one-time startup warning when no keys are configured.
 
     Returns True when auth is OPEN — call it in the server's HTTP-mode
@@ -412,3 +428,69 @@ def warn_if_open(server_label: str, env_names=("MCP_API_KEYS",)) -> bool:
     print("shared or gateway-exposed deployment.")
     print(line)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Transport security (DNS-rebinding Host allowlist) — the K8S-MCP fleet
+# reference semantics, extracted 2026-10 so every streamable-HTTP server
+# shares one implementation instead of five hand-rolled
+# `TransportSecuritySettings(enable_dns_rebinding_protection=False)` lines.
+# ---------------------------------------------------------------------------
+
+HOSTNAME_ENV = "MCP_HOSTNAME"  # pinned public FQDN clients use to reach us
+
+EXTRA_ALLOWED_HOSTS_ENV = "MCP_EXTRA_ALLOWED_HOSTS"  # in-cluster svc-DNS Host allowlist additions
+
+
+def parse_extra_allowed_hosts(raw: str) -> list[str]:
+    """Parse ``MCP_EXTRA_ALLOWED_HOSTS`` into Host-header allowlist additions.
+
+    Comma-separated entries for in-cluster callers that address the server by
+    its service DNS name instead of the public FQDN (e.g.
+    ``http://<name>-service.<ns>.svc.cluster.local:9090/mcp``). The SDK's
+    transport security matches entries verbatim, or the ``host:*`` form to
+    accept any port. Order kept, surrounding whitespace and empties dropped,
+    duplicates deduplicated.
+    """
+    hosts: list[str] = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if entry and entry not in hosts:
+            hosts.append(entry)
+    return hosts
+
+
+def transport_security_from_env() -> "TransportSecuritySettings | None":
+    """TransportSecuritySettings for the streamable-HTTP MCP app, or None.
+
+    K8S-MCP's fleet-reference semantics:
+
+    * With NEITHER ``MCP_HOSTNAME`` nor ``MCP_EXTRA_ALLOWED_HOSTS`` set
+      (local dev), returns None — the SDK's implicit loopback-only
+      protection applies untouched.
+    * With either set, protection is explicitly ON and the Host allowlist
+      is: the pinned public FQDN (when set) + the extra in-cluster hosts +
+      loopback. ``allowed_origins`` stays the https-only browser form of
+      the pinned FQDN (in-cluster callers send no Origin header).
+
+    CHART CONTRACT: a server adopting this helper must wire both env vars
+    from its chart (``mcpHostname`` / ``extraAllowedHosts`` values) in the
+    SAME change, or in-cluster service-DNS callers start getting 421s.
+
+    Lazy SDK import on purpose — this module stays stdlib-only at import
+    time (see the module docstring); every consumer is an MCP server and
+    already has the SDK.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    mcp_hostname = os.environ.get(HOSTNAME_ENV, "").strip()
+    extra_hosts = parse_extra_allowed_hosts(os.environ.get(EXTRA_ALLOWED_HOSTS_ENV, ""))
+    if not mcp_hostname and not extra_hosts:
+        return None
+    allowed_hosts = ([mcp_hostname] if mcp_hostname else []) + extra_hosts
+    allowed_hosts += ["localhost:*", "127.0.0.1:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=([f"https://{mcp_hostname}"] if mcp_hostname else []),
+    )

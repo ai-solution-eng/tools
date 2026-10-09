@@ -85,8 +85,9 @@
       <div class="field">
         <label for="m-model">Model</label>
         <div class="combo">
-          <input id="m-model" autocomplete="off" placeholder="pick a catalog deployment or paste any repo id / path" spellcheck="false">
-          <button type="button" id="m-model-toggle" class="combo-toggle" aria-label="Catalog model suggestions">▾</button>
+          <input id="m-model" autocomplete="off" placeholder="pick a catalog deployment, search HuggingFace, or paste any repo id / path" spellcheck="false">
+          <button type="button" id="m-model-toggle" class="combo-toggle" aria-label="Model suggestions">▾</button>
+          <button type="button" id="m-model-refresh" class="combo-toggle" title="Re-fetch the catalog list" aria-label="Refresh model catalog">⟳</button>
           <div id="m-model-menu" class="combo-menu" hidden></div>
         </div>
         <details class="mini-details">
@@ -111,6 +112,18 @@
     <div class="sect-list">
       <div class="field-row">
         <div class="field">
+          <label for="m-weight-dtype">Weight dtype <span class="mini">override the checkpoint</span></label>
+          <select id="m-weight-dtype">
+            <option value="">auto — checkpoint dtype</option>
+            <option value="bf16">bf16 (2 B/param)</option>
+            <option value="fp8">fp8 (1 B/param)</option>
+            <option value="int8">int8 (1 B/param)</option>
+            <option value="nvfp4">nvfp4 (0.5 B/param)</option>
+            <option value="mxfp4">mxfp4 (0.5 B/param)</option>
+            <option value="int4">int4/gptq/awq (0.5 B/param)</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="m-runner">MoE runner backend <span class="mini">optional</span></label>
           <select id="m-runner">
             <option value="">none — as stored in the checkpoint</option>
@@ -119,7 +132,7 @@
           </select>
         </div>
         <div class="field">
-          <label for="m-ep">Expert parallel (EP) <span class="mini">MoE only</span></label>
+          <label for="m-ep">Expert parallel (EP) <span class="mini">MoE only, ≤ GPUs</span></label>
           <input id="m-ep" type="number" min="1" max="64" value="1">
         </div>
       </div>
@@ -176,6 +189,47 @@
           <option value="replicated">replicated (full stream on every rank)</option>
           <option value="sharded">sharded (each rank holds its head-share)</option>
         </select>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="m-engram">Engram tables <span class="mini">DeepSeek-V4.1 n-gram memory</span></label>
+          <select id="m-engram">
+            <option value="auto">auto — catalog preset / default VRAM</option>
+            <option value="host">host offload (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE)</option>
+            <option value="vram">VRAM (default row-sharded)</option>
+            <option value="off">ignore</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="m-engram-host">Engram host budget (GiB) <span class="mini">pod memory limit — tables + ~24 GiB runtime</span></label>
+          <input id="m-engram-host" type="number" min="0" max="8192" step="16" value="0" placeholder="0 = no check (V4.1-Flash needs ~207)">
+        </div>
+        <div class="field">
+          <label for="m-cstate">Compress-state dtype <span class="mini">SGLANG_DSV4_COMPRESS_STATE_DTYPE</span></label>
+          <select id="m-cstate">
+            <option value="">checkpoint default (FP4 + scales)</option>
+            <option value="bf16">bf16</option>
+            <option value="fp8">fp8</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="m-ssm">SSM state dtype <span class="mini">--mamba-ssm-dtype; float32 doubles the state</span></label>
+          <select id="m-ssm">
+            <option value="">config default (from mamba_ssm_dtype)</option>
+            <option value="bf16">bfloat16 (2 B/elem)</option>
+            <option value="fp32">float32 (4 B/elem)</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="m-mamba-ratio">Mamba full-memory ratio <span class="mini">--mamba-full-memory-ratio; 64 seqs @ 64k ≈ 0.08</span></label>
+          <input id="m-mamba-ratio" type="number" min="0" max="8" step="0.01" value="" placeholder="engine default (no split modeled)">
+        </div>
+        <div class="field">
+          <label for="m-mamba-conc">Target mamba concurrency <span class="mini">seqs the pool must carry</span></label>
+          <input id="m-mamba-conc" type="number" min="0" max="4096" step="1" value="0" placeholder="0 = KV-pool concurrency">
+        </div>
       </div>
     </div>
 
@@ -238,7 +292,67 @@
       return { name: m.label + " — " + m.gpu.toUpperCase() + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : ""), url: m.repo || m.name, _meta: m };
     });
   }).catch(function () { /* catalog is optional */ });
-  MB.combobox("m-model", function () { return catalogModels; }, applyCatalogModel);
+
+  // ---- HuggingFace autocomplete (goal: pull ANY model name) ----------------
+  // The combobox shows catalog presets + the live HF search results for the
+  // typed query (GET /api/models/search — public hub metadata, fails soft
+  // offline; catalog entries keep priority). A Refresh button re-lists the
+  // seed catalog (and re-enables search after an offline start).
+  var hfResults = [];          // latest HF search hits
+  var hfQuery = "";            // query the current hfResults belong to
+  var hfTimer = null;          // 300ms debounce
+  var hfSeq = 0;               // stale-response guard
+  function hfSuggest() {
+    var q = $("m-model").value.trim();
+    // free text under 2 chars (or a repo id already fully typed) -> catalog only
+    if (q.length < 2 || (q.indexOf("/") > 0 && q.split("/").length === 2 && hfQuery !== q)) {
+      // still search full repo ids — typing "Qwen/Qwen3-8B" should find it
+    }
+    if (q.length < 2) return;
+    if (q === hfQuery) return;  // already have these results
+    if (hfTimer) clearTimeout(hfTimer);
+    hfTimer = setTimeout(function () {
+      var seq = ++hfSeq;
+      fetch("/api/models/search?q=" + encodeURIComponent(q) + "&limit=8")
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (seq !== hfSeq) return;  // a newer keystroke superseded this
+          hfResults = (d.models || []).map(function (m) {
+            var bits = [];
+            if (m.downloads) bits.push(MB.fmtNum(m.downloads, 0) + " dl");
+            if (m.likes) bits.push("\u2665" + m.likes);
+            return { name: bits.length ? m.repo + "  (" + bits.join(", ") + ")" : m.repo, url: m.repo, _hf: true };
+          });
+          hfQuery = q;
+          // refresh the open menu in place (typing continues into the new list)
+          var menu = $("m-model-menu");
+          if (menu && !menu.hidden) {
+            var input = $("m-model");
+            var toggle = document.getElementById("m-model-toggle");
+            if (toggle) toggle.click();  // close+reopen with fresh suggestions
+          }
+        })
+        .catch(function () { /* offline: catalog-only suggestions stay */ });
+    }, 300);
+  }
+  $("m-model").addEventListener("input", hfSuggest);
+  $("m-model-refresh").addEventListener("click", function () {
+    hfResults = []; hfQuery = ""; hfSeq++;
+    var btn = this;
+    btn.disabled = true;
+    Promise.all([
+      fetch("/api/catalog").then(function (r) { return r.json(); }),
+    ]).then(function (out) {
+      catalogModels = (out[0].models || []).map(function (m) {
+        return { name: m.label + " — " + m.gpu.toUpperCase() + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : ""), url: m.repo || m.name, _meta: m };
+      });
+      $("m-msg").textContent = "catalog refreshed (" + catalogModels.length + " deployments)";
+    }).catch(function () {
+      $("m-msg").textContent = "refresh failed — catalog unavailable";
+    }).finally(function () { btn.disabled = false; });
+  });
+
+  MB.combobox("m-model", function () { return catalogModels.concat(hfResults); }, applyCatalogModel);
 
   var currentSpec = null;      // speculative struct from the picked catalog entry
   var currentRunner = "";      // --moe-runner-backend from the picked entry
@@ -254,8 +368,19 @@
     if (m.mem_fraction) $("m-mem").value = m.mem_fraction;
     currentSpec = m.speculative || null;
     currentRunner = m.moe_runner || "";
+    if (m.engram === "host") {
+      $("m-engram").value = "host";
+      if (m.engram_host_gib) $("m-engram-host").value = m.engram_host_gib;
+    }
+    if (m.compress_state_dtype) $("m-cstate").value = m.compress_state_dtype;
+    if (m.mamba_full_memory_ratio) $("m-mamba-ratio").value = m.mamba_full_memory_ratio;
+    if (m.mamba_ssm_dtype) $("m-ssm").value = m.mamba_ssm_dtype;
     var bits = ["serving preset: " + m.gpu + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : "")];
     if (currentRunner) bits.push("MoE runner " + currentRunner);
+    if (m.engram === "host") bits.push("engram host offload" + (m.engram_host_gib ? " (" + m.engram_host_gib + " GiB)" : ""));
+    if (m.compress_state_dtype) bits.push("compress-state " + m.compress_state_dtype);
+    if (m.mamba_full_memory_ratio) bits.push("mamba ratio " + m.mamba_full_memory_ratio);
+    if (m.mamba_ssm_dtype) bits.push("mamba ssm " + m.mamba_ssm_dtype);
     if (currentSpec && currentSpec.algorithm) {
       bits.push("speculative " + currentSpec.algorithm + (currentSpec.draft_model ? " (draft: " + currentSpec.draft_model.split("/").pop() + ")" : "") + (currentSpec.draft_tokens ? " x" + currentSpec.draft_tokens : ""));
     }
@@ -284,6 +409,7 @@
       tp: $("m-tp").value,
       pp: $("m-pp").value,
       kv_dtype: $("m-kv").value,
+      weight_dtype: $("m-weight-dtype").value || undefined,
       mem_fraction: $("m-mem").value,
       ep: $("m-ep").value,
       speculative: $("m-spec").value,
@@ -295,6 +421,12 @@
       hicache_size: $("m-hcs").value,
       hicache_l3: $("m-hcl3").value,
       hicache_tp_layout: $("m-hclayout").value,
+      engram: $("m-engram").value,
+      engram_host_gib: $("m-engram-host").value || undefined,
+      compress_state_dtype: $("m-cstate").value || undefined,
+      mamba_ssm_dtype: $("m-ssm").value || undefined,
+      mamba_full_memory_ratio: $("m-mamba-ratio").value || undefined,
+      mamba_concurrency: $("m-mamba-conc").value || undefined,
       moe_runner: currentRunner || $("m-runner").value || undefined,
       speculative: (function () {
         var flip = $("m-spec").checked;
@@ -336,6 +468,42 @@
     html += '<p class="sub">' + MB.esc(d.status) + "</p>";
     html += "<h2>Memory configuration</h2>" + kvTable(d.config);
     html += "<h2>Model structure</h2>" + kvTable(d.structure);
+    // Measured benchmarks: shown ONLY when the results library holds a real
+    // run for this model + GPU. The estimator does not predict tokens/second
+    // (a roofline over-predicted this fleet 3-5x), so there is deliberately
+    // no throughput estimate here -- only measured numbers, with provenance.
+    if (d.measured_benchmarks && d.measured_benchmarks.length) {
+      html += "<h2>Measured benchmarks <span class=\"mini\">from the committed results library</span></h2>";
+      d.measured_benchmarks.forEach(function (b, i) {
+        html += '<div class="measured"><div class="mini">'
+          + '<b>' + MB.esc(b.label || b.file) + "</b>"
+          + (b.setup ? " · " + MB.esc(b.setup) : "")
+          + (b.status === "partial" ? ' · <span class="badge warn">partial run</span>' : "")
+          + (b.same_shape ? ' · <span class="badge pass">same GPU count</span>' : "")
+          + "</div>";
+        var cols = b.columns || [];
+        html += '<table><thead><tr><th>level</th>'
+          + cols.map(function (c) { return '<th class="num">' + MB.esc(c.label) + "</th>"; }).join("")
+          + "</tr></thead><tbody>";
+        (b.rows || []).forEach(function (r) {
+          html += "<tr><td>" + MB.esc(r.label) + "</td>"
+            + cols.map(function (c) {
+                var v = r[c.key];
+                return '<td class="num">' + (v == null ? "-" : MB.fmtNum(v, 1)) + "</td>";
+              }).join("")
+            + "</tr>";
+        });
+        html += "</tbody></table>";
+        html += '<p class="mini">artifact: <code>results/' + MB.esc(b.id ? b.id.replace(/^lib:/, "") : "") + "</code>"
+          + (b.engine ? " · engine " + MB.esc(b.engine) : "")
+          + (b.weights ? " · " + MB.esc(b.weights) : "")
+          + (b.hicache ? " · HiCache x" + MB.esc(String(b.hicache)) : "")
+          + "</p></div>";
+      });
+      html += '<p class="mini">These are <b>measured</b> numbers from the named run — not estimates. '
+        + "tokens/s is per-request generation rate (TTFT excluded); multiply by the user count for "
+        + "aggregate throughput. Different setup than yours? Treat them as a reference point, not a prediction.</p>";
+    }
     if (d.scenarios && d.scenarios.length) {
       html += "<h2>Deployment scenarios</h2>";
       html += "<table><tbody>" + d.scenarios.map(function (s) {
@@ -356,12 +524,6 @@
         html += "</tr>";
       });
       html += "</tbody></table>";
-    }
-    if (d.kv_per_token_optimistic) {
-      html += '<div class="banner">Compressed-attention note: the headline prices the indexer\'s compressed K stream '
-        + "(conservative). The optimistic floor is <b>" + (d.kv_per_token_optimistic / 1024).toFixed(1)
-        + " KiB/token</b> if your engine does not keep it resident — compare a live server's "
-        + "max_total_num_tokens against both.</div>";
     }
     if (d.cache_tiers && d.cache_tiers.l2) {
       var t = d.cache_tiers;

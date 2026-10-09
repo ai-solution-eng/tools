@@ -157,41 +157,18 @@ def normalize_chat_rows(report_md: str) -> list[dict]:
     """report.md -> normalized comparison rows, one per distinct
     (ctx, users, task) tuple.
 
-    Chat sweeps repeat the same (ctx, users, task) across levels; later rows
-    in file order are later levels, so the LAST occurrence of each tuple wins.
+    DECOMPOSED through the atom layer (atomize.py): the SAME parse+dedupe
+    path that feeds /api/results/atoms and the CLI also produces this
+    compare-view shape — one implementation, three consumers. Within one
+    file a repeated (ctx, users, task) is a later level of the same test;
+    the LAST occurrence wins (atomize.latest_occurrences semantics).
     """
-    # imported lazily: keeps compare.py importable standalone and the webapp
-    # runtime resilient if results_to_html ever grows heavy deps
-    import importlib
+    from model_benchmarker import atomize
 
-    parser = importlib.import_module("model_benchmarker.results_to_html")
-    _mode, rows, _arrival = parser.parse_chat_table_full(report_md or "")
-
-    out: list[dict] = []
-    seen: dict[tuple, dict] = {}
-    for r in rows:
-        ttft = r.get("ttft") or []
-        tokens = r.get("tokens") or []
-        if not ttft or not tokens:
-            continue
-        ttft_post = r.get("ttft_post") or []
-        key = (r.get("ctx"), r.get("users"), r.get("task"))
-        metrics = {
-            "ttft_turn1_p50_ms": _num(ttft[0]) if len(ttft) > 0 else None,
-            "ttft_turn1_p95_ms": _num(ttft[1]) if len(ttft) > 1 else None,
-            "ttft_post_p50_ms": _num(ttft_post[0]) if len(ttft_post) > 0 else None,
-            "ttft_post_p95_ms": _num(ttft_post[1]) if len(ttft_post) > 1 else None,
-            "tokens_p50": _num(tokens[0]) if len(tokens) > 0 else None,
-            "tokens_p95": _num(tokens[1]) if len(tokens) > 1 else None,
-            "failed": _num(r.get("failed")),
-        }
-        row = {"label": f"ctx={key[0]} users={key[1]} {key[2]}", "metrics": metrics}
-        if key in seen:
-            seen[key]["metrics"] = metrics  # later levels overwrite earlier ones
-        else:
-            seen[key] = row
-            out.append(row)
-    return out
+    atoms = atomize.atomize_chat_report(report_md, source="report.md", meta={})
+    return [
+        {"label": a["label"], "metrics": atomize.atom_to_compare_metrics(a)} for a in atomize.latest_occurrences(atoms)
+    ]
 
 
 def _columns_for(rows: list[dict]) -> list[str]:

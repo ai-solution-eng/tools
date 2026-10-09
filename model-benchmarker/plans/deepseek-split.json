@@ -1,0 +1,44 @@
+{
+  "_comment": "Split the 2h-timeout deepseek sweep into sequential, per-context runs. Each stays far under BENCH_MAX_RUN_SECONDS (default 7200s); the sequencer launches them one at a time so TTFT/TPS never contend. Edit the ctx32k/ctx64k targets (same URL as ctx0), then: MB_API_KEY=... python -m model_benchmarker.webapp.sequencer plans/deepseek-split.json --base-url http://<webapp>:8000",
+  "settle_seconds": 30,
+  "runs": [
+    {
+      "name": "ctx0",
+      "target": "http://deepseek-v41-flash-offload.project-user-andrew-bydlon.svc.cluster.local:80",
+      "params": {
+        "number_users": "1,4,32,64",
+        "requests_per_user": 5,
+        "context_length": "0",
+        "tasks": "coding,creative",
+        "separate_tasks": true,
+        "multiturn": false
+      }
+    },
+    {
+      "name": "ctx32k-light",
+      "_comment": "32k context WITHOUT separate_tasks: one pass per user level instead of one per task -- roughly half the wall clock of the timed-out sweep for this context.",
+      "target": "http://deepseek-v41-flash-offload.project-user-andrew-bydlon.svc.cluster.local:80",
+      "params": {
+        "number_users": "1,4,32",
+        "requests_per_user": 5,
+        "context_length": "32768",
+        "tasks": "coding,creative",
+        "separate_tasks": false,
+        "multiturn": false
+      }
+    },
+    {
+      "name": "ctx32k-heavy",
+      "_comment": "The saturation level alone, separate_tasks on for the clean turn1/turn2+ split. If this still approaches ~2h, drop users to 48 or requests_per_user to 3.",
+      "target": "http://deepseek-v41-flash-offload.project-user-andrew-bydlon.svc.cluster.local:80",
+      "params": {
+        "number_users": "64",
+        "requests_per_user": 5,
+        "context_length": "32768",
+        "tasks": "coding,creative",
+        "separate_tasks": true,
+        "multiturn": false
+      }
+    }
+  ]
+}

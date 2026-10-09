@@ -76,6 +76,21 @@ def seed_results_into_workdir(work_dir: Path) -> Path | None:
     return None
 
 
+def _model_of(slug: str, path) -> str | None:
+    """The committed artifact's model identity: the directory slug IS the
+    model (results/<model-slug>/<SETUP>.md — the same identity /api/library
+    groups by); the file's own "- Model: ... name='...'" bullet overrides
+    when present (a file moved out of its slug dir still names itself)."""
+    import re
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:4096]
+    except OSError:
+        text = ""
+    m = re.search(r"- Model: \S+ name='([^']*)'", text)
+    return m.group(1) if m else slug
+
+
 def _setup_label(meta: dict[str, Any]) -> str:
     parts: list[str] = []
     if meta.get("gpu"):
@@ -149,6 +164,7 @@ def scan_library(root: Path | None = None) -> dict:
                     "kind": kind,
                     "file": fp.name,
                     "label": stem,
+                    "model": _model_of(slug, fp),
                     "setup": _setup_label(meta),
                     "gpu": meta.get("gpu"),
                     "gpu_count": meta.get("gpu_count") or 1,
@@ -206,13 +222,16 @@ def library_entry(entry_id: str) -> dict | None:
     if not chat_rows and mem is None:
         return None
     meta = _rts.parse_setup(path.stem)
+    model = _model_of(ref.split("/")[0], path)
+    setup_label = _setup_label(meta) or path.stem
     return {
         "run_id": LIB_PREFIX + ref,
         "kind": "chat" if chat_rows else "memory",
         "target_url": f"results/{ref}{path.suffix} (committed baseline)",
         "status": "complete" if "Status: complete" in text else "partial",
         "started_utc": "",
-        "params_label": _setup_label(meta) or path.stem,
+        "model": model,
+        "params_label": " · ".join(x for x in (model, setup_label) if x) or path.stem,
         "config": mem.get("config", {}) if mem else {},
         "rows": chat_rows,
         "knee": None,

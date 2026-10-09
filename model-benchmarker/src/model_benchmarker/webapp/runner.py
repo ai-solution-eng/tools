@@ -217,6 +217,34 @@ def apply_target_usage(url: str, params: dict) -> str:
     return url
 
 
+def target_aliases(url: str) -> list[str]:
+    """Every URL form that refers to the SAME backend: the input as typed,
+    its remote/local rewrite, and both stripped to scheme://host:port. The
+    MB-E resume suggester matches a user-typed target against run records —
+    records store the RESOLVED url (local origin), users type the SERVING
+    url from the combobox; exact-string matching silently never fires
+    (observed live: the resume suggestion pre-check never appeared)."""
+    forms = [url]
+    local = convert_remote_url_to_local(url)
+    if local != url:
+        forms.append(local)
+    out: list[str] = []
+    for f in forms:
+        try:
+            out.append(origin_of(f))
+        except BenchError:
+            continue
+        out.append(f.rstrip("/"))
+    # dedupe, preserve order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for f in out:
+        if f not in seen:
+            seen.add(f)
+            deduped.append(f)
+    return deduped
+
+
 def endpoint_api_keys() -> dict[str, str]:
     """Target API keys: JSON object of exact target URL -> key (from a
     Secret). When a run's target matches exactly, the key is injected into
@@ -377,6 +405,7 @@ def _redact(params: dict) -> dict:
             k: ("...(redacted)" if "key" in k.lower() or "token" in k.lower() else v) for k, v in out["args"].items()
         }
     out.pop("api_key", None)
+    out.pop("_resume_src", None)  # launch()-internal resolved path, never served
     return out
 
 
@@ -393,6 +422,22 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_KEY_PARTS = ("key", "token", "secret", "password", "authorization", "credential")
+
+
+_MODEL_BULLET_RE = re.compile(r"- Model: \S+ name='([^']*)'")
+
+
+def _report_model_identity(report_text: str | None, params: dict) -> str | None:
+    """Model identity for a chat run, best-effort, in priority order: the
+    report's own "- Model: ... name='...'" header bullet (the engine stamps
+    it on every report.md rewrite; empty name='' does NOT count), then
+    params.model (already redacted at read time like every params consumer).
+    None when neither applies — callers render the run id, never a guess."""
+    if report_text:
+        m = _MODEL_BULLET_RE.search(report_text)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return str(params.get("model") or "").strip() or None
 
 
 def _flatten_config_subset(params: dict) -> dict[str, Any]:
@@ -469,6 +514,34 @@ def build_chat_argv(
     del prom_url  # chat bench has no telemetry join (yet)
     original_url = target_url
     target_url = apply_target_usage(target_url, params)
+    # MB-E resume: seed this run's report from a previous artifact's completed
+    # levels. Two client shapes: resume_output (an explicit artifact path,
+    # kept for parity with the engine's --resume-from) or resume_run (a prior
+    # RUN ID — resolved to that run's report.md by launch() BEFORE this
+    # builder runs, so the client never supplies a path). The engine copies
+    # the source's measurements into the NEW run's own report.md before
+    # running the missing levels; guardrails (model/url/run-shape stamps)
+    # refuse mismatches inside the engine, at run start.
+    resume_from = ""
+    if _flag(params, "resume"):
+        resume_run = _capped_str(params, "resume_run", 128)
+        resume_output = _capped_str(params, "resume_output", 512)
+        if resume_run and resume_output:
+            raise BenchError("resume: give resume_run OR resume_output, not both")
+        if resume_run:
+            # launch() resolves this to the resolved-resume path (key
+            # "_resume_src") before the builder is invoked; its absence here
+            # means the launch path skipped resolution — refuse loudly.
+            resume_from = _capped_str(params, "_resume_src", 1024) or ""
+            if not resume_from:
+                raise BenchError(
+                    "resume_run: could not be resolved to a report artifact (unknown run id or no report.md)"
+                )
+        elif resume_output:
+            resume_from = resume_output
+        else:
+            raise BenchError("resume: provide resume_run (a prior run id) or resume_output (an artifact path)")
+    output_path = str(run_dir / "report.md")
     argv = [
         sys.executable,
         "-m",
@@ -479,8 +552,10 @@ def build_chat_argv(
         # TTFT/ITL when stdout is a pipe (the module's own --quiet guidance)
         "--quiet",
         "--output",
-        str(run_dir / "report.md"),
+        output_path,
     ]
+    if resume_from:
+        argv += ["--resume-from", resume_from]
     env: dict[str, str] = {}
 
     api_key = _capped_str(params, "api_key", 4096) or ""
@@ -566,6 +641,8 @@ def build_chat_argv(
         argv.append("--prewarm")
     if _flag(params, "separate_tasks"):
         argv.append("--separate_tasks")
+
+    prompt = _capped_str(params, "prompt", 20000)
 
     prompt = _capped_str(params, "prompt", 20000)
     if prompt:
@@ -842,6 +919,25 @@ class RunManager:
         run_dir.mkdir(parents=True, exist_ok=False)
 
         prom_url = (os.environ.get(PROM_URL_ENV) or "").strip() or None
+        # MB-E resume: resolve a resume_run id to its artifact BEFORE the
+        # builder runs (the builder is pure; only the manager may touch the
+        # runs dir). Unknown id / missing report.md / non-chat-kind source ->
+        # BenchError -> HTTP 400 with the reason, before any subprocess.
+        if _flag(params, "resume") and _capped_str(params, "resume_run", 128):
+            rid = _capped_str(params, "resume_run", 128) or ""
+            try:
+                src_rec = self._require(rid)
+            except KeyError:
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise BenchError(f"resume_run: unknown run id {rid!r}") from None
+            try:
+                src = self.artifact_path(rid, "report.md")
+            except BenchError:
+                src = None
+            if src is None or src_rec.kind != "chat":
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise BenchError(f"resume_run: run {rid!r} has no chat report.md to resume from")
+            params = {**params, "_resume_src": str(src)}
         argv, env_extra, redacted = BUILDERS[kind](url, dict(params), run_dir, prom_url)
         # the record shows what actually gets benchmarked: the resolved URL
         # (local/remote toggle applied); the user's original input stays in
@@ -923,6 +1019,65 @@ class RunManager:
                 if self._busy.get(rec.endpoint) == rec.run_id:
                     del self._busy[rec.endpoint]
             self._write_meta(rec)
+            # MB-DB: the run is TERMINAL here (success|failed|cancelled|
+            # timeout|interrupted) — the artifact on disk is the final report
+            # with ALL levels, so this is the one and only record point.
+            # Recording on intermediate level updates would store partial
+            # measurements; recording must also stay fire-and-forget: a store
+            # failure never breaks run supervision.
+            if rec.status != "running":
+                recorded = self._record_run_atoms(rec.run_id)
+                if recorded is not None:
+                    print(f"[store] {rec.run_id}: {recorded[0]} recorded, {recorded[1]} already stored")
+
+    def _store_path(self) -> Path:
+        """The measurement store lives beside the runs on the PVC."""
+        return self.work_dir / "atoms.db"
+
+    def _record_run_atoms(self, run_id: str) -> tuple[int, int] | None:
+        """Decompose a terminal run's artifact into the measurement store.
+
+        Chat runs: report.md; endpoint runs: run.json -- whatever is on disk
+        at completion time (the final report with ALL levels; intermediate
+        level updates never reach here because recording happens only in
+        _supervise's teardown, after _write_meta). Returns (inserted,
+        skipped) on success, None when there is nothing to record (unknown
+        run id, missing artifact, unknown kind). The WHOLE body is guarded:
+        the store is fire-and-forget for run supervision -- any failure is
+        logged and swallowed so a store problem can never break teardown.
+        """
+        try:
+            rec = self._require(run_id)
+        except KeyError:
+            return None
+        try:
+            meta = {
+                "run_id": run_id,
+                "status": rec.status,
+                "started_utc": rec.started_utc,
+                "target_url": rec.target_url,
+                "params": rec.params if isinstance(rec.params, dict) else {},
+            }
+            from model_benchmarker import atomize, store
+
+            if rec.kind == "chat":
+                text = self._read_text_artifact(run_id, "report.md")
+                if text is None:
+                    return None
+                atoms = atomize.atomize_chat_report(text, f"runs/{run_id}/report.md", meta)
+                source = f"runs/{run_id}/report.md"
+            elif rec.kind == "endpoint":
+                parsed = self._read_json_artifact(run_id, "run.json")
+                if parsed is None:
+                    return None
+                atoms = atomize.atomize_endpoint_run(parsed, f"runs/{run_id}/run.json", meta)
+                source = f"runs/{run_id}/run.json"
+            else:
+                return None
+            return store.record_atoms(self._store_path(), atoms, source=source)
+        except Exception as exc:  # store failure must NEVER break supervision
+            print(f"[store] {run_id}: recording failed ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+            return None
 
     def cancel(self, run_id: str) -> RunRecord:
         rec = self._require(run_id)
@@ -992,24 +1147,178 @@ class RunManager:
     def busy_endpoints(self) -> dict[str, str]:
         return dict(self._busy)
 
-    def public_index(self, limit: int = 200) -> list[dict]:
+    def _fuse_key(self, rec: RunRecord) -> tuple | None:
+        """The fusion identity for the results index: same kind + same MODEL
+        + the same run-shape fingerprint the ENGINE stamps into report.md
+        headers (``_resume_config_fingerprint``: arrival mechanics, task mix,
+        requests_per_user, mode flags, and sampling overrides when set).
+        Runs differing in any of those are DIFFERENT experiments and never
+        fuse.
+
+        The MODEL (not the serving target) is the identity the results page
+        compares on: a re-deployment of the same model at a different URL —
+        or a resume of an earlier attempt — is the same experiment and must
+        collapse into one listing entry whose compare rows are the latest
+        measurement per test condition (the compare/atom layer already
+        resolves latest-occurrence-wins per (ctx, users, task)). The
+        number_users / context_length ROSTERS are deliberately NOT part of
+        the key — the engine's own resume gate treats them as sweep progress,
+        not identity (a resume of a 1,4,32,64 sweep launched with roster
+        32,64 must land in the same group). Model identity follows the same
+        priority as compare_data: the report.md "- Model: ... name='...'"
+        bullet, else params.model. A run with NO model identity anywhere
+        falls back to its resolved target (the previous behavior), so
+        anonymous runs still fuse only with themselves. None for endpoint
+        runs (they keep per-run rows)."""
+        if rec.kind != "chat":
+            return None
+        p = rec.params if isinstance(rec.params, dict) else {}
+        sweep = (
+            str(p.get("arrival_mode") or "closed"),
+            str(p.get("requests_per_user") or ""),
+            str(p.get("tasks") or ""),
+            str(bool(p.get("multiturn"))),
+            str(bool(p.get("no_nonce"))),
+            str(bool(p.get("separate_tasks"))),
+            str(p.get("request_rate") or ""),
+            str(p.get("level_duration") or ""),
+            str(p.get("max_tokens") or ""),
+            str(p.get("temperature") or ""),
+            str(p.get("top_p") or ""),
+        )
+        model = _report_model_identity(self._read_text_artifact(rec.run_id, "report.md"), p)
+        if not model:
+            model = rec.target_url.rstrip("/")
+        return (rec.kind, model, sweep)
+
+    def public_index(self, limit: int = 200, fuse: bool = True) -> list[dict]:
         """Public-safe run index for the results page: no params (they can
         carry redacted-but-still-sensitive header names), no log content.
-        From the PVC-resident metadata, newest first."""
-        out = []
-        for r in sorted(self._runs.values(), key=lambda x: x.started_utc, reverse=True)[:limit]:
-            out.append(
-                {
-                    "run_id": r.run_id,
-                    "kind": r.kind,
-                    "target_url": r.target_url,
-                    "status": r.status,
-                    "started_utc": r.started_utc,
-                    "finished_utc": r.finished_utc,
-                    "artifacts": self.artifacts(r.run_id),
-                    "n": len(self.artifacts(r.run_id)),
-                }
-            )
+        From the PVC-resident metadata, newest first.
+
+        With ``fuse`` (default) partial runs of the SAME experiment — same
+        target + sweep shape, non-running terminal status — collapse into ONE
+        listing entry: the run with the most completed test rows represents
+        the group (its artifacts/rows win), and the entry carries
+        ``fused_from`` (the run ids absorbed) + ``fused_count`` so the UI can
+        show "3 runs fused". Completed measurements are additive across the
+        group; showing five rows for one experiment was noise. Runs still
+        ``running`` and full-success runs always stand alone."""
+        # newest first, then group
+        recs = sorted(self._runs.values(), key=lambda x: x.started_utc, reverse=True)[:limit]
+        groups: dict[tuple, list[RunRecord]] = {}
+        singles: list[RunRecord] = []
+        for r in recs:
+            if r.status == "running":
+                singles.append(r)
+                continue
+            key = self._fuse_key(r) if fuse else None
+            if key is None:
+                singles.append(r)
+                continue
+            groups.setdefault(key, []).append(r)
+
+        def _row(r: RunRecord, fused_from: list[str] | None = None) -> dict:
+            aliases = []
+            if r.target_url:
+                try:
+                    aliases = target_aliases(r.target_url)
+                except Exception:
+                    aliases = [r.target_url]
+            p = r.params if isinstance(r.params, dict) else {}
+            model = None
+            if r.kind == "chat":
+                model = _report_model_identity(self._read_text_artifact(r.run_id, "report.md"), p)
+            if not model:
+                model = str(p.get("model") or "") or None
+            row = {
+                "run_id": r.run_id,
+                "kind": r.kind,
+                "model": model,
+                "target_url": r.target_url,
+                "target_aliases": aliases,
+                "status": r.status,
+                "started_utc": r.started_utc,
+                "finished_utc": r.finished_utc,
+                "artifacts": self.artifacts(r.run_id),
+                "n": len(self.artifacts(r.run_id)),
+            }
+            if fused_from:
+                row["fused_from"] = fused_from
+                row["fused_count"] = len(fused_from) + 1
+            return row
+
+        out: list[dict] = []
+        for r in singles:
+            out.append(_row(r))
+        for key, group in groups.items():
+            if len(group) == 1:
+                out.append(_row(group[0]))
+                continue
+
+            # representative = the run with the most completed test rows
+            # (report.md table rows); tie-break newest started_utc
+            def _completed(rec: RunRecord) -> int:
+                text = self._read_text_artifact(rec.run_id, "report.md")
+                if not text:
+                    return 0
+                from model_benchmarker import atomize as _atom
+
+                return len(_atom.atomize_chat_report(text, f"runs/{rec.run_id}/report.md", {}))
+
+            ranked = sorted(group, key=lambda r: (_completed(r), r.started_utc), reverse=True)
+            best = ranked[0]
+            absorbed = [r.run_id for r in ranked[1:]]
+            row = _row(best, absorbed)
+            row["status"] = "timeout" if any(r.status == "timeout" for r in group) else best.status
+            out.append(row)
+        return out
+
+    def atoms_data(self, run_id: str) -> dict:
+        """Atomic test records for ONE run (the /api/results/atoms surface).
+
+        Same shape contract as compare_data: read-only, public-safe (params
+        are the write-time-redacted ones), path safety identical to
+        artifact_path. Chat runs decompose through report.md; endpoint runs
+        through run.json. An interrupted run with neither artifact returns
+        atoms=[] + an "error" reason."""
+        rec = self._require(run_id)
+        run_dir = (self.runs_dir / rec.run_id).resolve()
+        if run_dir.parent != self.runs_dir.resolve():
+            raise BenchError("invalid run id")
+        from model_benchmarker import atomize as _atom
+
+        meta = {
+            "run_id": rec.run_id,
+            "status": rec.status,
+            "started_utc": rec.started_utc,
+            "target_url": rec.target_url,
+            "params": rec.params if isinstance(rec.params, dict) else {},
+        }
+        out: dict[str, Any] = {
+            "run_id": rec.run_id,
+            "kind": rec.kind,
+            "target_url": rec.target_url,
+            "status": rec.status,
+            "started_utc": rec.started_utc,
+            "atoms": [],
+            "error": None,
+        }
+        if rec.kind == "chat":
+            text = self._read_text_artifact(run_id, "report.md")
+            if text is None:
+                out["error"] = "no machine-readable summary"
+                return out
+            out["atoms"] = _atom.atomize_chat_report(text, f"runs/{run_id}/report.md", meta)
+            return out
+        if rec.kind == "endpoint":
+            parsed = self._read_json_artifact(run_id, "run.json")
+            if parsed is None:
+                out["error"] = "no machine-readable summary"
+                return out
+            out["atoms"] = _atom.atomize_endpoint_run(parsed, f"runs/{run_id}/run.json", meta)
+            return out
+        out["error"] = f"unknown kind {rec.kind!r}"
         return out
 
     def compare_data(self, run_id: str) -> dict:
@@ -1043,6 +1352,16 @@ class RunManager:
         else:
             label = _chat_params_label(redacted)
 
+        # model identity for the compare cards/series: the artifact's own
+        # "- Model: ... name='...'" header bullet (same source the atomizer
+        # uses); falls back to params.model, else None (the UI renders the
+        # run id — it never invents a name)
+        model = None
+        if rec.kind == "chat":
+            model = _report_model_identity(self._read_text_artifact(run_id, "report.md"), redacted)
+        if not model:
+            model = str(redacted.get("model") or "") or None
+
         out: dict[str, Any] = {
             "run_id": rec.run_id,
             "kind": rec.kind,
@@ -1050,6 +1369,7 @@ class RunManager:
             "status": rec.status,
             "started_utc": rec.started_utc,
             "params_label": label,
+            "model": model,
             "config": config,
             "rows": [],
             "knee": None,

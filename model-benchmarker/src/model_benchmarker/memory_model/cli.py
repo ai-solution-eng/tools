@@ -29,8 +29,10 @@ from .configs import load_config_json
 from .dtypes import dtype_label
 from .estimate import (
     DEFAULT_OVERHEAD_GIB,
+    EngramSpec,
     EstimateRequest,
     HicacheSpec,
+    MambaSpec,
     SpeculativeSpec,
     resolve_dtype_weight,
     run_estimate,
@@ -62,6 +64,47 @@ def _fmt_gib(b: float | None) -> str:
 
 def _fmt_m(b: float | None) -> str:
     return f"{b / 1e6:.2f}M" if b is not None else "?"
+
+
+def _engram_from_args(args: argparse.Namespace, entry: dict | None) -> EngramSpec:
+    """EngramSpec from --engram* flags, with the catalog entry's environment
+    as the auto default (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 -> host).
+
+    Resolution: explicit --engram wins; else the catalog entry's env; else
+    the config's default layout (VRAM). --engram-dtype / --engram-host-gib
+    carry the layout knobs; the host budget defaults from the entry's
+    resource_limit_memory when the offload is on.
+    """
+    mode = (getattr(args, "engram", "") or "").strip().lower()
+    env = (entry or {}).get("environment") or {}
+    env_on = str(env.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "")).strip().lower() in ("1", "true", "yes")
+    if not mode or mode == "auto":
+        mode = "host" if env_on else ""
+    if mode == "off":
+        return EngramSpec(mode="", dtype=None, host_gib=0.0)
+    host_gib = getattr(args, "engram_host_gib", 0.0) or 0.0
+    if not host_gib and mode == "host" and entry:
+        lim = str(entry.get("resource_limit_memory") or "").strip()
+        if lim.lower().endswith("gi"):
+            try:
+                host_gib = float(lim[:-2])
+            except ValueError:
+                host_gib = 0.0
+    return EngramSpec(mode=mode, dtype=getattr(args, "engram_dtype", None) or None, host_gib=host_gib)
+
+
+def _engram_config_rows(spec: EngramSpec, res) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    ed = res.details.get("engram") or {}
+    if not ed.get("present"):
+        return rows
+    if spec.mode == "host":
+        rows.append(("engram", f"HOST offload: {ed.get('bytes', 0) / 1024**3:.1f} GiB host RAM (out of HBM)"))
+        if spec.host_gib:
+            rows.append(("engram host budget", f"{spec.host_gib:g} GiB (pod memory limit)"))
+    else:
+        rows.append(("engram", f"VRAM (default row-sharded across TP): {ed.get('bytes', 0) / 1024**3:.1f} GiB"))
+    return rows
 
 
 def _hicache_from_args(args: argparse.Namespace) -> HicacheSpec:
@@ -161,6 +204,20 @@ def _args_from_catalog(entry: dict, args: argparse.Namespace) -> None:
             args.mem_fraction = float(mf) if mf else None
         except ValueError:
             pass
+    # mamba/KDA pool knobs (linear-attention deployments: Qwen3.8-27B
+    # DFLASH2 shape, GLM-5.3-Flash KDA, ...)
+    if getattr(args, "mamba_full_memory_ratio", None) is None:
+        r = opt("--mamba-full-memory-ratio")
+        try:
+            args.mamba_full_memory_ratio = float(r) if r else None
+        except ValueError:
+            args.mamba_full_memory_ratio = None
+    if getattr(args, "mamba_ssm_dtype", None) is None:
+        args.mamba_ssm_dtype = opt("--mamba-ssm-dtype")
+    if not getattr(args, "draft_tokens", 0):
+        dt = opt("--speculative-num-draft-tokens")
+        if dt and dt.isdigit():
+            args.draft_tokens = int(dt)
 
 
 def _catalog_model_ref(entry: dict) -> str | None:
@@ -220,6 +277,15 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
     kv_dtype = args.kv_dtype
     mem_fraction = args.mem_fraction if args.mem_fraction is not None else 0.9
     contexts = sorted({int(c) for c in (args.context or DEFAULT_CONTEXTS)})
+    if args.ep > gpus:
+        # the estimator clamps EP to the GPU count (same guardrail as TP/PP);
+        # say so instead of silently re-pricing as pure TP (webapp 400s here)
+        print(
+            f"warning: --ep {args.ep} exceeds the GPU count ({gpus}) — expert parallelism "
+            "ignored (pure TP pricing); pass --gpus >= --ep for the EP split",
+            file=sys.stderr,
+        )
+        args.ep = 1
 
     if entry:
         _args_from_catalog(entry, args)
@@ -243,20 +309,38 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
     )
     kv_label_str = dtype_label(kv_dtype) if kv_dtype else "bf16 (auto)"
 
+    hicache = _hicache_from_args(args)
+    engram = _engram_from_args(args, entry)
+    mamba = MambaSpec(
+        full_memory_ratio=getattr(args, "mamba_full_memory_ratio", None),
+        ssm_dtype=getattr(args, "mamba_ssm_dtype", None) or None,
+    )
+    mamba_concurrency = getattr(args, "mamba_concurrency", 0) or 0
+    compress_state = (
+        getattr(args, "compress_state_dtype", None)
+        or str(((entry or {}).get("environment") or {}).get("SGLANG_DSV4_COMPRESS_STATE_DTYPE") or "").strip()
+        or None
+    )
+
     req = EstimateRequest(
         cfg=cfg,
+        model_ref=model_ref,
         gpu=gpu,
         gpu_count=gpus,
         tp_size=tp,
         pp_size=pp,
         weight_dtype=weight_dtype,
         kv_dtype=kv_dtype,
+        state_dtype=compress_state,
         mem_fraction=mem_fraction,
         overhead_gib=args.overhead,
         context=contexts[-1],
         speculative=spec_args,
         moe_runner=getattr(args, "moe_runner", "") or None,
         hicache=_hicache_from_args(args),
+        engram=engram,
+        mamba=mamba,
+        mamba_concurrency=mamba_concurrency,
         ep_size=args.ep,
     )
     res = run_estimate(req)
@@ -280,6 +364,16 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
     ]
     if cfg.num_nextn_predict_layers:
         structure.append(("MTP layers (checkpoint)", str(cfg.num_nextn_predict_layers)))
+    ed = res.details.get("engram") or {}
+    if ed.get("present") and ed.get("parse_ok"):
+        structure.append(
+            (
+                "engram tables",
+                f"{ed.get('layers', 0)} layer(s), {ed.get('rows', 0):,} rows x {ed.get('head_dim', 0)} dims"
+                f" @ {ed.get('dtype', '?')} = {_fmt_gib(ed.get('bytes'))}"
+                + (" (host-table offload)" if engram.mode == "host" else " (VRAM, row-sharded)"),
+            )
+        )
 
     hicache = _hicache_from_args(args)
 
@@ -297,17 +391,21 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
             r = run_estimate(
                 EstimateRequest(
                     cfg=cfg,
+                    model_ref=model_ref,
                     gpu=gpu,
                     gpu_count=g,
                     tp_size=t,
                     pp_size=pp,
                     weight_dtype=weight_dtype,
                     kv_dtype=kv_dtype,
+                    state_dtype=compress_state,
                     mem_fraction=mem_fraction,
                     overhead_gib=args.overhead,
                     context=contexts[-1],
                     speculative=spec_args,
                     hicache=hicache,
+                    engram=engram,
+                    mamba=mamba,
                     ep_size=args.ep,
                 )
             )
@@ -354,6 +452,14 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
             *([("expert parallel", str(args.ep))] if args.ep > 1 else []),
             ("overhead", f"{args.overhead:g} GiB/GPU"),
             *(_hicache_config_rows(hicache, res)),
+            *(_engram_config_rows(engram, res)),
+            *([("compress state", f"{compress_state} (SGLANG_DSV4_COMPRESS_STATE_DTYPE)")] if compress_state else []),
+            *(
+                [("mamba full-memory ratio", f"{mamba.full_memory_ratio:g}")]
+                if mamba.full_memory_ratio is not None
+                else []
+            ),
+            *([("ssm state dtype", mamba.ssm_dtype)] if mamba.ssm_dtype else []),
             ("max context", f"{contexts[-1]:,}"),
         ],
         "structure": structure,
@@ -379,8 +485,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gpu-vram", type=float, help="override VRAM in GiB (unknown GPUs)")
     ap.add_argument("--gpus", dest="gpu_count", type=int, help="number of GPUs (default 1)")
     ap.add_argument("--tp", type=int, help="tensor-parallel size (default: all GPUs)")
-    ap.add_argument("--pp", type=int, help="pipeline-parallel size (default 1; weights stage-split x PP, "
-                                            "KV pool unchanged — the GLM-5.2 TP4/PP2 shape)")
+    ap.add_argument(
+        "--pp",
+        type=int,
+        help="pipeline-parallel size (default 1; weights stage-split x PP, "
+        "KV pool unchanged — the GLM-5.2 TP4/PP2 shape)",
+    )
     ap.add_argument("--weight-dtype", help="weights dtype (default: from quantization_config/torch_dtype)")
     ap.add_argument("--kv-dtype", help="KV cache dtype (fp16/bf16 default; fp8_e4m3 etc.)")
     ap.add_argument("--mem-fraction", type=float, help="engine mem-fraction-static (default 0.9)")
@@ -480,6 +590,66 @@ def main(argv: list[str] | None = None) -> int:
         "--hicache-tp-sharded",
         action="store_true",
         help="L2 is partitioned across TP ranks (forced; the auto rule shards for standard GQA/MHA families)",
+    )
+    ap.add_argument(
+        "--engram",
+        default="auto",
+        metavar="MODE",
+        help="DeepSeek-V4.1 engram n-gram memory tables: 'auto' (default -- host when the "
+        "catalog entry sets SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE, else VRAM), 'vram' "
+        "(default row-sharded layout, counted as weights), 'host' (host-table offload, "
+        "freed HBM goes to the KV pool), 'off' (ignore the tables)",
+    )
+    ap.add_argument(
+        "--engram-dtype",
+        default=None,
+        metavar="DT",
+        help="engram table storage dtype (default: the checkpoint's fp8 -- the SGLang "
+        "model page prices the tables as fp8)",
+    )
+    ap.add_argument(
+        "--engram-host-gib",
+        type=float,
+        default=0.0,
+        metavar="GIB",
+        help="host-RAM budget for the engram tables (default: the catalog entry's "
+        "resource_limit_memory when offloading; 0 = no budget check)",
+    )
+    ap.add_argument(
+        "--compress-state-dtype",
+        default=None,
+        metavar="DT",
+        help="compressed-state storage dtype for the DeepSeek CSA families "
+        "(SGLANG_DSV4_COMPRESS_STATE_DTYPE): 'bf16' prices entries flat at 2 B/elem, "
+        "default fp4 uses the checkpoint's FP4+scales layout",
+    )
+    ap.add_argument(
+        "--mamba-full-memory-ratio",
+        type=float,
+        default=None,
+        metavar="X",
+        help="SGLang --mamba-full-memory-ratio: the fraction of the device budget the "
+        "mamba/KDA recurrent-state pool may claim (splits the KV pool; the estimator "
+        "warns when the reserved pool cannot carry the target concurrency)",
+    )
+    ap.add_argument(
+        "--mamba-concurrency",
+        type=int,
+        default=0,
+        metavar="C",
+        help="target concurrent sequences the mamba pool must carry (default: the "
+        "KV-pool concurrency); used for the --mamba-full-memory-ratio adequacy warning",
+    )
+    ap.add_argument(
+        "--mamba-ssm-dtype",
+        "--ssm-dtype",  # legacy alias for the SAME knob (one destination)
+        dest="mamba_ssm_dtype",
+        default=None,
+        metavar="DT",
+        help="linear-attention recurrent-state storage width (SGLang "
+        "--mamba-ssm-dtype): 'float32' (4 B/elem) or 'bfloat16' (2 B/elem); "
+        "default from the config's mamba_ssm_dtype. float32 doubles the "
+        "per-sequence mamba/KDA state and the pool it needs",
     )
     ap.add_argument("--catalog", type=Path, help="seed_catalog.json path (serving args from a matched entry)")
     ap.add_argument("--catalog-id", help="exact catalog_id to take serving args from (implies --catalog discovery)")
