@@ -195,6 +195,8 @@ body {
 }
 .combo-toggle:hover { color: var(--accent2); }
 .combo-menu {
+  /* position is set inline (fixed, viewport-anchored) by shared.js while open;
+     these absolute defaults are the no-JS fallback */
   position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 50;
   max-height: 260px; overflow: auto;
   background: var(--panel); border: 1px solid var(--border); border-radius: 6px;

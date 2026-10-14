@@ -216,7 +216,7 @@
             '<span class="combo-item-name">' + esc(t.url) + "</span>";
           item.addEventListener("click", function () {
             input.value = t.url;
-            menu.hidden = true;
+            hideMenu();
             if (renderMeta) renderMeta(t);
           });
           menu.appendChild(item);
@@ -229,14 +229,51 @@
       if (menu.hidden) show(input.value);
       else menu.hidden = true;
     });
+    // Keep the OPEN menu pinned to the input while the page scrolls: fixed
+    // positioning detaches it from the scrolling flow, and a scroll/resize
+    // re-anchor (rAF-throttled) moves it with the input. The menu also never
+    // auto-closes on scroll -- it follows instead.
+    var anchorRAF = 0;
+    function anchorMenu() {
+      if (menu.hidden) return;
+      var r = input.getBoundingClientRect();
+      if (r.width === 0) { menu.hidden = true; return; }
+      menu.style.position = "fixed";
+      menu.style.left = r.left + "px";
+      menu.style.width = r.width + "px";
+      menu.style.right = "auto";
+      var mh = menu.scrollHeight || 260;
+      var below = window.innerHeight - r.bottom - 6;
+      var above = r.top - 6;
+      if (below >= Math.min(mh, 120) || below >= above) {
+        menu.style.top = r.bottom + 4 + "px";
+        menu.style.bottom = "auto";
+        menu.style.maxHeight = Math.max(below - 4, 120) + "px";
+      } else {
+        menu.style.bottom = window.innerHeight - r.top + 4 + "px";
+        menu.style.top = "auto";
+        menu.style.maxHeight = Math.max(above - 4, 120) + "px";
+      }
+    }
+    function requestAnchor() {
+      if (anchorRAF) return;
+      anchorRAF = requestAnimationFrame(function () { anchorRAF = 0; anchorMenu(); });
+    }
+    window.addEventListener("scroll", requestAnchor, true);   // capture: inner scrollers too
+    window.addEventListener("resize", requestAnchor);
     input.addEventListener("input", function () { show(input.value); });
     input.addEventListener("focus", function () { show(input.value); });
     input.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" || e.key === "Enter") menu.hidden = true;
+      if (e.key === "Escape" || e.key === "Enter") hideMenu();
     });
     document.addEventListener("click", function (e) {
-      if (!e.target.closest(".combo")) menu.hidden = true;
+      if (!e.target.closest(".combo")) hideMenu();
     });
+    function hideMenu() {
+      menu.hidden = true;
+      menu.style.position = menu.style.left = menu.style.top = menu.style.bottom = "";
+      menu.style.width = menu.style.maxHeight = menu.style.right = "";
+    }
   }
 
   // Recent-runs restore: the run panel was tab-local, so leaving the page
