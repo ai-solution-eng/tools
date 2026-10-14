@@ -17,5 +17,4 @@ __pycache__/
 # run artifacts + archives
 results/
 *.tgz
-*.tar.gz
 .mb.zip
