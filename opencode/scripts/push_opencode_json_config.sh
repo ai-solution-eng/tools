@@ -6,8 +6,16 @@ NAMESPACE="${NAMESPACE:-opencode-web-helm}"
 CONTAINER="${CONTAINER:-opencode-web}"
 TARGET="/var/opencode/home/.config/opencode/opencode.json"
 DEFAULTS="/opt/opencode-defaults/opencode.json"
-PULL_CMD="mkdir -p /var/opencode/home/.config/opencode && cp $DEFAULTS $TARGET"
-PUSH_CMD="mkdir -p /var/opencode/home/.config/opencode && cat > $TARGET"
+# Pre-push backup: the CURRENT per-user file is copied to $BACKUP (same
+# directory) before anything overwrites it, so an administrator push can
+# never destroy the user's existing configuration. Rolling single backup:
+# each push replaces the previous backup with the then-current file.
+BACKUP="/var/opencode/home/.config/opencode/opencode-backup.json"
+# cp -p preserves the original ownership/mode; the guard makes the backup a
+# no-op for units that have no file yet. If the backup fails the &&-chain
+# stops and the overwrite never runs (fail-closed).
+PULL_CMD="mkdir -p /var/opencode/home/.config/opencode && if [ -f $TARGET ]; then cp -p $TARGET $BACKUP; fi && cp $DEFAULTS $TARGET"
+PUSH_CMD="mkdir -p /var/opencode/home/.config/opencode && if [ -f $TARGET ]; then cp -p $TARGET $BACKUP; fi && cat > $TARGET"
 
 usage() {
   cat <<EOF
@@ -16,6 +24,8 @@ usage: push-config.sh [--apply] [--file config.json] [--namespace NS]
 Updates ~/.config/opencode/opencode.json in every opencode-web user environment
 (all deployments labeled opencode-user-managed=true, warm-pool units included).
 The in-pod supervisor hot-reloads the change, so no pod restart is needed.
+Before overwriting, the current file is backed up to
+$BACKUP (a previous backup is replaced by the newest pre-push state).
 
   (default)            dry-run preview only
   --apply              actually run
@@ -108,6 +118,7 @@ if [ "$APPLY" -eq 0 ]; then
     echo "mode: copy in-pod defaults ($DEFAULTS -> $TARGET)"
     echo "note: run a helm upgrade of opencodeConfig first so the mounted ConfigMap is current"
   fi
+  echo "backup: current file -> $BACKUP (kept before each overwrite)"
   echo "namespace: $NAMESPACE | container: $CONTAINER | deployments: $COUNT"
   for name in $DEPLOYMENTS; do
     echo " - $name"

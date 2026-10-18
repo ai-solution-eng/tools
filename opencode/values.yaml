@@ -23,9 +23,15 @@ storageClass: gl4f-filesystem
 storage:
   sharedSize: 20Gi
   workspaceSize: 5Gi
-  # Version suffix for per-user PVC names. Bump to provision fresh volumes and
-  # avoid colliding with orphaned VAST quotas (when VAST volume deletion is not
-  # enabled). v2 is the first versioned scheme; no user data exists yet to migrate.
+  # Version prefix for per-user PVC names (`opencode-<nameVersion>-ws/st-<slug>`).
+  # CANONICAL SCHEME: opencode-v2 — do NOT bump this casually and never revert
+  # to v1 (v2 is what the live release uses; a mismatch re-stamps units onto
+  # fresh volumes). The version is embedded early in the PVC name (VAST quota
+  # names are `csi:<ns>:<pvc>` truncated to 64 chars), the claims convergence
+  # contract re-stamps EXISTING units on a bump, and every bump mints FRESH
+  # volumes while the old data is orphaned (kept, never deleted, never
+  # migrated). Reinstall with this value unchanged always re-attaches the
+  # existing opencode-v2-* claims.
   nameVersion: v2
   keepPvcOnDelete: true
   stateSize: 2Gi
@@ -73,6 +79,13 @@ images:
 #     RUN steps additionally need --network host + explicit proxy build-args
 #     — use the baked `dockerbuild` wrapper (see docker/user/Dockerfile).
 docker:
+  ###
+  # Setting	Effect
+  # enabled: true	Docker exists at all (and only for SSO users — local accounts never get a daemon)
+  # brokerForPlatformUnits: true	Your current setup. Platform units (project-user-*) get a separate privileged dind pod in the release namespace; the unit reaches it over the network
+  # onPlatformUnits: false	Platform units must not carry an in-pod daemon (privileged containers are denied there by Kyverno)
+  # onPlatformUnits: true	Forces the daemon inside the platform unit's own pod (sidecar mode) instead of the broker
+  ###
   enabled: true
   image: docker:28-dind
   resources:

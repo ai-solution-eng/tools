@@ -189,7 +189,7 @@ The hook:
 3. Waits for their **pods to terminate** (releasing the PVC mounts).
 4. **Keeps every user data PVC** (default `storage.keepPvcOnDelete: true`):
    per-user `opencode-*-ws-*/-st-*` claims, warm-pool claims
-   (`opencode-user-warm-N-*-pvc-v2`) and the per-namespace shared mirror are
+   (`opencode-user-warm-N-*-pvc-<nameVersion>` — `v2` on every current install) and the per-namespace shared mirror are
    listed and logged, never deleted — the first re-login / re-install re-binds
    the exact same volumes and the data is still there. Set
    `storage.keepPvcOnDelete: false` to restore the legacy

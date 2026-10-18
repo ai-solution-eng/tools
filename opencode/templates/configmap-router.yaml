@@ -88,7 +88,10 @@ data:
       ? (dockerOnPlatformUnits ? 'dind-platform' : 'dind-classic')
       : 'nodind'
     const dindBrokerVersion = `${dockerSidecar}-${(dockerImage.split(':').pop() || 'untagged')}-${dockerDiskSize}`
-    const userTemplateVersion = `terminal-tab-v13-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    // v14: per-user folder in the shared workspace — the unit init creates
+    // /workspace/shared/<login-username> (mkdir -p as the project identity;
+    // warm-pool placeholders skipped until adopted by a user).
+    const userTemplateVersion = `terminal-tab-v14-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1601,6 +1604,17 @@ data:
         // permissions against the identity, exactly like a notebook.
         'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/opencode/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/opencode /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
         '$RUN_AS_USER ln -sfn /workspace /var/opencode/home/workspace',
+        // Per-user folder in the shared workspace: every real unit creates
+        // /workspace/shared/<slug> — named after the login username (SSO or
+        // local) — as the project identity; mkdir -p is idempotent and never
+        // touches existing data. Warm-pool placeholder units (slug
+        // warm-<poolId>, no owner yet) are skipped: the folder appears when
+        // a user claims the unit, because the adoption re-stamp re-runs this
+        // init with the owner's slug. NOTE: for platform units
+        // /workspace/shared is the per-namespace mirror claim, so the folder
+        // lands in the user's own project namespace; classic units share the
+        // release-level PVC.
+        ...(isWarmPool && !owner ? [] : [`$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`]),
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
         '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/home/.config/opencode/opencode.json ]; then if [ -f /var/opencode/config/opencode/opencode.json ]; then cp /var/opencode/config/opencode/opencode.json /var/opencode/home/.config/opencode/opencode.json; else cp /opt/opencode-defaults/opencode.json /var/opencode/home/.config/opencode/opencode.json; fi; fi\'',
@@ -1611,9 +1625,13 @@ data:
         {{- range .Values.opencodeAgents }}
         '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/home/.config/opencode/.seeded-agent-{{ .name }} ]; then if [ ! -f /var/opencode/home/.config/opencode/agents/{{ .name }}.md ]; then cp /opt/opencode-defaults/agent-{{ .name }}.md /var/opencode/home/.config/opencode/agents/{{ .name }}.md; fi; touch /var/opencode/home/.config/opencode/.seeded-agent-{{ .name }}; fi\' || true',
         {{- end }}
+        // Administrator-provided personal/ templates are ADD-ONLY: cp -n
+        // seeds files the user does not have yet and never overwrites what
+        // is already in the user's workspace — user edits survive restarts,
+        // reinstalls and upgrades.
 {{- range $path, $_ := $.Files.Glob "personal/**" }}
 {{- if not (hasPrefix "." (base $path)) }}
-        '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
+        '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp -n /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
 {{- end }}
 {{- end }}
 {{- range $path, $_ := $.Files.Glob "create-server.sh" }}
@@ -1625,9 +1643,18 @@ data:
         // created under the project identity where possible (a plain root
         // printf into a uid-owned directory would leave root-owned,
         // non-editable files — reconciled by the root chown below).
-        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/opencode/home/.bashrc",
-        "$RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/opencode/home/.bash_profile",
-        '$RUN_AS_USER cp /var/opencode/home/.bash_profile /var/opencode/home/.profile',
+        // Shell rc files (.bashrc/.bash_profile/.profile) are USER-OWNED:
+        // seeded ONCE on first boot (test -f guard) and never rewritten —
+        // user customizations survive restarts, reinstalls and upgrades.
+        // The chart-managed env stays current via /var/opencode/bin/
+        // opencode-bashrc (rewritten below on every boot, consumed through
+        // BASH_ENV / opencode-login-shell); .bashrc sources it, and the
+        // guarded append below adds that source line to pre-existing rc
+        // files without touching any user edits.
+        "$RUN_AS_USER test -f /var/opencode/home/.bashrc || $RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n[ -f /var/opencode/bin/opencode-bashrc ] && . /var/opencode/bin/opencode-bashrc\\n' > /var/opencode/home/.bashrc",
+        "$RUN_AS_USER grep -qs opencode-bashrc /var/opencode/home/.bashrc || $RUN_AS_USER printf '\\n# chart-managed opencode env — keep this line\\n[ -f /var/opencode/bin/opencode-bashrc ] && . /var/opencode/bin/opencode-bashrc\\n' >> /var/opencode/home/.bashrc",
+        "$RUN_AS_USER test -f /var/opencode/home/.bash_profile || $RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/opencode/home/.bash_profile",
+        "$RUN_AS_USER test -f /var/opencode/home/.profile || $RUN_AS_USER cp /var/opencode/home/.bash_profile /var/opencode/home/.profile",
         "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/opencode/bin/opencode-bashrc",
         "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/opencode/bin/opencode-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/opencode/bin/opencode-login-shell",
         // ROOT chmod + ownership reconciliation: the `>` redirections above
@@ -1640,7 +1667,7 @@ data:
         'chmod 0755 /var/opencode/bin/opencode-login-shell',
         'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then chown -f "$USER_INFO_UID:$USER_INFO_GID" /var/opencode/home/.bashrc /var/opencode/home/.bash_profile /var/opencode/home/.profile /var/opencode/bin/opencode-bashrc /var/opencode/bin/opencode-login-shell /var/opencode/bin/create-server.sh || true; fi',
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
-        '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/opencode/bin/opencode-bashrc\'',
+        '$RUN_AS_USER sh -c \'for f in /var/opencode/home/.bashrc /var/opencode/home/.profile /var/opencode/bin/opencode-bashrc; do grep -qs NODE_EXTRA_CA_CERTS "$f" || echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> "$f"; done\'',
 {{- end }}
         // uv: prefer the baked copy (/opt/opencode/bin, baked user image) when
         // present; only download when neither the state PVC nor the image
@@ -1672,7 +1699,6 @@ data:
         // before.
         "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
         "chmod 0755 /var/opencode/bin/opencode-startup.sh",
-        '$RUN_AS_USER sh -c \'rm -rf /workspace/personal/shared\' || true',
       ]
       const initCommand = initCommandParts.join(' && ')
 
@@ -3550,9 +3576,6 @@ data:
             var lastLogin = u.lastLogin ? new Date(u.lastLogin).toLocaleString() : '&mdash;';
             var nameCell = u.username ? u.username : '<i style="color:var(--text-muted);">unidentified</i>';
             var actions = '';
-            if (u.username) {
-              actions += '<button data-act="open" data-slug="' + u.slug + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Open</button>';
-            }
             if (u.username && u.source !== 'sso') {
               actions += '<button data-act="rename" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Rename</button>' +
                 '<button data-act="reset" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Reset</button>';
@@ -3572,7 +3595,6 @@ data:
             var u = b.getAttribute('data-u');
             var slug = b.getAttribute('data-slug');
             var act = b.getAttribute('data-act');
-            if (act === 'open') { window.location.href = '/' + slug; return; }
             if (act === 'rename') { openModal('rename', u); return; }
             if (act === 'reset') { openModal('reset', u); return; }
             b.disabled = true;
@@ -4061,34 +4083,13 @@ data:
       }
 
       // Main host presents the login/account page (with an "Open your
-      // environment / Log out" strip when a session already exists). When the
-      // request arrives already authenticated through the platform SSO
-      // (x-auth-request headers injected by the gateway) and no local session
-      // exists yet, sign the user in automatically: a portal deep-link then
-      // lands in the normal provisioning flow instead of requiring a second
-      // click on "Continue with SSO". /__oc_logout plants a suppress marker so
-      // users who explicitly log out are not bounced straight back in.
-      if (!sessionIdentity && pathname === '/' && method === 'GET') {
-        const headerIdentity = userFromHeaders(request.headers)
-        if (headerIdentity) {
-          const cookieHeader = request.headers.cookie || ''
-          const suppressed = cookieHeader.split(';').some((part) => part.trim() === `${ssoLogoutMarkerName}=1`)
-          if (!suppressed) {
-            const identity = headerIdentity.trim().toLowerCase()
-            console.log(`[auth] auto-sso login slug=${slugForUser(identity)}`)
-            await trackSsoIdentity(identity)
-            response.writeHead(302, {
-              location: '/__oc_start',
-              'set-cookie': [
-                sessionCookieHeader(identity, false),
-                ssoLogoutMarkerCookie(false),
-              ],
-            })
-            response.end()
-            return
-          }
-        }
-      }
+      // environment / Log out" strip when a session already exists). SSO
+      // users land here deliberately: they choose their account (Continue
+      // with SSO vs local login) instead of being auto-signed-in and
+      // auto-provisioned on first visit. The explicit /__oc_sso endpoint
+      // (the login page's "Continue with SSO" button) performs the same
+      // registration + cookie + marker-clear the removed auto-flow did, and
+      // /__oc_logout's suppress marker still governs it.
       serveAuthPage(response, sessionIdentity)
     })
 
