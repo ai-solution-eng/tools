@@ -94,7 +94,14 @@ data:
     // deepest common parent of the selection (a single file/folder download
     // no longer embeds the chain from the navigable root), and the editor
     // dialog grows to 96vw x 94vh (was capped at 1000x700px).
-    const RUNTIME_REV = '33'
+    // 34: per-user folder in the shared workspace — every unit creates
+    // /workspace/shared/<login-username> on boot (mkdir -p as the project
+    // identity; warm-pool placeholders skipped until adopted by a user).
+    // 35: removed the legacy dshSettings seed — settings.yaml is no longer
+    // initialized by the chart (dshSettings value deleted); existing
+    // per-user files are untouched and still watched. The project-config
+    // ConfigMap and the /opt/dsh-defaults mount went with it.
+    const RUNTIME_REV = '35'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -470,7 +477,6 @@ data:
     // project namespace these are mirrored (copied + owner-anchored) into
     // that namespace, since cross-namespace volume mounts are impossible.
     const unitConfigMapNames = [
-      '{{ .Release.Name }}-project-config',
       '{{ .Release.Name }}-personal-content',
       '{{ .Release.Name }}-preview-config',
       {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
@@ -901,11 +907,12 @@ data:
           if (!job) {
             return { username, slug, status: 'failed: cleanup job disappeared' }
           }
-          const podPhase = await jobPodPhase(jobName)
+          const podPhase = await jobPodPhase(jobName, deploymentNs)
           if ((job.status?.succeeded || 0) >= 1 || podPhase === 'Succeeded') {
-            // The running dsh process keeps deleted session files open (WAL
-            // mode), so roll the pod to make the fresh, empty database take
-            // effect immediately. Recreate strategy swaps the pod cleanly.
+            // The running dsh process may keep deleted session files open
+            // (and caches session state in memory), so roll the pod to make
+            // the cleared ~/.dsh/sessions take effect immediately. Recreate
+            // strategy swaps the pod cleanly.
             if (pod) {
               try {
                 await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${deploymentNs}/deployments/${deployment.metadata.name}`, {
@@ -1641,13 +1648,18 @@ data:
         // runs directly as the (already correct) forced identity.
         'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ] && [ "$(id -u)" = "0" ]; then export HOME=/var/dsh/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/dsh /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
         '$RUN_AS_USER ln -sfn /workspace /var/dsh/home/workspace',
+        // Per-user folder in the shared workspace: every real unit creates
+        // /workspace/shared/<slug> — named after the login username (SSO or
+        // local) — as the project identity; mkdir -p is idempotent and never
+        // touches existing data. Warm-pool placeholder units (slug
+        // warm-<poolId>, no owner yet) are skipped: the folder appears when
+        // a user claims the unit, because the adoption re-stamp re-runs this
+        // init with the owner's slug. NOTE: for platform units
+        // /workspace/shared is the per-namespace mirror claim, so the folder
+        // lands in the user's own project namespace; classic units share the
+        // release-level PVC.
+        ...(isWarmPool && !owner ? [] : [`$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`]),
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
-        '$RUN_AS_USER sh -c \'if [ ! -f /var/dsh/home/.dsh/settings.yaml ]; then if [ -f /var/dsh/config/dsh/settings.yaml ]; then cp /var/dsh/config/dsh/settings.yaml /var/dsh/home/.dsh/settings.yaml; elif [ -f /opt/dsh-defaults/settings.yaml ]; then cp /opt/dsh-defaults/settings.yaml /var/dsh/home/.dsh/settings.yaml; fi; fi\'',
-        // AGENTS.md seeding is best-effort: the file is user-managed now
-        // (dshInstructions was removed from the chart), so both sources may
-        // legitimately be absent — a failed cp must NOT kill the init
-        // container (that would crash-loop every new pod).
-        '$RUN_AS_USER sh -c \'if [ ! -f /workspace/personal/AGENTS.md ]; then if [ -f /var/dsh/config/dsh/AGENTS.md ]; then cp /var/dsh/config/dsh/AGENTS.md /workspace/personal/AGENTS.md; elif [ -f /opt/dsh-defaults/AGENTS.md ]; then cp /opt/dsh-defaults/AGENTS.md /workspace/personal/AGENTS.md; fi; fi || true\'',
         // Seed $DSH_HOME/.env from chart values (dshEnv) — the same launch-
         // env layer a laptop .env provides. Seed-once semantics like
         // settings.yaml: user edits afterwards are never overwritten. The
@@ -1670,9 +1682,13 @@ data:
         // Skills are user-managed: drop SKILL.md trees into
         // /var/dsh/home/.dsh/skills/ (Data Manager or terminal) — dsh
         // hot-refreshes them natively, no chart seeding, no watcher restart.
+        // Administrator-provided personal/ templates are ADD-ONLY: cp -n
+        // seeds files the user does not have yet and never overwrites what
+        // is already in the user's workspace — user edits survive restarts,
+        // reinstalls and upgrades.
 {{- range $path, $_ := $.Files.Glob "personal/**" }}
 {{- if not (hasPrefix "." (base $path)) }}
-        '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
+        '$RUN_AS_USER sh -c \'mkdir -p /workspace/personal{{ dir $path | trimPrefix "personal" }} && cp -n /personal-templates/{{ trimPrefix "personal/" $path | replace "/" "." }} /workspace/personal{{ dir $path | trimPrefix "personal" }}/{{ base $path }}\' || true',
 {{- end }}
 {{- end }}
 {{- range $path, $_ := $.Files.Glob "create-server.sh" }}
@@ -1683,9 +1699,18 @@ data:
         // expand at login time. $RUN_AS_USER prefixes each so the files are
         // created owned by the project identity (a plain root printf into a
         // uid-owned directory would leave root-owned, non-editable files).
-        "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/home/.bashrc",
-        "$RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/dsh/home/.bash_profile",
-        '$RUN_AS_USER cp /var/dsh/home/.bash_profile /var/dsh/home/.profile',
+        // Shell rc files (.bashrc/.bash_profile/.profile) are USER-OWNED:
+        // seeded ONCE on first boot (test -f guard) and never rewritten —
+        // user customizations survive restarts, reinstalls and upgrades.
+        // The chart-managed env stays current via /var/dsh/bin/dsh-bashrc
+        // (rewritten below on every boot, consumed through BASH_ENV /
+        // dsh-login-shell); .bashrc sources it, and the guarded append
+        // below adds that source line to pre-existing rc files without
+        // touching any user edits.
+        "$RUN_AS_USER test -f /var/dsh/home/.bashrc || $RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n[ -f /var/dsh/bin/dsh-bashrc ] && . /var/dsh/bin/dsh-bashrc\\n' > /var/dsh/home/.bashrc",
+        "$RUN_AS_USER grep -qs dsh-bashrc /var/dsh/home/.bashrc || $RUN_AS_USER printf '\\n# chart-managed dsh env — keep this line\\n[ -f /var/dsh/bin/dsh-bashrc ] && . /var/dsh/bin/dsh-bashrc\\n' >> /var/dsh/home/.bashrc",
+        "$RUN_AS_USER test -f /var/dsh/home/.bash_profile || $RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/dsh/home/.bash_profile",
+        "$RUN_AS_USER test -f /var/dsh/home/.profile || $RUN_AS_USER cp /var/dsh/home/.bash_profile /var/dsh/home/.profile",
         "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/dsh/bin:/var/dsh/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/dsh/bin/dsh-bashrc",
         "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/dsh/bin/dsh-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/dsh/bin/dsh-login-shell",
         // ROOT chmod + ownership reconciliation: the `>` redirections above
@@ -1697,7 +1722,7 @@ data:
         'chmod 0755 /var/dsh/bin/dsh-login-shell',
         'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then chown -f "$USER_INFO_UID:$USER_INFO_GID" /var/dsh/home/.bashrc /var/dsh/home/.bash_profile /var/dsh/home/.profile /var/dsh/bin/dsh-bashrc /var/dsh/bin/dsh-login-shell /var/dsh/bin/create-server.sh || true; fi',
 {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
-        '$RUN_AS_USER sh -c \'echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.bashrc && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/home/.profile && echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> /var/dsh/bin/dsh-bashrc\'',
+        '$RUN_AS_USER sh -c \'for f in /var/dsh/home/.bashrc /var/dsh/home/.profile /var/dsh/bin/dsh-bashrc; do grep -qs NODE_EXTRA_CA_CERTS "$f" || echo "export NODE_EXTRA_CA_CERTS=/tmp/certs/ca-certificates.crt" >> "$f"; done\'',
 {{- end }}
         // uv: prefer the baked copy (/opt/dsh/bin, baked user image) when
         // present; only download when neither the state PVC nor the image
@@ -1737,7 +1762,6 @@ data:
         // (classic local units) it runs as root, exactly as before.
         "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/dsh/bin:/var/dsh/data/npm/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/dsh/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/dsh/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true\nstart_services() {\n  /var/dsh/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"DeepSeek Harness Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/dsh_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): already the tenant uid — setpriv is a\n  # no-op requirement and groupadd/useradd cannot run as non-root.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-dshuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/dsh/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-dshuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/dsh/bin/dsh-startup.sh",
         "chmod 0755 /var/dsh/bin/dsh-startup.sh",
-        '$RUN_AS_USER sh -c \'rm -rf /workspace/personal/shared\' || true',
       ]
       const initCommand = initCommandParts.join(' && ')
 
@@ -1839,7 +1863,6 @@ data:
                     { name: 'personal-workspace', mountPath: '/workspace/personal' },
                     { name: 'shared-workspace', mountPath: '/workspace/shared' },
                     { name: 'state', mountPath: '/var/dsh' },
-                    { name: 'project-config', mountPath: '/opt/dsh-defaults', readOnly: true },
                     { name: 'personal-content', mountPath: '/personal-templates', readOnly: true },
 {{- if and .Values.sharedContent .Values.sharedContent.enabled }}
                     { name: 'shared-content-seed', mountPath: '/dsh-shared-seed', readOnly: true },
@@ -1959,7 +1982,6 @@ data:
                     { name: 'personal-workspace', mountPath: '/workspace/personal' },
                     { name: 'shared-workspace', mountPath: '/workspace/shared' },
                     { name: 'state', mountPath: '/var/dsh' },
-                    { name: 'project-config', mountPath: '/opt/dsh-defaults', readOnly: true },
                     { name: 'preview-config', mountPath: '/usr/local/bin/preview-url', subPath: 'preview-url' },
                     { name: 'preview-config', mountPath: '/opt/preview/port_watcher.mjs', subPath: 'port_watcher.mjs' },
                     { name: 'preview-config', mountPath: '/opt/preview/dsh_supervisor.mjs', subPath: 'dsh_supervisor.mjs' },
@@ -2025,7 +2047,6 @@ data:
                 { name: 'personal-workspace', persistentVolumeClaim: { claimName: workspaceClaim } },
                 { name: 'shared-workspace', persistentVolumeClaim: { claimName: sharedWorkspaceClaim } },
                 { name: 'state', persistentVolumeClaim: { claimName: stateClaim } },
-                { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
                 { name: 'preview-config', configMap: { name: '{{ .Release.Name }}-preview-config', defaultMode: 365 } },
                 // DinD image store — node-local emptyDir (overlay2 fails on
@@ -3475,9 +3496,6 @@ data:
             var lastLogin = u.lastLogin ? new Date(u.lastLogin).toLocaleString() : '&mdash;';
             var nameCell = u.username ? u.username : '<i style="color:var(--text-muted);">unidentified</i>';
             var actions = '';
-            if (u.username) {
-              actions += '<button data-act="open" data-slug="' + u.slug + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Open</button>';
-            }
             if (u.username && u.source !== 'sso') {
               actions += '<button data-act="rename" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Rename</button>' +
                 '<button data-act="reset" data-u="' + u.username + '" style="padding:6px 10px;font-size:12px;margin-right:6px;">Reset</button>';
@@ -3496,7 +3514,6 @@ data:
             var u = b.getAttribute('data-u');
             var slug = b.getAttribute('data-slug');
             var act = b.getAttribute('data-act');
-            if (act === 'open') { window.location.href = '/' + slug; return; }
             if (act === 'rename') { openModal('rename', u); return; }
             if (act === 'reset') { openModal('reset', u); return; }
             b.disabled = true;
@@ -3990,34 +4007,13 @@ data:
       }
 
       // Main host presents the login/account page (with an "Open your
-      // environment / Log out" strip when a session already exists). When the
-      // request arrives already authenticated through the platform SSO
-      // (x-auth-request headers injected by the gateway) and no local session
-      // exists yet, sign the user in automatically: a portal deep-link then
-      // lands in the normal provisioning flow instead of requiring a second
-      // click on "Continue with SSO". /__dsh_logout plants a suppress marker so
-      // users who explicitly log out are not bounced straight back in.
-      if (!sessionIdentity && pathname === '/' && method === 'GET') {
-        const headerIdentity = userFromHeaders(request.headers)
-        if (headerIdentity) {
-          const cookieHeader = request.headers.cookie || ''
-          const suppressed = cookieHeader.split(';').some((part) => part.trim() === `${ssoLogoutMarkerName}=1`)
-          if (!suppressed) {
-            const identity = headerIdentity.trim().toLowerCase()
-            console.log(`[auth] auto-sso login slug=${slugForUser(identity)}`)
-            await trackSsoIdentity(identity)
-            response.writeHead(302, {
-              location: '/__dsh_start',
-              'set-cookie': [
-                sessionCookieHeader(identity, false),
-                ssoLogoutMarkerCookie(false),
-              ],
-            })
-            response.end()
-            return
-          }
-        }
-      }
+      // environment / Log out" strip when a session already exists). SSO
+      // users land here deliberately: they choose their account (Continue
+      // with SSO vs local login) instead of being auto-signed-in and
+      // auto-provisioned on first visit. The explicit /__dsh_sso endpoint
+      // (the login page's "Continue with SSO" button) performs the same
+      // registration + cookie + marker-clear the removed auto-flow did, and
+      // /__dsh_logout's suppress marker still governs it.
       serveAuthPage(response, sessionIdentity)
     })
 

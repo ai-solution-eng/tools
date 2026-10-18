@@ -78,7 +78,7 @@ deleted. Unit ConfigMap mirrors (the pod template mounts them cross-namespace vi
 copies) are DSH-owned and cleaned with the unit.
 
 **PVC-survival contract (since 0.4.13, `storage.keepPvcOnDelete: true`):** user data PVCs —
-per-user `dsh-*-ws-*/-st-*` claims, warm-pool claims (`dsh-user-warm-N-*-pvc-v2`) and the
+per-user `dsh-*-ws-*/-st-*` claims, warm-pool claims (`dsh-user-warm-N-*-pvc-<nameVersion>` — `v2` on every current install) and the
 per-namespace `dsh-web-helm-shared-pvc` mirror — are never deleted by the app: not via the
 anchor GC cascade (PVCs are no longer owner-referenced), not by the admin user-delete flow,
 not by uninstall (the hook lists them and keeps them). The release shared PVC carries
@@ -159,11 +159,10 @@ Ports map: **443→8080 router→8082 nginx→3080 dsh** (loopback), 7681 ttyd, 
 
 ---
 
-## Configuration (settings.yaml, patch, env)
+## Configuration (patch, env)
 
 | Field | What it defines |
 |---|---|
-| `dshSettings` | `$DSH_HOME/settings.yaml` — providers/models/compat/telemetry |
 | `dshCordisPatch` | the web profile's `cordis.patch.yml` (MCP integrations etc.), seeded base64, seed-once, watched + YAML-validated |
 | `dshEnv` | Seed `.env` written into `$DSH_HOME` on first start — the credential layer (`apiKeyEnv` resolves from it; edit via Data Manager, hot-reloaded) |
 | `dsh.version` / `dsh.port` | dsh npm version / loopback port (3080) |
@@ -338,7 +337,7 @@ The first login after logout used to strand the user on the login menu ("Signed 
 ## Scripts
 
 - `scripts/build-user-image.sh` — build/push the baked user image (reads `dsh.version` + `provisioning.aptPackages` from the values file)
-- `scripts/push_dsh_settings.sh` — push a settings.yaml into every user env (hot-reloaded)
+- `scripts/push_dsh_cordis_patch.sh` — push a cordis.patch.yml (the web profile's patch layer) into every user env, backing up each user's previous patch to `cordis.patch-backup.yml` first (hot-reloaded, YAML-validated by the in-pod supervisor)
 - `scripts/user_manager.ipynb` — bulk user admin against the router API
 - `scripts/cleanup-dsh-web-helm-stale-quotas.sh` — VAST quota cleanup (dry-run default)
 
