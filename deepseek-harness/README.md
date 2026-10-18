@@ -336,6 +336,10 @@ The first login after logout used to strand the user on the login menu ("Signed 
 
 ## Scripts
 
+- `scripts/verify-dsh-patches.sh` — **run this before every dsh version bump**: re-checks the
+  image's guarded source patches (the `isLoopback` multi-user patch) and the Node floor
+  (`commander@15` needs >= 22.12) against the published npm tarballs, in seconds, so an
+  upstream file reorganisation fails here instead of 145s into `build-user-image.sh`
 - `scripts/build-user-image.sh` — build/push the baked user image (reads `dsh.version` + `provisioning.aptPackages` from the values file)
 - `scripts/push_dsh_cordis_patch.sh` — push a cordis.patch.yml (the web profile's patch layer) into every user env, backing up each user's previous patch to `cordis.patch-backup.yml` first (hot-reloaded, YAML-validated by the in-pod supervisor)
 - `scripts/user_manager.ipynb` — bulk user admin against the router API
