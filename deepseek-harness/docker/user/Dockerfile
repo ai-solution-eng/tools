@@ -11,7 +11,7 @@
 # Build (canonical invocation, also wrapped by scripts/build-user-image.sh
 # which defaults the tag to dsh.version from values.yaml):
 #   docker buildx build --platform linux/amd64 \
-#     -t ghcr.io/ai-solution-eng/deepseek-harness:0.1.7-rc.2 --push docker/user
+#     -t ghcr.io/ai-solution-eng/deepseek-harness:0.2.1-rc.2-dind --push docker/user
 #
 # IMPORTANT — the chart's runtime install steps remain in place as GUARDED
 # FALLBACKS: on this image they no-op (everything they look for is present),
@@ -28,9 +28,12 @@
 #      HELM_VERSION is intentionally NOT mirrored anywhere: helm has no
 #      runtime-install fallback (offline packaging tool only), so its pin
 #      lives here alone.
-FROM node:22-bookworm-slim
+# Pinned Node minor: dsh >= 0.2.1 depends on commander@15 which requires
+# node >= 22.12.0 (node:22-bookworm-slim floats, so a rebuild could silently
+# land on a different patch). 22.23.3 = latest 22.x LTS "Jod".
+FROM node:22.23.3-bookworm-slim
 
-ARG DSH_VERSION=0.1.7-rc.2
+ARG DSH_VERSION=0.2.1-rc.2
 ARG TTYD_VERSION=1.7.7
 # helm: OFFLINE ONLY (package/template/lint) — user pods carry no
 # kubeconfig/ServiceAccount, so helm upgrade stays on the deploy host.
@@ -84,13 +87,18 @@ RUN mkdir -p /opt/dsh/bin /opt/dsh/npm \
 # the build fails if upstream changes the expression, so the patch can never
 # silently stop applying.
 # 2026-09-25 (0.1.7-rc.2 prep): resolve the package path dynamically. The
-# expression is UNCHANGED in 0.1.7-rc.2 (verified against unpkg), but the
 # 0.1.7 line pins every @deepseek-ai dep to one exact version, so npm may
 # hoist dsh-client-connection to the tree root instead of nesting it under
 # @deepseek-ai/dsh/node_modules (the 0.1.6-alpha.2 layout the old hardcoded
-# path assumed). Guards unchanged: a missing file or a changed upstream
-# expression still fails the build loudly.
-RUN PKG="$(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-connection/lib/client.js' -print -quit)" \
+# path assumed).
+# 2026-10-18 (0.2.1-rc.2 prep): upstream SPLIT lib/client.js into
+# lib/client.browser.js + lib/client.node.js. The isLoopback expression itself
+# is UNCHANGED (verified against the published 0.2.1-rc.2 tarball:
+# client.browser.js carries the identical line), so the patch now matches any
+# lib/client*.js and applies to whichever file still contains the expression.
+# Guards unchanged: no matching file, or a changed upstream expression, still
+# fails the build loudly.
+RUN PKG="$(grep -Fl 'isLoopback: transport?.ownsHost === true' $(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-connection/lib/client*.js' -print) | head -1)" \
  && test -n "$PKG" \
  && grep -Fq "isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)" "$PKG" \
  && sed -i "s#isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)#isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */#" "$PKG" \

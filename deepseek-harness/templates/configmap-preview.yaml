@@ -517,24 +517,25 @@ data:
     // The public hostname is passed via --trusted-host so dsh's Host/Origin
     // browser-trust fence accepts proxied requests, and --no-open prevents
     // the headless container from trying to launch a browser.
-    const primaryConfigPath = process.env.DSH_CONFIG || process.env.DSH_CONFIG_PATH || '/var/dsh/home/.dsh/settings.yaml'
+    const primaryConfigPath = process.env.DSH_CONFIG || process.env.DSH_CONFIG_PATH || '/var/dsh/home/.dsh/profiles/web/cordis.patch.yml'
     const configDir = path.dirname(primaryConfigPath)
     // `.env` is a launch-environment layer: dsh reads it only when the
     // process starts, so edits require a dsh restart to take effect —
     // watching it here gives that automatically (same UX as settings.yaml).
     //
-    // Watch model (v0.3.0): config FILES only — settings.yaml, .env, the
-    // web profile's cordis.patch.yml and dsh.profile manifest. Do NOT watch
-    // the profile tree: dsh writes session/runtime state into it
-    // continuously, and restarting on our own output is an endless loop
-    // (kills every session ~15s after it opens). Plugin add/remove changes
-    // dsh.profile (watched); deep plugin-file edits need a manual
-    // `pkill -f "dsh web"`. skills/ is not watched either — dsh
-    // hot-refreshes skills natively.
+    // Watch model: config FILES only — .env, the web profile's
+    // cordis.patch.yml and the dsh.profile manifest. dsh >= 0.2.1 dropped
+    // settings.yaml entirely: the profile patch layer IS the config, so
+    // there is nothing else to watch. Do NOT watch the profile tree: dsh
+    // writes session/runtime state into it continuously, and restarting on
+    // our own output is an endless loop (kills every session ~15s after it
+    // opens). Plugin add/remove changes dsh.profile (watched); deep
+    // plugin-file edits need a manual `pkill -f "dsh web"`. skills/ is not
+    // watched either — dsh hot-refreshes skills natively.
     const watchedConfigFiles = [
       ...new Set(
         (process.env.DSH_WATCH_CONFIG_FILES ||
-          'settings.yaml,.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile')
+          '.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile')
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean)
@@ -636,7 +637,7 @@ data:
         .map((key) => key.replace(/^file:/, '').replace(/^dir:/, ''))
     }
 
-    // Validate the config before restarting dsh on change. settings.yaml is
+    // Validate the config before restarting dsh on change. YAML is
     // YAML (dsh's native format), NOT JSON — mirror opencode's JSON.parse
     // validator with a real YAML parse instead of a textual guess. dsh bundles
     // js-yaml (^4.2.0) in its install tree, so resolve it from there at
@@ -968,7 +969,7 @@ data:
       }, 750)
     }
 
-    // User FILE edits (settings.yaml/.env) detected during the boot settle
+    // User FILE edits (.env / cordis.patch.yml) detected during the boot settle
     // window are QUEUED here and fire as soon as the window ends — never
     // dropped. dir:profiles/web churn (dsh's own boot writes) stays absorbed.
     let pendingRestart = null
@@ -993,7 +994,7 @@ data:
       // Changed YAML files (e.g. profiles/web/cordis.patch.yml) must parse
       // before dsh sees them: booting on a broken patch fails dsh startup
       // and puts the supervisor into a restart loop. Same js-yaml as
-      // settings.yaml; skipped when the parser is unavailable (the fresh/
+      // cordis.patch.yml; skipped when the parser is unavailable (the fresh/
       // broken-install fallback), matching isPrimaryConfigValid's posture.
       for (const changedFile of changedFiles) {
         if (changedFile === path.basename(primaryConfigPath) || !/\.ya?ml$/.test(changedFile)) continue
@@ -1010,7 +1011,7 @@ data:
     }
 
     try {
-      // Instant trigger for top-level files (settings.yaml, .env). Deeper
+      // Instant trigger for top-level files (.env). Deeper
       // changes (profiles/web tree) are caught by the 3s signature poll —
       // fs.watch is non-recursive on Linux. Extra triggers are cheap:
       // maybeRestart diffs signatures and no-ops when nothing watched moved.
@@ -1059,7 +1060,7 @@ data:
     const BASE_ROOTS = [
       { key: 'personal', label: 'Personal', path: '/workspace/personal', navigable: true, shared: false },
       { key: 'shared', label: 'Shared', path: '/workspace/shared', navigable: true, shared: true },
-      // dsh home: settings.yaml, skills/, sessions — the opencode chart
+      // dsh home: profiles/, skills/, sessions — the opencode chart
       // browsed ~/.config/opencode; the dsh equivalent is $DSH_HOME.
       { key: 'config', label: 'DSH Home', path: '/var/dsh/home/.dsh', navigable: true, shared: false },
       { key: 'state', label: 'State', path: '/var/dsh', navigable: false, shared: false },

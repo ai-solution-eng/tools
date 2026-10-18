@@ -1904,14 +1904,16 @@ data:
                     // units). The baked `dockerbuild` wrapper is the
                     // proxy-aware way to run builds (see docker/user/Dockerfile).
                     ...(dockerHostForUnit ? [{ name: 'DOCKER_HOST', value: dockerHostForUnit }] : []),
-                    { name: 'DSH_CONFIG_PATH', value: '/var/dsh/home/.dsh/settings.yaml' },
+                    { name: 'DSH_CONFIG_PATH', value: '/var/dsh/home/.dsh/profiles/web/cordis.patch.yml' },
                     // Match the supervisor's safe watch defaults: config FILES
-                    // only. NEVER watch the profiles/web DIRECTORY — dsh writes
-                    // session/runtime state into it continuously, and restarting
-                    // on our own output kills every live session (the opencode
-                    // chart's 'skills,agents' dirs have no dsh equivalent; dsh
-                    // hot-refreshes skills natively).
-                    { name: 'DSH_WATCH_CONFIG_FILES', value: 'settings.yaml,.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile' },
+                    // only. dsh >= 0.2.1 has no settings.yaml — the profile
+                    // patch layer (profiles/web/cordis.patch.yml) plus the
+                    // dsh.profile manifest ARE the config surface, so only
+                    // those are watched. NEVER watch the profiles/web
+                    // DIRECTORY — dsh writes session/runtime state into it
+                    // continuously, and restarting on our own output kills
+                    // every live session (dsh hot-refreshes skills natively).
+                    { name: 'DSH_WATCH_CONFIG_FILES', value: '.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile' },
                     { name: 'DSH_WATCH_CONFIG_DIRS', value: '' },
                     { name: 'PREVIEW_DOMAIN_SUFFIX', value: previewDomainSuffix },
                     // Canonical public UI host for preview URL construction

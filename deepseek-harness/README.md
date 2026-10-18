@@ -4,7 +4,7 @@ Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.co
 
 Port of the `opencode` chart (`opencode-web-helm`): same router, warm pool, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
-Chart: `dsh-web-helm` · current version **0.4.14** (dsh `0.1.7-rc.2`, Node 22 image).
+Chart: `dsh-web-helm` · current version **0.4.22** (dsh `0.2.1-rc.2`, Node 22.23.3 image).
 0.4.4 fixes the VAST quota-collision hang for long usernames: quota names are `csi:<ns>:<pvc>`
 **truncated to 64 chars** — with a long namespace (e.g. `project-user-alejandro-morales-martinez`)
 only the first ~20 chars of the PVC name survive, so a version *suffix* was invisible to VAST and
