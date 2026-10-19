@@ -227,6 +227,10 @@
           <input id="m-mamba-ratio" type="number" min="0" max="8" step="0.01" value="" placeholder="engine default (no split modeled)">
         </div>
         <div class="field">
+          <label for="m-mamba-max">Max mamba cache size <span class="mini">--max-mamba-cache-size; seqs the pool may hold — demand-sizes the pool (engine sizes by demand up to this)</span></label>
+          <input id="m-mamba-max" type="number" min="0" max="65536" step="1" value="" placeholder="0 = ratio cap claimed whole">
+        </div>
+        <div class="field">
           <label for="m-mamba-conc">Target mamba concurrency <span class="mini">seqs the pool must carry</span></label>
           <input id="m-mamba-conc" type="number" min="0" max="4096" step="1" value="0" placeholder="0 = KV-pool concurrency">
         </div>
@@ -375,12 +379,14 @@
     if (m.compress_state_dtype) $("m-cstate").value = m.compress_state_dtype;
     if (m.mamba_full_memory_ratio) $("m-mamba-ratio").value = m.mamba_full_memory_ratio;
     if (m.mamba_ssm_dtype) $("m-ssm").value = m.mamba_ssm_dtype;
+    if (m.mamba_max_cache_size) $("m-mamba-max").value = m.mamba_max_cache_size;
     var bits = ["serving preset: " + m.gpu + " x" + m.gpus + " TP" + m.tp + (m.pp > 1 ? " PP" + m.pp : "")];
     if (currentRunner) bits.push("MoE runner " + currentRunner);
     if (m.engram === "host") bits.push("engram host offload" + (m.engram_host_gib ? " (" + m.engram_host_gib + " GiB)" : ""));
     if (m.compress_state_dtype) bits.push("compress-state " + m.compress_state_dtype);
     if (m.mamba_full_memory_ratio) bits.push("mamba ratio " + m.mamba_full_memory_ratio);
     if (m.mamba_ssm_dtype) bits.push("mamba ssm " + m.mamba_ssm_dtype);
+    if (m.mamba_max_cache_size) bits.push("mamba cache " + m.mamba_max_cache_size);
     if (currentSpec && currentSpec.algorithm) {
       bits.push("speculative " + currentSpec.algorithm + (currentSpec.draft_model ? " (draft: " + currentSpec.draft_model.split("/").pop() + ")" : "") + (currentSpec.draft_tokens ? " x" + currentSpec.draft_tokens : ""));
     }
@@ -426,6 +432,7 @@
       compress_state_dtype: $("m-cstate").value || undefined,
       mamba_ssm_dtype: $("m-ssm").value || undefined,
       mamba_full_memory_ratio: $("m-mamba-ratio").value || undefined,
+      mamba_max_cache_size: $("m-mamba-max").value || undefined,
       mamba_concurrency: $("m-mamba-conc").value || undefined,
       moe_runner: currentRunner || $("m-runner").value || undefined,
       speculative: (function () {

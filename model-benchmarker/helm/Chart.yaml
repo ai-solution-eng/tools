@@ -10,8 +10,8 @@ description: >-
   behind the PCAI Istio gateway. Benchmarks are restricted to the configured
   endpoint allowlist, one endpoint at a time, gated by an API key.
 type: application
-version: 0.9.0
-appVersion: "v0.9.0"
+version: 0.9.3
+appVersion: "v0.9.3"
 keywords:
   - benchmarking
   - pcai

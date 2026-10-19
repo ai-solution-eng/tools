@@ -168,8 +168,22 @@ def _catalog_entry(catalog_path: Path | None, catalog_id: str | None, model_ref:
                 return e
         return None
     low = model_ref.lower().rsplit("/", 1)[-1]
+    # Name matching is the FALLBACK and must be boundary-safe: 'glm-5.3' must
+    # NOT match 'glm-5.3-flash-sglang' (the family sibling) — a fuzzy substring
+    # made the 743B model inherit Flash's mamba/EAGLE serving args. The
+    # authoritative match is the entry's own model repo (from its serve args /
+    # PVC uri); the name is only used when the repo can't be derived.
+    for e in entries:
+        repo = _catalog_model_ref(e)
+        if repo and repo.lower().rsplit("/", 1)[-1] == low:
+            return e
     for e in entries:
         name = str(e.get("name", "")).lower()
+        # boundary rule: full-name equality, or basename + separator at the
+        # same position ('glm-5.3-flash' matches 'glm-5.3-flash-sglang' but
+        # 'glm-5.3' does not)
+        if name == low or (low and name.startswith(low + "-")):
+            continue  # prefix-of-a-longer-family name is ambiguous -> no match
         if low and (low in name or name in low):
             return e
     return None
@@ -214,6 +228,18 @@ def _args_from_catalog(entry: dict, args: argparse.Namespace) -> None:
             args.mamba_full_memory_ratio = None
     if getattr(args, "mamba_ssm_dtype", None) is None:
         args.mamba_ssm_dtype = opt("--mamba-ssm-dtype")
+    if not getattr(args, "mamba_max_cache_size", 0):
+        mcs = opt("--max-mamba-cache-size")
+        if mcs and mcs.isdigit():
+            args.mamba_max_cache_size = int(mcs)
+    if not getattr(args, "speculative_algorithm", ""):
+        sa = opt("--speculative-algorithm")
+        if sa:
+            args.speculative_algorithm = sa
+    if not getattr(args, "draft_tokens", 0):
+        dt = opt("--speculative-num-draft-tokens")
+        if dt and dt.isdigit():
+            args.draft_tokens = int(dt)
     if not getattr(args, "draft_tokens", 0):
         dt = opt("--speculative-num-draft-tokens")
         if dt and dt.isdigit():
@@ -314,6 +340,7 @@ def build_payload(args: argparse.Namespace) -> tuple[dict, int]:
     mamba = MambaSpec(
         full_memory_ratio=getattr(args, "mamba_full_memory_ratio", None),
         ssm_dtype=getattr(args, "mamba_ssm_dtype", None) or None,
+        max_cache_size=int(getattr(args, "mamba_max_cache_size", 0) or 0),
     )
     mamba_concurrency = getattr(args, "mamba_concurrency", 0) or 0
     compress_state = (

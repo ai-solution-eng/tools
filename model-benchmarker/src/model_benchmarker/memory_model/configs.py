@@ -830,13 +830,29 @@ def unmodeled_structural_fields(cfg: ModelConfig, details: dict) -> list[str]:
 
 
 def _linear_state_bytes_per_seq(cfg: ModelConfig, bytes_per_elem: float) -> float:
-    """Recurrent state per sequence for gated-deltanet/mamba2 layers."""
+    """Recurrent state per sequence for gated-deltanet/mamba2 layers.
+
+    Two config shapes:
+    * Qwen3-Next / qwen4_exp: flat ``linear_key_head_dim`` /
+      ``linear_value_head_dim`` / ``linear_num_value_heads`` (state =
+      heads x value_head_dim x key_head_dim).
+    * GLM-5.x hybrid (glm5_next): a nested ``linear_attn_config`` with
+      ``num_heads`` x ``head_dim`` (square KDA state: heads x head_dim^2).
+    """
     khd = cfg.linear_key_head_dim or 0
     vhd = cfg.linear_value_head_dim or 0
     vh = cfg.linear_num_value_heads or 0
-    if not (khd and vhd and vh):
-        return 0.0
-    return vh * vhd * khd * bytes_per_elem
+    if khd and vhd and vh:
+        return vh * vhd * khd * bytes_per_elem
+    raw = cfg.raw.get("text_config", cfg.raw)
+    lat = raw.get("linear_attn_config") if isinstance(raw.get("linear_attn_config"), dict) else None
+    if lat:
+        heads = lat.get("num_heads")
+        hdim = lat.get("head_dim")
+        if isinstance(heads, int) and isinstance(hdim, int) and heads > 0 and hdim > 0:
+            # gated-deltanet recurrent state is num_heads x head_dim x head_dim
+            return heads * hdim * hdim * bytes_per_elem
+    return 0.0
 
 
 def _ssm_bytes_per_elem(cfg: ModelConfig) -> float:
@@ -877,7 +893,15 @@ def kv_bytes_per_token(
     details: dict = {"kv_bytes_per_elem": bpe}
 
     # --- MLA family -------------------------------------------------------
-    if mt.startswith(("deepseek_v2", "deepseek_v3")) or "dsa" in mt:
+    # glm5_next (GLM-5.3-Flash hybrid) carries the MLA latent too (kv_lora_rank
+    # + mla_use_nope): route it here like the DSA families — the old fallback
+    # priced its full-attention layers as 64-head MHA (16 KiB/layer instead of
+    # the 1 KiB latent) and under-reported KV capacity ~14x.
+    if (
+        mt.startswith(("deepseek_v2", "deepseek_v3", "glm5_next"))
+        or "dsa" in mt
+        or (cfg.kv_lora_rank and cfg.model_type in ("glm_moe_dsa", "glm5_next"))
+    ):
         per_layer = _mla_bytes_per_layer(cfg, bpe)
         mix = classify_layers(cfg)
         details.update(
@@ -885,16 +909,20 @@ def kv_bytes_per_token(
             formula=f"(kv_lora_rank {cfg.kv_lora_rank} + qk_rope_head_dim {cfg.qk_rope_head_dim}) x {bpe:g} B",
             per_layer_bytes=per_layer,
             layer_mix=mix,
-            _consumed_fields={"kv_lora_rank", "qk_rope_head_dim"},
+            _consumed_fields={"kv_lora_rank", "qk_rope_head_dim", "mla_use_nope"},
         )
-        if "dsa" in mt and cfg.index_head_dim:
-            # GLM DSA (glm_moe_dsa): the sparse selector keeps its own small
-            # index-K stream per FULL layer alongside the latent. Priced per
-            # the GLM-5 family paper: the selection reads the index keys
-            # compressed at the DSA token-granularity, one index_head_dim
-            # entry per token per layer (the index_*_heads count projection
-            # heads, not stored streams). Only makes the estimate MORE
-            # conservative; engines reading less make real capacity better.
+        if cfg.index_head_dim:
+            # GLM DSA (glm_moe_dsa) and the glm5_next hybrid alike: the sparse
+            # selector keeps its own small index-K stream per FULL layer
+            # alongside the latent (Flash's indexer_types are all 'full' — the
+            # same NSA-style per-token index stream). Priced per the GLM-5
+            # family paper: the selection reads the index keys compressed at
+            # the DSA token-granularity, one index_head_dim entry per token
+            # per layer (the index_*_heads count projection heads, not stored
+            # streams). Only makes the estimate MORE conservative; engines
+            # reading less make real capacity better. Live check: pricing the
+            # index stream moves GLM-5.3-Flash TP4 from 3.6M to ~2.9M modeled
+            # tokens against the engine's reported ~1.73M pool.
             idx = cfg.index_head_dim * bpe
             per_layer += idx
             details["per_layer_bytes"] = per_layer

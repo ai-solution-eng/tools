@@ -613,6 +613,7 @@ def _catalog_payload() -> dict:
                 "compress_state_dtype": _catalog_env(entry, "SGLANG_DSV4_COMPRESS_STATE_DTYPE") or "",
                 "mamba_full_memory_ratio": _arg_value(a, "--mamba-full-memory-ratio") or "",
                 "mamba_ssm_dtype": _arg_value(a, "--mamba-ssm-dtype") or "",
+                "mamba_max_cache_size": _arg_value(a, "--max-mamba-cache-size") or "",
                 "mamba_concurrency": 0,
                 "speculative": {
                     "algorithm": (
@@ -995,9 +996,16 @@ def _run_estimate_api(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="mamba_full_memory_ratio must be a number") from None
     if mamba_ratio is not None and not 0 < mamba_ratio <= 8:
         raise HTTPException(status_code=400, detail="mamba_full_memory_ratio must be in (0, 8]") from None
+    try:
+        mamba_max_cache = int(payload.get("mamba_max_cache_size") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="mamba_max_cache_size must be an integer") from None
+    if mamba_max_cache < 0 or mamba_max_cache > 65536:
+        raise HTTPException(status_code=400, detail="mamba_max_cache_size must be 0..65536") from None
     mamba = MambaSpec(
         full_memory_ratio=mamba_ratio,
         ssm_dtype=ssm_dtype,
+        max_cache_size=mamba_max_cache,
     )
     try:
         mamba_conc = int(payload.get("mamba_concurrency") or 0)
