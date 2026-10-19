@@ -165,8 +165,6 @@ admin:
 # Manager → DSH Home → .env), or here before install for shared deploys.
 dshEnv: |
     PCAI_LLM_KEY=CHANGEME
-    MCP_BEARER_TOKEN=CHANGEME
-
 
 dshCordisPatch: |
     # =============================================================================
@@ -194,7 +192,6 @@ dshCordisPatch: |
     # The built-in DeepSeek (api.deepseek.com) endpoint is not used in this setup.
     - id: llm-deepseek
       disabled: true
-
     - id: web
       config:
         fetchProvider: http
@@ -205,54 +202,106 @@ dshCordisPatch: |
           pcai-model-endpoint:
             apiKeyEnv: PCAI_LLM_KEY
             api: openai-completions
-            baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
+            baseURL: https://pcai-llm-gateway.pcai-se-ai-application.hst.rdlabs.hpecorp.net/v1
             headers:
               X-PCAI-Execute-Tools: "1"
+              X-PCAI-Relay-Deltas: "1"
+              X-PCAI-Stream-Events: "1"          
             reasoning: max
+            # Route-level capability defaults (pi-ai: entry ?? installed catalog ?? these).
+            # NOTE maxTokens stays per-entry on purpose: an entry maxTokens is also the
+            # per-request default the gateway forwards; the route-level defaultMaxTokens
+            # is capability-only and would stop sending it.
+            defaultContextWindow: 1048576
+            defaultInput:
+              - text
+              - image
             models:
+              - id: auto-demand-aware
+                name: pcai_llm_fallback_flow (demand-aware)
+                reasoningEfforts:
+                  off: "none"
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                contextWindow: 1048576
+                maxTokens: 262144
               - id: auto
-                name: PCAI_LLM_FALLBACK_FLOW
-                contextWindow: 1048576
-                input:
-                  - text
-                  - image
+                name: pcai_llm_fallback_flow
+                maxTokens: 262144
                 reasoningEfforts:
-                  off: off
+                  off: "none"
                   minimal: minimal
                   medium: medium
                   high: high
                   max: max
-                maxTokens: 262144
+                contextWindow: 1048576
               - id: GLM-5.3-Flash
-                name: GLM-5.3-Flash
-                contextWindow: 1048576
-                input:
-                  - text
-                  - image
-                reasoningEfforts:
-                  off: off
-                  minimal: minimal
-                  medium: medium
-                  high: high
-                  max: max
+                name: GLM (pinned via gateway)
                 maxTokens: 262144
-              - id: Qwen3.8-27B
-                name: Qwen3.8-27B
-                input:
-                  - text
-                  - image
                 reasoningEfforts:
-                  off: off
+                  off: "none"
                   minimal: minimal
                   medium: medium
                   high: high
                   max: max
+                contextWindow: 1048576
+              - id: Deepseek-V4.1-Flash-1017
+                name: Deepseek V4.1 Flash 1017 (pinned via gateway)
+                maxTokens: 262144
+                reasoningEfforts:
+                  off: "none"
+                  minimal: minimal
+                  medium: medium
+                  high: high
+                  max: max
+                contextWindow: 1048576
+              - id: Qwen3.8-27B
+                name: Qwen (pinned via gateway)
+                contextWindow: 262144
+                maxTokens: 65536
+                input:
+                  - text
+                reasoningEfforts:
+                  minimal: low
+                  medium: medium
+                  high: high
+                  max: max
+                compat:
+                  supportsDeveloperRole: false
+                  maxTokensField: max_tokens
     - id: agent-default-model
       name: "@deepseek-ai/dsh-agent-default-model"
       config:
         provider: pcai-model-endpoint
-        model: GLM-5.3-Flash
+        model: auto-demand-aware
         reasoningEffort: max
+    - id: subagent
+      name: "@deepseek-ai/dsh-subagent"
+      config:
+        maxDepth: 2
+        maxActiveSubagents: 12
+    - id: agent-preset-registry
+      name: "@deepseek-ai/dsh-agent-preset-registry"
+      config:
+        default: standard
+        selectedDefault: ptc
+    - id: subagent-model-selection-settings
+      name: "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+      config:
+        enabled: true
+        allowedModels:
+          - provider: pcai-model-endpoint-flow
+            model: auto-demand-aware
+          - provider: pcai-model-endpoint-flow
+            model: auto
+          - provider: pcai-model-endpoint-flow
+            model: GLM-5.3-Flash
+          - provider: pcai-model-endpoint-flow
+            model: Qwen3.8-27B
+          - provider: pcai-model-endpoint-flow
+            model: Deepseek-V4.1-Flash-1017
     - id: session-log-deepseek
       name: "@deepseek-ai/dsh-session-log-deepseek"
       config:
@@ -261,6 +310,7 @@ dshCordisPatch: |
       name: "@deepseek-ai/dsh-client-ui-settings-general"
       config:
         welcomeNoticeVersion: 2026-09-28.1
+
 
 router:
   resources:

@@ -686,6 +686,17 @@ data:
       return volume?.persistentVolumeClaim?.claimName || null
     }
 
+    // Claim backing a named volume of a unit's pod template ('state',
+    // 'personal-workspace', 'shared-workspace'). Used by the workspace reset
+    // so the cleanup Job mounts exactly the claims THIS unit already mounts —
+    // never a name re-derived from the slug (which could miss a unit that
+    // predates a naming-scheme change).
+    function claimForDeploymentVolume(dep, volumeName) {
+      const volumes = dep?.spec?.template?.spec?.volumes || []
+      const volume = volumes.find((v) => v.name === volumeName)
+      return volume?.persistentVolumeClaim?.claimName || null
+    }
+
     async function podForSlug(slug, legacySlug, ns = namespace) {
       const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       let fallback = null
@@ -822,7 +833,8 @@ data:
       return { deployments, podBySlug }
     }
 
-    async function clearUserConversations(username, snapshot) {
+    async function clearUserConversations(username, snapshot, options = {}) {
+      const resetWorkspace = options.resetWorkspace === true
       const slug = slugForUser(username)
       const legacySlug = legacySlugForUser(username)
       const deployments = snapshot?.deployments || await listUserDeployments()
@@ -834,6 +846,12 @@ data:
       const deploymentNs = deployment.metadata?.namespace || namespace
       const claimName = stateClaimForDeployment(deployment)
       if (!claimName) return { username, slug, status: 'failed: state claim not found on deployment' }
+      // Workspace reset (opt-in): wipe the user's OWN workspace content and
+      // re-seed from the chart templates. Resolved from the unit's own pod
+      // template so a unit that predates a naming-scheme change still mounts
+      // the volumes it actually uses.
+      const personalClaim = resetWorkspace ? claimForDeploymentVolume(deployment, 'personal-workspace') : null
+      const sharedClaim = resetWorkspace ? claimForDeploymentVolume(deployment, 'shared-workspace') : null
       // Pin the cleanup pod to the node already holding the RWO state PVC so
       // it can co-mount the volume. Prefer a Running pod but fall back to any
       // scheduled pod: an unpinned Job can deadlock on Multi-Attach.
@@ -877,14 +895,32 @@ data:
                   // (~/.dsh inside the mounted state volume); the workspace
                   // and settings.yaml / credentials live on the same volume
                   // but outside the session subdirectories.
-                  command: ['/bin/sh', '-c', 'rm -rf /var/dsh/home/.dsh/sessions /var/dsh/home/.dsh/agent /var/dsh/home/.dsh/logs'],
+                  // SESSIONS (always) + WORKSPACE (opt-in, resetWorkspace):
+                  // only this user's own content is removed. /workspace/shared
+                  // is a SHARED volume, so the wipe is scoped to the user's own
+                  // /workspace/shared/<slug> folder — never the whole volume.
+                  // Re-seeding happens on the next pod start (the unit init
+                  // runs cp -n from the chart templates), which is exactly how
+                  // a fresh environment is populated.
+                  // No `set -e`: a false test as the last command exits 1 and
+                  // the router reports "cleanup pod errored" even though the
+                  // deletions succeeded. Collect a status and exit deliberately.
+                  command: ['/bin/sh', '-c', 'for p in /var/dsh/home/.dsh/sessions /var/dsh/home/.dsh/agent /var/dsh/home/.dsh/logs; do rm -rf "$p" 2>/dev/null || echo "FAILED $p" >> /var/dsh/.dsh-clear-error.log; done; if [ -n "$WIPE_WORKSPACE" ]; then rm -rf /ws/personal/* /ws/personal/.[!.]* 2>/dev/null || echo "FAILED personal" >> /var/dsh/.dsh-clear-error.log; if [ -n "$SHARED_SLUG" ] && [ -d "/shared/$SHARED_SLUG" ]; then rm -rf "/shared/$SHARED_SLUG"/* "/shared/$SHARED_SLUG"/.[!.]* 2>/dev/null || echo "FAILED shared/$SHARED_SLUG" >> /var/dsh/.dsh-clear-error.log; fi; fi; exit 0'],
+                  env: [
+                    { name: 'WIPE_WORKSPACE', value: resetWorkspace ? '1' : '' },
+                    { name: 'SHARED_SLUG', value: resetWorkspace ? slug : '' },
+                  ],
                   volumeMounts: [
                     { name: 'state', mountPath: '/var/dsh' },
+                    ...(personalClaim ? [{ name: 'personal', mountPath: '/ws/personal' }] : []),
+                    ...(sharedClaim ? [{ name: 'shared', mountPath: '/shared' }] : []),
                   ],
                 },
               ],
               volumes: [
                 { name: 'state', persistentVolumeClaim: { claimName } },
+                ...(personalClaim ? [{ name: 'personal', persistentVolumeClaim: { claimName: personalClaim } }] : []),
+                ...(sharedClaim ? [{ name: 'shared', persistentVolumeClaim: { claimName: sharedClaim } }] : []),
               ],
             },
           },
@@ -938,7 +974,13 @@ data:
         }
         return { username, slug, status: 'failed: timed out waiting for cleanup job' }
       } finally {
-        await deleteK8s(`/apis/batch/v1/namespaces/${deploymentNs}/jobs`, jobName).catch(() => {})
+        // Only remove SUCCEEDED jobs. A failed cleanup Job is the only
+        // evidence of why a clear did not work (its pod log), and the
+        // manifest's ttlSecondsAfterFinished (300s) reaps it afterwards.
+        const finished = await k8sRequest('GET', `/apis/batch/v1/namespaces/${deploymentNs}/jobs/${jobName}`).catch(() => null)
+        if (!finished || (finished.status?.succeeded || 0) >= 1) {
+          await deleteK8s(`/apis/batch/v1/namespaces/${deploymentNs}/jobs`, jobName).catch(() => {})
+        }
       }
     }
 
@@ -3881,6 +3923,10 @@ data:
         }
         const body = await readJsonBody(request).catch(() => ({}))
         const username = (body?.username || '').trim().toLowerCase()
+        // Opt-in workspace reset: also wipe the user's OWN workspace content
+        // (/workspace/personal and /workspace/shared/<slug>) and let the unit
+        // init re-seed it from the chart templates on the next pod start.
+        const resetWorkspace = body?.reset_workspace === true
         const users = await loadUserRegistry()
         let targets = []
         if (username) {
@@ -3897,7 +3943,7 @@ data:
           json(response, 200, { ok: true, results: [] })
           return
         }
-        console.log(`[admin] clearing dsh session history for ${targets.length} user(s)`)
+        console.log(`[admin] clearing dsh session history${resetWorkspace ? ' + workspace' : ''} for ${targets.length} user(s)`)
         const snapshot = await fetchEnvironmentSnapshot()
         const results = []
         const concurrency = 5
@@ -3906,7 +3952,7 @@ data:
           while (cursor < targets.length) {
             const name = targets[cursor++]
             try {
-              results.push(await clearUserConversations(name, snapshot))
+              results.push(await clearUserConversations(name, snapshot, { resetWorkspace }))
             } catch (error) {
               results.push({ username: name, slug: slugForUser(name), status: `failed: ${error.message}` })
             }
