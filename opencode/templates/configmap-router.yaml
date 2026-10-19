@@ -649,6 +649,17 @@ data:
       return volume?.persistentVolumeClaim?.claimName || null
     }
 
+    // Claim backing a named volume of a unit's pod template ('state',
+    // 'personal-workspace', 'shared-workspace'). Used by the workspace reset
+    // so the cleanup Job mounts exactly the claims THIS unit already mounts —
+    // never a name re-derived from the slug (which could miss a unit that
+    // predates a naming-scheme change).
+    function claimForDeploymentVolume(dep, volumeName) {
+      const volumes = dep?.spec?.template?.spec?.volumes || []
+      const volume = volumes.find((v) => v.name === volumeName)
+      return volume?.persistentVolumeClaim?.claimName || null
+    }
+
     async function podForSlug(slug, legacySlug, ns = namespace) {
       const result = await k8sRequest('GET', `/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent('opencode-user-managed=true')}`)
       let fallback = null
@@ -786,7 +797,8 @@ data:
       return { deployments, podBySlug }
     }
 
-    async function clearUserConversations(username, snapshot) {
+    async function clearUserConversations(username, snapshot, options = {}) {
+      const resetWorkspace = options.resetWorkspace === true
       const slug = slugForUser(username)
       const legacySlug = legacySlugForUser(username)
       const deployments = snapshot?.deployments || await listUserDeployments()
@@ -798,6 +810,12 @@ data:
       const deploymentNs = deployment.metadata?.namespace || namespace
       const claimName = stateClaimForDeployment(deployment)
       if (!claimName) return { username, slug, status: 'failed: state claim not found on deployment' }
+      // Workspace reset (opt-in): wipe the user's OWN workspace content and
+      // re-seed from the chart templates. Resolved from the unit's own pod
+      // template so a unit that predates a naming-scheme change still mounts
+      // the volumes it actually uses.
+      const personalClaim = resetWorkspace ? claimForDeploymentVolume(deployment, 'personal-workspace') : null
+      const sharedClaim = resetWorkspace ? claimForDeploymentVolume(deployment, 'shared-workspace') : null
       // Pin the cleanup pod to the node already holding the RWO state PVC so
       // it can co-mount the volume. Prefer a Running pod but fall back to any
       // scheduled pod: an unpinned Job can deadlock on Multi-Attach.
@@ -837,14 +855,29 @@ data:
                   name: 'clear-opencode-storage',
                   image: 'alpine:3.20',
                   imagePullPolicy: 'IfNotPresent',
-                  command: ['/bin/sh', '-c', 'rm -rf /var/opencode/data/opencode/opencode.db /var/opencode/data/opencode/opencode.db-shm /var/opencode/data/opencode/opencode.db-wal /var/opencode/data/opencode/storage /var/opencode/data/opencode/project/*/storage'],
+                  // SESSIONS (always) + WORKSPACE (opt-in, resetWorkspace):
+                  // only this user's own content is removed. /workspace/shared
+                  // is a SHARED volume, so the wipe is scoped to the user's own
+                  // /workspace/shared/<slug> folder — never the whole volume.
+                  // Re-seeding happens on the next pod start (the unit init
+                  // runs cp -n from the chart templates), which is exactly how
+                  // a fresh environment is populated.
+                  command: ['/bin/sh', '-c', 'set -e; rm -rf /var/opencode/data/opencode/opencode.db /var/opencode/data/opencode/opencode.db-shm /var/opencode/data/opencode/opencode.db-wal /var/opencode/data/opencode/storage /var/opencode/data/opencode/project/*/storage; if [ -n "$WIPE_WORKSPACE" ]; then rm -rf /ws/personal/* /ws/personal/.[!.]* 2>/dev/null || true; if [ -n "$SHARED_SLUG" ] && [ -d "/shared/$SHARED_SLUG" ]; then rm -rf "/shared/$SHARED_SLUG"/* "/shared/$SHARED_SLUG"/.[!.]* 2>/dev/null || true; fi; fi'],
+                  env: [
+                    { name: 'WIPE_WORKSPACE', value: resetWorkspace ? '1' : '' },
+                    { name: 'SHARED_SLUG', value: resetWorkspace ? slug : '' },
+                  ],
                   volumeMounts: [
                     { name: 'state', mountPath: '/var/opencode' },
+                    ...(personalClaim ? [{ name: 'personal', mountPath: '/ws/personal' }] : []),
+                    ...(sharedClaim ? [{ name: 'shared', mountPath: '/shared' }] : []),
                   ],
                 },
               ],
               volumes: [
                 { name: 'state', persistentVolumeClaim: { claimName } },
+                ...(personalClaim ? [{ name: 'personal', persistentVolumeClaim: { claimName: personalClaim } }] : []),
+                ...(sharedClaim ? [{ name: 'shared', persistentVolumeClaim: { claimName: sharedClaim } }] : []),
               ],
             },
           },
@@ -3960,6 +3993,10 @@ data:
         }
         const body = await readJsonBody(request).catch(() => ({}))
         const username = (body?.username || '').trim().toLowerCase()
+        // Opt-in workspace reset: also wipe the user's OWN workspace content
+        // (/workspace/personal and /workspace/shared/<slug>) and let the unit
+        // init re-seed it from the chart templates on the next pod start.
+        const resetWorkspace = body?.reset_workspace === true
         const users = await loadUserRegistry()
         let targets = []
         if (username) {
@@ -3976,7 +4013,7 @@ data:
           json(response, 200, { ok: true, results: [] })
           return
         }
-        console.log(`[admin] clearing opencode chat history for ${targets.length} user(s)`)
+        console.log(`[admin] clearing opencode chat history${resetWorkspace ? ' + workspace' : ''} for ${targets.length} user(s)`)
         const snapshot = await fetchEnvironmentSnapshot()
         const results = []
         const concurrency = 5
@@ -3985,7 +4022,7 @@ data:
           while (cursor < targets.length) {
             const name = targets[cursor++]
             try {
-              results.push(await clearUserConversations(name, snapshot))
+              results.push(await clearUserConversations(name, snapshot, { resetWorkspace }))
             } catch (error) {
               results.push({ username: name, slug: slugForUser(name), status: `failed: ${error.message}` })
             }
