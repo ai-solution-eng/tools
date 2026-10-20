@@ -150,6 +150,11 @@ class MambaSpec:
 
     full_memory_ratio: float | None = None  # None = engine default, no split modeled
     ssm_dtype: str | None = None
+    # --max-mamba-cache-size: the sequence bound the OPERATOR set (SGLang
+    # sizes the recurrent-state pool by demand up to this many sequences).
+    # 0/None = unknown — the pool is modeled as claiming the full ratio cap
+    # (the conservative pre-demand-sizing behavior, with a loud warning).
+    max_cache_size: int = 0
 
     @property
     def active(self) -> bool:
@@ -319,7 +324,15 @@ def kv_replication_factor(cfg: ModelConfig, tp_size: int) -> int:
       FULL stream (factor tp) — wide TP adds speed, not tokens.
     """
     mt = cfg.model_type or ""
-    if mt.startswith(("deepseek_v2", "deepseek_v3", "deepseek_v4")) or "dsa" in mt:
+    # glm5_next (GLM-5.3-Flash hybrid) routes to MLA latent pricing — its
+    # full-attention layers store ONE compressed latent per token, replicated
+    # per rank under TP (same as the DSA families), NOT 64 sharded KV heads
+    # (num_key_value_heads=64 is the pre-latent MHA shape, stale here).
+    if (
+        mt.startswith(("deepseek_v2", "deepseek_v3", "deepseek_v4", "glm5_next"))
+        or "dsa" in mt
+        or (cfg.kv_lora_rank and cfg.model_type in ("glm_moe_dsa", "glm5_next"))
+    ):
         return max(tp_size, 1)  # MLA latent / V4-family MQA store: one per rank
     kv_heads = cfg.num_key_value_heads if cfg.num_key_value_heads is not None else cfg.num_attention_heads
     return max(1, tp_size // max(kv_heads or 1, 1))
@@ -487,6 +500,18 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
 
     spec = req.speculative
     draft_weights_bytes: float | None = None
+    # MTP-family default (BEFORE the active gate — spec.active requires layers or
+    # a draft model, so an algorithm-only EAGLE/NEXTN/MTP spec would never reach
+    # the block inside): the checkpoint's built-in draft head is what those
+    # algorithms serve; when speculative is enabled without a layer count, take
+    # it from the config (GLM-5.3-Flash ships num_nextn_predict_layers=1 and the
+    # seed deployment runs EAGLE on it).
+    if spec and spec.algorithm and not spec.layers and not spec.draft_model and cfg.num_nextn_predict_layers:
+        spec.layers = cfg.num_nextn_predict_layers
+        warnings.append(
+            f"speculative {spec.algorithm or 'MTP'}: draft layers defaulted to the checkpoint's "
+            f"built-in MTP module ({spec.layers} layer(s)) — pass --speculative 0 to model without it"
+        )
     if spec and spec.active:
         if spec.algorithm.upper() == "DFLASH" and spec.draft_model:
             # DFLASH: a separate draft model -- price its weights AND KV from
@@ -596,19 +621,90 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
     mamba_details: dict = {}
     ms = req.mamba
     if ms.active and kv_pool_per_gpu is not None and ms.full_memory_ratio is not None:
-        ratio = ms.full_memory_ratio
-        budget_per_gpu = usable_per_gpu - (weights_per_gpu or 0.0)
-        mamba_pool_per_gpu = min(ratio * usable_per_gpu, max(budget_per_gpu, 0.0))
-        kv_pool_per_gpu = max(budget_per_gpu - mamba_pool_per_gpu, 0.0)
-        mamba_details = {
-            "full_memory_ratio": ms.full_memory_ratio,
-            "pool_bytes_per_gpu": mamba_pool_per_gpu,
-        }
-        warnings.append(
-            f"mamba state pool: --mamba-full-memory-ratio {ratio:g} reserves "
-            f"~{mamba_pool_per_gpu / 1024**3:.1f} GiB/GPU for the recurrent-state pool; "
-            "the KV pool is what remains"
-        )
+        # A mamba/KDA pool can only exist where linear-attention layers exist.
+        # A ratio/cache-size on a model with none (DeepSeek-V4.1-Flash: pure
+        # MLA+CSA) is inert engine-side (no pool is allocated) — model it the
+        # same way instead of splitting the budget against a phantom pool.
+        _mix_guard = kvdetails.get("layer_mix")
+        _linear_guard = _mix_guard.linear if _mix_guard else 0
+        if not _linear_guard:
+            warnings.append(
+                f"mamba flags ignored: {req.cfg.model_type} has no linear-attention layers — "
+                "no mamba/KDA pool exists to reserve (full budget stays in the KV pool)"
+            )
+            mamba_details = {"ignored": True, "reason": "no linear-attention layers"}
+        else:
+            ratio = ms.full_memory_ratio
+            budget_per_gpu = usable_per_gpu - (weights_per_gpu or 0.0)
+            # Engine-faithful sizing (SGLang model_runner_kv_cache_mixin.
+            # handle_max_mamba_cache, v0.5.x): the post-weights budget ("rest") is
+            # split mamba-vs-KV. The RATIO is mamba:kv, NOT mamba:budget — the
+            # engine solves mamba + kv = rest with mamba/kv = ratio, i.e.
+            # mamba = rest x ratio/(1+ratio) (0.9 -> 47% of rest, never 90%).
+            # --max-mamba-cache-size OVERRIDES the ratio: the pool is then exactly
+            # max_cache_size x per-request state. Speculative decoding adds an
+            # intermediate reserve of per_req x target_concurrency x draft_tokens.
+            # The recurrent state SHARDS across the TP group (verified against the
+            # live GLM-5.3-Flash TP4 deployment: 480-seq pool + 96x6 draft reserve
+            # => ~23.9 GiB/GPU KV => ~1.72M tokens vs the engine's reported 1.73M).
+            _pool_per_gpu: float | None = None
+            _per_req = 0.0
+            _n_linear = 0
+            try:
+                from .configs import _linear_state_bytes_per_seq, _ssm_bytes_per_elem, state_bytes_per_elem
+
+                _mix = kvdetails.get("layer_mix")
+                _n_linear = _mix.linear if _mix else 0
+                _per_req = _linear_state_bytes_per_seq(
+                    cfg, state_bytes_per_elem(ssm_dtype_eff) or _ssm_bytes_per_elem(cfg)
+                ) * _n_linear
+            except Exception:  # pragma: no cover — advisory path must never break an estimate
+                _per_req = 0.0
+            _tp = max(req.tp_size, 1)
+            if ms.max_cache_size and _per_req:
+                # explicit cache size: the ratio is ignored (engine elif order)
+                _pool_per_gpu = ms.max_cache_size * _per_req / _tp
+                mamba_details["max_cache_size"] = ms.max_cache_size
+                mamba_details["state_bytes_per_seq"] = _per_req / max(_n_linear, 1)
+                mamba_details["linear_layers"] = _n_linear
+                mamba_details["sizing"] = "max-mamba-cache-size (ratio overridden)"
+            elif _per_req:
+                # ratio split: mamba = rest x ratio/(1+ratio)
+                _pool_per_gpu = budget_per_gpu * ratio / (1.0 + ratio)
+                mamba_details["sizing"] = f"ratio {ratio:g} (mamba:kv split of the post-weights budget)"
+            if _pool_per_gpu is not None:
+                # speculative decoding: intermediate mamba states for the draft
+                # window are reserved ON TOP (engine subtracts them from rest
+                # before the KV split); target concurrency = mamba_concurrency
+                # (the form's "target mamba concurrency" / --mamba-concurrency)
+                _draft = 0
+                if spec is not None and spec.active and spec.draft_tokens:
+                    _draft = spec.draft_tokens
+                _conc = req.mamba_concurrency or 0
+                if _draft and _conc and _per_req:
+                    _inter = _conc * _draft * _per_req / _tp
+                    _pool_per_gpu += _inter
+                    mamba_details["spec_intermediate_bytes_per_gpu"] = _inter
+                mamba_pool_per_gpu = min(_pool_per_gpu, max(budget_per_gpu, 0.0))
+                kv_pool_per_gpu = max(budget_per_gpu - mamba_pool_per_gpu, 0.0)
+                mamba_details["pool_bytes_per_gpu"] = mamba_pool_per_gpu
+                warnings.append(
+                    f"mamba state pool: {_pool_per_gpu / 1024**3:.1f} GiB/GPU "
+                    f"({mamba_details.get('sizing', '')}"
+                    + (f"; +{_conc}x{_draft} draft-window intermediate" if _draft and _conc else "")
+                    + f") — the KV pool is what remains "
+                    f"({kv_pool_per_gpu / 1024**3:.1f} GiB/GPU)"
+                )
+            else:
+                mamba_pool_per_gpu = budget_per_gpu * ratio / (1.0 + ratio)
+                kv_pool_per_gpu = max(budget_per_gpu - mamba_pool_per_gpu, 0.0)
+                mamba_details["pool_bytes_per_gpu"] = mamba_pool_per_gpu
+                warnings.append(
+                    f"mamba state pool: --mamba-full-memory-ratio {ratio:g} splits the post-weights budget "
+                    f"mamba:kv = {ratio:g}:1 -> ~{mamba_pool_per_gpu / 1024**3:.1f} GiB/GPU mamba, "
+                    f"{kv_pool_per_gpu / 1024**3:.1f} GiB/GPU KV (per-sequence state unknown: "
+                    "pass --max-mamba-cache-size to size the pool exactly)"
+                )
 
     kv_tokens_total: float | None = None
     kv_tokens_per_gpu: float | None = None
@@ -642,7 +738,11 @@ def run_estimate(req: EstimateRequest) -> EstimateResult:
         kv_tokens_per_gpu = (
             kv_tokens_total * rep_factor / req.gpu_count if rep_factor > 1 else kv_tokens_total / req.gpu_count
         )
-        fits = kv_pool_per_gpu >= 0
+        # fits must be False when weights alone bust the budget: the mamba
+        # split clamps a negative post-weights budget to 0, which would make
+        # this check vacuously true (GLM-5.3 743B on 4xH200 printed "fits"
+        # with a 0-token pool).
+        fits = kv_pool_per_gpu >= 0 and (weights_per_gpu is None or weights_per_gpu <= usable_per_gpu)
         concurrency = math.floor(kv_tokens_total / req.context) if fits and kv_tokens_total is not None else 0
         if not fits and weights_per_gpu is not None:
             warnings.append(

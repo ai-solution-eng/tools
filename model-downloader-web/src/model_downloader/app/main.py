@@ -162,7 +162,7 @@ aioli_db = AioliDB(
     port=AIOLI_DB_PORT,
     dbname=AIOLI_DB_NAME,
     user=AIOLI_DB_USER,
-    secret_name=AIOLI_DB_SECRET_NAME,
+    secret_name=AIOLI_DB_SECRET_NAME,  # secret-scan:allow (k8s Secret NAME constant, not a credential)
     secret_ns=AIOLI_DB_SECRET_NS,
     secret_key=AIOLI_DB_SECRET_KEY,
 )
