@@ -1,0 +1,96 @@
+---
+name: cross-validate
+description: Use when doing coding, kube/cluster, or other consequential operational work with two (or more) models available, and when the user asks for cross-validation, a second opinion, or ensemble review. Implements a tiered, direction-matched model ensemble — the reviewer is chosen to target the primary's characteristic failure mode. See `model-roster-check` when a model is upgraded or the direction table looks stale.
+---
+
+# Cross-validate (tiered model ensemble)
+
+## Authority order (never inverted)
+
+1. **Machines** — dry-runs, logs, file contents, `kubectl`, tests. Models propose; machines dispose.
+2. **Cross-model review** — the OTHER cell reviews this work at decision points only.
+3. **Primary execution** — the task-shaped model does the work.
+
+A model may never override a log line, a dry-run result, or a file. Agreement between models is weak
+evidence on shared-training facts; go to machines for load-bearing claims.
+
+## Precondition: the ensemble only works if the cells are ANTI-CORRELATED
+
+Two models whose failure modes overlap fail *together*, and their agreement becomes false confirmation.
+Before adopting a pair, check that each model's **failure** rows are the other's **strong** rows. If both
+fail the same things, they are one model twice — **skip the ensemble and lean on the machine layer harder.**
+See `model-roster-check` for how to diagnose this from per-row benchmark data.
+
+## Direction-matched reviews (do not symmetrize)
+
+Classify each cell by posture, then pair the reviewer so its strength targets the primary's weakness:
+
+| The primary fails by | Reviewer should be | Review targets |
+|---|---|---|
+| **Confident assertion** (low abstention; invents APIs/flags/paths, wrong versions) | a **calibrated/abstaining** model | unsupported factual claims, invented APIs/flags/paths, wrong versions, unverifiable system behavior |
+| **Under-exploration** (high abstention; shallow execution) | an **environment-trained agentic** model | missed steps, unhandled failure modes, plans that die on a real terminal |
+
+Running the review in the wrong direction wastes the ensemble: a confident model reviewing facts just
+agrees confidently. Review **at decision points only** — claims, diffs, plans, conclusions — not a full
+independent re-derivation by default.
+
+## Procedure
+
+1. **Propose**: do the task in this session (you are the primary; your session's model sets the direction).
+2. **Review**: delegate ONE review subagent at a decision point:
+   - Supply `provider` and `model` **together** — pinning one alone is not a pin. **Enumerate the actually
+     registered providers with `list_subagent_models` before spawning**; ids are deployment-specific and a
+     stale id silently routes to the wrong cell or fails. (Reference deployment's ids are fenced below.)
+   - Review prompt template: "You are the FACTUAL-INTEGRITY reviewer (or EXECUTION-COMPLETENESS reviewer).
+     The producing model tends to [assert confidently when uncertain | under-explore]. For each concrete
+     problem: quote the claim, state the correction if confident, else UNVERIFIABLE. No style comments. If
+     clean, reply exactly REVIEW-CLEAN. ARTIFACT: <artifact>"
+   - Keep review effort **LOW** — verbose models turn a diff review into an essay; long reviews are pure cost.
+   - Some models stall before doing tool work. If a review stalls, convert the artifact into a list of
+     **machine-verifiable claims** and check them directly — the machine layer outranks model review anyway.
+3. **Verdict**:
+   - `REVIEW-CLEAN` → proceed to machines (dry-run/logs/tests) before any apply.
+   - Flags raised → resolve each against machine sources; if a flag is consequential and unresolved, escalate.
+4. **Escalate (only on consequential disagreement)**: independent re-derivation by the other cell, then
+   adjudicate point-by-point against machine evidence — never by which output sounds more confident.
+
+## Kube/cluster addendum
+
+- Any manifest change: run the dry-run/plan step FIRST, read per-document verdicts, then apply bound to the
+  planned bytes. See `cluster-triage` for the fail-closed apply contract.
+- RCA questions: cite log lines / metrics / events **by quote**. When the two cells are peers at RCA, run
+  BOTH derivations only when the first pass fails to converge.
+
+## Anti-patterns
+
+- **Always-on dual execution** — pays double for ~90% agreement; reserve re-derivation for escalations.
+- **Symmetric reviews** — "each checks the other" discards the anti-correlation you are paying for.
+- **Model-over-machine** — citing a model against a log line, dry-run, or file.
+- **Agreement-as-proof** — two models agreeing is weak on shared-training facts.
+- **Reviewing at max effort** — keep reviewer dials low.
+
+## Operational notes
+
+- Models with thinking enabled may need a **generous `max_tokens`** — a small budget can return *empty
+  content* with the budget spent on the reasoning trace. Empty content = retry with more budget or lower
+  effort, **not** a refusal.
+- Endpoint URLs, tokens and auth live in the project's model-catalog module — that is the single source of
+  auth truth, not this skill.
+- Self-signed ingress: set a CA bundle env var for CLI runs (see the fenced section).
+- **Postures drift between model versions.** Re-verify the direction table against fresh per-row benchmark
+  data whenever either cell is upgraded: hallucination/non-hallucination row = calibration posture;
+  agentic-vs-knowledge spread = training concentration. Use `model-roster-check`.
+
+## Reference instantiation
+
+One deployment's values — re-derive locally:
+
+- Cells: `pcai-ds` = DeepSeek V4.1-Flash (confident asserter; AA non-hallucination 4%), `pcai-glm` =
+  GLM-5.3-Flash (calibrated abstainer; non-hallucination 72%). Direction: GLM reviews DS's facts; DS reviews
+  GLM's execution depth. Both peers at kube RCA (ITBench 51% vs 47%).
+- Providers: `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash`, `GLM-5.3-Flash`, `Qwen3.8-27B`,
+  `auto`).
+- Method doc + runnable implementation: `ModelDeploymentApproaches/MODEL_CROSS_VALIDATION.md` and
+  `ensemble_flow.py` (update only its §6 when the roster changes).
+- Auth/TLS: endpoints in `ModelBenchmarker/src/model_benchmarker/utils/pcai_models.py`;
+  `REMOTE_CA_BUNDLE=$DSH_HOME/hpe-private-ssl-ca.pem`.

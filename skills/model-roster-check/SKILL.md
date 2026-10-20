@@ -68,7 +68,7 @@ One deployment's pair — re-derive locally:
 
 - Method doc: `/home/andrew/Code/HPE/ModelDeploymentApproaches/MODEL_CROSS_VALIDATION.md`; implementation
   `ensemble_flow.py` (25 for reviews, 50 for DS primaries).
-- Providers: `pcai-model-endpoint-flow`, `glm53-flash-sproket` — enumerate with `list_subagent_models`.
+- Providers: `pcai-model-endpoint-flow` — enumerate with `list_subagent_models`.
 - Auth/TLS: endpoints in `ModelBenchmarker/src/model_benchmarker/utils/pcai_models.py`;
   `REMOTE_CA_BUNDLE=$DSH_HOME/hpe-private-ssl-ca.pem` (without it the CLI disables verification and warns
   on stderr).

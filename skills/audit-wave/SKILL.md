@@ -24,7 +24,6 @@ Do not skip a phase to save time. Each phase's cost was paid back by defects the
 
 - **Split by breadth vs depth.** In the reference run, 5 subagents: one model family took breadth (API/identity, input processors, helm/deployment); a second took depth (MCP tool surface, data-core perf/correctness). Breadth finds surfaces; depth finds mechanisms.
 - **Model-pin each subagent by `provider` + `model` together.** Pinning one alone is not a pin. **Resolve the ids with `list_subagent_models` before spawning** — registered provider ids drift between deployments and a stale id silently routes to the wrong cell, so check, never assume. (Reference deployment's ids: see below.)
-- **Spawn each subagent as a durable agent-team teammate, per `subagent-teams`** — via `await tools.spawn_teammate({...})` inside `run_code` (PTC mode; team tools are SDK-only). Anonymous background children are not addressable — not in `list_agents`, not messaged, not interruptible — and an invisible spawn plus a blind re-spawn is how the same agent gets set up twice (reference: a 2026-10-06 review ran twice, 7m19s + 6m16s). Verify addressability right after every spawn and record each member's target.
 - **Audits are read-only for the auditor — say so explicitly in the prompt.** Pair it with the git prohibition: "read-only for you" alone does NOT stop a write (see `guard-uncommitted-work`).
 - **Spot-check EVERY subagent claim before believing it.** In the reference run **26/26 lead spot-checks held, but 2 over-claims were corrected**:
   - a claimed `tar.gz` archive-bomb exploit chain was **false** — the extractor's dispatch already caps it;
@@ -91,7 +90,7 @@ Hand off to `release-verify` for the build/deploy/verify path. Two rules that bi
 One deployment's concrete values (2026-10-02) — re-derive locally, never hardcode:
 
 - Target repo: `/home/andrew/Code/HPE/MultimodalRAG/`, version `v5.3.2`; report at `documentation/AUDIT-2026-10-02.md`.
-- Subagent provider ids (verified 2026-10-04 via `list_subagent_models`): `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`) and `glm53-flash-sproket` (model `glm-5.3-flash`). These differ from the `pcai-ds` / `pcai-glm` shorthands used elsewhere — those are model *names*, not spawnable provider ids.
+- Subagent provider ids (verified 2026-10-04 via `list_subagent_models`): `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`). These differ from the `pcai-ds` / `pcai-glm` shorthands used elsewhere — those are model *names*, not spawnable provider ids.
 - Breadth/depth split: GLM-5.3-Flash took breadth (API/identity, processors, helm); DeepSeek-V4.1-Flash took depth (MCP tool surface, data core).
 - Over-claim #2's file: `src/multimodal_rag/utils/pcai_models.py` (gitignored; absent from the shipped tarballs).
 - Build script named in Phase 5: `automation.sh`.

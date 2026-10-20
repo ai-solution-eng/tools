@@ -146,6 +146,60 @@ graph pools 18.34 GiB (deterministic); decode graph pools ≈6–12; boot runtim
 - Deploying a serving change is a manifest change → `plan_apply` dry-run first, then apply bound to the plan sha (see
   **cluster-triage**); a stale image means **release-verify**.
 
+## Launch-argument hygiene (PCAI / KServe)
+
+**Never quote JSON-valued args.** PCAI's serving path passes `--preferred-sampling-params` (and any other
+JSON-valued flag) through **unquoted** and **errors out if shell quotes are added**:
+
+```bash
+# CORRECT on PCAI
+--preferred-sampling-params {"temperature":1.0,"top_p":0.95}
+
+# WRONG on PCAI - the quotes reach the arg and it is rejected
+--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'
+```
+
+This is the opposite of a bare shell invocation, where quoting is required. If you are writing a **shell
+script** that is not PCAI-mediated, quote it there; if you are writing the **command pasted into the PCAI
+values editor**, leave it bare. Do not "fix" an unquoted JSON arg in a PCAI command - it is already correct.
+(Recurring operator correction: this has been flagged wrongly more than once.)
+
+## Verify the resolved config, never the intended one
+
+`/get_server_info` is the authority for what the engine actually runs (auto-resolved backends, pool sizes,
+parsed sampling params). Two habits:
+
+- **Backends auto-resolve; do not pass them.** `attention_backend` and `moe_runner_backend` are selected from
+  model + hardware + shape. Both SGLang and vLLM docs warn that overriding them is the most common cause of a
+  disappointing measurement. Confirm them in `/get_server_info` / the boot log instead of pinning them.
+- **`preferred_sampling_params` is only a DEFAULT.** It fills in what the client omits; any request that sends
+  `top_p`/`temperature` explicitly wins. Verify with the pod's `request.received` log line, which records the
+  sampling params actually applied.
+
+## Sampling / effort: match the source you are comparing against
+
+Published benchmark numbers and "recommended serving" values are **not the same thing**, and the two can differ
+between a base checkpoint and its delta update. Check the specific card you are serving:
+
+- DeepSeek publishes `temperature=1.0, top_p=0.95` as the **evaluation** setting for V4.1-Flash; the
+  **-1017** delta card lists `top_p: 1.0` as its **serving** recommendation but does not restate an eval setting.
+  Reproducing scores needs 0.95; following the serving rec needs 1.0. State which you are doing.
+- **Thinking mode defaults differ by engine.** SGLang V4.1 leaves thinking OFF unless asked; vLLM V4.1 turns
+  thinking ON at effort 50 when both keys are unset. A small `max_tokens` then returns empty `content` with
+  `finish_reason=length` - that is the budget spent on the trace, **not** a broken model.
+- **Effort alias values are engine-specific.** SGLang/DeepSeek's encoder maps `low/high/max` -> 50/75/100; vLLM
+  maps `low/high/xhigh/max` -> 25/50/75/100. A request tuned at `high` on one runs at a different budget on the
+  other - pass an integer when parity matters. The numeric 1-100 budget is reachable only via
+  `chat_template_kwargs`, not the top-level field.
+
+## Cross-check against the native engine docs
+
+Before finalizing any serve command, diff it against the vendor's own page for that engine and checkpoint -
+SGLang cookbook (`docs/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1.mdx` at the **matching release tag**, not
+`main`) and vLLM recipes (`recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash`). Recipes are hardware-specific:
+the cookbook's H200 cell is 8xH200 TP8/EP8, so its `--cuda-graph-max-bs-decode 64` and TP/EP values do **not**
+transfer to a 4xH200 TP4/EP4 box. Take the *rules*, not the literals.
+
 ## Reference instantiation (one deployment's values — re-derive locally)
 
 - Fleet: 4×H200 nodes `scs04` / `scs05`; two models co-scheduled on an 8-GPU node. Models: `GLM-5.3-Flash` (served
