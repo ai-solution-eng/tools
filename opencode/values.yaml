@@ -1,3 +1,6 @@
+# Opencode harness deployment in PCAI
+# This app is very powerful, be responsible.
+
 # ============================================================
 # EZUA settings
 # ============================================================
@@ -35,6 +38,16 @@ storage:
   nameVersion: v2
   keepPvcOnDelete: true
   stateSize: 2Gi
+
+# Max request body accepted by the in-pod nginx (the single entry point in
+# front of opencode at :8082). nginx's own default is 1 MB, which is far too
+# small once the browser base64-encodes a pasted/dropped image into a prompt
+# body — the request is rejected with HTTP 413 before the app sees it. 64 MB
+# comfortably covers a screenshot plus conversation history. Raise it if users
+# paste very large images; the platform gateway in front of the pod may impose
+# its own (separate) limit.
+nginx:
+  clientMaxBodySize: 64m
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
