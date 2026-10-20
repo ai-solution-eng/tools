@@ -862,7 +862,10 @@ data:
                   // Re-seeding happens on the next pod start (the unit init
                   // runs cp -n from the chart templates), which is exactly how
                   // a fresh environment is populated.
-                  command: ['/bin/sh', '-c', 'set -e; rm -rf /var/opencode/data/opencode/opencode.db /var/opencode/data/opencode/opencode.db-shm /var/opencode/data/opencode/opencode.db-wal /var/opencode/data/opencode/storage /var/opencode/data/opencode/project/*/storage; if [ -n "$WIPE_WORKSPACE" ]; then rm -rf /ws/personal/* /ws/personal/.[!.]* 2>/dev/null || true; if [ -n "$SHARED_SLUG" ] && [ -d "/shared/$SHARED_SLUG" ]; then rm -rf "/shared/$SHARED_SLUG"/* "/shared/$SHARED_SLUG"/.[!.]* 2>/dev/null || true; fi; fi'],
+                  // No `set -e`: a false test as the last command exits 1 and
+                  // the router reports "cleanup pod errored" even though the
+                  // deletions succeeded. Collect a status and exit deliberately.
+                  command: ['/bin/sh', '-c', 'rc=0; rm -rf /var/opencode/data/opencode/opencode.db /var/opencode/data/opencode/opencode.db-shm /var/opencode/data/opencode/opencode.db-wal /var/opencode/data/opencode/storage /var/opencode/data/opencode/project/*/storage || rc=1; if [ -n "$WIPE_WORKSPACE" ]; then rm -rf /ws/personal/* /ws/personal/.[!.]* || rc=1; if [ -n "$SHARED_SLUG" ] && [ -d "/shared/$SHARED_SLUG" ]; then rm -rf "/shared/$SHARED_SLUG"/* "/shared/$SHARED_SLUG"/.[!.]* || rc=1; fi; fi; exit $rc'],
                   env: [
                     { name: 'WIPE_WORKSPACE', value: resetWorkspace ? '1' : '' },
                     { name: 'SHARED_SLUG', value: resetWorkspace ? slug : '' },
@@ -930,7 +933,13 @@ data:
         }
         return { username, slug, status: 'failed: timed out waiting for cleanup job' }
       } finally {
-        await deleteK8s(`/apis/batch/v1/namespaces/${deploymentNs}/jobs`, jobName).catch(() => {})
+        // Only remove SUCCEEDED jobs. A failed cleanup Job is the only
+        // evidence of why a clear did not work (its pod log), and the
+        // manifest's ttlSecondsAfterFinished (300s) reaps it afterwards.
+        const finished = await k8sRequest('GET', `/apis/batch/v1/namespaces/${deploymentNs}/jobs/${jobName}`).catch(() => null)
+        if (!finished || (finished.status?.succeeded || 0) >= 1) {
+          await deleteK8s(`/apis/batch/v1/namespaces/${deploymentNs}/jobs`, jobName).catch(() => {})
+        }
       }
     }
 
