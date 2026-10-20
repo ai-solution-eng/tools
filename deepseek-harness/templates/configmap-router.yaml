@@ -101,7 +101,10 @@ data:
     // initialized by the chart (dshSettings value deleted); existing
     // per-user files are untouched and still watched. The project-config
     // ConfigMap and the /opt/dsh-defaults mount went with it.
-    const RUNTIME_REV = '35'
+    // 36: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
+    // default rejected pasted/dropped images with HTTP 413 before dsh saw
+    // the request. Bumped so existing units re-stamp onto the new nginx.conf.
+    const RUNTIME_REV = '36'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,

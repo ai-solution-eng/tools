@@ -16,6 +16,11 @@ data:
       worker_connections 1024;
     }
     http {
+      # nginx defaults to 1 MB, which rejects a pasted/dropped image once the
+      # browser base64-encodes it into a /api/session/prompt body (HTTP 413,
+      # before dsh sees the request). Tunable via nginx.clientMaxBodySize.
+      client_max_body_size {{ .Values.nginx.clientMaxBodySize | default "64m" }};
+
       map $http_upgrade $connection_upgrade {
         default upgrade;
         '' close;
