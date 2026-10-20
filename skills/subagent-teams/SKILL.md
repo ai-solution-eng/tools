@@ -88,7 +88,7 @@ itself by guessing from its own teammate name.
    again**; that is the duplicate trap (see below).
 4. **Record the target** in the todo list / task notes at spawn time. The spawn result is often the
    only durable handle for the member; "I'll remember the id" is how duplicates happen.
-5. **Collect through the team loop**: `wait_agent` (blocks) over polling; `send_message` for
+5. **Collect through the team loop**: messages first (end the turn; completion notices arrive as lead messages — see team-collect-loop Mode A), `wait_agent` chunks only as fallback; `send_message` for
    follow-ups; `interrupt_agent` to stop. **Completion notices are authoritative; the `list_agents`
    registry goes stale** — it has shown 'running' after agents finished and 'ready' after they
    closed. Trust the notice/result over the registry status.
@@ -149,7 +149,7 @@ One harness's tools and limits — re-derive locally:
 - Limits (reference harness, verified 2026-10): max 8 live continuable children, delegation depth 1;
   tool bindings accept lossless-JSON arguments only — pass `{}`, never a bare undefined.
 - Providers verified 2026-10-04 via `list_subagent_models`: `pcai-model-endpoint-flow` (models
-  `Deepseek-V4.1-Flash`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`) and `glm53-flash-sproket` (model
+  `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`) and `glm53-flash-sproket` (model
   `glm-5.3-flash`).
 - The 2026-10-06 incident's exact tell: spawn "succeeded", then `unknown job <uuid>` from job
   output, `list subagents: 1 agents` (lead only), `0 background jobs`,

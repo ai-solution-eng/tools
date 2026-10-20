@@ -1,6 +1,6 @@
 ---
 name: cross-validate
-description: Use when doing coding, kube/cluster, or other consequential operational work with two (or more) models available, and when the user asks for cross-validation, a second opinion, or ensemble review. Implements a tiered, direction-matched model ensemble — the reviewer is chosen to target the primary's characteristic failure mode. Reviewer spawns follow `subagent-teams` (durable agent-team teammates, never anonymous background children). See `model-roster-check` when a model is upgraded or the direction table looks stale.
+description: Use when doing coding, kube/cluster, or other consequential operational work with two (or more) models available, and when the user asks for cross-validation, a second opinion, or ensemble review. Implements a tiered, direction-matched model ensemble — the reviewer is chosen to target the primary's characteristic failure mode. See `model-roster-check` when a model is upgraded or the direction table looks stale.
 ---
 
 # Cross-validate (tiered model ensemble)
@@ -38,12 +38,7 @@ independent re-derivation by default.
 
 1. **Propose**: do the task in this session (you are the primary; your session's model sets the direction).
 2. **Review**: delegate ONE review subagent at a decision point:
-   - **Spawn the reviewer as a durable agent-team teammate** — `await tools.spawn_teammate({...})` inside `run_code` (PTC mode: team tools are SDK-only, never in the declared function list — see `subagent-teams`' path section), per `subagent-teams`:
-     verify it appears in `list_agents` immediately after the spawn, collect with `wait_agent`, steer
-     with `send_message`. Anonymous background subagents are not addressable (not listed, not
-     messaged, not interruptible, job id may not resolve) — if one "goes invisible", re-list; a blind
-     re-spawn runs the same review twice and hands you two verdicts to cherry-pick.
-   - Supply `provider` and `model` **together** on the spawn (`spawn_teammate` takes them since the 2026-10-10 routing fix; verify the spawn result echoes the pinned model, not `auto`) — pinning one alone is not a pin. **Enumerate the actually
+   - Supply `provider` and `model` **together** — pinning one alone is not a pin. **Enumerate the actually
      registered providers with `list_subagent_models` before spawning**; ids are deployment-specific and a
      stale id silently routes to the wrong cell or fails. (Reference deployment's ids are fenced below.)
    - Review prompt template: "You are the FACTUAL-INTEGRITY reviewer (or EXECUTION-COMPLETENESS reviewer).
@@ -73,8 +68,6 @@ independent re-derivation by default.
 - **Model-over-machine** — citing a model against a log line, dry-run, or file.
 - **Agreement-as-proof** — two models agreeing is weak on shared-training facts.
 - **Reviewing at max effort** — keep reviewer dials low.
-- **Duplicate reviewer spawn** — re-spawning after a visibility failure instead of re-listing; the
-  first reviewer was usually still alive. Set reviewers up as agent-team teammates (`subagent-teams`).
 
 ## Operational notes
 
@@ -95,8 +88,8 @@ One deployment's values — re-derive locally:
 - Cells: `pcai-ds` = DeepSeek V4.1-Flash (confident asserter; AA non-hallucination 4%), `pcai-glm` =
   GLM-5.3-Flash (calibrated abstainer; non-hallucination 72%). Direction: GLM reviews DS's facts; DS reviews
   GLM's execution depth. Both peers at kube RCA (ITBench 51% vs 47%).
-- All spawns go through `run_code` SDK calls (`await tools.*`) — this deployment's preset is PTC. Providers: `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash`, `GLM-5.3-Flash`, `Qwen3.8-27B`,
-  `auto`) and `glm53-flash-sproket` (`glm-5.3-flash`).
+- Providers: `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`,
+  `auto`).
 - Method doc + runnable implementation: `ModelDeploymentApproaches/MODEL_CROSS_VALIDATION.md` and
   `ensemble_flow.py` (update only its §6 when the roster changes).
 - Auth/TLS: endpoints in `ModelBenchmarker/src/model_benchmarker/utils/pcai_models.py`;
