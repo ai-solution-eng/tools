@@ -91,7 +91,10 @@ data:
     // v14: per-user folder in the shared workspace — the unit init creates
     // /workspace/shared/<login-username> (mkdir -p as the project identity;
     // warm-pool placeholders skipped until adopted by a user).
-    const userTemplateVersion = `terminal-tab-v14-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    // v15: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
+    // default rejected pasted/dropped images with HTTP 413 before the app saw
+    // the request. Bumped so existing units re-stamp onto the new nginx.conf.
+    const userTemplateVersion = `terminal-tab-v15-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------

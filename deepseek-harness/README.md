@@ -166,6 +166,7 @@ Ports map: **443→8080 router→8082 nginx→3080 dsh** (loopback), 7681 ttyd, 
 | `dshCordisPatch` | the web profile's `cordis.patch.yml` (MCP integrations etc.), seeded base64, seed-once, watched + YAML-validated |
 | `dshEnv` | Seed `.env` written into `$DSH_HOME` on first start — the credential layer (`apiKeyEnv` resolves from it; edit via Data Manager, hot-reloaded) |
 | `dsh.version` / `dsh.port` | dsh npm version / loopback port (3080) |
+| `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a `/api/session/prompt` body — the request never reaches dsh. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
 
 **Hot reload:** the supervisor watches `settings.yaml`, `.env`, `profiles/web/cordis.patch.yml` and `profiles/web/dsh.profile` as FILES and restarts dsh on change — every changed YAML file is validated (js-yaml from the dsh install, `!!js`-aware) before the restart, so a broken edit can never crash-loop dsh. dsh also re-reads settings per request, so most model edits apply without restart. Edit via the Data Manager's **DSH Home** root or the terminal; seeded on first start only, never overwritten.
 

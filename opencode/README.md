@@ -103,6 +103,7 @@ All configuration lives in `values.yaml`:
 | `opencode.version` | The opencode npm version to install (e.g. `1.18.11`) |
 | `openchamber.version` | The OpenChamber npm version to install (used when `ui.mode: openchamber`) |
 | `ui.mode` | `opencode` (default, built-in web UI) or `openchamber` (OpenChamber frontend) |
+| `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a prompt body — the request never reaches the app. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
 
 To switch the version of either opencode or OpenChamber, change the number in `values.yaml` and repackage. The chart `version` (in `Chart.yaml`) is bumped manually per release; `appVersion` tracks the opencode major.minor family.
 
