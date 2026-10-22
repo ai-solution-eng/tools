@@ -1,0 +1,12 @@
+apiVersion: v2
+name: openwork-web-helm
+description: Multi-user OpenWork (openwork-server web) deployment with per-user PVC-backed workspaces on HPE Private Cloud AI
+type: application
+appVersion: "0.18.59"
+version: 0.1.13
+keywords:
+  - openwork
+  - opencode
+  - coding-agent
+  - AI
+  - pcai

@@ -1,0 +1,484 @@
+# ============================================================
+# OpenWork deployment in PCAI — g2 environment
+# This app is very powerful, be responsible.
+# OpenWork is the open-source Claude Cowork alternative, powered by opencode
+# (https://github.com/different-ai/openwork). This chart runs openwork-server
+# web per user on HPE Private Cloud AI.
+# Owner Francesco Caliva
+# Admin password: admin-password
+# You can login using SSO, or create a user via admin account
+# SSO login grants you access to the kubeflow personal and shared PVCs
+# Visit https://openwork.pcai-se-ai-application.hst.rdlabs.hpecorp.net/terminal for a terminal
+# Visit https://openwork.pcai-se-ai-application.hst.rdlabs.hpecorp.net/data-manager for a file explorer
+# Note: We now support helm and docker functionalities.
+# ============================================================
+
+
+# ============================================================
+# EZUA settings
+# ============================================================
+
+
+ezua:
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "openwork.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# ============================================================
+# General configuration
+# ============================================================
+previewDomain: "${DOMAIN_NAME}"
+
+# Session cookie signing secret (also used by each user pod to validate the
+# session cookie that gates access to that pod's UI/terminal/previews).
+sessionSecret: "9xT2mQvR4pS7kL1nW8yB5dF3hJ6cZ0aG"
+
+storageClass: gl4f-filesystem
+storage:
+  sharedSize: 20Gi
+  workspaceSize: 5Gi
+  # CANONICAL SCHEME: openwork-v2 (matches values.yaml — every claim this
+  # chart deploys is openwork-v2-*). Never bump casually: a bump re-stamps
+  # existing units onto fresh volumes and orphans user data (kept, never
+  # deleted, never migrated).
+  nameVersion: v2
+  keepPvcOnDelete: true
+  stateSize: 2Gi
+
+images:
+  # Baked user image: carries the apt toolchain, openwork-server, the pinned
+  # OpenCode engine, uv, ttyd and helm under /opt/openwork so pods stop
+  # installing everything at boot (see docker/user/Dockerfile +
+  # scripts/build-user-image.sh). Rebuild and bump whenever openwork.serverVersion /
+  # openwork.opencodeVersion / provisioning.aptPackages change — the router folds
+  # the tag into the pod-template version, so existing units re-stamp
+  # automatically on upgrade. Set both entries back to node:22-bookworm-slim
+  # to revert to install-on-boot behavior.
+  user: ghcr.io/ai-solution-eng/openwork-server:0.18.59-1.18.30-dind
+  init: ghcr.io/ai-solution-eng/openwork-server:0.18.59-1.18.30-dind
+  # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
+  # Public ghcr.io packages pull anonymously (leave empty).
+  pullSecret: ""
+  # Download policy for chart-managed images: IfNotPresent (default; reuse the
+  # node-cached image) or Always (pull on every pod (re)start — use while
+  # iterating on the same tag, at the cost of slower unit starts). Applies to
+  # the user unit containers and the router; infra images (dind, alpine, nginx,
+  # cleanup) keep their own fixed policies.
+  pullPolicy: Always
+
+# ============================================================
+# Docker-in-Docker sidecar (dockerize + push images from the pod terminal)
+# ============================================================
+# ENABLED on g2: the pod carries the hpeproxy env (below) and the combined
+# CA bundle (certificatesPolicy), and the router forwards both to the dind
+# daemon — so docker pull/push work through the corporate proxy, and
+# builds succeed with the baked dockerbuild wrapper (--network host +
+# explicit proxy build-args; the daemon bridge cannot reach the proxy).
+# The image store is node-local emptyDir storage (disk-capped at
+# docker.diskSize = 50Gi): push after build.
+docker:
+  ###
+  # Setting	Effect
+  # enabled: true	Docker exists at all (and only for SSO users — local accounts never get a daemon)
+  # brokerForPlatformUnits: true	Your current setup. Platform units (project-user-*) get a separate privileged dind pod in the release namespace; the unit reaches it over the network
+  # onPlatformUnits: false	Platform units must not carry an in-pod daemon (privileged containers are denied there by Kyverno)
+  # onPlatformUnits: true	Forces the daemon inside the platform unit's own pod (sidecar mode) instead of the broker
+  ###
+  enabled: true
+  image: docker:28-dind
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits:   {cpu: "4", memory: 8Gi}
+  diskSize: 50Gi
+  diskRequest: 5Gi
+  # Platform units get their daemon via the per-user broker in the release
+  # namespace (no Kyverno PolicyException needed). Flip onPlatformUnits to
+  # true ONLY after the exception is applied (see values.yaml).
+  onPlatformUnits: false
+  brokerForPlatformUnits: true
+
+# ============================================================
+# OpenWork pins (upstream versions baked into the unit image)
+# ============================================================
+openwork:
+  serverVersion: "0.18.59"      # appVersion; baked into images.user
+  opencodeVersion: "1.18.30"   # engine binary pin; MUST equal OpenWork's constants.json.opencodeVersion
+  approvalMode: auto           # manual would time out every gated write in web mode
+  webBootstrapToken: false      # browser auto sign-in behind the router cookie gate
+  disableCloudModels: true      # no OpenWork Cloud sign-in handoff; providers are configured locally (PCAI gateway)
+  corsOrigins: ""              # empty => rendered from ezua.virtualService.endpoint
+  readOnly: false
+  logFormat: json
+  sandboxEnabled: false
+  tokenSecret: ""
+
+RUNTIME_REV: 7
+
+# Browser-facing UI: openwork-server web — single origin (UI + API) on
+# serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
+# is the only non-loopback listener. There is no chamber mode in this chart.
+nginx:
+  clientMaxBodySize: 64m
+
+ui:
+  mode: openwork
+  serverPort: 8787
+
+provisioning:
+  aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # Loading screen shown while a user's pod is being provisioned/assigned.
+  # When disabled the router reverts to the original blocking behavior.
+  loadingUI:
+    enabled: true
+    heading: "Setting up your account\u2026"
+    subtext: "This usually takes a few minutes on first launch. Please wait."
+
+# ============================================================
+warmPool:
+  enabled: false
+  size: 2
+  refreshIntervalSeconds: 15
+
+auth:
+  username: opencode
+  password: "password" # "7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N"
+
+# Admin console credentials (admin page to create/delete user accounts).
+admin:
+  username: admin-user
+  password: "admin-password"
+
+# ============================================================
+# OpenCode engine config (model, provider, MCP servers) — unchanged from the
+# opencode deployment: OpenWork runs the opencode engine underneath, so this
+# surface is identical. Delivered to pods via the project-config ConfigMap
+# and seeded at first boot (scripts/push_openwork_json_config.sh to propagate).
+# ============================================================
+
+opencodeConfig: |
+    {
+      "$schema": "https://opencode.ai/config.json",
+      "formatter": false,
+      "model": "glm-5.3-flash/glm-5.3-flash",
+      "provider": {
+        "glm-5.3-flash": {
+          "npm": "@ai-sdk/openai-compatible",
+          "name": "glm-5.3-flash",
+          "options": {
+            "baseURL": "http://glm-53-flash.project-user-andrew-bydlon.svc.cluster.local/v1",
+            "apiKey": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE5NjY1MDEwLCJpYXQiOjE3ODgxMjkwMTAsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiM2RhZGRkYzgtNTVmMy00M2FjLWI5NDMtOWQ0MDNmZGU5MDEyIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODgxMjkwMTA0MzEiLCJ1aWQiOiI2M2Q1MjE1YS02NmMzLTQyYTEtYWE4MS00OWRjMWM2MWNjYzcifX0sIm5iZiI6MTc4ODEyOTAxMCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4ODEyOTAxMDQzMSJ9.GOqzuS6-7pwKKYx8s1mSPvR-9vdFCfGS7PwmKnxn1q26DgPt1xvxkX3BBWxFJbrbnqDsTM46PASKHxfnJdUnh89wFXTsZsXPY4KydcMorR-Na6kYXl5GKRbTi_Q53PuAv95KxQtZUwrIAngbYVMz6ce8-8la-KCQYxgEUaJuK_VcA_dj9AgxP75EdWCwNqXKgfRkrUvXgbAGritJBxhVM_3l56BDpC5LCbzuMh09W2DLoXBcDPVntAekYjp3YlOzNSgM3CVXzjE8OTZJuGJwWUQhom46yKNdxvuIFueU3OiZRDe12VbCxWITfwpJ-VgTuYZ_x4rL6GFNP5GKQ_GpxA"
+          },
+          "models": {
+            "glm-5.3-flash": {
+              "name": "GLM-5.3-flash",
+              "attachment": true,
+              "modalities": {
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "output": [
+                  "text"
+                ]
+              },
+              "reasoning": true,
+              "limit": {
+                "context": 1048576,
+                "output": 262144
+              }
+            }            
+          }
+        },
+        "qwen3.8-27b-fp8": {
+          "npm": "@ai-sdk/openai-compatible",
+          "name": "MLIS Local Models - Qwen.8-27B-FP8",
+          "options": {
+            "baseURL": "http://qwen-38-27b.project-user-andrew-bydlon.svc.cluster.local/v1",
+            "apiKey": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE4Mzc5NjcxLCJpYXQiOjE3ODY4NDM2NzEsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZmZkMzM0MjktNmE3ZC00YmFjLTkxYjYtNDhjNWEzMjMwOWRkIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODY4NDM2NzE2ODAiLCJ1aWQiOiIwM2RjODJmYy1jNjUzLTQyMTgtODY5NS03ZjExZmIxNTMxYzcifX0sIm5iZiI6MTc4Njg0MzY3MSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4ODY4NDM2NzE2ODAifQ.SoO5qFg2VnzXtOnprWJ_qnt_Hi9sle0WpreDMRvuP-rl2JcbJTI8drlzqYAc-Df_3V_S-j6PdauH9Oqs4M656tec5VJAt2-0x7AqW5aZ2RbagSHOYQUOqidKyPj8Y_xshfEBu9r85WWBekVyddPcxPHdBWux_gyJ26UM_Zhquk42zq33Ua8v7XPIXsN3v7aAXTWEdeV4ljaw2PC6YoD2NkKDi-7PXR-IaBPRK49CHNeyGdgLNiIeNxASryVVLq-IzGPz4X_m7ZSvahc_K7Qqrx6rfDp6zz-KYnxjjcwFtJgZb_UKkH0qHPkpykfBkfH7GP2wghADohRG8UDEdr4uYQ"
+          },
+          "models": {
+            "Qwen/Qwen3.8-27B-FP8": {
+              "name": "Qwen/Qwen3.8-27B-FP8",
+              "attachment": true,
+              "modalities": {
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "output": [
+                  "text"
+                ]
+              },
+              "reasoning": true
+            }
+          }
+        }
+      },
+      "mcp": {
+        "dsearxng-mcp": {
+          "type": "remote",
+          "url": "http://searxng-mcp-service.searxng-mcp.svc.cluster.local:9090/mcp",
+          "headers": {
+            "transport": "streamable-http"
+          }
+        },
+        "yahoo-finance-mcp": {
+          "type": "remote",
+          "url": "http://yahoo-finance-mcp.finance-mcp.svc.cluster.local:8000/mcp",
+          "enabled": true,
+          "headers": {
+            "transport": "streamable-http"
+          }
+        },
+        "alpaca-mcp": {
+          "type": "remote",
+          "url": "http://alpaca-mcp.finance-mcp.svc.cluster.local:8000/mcp",
+          "enabled": true,
+          "headers": {
+            "transport": "streamable-http"
+          }
+        },
+        "k8s-ops-mcp": {
+          "type": "remote",
+          "enabled": true,
+          "url": "http://k8s-mcp-service.k8s-mcp-ops.svc.cluster.local:9090/mcp",
+          "headers": {
+            "Authorization": "Bearer d9e657d4799ba4ed9cddbe4539311c3174f58de8731f3cddf8a498ed139adf8a",
+            "Host": "k8s-mcp-2-0-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+          }
+        }
+      },
+      "permission": {
+        "bash": {
+          "*": "ask",
+          "ls *": "allow",
+          "grep *": "allow",
+          "glob *": "allow",
+          "rm *": "deny"
+        },
+        "edit": "ask",
+        "read": "allow",
+        "glob": "allow",
+        "question": "allow",
+        "webfetch": "ask",
+        "websearch": "ask",
+        "codesearch": "allow",
+        "external_directory": "allow",
+        "doom_loop": "deny"
+      }
+    }
+
+
+# ============================================================
+# OpenWork server config (new surface — openwork-server web itself)
+# Single origin on 127.0.0.1:8787; platform volumes are authorized roots so
+# SSO users can reach /mnt/shared and /mnt/user through the app.
+# ============================================================
+openworkConfig:
+  serverJson: |
+    {
+      "host": "127.0.0.1",
+      "port": 8787,
+      "approval": { "mode": "auto", "timeoutMs": 30000 },
+      "workspaces": [ { "path": "/workspace/personal", "name": "personal", "workspaceType": "local" } ],
+      "authorizedRoots": ["/workspace", "/mnt/shared", "/mnt/user"],
+      "readOnly": false,
+      "logFormat": "json",
+      "logRequests": true
+    }
+
+opencodeSkills:
+  - name: pcai-platform
+    content: |
+      ---
+      name: pcai-platform
+      description: Use for PCAI/AIE Kubernetes, routing, model-serving, and deployment troubleshooting.
+      compatibility: opencode
+      ---
+
+      ## Guidance
+
+      - Start with read-only inspection.
+      - Check pods, services, endpoints, VirtualServices, and logs before changing anything.
+      - Prefer the smallest safe fix.
+
+opencodeAgents:
+  - name: pcai-platform-assistant
+    content: |
+      ---
+      description: Expert HPE AIE/PCAI platform engineer and advisor.
+      mode: subagent
+      ---
+
+      # HPE AI Essentials (AIE) Platform Assistant
+
+      You are an expert AIE/PCAI platform engineer and advisor. You have access to live Kubernetes cluster tools, indexed product documentation, and web search.
+
+      Your mission: **Think deeply. Act decisively. Anticipate what the user needs before they ask.**
+
+  - name: pcai-debugger
+    content: |
+      ---
+      description: Diagnose PCAI/AIE Kubernetes, Istio routing, PVC, and opencode deployment issues.
+      mode: subagent
+      ---
+
+      Start with read-only inspection. Check pods, events, services, endpoints, VirtualServices, PVCs, and logs before recommending changes.
+
+      Prefer the smallest safe fix and call out any destructive operation before suggesting it.
+
+router:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# ============================================================
+# Pre-delete cleanup hook (removes dynamically-created per-user
+# resources on helm uninstall so the namespace and shared PVC
+# don't hang in Terminating)
+# ============================================================
+cleanup:
+  image: node:22-bookworm-slim
+  podTimeout: 180  # seconds to wait for user pods to terminate
+  pvcTimeout: 120  # seconds to wait for user PVCs to be deleted
+
+# This policy adds the ezaf-root-ca.crt to the base CA bundle in the init container, and then mounts the combined CA bundle into the user container.
+certificatesPolicy:
+  enabled: true # Set to false if the cluster already has the ezaf-root-ca.crt in its base CA bundle (e.g. HT evironments)
+
+  env:
+    - name: SSL_CERT_DIR
+      value: /etc/ssl/certs
+    - name: NODE_EXTRA_CA_CERTS
+      value: /tmp/certs/ca-certificates.crt
+    - name: REQUESTS_CA_BUNDLE
+      value: /tmp/certs/ca-certificates.crt
+    - name: SSL_CERT_FILE
+      value: /tmp/certs/ca-certificates.crt
+    - name: AIOHTTP_CLIENT_SESSION_SSL
+      value: /tmp/certs/ca-certificates.crt
+    - name: CURL_CA_BUNDLE
+      value: /tmp/certs/ca-certificates.crt
+
+  initContainer:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+          cp /etc/ssl/certs/ca-certificates.crt /work/ca-certificates.crt
+        elif [ -f /etc/ssl/certs/ca-bundle.crt ]; then
+          cp /etc/ssl/certs/ca-bundle.crt /work/ca-certificates.crt
+        else
+          echo "No base CA bundle found in init container"
+          exit 1
+        fi
+        cat /config/ezaf-root-ca.crt >> /work/ca-certificates.crt
+        echo "" >> /work/ca-certificates.crt
+
+  initVolumeMounts:
+    - name: combined-certs
+      mountPath: /work
+    - name: ezaf-root-ca
+      mountPath: /config/ezaf-root-ca.crt
+      subPath: ca-certificates.crt
+      readOnly: true
+
+  volumeMounts:
+    - name: combined-certs
+      mountPath: /tmp/certs
+      readOnly: false
+
+  volumes:
+    - name: combined-certs
+      emptyDir: {}
+    - name: ezaf-root-ca
+      configMap:
+        name: ezaf-root-ca
+        items:
+          - key: ezaf-root-ca.crt
+            path: ca-certificates.crt
+
+# ============================================================
+# Proxy configuration (for clusters behind corporate proxy)
+# ============================================================
+# Set proxy.enabled to true to enable proxy settings for the user container. The init container will also inherit these settings.
+proxy:
+  enabled: true # Set to false if the cluster is not behind a corporate proxy (e.g. HT evironments)
+  env:
+    - name: HTTP_PROXY
+      value: http://hpeproxy.its.hpecorp.net:8080
+    - name: http_proxy
+      value: http://hpeproxy.its.hpecorp.net:8080
+    - name: HTTPS_PROXY
+      value: http://hpeproxy.its.hpecorp.net:8080
+    - name: https_proxy
+      value: http://hpeproxy.its.hpecorp.net:8080
+# ============================================================ 
+no_proxy:
+  enabled: true # Set to false if the cluster is not behind a corporate proxy (e.g. HT evironments)
+  env:
+    - name: NO_PROXY
+      value: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost,pcai-se-ai-application.hst.rdlabs.hpecorp.net,pcai-se-nfs-vip-pool.hst.lab,ai-application.staging.discover.hpepcai.com,prod.lg-pcai.hou,hpecolo.net,.hpecolo.net
+    - name: no_proxy
+      value: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost,pcai-se-ai-application.hst.rdlabs.hpecorp.net,pcai-se-nfs-vip-pool.hst.lab,ai-application.staging.discover.hpepcai.com,prod.lg-pcai.hou,hpecolo.net,.hpecolo.net
+
+# ============================================================
+# Platform (PCAI/Kubeflow) workspace integration
+# ============================================================
+# When enabled AND the endpoint is SSO-gated, SSO users get their unit
+# deployed INSIDE their platform project namespace (project-user-<username>)
+# with the platform volumes kubeflow-shared-pvc (/mnt/shared, cluster-wide
+# shared) and user-pvc (/mnt/user, personal project volume) mounted
+# read-write, and the unit process running as the project's unix identity
+# (uid/gid from the project-info ConfigMap) so file ownership on the
+# platform volumes matches notebook-written files exactly.
+#
+# Enabling this renders a cross-namespace ClusterRole for the router and
+# cleanup service accounts (see README "Platform volumes for SSO users").
+# Local (non-SSO) users keep the classic single-namespace behavior.
+platformIntegration:
+  enabled: true
+  # Platform project namespace prefix (ezprojects-operator:
+  # EZPROJECTS_NAMESPACE_NAME=project-{{ "{{" }} .EzProjectName {{ "}}" }}, private projects
+  # are named user-<username>).
+  namespacePrefix: "project-user-"
+  # Candidate naming patterns for a user's platform project namespace —
+  # comma-separated templates with a {username} placeholder (the sanitized
+  # username). A trailing * acts as a wildcard: any namespace whose name
+  # starts with the expanded prefix becomes a candidate (ownership is
+  # verified through the project-info user field). The first candidate that
+  # verifies (namespace exists + project-info carries uid/gid) wins.
+  # Example: "project-user-{username},user-{username},{username}-slug"
+  # When empty, the legacy single-prefix behavior applies (namespacePrefix).
+  namespacePatterns: ""
+  volumes:
+    shared:
+      claim: "kubeflow-shared-pvc"
+      mountPath: "/mnt/shared"
+    user:
+      claim: "user-pvc"
+      mountPath: "/mnt/user"
+  # Monitor-only deployments: mount the platform volumes but expose them
+  # read-only in the Data Manager (unix permissions stay the real
+  # enforcement regardless).
+  readOnly: false
+
+# ============================================================
+# Shared workspace content (populates the shared PVC)
+# ============================================================
+sharedContent:
+  enabled: true
+
+kyverno:
+  enabled: true

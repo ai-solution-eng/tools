@@ -1,0 +1,14 @@
+*.tgz
+*.tar.gz
+.DS_Store
+shared/.DS_Store
+values-*.yaml
+apply/
+scripts/
+docker/
+dist/
+docs/
+# Anchored to the chart root: an unanchored "README.md" also
+# strips shared/**/README.md from the package, so the toy-*
+# demo folders shipped without their READMEs (fixed 2026-10-19).
+/README.md
