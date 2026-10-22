@@ -1,2 +1,6 @@
 values-*.yaml
-values.yaml.opencode-reference
+__pycache__/
+*.opencode-reference
+ezappconfig-openwork-web-helm.yaml
+*.pyc
+.DS_Store

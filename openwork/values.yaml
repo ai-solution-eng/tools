@@ -1,5 +1,5 @@
 # ============================================================
-# OpenWork deployment in PCAI — g2 environment
+# OpenWork deployment in PCAI
 # This app is very powerful, be responsible.
 # OpenWork is the open-source Claude Cowork alternative, powered by opencode
 # (https://github.com/different-ai/openwork). This chart runs openwork-server
@@ -8,17 +8,20 @@
 # Admin password: admin-password
 # You can login using SSO, or create a user via admin account
 # SSO login grants you access to the kubeflow personal and shared PVCs
-# Visit https://openwork.pcai-se-ai-application.hst.rdlabs.hpecorp.net/terminal for a terminal
-# Visit https://openwork.pcai-se-ai-application.hst.rdlabs.hpecorp.net/data-manager for a file explorer
+# Visit https://openwork.${DOMAIN}/terminal for a terminal
+# Visit https://openwork.${DOMAIN}/data-manager for a file explorer
 # Note: We now support helm and docker functionalities.
+# If one wants to connect OpenWork cloud, must follow the following steps:
+# 1) login in their account in https://app.openworklabs.com
+# 2) on the left side bar click on settings and navigate to Approved web origins
+# 3) type https://openwork.${DOMAIN}
+# 4) click "approve origin"
 # ============================================================
 
 
 # ============================================================
 # EZUA settings
 # ============================================================
-
-
 ezua:
   domainName: "${DOMAIN_NAME}"
   virtualService:
@@ -35,6 +38,7 @@ previewDomain: "${DOMAIN_NAME}"
 
 # Session cookie signing secret (also used by each user pod to validate the
 # session cookie that gates access to that pod's UI/terminal/previews).
+# This can be any hard-coded value, or with helm templates adaptation can become a k8s secret.
 sessionSecret: "9xT2mQvR4pS7kL1nW8yB5dF3hJ6cZ0aG"
 
 storageClass: gl4f-filesystem
@@ -109,14 +113,14 @@ openwork:
   opencodeVersion: "1.18.30"   # engine binary pin; MUST equal OpenWork's constants.json.opencodeVersion
   approvalMode: auto           # manual would time out every gated write in web mode
   webBootstrapToken: false      # browser auto sign-in behind the router cookie gate
-  disableCloudModels: true      # no OpenWork Cloud sign-in handoff; providers are configured locally (PCAI gateway)
+  disableCloudModels: false   # OpenWork Cloud sign-in/handoff enabled (origin approved in OpenWork Labs org settings)
   corsOrigins: ""              # empty => rendered from ezua.virtualService.endpoint
   readOnly: false
   logFormat: json
   sandboxEnabled: false
   tokenSecret: ""
 
-RUNTIME_REV: 7
+RUNTIME_REV: 8
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
@@ -145,7 +149,7 @@ warmPool:
 
 auth:
   username: opencode
-  password: "password" # "7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N"
+  password: "7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N"
 
 # Admin console credentials (admin page to create/delete user accounts).
 admin:
@@ -169,8 +173,8 @@ opencodeConfig: |
           "npm": "@ai-sdk/openai-compatible",
           "name": "glm-5.3-flash",
           "options": {
-            "baseURL": "http://glm-53-flash.project-user-andrew-bydlon.svc.cluster.local/v1",
-            "apiKey": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE5NjY1MDEwLCJpYXQiOjE3ODgxMjkwMTAsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiM2RhZGRkYzgtNTVmMy00M2FjLWI5NDMtOWQ0MDNmZGU5MDEyIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODgxMjkwMTA0MzEiLCJ1aWQiOiI2M2Q1MjE1YS02NmMzLTQyYTEtYWE4MS00OWRjMWM2MWNjYzcifX0sIm5iZiI6MTc4ODEyOTAxMCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4ODEyOTAxMDQzMSJ9.GOqzuS6-7pwKKYx8s1mSPvR-9vdFCfGS7PwmKnxn1q26DgPt1xvxkX3BBWxFJbrbnqDsTM46PASKHxfnJdUnh89wFXTsZsXPY4KydcMorR-Na6kYXl5GKRbTi_Q53PuAv95KxQtZUwrIAngbYVMz6ce8-8la-KCQYxgEUaJuK_VcA_dj9AgxP75EdWCwNqXKgfRkrUvXgbAGritJBxhVM_3l56BDpC5LCbzuMh09W2DLoXBcDPVntAekYjp3YlOzNSgM3CVXzjE8OTZJuGJwWUQhom46yKNdxvuIFueU3OiZRDe12VbCxWITfwpJ-VgTuYZ_x4rL6GFNP5GKQ_GpxA"
+            "baseURL": "BASE_URL_FOR_GLM.3-FLASH",
+            "apiKey": "MODEL-API-KEY"
           },
           "models": {
             "glm-5.3-flash": {
@@ -192,65 +196,9 @@ opencodeConfig: |
               }
             }            
           }
-        },
-        "qwen3.8-27b-fp8": {
-          "npm": "@ai-sdk/openai-compatible",
-          "name": "MLIS Local Models - Qwen.8-27B-FP8",
-          "options": {
-            "baseURL": "http://qwen-38-27b.project-user-andrew-bydlon.svc.cluster.local/v1",
-            "apiKey": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE4Mzc5NjcxLCJpYXQiOjE3ODY4NDM2NzEsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZmZkMzM0MjktNmE3ZC00YmFjLTkxYjYtNDhjNWEzMjMwOWRkIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODY4NDM2NzE2ODAiLCJ1aWQiOiIwM2RjODJmYy1jNjUzLTQyMTgtODY5NS03ZjExZmIxNTMxYzcifX0sIm5iZiI6MTc4Njg0MzY3MSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4ODY4NDM2NzE2ODAifQ.SoO5qFg2VnzXtOnprWJ_qnt_Hi9sle0WpreDMRvuP-rl2JcbJTI8drlzqYAc-Df_3V_S-j6PdauH9Oqs4M656tec5VJAt2-0x7AqW5aZ2RbagSHOYQUOqidKyPj8Y_xshfEBu9r85WWBekVyddPcxPHdBWux_gyJ26UM_Zhquk42zq33Ua8v7XPIXsN3v7aAXTWEdeV4ljaw2PC6YoD2NkKDi-7PXR-IaBPRK49CHNeyGdgLNiIeNxASryVVLq-IzGPz4X_m7ZSvahc_K7Qqrx6rfDp6zz-KYnxjjcwFtJgZb_UKkH0qHPkpykfBkfH7GP2wghADohRG8UDEdr4uYQ"
-          },
-          "models": {
-            "Qwen/Qwen3.8-27B-FP8": {
-              "name": "Qwen/Qwen3.8-27B-FP8",
-              "attachment": true,
-              "modalities": {
-                "input": [
-                  "text",
-                  "image"
-                ],
-                "output": [
-                  "text"
-                ]
-              },
-              "reasoning": true
-            }
-          }
         }
       },
       "mcp": {
-        "dsearxng-mcp": {
-          "type": "remote",
-          "url": "http://searxng-mcp-service.searxng-mcp.svc.cluster.local:9090/mcp",
-          "headers": {
-            "transport": "streamable-http"
-          }
-        },
-        "yahoo-finance-mcp": {
-          "type": "remote",
-          "url": "http://yahoo-finance-mcp.finance-mcp.svc.cluster.local:8000/mcp",
-          "enabled": true,
-          "headers": {
-            "transport": "streamable-http"
-          }
-        },
-        "alpaca-mcp": {
-          "type": "remote",
-          "url": "http://alpaca-mcp.finance-mcp.svc.cluster.local:8000/mcp",
-          "enabled": true,
-          "headers": {
-            "transport": "streamable-http"
-          }
-        },
-        "k8s-ops-mcp": {
-          "type": "remote",
-          "enabled": true,
-          "url": "http://k8s-mcp-service.k8s-mcp-ops.svc.cluster.local:9090/mcp",
-          "headers": {
-            "Authorization": "Bearer d9e657d4799ba4ed9cddbe4539311c3174f58de8731f3cddf8a498ed139adf8a",
-            "Host": "k8s-mcp-2-0-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
-          }
-        }
       },
       "permission": {
         "bash": {
@@ -352,86 +300,31 @@ cleanup:
 
 # This policy adds the ezaf-root-ca.crt to the base CA bundle in the init container, and then mounts the combined CA bundle into the user container.
 certificatesPolicy:
-  enabled: true # Set to false if the cluster already has the ezaf-root-ca.crt in its base CA bundle (e.g. HT evironments)
-
-  env:
-    - name: SSL_CERT_DIR
-      value: /etc/ssl/certs
-    - name: NODE_EXTRA_CA_CERTS
-      value: /tmp/certs/ca-certificates.crt
-    - name: REQUESTS_CA_BUNDLE
-      value: /tmp/certs/ca-certificates.crt
-    - name: SSL_CERT_FILE
-      value: /tmp/certs/ca-certificates.crt
-    - name: AIOHTTP_CLIENT_SESSION_SSL
-      value: /tmp/certs/ca-certificates.crt
-    - name: CURL_CA_BUNDLE
-      value: /tmp/certs/ca-certificates.crt
-
-  initContainer:
-    image: alpine:3.20
-    command:
-      - /bin/sh
-      - -c
-      - |
-        set -e
-        if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-          cp /etc/ssl/certs/ca-certificates.crt /work/ca-certificates.crt
-        elif [ -f /etc/ssl/certs/ca-bundle.crt ]; then
-          cp /etc/ssl/certs/ca-bundle.crt /work/ca-certificates.crt
-        else
-          echo "No base CA bundle found in init container"
-          exit 1
-        fi
-        cat /config/ezaf-root-ca.crt >> /work/ca-certificates.crt
-        echo "" >> /work/ca-certificates.crt
-
-  initVolumeMounts:
-    - name: combined-certs
-      mountPath: /work
-    - name: ezaf-root-ca
-      mountPath: /config/ezaf-root-ca.crt
-      subPath: ca-certificates.crt
-      readOnly: true
-
-  volumeMounts:
-    - name: combined-certs
-      mountPath: /tmp/certs
-      readOnly: false
-
-  volumes:
-    - name: combined-certs
-      emptyDir: {}
-    - name: ezaf-root-ca
-      configMap:
-        name: ezaf-root-ca
-        items:
-          - key: ezaf-root-ca.crt
-            path: ca-certificates.crt
-
+  enabled: false
+  
 # ============================================================
 # Proxy configuration (for clusters behind corporate proxy)
 # ============================================================
 # Set proxy.enabled to true to enable proxy settings for the user container. The init container will also inherit these settings.
 proxy:
-  enabled: true # Set to false if the cluster is not behind a corporate proxy (e.g. HT evironments)
+  enabled: false
   env:
     - name: HTTP_PROXY
-      value: http://hpeproxy.its.hpecorp.net:8080
+      value: ""
     - name: http_proxy
-      value: http://hpeproxy.its.hpecorp.net:8080
+      value: ""
     - name: HTTPS_PROXY
-      value: http://hpeproxy.its.hpecorp.net:8080
+      value: ""
     - name: https_proxy
-      value: http://hpeproxy.its.hpecorp.net:8080
+      value: ""
 # ============================================================ 
 no_proxy:
-  enabled: true # Set to false if the cluster is not behind a corporate proxy (e.g. HT evironments)
+  enabled: false
   env:
     - name: NO_PROXY
-      value: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost,pcai-se-ai-application.hst.rdlabs.hpecorp.net,pcai-se-nfs-vip-pool.hst.lab,ai-application.staging.discover.hpepcai.com,prod.lg-pcai.hou,hpecolo.net,.hpecolo.net
+      value: ""
     - name: no_proxy
-      value: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,172.28.1.161,172.28.1.162,172.28.1.61,172.28.1.62,172.28.1.63,172.28.1.81,192.0.0.0/8,kubeapi-d2e14158-5243-4688-93c2-610381d9a46a.external.hpe.local,localhost,pcai-se-ai-application.hst.rdlabs.hpecorp.net,pcai-se-nfs-vip-pool.hst.lab,ai-application.staging.discover.hpepcai.com,prod.lg-pcai.hou,hpecolo.net,.hpecolo.net
+      value: ""
 
 # ============================================================
 # Platform (PCAI/Kubeflow) workspace integration
@@ -448,7 +341,7 @@ no_proxy:
 # cleanup service accounts (see README "Platform volumes for SSO users").
 # Local (non-SSO) users keep the classic single-namespace behavior.
 platformIntegration:
-  enabled: true
+  enabled: false
   # Platform project namespace prefix (ezprojects-operator:
   # EZPROJECTS_NAMESPACE_NAME=project-{{ "{{" }} .EzProjectName {{ "}}" }}, private projects
   # are named user-<username>).

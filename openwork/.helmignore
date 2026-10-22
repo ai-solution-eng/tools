@@ -12,3 +12,5 @@ docs/
 # strips shared/**/README.md from the package, so the toy-*
 # demo folders shipped without their READMEs (fixed 2026-10-19).
 /README.md
+*.opencode-reference
+ezappconfig-openwork-web-helm.yaml
