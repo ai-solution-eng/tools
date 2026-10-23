@@ -1,0 +1,13 @@
+diff --git a/dist/api/pi-messages.js b/dist/api/pi-messages.js
+index 5b9cb1680c47083a9a36eefa93124c67c750fd42..dc5a43ebd801fa6d4b7897c3739b588d4d571d3a 100644
+--- a/dist/api/pi-messages.js
++++ b/dist/api/pi-messages.js
+@@ -155,8 +155,6 @@ function createEventConverter(model) {
+             case "toolcall_delta": {
+                 const json = `${toolJson.get(event.contentIndex) ?? ""}${event.delta}`;
+                 toolJson.set(event.contentIndex, json);
+-                partial.content[event.contentIndex].arguments =
+-                    parseStreamingJson(json);
+                 break;
+             }
+             case "toolcall_end":

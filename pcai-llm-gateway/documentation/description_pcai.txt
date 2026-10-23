@@ -1,0 +1,1 @@
+Similar to litellm, except MCP tool calling is kept internal to the cluster and relayed to the user, improving latency. Additional features, such as off-peak billing, and HPE branded.

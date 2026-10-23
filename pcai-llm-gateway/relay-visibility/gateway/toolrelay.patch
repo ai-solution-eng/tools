@@ -1,0 +1,196 @@
+--- a/src/pcai_llm/core/toolrelay.py
++++ b/src/pcai_llm/core/toolrelay.py
+@@ -633,6 +633,17 @@
+     # deltas; this gates the NON-COMPLIANT {"pcai": …} lines. Resolved
+     # per-request at the routes layer (key default + X-PCAI-Stream-Events).
+     stream_pcai_events: bool = True,
++    # Stamped inert tool-call deltas (Wave R1): emit each in-cluster tool
++    # call as a NATIVE tool_call delta stamped `pcai.relay: true` (display
++    # contract — a client that understands the stamp renders it and never
++    # executes; every other client must never see it, so this is gated by
++    # the routes layer on BOTH settings.tool_relay_render_deltas AND the
++    # request header X-PCAI-Relay-Deltas: 1). Indexes start at
++    # render_index_base (>> any handback enumeration) so a legacy client
++    # that assembles deltas by index cannot merge rendered and handback
++    # calls even if it never notices the stamp.
++    render_deltas: bool = False,
++    render_index_base: int = 1000,
+ ):
+     """The streaming relay loop — yields SSE bytes for the client.
+ 
+@@ -1015,6 +1026,83 @@
+             }
+         )
+ 
++    def _rendered_delta(tc: dict, idx: int) -> bytes:
++        """Stamped inert tool-call delta (Wave R1): the SAME wire shape as a
++        handback delta plus the top-level `pcai.relay: true` stamp. The
++        stamp is the contract — a rendering client shows this call as a
++        completed display-only card (the relay owns execution) and NEVER
++        executes it; the off-base index (render_index_base, default 1000)
++        keeps a stamp-blind client from merging it with handback deltas.
++        Only reachable when render_deltas is on, which the routes layer
++        gates on settings AND the client's X-PCAI-Relay-Deltas: 1."""
++        fn = tc.get("function", {})
++        chunk: dict[str, Any] = {
++            "id": request_id,
++            "object": "chat.completion.chunk",
++            "model": model,
++            "choices": [
++                {
++                    "index": 0,
++                    "delta": {
++                        "tool_calls": [
++                            {
++                                "index": render_index_base + idx,
++                                "id": tc.get("id", ""),
++                                "type": "function",
++                                "function": {
++                                    "name": fn.get("name", ""),
++                                    "arguments": fn.get("arguments", ""),
++                                },
++                            }
++                        ]
++                    },
++                }
++            ],
++            "pcai": {"relay": True},
++        }
++        return sse_event(chunk)
++
++    def _trace_call(
++        server: str,
++        tool: str,
++        args: dict | str,
++        status: str,
++        ms: int | None = None,
++        content: Any = None,
++    ) -> str:
++        """One tombstone line for the reasoning stream. Prefixed exactly
++        `[tool] {server}__{tool} →` (tests and humans pattern-match that);
++        the enriched form adds the (collapsed) arguments and, on completion,
++        a bounded result preview, so the line is self-sufficient for clients
++        that never parse the pcai events. Preview/args bounds mirror the
++        mcp_summaries discipline (model-facing caps, not display caps)."""
++        line = f"\n[tool] {server}__{tool}"
++        if args:
++            if isinstance(args, str):
++                args_s = args
++            else:
++                try:
++                    args_s = json.dumps(args, default=str)
++                except (TypeError, ValueError):
++                    args_s = str(args)
++            if len(args_s) > 200:
++                args_s = args_s[:200] + "…"
++            line += f"({args_s})"
++        if status in ("ok", "error"):
++            line += f" → {status} ({ms}ms)"
++        elif status == "denied":
++            line += " → denied by ACL"
++        elif status == "invalid arguments":
++            line += " → invalid arguments JSON"
++        else:
++            line += f" → {status}"
++        if content is not None:
++            preview = _preview(content, cap=300)
++            if preview:
++                flat = " ".join(preview.split())
++                line += f"\n  ↳ {flat}"
++        return line + "\n"
++
+     if failover_note:
+         yield _reasoning_delta(f"\n[relay] {failover_note}\n")
+ 
+@@ -1476,6 +1564,15 @@
+             for _i, _tc in enumerate(tool_calls):
+                 yield _tc_delta(_tc, _i)
+ 
++        # Stamped inert render deltas (Wave R1): in-cluster MCP calls re-emitted
++        # as `pcai.relay: true` chunks for rendering clients. Only the
++        # IN-CLUSTER side — handback deltas below carry NO stamp and remain
++        # executable; a client that honors the stamp treats stamped calls as
++        # display-only, so double execution stays structurally impossible.
++        if render_deltas:
++            for _i, _tc in enumerate(mcp_calls):
++                yield _rendered_delta(_tc, _i)
++
+         # CLIENT-side loop guard (see signature): a handback call whose exact
+         # fingerprint repeats across requests gets its refusal fed to the model
+         # IN-LOOP instead of another blind handback — the loop turns into a
+@@ -1715,6 +1812,7 @@
+                     {
+                         "pcai": {
+                             "event": "tool_error",
++                            "id": tc.get("id", ""),
+                             "tool": fn_name,
+                             "detail": "not an MCP tool name",
+                             "args": _preview(fn.get("arguments") or "{}"),
+@@ -1748,6 +1846,7 @@
+                     {
+                         "pcai": {
+                             "event": "tool_error",
++                            "id": tc.get("id", ""),
+                             "server": server,
+                             "tool": tool,
+                             "detail": "arguments not valid JSON",
+@@ -1755,7 +1854,7 @@
+                         }
+                     }
+                 )
+-                yield _reasoning_delta(f"\n[tool] {server}__{tool} → invalid arguments JSON\n")
++                yield _reasoning_delta(_trace_call(server, tool, _preview(fn.get("arguments") or "{}", cap=200), "invalid arguments"))
+                 await _trace_step(
+                     iteration,
+                     "tool",
+@@ -1790,6 +1889,7 @@
+                     {
+                         "pcai": {
+                             "event": "tool_call",
++                            "id": tc.get("id", ""),
+                             "server": server,
+                             "tool": tool,
+                             "ok": exec_ok,
+@@ -1799,7 +1899,7 @@
+                         }
+                     }
+                 )
+-                yield _reasoning_delta(f"\n[tool] {server}__{tool} → {'ok' if exec_ok else 'error'} ({ms}ms)\n")
++                yield _reasoning_delta(_trace_call(server, tool, args, "ok" if exec_ok else "error", ms=ms, content=content))
+                 await _trace_step(
+                     iteration,
+                     "tool",
+@@ -1826,6 +1926,7 @@
+                     {
+                         "pcai": {
+                             "event": "tool_error",
++                            "id": tc.get("id", ""),
+                             "server": server,
+                             "tool": tool,
+                             "detail": "denied by ACL",
+@@ -1833,7 +1934,7 @@
+                         }
+                     }
+                 )
+-                yield _reasoning_delta(f"\n[tool] {server}__{tool} → denied by ACL\n")
++                yield _reasoning_delta(_trace_call(server, tool, args, "denied"))
+                 await _trace_step(
+                     iteration,
+                     "tool",
+@@ -1876,6 +1977,7 @@
+                 {
+                     "pcai": {
+                         "event": "tool_call",
++                        "id": tc.get("id", ""),
+                         "server": server,
+                         "tool": tool,
+                         "ok": ok,
+@@ -1885,7 +1987,7 @@
+                     }
+                 }
+             )
+-            yield _reasoning_delta(f"\n[tool] {server}__{tool} → {'ok' if ok else 'error'} ({ms}ms)\n")
++            yield _reasoning_delta(_trace_call(server, tool, args, "ok" if ok else "error", ms=ms, content=content))
+             await _trace_step(
+                 iteration, "tool", server=server, tool=tool, ms=ms, status=_tool_trace_status(ok, content)
+             )

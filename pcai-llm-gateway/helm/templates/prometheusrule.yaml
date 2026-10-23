@@ -1,0 +1,119 @@
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+# PrometheusRule for the gateway's OWN series — ADDITIVE and OFF by default
+# (values.metrics.prometheusRule.enabled), mirroring the ServiceMonitor
+# guard above: the DEFAULT render stays byte-identical. Requires BOTH the
+# /metrics surface (values.metrics.enabled) and the prometheus-operator
+# PrometheusRule CRD. Metric labels carry endpoint/model/outcome only —
+# never tenant, key or prompt material (same contract as the ServiceMonitor
+# comment; per-key questions live in the ledger, not Prometheus).
+# `rules: []` renders the default ruleset; a non-empty list REPLACES it
+# wholesale (same operator-override semantics as the network policies).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: pcai-llm-gateway
+      rules:
+        {{- if .Values.metrics.prometheusRule.rules }}
+{{ toYaml .Values.metrics.prometheusRule.rules | indent 8 }}
+        {{- else }}
+        - alert: GatewayHighErrorRatio
+          expr: |
+            sum(rate(gateway_requests_total{status!="ok",status!="cache_hit"}[5m]))
+              / clamp_min(sum(rate(gateway_requests_total[5m])), 0.001)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "gateway error/refusal ratio above 10% for 10m"
+            description: "Refusals = error + budget_exceeded + rate_limited (cache_hit excluded — free, not a failure). Tenant-visible failures, ledger vocabulary identical."
+        - alert: GatewayBreakerOpen
+          expr: max(gateway_breaker_open) by (endpoint) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            # Raw-string passthrough: $labels must reach PROMETHEUS intact —
+            # Helm would otherwise evaluate it as a template variable.
+            summary: {{ `endpoint {{ $labels.endpoint }} in cooldown > 5m` | quote }}
+            description: "The endpoint circuit breaker tripped and a 5m window passed without a closed gauge — check GET /admin/endpoints for last_error."
+        - alert: GatewayBudgetRejectionsSpike
+          expr: sum(rate(gateway_budget_rejections_total[15m])) > 0
+          for: 15m
+          labels:
+            severity: info
+          annotations:
+            summary: "budget rejections firing continuously"
+            description: "Tenants are hitting period caps (tokens or USD) — expected near billing boundaries; sustained nonzero means a review of profile budgets."
+        # --- automatic memory feed (2026-10-14) ---------------------------
+        # Added after a TOTAL feed outage that nothing detected: the sweep
+        # raised on every pass, the exception was swallowed at log.debug, and
+        # /health stayed 200 - so the only signal was a human noticing the
+        # memory count had stopped growing, days later. These rules make that
+        # failure announce itself.
+        #
+        # WHY TWO RULES FOR ONE PIPELINE: the timestamp rule catches a feed
+        # that stopped ENTIRELY; the due-depth rule catches a feed that is
+        # alive but stuck behind a row it can never finish. Different causes,
+        # different fixes, so they alert separately.
+        - alert: GatewayMemoryFeedStalled
+          # No successful write in 2h, measured from the LATER of "the last
+          # write" and "this process started".
+          #
+          # WHY NOT A `last_write > 0` GUARD (the bug this rule shipped with,
+          # found 2026-10-14 while validating the live deployment): the gauge is
+          # PROCESS-LOCAL and resets to 0 on every pod restart. A guard of
+          # `last_write > 0` is therefore FALSE after any restart, and stays
+          # false FOREVER if the feed never writes again — which is EXACTLY the
+          # v2.5.0 outage shape (it wrote nothing at all). The "fresh boot"
+          # guard silently recreated the blind spot the alert exists to close:
+          # measured live, the shipped expression returned no series while the
+          # gauge sat at 0.
+          #
+          # Using process_start_time_seconds as the boot reference keeps the
+          # fresh-boot exemption (a pod that just came up is not "stalled") while
+          # still firing when a pod has been up > 2h and never written once.
+          expr: (time() - max(gateway_distill_last_write_timestamp_seconds{job="pcai-llm-gateway-service"}) > 7200) and on() ((max(gateway_distill_last_write_timestamp_seconds{job="pcai-llm-gateway-service"}) > 0) or (time() - max(process_start_time_seconds{job="pcai-llm-gateway-service"}) > 7200))
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "automatic memory feed has written nothing for 2h"
+            description: "No successful distiller write in over 2 hours. Check the POSTGRES pod log FIRST - a schema/SQL fault is swallowed at log.debug and appears ONLY there (that was the 2026-10-14 outage: a missing column raised on every sweep). Then grep the gateway log for distill sweep."
+
+        - alert: GatewayMemoryFeedBacklogStuck
+          # Rows are due and STAY due: the sweep selects them but nothing is
+          # ever written - the exact shape of the 2026-10-14 stall.
+          # `or` covers the never-written case: a fresh counter has no
+          # increase() to evaluate, so the second term alone is empty and the
+          # whole expression would never fire (same class of bug as the stall
+          # rule above). Rows due for an hour with a zero write counter IS the
+          # stall.
+          expr: (max(gateway_distill_due_rows) > 0 and on() (increase(gateway_distill_writes_total{outcome="ok"}[1h]) == 0)) or (max(gateway_distill_due_rows) > 0 and on() (max(gateway_distill_writes_total{outcome="ok"}) == 0))
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "memory distill backlog stuck: rows due but nothing written for 1h"
+            description: "The distiller has rows due but completed no successful write in an hour - it is failing, not idle. Check the Postgres pod log for statement errors and the gateway log for distill sweep lines."
+
+        - alert: GatewayMemoryFeedWriteFailures
+          # Writes attempted and FAILING - the loudest case, and the one that
+          # precedes a stalled feed.
+          expr: sum(rate(gateway_distill_writes_total{outcome="failed"}[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "distiller memory writes are failing"
+            description: "The distiller is attempting writes and they are failing (memory server unreachable, or the attachment gate is down). The conversation is NOT lost - the row stays due and retries - but memories are not being stored."
+        {{- end }}
+{{- end }}

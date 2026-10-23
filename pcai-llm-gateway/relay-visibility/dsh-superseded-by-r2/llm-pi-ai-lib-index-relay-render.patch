@@ -1,0 +1,116 @@
+--- a/packages/llm/llm-pi-ai/lib/index.js
++++ b/packages/llm/llm-pi-ai/lib/index.js
+@@ -1464,6 +1464,34 @@
+ */
+ async function* toStreamChunks(events, contextWindow, callerSignal, requestedModel) {
+ 	const toolIds = /* @__PURE__ */ new Map();
++	const relayCalls = /* @__PURE__ */ new Map();
++	const relayByTool = /* @__PURE__ */ new Map();
++	let lastRelay;
++	let sawRelayActivity = false;
++	let relayStreamIndex = -1;
++	let nextSyntheticIndex = 1e6;
++	const collapse = (text, cap) => {
++		const flat = String(text).replace(/\s+/g, " ").trim();
++		return flat.length > cap ? flat.slice(0, cap) + "\u2026" : flat;
++	};
++	const renderTombstone = async function* (call) {
++		if (relayStreamIndex === -1) {
++			relayStreamIndex = nextSyntheticIndex++;
++			yield { type: "block-start", index: relayStreamIndex, blockType: "reasoning" };
++		}
++		sawRelayActivity = true;
++		const argsPart = call.args.length > 0 ? `(${collapse(call.args, 200)})` : "";
++		yield { type: "reasoning-delta", index: relayStreamIndex, text: `\n[tool] ${call.name}${argsPart} ` };
++		if (call.pcai === undefined) {
++			yield { type: "reasoning-delta", index: relayStreamIndex, text: "\u2192 executed server-side\n" };
++			return;
++		}
++		const ms = typeof call.pcai.ms === "number" ? ` (${call.pcai.ms}ms)` : "";
++		yield { type: "reasoning-delta", index: relayStreamIndex, text: `\u2192 ${call.pcai.ok ? "ok" : "error"}${ms}\n` };
++		if (typeof call.pcai.result === "string" && call.pcai.result.length > 0) {
++			yield { type: "reasoning-delta", index: relayStreamIndex, text: `  \u21b3 ${collapse(call.pcai.result, 300)}\n` };
++		}
++	};
+ 	for await (const event of events) switch (event.type) {
+ 		case "start": break;
+ 		case "text_start":
+@@ -1516,6 +1544,16 @@
+ 			break;
+ 		case "toolcall_start": {
+ 			const partial = event.partial.content[event.contentIndex];
++			if (partial?.pcaiRelay === true) {
++				const call = {
++					name: partial?.type === "toolCall" ? partial.name : "",
++					args: partial?.type === "toolCall" ? JSON.stringify(partial.arguments ?? {}) : ""
++				};
++				relayCalls.set(event.contentIndex, call);
++				if (call.name.length > 0) relayByTool.set(call.name, call);
++				lastRelay = call;
++				break;
++			}
+ 			const id = partial?.type === "toolCall" ? partial.id : "";
+ 			const name = partial?.type === "toolCall" ? partial.name : "";
+ 			toolIds.set(event.contentIndex, {
+@@ -1530,6 +1568,7 @@
+ 			break;
+ 		}
+ 		case "toolcall_delta": {
++			if (relayCalls.has(event.contentIndex)) break;
+ 			const known = toolIds.get(event.contentIndex);
+ 			yield {
+ 				type: "tool-call-delta",
+@@ -1540,7 +1579,8 @@
+ 			};
+ 			break;
+ 		}
+-		case "toolcall_end":
++		case "toolcall_end": {
++			if (relayCalls.has(event.contentIndex)) break;
+ 			yield {
+ 				type: "block-end",
+ 				index: event.contentIndex,
+@@ -1552,17 +1592,41 @@
+ 				}
+ 			};
+ 			break;
+-		case "done":
++		}
++		case "done": {
++			for (const call of relayCalls.values()) {
++				if (call.pcai === undefined) yield* renderTombstone(call);
++			}
+ 			yield {
+ 				type: "usage",
+ 				usage: mapUsage(event.message.usage)
+ 			};
++			const reason = mapStopReason(event.message, contextWindow);
++			const finishReason = sawRelayActivity && reason.kind === "error" && reason.failure?.code === "EMPTY_RESPONSE" ? { kind: "stop" } : reason;
+ 			yield {
+ 				type: "finish",
+-				reason: mapStopReason(event.message, contextWindow),
++				reason: finishReason,
+ 				replayState: toPiReplayState(event.message, requestedModel)
+ 			};
+ 			return;
++		}
++		default: {
++			// pcai_event (gateway relay sideband) — delivered by the patched dist
++			const pcai = event.pcai;
++			if (event.type !== "pcai_event" || pcai === undefined) break;
++			if (pcai.event === "tool_call" || pcai.event === "tool_error") {
++				const call = relayByTool.get(typeof pcai.tool === "string" ? pcai.tool : "") ?? lastRelay;
++				if (call !== undefined) {
++					call.pcai = {
++						ok: pcai.event === "tool_call" ? pcai.ok === true : false,
++						ms: typeof pcai.ms === "number" ? pcai.ms : undefined,
++						result: typeof pcai.result === "string" ? pcai.result : undefined
++					};
++					yield* renderTombstone(call);
++				}
++			}
++			break;
++		}
+ 		case "error":
+ 			yield {
+ 				type: "usage",

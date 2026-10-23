@@ -1,0 +1,156 @@
+--- a/packages/llm/llm-pi-ai/src/stream.ts
++++ b/packages/llm/llm-pi-ai/src/stream.ts
+@@ -149,6 +149,49 @@
+   // in stream order), but we track ids per index for tool calls.
+   const toolIds = new Map<number, { id: string; name: string }>()
+ 
++  // PCAI gateway relay (Wave R1): in-cluster tool calls arrive as stamped
++  // render-only blocks that pi-ai strips from the final message (the patch)
++  // plus standalone `pcai` telemetry events carrying the result preview.
++  // Both are folded into the reasoning stream as enriched tombstones — the
++  // same shape the gateway emits for non-rendering clients — so the user
++  // sees server-executed calls while DSH never gains an executable call
++  // (the replay pairing lives in the gateway, not this session).
++  type RelayCall = { name: string; args: string; pcai?: { ok?: boolean; ms?: number; result?: string } }
++  const relayCalls = new Map<number, RelayCall>()
++  const relayByTool = new Map<string, RelayCall>()
++  let lastRelay: RelayCall | undefined
++  let sawRelayActivity = false
++  // Synthetic reasoning block hosting relay tombstones. Real reasoning gets
++  // pi-ai's own indices; the synthetic block uses a far index that can never
++  // collide with pi-ai's 0..n block enumeration.
++  let relayStreamIndex = -1
++  let nextSyntheticIndex = 1_000_000
++
++  const collapse = (text: string, cap: number): string => {
++    const flat = text.replace(/\s+/g, ' ').trim()
++    return flat.length > cap ? flat.slice(0, cap) + '…' : flat
++  }
++  const renderTombstone = async function* (call: RelayCall): AsyncGenerator<StreamChunk> {
++    if (relayStreamIndex === -1) {
++      relayStreamIndex = nextSyntheticIndex++
++      yield { type: 'block-start', index: relayStreamIndex, blockType: 'reasoning' }
++    }
++    sawRelayActivity = true
++    const argsPart = call.args.length > 0 ? `(${collapse(call.args, 200)})` : ''
++    yield { type: 'reasoning-delta', index: relayStreamIndex, text: `\n[tool] ${call.name}${argsPart} ` }
++    if (call.pcai === undefined) {
++      // Stream ended without a telemetry event: the gateway still executed
++      // the call (the stamped delta proves it); report the honest outcome.
++      yield { type: 'reasoning-delta', index: relayStreamIndex, text: '→ executed server-side\n' }
++      return
++    }
++    const ms = typeof call.pcai.ms === 'number' ? ` (${call.pcai.ms}ms)` : ''
++    yield { type: 'reasoning-delta', index: relayStreamIndex, text: `→ ${call.pcai.ok ? 'ok' : 'error'}${ms}\n` }
++    if (typeof call.pcai.result === 'string' && call.pcai.result.length > 0) {
++      yield { type: 'reasoning-delta', index: relayStreamIndex, text: `  ↳ ${collapse(call.pcai.result, 300)}\n` }
++    }
++  }
++
+   for await (const event of events) {
+     switch (event.type) {
+       case 'start':
+@@ -174,6 +217,18 @@
+       case 'toolcall_start': {
+         // The id/name live on the partial's content at this index.
+         const partial = event.partial.content[event.contentIndex]
++        // PCAI relay render blocks never become harness tool calls: record
++        // them for the tombstone instead of emitting a block-start.
++        if ((partial as { pcaiRelay?: boolean } | undefined)?.pcaiRelay === true) {
++          const call: RelayCall = {
++            name: partial?.type === 'toolCall' ? partial.name : '',
++            args: partial?.type === 'toolCall' ? JSON.stringify(partial.arguments ?? {}) : '',
++          }
++          relayCalls.set(event.contentIndex, call)
++          if (call.name.length > 0) relayByTool.set(call.name, call)
++          lastRelay = call
++          break
++        }
+         const id = partial?.type === 'toolCall' ? partial.id : ''
+         const name = partial?.type === 'toolCall' ? partial.name : ''
+         toolIds.set(event.contentIndex, { id, name })
+@@ -181,6 +236,7 @@
+         break
+       }
+       case 'toolcall_delta': {
++        if (relayCalls.has(event.contentIndex)) break // display-only: no harness deltas
+         const known = toolIds.get(event.contentIndex)
+         yield {
+           type: 'tool-call-delta',
+@@ -191,7 +247,8 @@
+         }
+         break
+       }
+-      case 'toolcall_end':
++      case 'toolcall_end': {
++        if (relayCalls.has(event.contentIndex)) break
+         yield {
+           type: 'block-end',
+           index: event.contentIndex,
+@@ -205,14 +262,51 @@
+           },
+         }
+         break
+-      case 'done':
++      }
++      default: {
++        // Gateway telemetry sideband (`pcai_event`, delivered by the patched
++        // pi-ai provider outside its declared union — reached via default
++        // because AssistantMessageEvent is a closed union at compile time).
++        const pcai = (event as unknown as { type?: string; pcai?: Record<string, unknown> }).pcai
++        if ((event as unknown as { type?: string }).type !== 'pcai_event' || pcai === undefined) break
++        const data: Record<string, unknown> = pcai
++        if (data.event === 'tool_call' || data.event === 'tool_error') {
++          const call
++            = relayByTool.get(typeof data.tool === 'string' ? data.tool : '')
++            ?? lastRelay
++          if (call !== undefined) {
++            call.pcai = {
++              ok: data.event === 'tool_call' ? data.ok === true : false,
++              ms: typeof data.ms === 'number' ? data.ms : undefined,
++              result: typeof data.result === 'string' ? data.result : undefined,
++            }
++            yield* renderTombstone(call)
++          }
++        }
++        break
++      }
++      case 'done': {
++        // Flush tombstones for relay calls whose telemetry event never
++        // arrived (e.g. the preview stream was disabled).
++        for (const call of relayCalls.values()) {
++          if (call.pcai === undefined) yield* renderTombstone(call)
++        }
+         yield { type: 'usage', usage: mapUsage(event.message.usage) }
++        // Relay-only turn guard: pi-ai strips stamped blocks from the
++        // message, so a stream that carried ONLY relay-rendered calls could
++        // otherwise map to EMPTY_RESPONSE. The gateway's own `[tool] …`
++        // reasoning (or our tombstones) means the turn did real work —
++        // surface the degenerate-shape case as a plain stop.
++        const reason = mapStopReason(event.message, contextWindow)
+         yield {
+           type: 'finish',
+-          reason: mapStopReason(event.message, contextWindow),
++          reason: sawRelayActivity && reason.kind === 'error' && reason.failure?.code === EMPTY_RESPONSE_CODE
++            ? { kind: 'stop' }
++            : reason,
+           replayState: toPiReplayState(event.message, requestedModel),
+         }
+         return
++      }
+       case 'error':
+         // In-stream error delivery (pi-ai's style) → error finish chunk
+         // (the harness's other sanctioned error path besides throwing).
+@@ -225,9 +319,9 @@
+           ),
+         }
+         return
+-      // no default: AssistantMessageEvent is pi-ai's closed union; a new
+-      // event type should fail compilation here via tsc's exhaustiveness
+-      // when one is added (switch covers all current variants).
++      // `pcai_event` (the gateway relay sideband) is delivered by the patched
++      // provider and handled in `default` above; AssistantMessageEvent's own
++      // closed union stays exhaustively covered by the explicit cases.
+     }
+   }
+   throw new LlmError('pi-ai event stream ended without done/error', 'STREAM_CLOSED')

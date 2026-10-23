@@ -1,0 +1,12 @@
+diff --git a/dist/api/mistral-conversations.js b/dist/api/mistral-conversations.js
+index 67f9341a6f7d855dce25054fd48cd9077e8e04a1..afdb5c2c873abb72ca8011b7e3f06a230dbe3e8a 100644
+--- a/dist/api/mistral-conversations.js
++++ b/dist/api/mistral-conversations.js
+@@ -543,7 +543,6 @@ async function consumeChatStream(model, output, stream, mistralStream) {
+                 ? toolCall.function.arguments
+                 : JSON.stringify(toolCall.function.arguments || {});
+             block.partialArgs = (block.partialArgs || "") + argsDelta;
+-            block.arguments = parseStreamingJson(block.partialArgs);
+             stream.push({
+                 type: "toolcall_delta",
+                 contentIndex: toolBlocksByKey.get(key),

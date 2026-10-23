@@ -1,0 +1,47 @@
+# ONE-TIME bootstrap: grant applygate-mcp write access to the pcai-llm
+# namespace (SE-G2). Applied ONCE by an admin with RBAC rights (the
+# applygate release's own identity is namespace-scoped and cannot create
+# RBAC — PCAI constraint). Idempotent; revoke by deleting both objects.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: applygate-mcp-writer
+  namespace: pcai-llm
+  labels:
+    app: applygate-mcp
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts", "pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: applygate-mcp-writer
+  namespace: pcai-llm
+  labels:
+    app: applygate-mcp
+subjects:
+  - kind: ServiceAccount
+    name: applygate-mcp
+    namespace: applygate-mcp
+roleRef:
+  kind: Role
+  name: applygate-mcp-writer
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,29 @@
+{{- if .Values.rbac.create }}
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+{{- end }}
+{{- /*
+
+RBAC DELIBERATELY EMPTY BY DEFAULT — read before extending:
+
+The gateway makes NO Kubernetes API calls in 0.1. Model endpoints, MCP
+servers and their upstream credentials are configured through the /admin
+API into Postgres; upstream keys are stored BY REFERENCE (the name of a
+K8s Secret in model_endpoints.api_key_secret) and resolved out-of-band by
+operators — the pod itself never reads Secrets or talks to kube-apiserver.
+An identity with zero permissions is dead weight, so rbac.create=false and
+this template renders nothing.
+
+If a future version ever needs the API (e.g. in-pod Secret resolution of
+upstream keys), add a NAMESPACED Role + RoleBinding here — get on "secrets"
+in the release namespace at most, NEVER a ClusterRole — and flip
+rbac.create=true explicitly.
+
+*/ -}}
+{{- end }}

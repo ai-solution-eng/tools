@@ -1,0 +1,7 @@
+# Files ignored by `helm package` — keeps site-local secrets out of the
+# packaged chart (fleet convention: helm*/local is gitignored AND
+# hardlink-excluded; this is the third lock on the same door).
+local/
+*.local.yaml
+.git/
+.venv/

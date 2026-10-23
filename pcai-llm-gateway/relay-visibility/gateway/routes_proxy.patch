@@ -1,0 +1,30 @@
+--- a/src/pcai_llm/api/routes_proxy.py
++++ b/src/pcai_llm/api/routes_proxy.py
+@@ -2370,6 +2370,15 @@
+         # amplification): X-PCAI-Stream-Thinking: 0 suppresses reasoning
+         # deltas entirely — steps stay traced, chips stay rendered.
+         stream_thinking = request.headers.get("x-pcai-stream-thinking", "1") != "0"
++        # Stamped inert render deltas (Wave R1): TWO gates — the deployment
++        # flag AND the client's explicit opt-in header. A client that does
++        # not understand `pcai.relay: true` would execute the stamped call
++        # a second time (the 2026-09-21 double-execution lesson), so an
++        # absent header never receives the deltas, flag on or off.
++        render_deltas = (
++            settings.tool_relay_render_deltas
++            and request.headers.get("x-pcai-relay-deltas", "0") == "1"
++        )
+ 
+         if relay_requested:
+             catalog, relay_grants = await _relay_catalog(key, relay_grants, requested_servers)
+@@ -2557,6 +2566,11 @@
+                         fallbacks=fallbacks,
+                         failover_note=failover_note,
+                         continuation=continuation,
++                        # Wave R1 stamped render deltas (both-gates resolved
++                        # above): display-only tool_call chunks for clients
++                        # that opted in via X-PCAI-Relay-Deltas: 1.
++                        render_deltas=render_deltas,
++                        render_index_base=settings.tool_relay_render_index_base,
+                         # Wave B2 client-tool dispatch: the executor (None
+                         # when the flag is off, no offer, or wiring failed —
+                         # handback behavior) and the shared wall-clock

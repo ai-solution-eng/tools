@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtualenvs / tool caches
+.venv*/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build artifacts
+dist/
+build/
+
+# Helm: local site values (per-cluster credentials/secrets) — never commit
+helm/local/
+
+# Session/local artifacts (audit P0: never mirror or commit these)
+.scratch/
+dsh/*.clean
+*.tar.gz
+*.jpg
+scratch_workspace/
+relay-visibility-r2/pod-check/
+relay-visibility-r2/shadow/
+relay-visibility-r2/shadow2/
+-o

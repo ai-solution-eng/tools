@@ -1,0 +1,26 @@
+# pcai-llm-gateway — the multi-tenant LLM + MCP gateway for HPE PCAI:
+# virtual API keys with ledger-based token budgets, an OpenAI-compatible
+# proxy over aggregated model endpoint pools, and federated MCP with
+# per-tool ACLs, behind the PCAI Istio gateway.
+apiVersion: v2
+name: pcai-llm-gateway
+description: >-
+  pcai-llm-gateway — multi-tenant LLM + MCP gateway for HPE PCAI: an
+  OpenAI-compatible /v1 proxy over aggregated model endpoint pools with
+  health/failover, federated MCP (/mcp) with per-tool ACLs, and virtual
+  API keys with day/week/month token budgets and an atomic usage ledger.
+type: application
+version: 2.9.5
+appVersion: "v2.9.5"
+keywords:
+  - llm
+  - gateway
+  - mcp
+  - pcai
+  - hpe
+maintainers:
+  - name: HPE AI Solution Engineering
+  - name: Andrew Bydlon
+    email: andrew.bydlon@hpe.com
+  - name: Francesco Caliva
+    email: francesco.caliva@hpe.com

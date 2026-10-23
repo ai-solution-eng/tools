@@ -1,0 +1,46 @@
+{{- if and .Values.ingress.enabled (not .Values.ezua.enabled) }}
+{{- $svc := printf "%s-service.%s.svc.cluster.local" .Values.deployment.name .Release.Namespace }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.deployment.name }}-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ required "ingress.host is required when ingress.enabled" .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required when ingress.enabled" .Values.ingress.host }}
+      http:
+        paths:
+          {{- /* /admin intentionally NOT exposed by default — add a path
+               block here only with platform-level auth in front. */}}
+          - path: /v1
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+          - path: /mcp
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+          - path: /health
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+          - path: /ready
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+          - path: /ui
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
+{{- end }}

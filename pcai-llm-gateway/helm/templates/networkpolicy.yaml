@@ -1,0 +1,146 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $gwApp := printf "%s-pg" .Values.deployment.appName }}
+{{- /* Fail loud on a hollow posture: 0.0.0.0/0 (or ::/0) in probeCidrs
+     without excepts admits EVERY cluster source on the app port — the
+     opposite of the default-deny this policy exists to express. Require
+     the pod-CIDR carve-out explicitly. */}}
+{{- range .Values.networkPolicy.probeCidrs }}
+{{- if or (eq . "0.0.0.0/0") (eq . "::/0") }}
+{{- if not $.Values.networkPolicy.probeExceptCidrs }}
+{{- fail (printf "networkPolicy: probeCidrs contains %s with an EMPTY probeExceptCidrs — that admits every cluster source on the app port. Set networkPolicy.probeExceptCidrs to your pod CIDR(s), or use real node CIDRs in probeCidrs." .) }}
+{{- end }}
+{{- end }}
+{{- end }}
+# NetworkPolicy — ADDITIVE and OFF by default (values.networkPolicy.enabled,
+# default false): the DEFAULT render is byte-identical to the baseline. The
+# policy selects the gateway pods via the chart's `app` label — the embedded
+# Postgres pod ({{ $gwApp }}) is intentionally NOT selected, so it stays
+# unrestricted and always reachable from the gateway.
+#
+# With networkPolicy.ingress left empty (default), rules (i)-(iii) below
+# render. Once this policy exists, anything NOT matched is DENIED in both
+# directions — the empty-lists baseline is a real posture, not a no-op.
+# Rule (iii) is an ipBlock allowance because kubelet probes and
+# `kubectl port-forward` originate at the NODE: no pod/namespace selector
+# can match them (the same reason the AuthorizationPolicy carries an
+# excludeInboundPorts relief valve — see templates/authorizationpolicy.yaml).
+# Sites that instead exempt the probe port from the Istio sidecar leave
+# probeCidrs empty and rely on that exemption. The extra rules lists
+# (networkPolicy.ingress / .egress) REPLACE these baselines when non-empty
+# (Helm lists replace on merge — same semantics as a values upgrade).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  # Gateway pods only — the embedded Postgres pod carries a different app
+  # label and stays out of this policy's scope.
+  podSelector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.networkPolicy.ingress }}
+    # Operator-supplied rules REPLACE the baseline (lists replace).
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+    {{- else }}
+    # (i) Istio ingress-gateway pods — the ezua VirtualService path: traffic
+    #     arrives via {{ .Values.ezua.virtualService.istioGateway }}
+    #     (virtualservice.yaml). Namespace matched via the automatic
+    #     kubernetes.io/metadata.name label; pod labels are SITE-specific
+    #     (networkPolicy.ingressGatewayLabels — verify yours with
+    #     kubectl -n <ns> get pod -l 'app=ezaf-gateway').
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressGatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressGatewayLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.targetPort }}
+          protocol: TCP
+    # (ii) Same-namespace callers: registry scraping / ops tooling
+    #      co-deployed in the release namespace.
+    - from:
+        - podSelector: {}
+    # (iii) Node-originated kubelet health probes + `kubectl port-forward`.
+    #       CAVEAT (see values.yaml): liveness/readiness share the single
+    #       app port, and an ipBlock rule cannot distinguish node sources
+    #       from pods whose IPs fall inside it — probeExceptCidrs carves
+    #       the pod CIDR back out so cross-namespace pod traffic stays
+    #       governed by rules (i)/(ii).
+    {{- with .Values.networkPolicy.probeCidrs }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | first }}
+            {{- with $.Values.networkPolicy.probeExceptCidrs }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - port: {{ $.Values.service.targetPort }}
+          protocol: TCP
+    {{- end }}
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.egress }}
+    # Operator-supplied rules REPLACE the baseline (lists replace).
+    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+    {{- else }}
+    # DNS — kube-dns in kube-system, UDP+TCP 53. Without this rule
+    # EVERYTHING else breaks (every peer is resolved by name first).
+    # node-local-dns sites: append a rule for the 169.254.20.10 injector.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- if .Values.database.embedded.enabled }}
+    # Postgres — EMBEDDED mode: the same-namespace Postgres StatefulSet
+    # (postgres.yaml). EXTERNAL mode renders NO Postgres rule at all —
+    # add one via networkPolicy.egress (selector or CIDR, port 5432) or
+    # the gateway cannot reach the DB (fail loud at /ready).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: {{ $gwApp }}
+      ports:
+        - port: 5432
+          protocol: TCP
+    {{- end }}
+    # In-cluster HTTP(S) — pod/service CIDRs: the gateway's fleet peers
+    # (model endpoints, MCP servers). Deliberately PORT-FREE — upstreams
+    # listen on arbitrary ports (vLLM 8000, ...), so the CIDR is the
+    # control. Mirrors proxy.noProxy (10.0.0.0/8 covers the fleet units;
+    # 172.16.0.0/12 is the RFC1918 private range — a /8 would also exempt
+    # public 172.x addresses): SITE — keep inClusterEgressCidrs in sync
+    # with noProxy, or add your unit's CIDR if it differs. Known follow-ups
+    # a site must append via networkPolicy.egress or lose: the corporate
+    # proxy when proxy.https is set (a DNS name outside the cluster — allow
+    # its IPs), the Keycloak JWKS endpoint when settings.tokenValidation is
+    # on, and — for pods WITH an injected Istio sidecar — istiod in
+    # istio-system (15012/15014) or the sidecar loses xDS.
+    {{- with .Values.networkPolicy.inClusterEgressCidrs }}
+    - to:
+        {{- range $cidr := . }}
+        - ipBlock:
+            cidr: {{ $cidr }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}

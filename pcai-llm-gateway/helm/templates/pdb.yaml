@@ -1,0 +1,32 @@
+{{- /* PodDisruptionBudget — ADDITIVE and OFF by default
+     (podDisruptionBudget.enabled, default false; the default render is
+     byte-identical). With replicas == 1 a PDB is meaningless (minAvailable
+     1 would block every drain forever), so the template refuses that
+     combination loudly: enable this only when replicas > 1 or the HPA is
+     on. Purpose: a node drain or voluntary disruption must not take every
+     gateway replica at once — the in-process quota state (concurrency
+     counters, dispatch hub) and long-lived SSE streams make a
+     simultaneous restart far noisier than a rolling one. */}}
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- if and (not .Values.autoscaling.enabled) (le (int .Values.deployment.replicaCount) 1) }}
+{{- fail (printf "podDisruptionBudget.enabled=true is meaningless (and blocks all drains) with a single replica: set deployment.replicaCount >= 2 or enable autoscaling first." ) }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.deployment.name }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+{{- end }}

@@ -1,0 +1,22 @@
+--- a/src/pcai_llm/config.py
++++ b/src/pcai_llm/config.py
+@@ -127,6 +127,19 @@
+     # semantic-mismatch surprise (same tool name, different behavior).
+     tool_relay_shadow_mcp: bool = True
+ 
++    # Stamped inert tool-call deltas (Wave R1): mid-loop, the relay re-emits
++    # each in-cluster tool call as a NATIVE OpenAI tool_call delta stamped
++    # with `pcai.relay: true`, so render-capable clients (DSH) can show real
++    # cards for server-executed calls. NOT relay_stream_wire_tools: these
++    # deltas carry the stamp, and only clients that understand the stamp
++    # (suppress execution, render display-only) opt in by sending
++    # X-PCAI-Relay-Deltas: 1; every other client gets today's bytes. The
++    # tool_call index space starts at tool_relay_render_index_base so a
++    # rendered delta can never merge with a handback's enumeration (which
++    # starts at 0).
++    tool_relay_render_deltas: bool = False
++    tool_relay_render_index_base: int = 1000
++
+     # --- server-owned conversations (ROADMAP §7, phase 1: reconciliation) ---
+     # Master switch for canonical conversation reconciliation on the relay
+     # path: each relayed turn is fingerprinted against the stored canonical

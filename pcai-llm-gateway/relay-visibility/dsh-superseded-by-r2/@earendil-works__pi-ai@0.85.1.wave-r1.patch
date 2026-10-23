@@ -1,0 +1,119 @@
+diff --git a/dist/api/anthropic-messages.js b/dist/api/anthropic-messages.js
+index e1538a5dfcf2225da9dc3ec622576564ee7c8530..abb8f990d680ee247708ca774a467fc5774e28b0 100644
+--- a/dist/api/anthropic-messages.js
++++ b/dist/api/anthropic-messages.js
+@@ -500,7 +500,6 @@ export const stream = (model, context, options) => {
+                         const block = blocks[index];
+                         if (block && block.type === "toolCall") {
+                             block.partialJson += event.delta.partial_json;
+-                            block.arguments = parseStreamingJson(block.partialJson);
+                             stream.push({
+                                 type: "toolcall_delta",
+                                 contentIndex: index,
+diff --git a/dist/api/bedrock-converse-stream.js b/dist/api/bedrock-converse-stream.js
+index 6bc6312906ec3d75f31d190994d21c87f1d0767d..7ff68fb60c3c1d9e3e7d2d2df8d4619593a67335 100644
+--- a/dist/api/bedrock-converse-stream.js
++++ b/dist/api/bedrock-converse-stream.js
+@@ -453,7 +453,6 @@ function handleContentBlockDelta(event, blocks, output, stream) {
+     }
+     else if (delta?.toolUse && block?.type === "toolCall") {
+         block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
+-        block.arguments = parseStreamingJson(block.partialJson);
+         stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
+     }
+     else if (delta?.reasoningContent) {
+diff --git a/dist/api/mistral-conversations.js b/dist/api/mistral-conversations.js
+index 67f9341a6f7d855dce25054fd48cd9077e8e04a1..afdb5c2c873abb72ca8011b7e3f06a230dbe3e8a 100644
+--- a/dist/api/mistral-conversations.js
++++ b/dist/api/mistral-conversations.js
+@@ -543,7 +543,6 @@ async function consumeChatStream(model, output, stream, mistralStream) {
+                 ? toolCall.function.arguments
+                 : JSON.stringify(toolCall.function.arguments || {});
+             block.partialArgs = (block.partialArgs || "") + argsDelta;
+-            block.arguments = parseStreamingJson(block.partialArgs);
+             stream.push({
+                 type: "toolcall_delta",
+                 contentIndex: toolBlocksByKey.get(key),
+diff --git a/dist/api/openai-responses-shared.js b/dist/api/openai-responses-shared.js
+index 43e463dbfd1e6cc437ebc680468036f47678de26..f4259772e289c326697ea7f2ece25954bfb5a520 100644
+--- a/dist/api/openai-responses-shared.js
++++ b/dist/api/openai-responses-shared.js
+@@ -546,7 +546,6 @@ export async function processResponsesStream(openaiStream, output, stream, model
+             if (!slot || slot.block.partialJson === undefined)
+                 continue;
+             slot.block.partialJson += event.delta;
+-            slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+             pushToolCallDelta(slot, event.delta);
+         }
+         else if (event.type === "response.function_call_arguments.done") {
+diff --git a/dist/api/pi-messages.js b/dist/api/pi-messages.js
+index 5b9cb1680c47083a9a36eefa93124c67c750fd42..dc5a43ebd801fa6d4b7897c3739b588d4d571d3a 100644
+--- a/dist/api/pi-messages.js
++++ b/dist/api/pi-messages.js
+@@ -155,8 +155,6 @@ function createEventConverter(model) {
+             case "toolcall_delta": {
+                 const json = `${toolJson.get(event.contentIndex) ?? ""}${event.delta}`;
+                 toolJson.set(event.contentIndex, json);
+-                partial.content[event.contentIndex].arguments =
+-                    parseStreamingJson(json);
+                 break;
+             }
+             case "toolcall_end":
+diff --git a/dist/api/openai-completions.js b/dist/api/openai-completions.js
+--- a/dist/api/openai-completions.js
++++ b/dist/api/openai-completions.js
++++ b/dist/api/openai-completions.js
+@@ -369,6 +369,14 @@
+             for await (const chunk of openaiStream) {
+                 if (!chunk || typeof chunk !== "object")
+                     continue;
++                // PCAI gateway relay (Wave R1 contract): standalone {"pcai": …}
++                // data lines carry no choices — surface them as a dedicated
++                // event type instead of dropping them, so the harness adapter
++                // can join relay-executed tool calls with their result previews.
++                if (chunk.pcai && !Array.isArray(chunk.choices)) {
++                    stream.push({ type: "pcai_event", pcai: chunk.pcai, partial: output });
++                    continue;
++                }
+                 // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+                 // and each chunk in a streamed completion carries the same id.
+                 output.responseId ||= chunk.id;
+@@ -441,6 +449,15 @@
+                     if (choice?.delta?.tool_calls) {
+                         for (const toolCall of choice.delta.tool_calls) {
+                             const block = ensureToolCallBlock(toolCall);
++                            if (chunk.pcai && chunk.pcai.relay === true) {
++                                // PCAI relay render delta (Wave R1): the gateway
++                                // already executed this call in-cluster. Mark the
++                                // block; the final message must never carry it as
++                                // an executable tool_call (no replay pairing
++                                // exists client-side), and the adapter suppresses
++                                // its execution path.
++                                block.pcaiRelay = true;
++                            }
+                             if (!block.id && toolCall.id) {
+                                 block.id = toolCall.id;
+                                 toolCallBlocksById.set(toolCall.id, block);
+@@ -453,7 +470,6 @@
+                             if (toolCall.function?.arguments) {
+                                 delta = toolCall.function.arguments;
+                                 block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
+-                                block.arguments = parseStreamingJson(block.partialArgs);
+                             }
+                             else if (toolCall.custom?.input) {
+                                 const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
+@@ -485,6 +501,14 @@
+             for (const block of blocks) {
+                 finishBlock(block);
+             }
++            // PCAI relay render blocks (Wave R1): display-only — remove them
++            // from the message so the harness never sees an executable call,
++            // and keep the stop reason honest (a relay-only stream is 'stop').
++            for (let i = output.content.length - 1; i >= 0; i--) {
++                if (output.content[i].type === "toolCall" && output.content[i].pcaiRelay) {
++                    output.content.splice(i, 1);
++                }
++            }
+             if (options?.signal?.aborted) {
+                 throw new Error("Request was aborted");
+             }

@@ -1,0 +1,477 @@
+# ============================================================================
+# pcai-llm-gateway — SE G2 site values (EXAMPLE — sanitized, no credentials)
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# Lives in helm/values-examples/ (hardlink-synced to GitHub): intentionally SECRET-FREE.
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (missing Secret = the pod refuses to start):
+#   1. adminApiKey.existingSecret — admin keys; /admin rejects everything without it
+#   2. database.existingSecret — the control-plane DSN (external mode, the default)
+#   3. ezua.virtualService.endpoint — the route host (render-guard when ezua.enabled)
+#   4. ingress.host — the route host (render-guard when ingress.enabled)
+#   5. upstreamKeySecrets[] / mcpKeySecrets[] — every entry needs secretName + secretKey
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
+#     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
+#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/SSO-ROLLOUT-G2.md (the G2 runbook)
+#   Embedded Postgres: database.embedded.* — DEPLOYMENT.md § Postgres
+#   Fernet master key (panel credential storage): secretsMasterKey.* — DEPLOYMENT.md
+#   Metrics + alert rules: metrics.enabled + metrics.prometheusRule — DEPLOYMENT.md
+#   Scaling: autoscaling.* + podDisruptionBudget.* + affinity — DEPLOYMENT.md § Sizing
+#   Network isolation: networkPolicy.* — DEPLOYMENT.md § Network isolation
+
+# Operator creates these out-of-band BEFORE applying (see NOTES.txt / DEPLOYMENT.md):
+#   pcai-llm-gateway-db    key: database-url    -> postgresql://user:pass@host:5432/pcai_llm
+#   pcai-llm-gateway-admin key: admin-api-keys  -> comma-separated admin keys
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
+deployment:
+  name: pcai-llm-gateway
+  appName: pcai-llm-gateway
+  replicaCount: 1
+  # Lab "redeploy in place": true + image.pullPolicy Always re-rolls pods on every apply.
+  rolloutOnUpgrade: false
+
+image:
+  repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
+  tag: ""                        # empty = chart default (see Chart.yaml)
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Upstream model-endpoint / MCP API keys — BY REFERENCE. G2 registers tokens via the admin panel
+# instead, so these stay empty; a by-ref key would live as PCAI_LLM_UPSTREAM_KEY__<NAME> env.
+upstreamKeySecrets: []
+
+mcpKeySecrets: []
+
+# ============================================================================
+# Secrets / Database
+# ============================================================================
+
+adminApiKey:
+  existingSecret: pcai-llm-gateway-admin        # your admin-keys Secret name
+  existingSecretKey: admin-api-keys
+  create: false                  # false = you manage the Secret (G2 standard)
+
+# Fernet master key for panel-stored credentials (endpoints/MCP tokens, per-key creds).
+# Verify against your live paste — the running pod already has this env from a Secret.
+secretsMasterKey:
+  existingSecret: pcai-llm-gateway-secrets
+  existingSecretKey: master-key
+  create: false
+
+database:
+  existingSecret: pcai-llm-gateway-db           # your Postgres URL Secret name
+  existingSecretKey: database-url
+  # Embedded Postgres (StatefulSet+Service+PVC; the chart derives the gateway URL). Password
+  # seeds the data dir on FIRST init only. The LIVE G2 release runs embedded PG.
+
+  embedded:
+    enabled: false
+
+    # Postgres max_connections: maxReplicas 4 × dbPoolMax 25 = 100 = the default ceiling, so the
+    # live release raises it to 200. CHANGING IT RESTARTS the PG StatefulSet (brief 503 window).
+    maxConnections: 200
+    image: postgres:16
+    serviceName: pcai-llm-gateway-pg
+    auth:
+      username: pcai_llm
+      database: pcai_llm
+      existingSecret: pcai-llm-gateway-pg-auth   # operator-created, key: password (only when enabled)
+      existingSecretKey: password
+      create: false              # false = you manage the password Secret
+
+    persistence:
+      size: 5Gi
+      storageClass: ""
+
+    resources:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits: {cpu: 4, memory: 4Gi}
+
+# ============================================================================
+# Runtime Settings
+# ============================================================================
+
+settings:
+  host: 0.0.0.0
+  port: 9200
+  logLevel: INFO                    # DEBUG to trace a routing/budget issue
+  keepAliveTimeoutS: 75
+  # Concurrency cap; 0 = unbounded (chart omits the env).
+  limitConcurrency: 0
+  upstreamTimeoutS: 900             # long completions; covers streaming
+  # UPSTREAM TLS verification CA bundle. Empty = system trust store; a PRIVATE-CA site mounts the
+  # bundle and sets the path. There is deliberately NO verify=False knob.
+  upstreamCaBundle: ""
+  # Operational-table retention (traces / conversations). 0 = disabled — G2 KEEPS the
+  # default; the usage LEDGER is never pruned regardless.
+  retentionTraceDays: 0
+  retentionConversationDays: 0
+  # canonical_conversations (the distiller's INPUT store — the biggest table here and
+  # pruned by nothing else). DISTILLED-ONLY: a row is deleted only when a marker
+  # proves a memory was written for it, so un-distilled conversations survive.
+  # Left at 0 (keep forever); set e.g. 90 to bound the PVC.
+  retentionCanonicalDays: 0
+  endpointFailureThreshold: 5       # circuit breaker: consecutive failures...
+  endpointCooldownS: 60             # ...before this cooldown (seconds)
+  maxBodyBytes: 33554432            # 32 MiB proxied-body cap
+  dbPoolMin: 5                      # Postgres pool bounds + bounded acquire
+  dbPoolMax: 25                     # (saturation -> fast 503, not a queue)
+  dbAcquireTimeoutS: 2
+  embeddingCacheEnabled: true      # identical embedding calls answered from cache
+  embeddingCacheMaxInputBytes: 65536
+  rateLimitExcludeCachedTokens: true  # cached tokens refunded from the TPM window
+  budgetCachedExemptFraction: 0.9     # cached tokens count 1/10 vs period budgets
+  # Admission cache PREDICTION (2.9.2): measure this key's own cache ratio
+  # BEFORE throttling, so a large cached context is not refused on tokens the
+  # upstream serves from prefix cache. Settle reconciles predicted-vs-actual,
+  # so it only moves WHEN tokens are charged, never HOW MANY.
+  rateLimitPredictCached: true
+  rateLimitPredictReconcile: true
+  toolRelayEnabled: true           # server-side model<->MCP loop (X-PCAI-Execute-Tools)
+  toolRelayMaxIterations: 16
+  # 'scope' (default) = every mcp-scoped key gets the policy-admitted tools of all enabled
+  # servers; 'explicit' = hand-granted (server, tool) pairs only.
+  toolRelayGrantMode: explicit    # profile IS the envelope; 'scope' = legacy attach-all
+  # Native wire visibility: FALSE for DSH — its stream client executes tool_call deltas, and
+  # flat '<server>__<tool>' names error as unknown.
+  toolRelayStreamWireTools: false
+  # Keys may register local tools (bash/edit/...) served back into the relay loop as
+  # `client__<tool>`. Inert for keys without a live offer; routes 404 while off.
+  clientToolDispatch: false
+  clientToolDispatchTimeoutS: 120.0
+  # Relay turn budget (seconds); clamped in code to the Istio VS timeout minus 30s headroom,
+  # so a burned budget still closes the stream cleanly.
+  toolRelayWallClockS: 900
+  # One extra attempt per relay TURN when a bounded model call expires on timeout; the retry
+  # budget comes out of the remaining wall clock. 0 = fail immediately.
+  toolRelayCallRetries: 1
+  # Complexity routing (pseudo-models `routing` / `routing__<model>`): per-profile
+  # routing_policy ('off'|'shadow'|'active') gates behavior — these are the scoring knobs.
+  routingEnabled: true
+  routingTier1Tokens: 1500
+  routingTier2Tokens: 6000
+  routingToolBytesPerToken: 64
+  routingTurnAdderTokens: 100
+  # MCP federation: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
+  # two-tool surface (mcp_catalog + mcp_call only).
+  mcpFlatTools: true
+  mcpCatalogCacheS: 60.0
+  mcpFailoverAttempts: 2
+  # Per-model fallback chains are admin-curated at runtime (nothing to preset in values);
+  # this caps the chain hops walked when the primary cannot serve. 0 = chains never walked.
+  modelFallbackMax: 2
+  # A chat call answering 2xx with EMPTY content / zero completion tokens / finish_reason=stop
+  # retries the identical call exactly once. Chart default false.
+  zeroCompletionRetry: true
+  # Off-peak billing — G2 CAN enable this (the prometheus MCP is registered).
+  offpeakEnabled: true
+  offpeakCheckS: 30
+  offpeakPromql: avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL[5m]))
+  offpeakEnterPct: 20
+  offpeakExitPct: 35
+  offpeakFraction: 0.5
+  offpeakMcpServer: prometheus
+  offpeakTool: prom_query
+  # Per-model evaluators: scope each served model to its own GPUs (DCGM has no pod label — use
+  # Hostname + device; an empty result bills full price). Models without an entry use the global query.
+  offpeakModelPromql:
+    GLM-5.3-Flash: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs04.hst.lab",device=~"nvidia[4-7]"}[5m]))'
+    Qwen3.8-27B: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs05.hst.lab",device=~"nvidia[4-7]"}[5m]))'
+  # The load-aware cascade is OFF by fleet default (helm/values.yaml) and ON here —
+  # the G2-only divergence. The cascade entry picks its head model at conversation START from the
+  # per-model off-peak state above, then stays with it for the conversation.
+  loadAwareCascade:
+    enabled: true
+  # TTFT failover budget (s): after a 2xx the stream waits up to this long for the upstream's
+  # FIRST SSE data line (keepalives don't count). 0 disables.
+  failoverTtftS: 45
+  # Per-model max_tokens ceiling: the auto entry sends 262144, which Qwen3.8-27B rejects with an
+  # API 400 when max_tokens+prompt exceeds its context. 192k leaves prompt headroom.
+  maxTokensCeiling:
+    Qwen3.8-27B: 196608
+  # Upstream MCP caller attribution: stamps X-MCP-Caller on every upstream fleet MCP call.
+  # Upstreams may RECORD it, never authorize off it.
+  mcpCallerAttribution: true
+
+  # Keycloak JWT validation (COMMENTED — needs the site's realm details; tokenValidation
+  # requires all three of issuer / jwksUrl / audience). Enable only with an enforcing proxy
+  # in front: settings.trustProxyIdentity / ssoKeyCreateEnabled / adminGroups / tokenShadowKeys.
+
+  # Enrollment-time per-user memory datasets (2026-10: ACTIVE — the memory
+  # distiller's substrate). Requires a registered mm-rag MCP server row (the
+  # fleet bundle registers it) + secretsMasterKey. enrollMemoryDefault stays
+  # false: provisioning is opt-in at redemption, the human at the keyboard
+  # decides; profile presets can force it per profile.
+  enrollMemoryDefault: false
+  enrollMemoryServer: "mm-rag"
+  enrollMemoryNameRetries: 3
+
+  # Session memory distiller (2026-10: ON): one canonical transcript -> memory
+  # pipeline replaces the per-harness distillers (DSH plugin / opencode agent /
+  # OWUI filter). Master switch only — the summarizer model (fleet Qwen),
+  # off-peak-only scheduling, quiet window, and output cap are admin-editable
+  # at runtime via the Memory Distiller panel (DB-backed; no redeploy to tune).
+  # Inert by construction for keys whose memory feature is not attached: no
+  # enabled mm-rag registry row or no stamped {X-Memory-Dataset,
+  # X-Dataset-Password} pair -> every call answers 200 inert no-op.
+  distillerEnabled: true
+  distillerMemoryServer: "mm-rag"
+  distillerMemoryTool: "add_memory"
+  distillerMemoryProbeTool: "memory_status"
+  # Skip backoff (2026-10-09 stall fix): gate-down / empty-transcript rows leave
+  # the due window for this long instead of being retried every pass.
+  distillerGateBackoffS: 900
+  # Raw-transcript fallback on a FAILED distill — OFF here (2026-10-10). The
+  # canonical store retains every conversation, so a failed distill can safely
+  # leave the row due and retry; writing the raw transcript instead would land
+  # 100+ mm-rag chunks of transcript noise (measured: 126 from one session).
+  # With this false the memory store only ever receives distilled summaries.
+  distillerRawFallback: false
+  # Session-title requests are NOT conversations (2026-10-17). DSH fires a
+  # title call after every human prompt; each used to become a canonical row
+  # and then a bogus "session summary" memory whose whole body was a title
+  # string. ON here — this is the deployment where that was observed.
+  canonicalSkipTitleRequests: true
+  # Minimum chars on a DISTILLED memory BODY (the `[MEMORY INDEX | ...]` header
+  # is stripped before measuring). 100 = the measured recommendation, and ON
+  # here because this is the deployment where title stubs were observed.
+  #
+  # The 11 observed stubs ran 8-37 body chars; a real one-fact card measures 130.
+  # 100 clears every stub by +63 and keeps the real card by +30. Do NOT raise
+  # this to 150+: that was a WHOLE-DOCUMENT figure and would reject the real
+  # 130-char card now that the ~85-char header is excluded.
+  #
+  # CORRECTION (2026-10-20): this comment previously claimed "a 250 floor would
+  # delete 58 real cards and catch zero junk". That measurement was WRONG — the
+  # 58 counted 220-char CHUNK FRAGMENTS as complete cards. See the CHANGELOG
+  # "Unreleased" entry for the corrected numbers and the full post-mortem.
+  distillerMinDocChars: 100
+
+# ============================================================================
+# Service
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9200
+  targetPort: 9200
+
+# ============================================================================
+# Resources / Autoscaling
+# ============================================================================
+
+# The HPA target's meaning shifts with the request: 70% of 500m = a 350m trigger line.
+resources:
+  requests: {cpu: 500m, memory: 512Mi}
+  limits: {cpu: '2', memory: 2Gi}
+
+# Autoscaling — ENABLED for G2. maxReplicas 4 × dbPoolMax 25 = the worst-case Postgres
+# connection demand; do NOT raise maxReplicas past 4 until embedded PG's max_connections is
+# raised. minReplicas 2 also buys rolling-upgrade availability.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# ============================================================================
+# Security / Service Account
+# ============================================================================
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+
+# The gateway makes NO Kubernetes API calls (no identity, no token).
+serviceAccount:
+  create: false
+  name: pcai-llm-gateway
+  automountServiceAccountToken: false
+
+rbac:
+  create: false
+
+# ============================================================================
+# Ingress / Kyverno
+# ============================================================================
+
+# G2 uses the EzUA Istio VirtualService (ezua below); plain-k8s Ingress unused.
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  tlsSecretName: ""              # optional TLS Secret in the release namespace
+
+# Kyverno vendor-label policy — cluster-scoped (needs cluster-admin); G2 ships the
+# hpe-ezua labels directly.
+kyverno:
+  enabled: false
+
+# ============================================================================
+# Metrics
+# ============================================================================
+
+metrics:
+  enabled: true                     # G2 convention — REQUIRED to pair with
+                                    # allowMetricsScrape once the policy is on
+  interval: 30s
+  # PrometheusRule (gateway-specific alert rules): ON for G2 as of 2026-10-14.
+  # The metrics surface existed for months while this stayed OFF, so the
+  # gateway shipped alerts that were NEVER loaded — Prometheus had 253 rules
+  # and zero gateway ones. In particular the automatic-memory-feed rules
+  # (GatewayMemoryFeedStalled / BacklogStuck / WriteFailures) are the only
+  # thing that will tell you the distiller stopped; without this flag a feed
+  # outage is again visible ONLY to a human watching the memory count, which
+  # is exactly how the 2026-10-14 outage ran unnoticed for hours.
+  # Requires the prometheus-operator PrometheusRule CRD (G2 has it).
+  # A non-empty `rules:` REPLACES the default ruleset wholesale.
+  prometheusRule:
+    enabled: true
+    rules: []
+    # Extra labels for the PrometheusRule object — must match the Prometheus
+    # CR's spec.ruleSelector or the operator never LOADS the rules (object
+    # presence is not enough; proved live 2026-10-14). On G2 the stack is
+    # kube-prometheus-stack release `kubeprom` with ruleSelector
+    # {matchLabels: {release: prometheus}} => the label below.
+    labels:
+      release: prometheus
+
+# ============================================================================
+# Network Isolation
+# ============================================================================
+
+# ENABLED for G2: 5432 (PG) -> the pcai-llm namespace only; 9200 (gw) -> ezaf-gateway +
+# pcai-llm + owebui0-11-0 + dsh-web-helm. Everything else is DENIED. Verify the CIDRs before the
+# first upgrade: `kubectl get nodes -o wide` and `kubectl cluster-info dump | grep -m1 cluster-cidr`.
+networkPolicy:
+  enabled: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: ezaf-gateway               # verify with kubectl -n istio-system get pod -l 'app=ezaf-gateway'
+
+  probeCidrs:
+    # The two G2 worker nodes (masters carry the control-plane taint). Replace with the
+    # INTERNAL-IP of each worker — `kubectl get nodes -o wide | grep worker` — as /32s.
+    - 172.28.1.161/32               # pcai-se-scs04.hst.lab (worker)
+    - 172.28.1.162/32               # pcai-se-scs05.hst.lab (worker)
+
+  probeExceptCidrs:
+    # The cluster pod CIDR — WITHOUT this carve-out any pod in the probe allowance bypasses
+    # rules (i)/(ii). Match your CNI.
+    - 10.224.0.0/16                 # G2 cluster pod range (scs04 = 10.224.1.0/24 per-node slice)
+  inClusterEgressCidrs: [10.0.0.0/8]  # RFC1918 pod/service egress for upstreams
+  # ⚠️ non-empty `ingress` REPLACES the chart's baseline rules — this list IS the complete
+  # ingress posture: (i) ezaf-gateway, (ii) same-namespace, (iii) in-cluster consumers, (iv) probes.
+  ingress:
+    # (i) laptops/desktops — via the ezaf-gateway + VirtualService
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+      ports:
+        - port: 9200
+          protocol: TCP
+    # (ii) same-namespace callers (ops tooling, jobs in pcai-llm)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pcai-llm
+      ports:
+        - port: 9200
+          protocol: TCP
+    # (iii-a) OpenWebUI
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: owebui0-11-0
+      ports:
+        - port: 9200
+          protocol: TCP
+    # (iii-b) DSH
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dsh-web-helm
+      ports:
+        - port: 9200
+          protocol: TCP
+    # (iii-c) opencode-web
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: opencode-web-helm
+      ports:
+        - port: 9200
+          protocol: TCP
+    # (iv) kubelet probes — the two WORKER nodes only. ⚠️ REQUIRED: with a non-empty `ingress`
+    # the baseline probe rule does NOT render and readiness fails without these.
+    - from:
+        - ipBlock:
+            cidr: 172.28.1.161/32   # pcai-se-scs04.hst.lab (worker)
+
+        - ipBlock:
+            cidr: 172.28.1.162/32   # pcai-se-scs05.hst.lab (worker)
+      ports:
+        - port: 9200
+          protocol: TCP
+  egress: []
+
+# ============================================================================
+# Proxy
+# ============================================================================
+
+# G2-style sites need the proxy for any non-cluster egress; in-cluster peers MUST stay on
+# NO_PROXY. PLACEHOLDER addresses — set your corporate proxy.
+proxy:
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  # 172.16.0.0/12 is the RFC1918 private range (a /8 would also exempt public 172.x addresses);
+  # keep the cluster-local entries so in-cluster peers stay direct.
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Deploys the Istio VirtualService on the ezaf-gateway when enabled.
+# ezua.authorizationPolicy below ships ON with BOTH relief rules — the live-verified G2 posture.
+ezua:
+  enabled: true
+  virtualService:
+    endpoint: pcai-llm-gateway.your-cluster.example   # SITE
+    istioGateway: istio-system/ezaf-gateway
+    # >= settings.upstreamTimeoutS (900s) or Istio 504s long streams
+    timeout: 960s
+
+  authorizationPolicy:
+    enabled: true                   # live-verified G2 posture — enable ATOMICALLY
+
+    allowMetricsScrape: true        # REQUIRED once metrics.enabled=true + policy on: the
+                                    # ANY-SOURCE /metrics rule (raw-IP outbound has no peer identity)
+    allowInClusterApi: true         # unmeshed in-cluster callers on the traffic port; the
+                                    # identity paths stay edge-only
+    ingressNamespace: istio-system
+    ingressGatewayPrincipals: []    # SPIFFE IDs tighten rule (i) beyond the namespace
+    excludeInboundPorts: []         # KEEP EMPTY — an excluded port bypasses ALL policy rules
+    rules: []                       # non-empty REPLACES the baseline ALLOW rules

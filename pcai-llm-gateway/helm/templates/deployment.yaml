@@ -1,0 +1,540 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    # EZUA vendor labels (static + kyverno-mutated): without them the PCAI
+    # console shows the app as "Unknown" instead of "Ready".
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.deployment.replicaCount }}
+  {{- end }}
+  {{- if .Values.deployment.rolloutOnUpgrade }}
+  # redeploy-in-place: fresh timestamp every upgrade forces a roll even when
+  # the pod template is otherwise unchanged (pairs with pullPolicy: Always if
+  # a site opts into rebuild-same-tag flows; default IfNotPresent just re-runs
+  # the node-cached image)
+  progressDeadlineSeconds: 600
+  {{- end }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+        "hpe-ezua/type": vendor-service
+        "hpe-ezua/app": {{ .Chart.Name }}
+      {{- $exclPorts := and .Values.ezua.enabled .Values.ezua.authorizationPolicy.enabled .Values.ezua.authorizationPolicy.excludeInboundPorts }}
+      {{- if or $exclPorts .Values.deployment.rolloutOnUpgrade .Values.deployment.holdApplicationUntilProxyStarts }}
+      annotations:
+        {{- if $exclPorts }}
+        # Ports pushed OUT of the Istio inbound mesh (kubelet-probe relief
+        # valve — see templates/authorizationpolicy.yaml). ⚠️ An excluded
+        # port bypasses ALL AuthorizationPolicy rules — never list a port
+        # that serves real traffic.
+        traffic.sidecar.istio.io/excludeInboundPorts: {{ .Values.ezua.authorizationPolicy.excludeInboundPorts | join "," | quote }}
+        {{- end }}
+        {{- if .Values.deployment.rolloutOnUpgrade }}
+        pcai-llm-gateway/redeployed-at: {{ now | quote }}
+        {{- end }}
+        {{- if .Values.deployment.holdApplicationUntilProxyStarts }}
+        # App starts only after the sidecar finishes starting — kills the
+        # first-boot outbound-connect race on meshed namespaces (no-op
+        # unmeshed; see values.yaml deployment.holdApplicationUntilProxyStarts).
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+        {{- end }}
+      {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if hasKey .Values.deployment "terminationGracePeriodSeconds" }}
+      # P6 (perf round 2026-10-16): upstreamTimeoutS is 900 and SSE streams
+      # settle their ledger rows in _StreamLedger.finish — a bare SIGKILL
+      # after the default 30s grace loses those settles (under-billed usage,
+      # invisible to budget gates) and kills mid-stream responses on rollout/
+      # scale-down. The preStop sleep lives in the CONTAINER lifecycle below
+      # (preStop is a container field, not a PodSpec field — a pod-level
+      # preStop fails server-side apply validation, caught by cross-review
+      # dry-run 2026-10-16).
+      terminationGracePeriodSeconds: {{ .Values.deployment.terminationGracePeriodSeconds }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      # Pod anti-affinity / topology spread (ADDITIVE — podAffinity is empty
+      # by default, so the default render is unchanged). With autoscaling or
+      # replicas > 1, co-located replicas share a node's failure domain;
+      # preferred (soft) anti-affinity on the app label spreads them without
+      # ever blocking scheduling on a small cluster.
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.database.embedded.enabled }}
+      initContainers:
+        - name: wait-for-pg
+          image: {{ .Values.database.embedded.image }}
+          command: ["sh", "-c", "until pg_isready -h {{ .Values.database.embedded.serviceName }} -p 5432 -U {{ .Values.database.embedded.auth.username }}; do sleep 2; done"]
+          # Same resources as the Postgres container itself — LimitRange
+          # namespaces reject resource-less containers.
+          resources:
+            {{- toYaml .Values.database.embedded.resources | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          {{- /* Empty image.tag ("" — e.g. the trial example) inherits the
+               Chart.yaml appVersion: a bare repo reference would mean
+               :latest, and repo + ":" is a malformed reference. */}}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: http
+          {{- if hasKey .Values.deployment "terminationGracePeriodSeconds" }}
+          # preStop (container field — see the pod-spec comment above): sleep
+          # past endpoint removal so the mesh stops routing before SIGTERM.
+          # Counts against the grace period (values default 120s -> ~115s
+          # of drain after the 5s sleep).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          {{- end }}
+          env:
+            # --- server (12-factor: every knob is an env var, rendered here
+            # from values; Helm does not template inside values.yaml) ---
+            - name: PCAI_LLM_HOST
+              value: {{ .Values.settings.host | quote }}
+            - name: PCAI_LLM_PORT
+              value: {{ .Values.settings.port | int | quote }}
+            - name: PCAI_LLM_LOG_LEVEL
+              value: {{ .Values.settings.logLevel | quote }}
+            - name: PCAI_LLM_KEEP_ALIVE_TIMEOUT_S
+              value: {{ .Values.settings.keepAliveTimeoutS | int | quote }}
+            {{- if .Values.settings.limitConcurrency }}
+            - name: PCAI_LLM_LIMIT_CONCURRENCY
+              value: {{ .Values.settings.limitConcurrency | int | quote }}
+            {{- end }}
+            # --- proxy behavior ---
+            - name: PCAI_LLM_UPSTREAM_TIMEOUT_S
+              value: {{ .Values.settings.upstreamTimeoutS | int | quote }}
+            {{- if .Values.settings.upstreamCaBundle }}
+            - name: PCAI_LLM_UPSTREAM_CA_BUNDLE
+              value: {{ .Values.settings.upstreamCaBundle | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "effectivePromptCapture" }}
+            - name: PCAI_LLM_EFFECTIVE_PROMPT_CAPTURE
+              value: {{ .Values.settings.effectivePromptCapture | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "effectivePromptRetainDays" }}
+            - name: PCAI_LLM_EFFECTIVE_PROMPT_RETAIN_S
+              value: {{ mul .Values.settings.effectivePromptRetainDays 86400 | int | quote }}
+            {{- end }}
+            {{- if .Values.settings.retentionTraceDays }}
+            - name: PCAI_LLM_RETENTION_TRACE_DAYS
+              value: {{ .Values.settings.retentionTraceDays | int | quote }}
+            {{- end }}
+            {{- if .Values.settings.retentionConversationDays }}
+            - name: PCAI_LLM_RETENTION_CONVERSATION_DAYS
+              value: {{ .Values.settings.retentionConversationDays | int | quote }}
+            {{- end }}
+            {{- if .Values.settings.retentionCanonicalDays }}
+            - name: PCAI_LLM_RETENTION_CANONICAL_DAYS
+              value: {{ .Values.settings.retentionCanonicalDays | int | quote }}
+            {{- end }}
+            - name: PCAI_LLM_ENDPOINT_FAILURE_THRESHOLD
+              value: {{ .Values.settings.endpointFailureThreshold | int | quote }}
+            - name: PCAI_LLM_ENDPOINT_COOLDOWN_S
+              value: {{ .Values.settings.endpointCooldownS | int | quote }}
+            - name: PCAI_LLM_MAX_BODY_BYTES
+              value: {{ .Values.settings.maxBodyBytes | int | quote }}
+            # --- Postgres pool (bounded acquire: saturation → fast 503) ---
+            - name: PCAI_LLM_DB_POOL_MIN
+              value: {{ .Values.settings.dbPoolMin | int | quote }}
+            - name: PCAI_LLM_DB_POOL_MAX
+              value: {{ .Values.settings.dbPoolMax | int | quote }}
+            - name: PCAI_LLM_DB_ACQUIRE_TIMEOUT_S
+              value: {{ .Values.settings.dbAcquireTimeoutS | int | quote }}
+            # --- embedding cache (0.1: RAG re-embed dedupe, zero-budget hits) ---
+            - name: PCAI_LLM_EMBEDDING_CACHE_ENABLED
+              value: {{ .Values.settings.embeddingCacheEnabled | quote }}
+            - name: PCAI_LLM_EMBEDDING_CACHE_MAX_INPUT_BYTES
+              value: {{ .Values.settings.embeddingCacheMaxInputBytes | int | quote }}
+            # --- cache-aware metering (2.5.0): cached tokens off the TPM
+            # window and discounted against period token budgets ---
+            - name: PCAI_LLM_RATE_LIMIT_EXCLUDE_CACHED_TOKENS
+              value: {{ .Values.settings.rateLimitExcludeCachedTokens | quote }}
+            - name: PCAI_LLM_BUDGET_CACHED_EXEMPT_FRACTION
+              value: {{ .Values.settings.budgetCachedExemptFraction | quote }}
+            # --- TPM admission cache prediction (2.9.2): measure the key's
+            # OWN cache ratio BEFORE throttling, instead of charging the full
+            # len//4 estimate and refunding after the fact. Off by default:
+            # it changes admission behaviour, so it is opted into per site.
+            - name: PCAI_LLM_RATE_LIMIT_PREDICT_CACHED
+              value: {{ .Values.settings.rateLimitPredictCached | quote }}
+            - name: PCAI_LLM_RATE_LIMIT_PREDICT_RECONCILE
+              value: {{ .Values.settings.rateLimitPredictReconcile | quote }}
+            # --- tool-use relay (server-side model<->MCP loop) ---
+            - name: PCAI_LLM_TOOL_RELAY_ENABLED
+              value: {{ .Values.settings.toolRelayEnabled | quote }}
+            - name: PCAI_LLM_TOOL_RELAY_MAX_ITERATIONS
+              value: {{ .Values.settings.toolRelayMaxIterations | int | quote }}
+            - name: PCAI_LLM_TOOL_RELAY_WALL_CLOCK_S
+              value: {{ .Values.settings.toolRelayWallClockS | int | quote }}
+            # Per-turn retries for a timed-out relay model call; spends only
+            # remaining wall clock (>=10s left to attempt). 0 = fail fast.
+            - name: PCAI_LLM_TOOL_RELAY_CALL_RETRIES
+              value: {{ .Values.settings.toolRelayCallRetries | int | quote }}
+            # How relay tools are granted: 'scope' (mcp-scoped keys get all
+            # policy-admitted server tools) or 'explicit' (hand-granted
+            # (server, tool) pairs only — console: Keys ▸ MCP).
+            - name: PCAI_LLM_TOOL_RELAY_GRANT_MODE
+              value: {{ .Values.settings.toolRelayGrantMode | quote }}
+            # Self-service MCP surface (homepage MCP tools dialog): keyed
+            # users manage their OWN key's MCP credential overrides and
+            # toggle tool grants WITHIN their entitlement catalog. false
+            # hides the /v1/mcp/selfservice routes (admin paths unchanged).
+            - name: PCAI_LLM_MCP_SELF_SERVICE
+              value: {{ .Values.settings.mcpSelfService | quote }}
+            # Native wire visibility for in-cluster tool calls: OFF by
+            # default — DSH's stream client executes tool_call deltas it
+            # sees, so the informational re-emission double-executes and
+            # phantom-errors flat names. Render-only clients may set true.
+            - name: PCAI_LLM_RELAY_STREAM_WIRE_TOOLS
+              value: {{ if hasKey .Values.settings "toolRelayStreamWireTools" }}{{ .Values.settings.toolRelayStreamWireTools | quote }}{{ else }}"false"{{ end }}
+            # Stamped inert render deltas (Wave R1): display-only tool_call
+            # chunks for clients that opted in via X-PCAI-Relay-Deltas: 1.
+            # Both gates (this value AND the request header) must be on.
+            - name: PCAI_LLM_TOOL_RELAY_RENDER_DELTAS
+              value: {{ if hasKey .Values.settings "toolRelayRenderDeltas" }}{{ .Values.settings.toolRelayRenderDeltas | quote }}{{ else }}"false"{{ end }}
+            - name: PCAI_LLM_TOOL_RELAY_RENDER_INDEX_BASE
+              value: {{ .Values.settings.toolRelayRenderIndexBase | default 1000 | int | quote }}
+            # --- client tool-server dispatch (wave B2; routes 404 while off,
+            # inert for keys without a registered offer) ---
+            - name: PCAI_LLM_CLIENT_TOOL_DISPATCH
+              value: {{ if hasKey .Values.settings "clientToolDispatch" }}{{ .Values.settings.clientToolDispatch | quote }}{{ else }}"false"{{ end }}
+            - name: PCAI_LLM_CLIENT_TOOL_DISPATCH_TIMEOUT_S
+              value: {{ .Values.settings.clientToolDispatchTimeoutS | default 120.0 | quote }}
+            # --- complexity routing (pseudo-models; per-profile policy gates) ---
+            - name: PCAI_LLM_ROUTING_ENABLED
+              value: {{ .Values.settings.routingEnabled | quote }}
+            - name: PCAI_LLM_ROUTING_TIER1_TOKENS
+              value: {{ .Values.settings.routingTier1Tokens | int | quote }}
+            - name: PCAI_LLM_ROUTING_TIER2_TOKENS
+              value: {{ .Values.settings.routingTier2Tokens | int | quote }}
+            - name: PCAI_LLM_ROUTING_TOOL_BYTES_PER_TOKEN
+              value: {{ .Values.settings.routingToolBytesPerToken | int | quote }}
+            - name: PCAI_LLM_ROUTING_TURN_ADDER_TOKENS
+              value: {{ .Values.settings.routingTurnAdderTokens | int | quote }}
+            # --- MCP federation surface (flat per-tool exposure; kill switch) ---
+            - name: PCAI_LLM_MCP_FLAT_TOOLS
+              value: {{ .Values.settings.mcpFlatTools | quote }}
+            - name: PCAI_LLM_MCP_CATALOG_CACHE_S
+              value: {{ .Values.settings.mcpCatalogCacheS | quote }}
+            - name: PCAI_LLM_MCP_FAILOVER_ATTEMPTS
+              value: {{ .Values.settings.mcpFailoverAttempts | int | quote }}
+            # --- router extras (review §4a/4b/4c; ledger authoritative) ---
+            # Per-model fallback chains: max fallback MODELS tried after the
+            # primary cannot serve (no healthy endpoint / upstream 5xx). 0 =
+            # chains are never walked. Each hop re-checks budgets fresh — a
+            # fallback is never a budget bypass.
+            - name: PCAI_LLM_MODEL_FALLBACK_MAX
+              value: {{ if hasKey .Values.settings "modelFallbackMax" }}{{ .Values.settings.modelFallbackMax | int | quote }}{{ else }}"2"{{ end }}
+            # Zero-completion insurance: ONE identical retry when a chat call
+            # answers 2xx with empty content, zero completion tokens and
+            # finish_reason=stop (BOTH attempts settle). DEFAULT OFF.
+            - name: PCAI_LLM_ZERO_COMPLETION_RETRY
+              value: {{ if hasKey .Values.settings "zeroCompletionRetry" }}{{ .Values.settings.zeroCompletionRetry | quote }}{{ else }}"false"{{ end }}
+            # --- identity (Phase A: trust-gated browser headers + MCP caller attribution) ---
+            - name: PCAI_LLM_TRUST_PROXY_IDENTITY
+              value: {{ .Values.settings.trustProxyIdentity | quote }}
+            - name: PCAI_LLM_MCP_CALLER_ATTRIBUTION
+              value: {{ .Values.settings.mcpCallerAttribution | quote }}
+            # --- identity Phase B (token validation + SSO surfaces; all default-off = inert) ---
+            - name: PCAI_LLM_TOKEN_ISSUER
+              value: {{ .Values.settings.tokenValidation.issuer | quote }}
+            - name: PCAI_LLM_TOKEN_JWKS_URL
+              value: {{ .Values.settings.tokenValidation.jwksUrl | quote }}
+            - name: PCAI_LLM_TOKEN_AUDIENCE
+              value: {{ .Values.settings.tokenValidation.audience | quote }}
+            - name: PCAI_LLM_TOKEN_JWKS_CACHE_S
+              value: {{ .Values.settings.tokenValidation.jwksCacheS | quote }}
+            - name: PCAI_LLM_TOKEN_LEEWAY_S
+              value: {{ .Values.settings.tokenValidation.leewayS | quote }}
+            - name: PCAI_LLM_TOKEN_SHADOW_KEYS
+              value: {{ .Values.settings.tokenShadowKeys | quote }}
+            - name: PCAI_LLM_TOKEN_SHADOW_TENANT_ID
+              value: {{ .Values.settings.tokenShadowTenantId | quote }}
+            - name: PCAI_LLM_TOKEN_SHADOW_KEY_NAME
+              value: {{ .Values.settings.tokenShadowKeyName | quote }}
+            - name: PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_RPM
+              value: {{ .Values.settings.tokenShadowRateLimitRpm | int | quote }}
+            - name: PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_TPM
+              value: {{ .Values.settings.tokenShadowRateLimitTpm | int | quote }}
+            - name: PCAI_LLM_SSO_KEY_CREATE_ENABLED
+              value: {{ .Values.settings.ssoKeyCreateEnabled | quote }}
+            - name: PCAI_LLM_ADMIN_GROUPS
+              value: {{ .Values.settings.adminGroups | quote }}
+            # --- enrollment-time memory datasets (review §2; opt-in at
+            # redemption; the deployment default is the fallback for redeem
+            # requests that carry no explicit answer) ---
+            - name: PCAI_LLM_ENROLL_MEMORY_DEFAULT
+              value: {{ if hasKey .Values.settings "enrollMemoryDefault" }}{{ .Values.settings.enrollMemoryDefault | quote }}{{ else }}"false"{{ end }}
+            - name: PCAI_LLM_ENROLL_MEMORY_SERVER
+              value: {{ .Values.settings.enrollMemoryServer | default "mm-rag" | quote }}
+            - name: PCAI_LLM_ENROLL_MEMORY_NAME_RETRIES
+              value: {{ if hasKey .Values.settings "enrollMemoryNameRetries" }}{{ .Values.settings.enrollMemoryNameRetries | int | quote }}{{ else }}"3"{{ end }}
+            # --- session memory distiller (2026-10): the harness-independent
+            # transcript -> memory pipeline. Master switch only — per-knob
+            # runtime config (model / offpeak-only / debounce / cap) is
+            # DB-backed and admin-editable at /admin (Memory Distiller panel).
+            # The surface is additionally INERT for any key whose memory
+            # feature is not attached (no enabled mm-rag registry row or no
+            # stamped dataset pair).
+            - name: PCAI_LLM_DISTILLER_ENABLED
+              value: {{ if hasKey .Values.settings "distillerEnabled" }}{{ .Values.settings.distillerEnabled | quote }}{{ else }}"false"{{ end }}
+            - name: PCAI_LLM_DISTILLER_MEMORY_SERVER
+              value: {{ .Values.settings.distillerMemoryServer | default "mm-rag" | quote }}
+            - name: PCAI_LLM_DISTILLER_MEMORY_TOOL
+              value: {{ .Values.settings.distillerMemoryTool | default "add_memory" | quote }}
+            - name: PCAI_LLM_DISTILLER_MEMORY_PROBE_TOOL
+              value: {{ .Values.settings.distillerMemoryProbeTool | default "memory_status" | quote }}
+            # Skip backoff (2026-10-09 stall fix): a row the engine skips (memory
+            # gate down, transcript collapsed) leaves the oldest-first due window
+            # for this long before retry, so a broken dependency cannot pin the
+            # window and starve newer rows. Not a distilled marker — the row
+            # returns to the due set when the window lapses.
+            # hasKey, NOT "| default": Helm's default treats FALSE as empty, so
+            # "| default 900" / "| default true" silently ignore an operator's
+            # explicit 0 / false and always render the default. Same idiom as
+            # enrollMemoryNameRetries above.
+            - name: PCAI_LLM_DISTILLER_GATE_BACKOFF_S
+              value: {{ if hasKey .Values.settings "distillerGateBackoffS" }}{{ .Values.settings.distillerGateBackoffS | int | quote }}{{ else }}"900"{{ end }}
+            # Raw-transcript fallback on a FAILED distill (2026-10-10). true =
+            # the historical DSH contract (write the raw transcript as
+            # session_history rather than lose the session). false = leave the
+            # row due and retry; the conversation is still in
+            # canonical_conversations so nothing is lost, and the memory store
+            # only ever receives distilled summaries (a raw transcript is
+            # CHUNKED by mm-rag into 100+ fragments).
+            - name: PCAI_LLM_DISTILLER_RAW_FALLBACK
+              value: {{ if hasKey .Values.settings "distillerRawFallback" }}{{ .Values.settings.distillerRawFallback | quote }}{{ else }}"true"{{ end }}
+            # Auxiliary SESSION-TITLE calls must never become memories
+            # (2026-10-17): harnesses fire one after every prompt, and each used
+            # to become a canonical row + a bogus "session summary". hasKey, not
+            # "| default" — Helm treats false as empty, so a default pipe could
+            # never turn this OFF from values (the 2026-10-10 boolean lesson).
+            - name: PCAI_LLM_CANONICAL_SKIP_TITLE_REQUESTS
+              value: {{ if hasKey .Values.settings "canonicalSkipTitleRequests" }}{{ .Values.settings.canonicalSkipTitleRequests | quote }}{{ else }}"true"{{ end }}
+            # Floor on a DISTILLED memory body (0 = no floor). See values.yaml:
+            # real distilled summaries run 789+ chars, so the useful range is
+            # narrow and mostly guards against degenerate empties.
+            - name: PCAI_LLM_DISTILLER_MIN_DOC_CHARS
+              value: {{ if hasKey .Values.settings "distillerMinDocChars" }}{{ .Values.settings.distillerMinDocChars | int | quote }}{{ else }}"0"{{ end }}
+            # Skip the summarizer's thinking trace (chat_template_kwargs
+            # {"enable_thinking": false}). ON by default: a reasoning model
+            # otherwise spends the whole max_tokens on reasoning_content and
+            # returns content="" with a 200, failing every distill. hasKey, not
+            # "| default" — Helm treats false as empty (the 2026-10-10 lesson).
+            - name: PCAI_LLM_DISTILLER_DISABLE_THINKING
+              value: {{ if hasKey .Values.settings "distillerDisableThinking" }}{{ .Values.settings.distillerDisableThinking | quote }}{{ else }}"true"{{ end }}
+            # --- off-peak billing (optional; safe defaults, off by default) ---
+            - name: PCAI_LLM_OFFPEAK_ENABLED
+              value: {{ .Values.settings.offpeakEnabled | quote }}
+            - name: PCAI_LLM_OFFPEAK_CHECK_S
+              value: {{ .Values.settings.offpeakCheckS | int | quote }}
+            - name: PCAI_LLM_OFFPEAK_PROMQL
+              value: {{ .Values.settings.offpeakPromql | quote }}
+            - name: PCAI_LLM_OFFPEAK_ENTER_PCT
+              value: {{ .Values.settings.offpeakEnterPct | int | quote }}
+            - name: PCAI_LLM_OFFPEAK_EXIT_PCT
+              value: {{ .Values.settings.offpeakExitPct | int | quote }}
+            - name: PCAI_LLM_OFFPEAK_FRACTION
+              value: {{ .Values.settings.offpeakFraction | quote }}
+            - name: PCAI_LLM_OFFPEAK_MCP_SERVER
+              value: {{ .Values.settings.offpeakMcpServer | quote }}
+            - name: PCAI_LLM_OFFPEAK_TOOL
+              value: {{ .Values.settings.offpeakTool | quote }}
+            {{- with .Values.settings.offpeakModelPromql }}
+            # Per-model off-peak evaluators (JSON object: model name ->
+            # PromQL). Omitted entirely when unset — the default render stays
+            # byte-identical and the app default ({}) applies.
+            - name: PCAI_LLM_OFFPEAK_MODEL_PROMQL
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            # --- load-aware cascade head (conversation-start off-peak pick,
+            # sticky per conversation; OFF keeps the profile-order head
+            # byte-identical) ---
+            - name: PCAI_LLM_LOAD_AWARE_CASCADE
+              value: {{ if and .Values.settings.loadAwareCascade (hasKey .Values.settings.loadAwareCascade "enabled") }}{{ .Values.settings.loadAwareCascade.enabled | quote }}{{ else }}"false"{{ end }}
+            # --- TTFT failover budget (seconds to first SSE data line before
+            # a 2xx-then-stalled upstream is failed over; 0 disables the
+            # gate — legacy commit-to-2xx behavior) ---
+            - name: PCAI_LLM_FAILOVER_TTFT_S
+              value: {{ .Values.settings.failoverTtftS | default 45 | quote }}
+            {{- with .Values.settings.demandAwareExcludedModels }}
+            # Demand-aware head exclusion list (JSON array of model names):
+            # models the load-aware head must never pick as conversation
+            # head (sticky included). They stay on the `auto` ladder and
+            # the failover tail — reachable as last resort, never the
+            # head. Omitted when empty — default render stays
+            # byte-identical and the app default ([]) applies.
+            - name: PCAI_LLM_DEMAND_AWARE_EXCLUDED_MODELS
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            {{- with .Values.settings.maxTokensCeiling }}
+            # Per-model max_tokens ceilings (JSON object: virtual model name
+            # -> ceiling). Omitted entirely when empty — the default render
+            # stays byte-identical and the app default ({}) applies.
+            - name: PCAI_LLM_MAX_TOKENS_CEILING
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            # /metrics gate — rendered ALWAYS so chart-off means app-off
+            # (the app default is true; a conditional here would leak it
+            # through when the chart says off). The ServiceMonitor below
+            # stays additive/conditional on the same key.
+            - name: PCAI_LLM_METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+            # Upstream endpoint keys: one env entry per listed Secret — the
+            # env NAME is the by-reference handle the app resolves from
+            # model_endpoints.api_key_secret (suffix normalized the same way).
+            {{- range .Values.upstreamKeySecrets }}
+            - name: PCAI_LLM_UPSTREAM_KEY__{{ .suffix | upper | replace "-" "_" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName | required "upstreamKeySecrets[].secretName is required" }}
+                  key: {{ .secretKey | required "upstreamKeySecrets[].secretKey is required" }}
+            {{- end }}
+            # Upstream MCP keys: same by-ref mechanism as model-endpoint keys
+            # (the app resolves PCAI_LLM_MCP_KEY__<NAME> from
+            # mcp_servers.auth_secret at call time).
+            {{- range .Values.mcpKeySecrets }}
+            - name: PCAI_LLM_MCP_KEY__{{ .suffix | upper | replace "-" "_" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName | required "mcpKeySecrets[].secretName is required" }}
+                  key: {{ .secretKey | required "mcpKeySecrets[].secretKey is required" }}
+            {{- end }}
+            # Fernet master key for panel-stored credentials (by-ref; absent
+            # env = credential storage disabled, by-ref Secret names still work)
+            - name: PCAI_LLM_SECRETS_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretsMasterKey.existingSecret }}
+                  key: {{ .Values.secretsMasterKey.existingSecretKey }}
+            # Admin API keys for /admin — always from an operator-created
+            # Secret (existingSecret-only, the K8S-MCP invariant): the chart
+            # never creates or inlines a key, and the pod fails loud
+            # (CreateContainerConfigError) until the Secret exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: PCAI_LLM_ADMIN_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminApiKey.existingSecret }}
+                  key: {{ .Values.adminApiKey.existingSecretKey }}
+            # PostgreSQL connection (control plane + usage ledger).
+            # EMBEDDED mode: discrete PCAI_LLM_DB_* env vars — the password
+            # comes from the SAME operator-created Secret the Postgres
+            # StatefulSet uses (secretKeyRef; a Secret cannot feed part of a
+            # URL string). EXTERNAL mode: the full URL from a Secret by ref.
+            # The gateway applies its schema at startup either way.
+            {{- if .Values.database.embedded.enabled }}
+            - name: PCAI_LLM_DB_HOST
+              value: {{ .Values.database.embedded.serviceName }}.{{ .Release.Namespace }}.svc.cluster.local
+            - name: PCAI_LLM_DB_PORT
+              value: "5432"
+            - name: PCAI_LLM_DB_USER
+              value: {{ .Values.database.embedded.auth.username | quote }}
+            - name: PCAI_LLM_DB_NAME
+              value: {{ .Values.database.embedded.auth.database | quote }}
+            - name: PCAI_LLM_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.embedded.auth.existingSecret | required "database.embedded.auth.existingSecret is required when embedded.enabled" }}
+                  key: {{ .Values.database.embedded.auth.existingSecretKey }}
+            {{- else }}
+            - name: PCAI_LLM_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.existingSecretKey }}
+            {{- end }}
+            {{- if .Values.proxy.http }}
+            # Corporate proxy env — each key wired into the gateway pod ONLY
+            # when non-empty (proxy: {} default keeps direct-egress sites
+            # proxy-free). The gateway's peers are in-cluster model endpoints
+            # and MCP servers (covered by the NO_PROXY cluster-local entries),
+            # so this is fleet consistency with applygate-mcp.
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          # StartupProbe: the first /ready can take a while (schema DDL on a
+          # fresh DB, cold pool). Without it, slow-but-healthy starts can be
+          # killed by liveness before they finish booting. Once it succeeds
+          # once, liveness/readiness take over unchanged.
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 36   # up to ~3 min to come up
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            timeoutSeconds: 5      # > default 1s: a busy event loop must not flap the pod
+            failureThreshold: 3
+          readinessProbe:
+            # /ready checks the Postgres connection — a DB outage takes the
+            # pod out of the Service (fail closed, never serve keyless).
+            # timeoutSeconds must exceed the app's own pool-acquire bound
+            # (PCAI_LLM_DB_ACQUIRE_TIMEOUT_S, default 2s) plus round-trip
+            # slack, or a saturated pool flaps the pod out of rotation.
+            httpGet:
+              path: /ready
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem: asyncpg/httpx scratch needs a writable
+            # /tmp. No PVC — the ledger lives in Postgres (values comment:
+            # persistence is deliberately absent for 0.1).
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

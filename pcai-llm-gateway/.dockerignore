@@ -1,0 +1,33 @@
+# Keep the build context lean and secret-free (applygate convention):
+# venvs, caches, local helm overlays, and anything the image doesn't need.
+.venv/
+.venv312/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+*.log
+helm/local/
+*.tar.gz
+build/
+tests/
+documentation/
+hardlinker.py
+hardlink_config.json
+automation.sh
+bump_version.sh
+prune_charts.py
+formatter.sh
+.git/
+# Session artifacts + local config snapshots (audit P0: keep the build context secret-free)
+.scratch/
+dsh/
+PCAI_LLM.jpg
+# Patch kits (relay-visibility: gateway tombstone/render work — source of truth
+# lives in src/; kits are working copies + DSH-side artifacts, never image content)
+relay-visibility/
+relay-visibility-r2/
