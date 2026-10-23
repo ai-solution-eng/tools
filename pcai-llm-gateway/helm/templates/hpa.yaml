@@ -1,0 +1,65 @@
+{{- if .Values.autoscaling.enabled }}
+# HorizontalPodAutoscaler for the gateway — ADDITIVE and OFF by default
+# (values.autoscaling.enabled), mirroring the ServiceMonitor/PrometheusRule
+# guard convention: the DEFAULT render stays byte-identical.
+#
+# Prerequisites (each one load-bearing, NOT boilerplate):
+# * metrics-server (or a compatible Metrics API provider) must serve
+#   metrics.k8s.io — the HPA reads resource metrics through it.
+# * The gateway's DB-touching paths are already bounded (dbPoolMin/Max,
+#   PoolUnavailable -> 503 fail-fast), so extra replicas only ADD capacity;
+#   they do not queue behind a shared bottleneck.
+#
+# Scaling signal choice: CPU is the honest default for this gateway. Its
+# per-request work is I/O-shaped (Postgres gate/settle + streaming pipe);
+# CPU is what actually saturates under load (TLS, JSON, SSE framing), and
+# it is measurable without a custom adapter. Memory is deliberately NOT a
+# target: the process holds few long-lived allocations, so an OOM here
+# signals a leak, and autoscaling a leak multiplies it.
+#
+# `maxReplicas` bounds spend and, more importantly for a shared-DB gateway,
+# bounds aggregate Postgres connection demand (dbPoolMax per replica).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.deployment.name }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  behavior:
+    # Slow UP (grow into load over minutes — a new pod needs DB pool warm-up
+    # and its first registry refresh before it is truly useful), fast DOWN
+    # prevention (thrash protection: scale-down stabilization window).
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100        # at most double per 60s
+          periodSeconds: 60
+        - type: Pods
+          value: 2          # and never more than 2 pods per period
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25         # shed at most a quarter per period
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

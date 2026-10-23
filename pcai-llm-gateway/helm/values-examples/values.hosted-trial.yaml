@@ -1,0 +1,324 @@
+# ============================================================================
+# pcai-llm-gateway — Hosted-trial site values (EXAMPLE — sanitized, no creds)
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# Lives in helm/values-examples/ (hardlink-synced to GitHub): intentionally SECRET-FREE.
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (missing Secret = the pod refuses to start):
+#   1. adminApiKey.existingSecret — admin keys; /admin rejects everything without it
+#   2. database.embedded.auth.existingSecret — the Postgres password (embedded mode)
+#   3. ezua.virtualService.endpoint — the route host (render-guard when ezua.enabled)
+#   4. ingress.host — the route host (render-guard when ingress.enabled)
+#   5. upstreamKeySecrets[] / mcpKeySecrets[] — every entry needs secretName + secretKey
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
+#     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
+#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/SSO-ROLLOUT-G2.md (the G2 runbook)
+#   Chart-generated Secrets (trial-friendly): adminApiKey.create / secretsMasterKey.create /
+#     database.embedded.auth.create — DEPLOYMENT.md § Required Secrets
+#   Embedded Postgres: database.embedded.* — DEPLOYMENT.md § Postgres
+#   Fernet master key (panel credential storage): secretsMasterKey.* — DEPLOYMENT.md
+#   Metrics + alert rules: metrics.enabled + metrics.prometheusRule — DEPLOYMENT.md
+#   Scaling: autoscaling.* + podDisruptionBudget.* + affinity — DEPLOYMENT.md § Sizing
+#   Network isolation: networkPolicy.* — DEPLOYMENT.md § Network isolation
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
+# One replica serves all three surfaces (/v1, /mcp, /admin); the gateway is stateless
+# (all state in Postgres), so scale by raising replicaCount.
+deployment:
+  name: pcai-llm-gateway
+  appName: pcai-llm-gateway
+  replicaCount: 1
+  # Trial convenience: true + pullPolicy Always re-rolls pods on every apply.
+  rolloutOnUpgrade: false
+
+image:
+  # Empty tag = inherit Chart.yaml appVersion (the release source of truth).
+  repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
+  tag: ""                        # empty = chart default (see Chart.yaml)
+  pullPolicy: IfNotPresent
+
+# Only if the image registry needs auth on your unit (mirror/pull secret).
+imagePullSecrets: []
+
+# ============================================================================
+# Secrets / Database
+# ============================================================================
+
+# Path A (default): operator creates the Secrets out-of-band. Path B (trial-friendly): set
+# create: true and ONE helm install generates them; upgrades preserve them via lookup().
+# ⚠️ Do NOT use *.create if your pipeline renders without cluster read access (lookup() = nil).
+adminApiKey:
+  existingSecret: pcai-llm-gateway-admin        # your admin-keys Secret name
+  existingSecretKey: admin-api-keys
+  create: false                  # true = chart generates/preserves (see NOTES)
+
+secretsMasterKey:
+  existingSecret: pcai-llm-gateway-secrets      # your master-key Secret name
+  existingSecretKey: master-key
+  create: false                  # true = chart generates/preserves
+
+# TRIAL DEFAULT: embedded Postgres (StatefulSet + Service + PVC in the release namespace) —
+# no site DB dependency. Set enabled=false for a site-provided Postgres.
+database:
+  existingSecret: pcai-llm-gateway-db           # used ONLY when embedded=false
+  existingSecretKey: database-url               # value: postgresql://... (in the Secret)
+
+  embedded:
+    enabled: true                 # false to use an external/site Postgres
+    image: postgres:16            # mirror if your unit cannot reach Docker Hub
+    serviceName: pcai-llm-gateway-pg
+
+    auth:
+      username: pcai_llm
+      database: pcai_llm
+      existingSecret: pcai-llm-gateway-pg-auth   # name (only when enabled)
+      existingSecretKey: password
+      create: false               # true = chart generates/preserves the password
+
+    persistence:
+      size: 5Gi
+      storageClass: ""            # your unit's StorageClass ('' = default)
+
+    # Relevant when the gateway AUTOSCALES: worst-case demand is maxReplicas × dbPoolMax
+    # + PG's own sessions. Trial default unset (100) — autoscaling stays OFF below.
+    maxConnections: 0
+
+    resources:                    # small trial sizing
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: 4, memory: 4Gi}
+
+# Upstream model-endpoint / MCP API keys — BY REFERENCE (usually empty on a trial; keys are
+# pasted in the admin panel, which requires secretsMasterKey).
+upstreamKeySecrets: []
+
+mcpKeySecrets: []
+
+# ============================================================================
+# Runtime Settings
+# ============================================================================
+
+settings:
+  host: 0.0.0.0
+  port: 9200
+  logLevel: INFO
+  keepAliveTimeoutS: 75
+  # Uvicorn concurrency cap; 0 = unset/unbounded (chart omits the env).
+  limitConcurrency: 0
+  upstreamTimeoutS: 900
+  # CA bundle for verifying UPSTREAM TLS. Empty = system trust store (fine when the trial's
+  # upstreams present cluster-trusted certs). A private-CA ingress mounts the bundle.
+  upstreamCaBundle: ""
+  # Retention for OPERATIONAL tables (traces/conversations). 0 = never delete; a trial unit
+  # with embedded Postgres may want these ON to bound the PVC — e.g. retentionTraceDays: 30.
+  retentionTraceDays: 0
+  retentionConversationDays: 0
+  # Canonical store (the distiller's input). DISTILLED-ONLY + opt-in: only rows
+  # whose marker proves a memory was written are pruned. See values.yaml.
+  retentionCanonicalDays: 0
+  endpointFailureThreshold: 5
+  endpointCooldownS: 60
+  maxBodyBytes: 33554432
+  dbPoolMin: 5
+  dbPoolMax: 25
+  dbAcquireTimeoutS: 2
+  embeddingCacheEnabled: true
+  embeddingCacheMaxInputBytes: 65536
+  # cache-aware metering: cached tokens refunded from TPM, discounted vs budgets
+  rateLimitExcludeCachedTokens: true
+  budgetCachedExemptFraction: 0.9
+  toolRelayEnabled: true
+  toolRelayMaxIterations: 16
+  toolRelayWallClockS: 900
+  toolRelayGrantMode: explicit    # 'explicit' | 'scope' (legacy: mcp-scoped keys get the policy-admitted fleet)
+  # Native wire visibility: FALSE for DSH — its stream client executes tool_call deltas, and
+  # flat '<server>__<tool>' names error as unknown.
+  toolRelayStreamWireTools: false
+  # Keys may register local tools (bash/edit/...) served back into the relay loop as
+  # `client__<tool>`. Inert for keys without a live offer; routes 404 while off.
+  clientToolDispatch: false
+  clientToolDispatchTimeoutS: 120.0
+  # One extra attempt per relay TURN when a bounded model call expires on timeout; the retry
+  # budget comes out of the remaining wall clock. 0 = fail immediately.
+  toolRelayCallRetries: 1
+  # Complexity routing (pseudo-models `routing` / `routing__<model>`): behavior is gated PER
+  # PROFILE by routing_policy ('off'|'shadow'|'active') — these are the scoring knobs.
+  routingEnabled: true
+  routingTier1Tokens: 1500
+  routingTier2Tokens: 6000
+  routingToolBytesPerToken: 64
+  routingTurnAdderTokens: 100
+  # MCP federation surface: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
+  # two-tool surface (mcp_catalog + mcp_call only).
+  mcpFlatTools: true
+  mcpCatalogCacheS: 60.0
+  mcpFailoverAttempts: 2
+  # Per-model fallback chains are admin-curated at runtime (nothing to preset in values);
+  # this caps how many chain hops are walked when the primary cannot serve. 0 = never walked.
+  modelFallbackMax: 2
+  # A chat call answering 2xx with EMPTY content / zero completion tokens / finish_reason=stop
+  # retries the identical call exactly once. Chart default false.
+  zeroCompletionRetry: true
+  # Off-peak billing — enable ONLY if the unit runs Prometheus + the prometheus MCP server.
+  offpeakEnabled: false
+  offpeakCheckS: 30
+  offpeakPromql: avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL[5m]))
+  offpeakEnterPct: 20
+  offpeakExitPct: 35
+  offpeakFraction: 0.5
+  offpeakMcpServer: prometheus
+  offpeakTool: prom_query
+  # Per-model evaluators (optional): model name -> PromQL returning a 0-100 load percentage for
+  # THAT model's GPUs (keys must match registered names EXACTLY; an empty result = full price).
+
+  # Keycloak JWT validation (COMMENTED — needs the site's realm details; tokenValidation
+  # requires all three of issuer / jwksUrl / audience). Enable only with an enforcing proxy
+  # in front: settings.trustProxyIdentity / ssoKeyCreateEnabled / adminGroups / tokenShadowKeys.
+
+  # Upstream MCP caller attribution: upstreams may RECORD X-MCP-Caller, never authorize off it.
+  mcpCallerAttribution: true
+
+  # Enrollment-time per-user memory datasets (COMMENTED — needs a registered mm-rag MCP server
+  # row + secretsMasterKey): settings.enrollMemory* .
+
+# ============================================================================
+# Service / Ingress
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9200
+  targetPort: 9200
+
+# Primary (PCAI): the Istio VirtualService below on ezaf-gateway. Alternative (plain k8s
+# Ingress): set enabled: true here and ezua.enabled: false.
+ingress:
+  enabled: false
+  className: nginx                # your IngressClass
+  host: ""                        # required when enabled (host override)
+  tlsSecretName: ""               # optional TLS Secret in the release namespace
+
+# ============================================================================
+# Resources / Autoscaling
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 1Gi}
+
+# Autoscaling — OFF for the hosted-trial profile: a trial runs tiny (100m request) and its
+# load is a handful of evaluators, not a fleet. See values.g2.yaml for the ENABLED shape.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# ============================================================================
+# Security / Service Account
+# ============================================================================
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+
+# Service account / RBAC
+serviceAccount:
+  create: false
+  name: pcai-llm-gateway
+  automountServiceAccountToken: false
+
+rbac:
+  create: false
+
+# ============================================================================
+# Kyverno / Metrics
+# ============================================================================
+
+# Cluster-scoped: needs cluster-admin. Leave FALSE on hosted trial units — the chart stamps
+# hpe-ezua labels directly; Kyverno only adds console polish.
+kyverno:
+  enabled: false
+
+# ServiceMonitor + /metrics; this key ALSO gates PCAI_LLM_METRICS_ENABLED in the app
+# (chart-off = app-off).
+metrics:
+  enabled: true                   # TRIAL: observability on by default
+  interval: 30s
+  # PrometheusRule (default ruleset: error ratio, breaker-open, budget-rejection spike).
+  prometheusRule:
+    enabled: true
+    rules: []
+
+# ============================================================================
+# Proxy
+# ============================================================================
+
+# Hosted trials run on customer clusters with their own egress — leave the proxy OFF. Each key
+# is wired only when non-empty.
+proxy: {}
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+ezua:
+  enabled: true
+  virtualService:
+    # keep ${DOMAIN_NAME} — PCAI envsubsts pasted values. CLI deploys: sed-resolve FIRST
+    # (istio DENIES the literal and fails the release — DEPLOYMENT.md § Gateway exposure).
+    endpoint: pcai-llm-gateway.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway      # verify this gateway exists on your unit
+    # >= settings.upstreamTimeoutS (900s) or Istio 504s long streams
+    timeout: 960s
+
+  # SAFE here because authorizationPolicy.enabled=true below caller-gates the mesh (and the
+  # site runs platform SSO at the ezaf-gateway). Sites WITHOUT the policy must leave false.
+  routeAdmin: true
+
+  # Istio AuthorizationPolicy (mesh L7, needs sidecar injection) on the gateway pods.
+  authorizationPolicy:
+    enabled: true                  # ALLOW-lists ezaf-gateway + same-namespace
+    ingressNamespace: istio-system
+    ingressGatewayPrincipals: []   # tighten to the ezaf-gateway SA SPIFFE IDs
+    excludeInboundPorts: []        # [9200] if kubelet probes stall (bypasses authz)
+    rules: []                      # non-empty REPLACES the baseline rules
+
+# Default-deny NetworkPolicy (CNI-layer, works without a sidecar) — trial exposure control.
+networkPolicy:
+  enabled: true                    # default-deny ingress/egress with the chart's baseline allows
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: ezaf-gateway              # verify with kubectl -n istio-system get pod -l 'app=ezaf-gateway'
+
+  # kubelet probes/port-forward come from the NODE (ipBlock — no selector matches).
+  probeCidrs:
+    - 0.0.0.0/0
+
+  # REQUIRED with 0.0.0.0/0: your pod CIDR, so cross-namespace pod traffic stays governed by
+  # the (i)/(ii) selectors. Match your CNI.
+  probeExceptCidrs:
+    - 10.0.0.0/8
+
+  inClusterEgressCidrs:
+    - 10.0.0.0/8                   # your pod/service CIDR — mirror proxy.noProxy
+  ingress: []                      # non-empty REPLACES the baseline rules
+  egress: []                       # non-empty REPLACES the baseline rules

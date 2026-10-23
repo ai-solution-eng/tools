@@ -1,0 +1,207 @@
+{{- if .Values.database.embedded.enabled }}
+{{- $pgName := .Values.database.embedded.serviceName }}
+{{- $appLabel := printf "%s-pg" .Values.deployment.appName }}
+# Embedded single-node Postgres (co-deployed in the release namespace).
+# Selected via database.embedded.enabled=true; the gateway's DATABASE_URL is
+# derived in deployment.yaml from the same auth block. Single node by design:
+# the ledger is rebuildable from nothing (schema auto-creates), and HA
+# Postgres is the site's job, not this chart's.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $pgName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $appLabel }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ $appLabel }}
+  ports:
+    - name: pg
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pgName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $appLabel }}
+spec:
+  serviceName: {{ $pgName }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $appLabel }}
+  template:
+    metadata:
+      labels:
+        app: {{ $appLabel }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      # Mirror-registry sites: same pull secret as the gateway Deployment —
+      # a private postgres mirror breaks the PG pod without this.
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: postgres
+          # TAG-PIN NOTE: `postgres:16` floats on the minor tag. The gateway
+          # image is digest-pinned; a site that wants the same guarantee here
+          # sets database.embedded.image to a digest reference (the
+          # wait-for-pg initContainer renders the SAME value — one edit).
+          image: {{ .Values.database.embedded.image }}
+          imagePullPolicy: IfNotPresent
+          # Container-level hardening (audit: the gateway pod had this, PG
+          # didn't). The official postgres image runs fine as non-root with
+          # the fsGroup-owned volume — it drops privileges to `postgres`
+          # internally. readOnlyRootFilesystem is NOT set: PG writes temp
+          # files under /var/run and /tmp of the container rootfs; site
+          # policies needing it should mount emptyDirs at those paths.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.database.embedded.auth.username | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.embedded.auth.existingSecret | required "database.embedded.auth.existingSecret is required when embedded.enabled" }}
+                  key: {{ .Values.database.embedded.auth.existingSecretKey }}
+            - name: POSTGRES_DB
+              value: {{ .Values.database.embedded.auth.database | quote }}
+            # Silence the "location of server log" noise; data lives in pgdata.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          {{- if .Values.database.embedded.maxConnections }}
+          # Postgres server tuning via the official image's passthrough
+          # (postgres -c). Needed when the gateway AUTOSCALES: every replica
+          # carries its own pool (dbPoolMax), so worst-case demand is
+          # maxReplicas × dbPoolMax + this pod's own sessions — the image
+          # default (100) exhausts at 4 replicas × 25. Only applied when set
+          # (default render byte-identical). CHANGING THIS RESTARTS THE
+          # STATEFULSET (args are in the pod template) — a brief gateway
+          # 503 window via /ready fail-closed, no data loss.
+          args: ["-c", "max_connections={{ .Values.database.embedded.maxConnections }}"]
+          {{- end }}
+          ports:
+            - containerPort: 5432
+              name: pg
+          # StartupProbe: a FRESH PVC runs initdb on first start (seconds to
+          # minutes on slow storage) — without this, liveness could kill a
+          # healthy first boot. After the first success, liveness/readiness
+          # take over unchanged.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.database.embedded.auth.username | quote }}, "-d", {{ .Values.database.embedded.auth.database | quote }}]
+            periodSeconds: 5
+            failureThreshold: 60   # up to ~5 min for a cold initdb
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.database.embedded.auth.username | quote }}, "-d", {{ .Values.database.embedded.auth.database | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.database.embedded.auth.username | quote }}, "-d", {{ .Values.database.embedded.auth.database | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.database.embedded.resources | nindent 12 }}
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+        labels:
+          # Ezua vendor labels: sites enforcing the Kyverno vendor-label
+          # policy on PVCs (ModelDownloader pattern) expect these.
+          hpe-ezua/app: {{ $appLabel }}
+          hpe-ezua/type: vendor-service
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.database.embedded.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.database.embedded.persistence.size }}
+---
+{{- /* Companion NetworkPolicy for the PG pod (audit finding: the gateway's
+     netpol deliberately excludes this pod, leaving it reachable by ANY
+     cluster source on 5432 — password-only auth). Selected via the SAME
+     networkPolicy.enabled flag as the gateway policy (both on = a real
+     posture; PG off + gateway on still leaves the DB reachable, so this
+     renders together with it). Allows: same-namespace gateway + ops pods,
+     node-originated probes (same probeCidrs caveat as the gateway policy),
+     DNS egress. */}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $pgName }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $appLabel }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  # The PG pod ONLY (app label carries the -pg suffix).
+  podSelector:
+    matchLabels:
+      app: {{ $appLabel }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # (i) Same-namespace callers (the gateway + ops tooling).
+        - podSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+    {{- with .Values.networkPolicy.probeCidrs }}
+    # (ii) Node-originated kubelet probes (same caveat: an ipBlock rule
+    #      cannot distinguish node sources from pods inside the CIDR —
+    #      probeExceptCidrs carves the pod CIDR back out).
+    - from:
+        - ipBlock:
+            cidr: {{ . | first }}
+            {{- with $.Values.networkPolicy.probeExceptCidrs }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - port: 5432
+          protocol: TCP
+    {{- end }}
+  egress:
+    # DNS (kube-dns) — PG resolves nothing in normal operation, but
+    # pg_isready/name lookups in admin sessions would fail without it.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
+{{- end }}

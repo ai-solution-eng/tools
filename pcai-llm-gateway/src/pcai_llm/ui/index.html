@@ -1,0 +1,1514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCAI LLM Gateway — Chat</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<style>
+  /* HPE design language, dual theme.
+     Dark (default): HPE green #01a982 accent on near-black — the "Ezmeral/PCAI
+     console" look. Light: HPE green primary on white — the corporate-site look.
+     Theme resolution: saved preference > OS prefers-color-scheme, toggleable
+     via the header button and persisted in localStorage. */
+  :root {
+    color-scheme: dark;
+    --bg: #0f1117; --panel: #1a1d27; --border: #2a2e3d; --border-soft: #23273500;
+    --text: #e6e8ee; --dim: #8b90a3;
+    --accent: #01a982; --accent-contrast: #04110d;
+    --accent2: #4b8bbe;
+    --user-bubble: #23364a;
+    --err: #e05252; --err-bg: rgba(224, 82, 82, .08);
+    --ok: #01a982; --warn: #d9a036;
+    --focus: #01a98266;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4; --border-soft: #e8ebf0;
+    --text: #191919; --dim: #5f6773;
+    --accent: #00815f; --accent-contrast: #ffffff;
+    --accent2: #2c6a9e;
+    --user-bubble: #e3f2ee;
+    --err: #b42323; --err-bg: rgba(180, 35, 35, .06);
+    --ok: #00815f; --warn: #a8741a;
+    --focus: #00815f55;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh;
+    display: flex; flex-direction: column;
+    transition: background .15s ease, color .15s ease;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header .hpe { color: var(--accent); }
+  header .spacer { flex: 1; }
+  /* Text-entry styling only. The bare `header input` form used to match the
+     tools checkbox too — `header input { width: 260px }` stretched it to a
+     260px box, visually detaching the check glyph from its 'tools · MCPs'
+     label (user-reported: "mcp tools is weirdly positioned"). */
+  header select, header input:not([type="checkbox"]) {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 13px;
+  }
+  /* The key field: masked secrets read fine narrower — 170px fits
+     'hllm-••••…' comfortably; the width was 260px (user-reported "too wide"). */
+  header input:not([type="checkbox"]) { width: 170px; font-size: 12.5px; }
+  header input[type="checkbox"] { accent-color: var(--accent); }
+  header input:focus-visible, header select:focus-visible { outline: 2px solid var(--focus); }
+  #theme {
+    background: none; border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 9px; cursor: pointer; font-size: 14px; line-height: 1;
+    color: var(--text);
+  }
+  #theme:hover { border-color: var(--accent); }
+  /* Cap the picker so a long model id (e.g. RamManavalan/Qwen3-VL-Embedding-8B-FP8)
+     can't stretch the header — truncated text, full name in the tooltip. */
+  #model { max-width: 300px; text-overflow: ellipsis; }
+  #model:disabled { opacity: .5; }
+  main { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg.error { align-self: center; background: var(--err-bg); border: 1px solid var(--err); color: var(--err); font-size: 13px; max-width: 90%; }
+  .msg .meta { display: block; margin-top: 6px; font-size: 11px; color: var(--dim); }
+  .msg.toolstep { align-self: flex-start; background: transparent; border: 1px dashed var(--border);
+                  color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace;
+                  padding: 5px 10px; border-radius: 8px; max-width: 85%; }
+  details.toolstep { padding: 5px 10px; }
+  details.toolstep summary { cursor: pointer; user-select: none; list-style-position: outside; }
+  details.toolstep pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+                         max-height: 260px; overflow: auto; font-size: 11.5px; color: var(--dim); }
+  .msg.assistant .chatimg { max-width: 100%; max-height: 340px; border-radius: 8px;
+                            display: block; margin: 6px 0; border: 1px solid var(--border); }
+  .msg.assistant a { color: var(--accent, #01a982); word-break: break-all; }
+  details.iter { align-self: flex-start; max-width: 85%; border: 1px solid var(--border);
+                 border-radius: 8px; background: var(--panel); font-size: 12.5px; }
+  details.iter summary { cursor: pointer; padding: 6px 10px; color: var(--dim); user-select: none; }
+  details.iter .body { padding: 2px 10px 8px; white-space: pre-wrap; color: var(--text); }
+  details.iter .tbody { padding: 2px 10px 8px; white-space: pre-wrap; color: var(--dim);
+                        font-family: ui-monospace, monospace; font-size: 11.5px; }
+  details.think { align-self: flex-start; max-width: 85%; border: 1px dashed var(--border);
+                  border-radius: 8px; background: var(--panel); font-size: 12.5px; margin-bottom: 4px; }
+  details.think summary { cursor: pointer; padding: 5px 10px; color: var(--dim); }
+  .hint { align-self: center; color: var(--dim); font-size: 12.5px; margin-top: 30vh; text-align: center; }
+  form {
+    display: flex; gap: 8px; padding: 12px 16px;
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  form textarea {
+    flex: 1; resize: none; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 12px; font: inherit; min-height: 44px; max-height: 160px;
+  }
+  form textarea:focus { outline: 2px solid var(--focus); }
+  form button {
+    background: var(--accent); color: var(--accent-contrast); border: 0; border-radius: 8px;
+    padding: 0 18px; font-weight: 600; cursor: pointer; font-size: 14px;
+  }
+  form button:disabled { opacity: .45; cursor: default; }
+  .conn { font-size: 12px; color: var(--dim); }
+  /* The status dot (text demoted into the #model tooltip): size it like text
+     so the click target / hover area stays reasonable. */
+  #conn { font-size: 14px; cursor: default; }
+  .conn.ok { color: var(--accent); }
+  .conn.bad { color: var(--err); }
+  /* usage panel (P3) */
+  .muted { color: var(--dim); font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+          background: var(--bg); border: 1px solid var(--border); color: var(--dim); margin-right: 4px; }
+  .pill.on { color: var(--accent); border-color: var(--accent); }
+  .pill.off { color: var(--err); border-color: var(--err); }
+  /* The hide/show CLASS the enroll dialog and the SSO card toggle. admin.html
+     defines this rule; index.html was missing it — inside an OPEN dialog the
+     class did nothing, so the enroll form and its 'You're in' panel co-showed
+     (Z4 depends on it too: the SSO card boots hidden until /v1/identity says
+     self_mint). */
+  .hidden { display: none !important; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+           border-radius: 12px; padding: 18px; max-width: 720px; width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  dialog th, dialog td { text-align: left; padding: 5px 8px; font-size: 12.5px;
+                         border-bottom: 1px solid var(--border); }
+  dialog th { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; }
+  .budget-bar { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+                width: 150px; height: 9px; overflow: hidden; }
+  .budget-bar > div { height: 100%; border-radius: 3px; }
+  /* saved conversations: left rail of the chat layout — collapsible on
+     desktop, a slide-in drawer behind the header ☰ toggle on phones */
+  #layout { flex: 1; display: flex; min-height: 0; }
+  #convpanel { width: 250px; flex: 0 0 250px; display: flex; flex-direction: column;
+               min-height: 0; background: var(--panel); border-right: 1px solid var(--border); }
+  #convpanel.collapsed { display: none; }
+  .conv-head { display: flex; align-items: center; justify-content: space-between;
+               padding: 10px 10px 8px 14px; font-weight: 600; font-size: 13px; }
+  .conv-head button { background: none; border: 1px solid var(--border); color: var(--text);
+                      border-radius: 6px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+  .conv-head button:hover { border-color: var(--accent); color: var(--accent); }
+  #conv-list { flex: 1; overflow-y: auto; padding-bottom: 10px; }
+  .conv-row { display: flex; align-items: center; gap: 6px; padding: 7px 8px 7px 12px;
+              cursor: pointer; font-size: 13px; border-left: 2px solid transparent; }
+  .conv-row:hover { background: var(--bg); }
+  .conv-row.active { border-left-color: var(--accent); background: var(--bg); }
+  .conv-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conv-count { flex: none; color: var(--dim); font-size: 11px; }
+  .conv-act { flex: none; background: none; border: 0; color: var(--dim); cursor: pointer;
+              font-size: 12px; line-height: 1; padding: 2px 3px; }
+  .conv-act:hover { color: var(--accent); }
+  .conv-act.del:hover { color: var(--err); }
+  .conv-note { color: var(--dim); font-size: 12px; padding: 4px 14px; }
+  #convtoggle { background: none; border: 1px solid var(--border); border-radius: 6px;
+                padding: 4px 9px; cursor: pointer; font-size: 14px; line-height: 1; color: var(--text); }
+  #convtoggle:hover { border-color: var(--accent); }
+  #convback { display: none; }
+  /* invite-code enrollment dialog (self-service key minting) */
+  #enroll-dlg .fieldrow { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
+  #enroll-dlg label { display: flex; flex-direction: column; gap: 4px;
+                      font-size: 12px; color: var(--dim); }
+  #enroll-dlg input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+                      border-radius: 6px; padding: 7px 9px; font: inherit; }
+  #enroll-dlg input:focus { outline: 2px solid var(--focus); }
+  #enroll-dlg .go { background: var(--accent); color: var(--accent-contrast); border: 0;
+                    border-radius: 7px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  #enroll-dlg .go:disabled { opacity: .45; cursor: default; }
+  #enroll-dlg .mini { background: none; border: 1px solid var(--border); color: var(--text);
+                      border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  /* the SSO mint dialog shares the enroll dialog's button system */
+  #sso-dlg .go { background: var(--accent); color: var(--accent-contrast); border: 0;
+                 border-radius: 7px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  #sso-dlg .go:disabled { opacity: .45; cursor: default; }
+  #sso-dlg .mini { background: none; border: 1px solid var(--border); color: var(--text);
+                   border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  /* Identity chip row (mirrors MM RAG's D23/D24 top-bar chip): 8px status
+     dot + 'Signed in as <subject>' + a source pill. The dot color and pill
+     text are set by renderIdentityChip() — green (--ok) for an SSO-probe
+     session, amber (--warn) for a pasted-key session. */
+  .src-tag { font-size: 11px; padding: 1px 6px; border-radius: 8px;
+             border: 1px solid var(--border); color: var(--dim); }
+  /* Budget strip layout lives in CSS, NOT inline style: an author display
+     rule on the element beats the hidden attribute's UA [hidden]{display:none}
+     (an inline display:flex rendered it as an empty pill before connect). */
+  #budget-strip { display: flex; align-items: center; gap: 8px; padding: 4px 10px; }
+  #budget-strip[hidden] { display: none; }
+  .keyreveal { background: var(--bg); border: 1px solid var(--accent); border-radius: 8px;
+               padding: 10px 12px; margin: 10px 0; }
+  .keyreveal code { font-size: 14px; user-select: all; word-break: break-all; }
+  #enroll-err { min-height: 1em; margin: 4px 0; color: var(--err); font-size: 12.5px; }
+  /* F8: phones — wrap the header instead of pushing Admin/theme off-screen */
+  @media (max-width: 720px) {
+    header { flex-wrap: wrap; }
+    header input[type=password], header input:not([type=checkbox]) { width: 100% !important; }
+    table { display: block; overflow-x: auto; white-space: nowrap; }
+    /* conversations become a slide-in drawer over the chat */
+    #convpanel, #convpanel.collapsed {
+      position: fixed; top: 0; bottom: 0; left: 0; z-index: 40;
+      width: 80vw; max-width: 320px; display: flex;
+      transform: translateX(-100%); transition: transform .18s ease;
+    }
+    #convpanel.open { transform: none; box-shadow: 0 0 40px rgba(0,0,0,.5); }
+    #convback.open { display: block; position: fixed; inset: 0; z-index: 39; background: rgba(0,0,0,.45); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <button id="convtoggle" type="button" title="Toggle the conversations panel"
+          aria-label="Toggle conversations panel">☰</button>
+  <h1><span class="hpe">HPE</span> LLM Gateway</h1>
+  <!-- Hidden-models hint (5d): the picker + its hint stack in one column so
+       the hint sits exactly UNDER the select — the header is a wrap-flex
+       row, and a detached or absolutely-positioned hint would drift when it
+       wraps. No inline display on the hint itself: an inline display:flex
+       overrides the [hidden] attribute's UA display:none (the budget-strip
+       lesson), and the hint must collapse fully at 0 / on older backends. -->
+  <span id="modelwrap" style="display:flex;flex-direction:column;gap:1px;min-width:0">
+    <select id="model" title="Model to send requests to" aria-label="Model"></select>
+    <span id="model-deny-hint" class="muted" style="max-width:340px" hidden></span>
+  </span>
+  <input id="apikey" type="password" placeholder="API key (hllm-…)" aria-label="API key" autocomplete="off">
+  <button id="keyconnect" class="ghost mini" style="padding:6px 10px">Connect</button>
+  <!-- Auth stack: the two pre-connect sign-in paths stacked vertically (one
+       visual slot instead of two). #sso-open toggles `hidden` per self-mint
+       flags; the wrapper collapses to the invite button alone when SSO is
+       unavailable. -->
+  <span id="authstack" style="display:flex;flex-direction:column;gap:4px;align-items:stretch">
+    <button id="sso-open" class="ghost mini" style="padding:4px 10px;font-size:11.5px" hidden
+            title="Sign in with SSO — your identity comes from the platform sign-in; no invite code needed">Sign in with SSO</button>
+    <button id="enroll-open" class="ghost mini" style="padding:4px 10px;font-size:11.5px"
+            title="Redeem an invite code from your administrator to get a personal API key">Have an invite code?</button>
+  </span>
+  <button id="newchat" class="ghost mini" style="padding:6px 10px" title="Clear this conversation and start a new one">New chat</button>
+  <!-- Budget strip: key-at-a-glance burn-down the moment the key connects.
+       Click-through opens the full usage dialog (why-am-I-429ing panel).
+       NO inline display here — the flex layout lives in the #budget-strip
+       CSS rule: an inline display:flex overrides the hidden attribute's
+       UA [hidden]{display:none}, and the strip rendered as an EMPTY pill
+       between the Connect button and the connection status (the header ghost/gap
+       seen 2026-10-07). -->
+  <button id="budget-strip" type="button" class="ghost mini" hidden
+          title="Budget usage vs limits — click for the full usage view"></button>
+  <span id="conn" class="conn" title="checking…">●</span>
+  <!-- identity chip row: same look as MM RAG's top bar (green dot + name +
+       source pill on SSO sessions; amber dot + 'API key' pill on pasted-key
+       sessions), with 'switch to API key' rendered INSIDE the chip on SSO
+       sessions + Sign out alongside -->
+  <span id="sso-chip" style="display:none;align-items:center;gap:8px;font-size:12px;color:var(--dim)"></span>
+  <button id="signout-btn" class="ghost mini" style="padding:4px 10px" hidden
+          title="End this session on this device — clears the stored key, and on an SSO session also signs out at the edge">Sign out</button>
+  <label class="conn" for="tools" style="cursor:pointer;display:flex;align-items:center;gap:4px"
+         title="Tool relay: registered MCP servers (search, k8s, applygate, …) are available to the model when checked">
+    <input type="checkbox" id="tools"> tools · MCPs
+  </label>
+  <button id="mcp-self" class="ghost mini" style="padding:4px 10px" hidden
+          title="Manage YOUR key's MCP tools (grants) and per-server credentials — no admin needed">MCP tools</button>
+  <a href="/admin" title="Admin console (admin key required)" style="color:var(--accent2);font-size:13px">Admin</a>
+  <button id="theme" type="button" title="Toggle dark/light theme" aria-label="Toggle theme">◐</button>
+</header>
+<div id="convback"></div>
+<div id="layout">
+  <aside id="convpanel" aria-label="Saved conversations">
+    <div class="conv-head"><span>Conversations</span>
+      <button id="conv-new" type="button" title="Start a new conversation">+ new</button></div>
+    <div id="conv-list"><div class="conv-note">connect a key to see saved chats</div></div>
+  </aside>
+  <main id="chat" aria-live="polite">
+    <div class="hint">Paste your gateway API key above, pick a model, and send a message.<br>
+    No key? Redeem an invite code, <span id="hint-sso" style="display:none">sign in with SSO above, </span>or ask your administrator.<br>
+    Chats are saved per key — browse them in the ☰ Conversations panel.</div>
+  </main>
+</div>
+<form id="f">
+  <textarea id="prompt" rows="1" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" type="submit" disabled>Send</button>
+</form>
+<dialog id="usage-dlg" aria-label="My usage">
+  <div id="usage-body"></div>
+  <div style="text-align:right;margin-top:12px"><button type="button" id="usage-close" class="ghost mini">Close</button></div>
+</dialog>
+<dialog id="mcp-self-dlg" aria-label="My MCP tools and credentials">
+  <div id="mcp-self-body"><p class="muted">loading…</p></div>
+  <div style="text-align:right;margin-top:12px"><button type="button" id="mcp-self-close" class="ghost mini">Close</button></div>
+</dialog>
+<dialog id="enroll-dlg" aria-label="Redeem an invite code">
+  <div id="enroll-form">
+    <h3 style="margin:0 0 4px">Redeem an invite code</h3>
+    <p class="muted">An enrollment code from your administrator mints a personal API key — no admin ticket needed.</p>
+    <div class="fieldrow">
+      <label>Invite code <input id="enroll-code" autocomplete="off" placeholder="enroll-…"></label>
+      <label>Your name <input id="enroll-name" autocomplete="off" placeholder="Ada Lovelace"></label>
+      <label for="enroll-memory" style="flex-direction:row;align-items:center;display:flex;gap:8px;font-weight:400">
+        <input type="checkbox" id="enroll-memory" style="width:auto">
+        <span>Give me a private memory dataset</span>
+      </label>
+      <p class="muted" style="margin:0;font-size:12px">Opt-in: provisions your own memory dataset on the fleet RAG server and binds it to your new key. Leave unchecked unless you know you want it.</p>
+    </div>
+    <div id="enroll-err" aria-live="polite"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button type="button" id="enroll-go" class="go">Redeem</button>
+      <button type="button" id="enroll-close" class="mini">Cancel</button>
+    </div>
+  </div>
+  <div id="enroll-done" class="hidden">
+    <h3 style="margin:0 0 4px">You're in</h3>
+    <p class="muted" id="enroll-msg"></p>
+    <div class="keyreveal"><code id="enroll-key"></code></div>
+    <p class="muted">This key is shown <b>once</b> — copy it somewhere safe before closing.</p>
+    <p class="muted hidden" id="enroll-memory-note" style="word-break:break-all"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button type="button" id="enroll-copy" class="mini">Copy key</button>
+      <button type="button" id="enroll-close2" class="go">Start chatting</button>
+    </div>
+  </div>
+</dialog>
+<dialog id="sso-dlg" aria-label="Sign in with SSO">
+  <div id="sso-busy">
+    <h3 style="margin:0 0 4px">Sign in with SSO</h3>
+    <p class="muted">Minting your personal API key from your platform SSO identity…</p>
+    <div id="sso-err" aria-live="polite" class="muted" style="min-height:1em"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button type="button" id="sso-cancel" class="mini">Cancel</button>
+    </div>
+  </div>
+  <div id="sso-done" class="hidden">
+    <h3 style="margin:0 0 4px">You're in</h3>
+    <p class="muted" id="sso-msg"></p>
+    <div class="keyreveal"><code id="sso-key"></code></div>
+    <p class="muted">This key is shown <b>once</b> — copy it somewhere safe before closing.</p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button type="button" id="sso-copy" class="mini">Copy key</button>
+      <button type="button" id="sso-start" class="go">Start chatting</button>
+    </div>
+  </div>
+</dialog>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // storage can be BLOCKED (iframes / privacy mode) — never let it throw
+  // (same guard the admin console uses; an unguarded access here would kill
+  // the whole chat page before any handler exists).
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} },
+  };
+  // quote-safe HTML escape for any server-provided string rendered into markup
+  const escHtml = s => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+  // Rich assistant rendering: escape EVERYTHING first, then convert only
+  // whitelisted markdown shapes on the escaped text. Server data can never
+  // inject markup — patterns must survive the escaper to render at all, and
+  // URLs are charset-restricted (no quotes/parens/whitespace).
+  function renderRich(el, text) {
+    const meta = el.querySelector('.meta');
+    let h = escHtml(text);
+    // images: ![alt](https://...) — lazy, no referrer leak
+    h = h.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+      (m, alt, url) => `<img src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer" class="chatimg">`);
+    // links: [text](https://...) — applied after images so ![..](..) is untouched
+    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      (m, t, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+    // bold: **text** (single line only)
+    h = h.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    el.innerHTML = h;
+    if (meta) el.appendChild(meta);   // renderRich rewrites the body — keep the meta chip
+  }
+  const THEME_KEY = 'pcai-llm-theme';
+  const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
+  applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+  $('theme').addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    store.set(THEME_KEY, next); applyTheme(next);
+  });
+
+  const chat = $('chat'), modelSel = $('model'), keyIn = $('apikey'),
+        promptIn = $('prompt'), sendBtn = $('send'), conn = $('conn'),
+        form = $('f'), toolsChk = $('tools');
+
+  // ---- painting: rAF-batched DOM updates (never per-token) ----------------
+  // textContent += per SSE event is O(n^2) over a long stream and freezes
+  // the tab; accumulate in JS, repaint at most once per animation frame.
+  const painters = new Set();
+  function paint(fn) {
+    painters.add(fn);
+    if (painters.size === 1) {
+      requestAnimationFrame(() => { for (const f of painters) f(); painters.clear(); scroll(); });
+    }
+  }
+  // Follow the stream ONLY while the viewer is pinned to the bottom. The old
+  // unconditional scrollTop=scrollHeight yanked the view back on every paint —
+  // scrolling up mid-generation was impossible (the lock). Scrolling up
+  // releases the follow; returning to the bottom re-engages it; sending a
+  // message re-engages explicitly (you asked to follow the reply).
+  let pinned = true;
+  chat.addEventListener('scroll', () => {
+    pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 48;
+  }, { passive: true });
+  function scroll() { if (pinned) chat.scrollTop = chat.scrollHeight; }
+
+  function add(cls, text, meta) {
+    const hint = chat.querySelector('.hint'); if (hint) hint.remove();
+    const div = document.createElement('div');
+    div.className = 'msg ' + cls;
+    div.textContent = text;
+    // F7: streaming updates land here — announce assistant replies to AT
+    if (cls === 'assistant') div.setAttribute('aria-label', 'Assistant reply');
+    if (meta) {
+      const m = document.createElement('span'); m.className = 'meta'; m.textContent = meta;
+      div.appendChild(m);
+    }
+    chat.appendChild(div); scroll();
+    return div;
+  }
+
+  // ---- connection ----
+  // Z1 envelope: the key ALSO goes as X-API-Key. Behind the platform SSO
+  // edge chain the proxy overwrites Authorization with its own Bearer
+  // id_token, so the browser key would never arrive — X-API-Key is the
+  // envelope the backend honors (de-escalation-only precedence: X-API-Key
+  // wins when both are present). Authorization stays for direct
+  // (non-proxied) deployments.
+  function auth() { return { 'Authorization': 'Bearer ' + keyIn.value.trim(), 'X-API-Key': keyIn.value.trim(), 'Content-Type': 'application/json' }; }
+  function ready() { return keyIn.value.trim().length > 0; }
+  // Conn status: the green/amber DOT is the always-visible signal; the text
+  // (model count, errors) demotes into the model picker's tooltip — operator
+  // diagnostics, not something a chat user needs inline (header-width wave).
+  function setConn(ok, text) {
+    conn.textContent = ok ? '●' : '●';
+    conn.className = 'conn ' + (ok ? 'ok' : 'bad');
+    conn.title = text;
+    modelSel.title = text + (modelSel.options.length ? ' — pick a model' : '');
+  }
+
+  // Hidden-models hint (5d): a key's allowed_models can hide registered
+  // models from /v1/models — the picker used to just show fewer options with
+  // no explanation (the "why is Qwen missing" report). The proxy reports the
+  // excluded count in the X-PCAI-Models-Denied response header; one muted
+  // line under the picker explains it. ABSENT header (older backend) -> 0 ->
+  // hidden again; this must never throw — a hint may not kill model loading.
+  function paintDeniedHint(n) {
+    const el = document.getElementById('model-deny-hint');
+    if (!el) return;
+    if (n > 0) {
+      el.textContent = n + ' model(s) hidden by this key\'s allowlist — ask your admin (Keys -> Edit -> Allowed models).';
+      el.hidden = false;
+    } else {
+      el.textContent = '';
+      el.hidden = true;
+    }
+  }
+
+  async function loadModels() {
+    if (!ready()) { setConn(false, 'enter API key'); return; }
+    try {
+      const r = await fetch('/v1/models', { headers: auth() });
+      if (r.status === 401) {
+        paintDeniedHint(0);   // dead key: stale "hidden by your allowlist" advice goes too
+        setConn(false, 'invalid key'); modelSel.innerHTML = ''; sendBtn.disabled = true;
+        $('mcp-self').hidden = true;   // dead key: its self-service surface goes too
+        store.del('pcai-llm-key');   // a stored key that 401s is dead — stop pre-filling it
+        renderIdentityChip();        // F3: the amber chip + Sign out would outlive the dead key — re-render
+        return;
+      }
+      // 5d: the excluded-model count rides the response header — read it
+      // straight off the response (before the JSON parse, so it survives a
+      // malformed body); the parse is failure-proof by construction:
+      // absent header -> null -> '0' -> 0, '' -> NaN -> 0.
+      paintDeniedHint(parseInt(r.headers.get('X-PCAI-Models-Denied') || '0', 10) || 0);
+      const j = await r.json();
+      modelSel.innerHTML = '';
+      const all = j.data || [];
+      // This is a CHAT page: the gateway advertises every pool type the key
+      // can call (chat|embedding|reranker|voice via pcai.type), but picking
+      // a non-chat model here can only 400 at send time ("is a embedding
+      // endpoint, not chat") — embedding consumers use the API directly.
+      // Hide them from the picker, count everything in the conn status.
+      const chatModels = all.filter(m => !m.pcai?.type || m.pcai.type === 'chat' || m.pcai.type === 'cascade');
+      for (const m of chatModels) {
+        const o = document.createElement('option'); o.value = m.id;
+        const star = m.pcai?.primary ? '★ ' : '';
+        const type = m.pcai?.type && m.pcai.type !== 'chat' ? ` (${m.pcai.type})` : '';
+        o.textContent = star + m.id + type;
+        // cascade alias: show the admin's fallback order right in the picker
+        if (m.pcai?.order?.length) o.title = 'profile cascade: ' + m.pcai.order.join(' → ');
+        modelSel.appendChild(o);
+      }
+      setConn(true, 'connected · ' + chatModels.length + ' model(s)');
+      $('mcp-self').hidden = !(j.data || []).some(m => m.pcai?.type !== 'embedding');  // keyed user → their MCP tools
+      store.set('pcai-llm-key', keyIn.value.trim());   // remember a WORKING key for next boot
+      // F10: no model → nothing to send to; keep Send disabled instead of
+      // letting an empty model: '' request 400.
+      sendBtn.disabled = !chatModels.length;
+    } catch { setConn(false, 'gateway unreachable'); }
+  }
+
+  // F10: a real "new conversation" affordance — clears history AND the DOM
+  // (and the streaming-state refs, which would otherwise point at removed
+  // nodes). Connect (new key) resets too — and drops the active saved
+  // conversation, since transcripts are scoped per key.
+  function resetChat() {
+    history = [];
+    activeBubble = null; iterBox = null; iterBody = null; iterN = -1;
+    chat.innerHTML = '<div class="hint">New conversation. Pick a model and send a message.</div>';
+  }
+  function newChat() {
+    activeConvId = null;              // next send auto-creates a fresh conversation
+    resetChat();
+    loadConversations().catch(() => {});
+  }
+  $('newchat').addEventListener('click', newChat);
+  async function connectKey() {
+    activeConvId = null;              // transcripts are per-key — never mix them
+    resetChat();
+    await loadModels();
+    loadConversations().catch(() => {});
+    refreshBudgetStrip().catch(() => {});   // at-a-glance budgets the moment the key is live
+  }
+  $('keyconnect').addEventListener('click', connectKey);
+  keyIn.addEventListener('change', connectKey);
+
+  // ---- relay event rendering (per-iteration collapsibles) -----------------
+  let history = [];
+  let iterBox = null, iterBody = null, iterN = -1, iterThinkAcc = '', iterThinkEl = null;
+  let thinkBox = null, thinkAcc = '';
+  let activeBubble = null;   // the assistant bubble events insert before
+  let relayToolSteps = 0;    // Task C: tool steps reported by relay events
+  let relayThinking = false; // turn-level: relay is rendering thinking in its
+                             // Step panels — its reasoning_content deltas then
+                             // MIRROR those bytes 1:1 (toolrelay yields both),
+                             // so the standalone box stays suppressed (dup fix)
+
+  function newIter(n) {
+    iterBox = document.createElement('details'); iterBox.className = 'iter';
+    iterBox.innerHTML = '<summary>Step ' + (n + 1) + '</summary>';
+    iterBody = document.createElement('div'); iterBody.className = 'tbody';
+    iterBox.appendChild(iterBody);
+    chat.insertBefore(iterBox, activeBubble); scroll();
+    iterN = n; iterThinkAcc = ''; iterThinkEl = null;
+  }
+  function ensureThink(parent) {
+    const d = document.createElement('details'); d.className = 'think'; d.open = true;
+    d.innerHTML = '<summary>Thinking</summary><div class="tbody"></div>';
+    parent.appendChild(d);
+    return d.querySelector('.tbody');
+  }
+
+  function handlePcai(ev) {
+    paint(() => {});
+    if (ev.event === 'thinking') {
+      relayThinking = true;   // deltas for the same bytes are now redundant
+      if (!iterBox || iterN !== ev.iteration) newIter(ev.iteration);
+      if (!iterThinkEl) iterThinkEl = ensureThink(iterBody);
+      iterThinkAcc += ev.text;
+      paint(() => { iterThinkEl.textContent = iterThinkAcc; });
+      return;
+    }
+    if (ev.event === 'iteration') {
+      if (!iterBox || iterN !== ev.iteration) newIter(ev.iteration);
+      const c = document.createElement('div'); c.textContent = ev.text;
+      paint(() => { iterBody.appendChild(c); });
+      return;
+    }
+    if (ev.event === 'tool_call' || ev.event === 'tool_error') {
+      relayToolSteps++;   // Task C: counted for the relay: status meta
+      // Expandable step chip: summary is the one-liner; the body carries the
+      // args + a truncated result preview (relay emits both — textContent
+      // only, the payload is server-provided).
+      const d = document.createElement('details');
+      d.className = 'msg toolstep';
+      const s = document.createElement('summary');
+      s.textContent = (ev.ok ? '→ ' : '✗ ') + (ev.server ? ev.server + '/' : '')
+        + ev.tool + (ev.ms ? ' (' + ev.ms + 'ms)' : '')
+        + (ev.detail ? ' — ' + ev.detail : '');
+      d.appendChild(s);
+      const body = document.createElement('div');
+      if (ev.args !== undefined && ev.args !== null) {
+        const pre = document.createElement('pre');
+        pre.textContent = 'args: ' + (typeof ev.args === 'string'
+          ? ev.args : JSON.stringify(ev.args, null, 2));
+        body.appendChild(pre);
+      }
+      if (ev.result) {
+        const pre = document.createElement('pre');
+        pre.textContent = 'result: ' + ev.result;
+        body.appendChild(pre);
+      }
+      if (body.childNodes.length) d.appendChild(body);
+      const target = (iterBox && iterN >= 0) ? iterBody : chat;
+      paint(() => { target.appendChild(d); });
+      return;
+    }
+    if (ev.event === 'guard') {
+      const div = document.createElement('div');
+      div.className = 'msg toolstep';
+      div.textContent = '(tool use halted: ' + ev.detail + ')';
+      paint(() => { chat.appendChild(div); });
+      return;
+    }
+    if (ev.event === 'model_usage' && activeBubble) {
+      const meta = ev.prompt + '+' + ev.completion + ' tokens';
+      paint(() => {
+        let m = activeBubble.querySelector('.meta');
+        if (!m) { m = document.createElement('span'); m.className = 'meta'; activeBubble.appendChild(m); }
+        m.textContent = meta;
+      });
+    }
+  }
+
+  // ---- my usage (P3): the self-service "why am I 429ing" panel ------------
+  // GET /v1/usage with the key's own bearer: budget burn-down bars, the
+  // current-minute rate window vs RPM/TPM, and recent outcomes with the
+  // refusal statuses highlighted. Auto-opens when send() catches a 429.
+  async function showUsage() {
+    if (!ready()) { setConn(false, 'enter API key'); return; }
+    const body = $('usage-body');
+    body.innerHTML = '<p class="muted">loading…</p>';
+    $('usage-dlg').showModal();
+    let u;
+    try {
+      const r = await fetch('/v1/usage', { headers: auth() });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      u = await r.json();
+    } catch (e) {
+      body.innerHTML = '<p class="muted">usage unavailable — ' + escHtml(e.message) + '</p>';
+      return;
+    }
+    const lim = u.limits || {};
+    const tm = u.this_minute || {};
+    const bar = (spent, limit, usd) => {
+      const pct = limit ? Math.min(100, (spent / limit) * 100) : 0;
+      const color = pct > 95 ? 'var(--err)' : pct > 80 ? 'var(--warn)' : 'var(--accent)';
+      return `<div class="budget-bar"><div style="width:${pct}%;background:${color}"></div></div>`;
+    };
+    const budgetRows = (u.budgets || []).map(b => b.kind === 'usd'
+      ? `<tr><td class="mono">${escHtml(b.model)} ${escHtml(b.period)}</td>
+         <td>$${(+((b.spent_usd ?? 0))).toFixed(4)} / $${(+((b.limit_usd ?? 0))).toFixed(2)}</td>
+         <td>${bar(b.spent_usd || 0, b.limit_usd || 0)}</td></tr>`
+      : `<tr><td class="mono">${escHtml(b.model)} ${escHtml(b.period)}</td>
+         <td>${(+((b.spent ?? 0))).toLocaleString()} / ${(+((b.limit ?? 0))).toLocaleString()} tokens</td>
+         <td>${bar(b.spent || 0, b.limit || 0)}</td></tr>`).join('')
+      || '<tr><td colspan="3" class="muted">no budgets configured on your key</td></tr>';
+    const pillFor = st => st === 'ok' ? '<span class="pill on">ok</span>'
+      : (st === 'rate_limited' || st === 'budget_exceeded')
+        ? `<span class="pill off">${escHtml(st)}</span>`
+        : `<span class="pill">${escHtml(st)}</span>`;
+    const recentRows = (u.recent || []).map(r2 =>
+      `<tr><td>${escHtml(new Date(r2.ts).toLocaleString())}</td><td class="mono">${escHtml(r2.model)}</td>
+       <td>${(+((r2.total_tokens ?? 0))).toLocaleString()}</td><td>${pillFor(r2.status)}</td>
+       <td>${escHtml(r2.latency_ms ?? '')}</td></tr>`).join('')
+      || '<tr><td colspan="5" class="muted">no requests yet</td></tr>';
+    body.innerHTML = `
+      <h3 style="margin:0 0 6px">My usage — ${escHtml(u.key?.name || 'key')} <span class="muted mono">${escHtml(u.key?.prefix || '')}…</span></h3>
+      <p class="muted">${(+((tm.requests ?? 0))).toLocaleString()} / ${lim.rpm ?? '∞'} requests this minute ·
+         ${(+((tm.tokens ?? 0))).toLocaleString()} / ${lim.tpm != null ? (+lim.tpm).toLocaleString() : '∞'} tokens this minute</p>
+      <table><thead><tr><th>Budget</th><th>Spent / Limit</th><th></th></tr></thead>
+      <tbody>${budgetRows}</tbody></table>
+      <table><thead><tr><th>When</th><th>Model</th><th>Tokens</th><th>Status</th><th>ms</th></tr></thead>
+      <tbody>${recentRows}</tbody></table>
+      <p class="muted">rate_limited / budget_exceeded rows are the reasons a request was refused — wait for the
+      window to roll over or ask your admin to raise the limit.</p>`;
+  }
+  // the header `usage` button was dropped (redundant: the budget strip is the
+  // same click-through); the dialog stays reachable via #budget-strip.
+  $('usage-close').addEventListener('click', () => $('usage-dlg').close());
+
+  // ---- budget strip: at-a-glance usage vs limits on connect --------------
+  // The usage DIALOG existed but was click-gated — users only found it AFTER
+  // a 429 taught them it existed. The strip shows the tightest budget
+  // burn-down (plus the minute window) as soon as the key connects, and
+  // click-through opens the full dialog. Same endpoint, no new surface.
+  // Best-effort: a failed fetch just hides the strip (the usage dialog is
+  // still there; the chat must never be blocked by a usage blip).
+  async function refreshBudgetStrip() {
+    const el = $('budget-strip');
+    if (!el) return;
+    if (!ready()) { el.hidden = true; return; }
+    try {
+      const r = await fetch('/v1/usage', { headers: auth() });
+      if (!r.ok) { el.hidden = true; return; }
+      const u = await r.json();
+      const budgets = (u.budgets || []).filter(b => b.kind === 'usd' || b.limit);
+      const bar = (spent, limit, usd) => {
+        const pct = limit ? Math.min(100, (spent / limit) * 100) : 0;
+        const color = pct > 95 ? 'var(--err)' : pct > 80 ? 'var(--warn)' : 'var(--accent)';
+        return `<span class="budget-bar" style="width:90px;display:inline-block;vertical-align:middle"><span style="display:block;width:${pct}%;height:100%;background:${color}"></span></span>`;
+      };
+      // The TIGHTEST budget leads (highest fill %) — that's the wall the user
+      // will actually hit first; everything else stays in the dialog.
+      const tightest = budgets.map(b => {
+        const spent = b.kind === 'usd' ? (b.spent_usd ?? 0) : (b.spent ?? 0);
+        const limit = b.kind === 'usd' ? (b.limit_usd ?? 0) : (b.limit ?? 0);
+        return { label: `${b.model} ${b.period}`, spent, limit, usd: b.kind === 'usd' };
+      }).filter(b => b.limit > 0)
+        .sort((a, b2) => (b2.spent / b2.limit) - (a.spent / a.limit))[0];
+      const tm = u.this_minute || {};
+      const parts = [];
+      if (tightest) {
+        const val = tightest.usd
+          ? `$${(+tightest.spent).toFixed(3)} / $${(+tightest.limit).toFixed(2)}`
+          : `${(+tightest.spent).toLocaleString()} / ${(+tightest.limit).toLocaleString()} tok`;
+        parts.push(`<b>${escHtml(tightest.label)}</b> ${escHtml(val)} ${bar(tightest.spent, tightest.limit)}`);
+      } else {
+        parts.push('no budgets on this key');
+      }
+      // rpm is deliberately NOT shown here (full view only): the strip is the
+      // budget bar's one-line summary, and the rpm counter was header noise.
+      el.innerHTML = parts.join('<span style="opacity:.4"> · </span>');
+      el.hidden = false;
+    } catch {
+      el.hidden = true;   // usage blip — never block the chat
+    }
+  }
+  $('budget-strip').addEventListener('click', () => { showUsage(); });
+
+  // ---- MCP self-service (grants + creds for YOUR OWN key) ----------------
+  // Backed by /v1/mcp/selfservice (one GET drives the whole dialog) and the
+  // PUT toggles. GOVERNANCE: the profile IS the envelope — the server lists
+  // only entitled pairs and OMITS a whole server the key holds nothing on
+  // (2026-10-09: withheld servers like applygate/k8s-ops must not appear,
+  // even disabled). Grant toggles are held-set-bounded server-side (a
+  // self-grant outside the held set 403s). Per-server UX: one master
+  // enable/disable-all checkbox + a collapsible per-tool list. Credentials
+  // are write-only: PUT stores, GET lists header NAMES only, values never
+  // return (so the form always starts empty; saving replaces the server's
+  // stored set wholesale).
+  async function showMcpSelf() {
+    const body = $('mcp-self-body');
+    $('mcp-self-dlg').showModal();
+    body.innerHTML = '<p class="muted">loading…</p>';
+    try {
+      const r = await fetch('/v1/mcp/selfservice', { headers: auth() });
+      if (r.status === 404) { body.innerHTML = '<p class="muted">MCP self-service is not enabled on this gateway.</p>'; return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      if (!(j.servers || []).length) {
+        body.innerHTML = '<p class="muted">No MCP tools are granted to this key. Your profile\'s grant envelope decides what appears here — ask your admin if a server you expect is missing.</p>';
+        return;
+      }
+      const esc = escHtml;
+      body.innerHTML = j.servers.map(s => {
+        const tools = s.tools || [];
+        const grantedCount = tools.filter(t => t.granted).length;
+        const allOn = tools.length > 0 && grantedCount === tools.length;
+        const anyFixed = tools.some(t => !t.self_grantable);
+        return `
+        <div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:8px;cursor:pointer" class="mcp-srv-head">
+            <input type="checkbox" class="mcp-srv-all" data-server="${esc(s.server)}"
+                   ${allOn ? 'checked' : ''} ${anyFixed ? '' : ''}
+                   title="Enable or disable every tool on ${esc(s.server)}">
+            <span style="font-weight:600">${esc(s.server)}</span>
+            <span class="muted" style="font-size:11.5px">${grantedCount}/${tools.length} tools</span>
+            <button type="button" class="ghost mini mcp-srv-toggle" data-server="${esc(s.server)}"
+                    style="padding:2px 8px;margin-left:auto" aria-expanded="false">▸ tools</button>
+          </div>
+          <div class="mcp-tool-list" data-server="${esc(s.server)}" hidden
+               style="margin:6px 0 0 24px;border-left:2px solid var(--border);padding-left:10px">
+          ${(tools.length ? tools.map(t => `
+            <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;margin:3px 0"
+                   title="${esc(t.description || t.tool)}${t.via_scope ? ' — callable via scope grant mode (no ACL row; unchecking writes the deny that blocks it)' : ''}">
+              <input type="checkbox" class="mcp-grant" data-server="${esc(s.server)}" data-tool="${esc(t.tool)}"
+                     ${t.granted ? 'checked' : ''} ${t.self_grantable ? '' : 'disabled'}>
+              <span${t.self_grantable ? '' : ' class="muted"'}>${esc(t.tool)}${t.via_scope ? ' <span class="muted" style="font-size:11px">(scope)</span>' : ''}${t.self_grantable ? '' : ' (fixed)'}</span>
+            </label>`).join('') : '<p class="muted" style="margin:4px 0">tool catalog unavailable</p>')}
+          </div>
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <input class="mcp-cred-name" data-server="${esc(s.server)}" placeholder="Header name (e.g. X-Dataset-Password)"
+                   style="flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font:inherit;font-size:12px">
+            <input class="mcp-cred-value" data-server="${esc(s.server)}" type="password" placeholder="Value"
+                   style="flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font:inherit;font-size:12px">
+            <button type="button" class="ghost mini mcp-cred-save" data-server="${esc(s.server)}" style="padding:5px 10px">Save cred</button>
+            ${s.cred_header_names.length ? `<button type="button" class="ghost mini mcp-cred-clear" data-server="${esc(s.server)}" style="padding:5px 10px">Clear</button>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+      // per-tool toggles (existing behavior)
+      body.querySelectorAll('.mcp-grant').forEach(box => box.addEventListener('change', async () => {
+        box.disabled = true;
+        try {
+          const resp = await fetch('/v1/mcp/selfservice/grants', {
+            method: 'PUT', headers: auth(),
+            body: JSON.stringify({ server: box.dataset.server, tool: box.dataset.tool, allowed: box.checked }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            box.checked = !box.checked;   // revert to the server's truth
+            alert(err.detail || err.error || 'grant change refused');
+          }
+        } catch (e) { box.checked = !box.checked; alert(e.message); }
+        box.disabled = false;
+      }));
+      // per-server master checkbox: fan out to every toggleable tool
+      body.querySelectorAll('.mcp-srv-all').forEach(master => master.addEventListener('change', async () => {
+        const server = master.dataset.server;
+        const boxes = [...body.querySelectorAll(`.mcp-grant[data-server="${CSS.escape(server)}"]:not(:disabled)`)];
+        master.disabled = true;
+        for (const box of boxes) {
+          if (box.checked === master.checked) continue;
+          box.disabled = true;
+          try {
+            const resp = await fetch('/v1/mcp/selfservice/grants', {
+              method: 'PUT', headers: auth(),
+              body: JSON.stringify({ server, tool: box.dataset.tool, allowed: master.checked }),
+            });
+            if (!resp.ok) box.checked = !box.checked;   // revert the refused one
+          } catch { box.checked = !box.checked; }
+          box.disabled = false;
+        }
+        master.disabled = false;
+        // refresh the n/m counter
+        const list = body.querySelector(`.mcp-tool-list[data-server="${CSS.escape(server)}"]`);
+        const all = [...(list ? list.querySelectorAll('.mcp-grant') : [])];
+        const counter = master.closest('.mcp-srv-head').querySelector('.muted');
+        if (counter) counter.textContent = `${all.filter(b => b.checked).length}/${all.length} tools`;
+        if (all.length && all.every(b => b.checked)) master.checked = true;
+      }));
+      // collapsible per-tool dropdown
+      body.querySelectorAll('.mcp-srv-toggle').forEach(btn => btn.addEventListener('click', () => {
+        const list = body.querySelector(`.mcp-tool-list[data-server="${CSS.escape(btn.dataset.server)}"]`);
+        if (!list) return;
+        list.hidden = !list.hidden;
+        btn.textContent = list.hidden ? '▸ tools' : '▾ tools';
+        btn.setAttribute('aria-expanded', String(!list.hidden));
+      }));
+      body.querySelectorAll('.mcp-cred-save').forEach(btn => btn.addEventListener('click', async () => {
+        const server = btn.dataset.server;
+        const nameEl = body.querySelector(`.mcp-cred-name[data-server="${CSS.escape(server)}"]`);
+        const valueEl = body.querySelector(`.mcp-cred-value[data-server="${CSS.escape(server)}"]`);
+        const name = (nameEl.value || '').trim(), value = valueEl.value || '';
+        if (!name || !value) { alert('enter both a header name and a value'); return; }
+        btn.disabled = true;
+        try {
+          const resp = await fetch(`/v1/mcp/creds/${encodeURIComponent(server)}`, {
+            method: 'PUT', headers: auth(),
+            body: JSON.stringify({ server, headers: { [name]: value } }),
+          });
+          const j = await resp.json().catch(() => ({}));
+          if (!resp.ok) { alert(j.detail || j.error || 'credential save refused'); }
+          else { nameEl.value = ''; valueEl.value = ''; showMcpSelf(); return; }  // re-render: names refresh
+        } catch (e) { alert(e.message); }
+        btn.disabled = false;
+      }));
+      body.querySelectorAll('.mcp-cred-clear').forEach(btn => btn.addEventListener('click', async () => {
+        const server = btn.dataset.server;
+        if (!confirm(`Clear stored credentials for ${server}?`)) return;
+        btn.disabled = true;
+        try {
+          const resp = await fetch(`/v1/mcp/creds/${encodeURIComponent(server)}`, { method: 'DELETE', headers: auth() });
+          if (!resp.ok) { const j = await resp.json().catch(() => ({})); alert(j.detail || j.error || 'clear refused'); }
+          else { showMcpSelf(); return; }
+        } catch (e) { alert(e.message); }
+        btn.disabled = false;
+      }));
+    } catch (e) {
+      body.innerHTML = '<p class="muted">MCP self-service unavailable — ' + escHtml(e.message) + '</p>';
+    }
+  }
+  $('mcp-self').addEventListener('click', () => { showMcpSelf(); });
+  $('mcp-self-close').addEventListener('click', () => $('mcp-self-dlg').close());
+
+  // ---- saved conversations (per-API-key server-side transcripts) ---------
+  // GET/POST/PATCH/PUT/DELETE /v1/conversations behind the SAME bearer as the
+  // proxy. This surface's error envelope is {"error": …} (not {"detail"}).
+  const CONV_CAP = 200;              // server-side cap — send at most the last 200 turns
+  let convList = [];                 // [{id,title,updated_at,message_count}]
+  let activeConvId = null;           // null = new chat; the next completed turn creates one
+  let convSaveBusy = false, convSaveQueued = false;
+
+  async function loadConversations() {
+    const list = $('conv-list');
+    if (!ready()) { convList = []; list.innerHTML = '<div class="conv-note">connect a key to see saved chats</div>'; return; }
+    try {
+      const r = await fetch('/v1/conversations', { headers: auth() });
+      if (r.status === 401) { convList = []; list.innerHTML = '<div class="conv-note">key invalid — saved chats unavailable</div>'; return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      convList = Array.isArray(j.data) ? j.data : [];
+      list.innerHTML = convList.map(c => `
+        <div class="conv-row${c.id === activeConvId ? ' active' : ''}" data-id="${escHtml(c.id)}"
+             role="button" tabindex="0" title="${escHtml(c.title || 'Untitled')}">
+          <span class="conv-title">${escHtml(c.title || 'Untitled')}</span>
+          <span class="conv-count">${+c.message_count || 0}</span>
+          <button class="conv-act" data-act="rename" title="Rename" aria-label="Rename conversation">✎</button>
+          <button class="conv-act del" data-act="del" title="Delete" aria-label="Delete conversation">✕</button>
+        </div>`).join('')
+        || '<div class="conv-note">no saved conversations yet</div>';
+    } catch {
+      list.innerHTML = '<div class="conv-note">saved chats unavailable right now</div>';
+    }
+  }
+
+  async function openConversation(id) {
+    let c;
+    try {
+      const r = await fetch('/v1/conversations/' + encodeURIComponent(id), { headers: auth() });
+      if (r.status === 404) { activeConvId = null; await loadConversations(); return; }   // stale row
+      if (r.status === 401) { setConn(false, 'invalid key'); return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      c = await r.json();
+    } catch {
+      const list = $('conv-list');
+      if (list) list.insertAdjacentHTML('beforeend', '<div class="conv-note">could not load that conversation</div>');
+      return;
+    }
+    resetChat();                     // clears DOM + history + streaming refs
+    activeConvId = c.id;
+    const msgs = Array.isArray(c.messages) ? c.messages : [];
+    history = msgs.map(m => ({ role: m.role, content: m.content }));
+    for (const m of msgs) {
+      if (m.role === 'assistant') renderRich(add('assistant', ''), m.content ?? '');
+      else add('user', m.content ?? '');
+    }
+    for (const row of $('conv-list').querySelectorAll('.conv-row'))
+      row.classList.toggle('active', row.dataset.id === activeConvId);
+    closeConvPanel();                // phones: slide the drawer back out of the way
+  }
+
+  async function renameConversation(id) {
+    const c = convList.find(x => x.id === id);
+    const title = prompt('Rename conversation:', c ? (c.title || '') : '');
+    if (title === null) return;
+    const t = title.trim(); if (!t) return;
+    try {
+      const r = await fetch('/v1/conversations/' + encodeURIComponent(id),
+        { method: 'PATCH', headers: auth(), body: JSON.stringify({ title: t }) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      await loadConversations();     // activeConvId untouched — selection stays
+    } catch { /* transient — the list keeps its previous titles */ }
+  }
+
+  async function deleteConversation(id) {
+    const c = convList.find(x => x.id === id);
+    const title = c ? (c.title || 'Untitled') : 'this conversation';
+    if (!confirm('Delete "' + title + '"? This cannot be undone.')) return;
+    try {
+      const r = await fetch('/v1/conversations/' + encodeURIComponent(id), { method: 'DELETE', headers: auth() });
+      if (!r.ok && r.status !== 404) throw new Error('HTTP ' + r.status);
+      if (activeConvId === id) { activeConvId = null; resetChat(); }
+      await loadConversations();
+    } catch { /* row stays; the next refresh reconciles */ }
+  }
+
+  // one delegated listener (this page is addEventListener-only) — the action
+  // buttons are checked BEFORE the row so ✎/✕ never trigger a load.
+  $('conv-list').addEventListener('click', e => {
+    const act = e.target.closest('[data-act]');
+    const row = e.target.closest('.conv-row');
+    if (act && row) {
+      if (act.dataset.act === 'rename') renameConversation(row.dataset.id);
+      else deleteConversation(row.dataset.id);
+      return;
+    }
+    if (row && row.dataset.id) openConversation(row.dataset.id);
+  });
+  $('conv-list').addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const row = e.target.closest('.conv-row');
+    if (row && row.dataset.id && !e.target.closest('[data-act]')) { e.preventDefault(); openConversation(row.dataset.id); }
+  });
+  $('conv-new').addEventListener('click', () => { newChat(); closeConvPanel(); });
+  $('convtoggle').addEventListener('click', () => {
+    if (isNarrow()) setConvPanel(!$('convpanel').classList.contains('open'));
+    else setConvPanel($('convpanel').classList.contains('collapsed'));
+  });
+  $('convback').addEventListener('click', () => setConvPanel(false));
+  function isNarrow() { return matchMedia('(max-width: 720px)').matches; }
+  function setConvPanel(open) {
+    if (isNarrow()) {
+      $('convpanel').classList.toggle('open', open);
+      $('convback').classList.toggle('open', open);
+    } else {
+      $('convpanel').classList.toggle('collapsed', !open);
+    }
+  }
+  function closeConvPanel() { if (isNarrow()) setConvPanel(false); }
+
+  // SAVE-ON-TURN-END: fire-and-forget after each completed assistant reply.
+  // Auto-creates the conversation on the first turn (the server auto-titles
+  // it from the first user message), then replace-all PUTs the transcript —
+  // {role, content} only (no toolsteps/thinking), capped to the last 200.
+  async function saveConversation() {
+    if (!ready()) return;
+    if (convSaveBusy) { convSaveQueued = true; return; }   // serialize: last-wins PUTs
+    convSaveBusy = true;
+    try {
+      if (!activeConvId) {
+        const r = await fetch('/v1/conversations', { method: 'POST', headers: auth(), body: '{}' });
+        if (!r.ok) return;
+        const j = await r.json().catch(() => null);
+        if (!j || !j.id) return;
+        activeConvId = j.id;
+      }
+      const r = await fetch('/v1/conversations/' + encodeURIComponent(activeConvId) + '/messages', {
+        method: 'PUT', headers: auth(),
+        body: JSON.stringify({ messages: history.slice(-CONV_CAP)
+          .map(m => ({ role: m.role, content: m.content })) }),
+      });
+      if (r.status === 404) { activeConvId = null; return; }   // deleted elsewhere — next turn recreates
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        add('toolstep', 'Transcript not saved: ' + (j.error || 'HTTP ' + r.status));
+      }
+    } catch { /* offline — the next completed turn retries */ }
+    finally {
+      convSaveBusy = false;
+      loadConversations().catch(() => {});
+      if (convSaveQueued) { convSaveQueued = false; saveConversation(); }
+    }
+  }
+
+  // ---- self-service key enrollment (invite codes) -------------------------
+  // POST /v1/enroll is PUBLIC by design — the code IS the credential. The
+  // code input is cleared the moment redemption succeeds: it is never echoed
+  // again after redemption.
+  function enrollError(msg) { $('enroll-err').textContent = msg || ''; }
+
+  function showEnrolled(j) {
+    $('enroll-code').value = ''; $('enroll-name').value = '';
+    $('enroll-memory').checked = false;
+    enrollError('');
+    $('enroll-form').classList.add('hidden');
+    $('enroll-done').classList.remove('hidden');
+    let msg = (j.message || 'Copy this key now — it is shown once.')
+      + (j.tenant ? ' Tenant: ' + j.tenant + '.' : '');
+    // memory dataset outcome (review §2): provisioned=true carries the
+    // dataset name + the ONCE-shown password; provisioned=false with an
+    // error is a REPORT, never a redemption failure (the key still works).
+    const mem = j.memory || {};
+    if (mem.provisioned) {
+      msg += ' Memory dataset "' + mem.dataset + '" is ready.';
+      $('enroll-memory-note').textContent =
+        'Memory dataset: ' + mem.dataset + ' — password (shown once): ' + mem.password;
+      $('enroll-memory-note').classList.remove('hidden');
+    } else if (mem.error) {
+      msg += ' (memory provisioning failed: ' + mem.error + ')';
+      $('enroll-memory-note').classList.add('hidden');
+    } else {
+      $('enroll-memory-note').classList.add('hidden');
+    }
+    $('enroll-msg').textContent = msg;
+    $('enroll-key').textContent = j.key || '';
+  }
+
+  async function redeemInvite() {
+    const code = $('enroll-code').value.trim();
+    const name = $('enroll-name').value.trim();
+    enrollError('');
+    if (!code || !name) { enrollError('enter both the invite code and your name'); return; }
+    const go = $('enroll-go');
+    go.disabled = true;
+    try {
+      const r = await fetch('/v1/enroll', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, name, memory_opt_in: $('enroll-memory').checked }) });
+      if (r.ok) {
+        const j = await r.json();
+        showEnrolled(j);
+        keyIn.value = j.key;                       // into the input…
+        store.set('pcai-llm-key', j.key);          // …persisted…
+        connectKey();                              // …and auto-connected
+        return;
+      }
+      if (r.status === 429) {
+        const ra = r.headers && r.headers.get ? r.headers.get('Retry-After') : null;
+        enrollError('too many attempts from this address' + (ra ? ' — retry after ' + ra + 's' : ' — try again later'));
+        return;
+      }
+      let j = null;
+      try { j = await r.json(); } catch {}
+      const d = j && j.detail;
+      // 400 → generic {"detail":"invalid, expired, or exhausted code"} as-is;
+      // 422 → pydantic's list form — render as a field hint.
+      enrollError(typeof d === 'string' ? d
+        : Array.isArray(d) ? d.map(x => (x.loc || []).join('.') + ': ' + (x.msg || 'invalid')).join('; ')
+        : 'could not redeem the code (HTTP ' + r.status + ')');
+    } catch {
+      enrollError('gateway unreachable — try again');
+    } finally { go.disabled = false; }
+  }
+
+  function resetEnrollDlg() {
+    $('enroll-code').value = ''; $('enroll-name').value = '';
+    $('enroll-memory').checked = false;
+    $('enroll-memory-note').textContent = '';
+    $('enroll-memory-note').classList.add('hidden');
+    enrollError('');
+    $('enroll-form').classList.remove('hidden');
+    $('enroll-done').classList.add('hidden');
+    $('enroll-key').textContent = '';
+  }
+  $('enroll-open').addEventListener('click', () => { resetEnrollDlg(); $('enroll-dlg').showModal(); });
+  $('enroll-go').addEventListener('click', redeemInvite);
+  $('enroll-close').addEventListener('click', () => $('enroll-dlg').close());
+  $('enroll-close2').addEventListener('click', () => $('enroll-dlg').close());
+  $('enroll-dlg').addEventListener('close', resetEnrollDlg);   // Esc too — nothing lingers
+  $('enroll-copy').addEventListener('click', async () => {
+    const k = $('enroll-key').textContent;
+    let ok = false;
+    try { await navigator.clipboard.writeText(k); ok = true; }
+    catch {
+      const ta = document.createElement('textarea');
+      ta.value = k; document.body.appendChild(ta); ta.select();
+      try { ok = document.execCommand('copy'); } finally { ta.remove(); }
+    }
+    $('enroll-copy').textContent = ok ? 'Copied ✓' : 'Copy blocked — select the key text';
+    setTimeout(() => { $('enroll-copy').textContent = 'Copy key'; }, 2500);
+  });
+  for (const idIn of ['enroll-code', 'enroll-name']) {
+    $(idIn).addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); redeemInvite(); }
+    });
+  }
+
+  // ---- SSO self-mint (Z4): "Sign in with SSO" card ------------------------
+  // The platform edge chain (oauth2-proxy) forwards the user's identity as
+  // request headers on BROWSER paths. The SPA asks the backend what it can
+  // see (GET /v1/identity, no credentials — the identity IS the headers);
+  // the card only exists where POST /v1/keys/for-me would succeed
+  // (flags.self_mint). The card is a convenience, not a surface: 404 (older
+  // backend), 503 (infra), flags off, 401/403 — every one of them just hides
+  // the card, never an error banner.
+  // Chip session flavor, MM RAG's renderIdentityChip semantics (D23): an
+  // SSO-probe identity outranks a pasted key (ssoSeen stays true for the
+  // tab's lifetime — pasting a key never demotes the discovered session).
+  // Chip vs card are SEPARATE gates: the chip is identity disclosure — it
+  // renders whenever the probe resolves a subject, flag state irrelevant
+  // ("Signed in as <name> · oidc" pre-mint too, the MM RAG banner parity);
+  // the card is the MINT affordance — it exists only where
+  // POST /v1/keys/for-me would succeed (flags.self_mint).
+  let ssoSeen = false;                 // probe resolved a browser-header identity
+  let ssoSubject = '';                 // the identity to render as-is (preferred_username-derived)
+
+  function renderIdentityChip() {
+    const chip = $('sso-chip'), signout = $('signout-btn');
+    if (!chip) return;
+    if (!ssoSeen && !ready()) {        // neither an SSO session nor a pasted key
+      chip.style.display = 'none'; signout.hidden = true;
+      return;
+    }
+    const dot = color => '<span style="display:inline-block;width:8px;height:8px;' +
+      'border-radius:50%;background:' + color + '"></span>';
+    let html;
+    if (ssoSeen) {
+      // SSO session: green dot, the probe's identity as-is, 'oidc' pill.
+      // The 'switch to API key' affordance lives HERE (click the chip), not
+      // as its own header link — one less element in the header row.
+      html = dot('var(--ok)') + '<span>Signed in as ' + escHtml(ssoSubject || 'unknown') + '</span>' +
+        '<span class="src-tag">oidc</span>' +
+        '<a href="#" id="use-key-link" title="Switch this session to a pasted API key"' +
+        ' style="color:var(--dim);text-decoration:none;font-size:11.5px">switch to API key</a>';
+    } else {
+      // Pasted key: amber dot + 'API key' pill (RAG's D23 paste-mode look)
+      html = dot('var(--warn)') + '<span>Signed in as API-key user</span>' +
+        '<span class="src-tag" title="Session from a pasted API key — stored in this browser only">API key</span>';
+    }
+    chip.innerHTML = html;
+    chip.style.display = 'flex';
+    signout.hidden = false;
+  }
+
+  // D24 sign-out, COMPLETE version: behind the edge chain there are TWO
+  // sessions to end — the remembered/pasted key (localStorage) and the edge
+  // SSO session (oauth2-proxy's HttpOnly cookie). Ending only the key
+  // reloads into the edge re-authenticating instantly. So: ALWAYS clear the
+  // local key; on an SSO-flavored session ALSO navigate to the standard
+  // same-origin oauth2-proxy sign-out (RAG's exact sequence).
+  function signOut() {
+    store.del('pcai-llm-key');
+    keyIn.value = '';
+    if (ssoSeen) location.href = '/oauth2/sign_out';
+    else {
+      ssoSeen = false;
+      resetChat();                     // transcripts are per-key — drop the active one
+      renderIdentityChip();
+    }
+  }
+
+  async function ssoProbeIdentity() {
+    $('sso-open').hidden = true;
+    let j = null;
+    try {
+      const r = await fetch('/v1/identity');   // NO auth headers — by design
+      if (!r.ok) return;                       // 404 / 503 / anything else: no card
+      j = await r.json();
+    } catch { return; }                        // unreachable gateway: no card
+    if (!j) return;
+    if (j.subject) {
+      // Identity resolved (browser-header rung, or the chain's verified
+      // token caller): the green chip renders regardless of the mint flag —
+      // the response's auth boolean is NOT the gate (behind the edge chain
+      // a credential-less probe resolves the subject BEFORE any key exists;
+      // gating the banner on that boolean would hide SSO from exactly the
+      // user it exists for). The subject renders as-is (no other source
+      // hardcoded).
+      ssoSeen = true;
+      ssoSubject = String(j.subject);
+    }
+    // The MINT affordance alone stays flag-gated (Z4: the card only exists
+    // where POST /v1/keys/for-me would succeed) — and the boot hint's SSO
+    // clause tracks it, so the text never names an affordance that isn't there.
+    const mintable = !!(j.flags && j.flags.self_mint === true);
+    $('sso-open').hidden = !mintable;
+    const hintSso = document.getElementById('hint-sso');
+    if (hintSso) hintSso.style.display = mintable ? 'inline' : 'none';
+    renderIdentityChip();
+  }
+
+  // One reveal flow for both 201 (fresh mint) and 409→confirmed rotate:
+  // byte-identical ending to the enroll-redeem path (input → persisted →
+  // auto-connected), presented with the SAME shown-once UX.
+  function ssoRevealKey(j) {
+    $('sso-busy').classList.add('hidden');
+    $('sso-done').classList.remove('hidden');
+    $('sso-msg').textContent = j.message || 'Copy this key now — it is shown once.';
+    $('sso-key').textContent = j.key || '';
+    ssoSeen = true;   // F4: a minted key IS oidc-provenance (sso-create) — green chip immediately, not after a reload
+    renderIdentityChip();
+    keyIn.value = j.key;
+    store.set('pcai-llm-key', j.key);
+    connectKey();
+  }
+
+  function resetSsoDlg() {
+    $('sso-busy').classList.remove('hidden');
+    $('sso-done').classList.add('hidden');
+    $('sso-key').textContent = '';
+    $('sso-err').textContent = '';
+  }
+
+  async function ssoMint(rotate) {
+    if (!rotate) {   // the entry point (button click): the probe's precondition held
+      $('sso-busy').classList.remove('hidden');
+      $('sso-done').classList.add('hidden');
+      $('sso-err').textContent = '';
+      $('sso-dlg').showModal();
+    }
+    let r;
+    try {
+      // NO auth headers, NO body beyond the rotate flag — the identity comes
+      // from the proxy-injected headers, never from a credential the SPA holds.
+      r = await fetch('/v1/keys/for-me', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rotate ? { rotate: true } : {}) });
+    } catch {
+      ssoHideAndClose('gateway unreachable');
+      return;
+    }
+    if (r.status === 201) {
+      ssoRevealKey(await r.json());
+      return;
+    }
+    if (r.status === 409) {   // already has a live SSO key → rotate is destructive
+      $('sso-busy').classList.add('hidden');
+      $('sso-done').classList.add('hidden');
+      if (confirm('Replace your API key? The previous key stops authenticating immediately.')) {
+        ssoMint(true);
+      } else {
+        $('sso-dlg').close();
+      }
+      return;
+    }
+    // 401 / 403 / 503 / anything else: the card was a convenience and its
+    // precondition just changed — hide it, no error banner, close quietly.
+    ssoHideAndClose();
+  }
+
+  function ssoHideAndClose(msg) {
+    $('sso-open').hidden = true;
+    // the boot hint's SSO clause tracks the mint affordance — a failed mint
+    // must not leave the hint naming a button that just disappeared
+    // (reviewer catch, 2026-10-07; self-healed on reload before this).
+    const hintSso = document.getElementById('hint-sso');
+    if (hintSso) hintSso.style.display = 'none';
+    if ($('sso-dlg').open) $('sso-dlg').close();
+    if (msg) $('sso-err').textContent = msg;   // cosmetic; dialog is closed
+  }
+
+  $('sso-open').addEventListener('click', () => ssoMint(false));
+  $('sso-cancel').addEventListener('click', () => $('sso-dlg').close());
+  $('sso-start').addEventListener('click', () => $('sso-dlg').close());
+  $('sso-dlg').addEventListener('close', resetSsoDlg);   // Esc too — nothing lingers
+  $('signout-btn').addEventListener('click', signOut);
+  // 'switch to API key' lives INSIDE the chip (re-rendered per call) —
+  // delegate from the chip so the handler survives every re-render.
+  $('sso-chip').addEventListener('click', e => {
+    const link = e.target.closest('#use-key-link');
+    if (!link) return;
+    e.preventDefault();                  // RAG's openKeyModal seed: focus the key entry
+    keyIn.focus();
+  });
+  $('sso-copy').addEventListener('click', async () => {
+    const k = $('sso-key').textContent;
+    let ok = false;
+    try { await navigator.clipboard.writeText(k); ok = true; }
+    catch {
+      const ta = document.createElement('textarea');
+      ta.value = k; document.body.appendChild(ta); ta.select();
+      try { ok = document.execCommand('copy'); } finally { ta.remove(); }
+    }
+    $('sso-copy').textContent = ok ? 'Copied ✓' : 'Copy blocked — select the key text';
+    setTimeout(() => { $('sso-copy').textContent = 'Copy key'; }, 2500);
+  });
+
+  // ---- send ----
+  async function send() {
+    const text = promptIn.value.trim();
+    if (!text || !ready()) return;
+    promptIn.value = ''; sendBtn.disabled = true;
+    relayToolSteps = 0;
+    relayThinking = false;
+    pinned = true;   // sending is explicit intent to follow the reply
+    add('user', text);
+    const model = modelSel.value;
+    history.push({ role: 'user', content: text });
+
+    const bubble_ = add('assistant', '…');
+    activeBubble = bubble_;
+    let acc = '', meta = '', thinkBox = null, thinkAcc = '';
+
+    try {
+      // Task B: with the relay defaulted on, a key without MCP grants gets a
+      // deterministic 400 ("tool execution requested but this key has no MCP
+      // grants"). Retry ONCE without the header — the user still gets an
+      // answer instead of a dead end — unchecking the box so the failed
+      // round-trip isn't paid again.
+      let useTools = toolsChk.checked;
+      let resp = null, detail = '';
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const hdrs = auth();
+        if (useTools) hdrs['X-PCAI-Execute-Tools'] = '1';
+        resp = await fetch('/v1/chat/completions', {
+          method: 'POST', headers: hdrs,
+          body: JSON.stringify({
+            model, messages: history, stream: true,
+            stream_options: { include_usage: true },
+          }),
+        });
+        if (resp.ok) break;
+        detail = '';
+        try { detail = (await resp.json()).detail || ''; if (typeof detail === 'object') detail = JSON.stringify(detail); } catch {}
+        if (attempt === 0 && useTools && resp.status === 400 && /no mcp grants/i.test(detail)) {
+          useTools = false;
+          toolsChk.checked = false;
+          store.set('pcai-tools', '0');
+          add('toolstep', "Tool relay skipped — your key has no MCP tool grants (an admin can grant them under Keys ▸ MCP, or via your profile's default grants). Retrying without tools…");
+          continue;
+        }
+        break;
+      }
+      if (!resp.ok) {
+        // F6: map raw statuses to self-service language — budget_exceeded,
+        // rate_limited and upstream-outage are NOT admin tickets.
+        const human = {
+          401: 'Your key is invalid, revoked, or expired — ask your administrator for a new one.',
+          429: 'Budget or rate limit reached. Wait a moment and retry; if it persists ask your admin to raise your limits.',
+          403: 'Your key is not allowed to use this model.',
+          502: 'The model endpoint is unreachable right now (upstream or gateway hop). Retry shortly.',
+          503: 'No healthy endpoint is serving this model right now.',
+        };
+        // Task B: the no-grants 400 in operator language (reached when tools
+        // were already off, or the fallback retry failed for another reason).
+        const noGrants = resp.status === 400 && /no mcp grants/i.test(detail);
+        let msg = human[resp.status]
+          || (noGrants
+            ? "Your key has no MCP tool grants — an admin can grant them in the console (Keys ▸ MCP, or your profile's default grants)."
+            : ('Request failed (' + resp.status + ')' + (detail ? ': ' + detail : '')));
+        // F6: the backend sets Retry-After on 429 — surface it instead of dropping it
+        const ra = resp.headers?.get?.('Retry-After');
+        if (ra) msg += ' — retry after ' + ra + 's';
+        // P3: a 429 means "look at your budgets/window" — open the panel in place
+        if (resp.status === 429) showUsage();
+        throw new Error(msg);
+      }
+      const reader = resp.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          const payload = t.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const j = JSON.parse(payload);
+            if (j.pcai) { handlePcai(j.pcai); continue; }
+            const delta = j.choices?.[0]?.delta || {};
+            if (delta.reasoning_content && !relayThinking) {
+              // thinking dropdown (GLM/Qwen reasoning parsers emit this).
+              // Suppressed while the tool relay is streaming: it already
+              // renders these exact bytes inside the per-iteration Step
+              // panels — an un-suppressed box here duplicated every one of
+              // them (and re-fired on every iteration). Relay-off turns
+              // (tools unchecked / no grants) never set the flag, so plain
+              // reasoning-only chats still get this box.
+              if (!thinkBox) {
+                thinkBox = document.createElement('details');
+                thinkBox.className = 'think';
+                thinkBox.innerHTML = '<summary>Thinking</summary><div class="tbody"></div>';
+                chat.insertBefore(thinkBox, activeBubble); scroll();
+              }
+              thinkAcc += delta.reasoning_content;
+              paint(() => { thinkBox.querySelector('.tbody').textContent = thinkAcc; });
+            }
+            if (delta.content) {
+              acc += delta.content;
+              paint(() => { renderRich(bubble_, acc); });
+            }
+            if (j.usage) meta = (meta ? meta + ' · ' : '') + j.usage.total_tokens + ' tokens';
+          } catch {}
+        }
+      }
+      if (resp.headers.get('X-Budget-Warning')) meta += ' · ⚠ ' + resp.headers.get('X-Budget-Warning');
+      if (resp.headers.get('X-PCAI-Relay')) {
+        // Task C: make the relay legible — the header only ever says
+        // "streaming"; count the tool steps the events already reported.
+        meta += ' · relay: ' + (relayToolSteps
+          ? relayToolSteps + ' tool call' + (relayToolSteps === 1 ? '' : 's')
+          : resp.headers.get('X-PCAI-Relay'));
+      }
+      // Off-peak billing: the data-plane may attach X-PCAI-Billing:
+      // offpeak-<fraction> (e.g. "offpeak-0.5") ONLY while low-demand billing
+      // is active — parse the fraction and flag the reply in the bubble meta.
+      // meta is painted via textContent (inert), and the echoed raw header is
+      // escHtml'd anyway per the meta-hygiene pattern.
+      const billing = resp.headers.get('X-PCAI-Billing');
+      if (billing) {
+        const fm = /offpeak-([0-9]+(?:\.[0-9]+)?)/i.exec(String(billing));
+        meta += ' · ⚡ off-peak ' + (fm ? escHtml(fm[1]) + '×' : escHtml(String(billing)));
+      }
+      history.push({ role: 'assistant', content: acc });
+      paint(() => {
+        if (!acc) bubble_.textContent = '(empty response)';
+        let m = bubble_.querySelector('.meta');
+        if (meta) {
+          if (!m) { m = document.createElement('span'); m.className = 'meta'; bubble_.appendChild(m); }
+          m.textContent = meta;
+        }
+      });
+      scroll();
+      // the turn is complete — persist the transcript (auto-creates the
+      // conversation on the first turn; never blocks or fails the chat)
+      saveConversation();
+    } catch (e) {
+      bubble_.remove();
+      history.pop();
+      add('error', e.message);
+    } finally {
+      sendBtn.disabled = !ready();
+      promptIn.focus();
+      // F10: refresh the dropdown every turn so models registered after the
+      // user connected appear without a manual Connect click.
+      loadModels().catch(() => {});
+      // the turn just spent budget — keep the strip honest (best-effort)
+      refreshBudgetStrip().catch(() => {});
+    }
+  }
+
+  // remember the tools preference — registered MCPs attach by default.
+  // Task A: the relay DEFAULTS ON (the flagship feature was invisible when
+  // the box defaulted off — users never found it, so "I don't have any MCP
+  // tools"). First visit: checked and remembered as '1'; only an EXPLICIT
+  // uncheck persists '0'.
+  const toolsPref = store.get('pcai-tools');
+  toolsChk.checked = toolsPref !== '0';
+  if (toolsPref == null) store.set('pcai-tools', '1');
+  toolsChk.addEventListener('change', () => {
+    store.set('pcai-tools', toolsChk.checked ? '1' : '0');
+  });
+
+  form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
+  promptIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  sendBtn.disabled = true;
+
+  // remember the chat key across visits (iframe-safe store wrapper) — prefill
+  // and auto-connect; a stored key that 401s is dropped by loadModels.
+  const savedKey = store.get('pcai-llm-key');
+  if (savedKey) {
+    keyIn.value = savedKey;
+    connectKey();
+  }
+
+  // Z4 boot (same best-effort posture as the enroll/usage surfaces): ask the
+  // backend whether this browser session carries an SSO identity that may
+  // self-mint. Runs even WITH a pasted key — a discovered SSO session
+  // outranks it on the chip (RAG's paste-vs-session precedence) and the
+  // chip row is what renders first. Shows the card + chip, or nothing at
+  // all — never blocks the chat either way. No stored key and no SSO: the
+  // chip row stays hidden (renderIdentityChip's !ssoSeen && !ready() branch) —
+  // nothing to disclose until a key is pasted or an SSO identity resolves.
+  ssoProbeIdentity().then(() => { if (!ssoSeen) renderIdentityChip(); }).catch(() => {});
+})();
+</script>
+</body>
+</html>

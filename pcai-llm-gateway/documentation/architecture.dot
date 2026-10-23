@@ -1,0 +1,151 @@
+// pcai-llm-gateway — MCP fleet & entry-path comparison (whiteboard, 2026-10-13)
+//
+// Render:
+//   dot -Tsvg documentation/architecture.dot -o documentation/architecture.svg
+//   dot -Tpng -Gdpi=150 documentation/architecture.dot -o documentation/architecture.png
+//
+// "USER" below = the local agent harness (automated), not a human.
+//
+// Two ALTERNATIVE entry designs — never used in tandem. Both traces show the
+// same request shape: model -> SQL -> model.
+//
+//   GREEN ①-⑤  pcai-llm-gateway (relay): the tool loop runs in-cluster.
+//              ① user call · ② relay model · ③ relay tool (call SQL) ·
+//              ④ tool out — SQL result fed back to model · ⑤ return out.
+//              The harness only ever touches ① and ⑤.
+//
+//   BLACK 1-10 LiteLLM (no relay): every tool call surfaces to the harness,
+//              which calls the MCP itself and re-sends.
+//              1 user call · 2 model · 3 return — tool call surfaces ·
+//              4 MCP (harness calls it) · 5 call SQL · 6 return — SQL result ·
+//              7 return — to harness · 8 data to model (re-send) ·
+//              9 model — 2nd call · 10 full return.
+//              Each model call pays an extra hop through the harness.
+//
+// Note: whiteboard's green flow compresses ④/⑤ into a single "4 return out";
+// they are split here so the tool-out-to-model leg keeps its own number.
+
+digraph pcai_llm_gw {
+  rankdir=TB;
+  compound=true;
+  nodesep=0.5;
+  ranksep=1.0;
+  fontname="Helvetica";
+  labelloc=t;
+  fontsize=14;
+  label="pcai-llm-gateway — MCP fleet & entry paths (model → SQL → model trace)\nUSER = local agent harness · green ①-⑤: pcai-llm-gw, relayed in-cluster · black 1-10: LiteLLM, no relay — harness runs the loop";
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.18,0.10"];
+  edge [fontname="Helvetica", fontsize=9, penwidth=1.4, arrowsize=0.8];
+
+  // ---------- actor + entries ----------
+  user [label="USER — local agent harness",
+        fillcolor="#dbeafe", color="#1d4ed8"];
+
+  gateway [label="pcai-llm-gateway\n/v1 OpenAI proxy · /mcp federation\ntool relay in-cluster · budget + per-tool ACLs",
+           fillcolor="#fbcfe8", color="#9d174d", penwidth=2.2];
+
+  litellm [label="LiteLLM\n(alternative entry — no relay)",
+           fillcolor="#f3f4f6", color="#374151", style="rounded,filled,dashed"];
+
+  // ---------- models ----------
+  subgraph cluster_models {
+    label="Models (endpoint pools)"; labeljust=l; fontname="Helvetica-Bold"; fontsize=12;
+    style="rounded"; color="#dc2626";
+    glm  [label="GLM 5.3 F",        fillcolor="#fee2e2", color="#dc2626"];
+    dsk  [label="DeepSeek 4.1 F",   fillcolor="#fee2e2", color="#dc2626"];
+    qwen [label="Qwen3.8-27B",       fillcolor="#fee2e2", color="#dc2626"];
+  }
+
+  // ---------- MCP fleet ----------
+  subgraph cluster_mcp {
+    label="MCP fleet"; labeljust=l; fontname="Helvetica-Bold"; fontsize=12;
+    style="rounded"; color="#6b7280";
+
+    subgraph cluster_data {
+      label="Data Handling — memory, knowledge, SQL"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#16a34a";
+      rag_mem  [label="MM RAG — memory\n(long-term · short-term)", fillcolor="#dcfce7", color="#16a34a"];
+      rag_know [label="MM RAG — knowledge\n(unstructured)", fillcolor="#dcfce7", color="#16a34a"];
+      sql      [label="SQL handler",                  fillcolor="#dcfce7", color="#16a34a"];
+    }
+    subgraph cluster_viz {
+      label="Visualization — charting"; labeljust=l; fontname="Helvetica-Bold"; fontsize=11;
+      style="rounded"; color="#db2777";
+      seaborn [label="Seaborn", fillcolor="#fce7f3", color="#db2777"];
+    }
+    subgraph cluster_research {
+      label="Research — web search & fetching"; labeljust=l; fontname="Helvetica-Bold";
+      fontsize=11; style="rounded"; color="#d97706";
+      searx [label="searxng\nweb search + fetch_content", fillcolor="#fef3c7", color="#d97706"];
+    }
+    subgraph cluster_admin {
+      label="Cluster Admin — read-only ops, logs, deploy"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#6b7280";
+      k8s  [label="k8s-ops\n(read-only)",       fillcolor="#f3f4f6", color="#6b7280"];
+      logs [label="logsearch\n(namespace-wide)", fillcolor="#f3f4f6", color="#6b7280"];
+      ag   [label="applygate\n(manifest handler)", fillcolor="#f3f4f6", color="#6b7280"];
+      ez   [label="ezapp deploy\nupdater",       fillcolor="#f3f4f6", color="#6b7280"];
+    }
+  }
+
+  // =============================================
+  // GREEN — pcai-llm-gateway (relayed, ①-⑤):
+  // model -> SQL -> model never leaves the cluster;
+  // the harness touches only ① and ⑤
+  // =============================================
+  edge [color="#16a34a", fontcolor="#15803d", penwidth=2.0];
+
+  user -> gateway [label="①  User Call"];
+
+  gateway -> glm [label="②  Relay Model — model call\l④  Tool Out — SQL result fed back\l       to model, loop continues in-cluster\l",
+                  dir=both, lhead=cluster_models];
+
+  gateway -> sql [label="③  Relay Tool — Call SQL\l     (SQL result ③ → ④)\l",
+                  dir=both, lhead=cluster_data];
+  gateway -> k8s [label="③ / ④", style=dashed, dir=both, lhead=cluster_admin];
+  gateway -> seaborn [label="③ / ④", style=dashed, dir=both, lhead=cluster_viz];
+  gateway -> searx [label="③ / ④", style=dashed, dir=both, lhead=cluster_research];
+
+  gateway -> user [label="⑤  Return Out — final response",
+                   constraint=false, style=dashed];
+
+  // =============================================
+  // BLACK — LiteLLM (no relay, 1-10): the HARNESS
+  // runs the loop — model -> SQL -> model crosses
+  // the harness boundary twice
+  // =============================================
+  edge [color="#111111", fontcolor="#111111", penwidth=1.4];
+
+  user -> litellm [label="1  User Call"];
+
+  litellm -> glm [label="2  Model\l8  Data to Model — harness re-sends\l       request + SQL output\l9  Model — 2nd call\l",
+                  dir=both, lhead=cluster_models];
+
+  litellm -> user [label="3  Return — tool call surfaces\l10  Full Return — final response\l",
+                   constraint=false, style=dashed];
+
+  user -> k8s [label="4  MCP — harness calls the MCP itself\l5  Call SQL · 6  Return — SQL result\l7  Return — to harness\l",
+               dir=both, style=dashed, lhead=cluster_mcp];
+
+  { rank=same; gateway; litellm; }
+
+  // ---------- legend ----------
+  subgraph cluster_legend {
+    label="Legend — model → SQL → model, side by side"; labeljust=l; fontsize=11;
+    style="rounded"; color="#9ca3af";
+    legend [shape=plaintext, style="",
+            label=<<table border="0" cellborder="0" cellspacing="2">
+              <tr><td align="left"><font color="#16a34a">━ ①-⑤</font></td>
+                  <td align="left"><b>pcai-llm-gateway</b> — tool loop relays in-cluster:</td></tr>
+              <tr><td> </td>
+                  <td align="left">the harness sees only the user call (①) and the final response (⑤).</td></tr>
+              <tr><td align="left"><font color="#111111">━ 1-10</font></td>
+                  <td align="left"><b>LiteLLM</b> — relayless: every tool call surfaces to the harness,</td></tr>
+              <tr><td> </td>
+                  <td align="left">which calls the MCP itself and re-sends — <b>two extra harness hops</b></td></tr>
+              <tr><td> </td>
+                  <td align="left">(model → harness → MCP → harness → model) per tool call.</td></tr>
+            </table>>];
+  }
+}

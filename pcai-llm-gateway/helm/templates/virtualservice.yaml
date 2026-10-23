@@ -1,0 +1,119 @@
+{{- if .Values.ezua.enabled }}
+# networking.istio.io/v1 (v1alpha3 is deprecated in current Istio).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ .Values.deployment.name }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    hpe-ezua/app: {{ .Values.deployment.appName }}
+    hpe-ezua/type: vendor-service
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required !" }}
+  http:
+    # OpenAI-compatible proxy: /v1/chat/completions, /v1/embeddings,
+    # /v1/models -> the gateway (9200). Requires a virtual key
+    # (Authorization: Bearer hllm-...) issued through /admin.
+    - match:
+        - uri:
+            prefix: /v1
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    # Federated MCP: /mcp -> the gateway's MCP surface (streamable-http).
+    # MCP ACLs are per-tool, default-DENY (see README) — still expose it
+    # through the gateway only where real gateway auth sits in front.
+    - match:
+        - uri:
+            prefix: /mcp
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    # Admin API: /admin/* — key management, budgets, endpoint pools, MCP
+    # registry, usage. It mutates the control plane. OPT-IN to route
+    # publicly (ezua.routeAdmin, default FALSE — the plain-Ingress flavor
+    # has always omitted it; this now matches): flip it on ONLY where real
+    # gateway auth sits in front (ezua.authorizationPolicy enabled with the
+    # ezaf-gateway ALLOW-listed + SSO/bearer at the platform), and keep the
+    # admin Secret scoped to real operators. When false, /admin falls
+    # through to the catch-all "/" route below — SAME destination, so the
+    # change is routing-declarative only; the enforcement point is the
+    # AuthorizationPolicy (which, when enabled, gates by caller identity
+    # regardless of which route matched).
+    {{- if .Values.ezua.routeAdmin }}
+    - match:
+        - uri:
+            prefix: /admin
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    {{- end }}
+    # Health + readiness (public, inert) and /metrics (served when enabled).
+    - match:
+        - uri:
+            prefix: /health
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    - match:
+        - uri:
+            prefix: /ready
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    {{- if .Values.metrics.enabled }}
+    # /metrics only when metrics.enabled (chart-off = app-off — the gateway
+    # does not serve the path either; routing it would just 404).
+    - match:
+        - uri:
+            prefix: /metrics
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    {{- end }}
+    # Chat UI (/ and /ui): a static page that talks to /v1 from the browser.
+    # /v1 above already carries the routes this page calls; the page itself
+    # is inert until a valid bearer key is pasted in. MUST sit behind real
+    # gateway auth (ezua.authorizationPolicy / SSO) — it is a convenience
+    # for key holders, not an auth boundary.
+    - match:
+        - uri:
+            prefix: /ui
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+{{- end }}

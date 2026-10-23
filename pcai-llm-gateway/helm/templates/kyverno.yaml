@@ -1,0 +1,46 @@
+{{- if .Values.kyverno.enabled }}
+# Ported from the fleet charts (identical body to searxng-mcp's and
+# prometheus-mcp's templates/kyverno.yaml): a pre-install/pre-upgrade
+# ClusterPolicy that
+# stamps the PCAI vendor-service labels onto this chart's workloads, so the
+# EZUA console/tooling can recognize them. Hook annotations — pre-install
+# AND pre-upgrade
+# with before-hook-creation deletion — so re-installs are idempotent (the
+# pre-upgrade leg re-stamps the policy on chart upgrades).
+#
+# Gated by .Values.kyverno.enabled (default false): a ClusterPolicy is
+# cluster-scoped, and this chart's DEFAULT render must stay unchanged. The
+# gateway already runs readOnlyRootFilesystem, dropped ALL capabilities and
+# non-root uid 10001 (podSecurityContext), so no security-context mutation
+# is (or should be) applied. WITHOUT this policy the EZUA console shows the
+# app as "Unknown" instead of "Ready" (observed 2026-09 on G2).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  background: false
+  rules:
+  - name: add-vendor-app-labels
+    match:
+      any:
+      - resources:
+          # list all namespaces defined by the chart here
+          # if there are no namespace resource defined leave only .Release.Namespace
+          namespaces:
+          - {{ .Release.Namespace }}
+          kinds:
+          - Pod
+          - Deployment
+          - Service
+    mutate:
+      patchStrategicMerge:
+        metadata:
+            labels:
+              "hpe-ezua/type": vendor-service
+              "hpe-ezua/app": {{ .Chart.Name }}
+{{- end }}

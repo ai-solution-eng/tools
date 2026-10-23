@@ -1,0 +1,48 @@
+--- a/node_modules/.pnpm/@earendil-works+pi-ai@0.85.1_patch_hash=b9bcce474fb2ac44633dff0fa722816a5bff5451b4575d5_3c00b6f0f25c45085bf0800c5ed7b6d4/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js
++++ b/node_modules/.pnpm/@earendil-works+pi-ai@0.85.1_patch_hash=b9bcce474fb2ac44633dff0fa722816a5bff5451b4575d5_3c00b6f0f25c45085bf0800c5ed7b6d4/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js
+@@ -369,6 +369,14 @@
+             for await (const chunk of openaiStream) {
+                 if (!chunk || typeof chunk !== "object")
+                     continue;
++                // PCAI gateway relay (Wave R1 contract): standalone {"pcai": …}
++                // data lines carry no choices — surface them as a dedicated
++                // event type instead of dropping them, so the harness adapter
++                // can join relay-executed tool calls with their result previews.
++                if (chunk.pcai && !Array.isArray(chunk.choices)) {
++                    stream.push({ type: "pcai_event", pcai: chunk.pcai, partial: output });
++                    continue;
++                }
+                 // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+                 // and each chunk in a streamed completion carries the same id.
+                 output.responseId ||= chunk.id;
+@@ -441,6 +449,15 @@
+                     if (choice?.delta?.tool_calls) {
+                         for (const toolCall of choice.delta.tool_calls) {
+                             const block = ensureToolCallBlock(toolCall);
++                            if (chunk.pcai && chunk.pcai.relay === true) {
++                                // PCAI relay render delta (Wave R1): the gateway
++                                // already executed this call in-cluster. Mark the
++                                // block; the final message must never carry it as
++                                // an executable tool_call (no replay pairing
++                                // exists client-side), and the adapter suppresses
++                                // its execution path.
++                                block.pcaiRelay = true;
++                            }
+                             if (!block.id && toolCall.id) {
+                                 block.id = toolCall.id;
+                                 toolCallBlocksById.set(toolCall.id, block);
+@@ -484,6 +501,14 @@
+             for (const block of blocks) {
+                 finishBlock(block);
+             }
++            // PCAI relay render blocks (Wave R1): display-only — remove them
++            // from the message so the harness never sees an executable call,
++            // and keep the stop reason honest (a relay-only stream is 'stop').
++            for (let i = output.content.length - 1; i >= 0; i--) {
++                if (output.content[i].type === "toolCall" && output.content[i].pcaiRelay) {
++                    output.content.splice(i, 1);
++                }
++            }
+             if (options?.signal?.aborted) {
+                 throw new Error("Request was aborted");
+             }

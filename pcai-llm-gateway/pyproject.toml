@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pcai-llm-gateway"
+version = "2.9.5"
+description = "Multi-tenant LLM + MCP gateway for HPE PCAI: OpenAI-compatible proxy over aggregated model endpoints, MCP federation with per-tool ACLs, virtual API keys with token budgets and an atomic usage ledger."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "HPE AI Solution Engineering" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # uvicorn's loop="auto"/http="auto" pick these up when present: libuv
+    # event loop + httptools parser (cp314 manylinux wheels verified 2026-09).
+    # Optional at runtime — uvicorn falls back to asyncio/h11 without them.
+    "uvloop>=0.22",
+    "httptools>=0.8",
+    "asyncpg>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx2>=2.12.0",   # direct client for upstream MCP relay (mcp SDK requires it too)
+    "mcp>=2.0.0",          # MCP 2.0 SDK (stateless streamable-http), fleet convention
+    "prometheus-client>=0.21",
+    # DIRECT imports carried transitively via mcp SDK extras until now — an
+    # SDK upgrade dropping them would break token auth and credential
+    # storage at runtime (audit finding 7). Declared explicitly:
+    "pyjwt[crypto]>=2.10.1",   # core.identity.validate_token — Keycloak JWT rung (lazy import)
+    "cryptography>=44.0",      # core.secretbox — Fernet-at-rest credential store (lazy import)
+    "anyio>=4.9",              # routes_proxy cancellation-shielded settle scopes (top-level import)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+pcai-llm-gateway = "pcai_llm.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pcai_llm"]
+# Ship the chat UI inside the package so "/" serves it from any install
+# (same pattern as SQLhandler's ui/).
+include = ["src/pcai_llm/ui/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["BLE001"]  # broad except at request boundaries returns errors to callers by design

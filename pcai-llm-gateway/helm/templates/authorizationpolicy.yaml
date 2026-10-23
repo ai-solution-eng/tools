@@ -1,0 +1,118 @@
+{{- if and .Values.ezua.enabled .Values.ezua.authorizationPolicy.enabled }}
+{{- $ap := .Values.ezua.authorizationPolicy }}
+{{- $app := .Values.deployment.appName }}
+{{- $ns := .Release.Namespace }}
+# Istio AuthorizationPolicy — ADDITIVE and OFF by default
+# (ezua.authorizationPolicy.enabled, default false): the DEFAULT render is
+# byte-identical to the baseline. Requires ezua.enabled=true (it guards the
+# ezua-exposed workload) and sidecar injection in the release namespace —
+# this is the MESH L7 control; the CNI-layer control is networkPolicy above.
+#
+# ⚠️ COUPLING (why this exists): settings.trustProxyIdentity
+# (PCAI_LLM_TRUST_PROXY_IDENTITY) makes the gateway CONSUME the oauth2-proxy
+# identity headers — those headers are client-spoofable at the pod, so the
+# flag alone is NOT the control. It is safe ONLY where (a) an enforcing
+# proxy (oauth2-proxy at the ezaf-gateway) OVERWRITES the identity headers
+# on every request AND (b) THIS AuthorizationPolicy keeps unauthenticated
+# callers from bypassing the proxy: with the policy present, Istio denies
+# everything not ALLOW-listed, so a direct in-cluster call can no longer
+# smuggle X-Auth-Request-User past the identity ladder.
+#
+# With ezua.authorizationPolicy.rules left empty (default), rules (i)-(ii)
+# below render. ALLOW-only semantics: once an AuthorizationPolicy with
+# ALLOW rules matches a workload, ANY request without a matching rule is
+# DENIED — so the kubelet problem is real and needs an explicit answer.
+# Rule (iii) is that answer's knob, not a rule: the kubelet is OUTSIDE the
+# mesh (no SPIFFE identity, not selectable via principals/namespaces/
+# ipBlocks that would not also admit pod traffic) and there is no separate
+# probe port to allow-list (liveness/readiness share the app port), so the
+# documented relief valve is traffic.sidecar.istio.io/excludeInboundPorts
+# (ezua.authorizationPolicy.excludeInboundPorts — stamped on the deployment
+# pod spec): the port leaves the mesh, kubelet probes bypass Envoy entirely,
+# and the NetworkPolicy ipBlock rule (networkpolicy.yaml (iii)) becomes the
+# control for it. ⚠️ An excluded port bypasses ALL AuthorizationPolicy
+# rules — never exclude a port that serves real traffic.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-authz
+  namespace: {{ $ns }}
+  labels:
+    app: {{ $app }}
+    "hpe-ezua/app": {{ .Chart.Name }}
+    "hpe-ezua/type": vendor-service
+spec:
+  # Target the gateway pods by label — an empty selector would make this a
+  # namespace-wide policy (rejected by istiod as IST0092).
+  selector:
+    matchLabels:
+      app: {{ $app }}
+  action: ALLOW
+  rules:
+    {{- if $ap.rules }}
+    # Operator-supplied rules REPLACE the baseline (lists replace).
+    {{- toYaml $ap.rules | nindent 4 }}
+    {{- else }}
+    # (i) Ingress-gateway workloads — the ezaf-gateway leg that terminates
+    #     the public route (virtualservice.yaml) and (where deployed) the
+    #     oauth2-proxy enforcing proxy: the only legitimate writers of the
+    #     proxy identity headers. DEFAULT match is the whole
+    #     ingressNamespace (istio-system): AuthorizationPolicy has no
+    #     pod-label SOURCE matcher (only principals/namespaces/ipBlocks),
+    #     and the gateway pods' ServiceAccount names are SITE-specific.
+    #     Tighten it with ingressGatewayPrincipals (SPIFFE IDs,
+    #     cluster.local/ns/<ns>/sa/<sa> — discover the gateway pods' SA
+    #     with kubectl -n istio-system get pod -l 'app=ezaf-gateway'
+    #     -o jsonpath='{.items[0].spec.serviceAccountName}').
+    - from:
+        - source:
+            {{- if $ap.ingressGatewayPrincipals }}
+            principals:
+              {{- toYaml $ap.ingressGatewayPrincipals | nindent 14 }}
+            {{- else }}
+            namespaces: ["{{ $ap.ingressNamespace }}"]
+            {{- end }}
+    # (ii) Same-namespace callers (registry scraping / ops tooling
+    #      co-deployed in the release namespace).
+    - from:
+        - source:
+            namespaces: ["{{ $ns }}"]
+    {{- if $ap.allowMetricsScrape }}
+    # (iii) Metrics scrape — ANY source, scoped to the metrics path on the
+    #     service port ONLY. The 2026-10-07 G2 rollout proved a
+    #     namespace-scoped rule cannot do this job: kube-prometheus scrapes
+    #     raw POD IPs, and a raw-IP outbound connection is envoy
+    #     passthrough — PLAINTEXT even from a MESHED scraper (verified
+    #     live: prometheus-0 given a sidecar, up stayed 0) — so no peer
+    #     identity exists for a namespaces/principals matcher to match.
+    #     /metrics carries endpoint/outcome labels only — never tenant,
+    #     key or prompt material (see servicemonitor.yaml) — so an
+    #     any-source rule on exactly this path restores the pre-policy
+    #     posture and loosens nothing that matters. Both spellings: the
+    #     app redirects /metrics -> /metrics/ and the scraper follows.
+    - to:
+        - operation:
+            ports: ["{{ .Values.service.port }}"]
+            paths: ["/metrics", "/metrics/"]
+    {{- end }}
+    {{- if $ap.allowInClusterApi }}
+    # (iv) In-cluster API access (ADDITIVE, default false; SITE call):
+    #      ANY source on the traffic port EXCEPT the identity-bearing
+    #      paths. For consumers that call the gateway's SERVICE directly
+    #      (DSH, OpenWebUI, opencode-web, clearwing…): unmeshed raw-IP or
+    #      plaintext callers carry no peer identity, so per-namespace
+    #      rules cannot match them (the (iii) lesson, same rollout). The
+    #      app's own key auth remains the control on every admitted path —
+    #      the edge classifies /v1/* exactly the same way. The
+    #      IDENTITY-BEARING paths (/v1/identity, /v1/keys/for-me — the
+    #      ONLY routes whose resolver consumes the browser-header rung,
+    #      routes_identity.py) stay reachable ONLY from the edge (rule i):
+    #      with trustProxyIdentity on, an in-cluster pod must never be
+    #      able to deliver spoofed X-Auth-Request-* headers to a mint.
+    - to:
+        - operation:
+            ports: ["{{ .Values.service.port }}"]
+            notPaths: ["/v1/identity", "/v1/keys/for-me"]
+    {{- end }}
+    {{- end }}
+{{- end }}

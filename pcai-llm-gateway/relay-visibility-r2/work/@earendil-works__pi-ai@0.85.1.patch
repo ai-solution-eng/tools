@@ -1,0 +1,220 @@
+diff --git a/dist/api/anthropic-messages.js b/dist/api/anthropic-messages.js
+index e1538a5dfcf2225da9dc3ec622576564ee7c8530..abb8f990d680ee247708ca774a467fc5774e28b0 100644
+--- a/dist/api/anthropic-messages.js
++++ b/dist/api/anthropic-messages.js
+@@ -500,7 +500,6 @@ export const stream = (model, context, options) => {
+                         const block = blocks[index];
+                         if (block && block.type === "toolCall") {
+                             block.partialJson += event.delta.partial_json;
+-                            block.arguments = parseStreamingJson(block.partialJson);
+                             stream.push({
+                                 type: "toolcall_delta",
+                                 contentIndex: index,
+diff --git a/dist/api/bedrock-converse-stream.js b/dist/api/bedrock-converse-stream.js
+index 6bc6312906ec3d75f31d190994d21c87f1d0767d..7ff68fb60c3c1d9e3e7d2d2df8d4619593a67335 100644
+--- a/dist/api/bedrock-converse-stream.js
++++ b/dist/api/bedrock-converse-stream.js
+@@ -453,7 +453,6 @@ function handleContentBlockDelta(event, blocks, output, stream) {
+     }
+     else if (delta?.toolUse && block?.type === "toolCall") {
+         block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
+-        block.arguments = parseStreamingJson(block.partialJson);
+         stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
+     }
+     else if (delta?.reasoningContent) {
+diff --git a/dist/api/mistral-conversations.js b/dist/api/mistral-conversations.js
+index 67f9341a6f7d855dce25054fd48cd9077e8e04a1..afdb5c2c873abb72ca8011b7e3f06a230dbe3e8a 100644
+--- a/dist/api/mistral-conversations.js
++++ b/dist/api/mistral-conversations.js
+@@ -543,7 +543,6 @@ async function consumeChatStream(model, output, stream, mistralStream) {
+                 ? toolCall.function.arguments
+                 : JSON.stringify(toolCall.function.arguments || {});
+             block.partialArgs = (block.partialArgs || "") + argsDelta;
+-            block.arguments = parseStreamingJson(block.partialArgs);
+             stream.push({
+                 type: "toolcall_delta",
+                 contentIndex: toolBlocksByKey.get(key),
+--- a/dist/api/openai-completions.js
++++ b/dist/api/openai-completions.js
+@@ -215,16 +215,18 @@
+                 maxRetryDelayMs: options?.maxRetryDelayMs,
+                 signal: options?.signal,
+             });
+             await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+             stream.push({ type: "start", partial: output });
+             let textBlock = null;
+             let thinkingBlock = null;
+             let hasFinishReason = false;
++            let pcaiLastIteration;
++            let lastRelayBlock;
+             const toolCallBlocksByIndex = new Map();
+             const toolCallBlocksById = new Map();
+             const blocks = output.content;
+             const getContentIndex = (block) => blocks.indexOf(block);
+             const getCustomToolCallInput = (block) => {
+                 const property = block.customInput?.property;
+                 if (property === undefined)
+                     return "";
+@@ -235,16 +237,25 @@
+                 const customInput = block.customInput;
+                 if (!customInput)
+                     return undefined;
+                 const delta = appendGrammarToolInputJsonDelta(customInput.jsonBuffer, customInput.property, nextInput, close);
+                 block.arguments = { [customInput.property]: nextInput };
+                 return delta;
+             };
+             const finishBlock = (block) => {
++                // PCAI relay render block (r3): finalize once — the pcai
++                // telemetry hook (mid-stream) or the end-of-stream loop below,
++                // never both.
++                if (block.type === "toolCall" && block.pcaiRelay === true) {
++                    if (block.pcaiFinished === true) {
++                        return;
++                    }
++                    block.pcaiFinished = true;
++                }
+                 const contentIndex = getContentIndex(block);
+                 if (contentIndex === -1) {
+                     return;
+                 }
+                 if (block.type === "text") {
+                     stream.push({
+                         type: "text_end",
+                         contentIndex,
+@@ -373,16 +384,58 @@
+                 // and each chunk in a streamed completion carries the same id.
+                 output.responseId ||= chunk.id;
+                 if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
+                     output.responseModel ||= chunk.model;
+                 }
+                 if (chunk.usage) {
+                     output.usage = parseChunkUsage(chunk.usage, model);
+                 }
++                if (chunk.pcai && !Array.isArray(chunk.choices)) {
++                    // PCAI relay cycle-break (r3): the relay numbers its in-stream
++                    // model cycles on every thinking telemetry event. A NEW cycle
++                    // number closes pi-ai's single accumulated thinking/text blocks
++                    // (thinking_end/text_end at the CURRENT indexes) and clears the
++                    // block pointers, so the following cycle's reasoning/content
++                    // deltas open FRESH blocks at their true stream position —
++                    // per-cycle Think panels instead of one ever-growing panel
++                    // that fills while the answer text below it is already final.
++                    if (chunk.pcai.event === "thinking" && typeof chunk.pcai.iteration === "number") {
++                        const it = chunk.pcai.iteration;
++                        if (typeof pcaiLastIteration === "number" && it > pcaiLastIteration) {
++                            if (thinkingBlock !== null) {
++                                finishBlock(thinkingBlock);
++                                thinkingBlock = null;
++                            }
++                            if (textBlock !== null) {
++                                finishBlock(textBlock);
++                                textBlock = null;
++                            }
++                        }
++                        pcaiLastIteration = it;
++                    }
++                    if (chunk.pcai.event === "tool_call" || chunk.pcai.event === "tool_error") {
++                        // The call's argument deltas are complete by the time its
++                        // telemetry event arrives — finalize the display-only block
++                        // AT ITS STREAM POSITION (toolcall_end, original index), so
++                        // the rendering client sees the completed card between the
++                        // cycles instead of every card closing at stream end.
++                        const relayBlock =
++                            (typeof chunk.pcai.id === "string" ? toolCallBlocksById.get(chunk.pcai.id) : undefined) || lastRelayBlock;
++                        if (relayBlock !== undefined && relayBlock.pcaiRelay === true) {
++                            finishBlock(relayBlock);
++                        }
++                    }
++                    // PCAI gateway relay (Wave R1 contract): standalone {"pcai": …}
++                    // SSE data objects carry no choices — surface them as a dedicated
++                    // event instead of dropping them, so the harness adapter can join
++                    // relay-executed tool calls with their result previews.
++                    stream.push({ type: "pcai_event", pcai: chunk.pcai, partial: output });
++                    continue;
++                }
+                 const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+                 if (!choice)
+                     continue;
+                 // Fallback: some providers (e.g., Moonshot) return usage
+                 // in choice.usage instead of the standard chunk.usage
+                 if (!chunk.usage && choice.usage) {
+                     output.usage = parseChunkUsage(choice.usage, model);
+                 }
+@@ -444,21 +497,29 @@
+                             if (!block.id && toolCall.id) {
+                                 block.id = toolCall.id;
+                                 toolCallBlocksById.set(toolCall.id, block);
+                             }
+                             const name = toolCall.function?.name ?? toolCall.custom?.name;
+                             if (!block.name && name) {
+                                 block.name = name;
+                             }
++                            if (chunk.pcai && chunk.pcai.relay === true) {
++                                // PCAI relay render delta (Wave R1): the gateway
++                                // already executed this call in-cluster. Mark the
++                                // block display-only; the assembled message must
++                                // never carry it as an executable tool_call (no
++                                // replay pairing exists client-side).
++                                block.pcaiRelay = true;
++                                lastRelayBlock = block;
++                            }
+                             let delta = "";
+                             if (toolCall.function?.arguments) {
+                                 delta = toolCall.function.arguments;
+                                 block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
+-                                block.arguments = parseStreamingJson(block.partialArgs);
+                             }
+                             else if (toolCall.custom?.input) {
+                                 const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
+                                 delta = appendCustomToolCallInput(block, nextInput, false) ?? "";
+                             }
+                             stream.push({
+                                 type: "toolcall_delta",
+                                 contentIndex: getContentIndex(block),
+@@ -480,16 +541,21 @@
+                             appendOpenAIReasoningDetail(streamedReasoningDetails, detail);
+                         }
+                     }
+                 }
+             }
+             for (const block of blocks) {
+                 finishBlock(block);
+             }
++            // PCAI relay render blocks (Wave R1): display-only — remove them
++            // from the message only after finishBlock has emitted every
++            // toolcall_end against the original content indexes, so no
++            // following block's index shifts.
++            output.content = output.content.filter((block) => !(block.type === "toolCall" && block.pcaiRelay));
+             if (options?.signal?.aborted) {
+                 throw new Error("Request was aborted");
+             }
+             if (output.stopReason === "aborted") {
+                 throw new Error("Request was aborted");
+             }
+             if (!hasFinishReason && !compat.supportsFinishReason) {
+                 output.stopReason = output.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+diff --git a/dist/api/openai-responses-shared.js b/dist/api/openai-responses-shared.js
+index 43e463dbfd1e6cc437ebc680468036f47678de26..f4259772e289c326697ea7f2ece25954bfb5a520 100644
+--- a/dist/api/openai-responses-shared.js
++++ b/dist/api/openai-responses-shared.js
+@@ -546,7 +546,6 @@ export async function processResponsesStream(openaiStream, output, stream, model
+             if (!slot || slot.block.partialJson === undefined)
+                 continue;
+             slot.block.partialJson += event.delta;
+-            slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+             pushToolCallDelta(slot, event.delta);
+         }
+         else if (event.type === "response.function_call_arguments.done") {
+diff --git a/dist/api/pi-messages.js b/dist/api/pi-messages.js
+index 5b9cb1680c47083a9a36eefa93124c67c750fd42..dc5a43ebd801fa6d4b7897c3739b588d4d571d3a 100644
+--- a/dist/api/pi-messages.js
++++ b/dist/api/pi-messages.js
+@@ -155,8 +155,6 @@ function createEventConverter(model) {
+             case "toolcall_delta": {
+                 const json = `${toolJson.get(event.contentIndex) ?? ""}${event.delta}`;
+                 toolJson.set(event.contentIndex, json);
+-                partial.content[event.contentIndex].arguments =
+-                    parseStreamingJson(json);
+                 break;
+             }
+             case "toolcall_end":

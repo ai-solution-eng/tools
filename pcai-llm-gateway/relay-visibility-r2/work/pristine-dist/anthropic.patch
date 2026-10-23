@@ -1,0 +1,12 @@
+diff --git a/dist/api/anthropic-messages.js b/dist/api/anthropic-messages.js
+index e1538a5dfcf2225da9dc3ec622576564ee7c8530..abb8f990d680ee247708ca774a467fc5774e28b0 100644
+--- a/dist/api/anthropic-messages.js
++++ b/dist/api/anthropic-messages.js
+@@ -500,7 +500,6 @@ export const stream = (model, context, options) => {
+                         const block = blocks[index];
+                         if (block && block.type === "toolCall") {
+                             block.partialJson += event.delta.partial_json;
+-                            block.arguments = parseStreamingJson(block.partialJson);
+                             stream.push({
+                                 type: "toolcall_delta",
+                                 contentIndex: index,
