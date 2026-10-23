@@ -112,7 +112,15 @@ openwork:
   serverVersion: "0.18.59"      # appVersion; baked into images.user
   opencodeVersion: "1.18.30"   # engine binary pin; MUST equal OpenWork's constants.json.opencodeVersion
   approvalMode: auto           # manual would time out every gated write in web mode
-  webBootstrapToken: false      # browser auto sign-in behind the router cookie gate
+  # true: the web UI gets the client bearer token injected into the page
+  # (window.__OPENWORK_BOOTSTRAP__). Without it every client-auth API call
+  # (status/workspaces/models) 401s and the UI strands on the welcome/connect
+  # screen after the router SSO login. The router cookie gate stays the auth
+  # boundary; the token is defence-in-depth behind it (spec D3). Note: the
+  # cloud handoff (PUT /den-session) is host-token-gated upstream and the
+  # page only receives the client token — cloud provider sync needs the host
+  # token pasted once in the UI settings panel (or stays cloud-only in Den).
+  webBootstrapToken: true
   disableCloudModels: false   # OpenWork Cloud sign-in/handoff enabled (origin approved in OpenWork Labs org settings)
   corsOrigins: ""              # empty => rendered from ezua.virtualService.endpoint
   readOnly: false
@@ -120,7 +128,8 @@ openwork:
   sandboxEnabled: false
   tokenSecret: ""
 
-RUNTIME_REV: 8
+# v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
+RUNTIME_REV: 11
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)

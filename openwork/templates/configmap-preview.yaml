@@ -332,7 +332,11 @@ data:
     // (provider keys) restart the web process instead of needing a pod restart.
     const openworkConfigPath = process.env.OPENWORK_SERVER_CONFIG || '/var/openwork/home/.config/openwork/server.json'
     const openworkConfigDir = path.dirname(openworkConfigPath)
-    const openworkWatchedFiles = ['server.json', 'auth.json']
+    // env.json / desktop-bootstrap.json: OpenWork Cloud sign-in state written into
+    // ~/.config/openwork. Watching them restarts the web process so cloud
+    // sign-in state dropped onto disk is picked up without a pod restart,
+    // mirroring the server.json/auth.json handling.
+    const openworkWatchedFiles = ['server.json', 'auth.json', 'env.json', 'desktop-bootstrap.json']
     const watchedConfigFiles = [
       ...new Set(
         (process.env.OPENCODE_WATCH_CONFIG_FILES || 'opencode.json,config.json,opencode.jsonc')
@@ -355,9 +359,31 @@ data:
     const webPort = Number(process.env.OPENWORK_PORT || '8787')
     const webHost = process.env.OPENWORK_HOST || '127.0.0.1'
     const portCheckHost = '127.0.0.1'
+    // Workspace precedence (upstream 0.18.60): the precedence chain is
+    //   --workspace CLI  >  OPENWORK_WORKSPACES env  >  server.json workspaces
+    // and openwork-server's `web` command AUTO-PUSHES process.cwd() as a
+    // workspace when BOTH the CLI flag list is empty AND OPENWORK_WORKSPACES is
+    // unset. That cwd fallback silently defeats server.json: the container's
+    // workingDir is /workspace, so the unit came up with ONE workspace named
+    // "Workspace" (path /workspace — the PARENT of personal/ and shared/)
+    // instead of the four config-declared ones. Verified live: the active
+    // workspace id resolved to sha256("/workspace")[0:12].
+    //
+    // Fix: when server.json declares workspaces, set OPENWORK_WORKSPACES to a
+    // whitespace-only value. parseList() returns [] for it (so no env-injected
+    // paths), but the env var is now DEFINED — which suppresses the cwd push
+    // and lets fileConfig.workspaces win. server.json stays authoritative and
+    // keeps the per-workspace NAMES (personal / shared / platform-*), which the
+    // path-only CLI/env routes cannot preserve.
+    const serverConfigPath = process.env.OPENWORK_SERVER_CONFIG || '/var/openwork/home/.config/openwork/server.json'
+    let serverConfigWorkspaces = []
+    try { serverConfigWorkspaces = (JSON.parse(fs.readFileSync(serverConfigPath, 'utf8')).workspaces || []) } catch {}
+    if (serverConfigWorkspaces.length > 0 && !process.env.OPENWORK_WORKSPACES) {
+      process.env.OPENWORK_WORKSPACES = ' '
+    }
     const openworkArgs = ['web', '--host', webHost, '--port', String(webPort),
-      '--workspace', '/workspace/personal',
-      '--config', process.env.OPENWORK_SERVER_CONFIG || '/var/openwork/home/.config/openwork/server.json',
+      ...(serverConfigWorkspaces.length > 0 ? [] : ['--workspace', '/workspace/personal']),
+      '--config', serverConfigPath,
       '--approval', process.env.OPENWORK_APPROVAL_MODE || 'auto']
     if ((process.env.OPENWORK_WEB_BOOTSTRAP_TOKEN || '1') === '0') openworkArgs.push('--no-bootstrap-token')
 
@@ -705,6 +731,7 @@ data:
       console.error('[opencode] config watch setup failed', error)
     }
     try {
+      if (!fs.existsSync(openworkConfigDir)) fs.mkdirSync(openworkConfigDir, { recursive: true })
       fs.watch(openworkConfigDir, (_event, filename) => {
         const changedFile = filename?.toString()
         if (!changedFile || openworkWatchedFiles.includes(changedFile)) {

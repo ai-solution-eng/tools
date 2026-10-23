@@ -14,3 +14,6 @@ docs/
 /README.md
 *.opencode-reference
 ezappconfig-openwork-web-helm.yaml
+
+# NFS silly-rename temp files (nfs server rename artifacts)
+.nfs*

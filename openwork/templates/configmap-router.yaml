@@ -1665,6 +1665,11 @@ data:
         ...(isWarmPool && !owner ? [] : [`$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`]),
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
+        '$RUN_AS_USER sh -c \'mkdir -p /var/openwork/home/.config/openwork && if [ ! -f /var/openwork/home/.config/openwork/server.json ] && [ -f /opt/openwork-defaults/openwork-server.json ]; then cp /opt/openwork-defaults/openwork-server.json /var/openwork/home/.config/openwork/server.json; fi\' || true',
+        // Convenience copy for tooling that looks for the engine config under
+        // ~/.config/openwork too: seeded copy-if-missing, never overwriting the
+        // canonical ~/.config/opencode/opencode.json (which the engine reads).
+        '$RUN_AS_USER sh -c \'if [ ! -f /var/openwork/home/.config/openwork/opencode.json ] && [ -f /var/openwork/home/.config/opencode/opencode.json ]; then cp /var/openwork/home/.config/opencode/opencode.json /var/openwork/home/.config/openwork/opencode.json; fi\' || true',
         '$RUN_AS_USER sh -c \'if [ ! -f /var/openwork/home/.config/opencode/opencode.json ]; then if [ -f /var/openwork/config/opencode/opencode.json ]; then cp /var/openwork/config/opencode/opencode.json /var/openwork/home/.config/opencode/opencode.json; else cp /opt/openwork-defaults/opencode.json /var/openwork/home/.config/opencode/opencode.json; fi; fi\'',
         "$RUN_AS_USER sh -c 'legacy_agents=/tmp/openwork-legacy-AGENTS.md; printf \"%s\n%s\n%s\n\" \"# HPE AI Essentials (AIE) Platform Assistant\" \"You are an expert AIE/PCAI platform engineer and advisor. You have access to live Kubernetes cluster tools, indexed product documentation, and web search.\" \"Your mission: **Think deeply. Act decisively. Anticipate what the user needs before they ask.**\" > \"$legacy_agents\"; if [ -f /var/openwork/home/.config/opencode/AGENTS.md ] && cmp -s \"$legacy_agents\" /var/openwork/home/.config/opencode/AGENTS.md; then rm /var/openwork/home/.config/opencode/AGENTS.md; fi; rm -f \"$legacy_agents\"' || true",
         {{- range .Values.opencodeSkills }}
@@ -3236,14 +3241,27 @@ data:
       })
     }
 
-    function authPageHtml(identity) {
+    function authPageHtml(identity, pendingGrant) {
       const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
       const adminConfigured = !!(adminUsername && adminPassword)
+      // OpenWork Cloud webAuth hands back on this origin as /?grant=... — the
+      // login page is the first responder. A signed-in visitor is sent straight
+      // to their environment WITH the grant attached (the pod UI consumes it); a
+      // visitor without a session sees the normal login page with the grant kept
+      // on a button so it survives the extra login click.
+      const grantForward = pendingGrant
+        ? (identity
+          ? `<noscript><meta http-equiv="refresh" content="0; url=/__oc_start?grant=${encodeURIComponent(pendingGrant)}"></noscript><script>window.location.replace('/__oc_start?grant=' + encodeURIComponent(${JSON.stringify(pendingGrant)}))</script>`
+          : `<a id="sso-grant-resume" href="/__oc_start?grant=${encodeURIComponent(pendingGrant)}" style="display:none"></a>`)
+        : ''
+      // With a pending OpenWork Cloud grant, "Open your environment" carries it
+      // through /__oc_start so the pod UI can finish the sign-in.
+      const startHref = pendingGrant ? `/__oc_start?grant=${encodeURIComponent(pendingGrant)}` : '/__oc_start'
       const strip = identity
         ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
             <div style="display:flex;gap:14px;">
-              <a href="/__oc_start" style="color:var(--accent);">Open your environment</a>
+              <a href="${startHref}" style="color:var(--accent);">Open your environment</a>
               <a href="/__oc_logout" style="color:var(--text-muted);">Log out</a>
             </div>
           </div>`
@@ -3455,21 +3473,22 @@ data:
       themeSwitch.addEventListener("change", function() { applyTheme(themeSwitch.checked ? "dark" : "light"); });
     })();
     </script>
+    ${grantForward}
     <footer class="hpe-footer">Powered by HPE Private Cloud AI</footer>
     </body>
     </html>`
     }
 
-    function serveAuthPage(response, identity) {
+    function serveAuthPage(response, identity, pendingGrant) {
       response.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
       })
-      response.end(authPageHtml(identity))
+      response.end(authPageHtml(identity, pendingGrant))
     }
 
-    function redirectToPod(response, slug) {
-      response.writeHead(302, { location: `/${slug}` })
+    function redirectToPod(response, slug, target) {
+      response.writeHead(302, { location: target || `/${slug}` })
       response.end()
     }
 
@@ -4102,7 +4121,10 @@ data:
           } else {
             await provisionReady(environment.names)
           }
-          redirectToPod(response, slugForUser(identity))
+          // Preserve the OpenWork Cloud webAuth grant through provisioning:
+          // the pod's UI reads ?grant= from its own URL to finish sign-in.
+          const grant = url.searchParams.get('grant')
+          redirectToPod(response, slugForUser(identity), grant ? `/${slugForUser(identity)}/?grant=${encodeURIComponent(grant)}` : undefined)
         } catch (error) {
           console.error('start request handling failed', error)
           json(response, error.statusCode || 500, { error: error.message })
@@ -4170,7 +4192,10 @@ data:
       // (the login page's "Continue with SSO" button) performs the same
       // registration + cookie + marker-clear the removed auto-flow did, and
       // /__oc_logout's suppress marker still governs it.
-      serveAuthPage(response, sessionIdentity)
+      // OpenWork Cloud webAuth returns to "/?grant=...": hand the grant to
+      // the auth page so it reaches the user's environment (see authPageHtml).
+      const pendingGrant = url.searchParams.get('grant') || undefined
+      serveAuthPage(response, sessionIdentity, pendingGrant)
     })
 
     // WebSocket upgrades for /{slug}/... and legacy /u-{hash}/... (terminal,
