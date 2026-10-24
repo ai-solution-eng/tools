@@ -4151,6 +4151,19 @@ class RoutingConfigPatch(BaseModel):
     decision_mode: str | None = None
     decision_min_confidence: float | None = Field(None, ge=0.0, le=1.0)
     decision_timeout_ms: int | None = Field(None, ge=250, le=30000)
+    # --- request scope + conversation stickiness (2026-10-23) ----------
+    # route_default_model is a DIFFERENT axis from decision_model: that
+    # dropdown picks WHO decides, this picks WHICH requests get decided
+    # (it promotes the legacy 'auto' alias into routing). Off by default so
+    # arming routing never silently changes what an existing client's
+    # request does; the explicit routing / routing__X names always route.
+    route_default_model: bool | None = None
+    # Never-downgrade stickiness: a routed conversation holds a capability
+    # floor and may escalate above it but never fall below it. Off by default.
+    sticky_routing: bool | None = None
+    # Idle reset for that floor (s). 0 = never reset. Bounded so a typo cannot
+    # park a floor for years nor thrash it on every turn.
+    sticky_routing_idle_reset_s: int | None = Field(None, ge=0, le=86400)
 
 
 class RoutingPromptPreview(BaseModel):

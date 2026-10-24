@@ -49,7 +49,7 @@ from ..config import settings
 from ..core import conversations, distiller_config, enroll_memory, memory_write, traces
 from ..core.budgets import check_budgets, settle
 from ..core.cascade import resolve_cascade
-from ..core.distiller import build_transcript, run_map_reduce
+from ..core.distiller import DistillTruncatedError, build_transcript, run_map_reduce
 from ..core.keys import KeyRecord
 from ..db import db
 from ..routing.router import router as model_router
@@ -424,6 +424,28 @@ def _llm_once_for(key: KeyRecord, request_id: str):
             request_id,
             cached_tokens=cached,
         )
+        # TRUNCATION GUARD (2026-10-23): a NON-empty reply that hit the
+        # max_tokens cap was treated as a successful distill -- two live
+        # memories shipped cut mid-document (one ends at a Pytest line, one
+        # mid-bullet). The empty-content branch above already names this
+        # cause for the reasoning-trace shape; this guard covers the
+        # content-present shape it misses. Map-stage calls (partial notes
+        # are legitimate intermediates) and callers that opted out via
+        # settings.distiller_reject_truncated are exempt.
+        finish = str(payload["choices"][0].get("finish_reason") or "")
+        used = int((payload.get("usage") or {}).get("completion_tokens") or 0)
+        map_stage = bool(getattr(llm_once, "_distill_map_stage", False))
+        if (
+            settings.distiller_reject_truncated
+            and not map_stage
+            and (finish == "length" or (used and max_tokens and used >= max_tokens))
+        ):
+            raise DistillTruncatedError(
+                "distill reply hit the max_tokens cap mid-document "
+                f"(finish_reason={finish or '?'}, completion_tokens={used}, "
+                f"max_tokens={max_tokens}) - document rejected before write; "
+                "raise distiller_max_tokens or retry"
+            )
         call_seq = getattr(llm_once, "_call_seq", None)
         if call_seq is None:
             call_seq = {"n": 0}
@@ -480,6 +502,43 @@ async def _mcp_call_for(key: KeyRecord):
         return True, text or "ok"
 
     return mcp_call
+
+
+async def _mcp_search_for(key: KeyRecord):
+    """Bind a search_memory probe to the registered memory server.
+
+    Same credential/URL discipline as _mcp_call_for (the registry row +
+    resolve_mcp_headers merge; no second credential path). The tool is
+    settings.distiller_memory_search_tool (operator-configurable, mirroring
+    distiller_memory_tool). Distinct helper, not a parameter of mcp_call:
+    the add tool and the search tool have different argument shapes, and the
+    dedup probe must never be able to write.
+    """
+    target = await enroll_memory.resolve_memory_server(settings.enroll_memory_server)
+    if target is None:
+        return None  # dedup is best-effort: no server -> no probe -> write anyway
+    from .routes_mcp import _upstream_session, resolve_mcp_headers
+
+    async def mcp_search(arguments: dict[str, Any]) -> tuple[bool, str]:
+        headers = await resolve_mcp_headers(target, key_id=key.id)
+
+        async def do(session: Any) -> Any:
+            return await session.call_tool(settings.distiller_memory_search_tool, arguments)
+
+        result = await _upstream_session(
+            str(target["url"]), headers, do, timeout_s=memory_write.WRITE_TIMEOUT_S
+        )
+        text = ""
+        for block in result.content or []:
+            t = getattr(block, "text", None)
+            if isinstance(t, str) and t:
+                text = t
+                break
+        if result.is_error:
+            return False, text or (settings.distiller_memory_search_tool + " refused")
+        return True, text
+
+    return mcp_search
 
 
 def _conversation_id(raw: str) -> uuid.UUID | None:
@@ -584,6 +643,7 @@ async def distill_inline(
         kind=memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK,
         fallback_doc=transcript if distilled else "",
         fallback_session_id=session_id,
+        mcp_search=await _mcp_search_for(key),
     )
     return {
         "ok": ok,
@@ -661,6 +721,7 @@ async def distill_conversation(
         # session_history
         fallback_doc=transcript if distilled else "",
         fallback_session_id=str(cid),
+        mcp_search=await _mcp_search_for(key),
     )
     kind = memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK
     # seed the marker on success: an explicit distill claims the conversation
@@ -974,6 +1035,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
         kind=memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK,
         fallback_doc=transcript if distilled else "",
         fallback_session_id=thread_id[:64],
+        mcp_search=await _mcp_search_for(key),
     )
     if ok:
         await distill_schedule.mark_canonical_distilled(key_id, thread_id, row.get("updated_at"), _content_hash)

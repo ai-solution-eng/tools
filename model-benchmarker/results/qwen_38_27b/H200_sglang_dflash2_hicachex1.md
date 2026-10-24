@@ -32,3 +32,43 @@ TTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ (shared prefix 
 | 32768 | 64 | coding | 9 | 165735.2 | 538340.4 | 554275.7 | 554441.3 | 286529.6 | 751683.5 | 898989.1 | 901328.8 | 35.3 | 20.9 | 17.5 | 13.9 |
 | 32768 | 64 | creative | 7 | 149044.2 | 293339.2 | 555892.0 | 564095.0 | 282228.2 | 598446.9 | 883495.7 | 900800.2 | 23.8 | 18.3 | 17.4 | 17.0 |
 | 32768 | 64 | mixed | 38 | 194117.4 | 853405.8 | 885767.8 | 885970.4 | 288911.4 | 887157.6 | 899403.6 | 901829.4 | 29.6 | 23.1 | 21.0 | 17.2 |
+
+## Derived: aggregate prefill throughput
+
+Computed from the TTFT column above, not measured separately:
+
+    aggregate prefill tok/s = users * ctx / (TTFT turn1 P100 in seconds)
+
+All `users` requests fire at once, so the last first-token (P100) marks
+when all `users * ctx` prompt tokens have been prefilled.  This is an
+AGGREGATE rate: it is flat-to-rising with concurrency, because more users each
+prefilling the same prompt is more total work in a similar window shape.
+Dividing it by `users` gives the per-user rate, which falls ~1/users.
+
+It does NOT mean the hardware is at peak: at ctx=32768 a single user already
+saturates prefill, and the achieved FLOPS sit around 30% of the 4x H200 BF16
+peak, limited by memory bandwidth and FP4/FP8 expert weights rather than FMA.
+
+Caveats:
+
+* `ctx` is the *nominal* padding target.  The padding rule assumes 4
+  chars/token while real tokenizers average ~5.3, so the true prompt is
+  roughly 25% shorter and these figures are ~25% high.
+* P100 is a single sample (the slowest request).  A level whose P100/P50
+  exceeds 2 is straggler-dominated and carries a leading `~`:
+  treat it as a floor, not a measurement.
+
+| ctx | users | task | P100 TTFT (ms) | P100/P50 | aggregate prefill tok/s |
+|:---|---:|:---|---:|---:|---:|
+| 32768 | 1 | coding | 2984 | 1.00 | 10,980 |
+| 32768 | 1 | creative | 2999 | 1.00 | 10,925 |
+| 32768 | 1 | mixed | 3092 | 1.00 | 10,596 |
+| 32768 | 4 | coding | 10428 | 1.15 | 12,569 |
+| 32768 | 4 | creative | 10441 | 1.14 | 12,554 |
+| 32768 | 4 | mixed | 10602 | 1.15 | 12,363 |
+| 32768 | 32 | coding | 165455 | 3.78 | ~6,338 |
+| 32768 | 32 | creative | 148349 | 3.41 | ~7,068 |
+| 32768 | 32 | mixed | 189381 | 4.35 | ~5,537 |
+| 32768 | 64 | coding | 554441 | 3.35 | ~3,782 |
+| 32768 | 64 | creative | 564095 | 3.78 | ~3,718 |
+| 32768 | 64 | mixed | 885970 | 4.56 | ~2,367 |

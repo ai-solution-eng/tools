@@ -45,3 +45,39 @@ TTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ (shared prefix 
 | | | | | | | | | | | | |
 | | | | | | | | | | | | |
 
+## Derived: aggregate prefill throughput
+
+Computed from the TTFT column above, not measured separately:
+
+    aggregate prefill tok/s = users * ctx / (TTFT turn1 P100 in seconds)
+
+All `users` requests fire at once, so the last first-token (P100) marks
+when all `users * ctx` prompt tokens have been prefilled.  This is an
+AGGREGATE rate: it is flat-to-rising with concurrency, because more users each
+prefilling the same prompt is more total work in a similar window shape.
+Dividing it by `users` gives the per-user rate, which falls ~1/users.
+
+It does NOT mean the hardware is at peak: at ctx=32768 a single user already
+saturates prefill, and the achieved FLOPS sit around 30% of the 4x H200 BF16
+peak, limited by memory bandwidth and FP4/FP8 expert weights rather than FMA.
+
+Caveats:
+
+* `ctx` is the *nominal* padding target.  The padding rule assumes 4
+  chars/token while real tokenizers average ~5.3, so the true prompt is
+  roughly 25% shorter and these figures are ~25% high.
+* P100 is a single sample (the slowest request).  A level whose P100/P50
+  exceeds 2 is straggler-dominated and carries a leading `~`:
+  treat it as a floor, not a measurement.
+
+| ctx | users | task | P100 TTFT (ms) | P100/P50 | aggregate prefill tok/s |
+|:---|---:|:---|---:|---:|---:|
+| 32768 | 1 | coding | 3486 | 1.00 | 9,400 |
+| 32768 | 1 | creative | 3446 | 1.00 | 9,509 |
+| 32768 | 1 | mixed | 3428 | 1.00 | 9,560 |
+| 32768 | 4 | coding | 12572 | 1.28 | 10,426 |
+| 32768 | 4 | creative | 12585 | 1.27 | 10,415 |
+| 32768 | 4 | mixed | 12602 | 1.28 | 10,401 |
+| 32768 | 32 | coding | 102452 | 1.90 | 10,235 |
+| 32768 | 32 | creative | 97185 | 1.93 | 10,789 |
+| 32768 | 32 | mixed | 82214 | 1.88 | 12,754 |

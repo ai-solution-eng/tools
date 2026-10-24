@@ -421,7 +421,8 @@ class TestLevelAggregation:
         # COMPACT format (one cell per metric group; fits GitHub width)
         assert "ITL P50/P95/P99/P100 (ms)" in header and "TPOT P50/P95/P99/P100 (ms)" in header
         cells = [c.strip() for c in lines[2].strip("|").split("|")]
-        assert len(cells) == 8  # 4 keys + TTFT + tokens/s + ITL + TPOT (compact, single-turn)
+        # 4 keys + TTFT + tokens/s + ITL + TPOT + prefill tok/s (compact, single-turn)
+        assert len(cells) == 9
         assert cells[4] == "100.0 / 110.0 / 120.0 / 130.0"  # TTFT group
         assert cells[5] == "33.0 / 32.0 / 31.0 / 30.0"  # tokens/s group
         assert cells[6] == "12.0 / 13.0 / 14.0 / 15.0"  # ITL group (extended)
@@ -447,7 +448,9 @@ class TestLevelAggregation:
         md = format_table_markdown([row], multiturn=True)
         lines = md.splitlines()
         cells = [c.strip() for c in lines[2].strip("|").split("|")]
-        assert len(cells) == 9  # multiturn compact: 4 keys + TTFT + TTFT-post + tokens/s + ITL + TPOT
+        # multiturn compact: 4 keys + TTFT + TTFT-post + tokens/s + ITL + TPOT
+        # + prefill tok/s (MB-PREFILL aggregate column)
+        assert len(cells) == 10
         parsed = rh._parse_md_chat_row(lines[2], lines[0].strip("|").split("|"))
         assert parsed["ctx"] == 32768 and parsed["failed"] == 2
         assert parsed["ttft"][0] == 19000.0 and parsed["tokens"][0] == 91.5
@@ -468,7 +471,7 @@ class TestLevelAggregation:
         )
         md = format_table_markdown([row], multiturn=True)
         cells = [c.strip() for c in md.splitlines()[2].strip("|").split("|")]
-        assert len(cells) == 9
+        assert len(cells) == 10
         parsed = rh._parse_md_chat_row(md.splitlines()[2], md.splitlines()[0].strip("|").split("|"))
         assert parsed["itl"] == [1.0, 1.0, 1.0, 1.0]
         assert parsed["tpot"] == [1.0, 1.0, 1.0, 1.0]

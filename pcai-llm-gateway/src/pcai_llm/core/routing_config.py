@@ -79,6 +79,35 @@ DEFAULTS: dict[str, Any] = {
     # Bounded so a hung decision endpoint cannot park a chat request. The
     # deployed d3-turbo answers a small state in ~790ms.
     "decision_timeout_ms": 2500,
+    # --- conversation stickiness (never-downgrade) -------------------------
+    # When on, a routed conversation remembers the capability position it was
+    # served at and may never move DOWN the ladder mid-conversation. It may
+    # still move UP (a "hi" that turns into a hard refactor must be able to
+    # escalate), and the stored head is re-validated every turn against the
+    # live candidate window / registry / ACL.
+    #
+    # WHY not a plain lock ("pick once, stay"): with capability routing a
+    # conversation that opens with "hi" lands on the cheapest model, and a
+    # literal lock would pin a subsequent hard refactor to it -- a quality
+    # REGRESSION dressed as a routing improvement. Never-downgrade gets the
+    # stability a lock is for (no thrash between turns) without the trap.
+    # Default OFF: it changes which model serves, so it is opt-in like every
+    # other behaviour-changing knob here.
+    "sticky_routing": False,
+    # Idle reset: a conversation untouched for this long forgets its floor and
+    # re-decides from scratch. Without it a long thread monotonically climbs to
+    # the ceiling (every escalation ratchets the floor up and nothing ever
+    # brings it back down). 0 = never reset (climb forever).
+    "sticky_routing_idle_reset_s": 1800,
+    # --- default-model opt-in ---------------------------------------------
+    # Whether a request that names NO model (or names the plain auto alias)
+    # is offered to the router instead of going straight to the cascade.
+    # Default OFF: auto keeps its documented meaning -- the legacy
+    # profile-order budget cascade -- so arming routing never silently
+    # changes what an existing client request does. This is the "flag" that
+    # promotes the default flow to routing; the explicit routing /
+    # routing__X names are unaffected by it and always route.
+    "route_default_model": False,
 }
 
 # The ONLY placeholder names render_prompt substitutes. Anything else in
@@ -166,6 +195,17 @@ async def _config() -> dict[str, Any]:
     if _cache and now - _cache_at < _CACHE_TTL_S:
         return _cache
     merged = dict(DEFAULTS)
+    # The ENV is the deployment default, the DB row is the OPERATOR override
+    # (this module docstring's own layering). Applied between the two so a
+    # helm value actually takes effect while the panel can still flip it --
+    # without this the env knobs are inert, because DEFAULTS alone is what the
+    # merge started from.
+    try:
+        merged["sticky_routing"] = bool(settings.sticky_routing)
+        merged["sticky_routing_idle_reset_s"] = int(settings.sticky_routing_idle_reset_s)
+        merged["route_default_model"] = bool(settings.route_default_model)
+    except Exception:  # pragma: no cover - settings are static per process
+        log.warning("routing config: env defaults unreadable - using module DEFAULTS")
     try:
         rows = await db.fetch("SELECT key, value FROM routing_config")
         for row in rows:

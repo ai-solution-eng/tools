@@ -56,6 +56,45 @@ DEFAULT_DISTILL_TOKENS = 2048
 KIND_SUMMARY = "project-summary"
 KIND_FALLBACK = "session_history"
 
+class DistillTruncatedError(Exception):
+    """The distill reply hit the max_tokens cap mid-document.
+
+    Raised by llm_once (routes_distill) when finish_reason == "length" with
+    NON-empty content and settings.distiller_reject_truncated is on. Distinct
+    from DistillModelFailure by DESIGN: the caller's failure handling treats
+    any Exception the same way (leave the row due / no raw fallback), but
+    tests and operators need the cause named, and the map stage must NEVER
+    see this for an intermediate part (partial notes are legitimate
+    intermediates -- only the final document must be complete).
+    """
+
+
+# The four section headers the DISTILL_SYSTEM_PROMPT contract requires. A
+# document missing one was cut (or degenerated); memory_body_chars cannot see
+# this because a half document still clears any length floor.
+REQUIRED_SECTIONS = (
+    "## What we did",
+    "## Key decisions",
+    "## Gotchas",
+    "## How to proceed",
+)
+
+
+def document_is_complete(doc: str) -> bool:
+    """True when the distilled document carries all four contract sections.
+
+    Belt-and-suspenders for the finish_reason guard: some proxies/models
+    drop finish_reason (returning None or "stop" on a capped reply), and a
+    document cut mid-section is still detectable structurally. Case-
+    sensitive exact-prefix match on the section headers the prompt mandates.
+    A missing-header document is not necessarily truncated (a caller-supplied
+    inline transcript may legitimately produce a shorter shape), so this is
+    the SECOND signal, never the only one.
+    """
+    if not isinstance(doc, str):
+        return False
+    return all(s in doc for s in REQUIRED_SECTIONS)
+
 DISTILL_SYSTEM_PROMPT = (
     "You distill AI-coding-assistant session transcripts into durable memory documents for a personal knowledge base.\n"
     "The knowledge base is a PROJECT MAP: what was worked on, how to access it, and how to proceed.\n"
@@ -366,13 +405,21 @@ async def run_map_reduce(
         )
         chunks = split_transcript(transcript, window)
         notes: list[str] = []
-        for i, chunk in enumerate(chunks):
-            note = await llm_once(
-                MAP_SYSTEM_PROMPT,
-                "Session part " + str(i + 1) + " of " + str(len(chunks)) + ":\n\n" + chunk,
-                MAP_DISTILL_TOKENS,
-            )
-            notes.append("### Part " + str(i + 1) + "\n" + note)
+        # MAP-STAGE MARKER (2026-10-23): partial notes are legitimate
+        # intermediates, so a capped map call must NOT raise
+        # DistillTruncatedError (routes_distill checks this attribute).
+        # Set for the loop, cleared before the final reduce call.
+        llm_once._distill_map_stage = True  # type: ignore[attr-defined]
+        try:
+            for i, chunk in enumerate(chunks):
+                note = await llm_once(
+                    MAP_SYSTEM_PROMPT,
+                    "Session part " + str(i + 1) + " of " + str(len(chunks)) + ":\n\n" + chunk,
+                    MAP_DISTILL_TOKENS,
+                )
+                notes.append("### Part " + str(i + 1) + "\n" + note)
+        finally:
+            llm_once._distill_map_stage = False  # type: ignore[attr-defined]
         input_text = "These are sequential notes from one session, part 1 first.\n\n" + "\n\n".join(notes)
 
     text = await llm_once(
@@ -383,4 +430,16 @@ async def run_map_reduce(
     text = text.strip()
     if not text:
         raise ValueError("distill model produced no text")
-    return synthesize_memory_index(text)
+    final_doc = synthesize_memory_index(text)
+    # TRUNCATION GUARD (2026-10-23): the DSH contract document is four
+    # sections; a document missing one was cut mid-write even when the
+    # upstream finish_reason lied or was dropped by a proxy. Raises
+    # DistillTruncatedError so the caller leaves the row due instead of
+    # shipping a half document.
+    if not document_is_complete(final_doc):
+        raise DistillTruncatedError(
+            "distilled document is missing required sections "
+            + repr(REQUIRED_SECTIONS)
+            + " - likely truncated mid-write; raise distiller_max_tokens or retry"
+        )
+    return final_doc

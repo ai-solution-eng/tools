@@ -50,9 +50,7 @@ S3_PREFIX = os.environ.get("S3_PREFIX", "")
 # Must be "" when no bucket is configured: a literal "s3:///" prefill would
 # ride along on every PVC-backend submit and be rejected by the s3_path
 # validator, which demands a bucket after the scheme.
-S3_DEFAULT_PATH = (
-    f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")
-) if S3_BUCKET else ""
+S3_DEFAULT_PATH = (f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")) if S3_BUCKET else ""
 # Debug pod ("Launch debug pod" in the UI). Requires chart >= 1.2.0, which
 # renders the debug-pod.yaml template into the job-template ConfigMap.
 DEBUG_POD_ENABLED = os.environ.get("DEBUG_POD_ENABLED", "true").strip().lower() == "true"
@@ -766,7 +764,16 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/catalog")
 async def get_catalog():
-    return {"tiers": catalog.list_by_tier(), "tier_labels": TIER_LABELS, "tier_info": TIER_INFO}
+    # "tiers" stays: the Download page (app.js) and the flat-table fallback
+    # still key off it.  "tree" is the lab > model > configuration grouping the
+    # catalog page renders, derived server-side so the grouping rules are
+    # unit-testable and identical for every client.
+    return {
+        "tiers": catalog.list_by_tier(),
+        "tier_labels": TIER_LABELS,
+        "tier_info": TIER_INFO,
+        "tree": catalog.tree(),
+    }
 
 
 @app.post("/api/catalog")

@@ -155,6 +155,35 @@ def test_pick_query_arg_fallback_first_required_string():
     assert pick_query_arg(tool) == "question"
 
 
+def test_pick_query_arg_optional_query_beats_required_dataset():
+    """Regression (2026-10-23): mm-rag's search_dataset declares dataset_name as
+    its ONLY required arg (query is optional for media-only search). The old
+    "query slot must be required" filter skipped it and fell through to
+    dataset_name, so every sampled query was sent AS the dataset name and 100%
+    of requests failed with "Invalid dataset name" at ~132 req/s."""
+    tool = _tool(
+        "search_dataset",
+        {
+            "dataset_name": {"type": "string"},
+            "query": {"type": "string"},
+            "top_k": {"type": "integer"},
+            "use_reranker": {"type": "boolean"},
+        },
+        ["dataset_name"],
+    )
+    assert pick_query_arg(tool) == "query"
+
+
+def test_pick_query_arg_never_returns_a_dataset_slot():
+    """No dataset-ish name may ever be chosen as the query slot."""
+    from model_benchmarker.endpoint_benchmarker.targets import DATASET_ARG_NAMES
+
+    for ds in DATASET_ARG_NAMES:
+        tool = _tool("t", {ds: {"type": "string"}}, [ds])
+        with pytest.raises(TargetError, match="--query-arg"):
+            pick_query_arg(tool)
+
+
 def test_pick_query_arg_error_lists_properties():
     tool = _tool("t", {"a": {"type": "integer"}, "b": {"type": "number"}}, ["a"])
     with pytest.raises(TargetError, match="--query-arg"):

@@ -87,7 +87,7 @@ class TestGateRender:
         """The gate must run AFTER the SUCCESS/config.json check so a failed
         download never scans (mirrors the manifest ordering rule)."""
         job = _cm_data(_render())["job.yaml"]
-        success_pos = job.find('SUCCESS: config.json is now present')
+        success_pos = job.find("SUCCESS: config.json is now present")
         gate_pos = job.find("GATE_EOF")
         assert 0 < success_pos < gate_pos
 
@@ -138,7 +138,6 @@ class TestGCRender:
         for marker in ("JOBS_EOF", "AIOLI_EOF", "GC_EOF"):
             _heredoc_body(script, marker)
 
-
     def test_gc_three_key_rule_in_job(self):
         docs = _docs(_render("gc.enabled=true"))
         cron = next(d for d in docs if d["kind"] == "CronJob")
@@ -149,8 +148,9 @@ class TestGCRender:
         assert "dry_run" in script and "shutil.rmtree" in script
 
     def test_gc_env_reaches_the_app(self):
-        out = _render("gc.enabled=true", "gc.dryRun=false", "gc.minKeep=3",
-                      "gc.protectedModels={deepseek-ai/*,models--Qwen--*}")
+        out = _render(
+            "gc.enabled=true", "gc.dryRun=false", "gc.minKeep=3", "gc.protectedModels={deepseek-ai/*,models--Qwen--*}"
+        )
         dep = next(d for d in _docs(out) if d["kind"] == "Deployment")
         env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
         assert env["GC_ENABLED"] == "true"

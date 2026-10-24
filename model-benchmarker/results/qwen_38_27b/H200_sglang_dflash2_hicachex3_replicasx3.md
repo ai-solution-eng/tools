@@ -32,3 +32,43 @@ TTFT turn1 = first request (full prefill);  TTFT-post = turns 2+ (shared prefix 
 | 32768 | 64 | coding | 0 | 29557.5 | 53307.9 | 54478.1 | 54892.1 | 4655.7 | 15675.0 | 20403.7 | 24576.4 | 46.2 | 34.3 | 32.6 | 31.8 |
 | 32768 | 64 | creative | 0 | 29664.2 | 52464.0 | 57227.2 | 57402.5 | 16220.7 | 143605.9 | 257552.2 | 266599.7 | 42.9 | 32.3 | 28.2 | 25.5 |
 | 32768 | 64 | mixed | 2 | 29679.4 | 53884.6 | 56703.3 | 56900.5 | 114437.2 | 363416.2 | 761329.1 | 883777.5 | 46.0 | 35.4 | 29.0 | 19.3 |
+
+## Derived: aggregate prefill throughput
+
+Computed from the TTFT column above, not measured separately:
+
+    aggregate prefill tok/s = users * ctx / (TTFT turn1 P100 in seconds)
+
+All `users` requests fire at once, so the last first-token (P100) marks
+when all `users * ctx` prompt tokens have been prefilled.  This is an
+AGGREGATE rate: it is flat-to-rising with concurrency, because more users each
+prefilling the same prompt is more total work in a similar window shape.
+Dividing it by `users` gives the per-user rate, which falls ~1/users.
+
+It does NOT mean the hardware is at peak: at ctx=32768 a single user already
+saturates prefill, and the achieved FLOPS sit around 30% of the 4x H200 BF16
+peak, limited by memory bandwidth and FP4/FP8 expert weights rather than FMA.
+
+Caveats:
+
+* `ctx` is the *nominal* padding target.  The padding rule assumes 4
+  chars/token while real tokenizers average ~5.3, so the true prompt is
+  roughly 25% shorter and these figures are ~25% high.
+* P100 is a single sample (the slowest request).  A level whose P100/P50
+  exceeds 2 is straggler-dominated and carries a leading `~`:
+  treat it as a floor, not a measurement.
+
+| ctx | users | task | P100 TTFT (ms) | P100/P50 | aggregate prefill tok/s |
+|:---|---:|:---|---:|---:|---:|
+| 32768 | 1 | coding | 2845 | 1.00 | 11,518 |
+| 32768 | 1 | creative | 2700 | 1.00 | 12,137 |
+| 32768 | 1 | mixed | 2838 | 1.00 | 11,546 |
+| 32768 | 4 | coding | 7777 | 1.25 | 16,854 |
+| 32768 | 4 | creative | 7752 | 1.24 | 16,908 |
+| 32768 | 4 | mixed | 7818 | 1.24 | 16,765 |
+| 32768 | 32 | coding | 29888 | 1.66 | 35,084 |
+| 32768 | 32 | creative | 27624 | 1.56 | 37,959 |
+| 32768 | 32 | mixed | 29805 | 1.68 | 35,182 |
+| 32768 | 64 | coding | 54892 | 1.86 | 38,205 |
+| 32768 | 64 | creative | 57402 | 1.94 | 36,534 |
+| 32768 | 64 | mixed | 56900 | 1.92 | 36,856 |

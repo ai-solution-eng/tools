@@ -2503,11 +2503,32 @@ async def chat_completions(
     # behavior (serve the name as it arrived), never fails the request.
     route_ctx: model_routing.RouteDecision | None = None
     _pseudo = model_routing.detect_pseudo_model(model)
+    # route_default_model promotes the legacy `auto` alias into routing. Read
+    # from the SAME cached routing config the decision seam below uses, so the
+    # two can never disagree within one request. Fail-safe: a config fault
+    # leaves auto on its documented cascade path (the pre-flag behaviour).
+    _rdef = False
+    _routable_models: list[str] | None = None
+    try:
+        from ..core import routing_config as _rc_early
+
+        _routing_cfg = await _rc_early.get_config()
+        _rdef = bool(_routing_cfg.get("route_default_model"))
+        # The console allowlist is ELIGIBILITY; the profile ladder is capability
+        # ORDER (core.model_routing.expand_candidates). Before this the panel
+        # claimed to bound what the router could pick while the request path
+        # never read it (defect, 2026-10-23). Empty/None = every chat model.
+        _allow = _routing_cfg.get("allowed_models")
+        _routable_models = [str(m) for m in _allow] if isinstance(_allow, list) and _allow else None
+    except Exception:
+        _rdef = False
+        _routable_models = None
+    _routable = model_routing.is_routable_name(model, _rdef)
     try:
         # The order is fetched here (not inside the router) so the no-ladder
         # special cases and the cascade reuse ONE lookup; resolve_cascade
         # re-fetches internally for its own walk (unchanged).
-        order = await profile_order_for_key(key.id) if _pseudo is not None else []
+        order = await profile_order_for_key(key.id) if _routable else []
         # --- decision-model seam -------------------------------------------
         # Built only for a pseudo-model request on an opted-in profile: a
         # direct (pinned) request never consults the router at all, and
@@ -2515,7 +2536,7 @@ async def chat_completions(
         # decision_mode "off" (the default) passes decide=None, so this whole
         # block is inert and the heuristic path is byte-identical.
         decide_fn = None
-        if _pseudo is not None:
+        if _routable:
             from ..core import routing_config as _rc
 
             _policy = await _rc.decision_settings()
@@ -2542,7 +2563,65 @@ async def chat_completions(
                             choice=result.choice,
                             confidence=result.confidence,
                             reason=result.reason,
+                            # Carry the full distribution through so the ledger
+                            # records how CLOSE the call was, not just the winner
+                            # (2026-10-23: needed to tune the confidence floor).
+                            probabilities=dict(result.probabilities),
                         )
+
+        # --- conversation stickiness (never-downgrade) ----------------------
+        # OFF by default (sticky_routing). When on, the conversation's last
+        # SERVED routed model is passed down as a capability floor: the router
+        # may escalate above it but never below it, so a thread that opened
+        # with "hi" cannot pin a later hard refactor to the cheap model.
+        #
+        # The floor keys on the SAME conversation fingerprint the canonical
+        # store uses (core.canonical.thread_key). It is computed here rather
+        # than reusing the cascade's _cascade_thread because that one is built
+        # BELOW this block (post-routing); the fingerprint is a pure hash of
+        # the key and the first user message, so recomputing it is cheap and
+        # cannot disagree.
+        #
+        # Fail-open at every step: a stickiness or fingerprint fault simply
+        # means "no floor" (plain routing), never a failed request.
+        _sticky_floor: str | None = None
+        _sticky_write = None
+        try:
+            from ..core import routing_config as _rcs
+
+            _sk_cfg = await _rcs.get_config()
+            if bool(_sk_cfg.get("sticky_routing")):
+                from ..core import stickiness as _sticky
+
+                # NAMESPACED: model_stickiness is shared with the cascade's
+                # load-aware head (auto-demand-aware), which keys on the SAME
+                # conversation fingerprint. Without this prefix a cascade head
+                # silently became routing's capability floor and pinned every
+                # later routed turn to it (defect fix 2026-10-23).
+                _sk_thread = _sticky.scoped_thread_key(
+                    canonical.thread_key(body.get("messages") or [], key.id),
+                    _sticky.SCOPE_ROUTING,
+                )
+                if _sk_thread:
+                    _sk_idle = int(_sk_cfg.get("sticky_routing_idle_reset_s") or 0)
+                    _sk_row = await _sticky.get_sticky_row(key.id, _sk_thread)
+                    if _sk_row is not None:
+                        _sk_model, _sk_age = _sk_row
+                        if _sk_idle > 0 and _sk_age > _sk_idle:
+                            # Idle reset: the thread went quiet long enough that
+                            # the old floor says nothing about the new work.
+                            await _sticky.drop_sticky(key.id, _sk_thread)
+                        else:
+                            _sticky_floor = _sk_model
+                    # The writer persists whatever the router SERVES, so an
+                    # ESCALATION ratchets the floor up and a held floor is
+                    # refreshed (which is also what makes the idle timer mean
+                    # "last activity" rather than "last escalation").
+                    _sticky_write = _sticky.make_writer(key.id, _sk_thread)
+        except Exception:
+            log.warning("routing: sticky floor unavailable - plain routing", exc_info=True)
+            _sticky_floor = None
+            _sticky_write = None
 
         model, route_ctx = await model_routing.resolve_routed_model(
             key,
@@ -2551,8 +2630,12 @@ async def chat_completions(
             registered,
             key.allowed_models,
             order,
-            available=_routing_available(key) if _pseudo is not None else None,
+            available=_routing_available(key) if _routable else None,
             decide=decide_fn,
+            sticky_floor=_sticky_floor,
+            sticky_write=_sticky_write,
+            route_default=_rdef,
+            routable_models=_routable_models,
         )
         # ACTIVE mode: the routed model IS the request's effective pinned
         # model — the admission failover below must classify it as pinned.

@@ -228,15 +228,21 @@ class TestPreflightService:
 
             svc._run_usage_scan = fake_scan  # type: ignore[method-assign]
             jobs = [{"namespace": "ns1", "cache_root": "/mnt/l", "model_name": "acme/A"}]
-            used, usage = await svc.get_usage(namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs)
+            used, usage = await svc.get_usage(
+                namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs
+            )
             assert used == 100 and usage["ns1"] == 100
             # second call inside TTL: cached, no re-scan
-            used2, _usage2 = await svc.get_usage(namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs)
+            used2, _usage2 = await svc.get_usage(
+                namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs
+            )
             assert used2 == 100
             assert svc.scan_runs == 1
             # a submission's delta is folded in immediately
             svc.record_usage_delta("ns1", 50)
-            _used3, usage3 = await svc.get_usage(namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs)
+            _used3, usage3 = await svc.get_usage(
+                namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs
+            )
             assert usage3["ns1"] == 150
 
         asyncio.run(go())
@@ -257,7 +263,9 @@ class TestPreflightService:
             await svc.get_usage(namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs)
             svc._run_usage_scan = bad_scan  # type: ignore[method-assign]
             await asyncio.sleep(0.02)
-            used, usage = await svc.get_usage(namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs)
+            used, usage = await svc.get_usage(
+                namespace="ns1", pvc_name="p", scan_root="/mnt/l", scan_image="img", jobs=jobs
+            )
             # stale-but-known beats zeroing a namespace's usage
             assert used == 100 and usage["ns1"] == 100
 
@@ -343,9 +351,16 @@ class TestPreflightGate:
 
     def test_disabled_returns_off_report(self):
         async def go():
-            svc = await self._service(capacity=1000, entries=[], jobs=[], config=PreflightConfig(enabled=False), size=1000)
+            svc = await self._service(
+                capacity=1000, entries=[], jobs=[], config=PreflightConfig(enabled=False), size=1000
+            )
             report = await svc.check(
-                namespace="ns", repo_id="acme/M", estimate_bytes=None, pvc_name="p", scan_root="/mnt/l", scan_image="img"
+                namespace="ns",
+                repo_id="acme/M",
+                estimate_bytes=None,
+                pvc_name="p",
+                scan_root="/mnt/l",
+                scan_image="img",
             )
             assert report["disk"]["decision"] == "off" and report["quota"]["decision"] == "off"
 
@@ -416,7 +431,9 @@ class TestQueueSubmitGate:
 
         async def check(self, **kwargs):
             self.checked = True
-            raise QuotaExceededError("namespace quota exceeded: 1 bytes used + 2 requested > 2 quota for namespace 'ns'")
+            raise QuotaExceededError(
+                "namespace quota exceeded: 1 bytes used + 2 requested > 2 quota for namespace 'ns'"
+            )
 
         def record_usage_delta(self, *a, **k):
             pass

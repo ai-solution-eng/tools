@@ -49,7 +49,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits Chart.yaml appVersion.
-  tag: v2.9.5
+  tag: v3.0.3
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -220,6 +220,17 @@ settings:
   routingTier2Tokens: 6000
   routingToolBytesPerToken: 64
   routingTurnAdderTokens: 100
+  # Conversation stickiness (never-downgrade): a routed conversation holds a capability
+  # FLOOR and may escalate above it but never fall below it. Off by default - it changes
+  # which model serves, so it is opt-in. The DB routing config (sticky_routing) overrides.
+  stickyRouting: false
+  # Idle reset for that floor (s): a conversation untouched this long re-decides fresh.
+  # Without it a long thread climbs monotonically to the ceiling. 0 = never reset.
+  stickyRoutingIdleResetS: 1800
+  # Promote the legacy auto alias into routing. Off by default so arming routing never
+  # silently changes what an existing client request does; the explicit routing /
+  # routing__<model> names always route regardless of this flag.
+  routeDefaultModel: false
   # MCP federation (/mcp): tools/list returns the key's GRANTED tools as individual
   # `{server}__{tool}` tools; false = legacy two-tool surface.
   mcpFlatTools: true

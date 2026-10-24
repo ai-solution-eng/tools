@@ -30,7 +30,7 @@ fullnameOverride: ""
 # Tags are packaged with the chart — change only if you build your own images.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.6.3
+  tag: v1.7.1
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent

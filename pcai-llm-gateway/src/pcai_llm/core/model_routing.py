@@ -50,7 +50,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 from ..config import settings
@@ -60,6 +60,13 @@ log = logging.getLogger(__name__)
 
 PSEUDO_ROUTING = "routing"
 PSEUDO_PREFIX = "routing__"
+
+# The legacy cascade alias. NOT a pseudo-model (detect_pseudo_model returns
+# None for it), so it normally goes straight to the budget cascade. The
+# route_default_model flag is what promotes it to routing -- see
+# is_routable_name. Kept here rather than imported from core.cascade so this
+# module stays import-light (cascade imports it, not the other way round).
+DEFAULT_ALIAS = "auto"
 
 # Requested max_tokens feeds the score CAPPED and DISCOUNTED (min(mt, 4096)
 # // 8): agents systematically inflate max_tokens (262144 is a normal harness
@@ -124,6 +131,28 @@ def detect_pseudo_model(name: str) -> PseudoModel | None:
         if target:
             return PseudoModel("named", target)
     return None
+
+
+def is_routable_name(name: str, route_default: bool) -> bool:
+    """Does this request name something the router should consider? PURE.
+
+    True for the two explicit pseudo-models (routing / routing__X) ALWAYS, and
+    for the legacy `auto` alias ONLY when the operator has armed
+    route_default_model.
+
+    WHY auto is opt-in: `auto` has a documented, long-standing meaning -- the
+    legacy profile-order budget cascade, no sticky read, no load ranking, no
+    routing. Flipping it to routing by default would silently change what an
+    existing client's request does, which is exactly the failure mode the
+    auto/auto-demand-aware split was created to avoid. The flag makes the
+    promotion explicit and reversible without a redeploy of client config.
+
+    A request that names a real model is NEVER routable: pinning is how a
+    client says "I need this specific model".
+    """
+    if detect_pseudo_model(name) is not None:
+        return True
+    return bool(route_default) and name == DEFAULT_ALIAS
 
 
 def complexity_score(body: dict[str, Any]) -> int:
@@ -264,6 +293,139 @@ def pick_serving_model(
     return RoutingChoice(chosen, reason)
 
 
+def _window(cheap_first: list[str], ceiling: str, min_model: str) -> list[str]:
+    """The candidate window (floor..ceiling, cheap-first) the router may pick
+    from. PURE.
+
+    Extracted so the decision-model seam and the never-downgrade floor build
+    the SAME window: the sticky floor measures capability POSITION inside this
+    list, so it must be the same list the router was offered -- otherwise a
+    conversation could be held at a model the router was never allowed to
+    consider. That is the invariant this helper protects; it does NOT claim the
+    window matches the heuristic's pick (see the floor note below).
+    """
+    if ceiling in cheap_first:
+        ceil_pos = cheap_first.index(ceiling)
+    else:
+        # A ceiling OUTSIDE the window (e.g. routing__Qwen3.8-27B when Qwen is
+        # not on the profile ladder). Before this it silently fell back to the
+        # window end, so the named ceiling was never offered and the decision
+        # model could not pick it -- the alias promised a ceiling it could not
+        # honour (defect fix, 2026-10-23). Append it as the most capable
+        # position: the operator named it explicitly, so it outranks the
+        # ladder for THIS request only. The window is returned, not mutated.
+        return list(cheap_first) + [ceiling]
+    # No configured floor -> position 0, i.e. the WHOLE ladder. This is the
+    # decision seam's long-standing behaviour and it is deliberately NOT the
+    # heuristic's rule: pick_serving_model pins to the ceiling when no floor is
+    # set ("no downgrade"), while the decision model is allowed to consider the
+    # full ladder. The two differ by design, and tests/test_decision_routing.py
+    # pins the decision side. Do not "harmonise" them here -- it silently
+    # changes which models a configured decision model may pick.
+    floor_pos = cheap_first.index(min_model) if min_model and min_model in cheap_first else 0
+    return cheap_first[min(floor_pos, ceil_pos) : ceil_pos + 1]
+
+
+def expand_candidates(
+    cheap_first: list[str],
+    routable_models: list[str] | None,
+    available: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """The router candidate list, CHEAP-FIRST, widened by the operator allowlist.
+
+    PURE. Two inputs with deliberately different jobs:
+      * `cheap_first` (the profile ladder, reversed) supplies CAPABILITY ORDER —
+        index 0 is the cheapest model, the last entry the most capable.
+      * `routable_models` (the console allowlist) supplies ELIGIBILITY — which
+        models the operator has signed off for routing at all.
+
+    Before this the ladder was BOTH, so a ticked model was unreachable unless it
+    also sat in `model_order`, while the console claimed a bound it never
+    applied (defect, 2026-10-23).
+
+    SEMANTICS — the allowlist BOUNDS, it does not merely add:
+      * empty/None -> the whole ladder (the documented "none checked = every
+        chat model is routable");
+      * non-empty  -> ONLY the allowlisted models, i.e. the operator's set is
+        authoritative. A model on the ladder but NOT ticked is excluded: the
+        panel says this set bounds what the router may pick, and a bound that
+        only ever widened would be a lie.
+
+    ORDER: ladder members keep their ladder position (capability order the admin
+    signed off). Allowlisted models NOT on the ladder are appended at the CHEAP
+    end, sorted by name. WHY cheap: an off-ladder model has no declared
+    capability position, and the router only downgrades when a cheaper model
+    positively fits, so an undeclared model must not outrank one the ladder
+    placed. WHY name-sorted: a load-ordered window would offer the same request
+    different options on different turns.
+
+    `available` (registered + key-ACL + healthy, the caller predicate) filters
+    the additions only. It never REMOVES a ladder model: the ladder is the
+    profile contract and the existing walk already handles an unservable ladder
+    entry by stepping up to the ceiling.
+    """
+    if not routable_models:
+        return list(cheap_first)
+    wanted = {str(m) for m in routable_models}
+    kept = [m for m in cheap_first if m in wanted]
+    extra = sorted(wanted - set(cheap_first))
+    if available is not None:
+        extra = [m for m in extra if available(m)]
+    # All ladder models filtered out (every tick was stale or every ticked model
+    # is off-ladder) -> fall back to the additions, then to the ladder, so a
+    # mis-ticked panel cannot empty the candidate set and 404 the request.
+    return (extra + kept) or extra or list(cheap_first)
+
+
+def apply_never_downgrade(
+    choice: RoutingChoice,
+    candidates: list[str],
+    sticky_head: str | None,
+) -> RoutingChoice:
+    """Hold a conversation at or ABOVE the capability it was already served at.
+
+    PURE -- no I/O, no config read; the caller supplies the stored head. Returns
+    the choice to serve: either the choice passed in (moving up, or no head),
+    or a RoutingChoice naming the sticky head (refusing to move down).
+
+    WHY a floor and not a lock: the operator sketch was "pick once, stay", but
+    with capability routing that pins a conversation that OPENED on the
+    cheapest model. A thread starting with "hi" (-> Qwen) that then asks for a
+    hard refactor would stay on Qwen -- a quality REGRESSION, not a routing
+    improvement. Never-downgrade keeps the stability a lock buys (no thrash
+    between turns) while still allowing escalation, the only direction that
+    can rescue a conversation whose difficulty rose.
+
+    Position is CAPABILITY, not preference: candidates is the caller cheap-first
+    (floor..ceiling) window, so a HIGHER index is a more capable model.
+
+    Total and fail-open, in the direction that cannot make an answer worse:
+      * no head, empty candidates, or a head NOT in the current window (it left
+        the ladder, the registry, or the key ACL) -> choice unchanged. A stale
+        preference must never resurrect a model the key may no longer use; the
+        caller re-persists whatever this returns.
+      * head at or above the new pick -> choice (moving up is allowed, and
+        staying put is the same model).
+      * new pick BELOW the head -> the head, with a reason naming the floor.
+    """
+    if not sticky_head or not candidates:
+        return choice
+    if sticky_head not in candidates:
+        # Not offered this turn: the ladder moved, the model was deregistered,
+        # or the key ACL narrowed. Ignore it rather than forcing it in.
+        return choice
+    try:
+        head_pos = candidates.index(sticky_head)
+        pick_pos = candidates.index(choice.model)
+    except ValueError:
+        # choice.model outside the window (a decision-model pick is validated
+        # against it by the caller; this is belt-and-braces).
+        return choice
+    if pick_pos < head_pos:
+        return RoutingChoice(sticky_head, "sticky_floor(was:" + choice.reason + ")")
+    return choice
+
+
 async def profile_routing_config(user_id: uuid.UUID) -> tuple[str, str]:
     """(routing_policy, routing_min_model) for the key's profile.
 
@@ -327,6 +489,13 @@ class DecisionOutcome:
     choice: str = ""
     confidence: float = 0.0
     reason: str = ""
+    # The FULL per-option distribution from the decision model (option -> p).
+    # Carried so the ledger can record how CLOSE a decision was, not just the
+    # winner score: a 0.62 winner over a 0.60 runner-up is a coin flip that
+    # happened to clear the floor, while a 0.99 winner is a real signal. Without
+    # this the operator can only see the winner and cannot tune the floor
+    # against real data (2026-10-23).
+    probabilities: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -356,6 +525,9 @@ class RouteDecision:
     served: str = ""
     reason: str = ""
     stamp: bool = False
+    # option -> probability from the decision model, when one answered. Empty
+    # when the heuristics served or the model abstained with no distribution.
+    probabilities: dict[str, float] = field(default_factory=dict)
 
 
 async def resolve_routed_model(
@@ -367,6 +539,10 @@ async def resolve_routed_model(
     order: list[str],
     available: Callable[[str], bool] | None = None,
     decide: DecideFn | None = None,
+    sticky_floor: str | None = None,
+    sticky_write: Callable[[str], None] | None = None,
+    route_default: bool = False,
+    routable_models: list[str] | None = None,
 ) -> tuple[str, RouteDecision]:
     """Resolve one (pseudo-)model request to the model name to serve next.
 
@@ -385,8 +561,24 @@ async def resolve_routed_model(
     ⇒ the no-ladder rules: bare `routing` is a 404 with a pointed message,
     `routing__X` serves X with plain pinned semantics (nothing to
     downgrade without a ladder).
+
+    `sticky_floor` / `sticky_write` are the conversation-stickiness seam
+    (never-downgrade). BOTH are optional and default to None, so a caller
+    that does not opt in keeps this function byte-identical to the
+    pre-stickiness behaviour. The caller owns the STORAGE (this module stays
+    I/O-free): `sticky_floor` is the head model this conversation was last
+    served at, and `sticky_write` is invoked with the model actually chosen
+    so the caller can persist it. A write is only attempted when a floor was
+    supplied at all (the feature is on) and the request actually routed.
     """
     pseudo = detect_pseudo_model(requested)
+    # route_default_model promotes the legacy 'auto' alias into a BARE routing
+    # request: without this the flag only changed whether the caller fetched an
+    # order, while 'auto' still fell into the direct branch below and returned
+    # unchanged -- an inert flag that also emitted a false "active" route
+    # header (caught by cross-validation 2026-10-23).
+    if pseudo is None and is_routable_name(requested, route_default):
+        pseudo = PseudoModel("bare")
     if pseudo is None:
         # Direct request: no routing math. The policy still rides along so
         # the response header can declare the profile's routing state
@@ -437,7 +629,13 @@ async def resolve_routed_model(
             if allowed_models and target not in allowed_models:
                 raise RoutingRefused(403, f"key is not allowed to use model {target!r} (routing ceiling)")
 
-        cheap_first = list(reversed(order))
+        # The ladder supplies CAPABILITY ORDER; the console allowlist supplies
+        # ELIGIBILITY. Widening here is what makes a ticked model reachable even
+        # when it is absent from model_order (defect fix, 2026-10-23: the
+        # allowlist was console-only and bounded nothing on the request path).
+        # available() is applied only to the ADDED models inside
+        # expand_candidates -- the ladder keeps its own upstream walk semantics.
+        cheap_first = expand_candidates(list(reversed(order)), routable_models, available)
         ceiling = pseudo.target if pseudo.kind == "named" else order[0]
 
         floor_usable = bool(min_model) and min_model in cheap_first
@@ -468,14 +666,13 @@ async def resolve_routed_model(
         # replaces the model NAME, inside the same ceiling/floor window the
         # heuristics use, so it can never escape the ladder or the key ACL.
         decision: DecisionOutcome | None = None
+        probs: dict[str, float] = {}
         if decide is not None:
             # Candidates = the same allowed window the heuristic walks
             # (floor..ceiling, in cheap-first order). Offering the model
             # anything outside that window would let it pick a model the
             # profile/ACL never offered.
-            floor_pos = cheap_first.index(min_model) if min_model and min_model in cheap_first else 0
-            ceil_pos = cheap_first.index(ceiling) if ceiling in cheap_first else len(cheap_first) - 1
-            candidates = cheap_first[min(floor_pos, ceil_pos) : ceil_pos + 1]
+            candidates = _window(cheap_first, ceiling, min_model)
             if available is not None:
                 candidates = [m for m in candidates if available(m)] or candidates
             if len(candidates) >= 2:
@@ -486,6 +683,25 @@ async def resolve_routed_model(
                     decision = None
                 if decision is not None and decision.ok and decision.choice in candidates:
                     choice = RoutingChoice(decision.choice, f"decision:{decision.confidence:.2f}")
+                    probs = dict(decision.probabilities or {})
+                elif decision is not None:
+                    # The model ANSWERED but was not served (abstained below the
+                    # floor, or named an option outside the window). Record its
+                    # distribution anyway: that is exactly the data an operator
+                    # needs to decide whether the floor is set right.
+                    probs = dict(decision.probabilities or {})
+
+        # --- never-downgrade floor (optional; sticky_floor is None when off) --
+        # Applied AFTER the decision-model seam so the floor constrains BOTH
+        # the heuristic and the model's pick: a decision model that tries to
+        # move a conversation down the ladder is held at the floor exactly
+        # like the heuristic is. `candidates` is the cheap-first window built
+        # above; when no decision ran (fewer than 2 candidates, or no decision
+        # model) it is rebuilt here so the floor still has a capability order
+        # to measure against. Both are pure list operations -- no I/O.
+        if sticky_floor:
+            floor_candidates = candidates if decide is not None else _window(cheap_first, ceiling, min_model)
+            choice = apply_never_downgrade(choice, floor_candidates, sticky_floor)
 
         if policy == "shadow":
             # Serve EXACTLY as 'off' would (the pseudo name rides the alias
@@ -497,12 +713,29 @@ async def resolve_routed_model(
                 would=choice.model,
                 reason=choice.reason,
                 stamp=True,
+                probabilities=probs,
             )
         # The upstream must see the model that will actually serve: a pinned
         # request forwards its own model name, and the response `model` field
         # is the upstream's echo — leaving "routing" in the body would make
         # the response report a name nobody served (ledger truth convention).
         body["model"] = choice.model
+        # Persist the capability floor for this conversation (never-downgrade).
+        # ONLY here, in the branch that actually SERVES a routed model: shadow
+        # harvests a decision without serving it, so writing a floor there
+        # would constrain a later request against a model that never served.
+        # Best-effort and swallowed -- the caller's writer is fail-open by
+        # contract, and a persistence fault must cost stickiness, never a
+        # request.
+        # Gate on the WRITER (feature on), NOT on an existing floor: a fresh
+        # conversation has no floor yet, and requiring one here meant the row
+        # was never written, so the next turn again had no floor -- the feature
+        # could never bootstrap (caught by cross-validation 2026-10-23).
+        if sticky_write is not None:
+            try:
+                sticky_write(choice.model)
+            except Exception as exc:  # pragma: no cover - writer is fail-open
+                log.warning("routing: sticky write failed (%s) - floor not persisted", type(exc).__name__)
         return choice.model, RouteDecision(
             policy="active",
             engaged=True,
@@ -510,6 +743,7 @@ async def resolve_routed_model(
             served=choice.model,
             reason=choice.reason,
             stamp=True,
+            probabilities=probs,
         )
     except RoutingRefused:
         raise
@@ -536,6 +770,7 @@ class RoutingLedgerStamp(TypedDict, total=False):
     routing_ceiling: str
     routing_served: str
     routing_reason: str
+    routing_probabilities: str
 
 
 def ledger_stamp(route: RouteDecision | None, actual_model: str) -> RoutingLedgerStamp:
@@ -556,6 +791,12 @@ def ledger_stamp(route: RouteDecision | None, actual_model: str) -> RoutingLedge
         "routing_ceiling": route.ceiling,
         "routing_served": served,
         "routing_reason": route.reason,
+        # Sorted so the same distribution always serializes identically (the
+        # ledger is compared across rows when tuning the floor). Empty when no
+        # decision model answered -- the column default, not a faux stamp.
+        "routing_probabilities": (
+            json.dumps(dict(sorted(route.probabilities.items())), separators=(",", ":")) if route.probabilities else ""
+        ),
     }
 
 

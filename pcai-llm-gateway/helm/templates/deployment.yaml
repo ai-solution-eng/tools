@@ -242,6 +242,15 @@ spec:
               value: {{ .Values.settings.routingToolBytesPerToken | int | quote }}
             - name: PCAI_LLM_ROUTING_TURN_ADDER_TOKENS
               value: {{ .Values.settings.routingTurnAdderTokens | int | quote }}
+            # Conversation stickiness (never-downgrade) + default-model promotion.
+            # Both default OFF: neither can change which model serves until an
+            # operator turns it on, and the DB routing config overrides the env.
+            - name: PCAI_LLM_STICKY_ROUTING
+              value: {{ .Values.settings.stickyRouting | default false | quote }}
+            - name: PCAI_LLM_STICKY_ROUTING_IDLE_RESET_S
+              value: {{ .Values.settings.stickyRoutingIdleResetS | default 1800 | int | quote }}
+            - name: PCAI_LLM_ROUTE_DEFAULT_MODEL
+              value: {{ .Values.settings.routeDefaultModel | default false | quote }}
             # --- MCP federation surface (flat per-tool exposure; kill switch) ---
             - name: PCAI_LLM_MCP_FLAT_TOOLS
               value: {{ .Values.settings.mcpFlatTools | quote }}

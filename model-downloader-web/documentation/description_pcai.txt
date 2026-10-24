@@ -1,0 +1,1 @@
+Faster parallel version of MLIS downloader without holding gpus. Supports model catalog of verified configurations.

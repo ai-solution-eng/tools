@@ -20,24 +20,6 @@ function extractModelId(e) {
   return arg || '';
 }
 
-// Reduce a model to its "base model" so different quants/variants of the
-// same model share one shade band. Drops the HF org prefix and strips
-// quantization / engine / serving-variant suffixes (FP8, NVFP4, block,
-// sglang, vllm, hicachex3, shared, -it, ...).
-function baseModelKey(e) {
-  let key = String(extractModelId(e) || e.name || '');
-  const slash = key.lastIndexOf('/');
-  if (slash !== -1) key = key.slice(slash + 1);
-  key = key.replace(/[\s_]+/g, '-');
-  const tail = /-?(?:fp8|nvfp4|fp4|bf16|fp16|int8|int4|gptq|awq|gguf|block|e4m3|e5m2|vllm|sglang|dflash2?|dspark|eagle3?|mtp|hicachex?\d*|nohicache|shared|dedicated|replicasx?\d*|it|instruct|chat|draft)$/i;
-  let prev;
-  do {
-    prev = key;
-    key = key.replace(tail, '');
-  } while (key !== prev);
-  return key.toLowerCase();
-}
-
 async function loadCatalog() {
   try {
     const r = await fetch('/api/catalog');
@@ -48,91 +30,265 @@ async function loadCatalog() {
   }
 }
 
+// ---- Hierarchical renderer: lab > model > configuration ----
+//
+// The catalog is stored flat (one entry per configuration) and grouped
+// server-side into catalogData.tree.  The tree renders as nested <details>
+// elements so expand/collapse needs no JS state and survives a re-render:
+// open state is tracked in openKeys and restored afterwards, so refreshing
+// the catalog does not collapse everything the user had opened.
+const openKeys = new Set();
+const searchState = { query: '', tier: '' };
+
+// Configurations ticked for push, keyed by catalog_id.  This is the SOURCE OF
+// TRUTH, not the DOM: filtering re-renders the tree and removes rows from the
+// document, so reading checked boxes out of the DOM would silently drop any
+// selection hidden by the current filter.  Keeping the set here means a
+// selection survives filtering, searching, and a catalog refresh.
+const selectedIds = new Set();
+
+// Seed the filter from ?q= so a filtered view is a shareable link.  The
+// Download page links here from its model picker; bookmarking a filtered
+// catalog is a natural thing to want.
+(function seedFiltersFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('q');
+    if (q) searchState.query = q;
+    const gpu = params.get('gpu');
+    if (gpu) searchState.tier = gpu;
+  } catch (e) { /* no URL support: fall back to an unfiltered view */ }
+})();
+
+// Stable identity for a collapsible node, used to restore open state.
+function nodeKey(parts) { return parts.join('\u001f'); }
+
+function captureOpenState() {
+  catalogTiers.querySelectorAll('details[data-node-key]').forEach(d => {
+    if (d.open) openKeys.add(d.dataset.nodeKey);
+    else openKeys.delete(d.dataset.nodeKey);
+  });
+}
+
+// Match one configuration against the search box.  The blob carries every
+// distinguishing dimension, so "nvfp4", "hicache", "rtx" or "sglang" filter
+// down to the configurations that actually match.  Multiple terms are ANDed.
+function configMatches(cfg, q) {
+  // GPU-class filter first: it is an exact match on the configuration's tier,
+  // not a text search, so "h200" must not also match a description mentioning
+  // H200 on an L40S entry.
+  if (searchState.tier) {
+    const tier = String((cfg.entry || {}).tier || '');
+    if (tier !== searchState.tier) return false;
+  }
+  if (!q) return true;
+  const e = cfg.entry || {};
+  const blob = [
+    cfg.label, cfg.framework, cfg.quant, cfg.publisher, cfg.model_id,
+    e.name, e.image, e.description, e.tier, e.model_format,
+    (e.metadata && e.metadata.tags) || '',
+  ].join(' ').toLowerCase();
+  return q.split(/\s+/).filter(Boolean).every(term => blob.includes(term));
+}
+
 function renderCatalog() {
+  captureOpenState();
   catalogTiers.innerHTML = '';
-  for (const [tier, entries] of Object.entries(catalogData.tiers || {})) {
-    const label = (catalogData.tier_labels || {})[tier] || tier;
-    const section = document.createElement('div');
-    section.className = 'tier-section';
+  const tree = catalogData.tree || [];
+  const q = searchState.query.trim().toLowerCase();
 
-    const header = document.createElement('div');
-    header.className = 'tier-header';
-    // Per-GPU specs (supported quant levels + VRAM) come from the API
-    // (TIER_INFO in catalog.py); unknown/custom tiers just show the count.
-    const info = (catalogData.tier_info || {})[tier] || {};
-    const specChips = [];
-    if (info.quants && info.quants.length) {
-      specChips.push('<span class="tier-spec" title="Quantization levels supported by this GPU">' + esc(info.quants.join(' / ')) + '</span>');
-    }
-    if (info.vram_gb) {
-      specChips.push('<span class="tier-spec" title="VRAM per GPU">' + info.vram_gb + ' GB</span>');
-    }
-    header.innerHTML = '<label class="tier-select-all"><input type="checkbox" data-tier="' + tier + '"><strong>' + esc(label) + '</strong> (' + entries.length + ')</label>' +
-      (specChips.length ? '<span class="tier-specs">' + specChips.join('') + '</span>' : '');
-    section.appendChild(header);
-
-    if (entries.length === 0) {
-      const empty = document.createElement('p');
-      empty.className = 'tier-empty';
-      empty.textContent = 'No models. Click "Add Model" to create one.';
-      section.appendChild(empty);
-    } else {
-      const table = document.createElement('table');
-      table.className = 'catalog-table';
-      table.innerHTML = '<thead><tr><th></th><th>Name</th><th>Ver</th><th>Image</th><th>Format</th><th>GPU</th><th>Cache</th><th></th></tr></thead>';
-      const tbody = document.createElement('tbody');
-      // Shade alternates per base model, so all variants/quants of the same
-      // model (vllm / sglang / FP8 / NVFP4...) share one shade and it flips
-      // only when the underlying base model changes.
-      let prevModel = null;
-      let lighter = false;
-      for (const e of entries) {
-        const model = baseModelKey(e);
-        if (prevModel !== null && model !== prevModel) lighter = !lighter;
-        prevModel = model;
-        tbody.appendChild(buildCatalogRow(e, lighter));
-      }
-      table.appendChild(tbody);
-      section.appendChild(table);
-    }
-    catalogTiers.appendChild(section);
+  if (tree.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'tier-empty';
+    empty.textContent = 'No models. Click "Add Model" to create one.';
+    catalogTiers.appendChild(empty);
+    syncSelectionToDom();
+    updateSelectionCount();
+    updateSearchSummary(q, 0, 0);
+    return;
   }
 
-  // Wire select-all checkboxes
-  catalogTiers.querySelectorAll('.tier-select-all input').forEach(cb => {
+  let shownConfigs = 0;
+  let totalConfigs = 0;
+
+  for (const lab of tree) {
+    // Keep a model only when at least one of its configurations matches.
+    const models = lab.models.map(m => ({
+      ...m,
+      configs: m.configs.filter(c => configMatches(c, q)),
+    })).filter(m => m.configs.length > 0);
+    totalConfigs += lab.config_count;
+    if (models.length === 0) continue;
+
+    const shown = models.reduce((n, m) => n + m.configs.length, 0);
+    shownConfigs += shown;
+
+    // A search always expands what it matched; otherwise restore prior state.
+    const labKey = nodeKey(['lab', lab.name]);
+    const labEl = document.createElement('details');
+    labEl.className = 'tree-lab';
+    labEl.dataset.nodeKey = labKey;
+    labEl.open = q ? true : openKeys.has(labKey);
+
+    const labSummary = document.createElement('summary');
+    labSummary.className = 'tree-lab-summary';
+    labSummary.innerHTML =
+      '<span class="tree-lab-name">' + esc(lab.name) + '</span>' +
+      '<span class="tree-count">' + models.length + ' model' + (models.length === 1 ? '' : 's') +
+      ' \u00b7 ' + shown + ' config' + (shown === 1 ? '' : 's') + '</span>' +
+      '<span class="tree-lab-actions">' +
+        '<label class="tree-select" title="Select every configuration in this lab">' +
+          '<input type="checkbox" data-select-lab="' + esc(lab.name) + '"> all</label>' +
+      '</span>';
+    labEl.appendChild(labSummary);
+
+    const labBody = document.createElement('div');
+    labBody.className = 'tree-lab-body';
+
+    for (const model of models) {
+      const mKey = nodeKey(['model', lab.name, model.key]);
+      const modelEl = document.createElement('details');
+      modelEl.className = 'tree-model';
+      modelEl.dataset.nodeKey = mKey;
+      modelEl.open = q ? true : openKeys.has(mKey);
+
+      const modelSummary = document.createElement('summary');
+      modelSummary.className = 'tree-model-summary';
+      modelSummary.innerHTML =
+        '<span class="tree-model-name">' + esc(model.name) + '</span>' +
+        '<span class="tree-count">' + model.configs.length + ' config' +
+          (model.configs.length === 1 ? '' : 's') + '</span>';
+      modelEl.appendChild(modelSummary);
+
+      const cfgWrap = document.createElement('div');
+      cfgWrap.className = 'tree-configs';
+      for (const cfg of model.configs) cfgWrap.appendChild(buildConfigRow(cfg));
+      modelEl.appendChild(cfgWrap);
+      labBody.appendChild(modelEl);
+    }
+
+    labEl.appendChild(labBody);
+    catalogTiers.appendChild(labEl);
+  }
+
+  if (shownConfigs === 0 && q) {
+    const none = document.createElement('p');
+    none.className = 'tier-empty';
+    none.textContent = 'No configurations match "' + searchState.query.trim() + '".';
+    catalogTiers.appendChild(none);
+  }
+
+  wireTreeControls();
+  syncSelectionToDom();
+  updateSelectionCount();
+  updateSearchSummary(q, shownConfigs, totalConfigs);
+}
+
+// Render a configuration label, emphasising the segments that deserve a second
+// look (HiCache, shared GPU) without repeating them as separate chips -- the
+// label already carries every dimension, and duplicating it is just noise.
+function configLabelHtml(cfg) {
+  const parts = String(cfg.label || '').split(' \u00b7 ');
+  return parts.map(part => {
+    if (part === 'HiCache') {
+      return '<span class="cfg-emph cfg-emph-cache" title="Hierarchical cache enabled in the serving args">' + esc(part) + '</span>';
+    }
+    if (part === 'Shared') {
+      return '<span class="cfg-emph cfg-emph-shared" title="Runs on a shared GPU">Shared GPU</span>';
+    }
+    return esc(part);
+  }).join('<span class="cfg-sep"> \u00b7 </span>');
+}
+
+// One configuration leaf: select box, label, and the actions that were
+// previously table-row buttons (details / download / delete).
+function buildConfigRow(cfg) {
+  const e = cfg.entry;
+  const row = document.createElement('div');
+  row.className = 'tree-config';
+
+  row.innerHTML =
+    '<label class="tree-config-select"><input type="checkbox" data-catalog-id="' + esc(e.catalog_id) +
+      '" data-tier="' + esc(e.tier || '') + '"></label>' +
+    '<span class="tree-config-label">' + configLabelHtml(cfg) + '</span>' +
+    '<span class="tree-config-id">' + esc(cfg.model_id || '') + '</span>' +
+    '<span class="tree-config-actions">' +
+      '<button type="button" class="action-btn details-btn" data-details="' + esc(e.catalog_id) + '">Config</button>' +
+      (cfg.model_id ? '<button type="button" class="action-btn download-btn" data-dl="' + esc(e.catalog_id) + '">Download</button>' : '') +
+      '<button type="button" class="action-btn delete-btn" data-del="' + esc(e.catalog_id) + '">Delete</button>' +
+    '</span>';
+
+  row.querySelector('[data-details]').addEventListener('click', () => showDetails(e));
+  const dlBtn = row.querySelector('[data-dl]');
+  if (dlBtn) dlBtn.addEventListener('click', () => {
+    window.location.href = '/?model=' + encodeURIComponent(cfg.model_id);
+  });
+  row.querySelector('[data-del]').addEventListener('click', () => deleteCatalogEntry(e.catalog_id, e.name));
+  const box = row.querySelector('input[data-catalog-id]');
+  box.addEventListener('change', updateSelectionCount);
+  return row;
+}
+
+// Lab-level "all" checkbox + per-node open/close bookkeeping.
+function wireTreeControls() {
+  catalogTiers.querySelectorAll('[data-select-lab]').forEach(cb => {
     cb.addEventListener('change', () => {
-      const tier = cb.dataset.tier;
-      catalogTiers.querySelectorAll('input[data-catalog-id]').forEach(box => {
-        if (box.dataset.tier === tier) box.checked = cb.checked;
+      const labEl = cb.closest('details.tree-lab');
+      if (!labEl) return;
+      // Only the configs currently rendered: with a GPU-class or text filter
+      // active, "all" means "all of what I can see", never an invisible
+      // selection the user cannot review before pushing.
+      labEl.querySelectorAll('input[data-catalog-id]').forEach(box => {
+        box.checked = cb.checked;
+        if (cb.checked) selectedIds.add(box.dataset.catalogId);
+        else selectedIds.delete(box.dataset.catalogId);
       });
+      cb.indeterminate = false;
+      updateSelectionCount();
+      syncSelectionToDom();
+    });
+  });
+  catalogTiers.querySelectorAll('details[data-node-key]').forEach(d => {
+    d.addEventListener('toggle', () => {
+      if (d.open) openKeys.add(d.dataset.nodeKey);
+      else openKeys.delete(d.dataset.nodeKey);
     });
   });
 }
 
-function buildCatalogRow(e, lighter) {
-  const tr = document.createElement('tr');
-  if (lighter) tr.className = 'model-shade';
-  const modelId = extractModelId(e);
-  tr.innerHTML =
-    '<td><input type="checkbox" data-catalog-id="' + e.catalog_id + '" data-tier="' + e.tier + '"></td>' +
-    '<td class="cat-name"><button type="button" class="cat-details-btn" data-details="' + e.catalog_id + '">' + esc(e.name) + '</button>' +
-      (modelId ? '<div class="cat-model-id">' + esc(modelId) + '</div>' : '') + '</td>' +
-    '<td>' + e.version + '</td>' +
-    '<td class="cat-image">' + esc(e.image || '') + '</td>' +
-    '<td>' + esc(e.model_format || '') + '</td>' +
-    '<td>' + esc(e.resource_limit_gpu || '') + '</td>' +
-    '<td>' + (e.caching_enabled ? '✓' : '') + '</td>' +
-    '<td>' +
-      (modelId ? '<button type="button" class="action-btn download-btn" data-dl="' + e.catalog_id + '">Download</button> ' : '') +
-      '<button type="button" class="action-btn delete-btn" data-del="' + e.catalog_id + '">Delete</button>' +
-    '</td>';
-  tr.querySelector('[data-details]').addEventListener('click', () => showDetails(e));
-  const dlBtn = tr.querySelector('[data-dl]');
-  if (dlBtn) dlBtn.addEventListener('click', () => {
-    window.location.href = '/?model=' + encodeURIComponent(modelId);
+function updateSelectionCount() {
+  const n = catalogTiers.querySelectorAll('input[data-catalog-id]:checked').length;
+  const btn = document.getElementById('push-selected-btn');
+  if (btn) btn.textContent = n ? ('Push ' + n + ' Selected to MLIS') : 'Push Selected to MLIS';
+}
+
+// Reflect the persistent selection onto the freshly rendered checkboxes, and
+// flag a lab's "all" box when every one of its visible configs is ticked.
+function syncSelectionToDom() {
+  catalogTiers.querySelectorAll('input[data-catalog-id]').forEach(box => {
+    box.checked = selectedIds.has(box.dataset.catalogId);
   });
-  tr.querySelector('[data-del]').addEventListener('click', () => deleteCatalogEntry(e.catalog_id, e.name));
-  return tr;
+  catalogTiers.querySelectorAll('[data-select-lab]').forEach(cb => {
+    const labEl = cb.closest('details.tree-lab');
+    if (!labEl) return;
+    const boxes = [...labEl.querySelectorAll('input[data-catalog-id]')];
+    cb.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    cb.indeterminate = !cb.checked && boxes.some(b => b.checked);
+  });
+}
+
+function updateSearchSummary(q, shown, total) {
+  const el = document.getElementById('catalog-search-summary');
+  if (!el) return;
+  const filtered = q || searchState.tier;
+  if (!filtered) {
+    el.textContent = total + ' configurations in ' + (catalogData.tree || []).length + ' labs';
+    return;
+  }
+  const scope = searchState.tier
+    ? ((catalogData.tier_labels || {})[searchState.tier] || searchState.tier)
+    : 'all GPUs';
+  el.textContent = shown + ' of ' + total + ' configurations (' + scope + ')';
 }
 
 // ---- Model details modal (full config that will be included) ----
@@ -240,15 +396,18 @@ function parseJsonSafe(text, fallback) {
 
 // ---- Push to MLIS ----
 document.getElementById('push-selected-btn').addEventListener('click', async () => {
-  const checked = [...catalogTiers.querySelectorAll('input[data-catalog-id]:checked')];
-  if (checked.length === 0) { alert('Select at least one model to push.'); return; }
-  const ids = new Set(checked.map(c => c.dataset.catalogId));
+  const ids = new Set([...catalogTiers.querySelectorAll('input[data-catalog-id]:checked')].map(c => c.dataset.catalogId));
+  if (ids.size === 0) { alert('Select at least one model to push.'); return; }
+  // Read from the tree (the single grouping source) so a push sends exactly
+  // the configurations the user sees, in tree order.
   const configs = [];
-  for (const entries of Object.values(catalogData.tiers || {})) {
-    for (const e of entries) {
-      if (ids.has(e.catalog_id)) {
-        const { catalog_id, tier, ...cfg } = e;
-        configs.push(cfg);
+  for (const lab of catalogData.tree || []) {
+    for (const model of lab.models) {
+      for (const cfg of model.configs) {
+        const e = cfg.entry;
+        if (!ids.has(e.catalog_id)) continue;
+        const { catalog_id, tier, ...rest } = e;
+        configs.push(rest);
       }
     }
   }
@@ -393,6 +552,81 @@ if (refreshGithubBtn) {
       refreshGithubBtn.disabled = false;
     }
   });
+}
+
+// ---- Catalog search ----
+// Filters the rendered tree live.  Re-rendering (rather than hiding rows) keeps
+// the lab/model counts honest: they report what matched, not what was hidden.
+const searchInput = document.getElementById('catalog-search-input');
+const searchClear = document.getElementById('catalog-search-clear');
+
+// Both filters share one URL writer, so a filtered view (text AND/OR GPU class)
+// is always a shareable link.
+function syncUrl() {
+  try {
+    const url = new URL(window.location.href);
+    if (searchState.query) url.searchParams.set('q', searchState.query);
+    else url.searchParams.delete('q');
+    if (searchState.tier) url.searchParams.set('gpu', searchState.tier);
+    else url.searchParams.delete('gpu');
+    window.history.replaceState(null, '', url);
+  } catch (e) { /* non-fatal: the filter still applies */ }
+}
+
+function applySearch(value) {
+  searchState.query = value;
+  if (searchClear) searchClear.hidden = !value;
+  syncUrl();
+  renderCatalog();
+}
+
+function applyTier(value) {
+  searchState.tier = value;
+  syncUrl();
+  renderCatalog();
+}
+
+if (searchInput) {
+  let debounce = null;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(debounce);
+    // Short debounce keeps typing smooth while the user is still mid-word.
+    debounce = setTimeout(() => applySearch(searchInput.value), 120);
+  });
+  searchInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      searchInput.value = '';
+      applySearch('');
+    }
+  });
+}
+if (searchClear) {
+  searchClear.addEventListener('click', () => {
+    if (searchInput) { searchInput.value = ''; searchInput.focus(); }
+    applySearch('');
+  });
+}
+
+// ---- GPU class filter ----
+const gpuRadios = [...document.querySelectorAll('input[name="gpu-class"]')];
+if (gpuRadios.length) {
+  gpuRadios.forEach(radio => {
+    radio.addEventListener('change', () => {
+      if (radio.checked) applyTier(radio.value);
+    });
+  });
+  // Restore a ?gpu= deep link onto the matching radio (the template renders
+  // "All" checked, so without this the URL and the control would disagree).
+  if (searchState.tier) {
+    const match = gpuRadios.find(r => r.value === searchState.tier);
+    if (match) match.checked = true;
+    else searchState.tier = '';
+  }
+}
+
+if (searchInput && searchState.query) {
+  searchInput.value = searchState.query;
+  if (searchClear) searchClear.hidden = false;
 }
 
 loadCatalog();

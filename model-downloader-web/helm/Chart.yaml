@@ -9,8 +9,8 @@ description: >-
   Kubernetes: submits PVC- or S3-backed downloader Jobs, lists downloaded
   models, and pushes model configs to the AIOLI/MLIS database.
 type: application
-version: 1.6.3
-appVersion: "1.6.3"
+version: 1.7.1
+appVersion: "1.7.1"
 keywords:
   - huggingface
   - models

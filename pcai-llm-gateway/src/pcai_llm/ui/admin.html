@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Admin</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,">
 <style>
   :root {
     color-scheme: dark;
@@ -37,7 +37,10 @@
          background: var(--bg); color: var(--text); min-height: 100vh; }
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
            background: var(--panel); border-bottom: 1px solid var(--border);
-           position: sticky; top: 0; z-index: 5; }
+           position: sticky; top: 0; z-index: 5;
+           /* --header-h is the offset the sticky nav parks under. Measured,
+              not guessed: 10px padding x2 + the 27px control row + 1px rule. */
+           --header-h: 48px; }
   header h1 { font-size: 15px; font-weight: 600; }
   header .hpe { color: var(--accent); }
   header input[type=password] { background: var(--bg); color: var(--text);
@@ -46,8 +49,14 @@
   header .spacer { flex: 1; }
   #theme { background: none; border: 1px solid var(--border); border-radius: 6px;
            padding: 4px 9px; cursor: pointer; color: var(--text); }
+  /* Sticky tab bar (2026-10-23): the admin page runs long enough that the
+     tab strip scrolled away and you had to scroll back to the top to change
+     sections. `top` is the header height so it parks directly under the
+     header instead of sliding beneath it; the z-index sits below the header
+     (5) and the error strip (9) so those still win when they overlap. */
   nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px 0; background: var(--panel);
-        border-bottom: 1px solid var(--border); }
+        border-bottom: 1px solid var(--border);
+        position: sticky; top: var(--header-h, 49px); z-index: 4; }
   /* Tab groups (2026-10-23 wave): buttons live in .navgroup divs — four
      intent groups separated by a thin green rule (--ok). Presentation only:
      the buttons keep the flat data-tab contract, so activateTab(), the nav
@@ -58,6 +67,17 @@
   nav button { background: none; border: none; color: var(--dim); padding: 8px 14px;
                cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
   nav button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  /* Key-row action grid (2026-10-23): eight stacked ghost buttons made every
+     row ~150px tall and read as a scattered pile. A fixed 2-column grid of
+     EQUAL cells gives one compact block whose height is predictable (3 rows),
+     so row height no longer depends on how many buttons a key happens to
+     show (a revoked key renders fewer). `grid-auto-rows: 1fr` keeps the two
+     columns the same height even when one label wraps. */
+  .rowacts { display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+             width: 168px; align-items: stretch; }
+  .rowacts button { width: 100%; padding: 4px 6px; font-size: 12px;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rowacts .wide { grid-column: 1 / -1; }
   main { padding: 18px 16px 60px; max-width: 1200px; margin: 0 auto; }
   section { display: none; } section.active { display: block; }
   h2 { font-size: 16px; margin: 6px 0 12px; }
@@ -288,6 +308,18 @@
     <h2>Keys <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:10px">
       <input type="checkbox" id="show-revoked"> show revoked
     </label></h2>
+    <!-- Search (2026-10-23): client-side filter over the ALREADY-LOADED key
+         list. Deliberately not a server query — the whole list is in memory
+         and a round-trip per keystroke would be worse than useless. Matches
+         name / user / key prefix / subject so "which key is this?" works from
+         any handle you happen to have. -->
+    <div class="row" style="margin-bottom:8px;align-items:center">
+      <input id="k-search" type="search" placeholder="search keys — name, user, prefix, or subject…"
+             style="flex:1;min-width:260px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px"
+             oninput="filterKeys()">
+      <span id="k-search-count" class="muted"></span>
+      <button class="ghost mini" onclick="if ($('k-search')) { $('k-search').value = ''; filterKeys(); }">clear</button>
+    </div>
     <table id="keys-table"><thead>
       <tr><th>Name</th><th>User</th><th>Key</th><th>Subject</th><th title="The USER's profile — profiles are user-scoped, so this is the ordering this key actually cascades through (api_keys -> users -> profiles). Click to reassign.">Profile</th><th>Scopes</th><th>Limits</th><th>Budgets</th><th>Status</th><th title="Self-mint: whether this user's subject may mint/rotate a key itself via POST /v1/keys/for-me (the browser SSO card). Admin-governed; default allowed.">Self-mint</th><th></th></tr>
     </thead><tbody></tbody></table>
@@ -445,7 +477,7 @@
       </div>
     </div>
     <h2>Live pools</h2>
-    <table id="models-table"><thead><tr><th>Model</th><th>Endpoints</th><th></th></tr></thead><tbody></tbody></table>
+    <table id="models-table"><thead><tr><th>Model</th><th title="The pool's model_type — what this endpoint actually SERVES. One pool, one type: a decision model cannot serve chat, and an embedding pool cannot serve chat completions.">Type</th><th>Endpoints</th><th></th></tr></thead><tbody></tbody></table>
     <!-- Presented endpoints (5c): the registry view /v1/models ADVERTISES —
          aliases, routing pseudo-models, real pools — with the reason any
          entry is absent. Admin-plane truth (no key profile in scope);
@@ -694,13 +726,26 @@
       <table><tbody>
         <tr><th style="width:220px">Runtime enabled</th>
           <td><label><input type="checkbox" id="rt-enabled"> enabled</label>
-            <span class="muted">— AND-ed with env <span class="mono">PCAI_LLM_ROUTING_ENABLED</span>, which owns the route mount. NOTE: this stored switch is not yet consulted by the data plane (the decision model is not wired — see the footer); the shipped heuristics still gate on the env flag alone</span></td></tr>
+            <span class="muted">— AND-ed with env <span class="mono">PCAI_LLM_ROUTING_ENABLED</span>, which owns the route mount. With <b>Decision mode = off</b> the shipped heuristics run exactly as before, gated on the env flag alone.</span></td></tr>
+        <tr><th>Decision mode</th>
+          <td><select id="rt-mode" style="width:280px">
+              <option value="off">off — heuristics only (default)</option>
+              <option value="shadow">shadow — ask the model, record what it WOULD serve, heuristics still serve</option>
+              <option value="active">active — serve the model's choice when it clears the confidence floor</option>
+            </select>
+            <div class="muted" style="margin-top:4px"><b>off</b> never calls the decision model — the shipped heuristics alone pick the model. <b>shadow</b> calls the model and records what it WOULD have picked (ledger <span class="mono">routing_would</span>) while the heuristics still serve — the model’s choice never reaches the user, and each routed request pays one extra decision call (bounded by the timeout above). Use it to compare the model against real traffic. <b>active</b> serves the model’s choice when it clears the confidence floor and lands inside the candidate window; otherwise the heuristics serve.</div></td></tr>
         <tr><th>Decision model</th>
           <td><select id="rt-decision" style="width:280px"></select>
-            <span class="muted">chat pool consulted for complex requests; empty = heuristics only</span></td></tr>
+            <span class="muted">decision-capable pool consulted for complex requests; empty = heuristics only</span></td></tr>
+        <tr><th>Confidence floor</th>
+          <td><input id="rt-minconf" type="number" min="0" max="1" step="0.05" style="width:110px">
+            <span class="muted">below this the model is treated as ABSTAINING and the heuristics serve. d3-turbo is calibrated but not always certain — a measured 3-way model choice scored <span class="mono">0.43</span>, while a clear 2-way split scored <span class="mono">0.9997</span>. Default <span class="mono">0.60</span>.</span></td></tr>
+        <tr><th>Decision timeout (ms)</th>
+          <td><input id="rt-timeout" type="number" min="250" max="30000" step="50" style="width:110px">
+            <span class="muted">a hung decision endpoint must never park a chat request; on timeout the heuristics serve. d3-turbo answered a small state in <span class="mono">~790ms</span>.</span></td></tr>
         <tr><th>Models the router may use</th>
           <td><div id="rt-allowed" class="chkrow"></div>
-            <span class="muted">none checked = every chat model is routable. Saved as the router's allowed set; the data plane does not consult it yet (the decision model is not wired — see the footer)</span></td></tr>
+            <span class="muted">none checked = every chat model is routable. This set also bounds what the DECISION MODEL may pick: it is offered only the floor..ceiling window already filtered by this allowlist and endpoint health, and an answer naming anything outside it is discarded.</span></td></tr>
         <tr><th>Decision prompt</th>
           <td><textarea id="rt-prompt" rows="8" style="width:100%;font-family:ui-monospace,monospace" placeholder="system prompt for the decision model — the placeholders below are substituted at render time"></textarea>
             <div id="rt-legend" class="muted" style="margin-top:4px"></div></td></tr>
@@ -710,6 +755,15 @@
         <tr><th>Max prompt chars</th>
           <td><input id="rt-maxchars" type="number" min="200" max="60000" style="width:110px">
             <span class="muted">hard cap on the RENDERED prompt — longer renders truncate (server accepts 200–60000)</span></td></tr>
+        <tr><th>Route the default model</th>
+          <td><label><input type="checkbox" id="rt-routedefault"> also route requests that name <span class="mono">auto</span></label>
+            <div class="muted" style="margin-top:4px">Off (the default): <span class="mono">auto</span> keeps its documented meaning — the profile-order budget cascade, never consulting the router. On: <span class="mono">auto</span> is offered to the router exactly like <span class="mono">routing</span>. This is a different axis from the decision model above: that picks <b>who decides</b>, this picks <b>which requests get decided</b>. The explicit <span class="mono">routing</span> / <span class="mono">routing__&lt;model&gt;</span> names route regardless. Requires the calling key's profile routing_policy to be shadow or active.</div></td></tr>
+        <tr><th>Sticky routing</th>
+          <td><label><input type="checkbox" id="rt-sticky"> hold a conversation at or above its chosen model (never downgrade)</label>
+            <div class="muted" style="margin-top:4px">Off (the default). On: once a conversation has been served by a routed model, later turns may escalate <b>above</b> it but never fall <b>below</b> — so a thread that opened with a trivial turn cannot pin later hard work to the cheap model. The floor is re-checked every turn against the live candidate window and the key's allowlist; a model that leaves either is ignored. Independent of <span class="mono">auto-demand-aware</span>, which keeps its own separate sticky head.</div></td></tr>
+        <tr><th>Sticky idle reset</th>
+          <td><input id="rt-stickyidle" type="number" min="0" max="86400" style="width:110px">
+            <span class="muted">seconds of inactivity after which a conversation forgets its floor and re-decides from scratch. Without it a long thread climbs monotonically to the ceiling. <span class="mono">0</span> = never reset (climb forever).</span></td></tr>
       </tbody></table>
       <div class="row" style="margin-top:10px">
         <button id="rt-save">Save</button>
@@ -717,7 +771,7 @@
         <span id="rt-overridden" class="muted"></span>
       </div>
       <pre id="rt-preview-out" class="mono hidden" style="white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:8px;max-height:340px;overflow:auto"></pre>
-      <p class="muted" style="margin-top:8px">This panel stores the decision-model prompt and router config — the decision model itself (vllm-sr / d3-turbo) is not called yet; routing behavior does not change until it is wired up.</p>
+      <p class="muted" style="margin-top:8px">The decision model (vllm-sr / d3-turbo) IS called on routed requests: <b>shadow</b> records its pick without serving it, <b>active</b> serves it. Routing engages only when a request names <span class="mono">routing</span> / <span class="mono">routing__&lt;model&gt;</span> (or <span class="mono">auto</span>, when <b>route the default model</b> is ticked) AND the calling key’s profile routing_policy is shadow or active.</p>
     </div>
   </section>
 </main>
@@ -968,15 +1022,37 @@ async function loadModels() {
       `<span class="dot ${st}"></span><span class="mono">${esc(ep.base_url)}</span> ` +
       `<span class="muted">pri ${esc(ep.priority)} · w ${esc(ep.weight)}</span></div>`;
   };
+  // Model TYPE per pool (2026-10-23): the registry carries model_type on every
+  // endpoint, and it is the single most load-bearing fact about a pool — a
+  // decision model cannot serve chat, an embedding pool 400s a chat
+  // completion, and a chat pool typed `decision` silently vanishes from
+  // /v1/models and the ladder. Reading it off /admin/endpoints keeps this
+  // column honest with no extra request.
+  const typeOf = m => {
+    const eps = byModel[m] || [];
+    const t = eps.length && eps[0].model_type ? eps[0].model_type : '';
+    return t || '?';
+  };
+  // A mixed pool cannot exist (model_type is per-model, and the proxy gates on
+  // endpoints[0]), but say so rather than picking one if the rows disagree.
+  const typeCell = m => {
+    const types = [...new Set((byModel[m] || []).map(e => e.model_type).filter(Boolean))];
+    if (!types.length) return '<span class="muted">?</span>';
+    if (types.length > 1) return `<span class="pill off" title="endpoints disagree: ${esc(types.join(', '))}">mixed</span>`;
+    const t = types[0];
+    const cls = t === 'chat' ? '' : ' off';
+    return `<span class="pill${cls}" title="model_type ${esc(t)}">${esc(t)}</span>`;
+  };
   $('models-table').querySelector('tbody').innerHTML = state.models.map(m =>
     `<tr><td class="mono"><b>${esc(m)}</b></td>
+     <td>${typeCell(m)}</td>
      <td>${(byModel[m] || []).map(epLine).join('')
        || (state.endpoints ? '<span class="muted">no endpoints</span>' : '<span class="muted">—</span>')}</td>
      <td><button class="ghost mini" data-model="${esc(m)}" onclick="probeModel(this)">test</button>
          <button class="ghost mini" data-model="${esc(m)}" onclick="editFallbacks(this)">fallbacks</button>
          <span class="probe-out" data-probe="${esc(m)}"></span><br>
          <button class="ghost mini danger" data-model="${esc(m)}" onclick="deleteModel(this)">remove</button></td></tr>`).join('')
-    || '<tr><td colspan="3" class="muted">none registered</td></tr>';
+    || '<tr><td colspan="4" class="muted">none registered</td></tr>';
 }
 
 // Per-model fallback chains (admin-curated failover, core.model_fallbacks):
@@ -1153,7 +1229,11 @@ async function loadKeys() {
   tb.innerHTML = keys.map(k => {
     const status = k.revoked_at ? '<span class="pill off">revoked</span>'
       : (k.expires_at && new Date(k.expires_at) < new Date() ? '<span class="pill off">expired</span>' : '<span class="pill on">active</span>');
-    return `<tr>
+    // data-search: the filter haystack, built from the handle fields only —
+    // NOT the whole row, so a search for "ok" cannot match the status pill.
+    const hay = [k.name, k.user_name, k.key_prefix, k.subject, k.profile_name]
+      .filter(Boolean).join(' ').toLowerCase();
+    return `<tr data-search="${esc(hay)}">
       <td>${esc(k.name)}</td>
       <td>${esc(k.user_name)}</td>
       <td class="mono" title="The full key was shown exactly once — at creation or rotation. It cannot be recovered or re-displayed afterwards; rotate the key to get a new secret.">${esc(k.key_prefix)}…</td>
@@ -1165,17 +1245,21 @@ async function loadKeys() {
       <td>${status}</td>
       <td>${selfMintCell(k)}</td>
       <td>
-        ${!k.revoked_at ? `<button class="ghost mini danger" onclick="revokeKey(this,'${k.id}')">revoke</button>
-        <button class="ghost mini" onclick="rotateKey(this,'${k.id}')">rotate</button>` : ''}
-        <button class="ghost mini" onclick="editKey(this,'${k.id}')">edit</button>
-        <button class="ghost mini" onclick="copyKeyPrefix(this,'${k.id}')">copy prefix</button>
-        <button class="ghost mini" onclick="showBudgets('${k.id}')">budgets</button>
-        <button class="ghost mini" onclick="showGrants('${k.id}')">MCP</button>
-        <button class="ghost mini" onclick="showCreds('${k.id}')">creds</button>
-        <button class="ghost mini" onclick="showUsage('${k.id}')">usage</button>
+        <div class="rowacts">
+          ${!k.revoked_at ? `<button class="ghost mini danger" onclick="revokeKey(this,'${k.id}')" title="Permanently revoke this key — immediate and irreversible">revoke</button>
+          <button class="ghost mini" onclick="rotateKey(this,'${k.id}')" title="Issue a new secret and revoke the old one in a single step">rotate</button>` : ''}
+          <button class="ghost mini" onclick="editKey(this,'${k.id}')" title="Name, rate limits, expiry, scopes, allowed models, and budgets">edit</button>
+          <button class="ghost mini" onclick="showGrants('${k.id}')" title="MCP tool grants">MCP</button>
+          <button class="ghost mini" onclick="showCreds('${k.id}')" title="Upstream credential overrides">creds</button>
+          <button class="ghost mini" onclick="showUsage('${k.id}')" title="Recent usage for this key">usage</button>
+        </div>
       </td></tr>`;
   }).join('') || '<tr><td colspan="11" class="muted">no keys yet</td></tr>';
   refreshFilterSelects();   // E: the user/key filters follow the key list
+  // Re-apply the search after every reload: a key that was filtered out must
+  // stay filtered once the list refreshes (otherwise editing a key silently
+  // resets the operator's search and the table jumps back to full length).
+  filterKeys();
 }
 // Reassign a USER's profile from the Keys table (2026-10-17). Profiles are
 // user-scoped (api_keys has NO profile column), so this is the only control
@@ -1208,13 +1292,32 @@ window.reassignProfile = (btn, userId) => withBtn(btn, async () => {
   });
 });
 
-window.copyKeyPrefix = (btn, id) => withBtn(btn, async () => {
-  const k = (state.keys || []).find(x => x.id === id) || (await api('/keys')).find(x => x.id === id);
-  if (!k) return;
-  const ok = await copyText(k.key_prefix);
-  banner(ok ? `copied prefix <b>${esc(k.key_prefix)}</b> (that's what request logs show)`
-            : 'clipboard blocked', ok ? '' : 'error', 3500);
-});
+
+// Client-side key filter (2026-10-23). Hides ROWS rather than re-rendering,
+// so typing never re-runs loadKeys() (no flicker, no lost scroll position, no
+// re-fetch). Matching is case-insensitive across the handles an operator
+// actually has when hunting a key: name, user, prefix, subject.
+window.filterKeys = () => {
+  const el = $('k-search');
+  const tb = $('keys-table') && $('keys-table').querySelector('tbody');
+  if (!el || !tb) return;
+  const q = (el.value || '').trim().toLowerCase();
+  const rows = [...tb.querySelectorAll('tr')];
+  let shown = 0;
+  for (const tr of rows) {
+    // Skip the empty-state row (it has a colspan, not real cells).
+    if (tr.querySelector('td[colspan]')) continue;
+    const hay = (tr.dataset.search || tr.textContent || '').toLowerCase();
+    const hit = !q || hay.includes(q);
+    tr.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  }
+  const cnt = $('k-search-count');
+  if (cnt) {
+    const real = rows.filter(tr => !tr.querySelector('td[colspan]')).length;
+    cnt.textContent = q ? `${shown} of ${real} shown` : (real ? `${real} keys` : '');
+  }
+};
 
 window.rotateKey = (btn, id) => withBtn(btn, () => doRotate(id));
 
@@ -1228,6 +1331,13 @@ window.editKey = (btn, id) => withBtn(btn, async () => {
   const name = k.name || 'key';
   const expLocal = k.expires_at ? new Date(k.expires_at).toISOString().slice(0, 16) : '';
   const scopes = k.scopes || [];
+  // Budgets are fetched up front so they render INSIDE this dialog: the row
+  // used to carry a separate `budgets` button, which is what made the action
+  // cell a scattered 8-button pile. A failure here must not block the edit
+  // form, so it degrades to an empty block with a note.
+  let bud = { budgets: [] };
+  try { bud = await api(`/keys/${id}/usage`); }
+  catch (e) { bud = { budgets: [], _err: (e && e.message) || 'unavailable' }; }
   dlg(`<h2>Edit key — ${esc(name)}</h2>
     <p class="muted">Blank fields stay unchanged. Edits apply to the NEXT request (keys are read per request — no restart).</p>
     <label>Name <input id="ek-name" value="${esc(name)}" style="width:100%"></label>
@@ -1245,10 +1355,14 @@ window.editKey = (btn, id) => withBtn(btn, async () => {
     <label>Allowed models (comma-separated; empty = all registered) <input id="ek-models" value="${esc((k.allowed_models || []).join(', '))}" style="width:100%"></label>
     <label><input type="checkbox" id="ek-relay" ${k.relay_default ? 'checked' : ''}> relay by default <span class="muted">(MCP tool calls run in-cluster WITHOUT the client header — X-PCAI-Execute-Tools still overrides per request)</span></label>
     <label><input type="checkbox" id="ek-stream-events" ${k.stream_pcai_events === false ? '' : 'checked'}> stream PCAI events <span class="muted">(in-stream {"pcai": …} telemetry chunks — OFF serves strict OpenAI-validating clients a byte-clean spec stream; X-PCAI-Stream-Events still overrides per request)</span></label>
+    ${bud._err ? `<p class="muted">budgets unavailable: ${esc(bud._err)}</p>` : budgetsMarkup(bud)}
     <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
       <button class="ghost" onclick="this.closest('dialog').close()">cancel</button>
       <button id="ek-save" class="primary">save changes</button>
     </div>`);
+  // Budgets save INDEPENDENTLY of the form (own endpoint, replace-all
+  // semantics); save-changes never touches them.
+  wireBudgets(id, bud, async () => { await loadKeys(); });
   // guarded (NOT a bare withBtn call): withBtn is async — invoking it
   // directly would PATCH immediately on dialog-open and leave onclick a
   // Promise. guarded defers to click time and disables during the request.
@@ -1386,14 +1500,16 @@ function armPasswordToggles(root) {
   }
 }
 
-async function showBudgets(id) {
-  // F1: id-only handler — the key name is looked up here, never interpolated
-  // into the inline onclick (an apostrophe in a name used to brick the row).
-  const k = (state.keys || []).find(x => x.id === id) || (await api('/keys')).find(x => x.id === id);
-  const name = k ? k.name : 'key';
-  const u = await api(`/keys/${id}/usage`);
+// Budgets as an EMBEDDABLE block (2026-10-23). Previously a standalone dialog
+// reached from its own row button; it now renders inside the Edit key dialog so
+// the row grid is a tidy 2x3 instead of 8 scattered buttons. Kept as a separate
+// builder because it owns real behaviour (replace-all semantics, the union-on-
+// add guard) that must not be duplicated inside editKey.
+//
+// RETURNS the markup; the caller wires the handlers via wireBudgets().
+function budgetsMarkup(u) {
   const bar = pct =>
-    `<div style="background:var(--bg);border-radius:4px;width:120px"><div style="background:${pct > .95 ? 'var(--err)' : pct > .8 ? 'var(--warn)' : 'var(--ok)'};width:${Math.min(100, pct * 100)}%;border-radius:4px;height:8px"></div></div>`;
+    `<div style="background:var(--bg);border-radius:4px;width:90px"><div style="background:${pct > .95 ? 'var(--err)' : pct > .8 ? 'var(--warn)' : 'var(--ok)'};width:${Math.min(100, pct * 100)}%;border-radius:4px;height:8px"></div></div>`;
   const tokenRows = (u.budgets || []).filter(b => b.kind !== 'usd').map(b =>
     `<tr><td>${esc(b.model)}</td><td>${esc(b.period)}</td>
      <td>${(b.spent || 0).toLocaleString()} / ${(b.limit || 0).toLocaleString()}</td>
@@ -1402,8 +1518,7 @@ async function showBudgets(id) {
     `<tr><td>${esc(b.model)}</td><td>${esc(b.period)}</td>
      <td>$${(b.spent_usd || 0).toFixed(4)} / $${(b.limit_usd || 0).toFixed(2)}</td>
      <td>${bar(b.limit_usd ? (b.spent_usd || 0) / b.limit_usd : 0)}</td></tr>`);
-  dlg(`<h2>Budgets — ${esc(name)}</h2>
-    <h3>Token budgets</h3>
+  return `<h3>Token budgets</h3>
     <table><thead><tr><th>Model</th><th>Period</th><th>Spent / Limit (tokens)</th><th></th></tr></thead>
     <tbody>${tokenRows.join('') || '<tr><td colspan="4" class="muted">none</td></tr>'}</tbody></table>
     <h3>Cost budgets (USD) <span class="muted">— whichever limit hits first stops the key</span></h3>
@@ -1421,17 +1536,23 @@ async function showBudgets(id) {
     </div>
     <p class="muted">This ADDS one entry — every budget shown above is sent along with it, so nothing is deleted.
     (Re-adding an entry for the same model + period + kind replaces that one entry.)
-    A dollar budget only counts models that have a price row on the Costs tab — a model with no price row bills $0 to that budget.</p>`);
-  $('b-type').onchange = () => {
-    const usd = $('b-type').value === 'usd';
+    A dollar budget only counts models that have a price row on the Costs tab — a model with no price row bills $0 to that budget.</p>`;
+}
+
+// Wire the add-budget control for whatever dialog currently holds the markup.
+function wireBudgets(id, u, afterSave) {
+  const typeEl = $('b-type'), addEl = $('b-add');
+  if (!typeEl || !addEl) return;              // budgets block absent
+  typeEl.onchange = () => {
+    const usd = typeEl.value === 'usd';
     $('b-limit-label').textContent = usd ? 'USD' : 'Tokens';
     $('b-limit').value = usd ? 20 : 200000;
   };
-  $('b-add').onclick = guarded('b-add', async () => {
+  addEl.onclick = guarded('b-add', async () => {
     const usd = $('b-type').value === 'usd';
     const entry = { model: $('b-model').value || '*', period: $('b-period').value };
     if (usd) entry.limit_usd = +$('b-limit').value; else entry.limit_tokens = +$('b-limit').value;
-    // F2: POST /keys/{id}/budgets is REPLACE-ALL — sending only [entry] deleted
+    // POST /keys/{id}/budgets is REPLACE-ALL — sending only [entry] deleted
     // every other budget on the key. Send the UNION: all displayed budgets plus
     // the new one. Dedupe on (model, period, kind): the backend enforces every
     // row independently, so a stale duplicate of the same slot would keep the
@@ -1443,8 +1564,18 @@ async function showBudgets(id) {
       : { model: b.model, period: b.period, limit_tokens: b.limit })
       .filter(b => !sameSlot(b, entry));
     await api(`/keys/${id}/budgets`, { method: 'POST', body: { budgets: [...keep, entry] } });
-    $('dlg').close(); await loadKeys(); banner('budgets saved', '', 3000);
+    banner('budget added', '', 3000);
+    if (afterSave) await afterSave();
   });
+}
+async function showBudgets(id) {
+  // F1: id-only handler — the key name is looked up here, never interpolated
+  // into the inline onclick (an apostrophe in a name used to brick the row).
+  const k = (state.keys || []).find(x => x.id === id) || (await api('/keys')).find(x => x.id === id);
+  const name = k ? k.name : 'key';
+  const u = await api(`/keys/${id}/usage`);
+  dlg(`<h2>Budgets — ${esc(name)}</h2>` + budgetsMarkup(u));
+  wireBudgets(id, u, async () => { $('dlg').close(); await loadKeys(); });
 }
 
 async function showGrants(id) {
@@ -3175,23 +3306,40 @@ async function loadRouting() {
   rtCfg = d;
   const c = d.config || {};
   $('rt-enabled').checked = c.enabled !== false;
-  // Decision-model dropdown over the CHAT pools: a configured name that is
-  // no longer a chat pool still renders, marked (never silently cleared).
+  // Decision-model dropdown over the DECISION-CAPABLE pools (decision first,
+  // then chat). It read d.chat_models until 2026-10-23, which meant a
+  // correctly-registered decision pool was invisible in the one place it is
+  // supposed to be chosen — the whole point of deploying d3-turbo. A
+  // configured name that is no longer decision-capable still renders, marked
+  // (never silently cleared).
   const chat = Array.isArray(d.chat_models) ? d.chat_models : [];
+  const decisionCapable = Array.isArray(d.decision_models) && d.decision_models.length
+    ? d.decision_models
+    : chat;
   const cur = c.decision_model || '';
   const opts = ['<option value="">(none — heuristics only)</option>'];
-  for (const m of chat) {
+  for (const m of decisionCapable) {
     opts.push('<option value="' + esc(m) + '"' + (m === cur ? ' selected' : '') + '>' + esc(m) + '</option>');
   }
-  if (cur && !chat.includes(cur)) {
-    opts.push('<option value="' + esc(cur) + '" selected>' + esc(cur) + ' (not a chat pool)</option>');
+  if (cur && !decisionCapable.includes(cur)) {
+    opts.push('<option value="' + esc(cur) + '" selected>' + esc(cur) + ' (not decision-capable)</option>');
   }
   $('rt-decision').innerHTML = opts.join('');
+  // decision_mode / min_confidence / timeout_ms (2026-10-23). Defaults are the
+  // API's own, so an older config row renders the shipped posture rather than
+  // a blank control that would then SAVE a blank.
+  const mode = ['off', 'shadow', 'active'].includes(c.decision_mode) ? c.decision_mode : 'off';
+  $('rt-mode').value = mode;
+  $('rt-minconf').value = c.decision_min_confidence != null ? c.decision_min_confidence : 0.60;
+  $('rt-timeout').value = c.decision_timeout_ms != null ? c.decision_timeout_ms : 2500;
   const storedAllowed = Array.isArray(c.allowed_models) ? c.allowed_models : [];
   paintRoutingAllowed(chat.concat(storedAllowed.filter(m => !chat.includes(m))), storedAllowed, chat);
   $('rt-prompt').value = c.prompt || '';
   $('rt-inject').checked = c.inject_gpu_load === true;
   $('rt-maxchars').value = c.max_prompt_chars != null ? c.max_prompt_chars : 8000;
+  $('rt-routedefault').checked = c.route_default_model === true;
+  $('rt-sticky').checked = c.sticky_routing === true;
+  $('rt-stickyidle').value = c.sticky_routing_idle_reset_s != null ? c.sticky_routing_idle_reset_s : 1800;
   const ov = (d.overridden || []);
   const ovEl = $('rt-overridden');
   if (ovEl) ovEl.textContent = ov.length
@@ -3235,6 +3383,14 @@ async function saveRouting() {
     // '' -> null: CLEAR the row instead of storing an empty override (the
     // GET's overridden list stays honest — only real choices appear in it)
     decision_model: $('rt-decision').value || null,
+    // decision_mode is a plain enum: '' -> null would clear the row and fall
+    // back to 'off', but the select can never be empty, so send it as-is.
+    decision_mode: $('rt-mode').value,
+    // Numbers are clamped SERVER-side too (the Pydantic Field bounds); a
+    // NaN from a cleared input is sent as null so the stored value stands
+    // rather than being overwritten with 0.
+    decision_min_confidence: $('rt-minconf').value === '' ? null : Number($('rt-minconf').value),
+    decision_timeout_ms: $('rt-timeout').value === '' ? null : Number($('rt-timeout').value),
     // Explicit null when nothing is ticked: an OMITTED key never reaches
     // set_values (the handler builds `provided` from exclude_unset, so absent
     // != null) — omitting it would silently KEEP the stored allowlist while
@@ -3244,14 +3400,23 @@ async function saveRouting() {
     prompt: $('rt-prompt').value || null,
     inject_gpu_load: $('rt-inject').checked,
     max_prompt_chars: maxChars,
+    // Checkboxes are always explicit booleans (a checkbox cannot express
+    // "unset", and the operator's untick IS a decision to store false).
+    route_default_model: $('rt-routedefault').checked,
+    sticky_routing: $('rt-sticky').checked,
+    // Same null-on-empty discipline as the numeric knobs above: a cleared
+    // input must not be written as 0 (which would mean "never reset").
+    sticky_routing_idle_reset_s: $('rt-stickyidle').value === '' ? null : Number($('rt-stickyidle').value),
   };
   try {
     await api('/routing/config', { method: 'PUT', body });
-    // No 'live within ~60s' promise here: unlike the PROFILE routing knobs
-    // (which the proxy really does re-read through a per-user TTL cache), this
-    // config has no data-plane reader yet — core.routing_config is consumed by
-    // routes_admin only until the decision model is wired.
-    banner('routing config saved (stored; not yet consulted by the data plane)', '', 4000);
+    // The data plane DOES read this now: routes_proxy calls
+    // routing_config.decision_settings() per pseudo-model request (60s TTL).
+    // The banner names the mode so the operator can see which posture took
+    // effect, and does not promise a sub-60s flip.
+    const savedMode = $('rt-mode').value;
+    banner('routing config saved — decision mode: ' + savedMode +
+      (savedMode === 'off' ? ' (heuristics only)' : ' (live within ~60s)'), '', 5000);
     await loadRouting();
   } catch (e) { banner(esc(e.message), 'error', 6000); }
 }
@@ -3473,7 +3638,7 @@ Object.assign(window, {
   newTenant, newUser, revokeKey, showBudgets, showGrants, showUsage,
   editProfile, deleteProfile, viewTools, moAddRow, deleteModel, deletePrice, saveOpFraction,
   pAddModel, pAddBudget, pMove, pDel, pDelBudget, pReloadTools,
-  copyKeyPrefix, rotateKey, probeModel, testMcp, editKey, propagateLimits,
+  rotateKey, probeModel, testMcp, editKey, propagateLimits,
   showCreds, delCred, revokeEnrollment,
   editGuardrail, attachGuardrail, deleteGuardrail,
 });
