@@ -102,6 +102,9 @@ All configuration lives in `values.yaml`:
 | `opencodeAgents` | Agent markdown files seeded into `~/.config/opencode/agents/` |
 | `opencode.version` | The opencode npm version to install (e.g. `1.18.11`) |
 | `openchamber.version` | The OpenChamber npm version to install (used when `ui.mode: openchamber`) |
+| `openchamber.reportUsage` | OpenChamber "Send anonymous usage reports". `false` (default) forces it off for every user on each unit start (the init writes `reportUsage: false` to OpenChamber's `settings.json` and `preferences.json`); `true` leaves each user's own choice. |
+
+**Provider lock and default model.** Put `enabled_providers` (e.g. `["litellm"]`), `model` and `small_model` in `opencodeConfig` to show only your own provider's models and default everyone to one model. `opencode.json` is seed-once, so the unit init (`apply-defaults.mjs`, in the project ConfigMap) merges those three keys into units seeded earlier — once per distinct value set, so later user edits survive until the values change — and moves OpenChamber's default model onto an enabled provider if it points at a disabled one.
 | `ui.mode` | `opencode` (default, built-in web UI) or `openchamber` (OpenChamber frontend) |
 | `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a prompt body — the request never reaches the app. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
 

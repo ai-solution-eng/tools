@@ -9,10 +9,20 @@ metadata:
 data:
   nginx.conf: |
     worker_processes 1;
+    # pid and temp paths under /tmp so nginx also starts under the uid that
+    # platform admission forces onto project-user-* pods (the stock image's
+    # /var/cache/nginx and /var/run are root-owned).
+    pid /tmp/nginx.pid;
     events {
       worker_connections 1024;
     }
     http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path       /tmp/proxy_temp;
+      fastcgi_temp_path     /tmp/fastcgi_temp;
+      uwsgi_temp_path       /tmp/uwsgi_temp;
+      scgi_temp_path        /tmp/scgi_temp;
+
       # nginx defaults to 1 MB, which rejects a pasted/dropped image once the
       # browser base64-encodes it into a prompt body (HTTP 413, before the app
       # sees the request). Tunable via nginx.clientMaxBodySize.

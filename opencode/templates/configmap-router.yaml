@@ -24,6 +24,9 @@ data:
     const userOpenChamberVersion = process.env.USER_INSTANCE_OPENCHAMBER_VERSION || '{{ .Values.openchamber.version }}'
     const userUiMode = process.env.USER_INSTANCE_OPENCODE_UI_MODE || '{{ .Values.ui.mode }}'
     const userIsChamber = userUiMode === 'openchamber'
+    // OpenChamber "send anonymous usage reports" (openchamber.reportUsage).
+    // Enforced off on every unit start unless the value is true.
+    const userOpenChamberReportUsage = '{{ ternary "true" "false" (default false .Values.openchamber.reportUsage) }}'
     const userChamberPort = Number(process.env.USER_INSTANCE_OPENCHAMBER_PORT || '{{ .Values.ui.chamberPort }}')
     const userServerPort = Number(process.env.USER_INSTANCE_OPENCODE_SERVER_PORT || '{{ .Values.ui.serverPort }}')
     const workspaceSize = process.env.PERSONAL_WORKSPACE_SIZE || '{{ .Values.storage.workspaceSize }}'
@@ -94,7 +97,20 @@ data:
     // v15: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
     // default rejected pasted/dropped images with HTTP 413 before the app saw
     // the request. Bumped so existing units re-stamp onto the new nginx.conf.
-    const userTemplateVersion = `terminal-tab-v15-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    // v16: platform (project-user-*) units run the init container and the
+    // opencode-web startup as root at container level. Platform admission
+    // (Kyverno ezprojects-workload-security-context) forces the tenant uid
+    // pod-wide, which broke chown / groupadd / useradd / setpriv (units
+    // crash-looped); nginx.conf now keeps its pid and temp paths under /tmp so
+    // the sidecar starts under the forced uid.
+    // v17: the init container and the startup script now exit with an explicit
+    // error when a platform identity is stamped but the container is not root,
+    // instead of exiting 0 after silently skipping every step.
+    // v18: apply-defaults.mjs runs in the unit init — opencode.json provider lock /
+    // default model (enabled_providers, model, small_model) merged into existing
+    // units, OpenChamber usage reporting forced off (openchamber.reportUsage), and
+    // OpenChamber's default model kept on an enabled provider.
+    const userTemplateVersion = `terminal-tab-v18-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1595,6 +1611,16 @@ data:
         { name: 'USER_INFO_GROUP', value: platform.identity.group || '' },
         { name: 'USER_INFO_HOMEDIR', value: platform.identity.homedir || '/var/opencode/home' },
       ] : []
+      // Platform admission (Kyverno ezprojects-workload-security-context)
+      // forces runAsUser/runAsGroup/fsGroup = the project identity onto every
+      // pod in a project namespace. The init container (chown, setpriv) and
+      // the startup script (groupadd/useradd, setpriv drop) need root, so
+      // override at container level — the same recipe as the dind spec — and
+      // let setpriv drop to the project identity. Only these two containers
+      // need it; empty for classic/warm units, which already run as root.
+      const platformRootSecurityContext = platformIdentityEnv.length > 0
+        ? { runAsUser: 0, runAsGroup: 0, runAsNonRoot: false }
+        : {}
       // Data Manager platform roots: mounted → show; pending/off → hide.
       const platformRootsMode = platform ? (platformVolumesMounted ? 'mounted' : 'pending') : 'off'
       // DinD placement for THIS unit (see the dockerEnabled note at the top
@@ -1638,6 +1664,13 @@ data:
       // /var/opencode/data/npm/bin resolves through the alias.
       const npmBakedGuardCommand = '$RUN_AS_USER sh -c \'if [ -f /opt/opencode/npm/.opencode-version ] && [ "$(cat /opt/opencode/npm/.opencode-version 2>/dev/null)" = "${OPENCODE_VERSION}" ] && [ -f /opt/opencode/npm/.openchamber-version ] && [ "$(cat /opt/opencode/npm/.openchamber-version 2>/dev/null)" = "${OPENCHAMBER_VERSION}" ]; then if [ ! -e /var/opencode/data/npm ]; then ln -sfn /opt/opencode/npm /var/opencode/data/npm; fi; ln -sf /opt/opencode/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true; else if [ ! -f /var/opencode/data/npm/bin/opencode ] || [ "$(cat /var/opencode/.opencode-version 2>/dev/null)" != "${OPENCODE_VERSION}" ]; then HOME=/var/opencode/home npm install -g "opencode-ai@${OPENCODE_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCODE_VERSION}" > /var/opencode/.opencode-version && (ln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true); fi; if [ -n "$OPENCHAMBER_INSTALL" ] && { [ ! -f /var/opencode/data/npm/bin/openchamber ] || [ "$(cat /var/opencode/.openchamber-version 2>/dev/null)" != "${OPENCHAMBER_VERSION}" ]; }; then HOME=/var/opencode/home npm install -g "@openchamber/web@${OPENCHAMBER_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCHAMBER_VERSION}" > /var/opencode/.openchamber-version && (ln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true); fi; fi\''
       const initCommandParts = [
+        // Fail fast when a platform identity is stamped but the container is
+        // not root. Every later step is `|| true`-guarded, so without this a
+        // non-root init (platform admission forcing the tenant uid, or a
+        // missing container-level runAsUser: 0) exits 0 having seeded nothing
+        // and the unit then crash-loops in the main container with a
+        // misleading message.
+        'if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ] && [ "$(id -u)" != "0" ]; then echo "ERROR: platform identity uid $USER_INFO_UID is set but this init container runs as uid $(id -u), not root. Platform units need a container-level runAsUser: 0 (platform admission forces the tenant uid pod-wide); check platformRootSecurityContext in the router config." >&2; exit 1; fi',
         'mkdir -p /workspace/personal /workspace/shared /var/opencode/home/.config/opencode/agents /var/opencode/home/.config/opencode/skills /var/opencode/data /var/opencode/state /var/opencode/cache /var/opencode/bin',
         // --- Platform identity (platform integration): when USER_INFO_* is
         // stamped (SSO unit inside the project namespace), all VOLUME content
@@ -1663,6 +1696,12 @@ data:
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
         '$RUN_AS_USER sh -c \'if [ ! -f /var/opencode/home/.config/opencode/opencode.json ]; then if [ -f /var/opencode/config/opencode/opencode.json ]; then cp /var/opencode/config/opencode/opencode.json /var/opencode/home/.config/opencode/opencode.json; else cp /opt/opencode-defaults/opencode.json /var/opencode/home/.config/opencode/opencode.json; fi; fi\'',
+        // Enforced defaults (apply-defaults.mjs in the project ConfigMap): provider
+        // lock / default model merged into existing opencode.json files (the seed
+        // above is seed-once), OpenChamber "send anonymous usage reports" off
+        // unless openchamber.reportUsage is true, and a default model that
+        // belongs to an enabled provider. Runs on every start; never fails it.
+        `$RUN_AS_USER env CONFIG_HOME=/var/opencode/home/.config OPENCHAMBER_REPORT_USAGE=${userOpenChamberReportUsage} node /opt/opencode-defaults/apply-defaults.mjs || true`,
         "$RUN_AS_USER sh -c 'legacy_agents=/tmp/opencode-legacy-AGENTS.md; printf \"%s\n%s\n%s\n\" \"# HPE AI Essentials (AIE) Platform Assistant\" \"You are an expert AIE/PCAI platform engineer and advisor. You have access to live Kubernetes cluster tools, indexed product documentation, and web search.\" \"Your mission: **Think deeply. Act decisively. Anticipate what the user needs before they ask.**\" > \"$legacy_agents\"; if [ -f /var/opencode/home/.config/opencode/AGENTS.md ] && cmp -s \"$legacy_agents\" /var/opencode/home/.config/opencode/AGENTS.md; then rm /var/opencode/home/.config/opencode/AGENTS.md; fi; rm -f \"$legacy_agents\"' || true",
         {{- range .Values.opencodeSkills }}
         '$RUN_AS_USER sh -c \'mkdir -p /var/opencode/home/.config/opencode/skills/{{ .name }} && if [ ! -f /var/opencode/home/.config/opencode/.seeded-skill-{{ .name }} ]; then if [ ! -f /var/opencode/home/.config/opencode/skills/{{ .name }}/SKILL.md ]; then cp /opt/opencode-defaults/skill-{{ .name }}.md /var/opencode/home/.config/opencode/skills/{{ .name }}/SKILL.md; fi; touch /var/opencode/home/.config/opencode/.seeded-skill-{{ .name }}; fi\' || true',
@@ -1742,7 +1781,7 @@ data:
         // the platform unix identity, byte-identical to a Kubeflow notebook.
         // Without identity (classic local units) it runs as root, exactly as
         // before.
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  if [ \"$(id -u)\" != \"0\" ]; then\n    echo \"ERROR: platform identity uid $USER_INFO_UID is set but opencode-web runs as uid $(id -u), not root; platform units need a container-level runAsUser 0 so setpriv can drop to the project identity\" >&2\n    exit 1\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
         "chmod 0755 /var/opencode/bin/opencode-startup.sh",
       ]
       const initCommand = initCommandParts.join(' && ')
@@ -1812,6 +1851,7 @@ data:
                   image: userInitImage,
                   imagePullPolicy: 'Always',
                   command: ['/bin/sh', '-lc', initCommand],
+                  ...(platformIdentityEnv.length > 0 ? { securityContext: platformRootSecurityContext } : {}),
                   env: [
                     { name: 'OPENCODE_VERSION', value: userOpencodeVersion },
                     { name: 'TTYD_VERSION', value: ttydVersion },
@@ -1855,6 +1895,7 @@ data:
                   tty: true,
                   securityContext: {
                     capabilities: { add: ['SYS_PTRACE'] },
+                    ...platformRootSecurityContext,
                   },
                   env: [
                     { name: 'HOME', value: '/var/opencode/home' },
