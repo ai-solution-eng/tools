@@ -231,6 +231,19 @@ input:focus {
   outline-offset: -1px;
   border-color: var(--hpe-green);
 }
+/* Checkboxes are not text inputs: the padding/border above is meant for text
+   fields and makes a bare checkbox render oversized and push its label onto a
+   new line.  Reset them everywhere they appear. */
+input[type="checkbox"], input[type="radio"] {
+  padding: 0;
+  border: 0;
+  background: none;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--hpe-green);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
 select {
   padding: 9px 11px;
   border: 1px solid var(--hpe-border);
@@ -648,3 +661,224 @@ tr.push-err td { background: var(--hpe-critical-tint); }
 }
 .checkbox-label input { width: 18px; height: 18px; }
 #add-model-form > button { margin-top: 16px; width: 100%; }
+
+/* ---- GPU class filter (radio group) ---- */
+.gpu-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+}
+/* The legend is visually hidden but kept for screen readers: the radios are
+   self-describing ("H200", "L40S"), so a visible heading would just be noise. */
+.gpu-filter-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.gpu-option {
+  display: inline-flex;
+  flex-direction: row;      /* override the global label { column } rule */
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 16px;
+  background: var(--hpe-surface);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.gpu-option:hover { border-color: var(--hpe-green); background: var(--hpe-green-tint); }
+/* :has lets the pill itself show selection — the radio is tiny and easy to
+   miss, and the whole pill is the click target. */
+.gpu-option:has(input:checked) {
+  border-color: var(--hpe-green);
+  background: var(--hpe-green-tint);
+  color: var(--hpe-green-dark);
+  font-weight: 700;
+}
+.gpu-option:has(input:focus-visible) { outline: 2px solid var(--hpe-focus); outline-offset: 2px; }
+.gpu-option input[type="radio"] { width: 14px; height: 14px; margin: 0; }
+.gpu-spec {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Catalog search ---- */
+.catalog-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.catalog-search input[type="search"] {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 14px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+}
+.catalog-search input[type="search"]:focus {
+  outline: 2px solid var(--hpe-green);
+  border-color: var(--hpe-green);
+}
+.search-summary {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+}
+
+/* ---- Hierarchical tree: lab > model > configuration ---- */
+/* Nested <details> so expand/collapse is native: no JS state, keyboard
+   accessible, and the open/closed state survives a re-render. */
+.tree-lab {
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  margin-bottom: 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+.tree-lab-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  background: var(--hpe-green-tint);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+/* Hide the default disclosure triangle; we draw our own so it can be styled
+   and rotated consistently across browsers. */
+.tree-lab-summary::-webkit-details-marker,
+.tree-model-summary::-webkit-details-marker { display: none; }
+.tree-lab-summary::before,
+.tree-model-summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.15s ease;
+  opacity: 0.65;
+}
+details[open] > .tree-lab-summary::before,
+details[open] > .tree-model-summary::before { transform: rotate(90deg); }
+.tree-lab-summary:hover { background: var(--hpe-tint-hover); }
+.tree-lab-summary:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+.tree-lab-name { font-size: 15px; font-weight: 700; color: var(--hpe-green-dark); }
+.tree-count {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  font-variant-numeric: tabular-nums;
+}
+.tree-lab-actions { margin-left: auto; }
+.tree-select {
+  display: inline-flex;
+  flex-direction: row;   /* override the global label { column } rule */
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.tree-select input { width: 14px; height: 14px; cursor: pointer; }
+
+.tree-lab-body { padding: 8px 10px 10px 14px; }
+
+.tree-model {
+  border-left: 2px solid var(--hpe-border-soft);
+  margin: 6px 0;
+  padding-left: 10px;
+}
+.tree-model-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 3px;
+  user-select: none;
+}
+.tree-model-summary:hover { background: var(--hpe-row-alt); }
+.tree-model-summary:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+.tree-model-name { font-size: 13px; font-weight: 700; }
+
+.tree-configs { padding: 2px 0 4px 16px; }
+.tree-config {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 3px;
+  font-size: 12.5px;
+}
+.tree-config:hover { background: var(--hpe-row-alt); }
+.tree-config-select { flex-direction: row; }
+.tree-config-select input { width: 15px; height: 15px; cursor: pointer; display: block; }
+.tree-config-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Everything after the label groups to the right of the row, so the chips and
+   model path sit together instead of floating mid-row with a dead gap. */
+/* Emphasised label segments (HiCache / shared GPU) -- part of the label text
+   itself, so they never duplicate what the label already says. */
+.cfg-emph {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 700;
+}
+.cfg-emph-cache { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.cfg-emph-shared { background: var(--hpe-skip-tint); color: var(--hpe-text); }
+.cfg-sep { color: var(--hpe-text-soft); font-weight: 400; }
+.tree-config-id {
+  flex: 0 1 auto;
+  margin-left: auto;
+  max-width: 34%;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-config-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; margin-left: 6px; }
+.tree-config-actions .action-btn { padding: 3px 8px; font-size: 11px; }
+
+/* Narrow screens: let the label wrap and drop the model-path column so the
+   action buttons stay reachable instead of overflowing. */
+@media (max-width: 720px) {
+  .tree-config { flex-wrap: wrap; }
+  .tree-config-label { white-space: normal; }
+  .tree-config-id { display: none; }
+  .tree-config-actions { margin-left: auto; }
+  .catalog-search { flex-wrap: wrap; }
+  .search-summary { width: 100%; }
+}

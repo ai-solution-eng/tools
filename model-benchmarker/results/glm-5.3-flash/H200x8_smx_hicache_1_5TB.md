@@ -44,3 +44,50 @@ Status: in progress — 34 levels completed (last updated 2026-09-15 09:01:20)
 | 524288 | 4 | coding | 0 | 48522.7 | 73151.4 | 75322.3 | 75865.0 | 1758.4 | 4563.8 | 4565.7 | 4566.2 | 161.4 | 73.4 | 15.0 | 0.4 |
 | 524288 | 8 | coding | 0 | 85417.4 | 143369.5 | 148394.0 | 149650.1 | 2987.0 | 5166.5 | 5970.5 | 5986.1 | 134.5 | 1.1 | 0.4 | 0.4 |
 | 524288 | 16 | coding | 0 | 159168.7 | 350018.7 | 361499.3 | 364369.4 | 60574.9 | 120838.2 | 147364.5 | 159094.3 | 122.7 | 27.1 | 0.0 | 0.0 |
+
+## Derived: aggregate prefill throughput
+
+Computed from the TTFT column above, not measured separately:
+
+    aggregate prefill tok/s = users * ctx / (TTFT turn1 P100 in seconds)
+
+All `users` requests fire at once, so the last first-token (P100) marks
+when all `users * ctx` prompt tokens have been prefilled.  This is an
+AGGREGATE rate: it is flat-to-rising with concurrency, because more users each
+prefilling the same prompt is more total work in a similar window shape.
+Dividing it by `users` gives the per-user rate, which falls ~1/users.
+
+It does NOT mean the hardware is at peak: at ctx=32768 a single user already
+saturates prefill, and the achieved FLOPS sit around 30% of the 4x H200 BF16
+peak, limited by memory bandwidth and FP4/FP8 expert weights rather than FMA.
+
+Caveats:
+
+* `ctx` is the *nominal* padding target.  The padding rule assumes 4
+  chars/token while real tokenizers average ~5.3, so the true prompt is
+  roughly 25% shorter and these figures are ~25% high.
+* P100 is a single sample (the slowest request).  A level whose P100/P50
+  exceeds 2 is straggler-dominated and carries a leading `~`:
+  treat it as a floor, not a measurement.
+
+| ctx | users | task | P100 TTFT (ms) | P100/P50 | aggregate prefill tok/s |
+|:---|---:|:---|---:|---:|---:|
+| 32768 | 1 | coding | 1334 | 1.00 | 24,573 |
+| 32768 | 1 | creative | 1245 | 1.00 | 26,320 |
+| 32768 | 1 | mixed | 1288 | 1.00 | 25,435 |
+| 32768 | 4 | coding | 4187 | 1.29 | 31,302 |
+| 32768 | 4 | creative | 4271 | 1.30 | 30,688 |
+| 32768 | 4 | mixed | 4184 | 1.29 | 31,324 |
+| 32768 | 8 | coding | 8117 | 1.56 | 32,297 |
+| 32768 | 8 | creative | 8444 | 1.56 | 31,044 |
+| 32768 | 8 | mixed | 8307 | 1.55 | 31,558 |
+| 32768 | 32 | coding | 32098 | 1.89 | 32,668 |
+| 32768 | 32 | creative | 32117 | 1.88 | 32,649 |
+| 32768 | 32 | mixed | 32310 | 1.85 | 32,454 |
+| 32768 | 64 | coding | 171920 | 5.18 | ~12,198 |
+| 32768 | 64 | creative | 168922 | 5.11 | ~12,415 |
+| 32768 | 64 | mixed | 162364 | 4.89 | ~12,916 |
+| 524288 | 1 | coding | 20527 | 1.00 | 25,541 |
+| 524288 | 4 | coding | 75865 | 1.56 | 27,643 |
+| 524288 | 8 | coding | 149650 | 1.75 | 28,027 |
+| 524288 | 16 | coding | 364369 | 2.29 | ~23,022 |

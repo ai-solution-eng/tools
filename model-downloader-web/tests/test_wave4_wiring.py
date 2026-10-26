@@ -51,10 +51,22 @@ class TestGcReportShape:
 
     def _entries(self):
         return [
-            {"model_name": "acme/Old", "cachepath": "/mnt/large-models/models--acme--Old",
-             "mtime": self.NOW - 90 * 86400, "bytes": 100, "manifest": True, "scanned": "clean"},
-            {"model_name": "acme/Serving", "cachepath": "/mnt/large-models/models--acme--Serving",
-             "mtime": self.NOW - 90 * 86400, "bytes": 200, "manifest": True, "scanned": ""},
+            {
+                "model_name": "acme/Old",
+                "cachepath": "/mnt/large-models/models--acme--Old",
+                "mtime": self.NOW - 90 * 86400,
+                "bytes": 100,
+                "manifest": True,
+                "scanned": "clean",
+            },
+            {
+                "model_name": "acme/Serving",
+                "cachepath": "/mnt/large-models/models--acme--Serving",
+                "mtime": self.NOW - 90 * 86400,
+                "bytes": 200,
+                "manifest": True,
+                "scanned": "",
+            },
         ]
 
     def _plan(self, aioli_uris, jobs, protected=None, min_keep=0):
@@ -103,7 +115,9 @@ class TestGcReportShape:
         assert plan["summary"]["delete"] == 0
 
     def test_parse_aioli_rows_for_report(self):
-        uris = parse_aioli_rows([("a", "pvc://models-pvc/large-models/acme/Serving?containerPath=/mnt/models"), ("b", None)])
+        uris = parse_aioli_rows(
+            [("a", "pvc://models-pvc/large-models/acme/Serving?containerPath=/mnt/models"), ("b", None)]
+        )
         assert uris == ["pvc://models-pvc/large-models/acme/Serving?containerPath=/mnt/models"]
 
 

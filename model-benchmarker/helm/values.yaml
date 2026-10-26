@@ -40,7 +40,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
   # Packaged with the chart — kept in lockstep by bump_version.sh.
-  tag: v0.9.3
+  tag: v1.0.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays private.

@@ -7,7 +7,6 @@ equality) and the dry-run report shape the UI renders. Each test in the
 matrix flips exactly one key to prove every missing key blocks deletion.
 """
 
-
 from model_downloader.app.gc import (
     aioli_protected_dirs,
     build_gc_plan,
@@ -101,8 +100,11 @@ class TestThreeKeyMatrix:
         assert "no manifest" in plan["rows"][0]["reason"]
 
     def test_aioli_row_blocks_deletion(self):
-        plan = plan_of([entry(name="acme/Serving")], ttl_days=30,
-                       aioli_uris=["pvc://models-pvc/large-models/acme/Serving?containerPath=/mnt/models"])
+        plan = plan_of(
+            [entry(name="acme/Serving")],
+            ttl_days=30,
+            aioli_uris=["pvc://models-pvc/large-models/acme/Serving?containerPath=/mnt/models"],
+        )
         assert plan["rows"][0]["action"] == "keep"
         assert "AIOLI" in plan["rows"][0]["reason"]
 
@@ -122,14 +124,20 @@ class TestThreeKeyMatrix:
         # key 1 removed (no manifest)
         assert plan_of([entry(manifest=False)], **base)["rows"][0]["action"] == "keep"
         # key 2 removed (AIOLI row present)
-        assert plan_of([entry(name="acme/S")], aioli_uris=["pvc://models-pvc/l/large-models/acme/S"], live_jobs=[])[
-            "rows"
-        ][0]["action"] == "keep"
+        assert (
+            plan_of([entry(name="acme/S")], aioli_uris=["pvc://models-pvc/l/large-models/acme/S"], live_jobs=[])[
+                "rows"
+            ][0]["action"]
+            == "keep"
+        )
         # key 3 removed (live job pins the root)
-        assert plan_of(
-            [entry(cachepath="/mnt/r/models--acme--L")],
-            live_jobs=[{"namespace": "n", "job_name": "j", "model_name": "acme/L", "cache_root": "/mnt/r"}],
-        )["rows"][0]["action"] == "keep"
+        assert (
+            plan_of(
+                [entry(cachepath="/mnt/r/models--acme--L")],
+                live_jobs=[{"namespace": "n", "job_name": "j", "model_name": "acme/L", "cache_root": "/mnt/r"}],
+            )["rows"][0]["action"]
+            == "keep"
+        )
 
     def test_below_ttl_keeps_even_when_all_keys_would_allow(self):
         plan = plan_of([entry(mtime=NOW - 5 * 86400)], ttl_days=30)
@@ -147,8 +155,11 @@ class TestThreeKeyMatrix:
         assert "protectedModels" in plan["rows"][0]["reason"]
 
     def test_protected_glob_by_cache_dir_name(self):
-        plan = plan_of([entry(name="Qwen/Qwen3", cachepath="/mnt/l/models--Qwen--Qwen3")], ttl_days=30,
-                       protected_models=["models--Qwen--*"])
+        plan = plan_of(
+            [entry(name="Qwen/Qwen3", cachepath="/mnt/l/models--Qwen--Qwen3")],
+            ttl_days=30,
+            protected_models=["models--Qwen--*"],
+        )
         assert plan["rows"][0]["action"] == "keep"
 
 
@@ -167,7 +178,13 @@ class TestLiveJobProtection:
         """A Completed downloader job is TTL-cleaned within the hour — while it
         exists its pod may still be writing; status is deliberately ignored."""
         e = entry(cachepath="/mnt/l/models--acme--A")
-        job = {"namespace": "ns", "job_name": "j", "model_name": "acme/A", "cache_root": "/mnt/l", "status": "succeeded"}
+        job = {
+            "namespace": "ns",
+            "job_name": "j",
+            "model_name": "acme/A",
+            "cache_root": "/mnt/l",
+            "status": "succeeded",
+        }
         assert live_job_protects(e, [job]) is job
 
     def test_name_match_only_when_no_root_annotation(self):
@@ -228,7 +245,17 @@ class TestReportShape:
             aioli_uris=["pvc://models-pvc/large-models/acme/Serving"],
         )
         for row in plan["rows"]:
-            assert set(row) >= {"model_name", "cachepath", "bytes", "mtime", "age_days", "manifest", "scanned", "action", "reason"}
+            assert set(row) >= {
+                "model_name",
+                "cachepath",
+                "bytes",
+                "mtime",
+                "age_days",
+                "manifest",
+                "scanned",
+                "action",
+                "reason",
+            }
         s = plan["summary"]
         assert s["total"] == 2 and s["delete"] == 1 and s["keep"] == 1
         assert s["delete_bytes"] == 700

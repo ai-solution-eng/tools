@@ -497,6 +497,22 @@ class Settings(BaseSettings):
     # X-PCAI-Route header reads "off" so the state is visible). Fail-safe:
     # any router error serves the profile ceiling, never fails the request.
     routing_enabled: bool = True
+    # Conversation stickiness (never-downgrade): a routed conversation holds a
+    # capability FLOOR and may escalate above it but never fall below it, so a
+    # thread that opened with a trivial turn cannot pin later hard work to the
+    # cheap model. Default OFF — it changes which model serves, so it is opt-in.
+    # The DB routing config (sticky_routing) is the operator override; this env
+    # is the deployment default and the kill switch.
+    sticky_routing: bool = False
+    # Idle reset for that floor, in seconds. A conversation untouched for this
+    # long forgets its floor and re-decides fresh; without it a long thread
+    # climbs monotonically to the ceiling. 0 = never reset.
+    sticky_routing_idle_reset_s: int = 1800
+    # Promote the legacy `auto` alias into routing. Default OFF: `auto` keeps
+    # its documented meaning (the profile-order budget cascade), so arming
+    # routing never silently changes what an existing client's request does.
+    # The explicit routing / routing__X names always route regardless.
+    route_default_model: bool = False
     # Complexity cut points, in estimated tokens, on the request score that
     # maps to a position on the profile's cheap-first ladder: score < tier1
     # serves the cheapest ladder model (>= routing_min_model floor), score
@@ -671,7 +687,45 @@ class Settings(BaseSettings):
     # key (the distill is real spend, the ledger must see it).
     distiller_model: str = ""
     # Distill output cap (the DSH plugin default maxDistillTokens).
-    distiller_max_tokens: int = 2048
+    # 4096 (raised from the plugin's 2048, 2026-10-23): the summary contract
+    # targets 300-1200 words of path/command-dense markdown, which alone can
+    # pass 2048 tokens -- at 2048 the cap cut two live summaries mid-document
+    # (finish_reason="length" with content present) that then shipped whole.
+    # The cap only binds when hit, so raising it costs nothing on calls that
+    # finish early.
+    distiller_max_tokens: int = 4096
+    # Reject a distill whose reply hit the max_tokens cap MID-DOCUMENT
+    # (2026-10-23, the truncated-write defect): finish_reason="length" with
+    # NON-empty content used to pass as a successful distill and was written
+    # whole. true (default) raises core.distiller.DistillTruncatedError
+    # instead: map-stage parts keep their partial notes (intermediate
+    # compression), the FINAL call fails, and the row stays due (with
+    # distiller_raw_fallback=false) so a bigger budget or the next sweep
+    # produces a complete summary -- no truncated document ever ships. The
+    # retry is backoff-gated like every model failure; the log names this
+    # knob. false = the pre-fix write-anyway behavior (truncation is silent
+    # there -- not recommended).
+    distiller_reject_truncated: bool = True
+    # Near-duplicate suppression at the memory write (2026-10-23). The dup
+    # clusters in the live store are CROSS-SESSION: the same session story
+    # re-distilled from parallel DSH threads (sqlhandler deployment distilled
+    # 4x from 4 different session ids; hugepages runbook 3x; pricing PDF 3x)
+    # -- mm-rag folds only at cosine >= 0.995, far below independent LLM
+    # paraphrases. Before writing a project-summary, search the dataset with
+    # the document's own text; a highly similar existing document from a
+    # DIFFERENT session suppresses the write (the cluster killer); a similar
+    # document from the SAME session allows it (the designed re-distill
+    # update for continued conversations). Best-effort: probe failures write
+    # through.
+    distiller_dedup_superseded: bool = True
+    # The MCP tool the dedup probe calls (the memory server's search).
+    distiller_memory_search_tool: str = "search_memory"
+    # Token-containment threshold for "near-duplicate": |hit ∩ new| /
+    # min(|hit|, |new|) over lowercase word tokens of the body text.
+    # CALIBRATED 2026-10-23 on the live store: sqlhandler near-dup siblings
+    # score 0.796-0.828, unrelated topic-siblings 0.222-0.391 -- 0.70 sits
+    # in the wide gap between the two populations.
+    distiller_dedup_containment: float = 0.70
     # Raw-transcript fallback on a FAILED distill (2026-10-10).
     #
     # true (the historical DSH contract): when a model call fails AFTER the

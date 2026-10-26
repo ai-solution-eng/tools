@@ -1526,3 +1526,441 @@ class RerankerModel(BaseModel):
                 handler=_rerank,
             )
         ]
+@dataclass(repr=False)
+class DecisionModel(BaseModel):
+    """A *decision* model served by the vLLM-SR native runtime (System One API).
+
+    This is the analog of ChatModel for the ``decision3`` model family
+    (vllm-sr/d3-turbo, d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge).
+    The two classes differ at the protocol level, not just in naming:
+
+    ============  =========================================================
+    ChatModel     POST /v1/chat/completions -- autoregressive text out.
+    DecisionModel POST /v1/systemone       -- calibrated probabilities out.
+    ============  =========================================================
+
+    A decision model never generates text: it reads a *state* (text/JSON, plus
+    optional images and videos) once and answers a set of typed *questions*,
+    returning a probability per candidate answer.  usage.output_tokens is
+    always 0.  There is NO /v1/chat/completions and NO /v1/responses on the
+    endpoint, which is why this class does not use the OpenAI SDK the way
+    ChatModel does -- it speaks the decision wire format over the shared
+    httpx2 clients.
+
+    Question types (what a given checkpoint supports is advertised by
+    GET /v1/models -> question_types):
+
+    * choice -- pick one of N labelled options (criteria: name -> description)
+    * noul   -- yes/no (criteria: optional true/false descriptions)
+    * score  -- ordered rubric (criteria: list of level names, 2..10)
+    * box    -- one bounding box in an image, or at a given second of a video
+    * track  -- a box per moment across one video (rate: 1 or 2 per second)
+
+    box/track are available on d3-turbo only within the family.
+
+    Example
+    -------
+    >>> m = DecisionModel(
+    ...     model_name="vllm-sr/d3-turbo",
+    ...     url_remote="https://vllmsr-d3-turbo-router.<ns>.serving.<domain>",
+    ...     api_key=KEY,
+    ... )
+    >>> m.choice(
+    ...     "Ticket: the invoice total is wrong after the plan change.",
+    ...     "Which team handles this?",
+    ...     {"billing": "Billing", "tech": "Technical support"},
+    ... )
+    {'type': 'choice', 'choice': 'billing',
+     'probabilities': {'billing': 0.9998, 'tech': 0.0002},
+     'confidence': 0.9997}
+    """
+
+    model_instantiation_class: Callable | None = None
+
+    # Advertised by GET /v1/models (best-effort; empty when unreachable).
+    # Kept as a plain dict rather than one field per attribute: a plain field
+    # that is ALSO named in _cached_properties gets popped by
+    # _clear_cached_class_elements and raises AttributeError on next access
+    # (the trap VoiceModel documents for tts_supported_voices).
+    model_card: dict[str, Any] = field(default_factory=dict)
+
+    _cached_properties = (
+        "client",
+        "async_client",
+        "base_url",
+        "http_client",
+        "http_async_client",
+        "model",
+        "system_one_function",
+        "system_one_async_function",
+    )
+    _cached_functions = (
+        "system_one_function",
+        "system_one_async_function",
+    )
+
+    allowable_modalities = ("text", "image", "video")
+
+    # -- construction -----------------------------------------------------
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.currently_deployed and not self.model_card:
+            self.model_card = self._fetch_model_card()
+
+    def _fetch_model_card(self) -> dict[str, Any]:
+        """Best-effort read of this model entry from GET {base_url}/models.
+
+        Returns {} on any failure -- same contract as discover_model_name, so an
+        unreachable endpoint degrades to "unknown capabilities" instead of
+        failing construction.
+        """
+        url = f"{self.base_url}/models"
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            resp = self.http_client.get(url, headers=headers, timeout=10.0)
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", []) if isinstance(body, dict) else []
+            for entry in data:
+                if isinstance(entry, dict) and entry.get("id") == self.model_name:
+                    return entry
+            if data and isinstance(data[0], dict):
+                return data[0]
+        except Exception as exc:
+            logger.warning("Could not read the model card from %s: %s", url, exc)
+        return {}
+
+    # -- capabilities (read from the model card) --------------------------
+
+    @property
+    def question_types(self) -> tuple[str, ...]:
+        """Question types this checkpoint accepts, e.g. (choice, noul, score, box, track)."""
+        return tuple(self.model_card.get("question_types") or ())
+
+    @property
+    def max_input_tokens(self) -> int:
+        """Architectural ceiling per question (e.g. 262144); 0 when unknown."""
+        return int((self.model_card.get("limits") or {}).get("max_input_tokens") or 0)
+
+    @property
+    def validated_input_tokens(self) -> int:
+        """Length the checkpoint was validated at (e.g. 32768); 0 when unknown."""
+        return int((self.model_card.get("limits") or {}).get("validated_input_tokens") or 0)
+
+    def supports(self, question_type: str) -> bool:
+        """True when the served checkpoint advertises question_type.
+
+        Unknown capabilities (unreachable /v1/models) return True rather than
+        blocking the call: the server is the authority and answers 400 with a
+        precise reason if the type is genuinely unsupported.
+        """
+        types = self.question_types
+        return True if not types else question_type in types
+
+    # -- transport --------------------------------------------------------
+
+    @cached_property
+    def client(self):
+        raise ValueError(
+            "A decision model has no OpenAI client: it serves POST /v1/systemone "
+            "and never /v1/chat/completions. Use system_one(...), system_one_async(...), "
+            "or the helpers decide(...) / choice(...) / yes_no(...) / score(...)."
+        )
+
+    @cached_property
+    def async_client(self):
+        raise ValueError(
+            "A decision model has no OpenAI client: it serves POST /v1/systemone "
+            "and never /v1/chat/completions. Use system_one_async(...)."
+        )
+
+    @cached_property
+    def model(self):
+        raise ValueError(
+            "Use system_one(...) / system_one_async(...); a decision model is "
+            "not instantiated as a chat client."
+        )
+
+    @property
+    def decisions_url(self) -> str:
+        """{base_url}/systemone -- base_url already ends in /v1."""
+        return f"{self.base_url}/systemone"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    # -- request building -------------------------------------------------
+
+    @staticmethod
+    def _check_questions(questions: dict[str, Any]) -> None:
+        """Light client-side validation; the server remains the authority.
+
+        Mirrors the documented limits so a typo fails locally with a clear
+        message instead of a 400 round-trip.
+        """
+        if not isinstance(questions, dict) or not questions:
+            raise ValueError("questions must be a non-empty dict of {id: question}.")
+        if len(questions) > 64:
+            raise ValueError(f"At most 64 questions per request; got {len(questions)}.")
+        for qid, spec in questions.items():
+            if not isinstance(qid, str) or not qid:
+                raise ValueError("Each question id must be a non-empty string.")
+            if not isinstance(spec, dict):
+                raise ValueError(f"Question {qid!r} must be a dict.")
+            qtype = spec.get("type")
+            if qtype not in ("choice", "noul", "score", "box", "track"):
+                raise ValueError(
+                    f"Question {qid!r} has type {qtype!r}; expected one of "
+                    "choice, noul, score, box, track."
+                )
+            if not spec.get("instructions"):
+                raise ValueError(f"Question {qid!r} needs non-empty 'instructions'.")
+            criteria = spec.get("criteria")
+            if qtype == "choice":
+                if not isinstance(criteria, dict) or len(criteria) < 2:
+                    raise ValueError(
+                        f"Question {qid!r} (choice) needs 'criteria' with >= 2 options."
+                    )
+                if len(criteria) > 255:
+                    raise ValueError(
+                        f"Question {qid!r} (choice) has {len(criteria)} options; max 255."
+                    )
+            if qtype == "score":
+                if not isinstance(criteria, (list, tuple)) or not 2 <= len(criteria) <= 10:
+                    raise ValueError(
+                        f"Question {qid!r} (score) needs 'criteria' as a list of 2..10 levels."
+                    )
+            if qtype == "track" and spec.get("rate") not in (None, 1, 2):
+                raise ValueError(f"Question {qid!r} (track) 'rate' must be 1 or 2.")
+
+    def _payload(
+        self,
+        state: Any,
+        questions: dict[str, Any],
+        *,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._check_questions(questions)
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "state": state,
+            "questions": questions,
+        }
+        if images:
+            payload["images"] = list(images)
+        if videos:
+            payload["videos"] = list(videos)
+        if options:
+            payload["options"] = dict(options)
+        return payload
+
+    # -- the call ---------------------------------------------------------
+
+    def system_one(
+        self,
+        state: Any,
+        questions: dict[str, Any],
+        *,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Answer every question about state in one request (blocking).
+
+        images/videos take base64 data: URLs (or http(s) URLs the server can
+        reach).  options may carry long_context (bool) and deadline_ms (int).
+        Returns the raw response::
+
+            {"model": ..., "answers": {qid: answer, ...},
+             "usage": {"input_tokens": n, "output_tokens": 0}}
+        """
+        return sync_wrapper_safe(
+            partial(self.system_one_async, **kwargs),
+            {
+                "state": state,
+                "questions": questions,
+                "images": images,
+                "videos": videos,
+                "options": options,
+            },
+        )
+
+    async def system_one_async(
+        self,
+        state: Any,
+        questions: dict[str, Any],
+        *,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Async form of system_one."""
+        payload = self._payload(
+            state, questions, images=images, videos=videos, options=options
+        )
+        resp = await self.http_async_client.post(
+            self.decisions_url,
+            json=payload,
+            headers=self._headers(),
+            timeout=_MODEL_REQUEST_TIMEOUT,
+            **kwargs,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # -- convenience wrappers --------------------------------------------
+
+    def decide(
+        self,
+        state: Any,
+        *,
+        instructions: str,
+        criteria: dict[str, Any] | list[str] | None = None,
+        type: str = "choice",
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Ask one question and return its answer (not the whole envelope).
+
+        type is the wire field name; choice/noul/score/box/track are accepted.
+        Shorthand for the common single-question case.
+        """
+        spec: dict[str, Any] = {"type": type, "instructions": instructions}
+        if criteria is not None:
+            spec["criteria"] = criteria
+        for extra in ("at", "rate"):
+            if extra in kwargs:
+                spec[extra] = kwargs.pop(extra)
+        out = self.system_one(
+            state,
+            {"answer": spec},
+            images=images,
+            videos=videos,
+            **kwargs,
+        )
+        return (out.get("answers") or {}).get("answer", {})
+
+    def choice(
+        self,
+        state: Any,
+        instructions: str,
+        criteria: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Pick one of criteria ({option: description})."""
+        return self.decide(
+            state, instructions=instructions, criteria=criteria, type="choice", **kwargs
+        )
+
+    def yes_no(self, state: Any, instructions: str, **kwargs: Any) -> float:
+        """Probability of yes for a yes/no question."""
+        ans = self.decide(state, instructions=instructions, type="noul", **kwargs)
+        return float(ans.get("noul", 0.0))
+
+    def score(
+        self,
+        state: Any,
+        instructions: str,
+        levels: list[str],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Expected level on an ordered rubric (levels ordered low -> high)."""
+        return self.decide(
+            state, instructions=instructions, criteria=levels, type="score", **kwargs
+        )
+
+    # -- agent integration ------------------------------------------------
+
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose this model as a single decide tool for agent workflows."""
+
+        async def _decide(arguments: dict[str, Any]) -> dict[str, Any]:
+            questions = arguments.get("questions")
+            if questions:
+                out = await self.system_one_async(
+                    arguments["state"],
+                    questions,
+                    images=arguments.get("images"),
+                    videos=arguments.get("videos"),
+                )
+                return out.get("answers", {})
+            spec: dict[str, Any] = {
+                "type": arguments.get("type", "choice"),
+                "instructions": arguments["instructions"],
+            }
+            if arguments.get("criteria") is not None:
+                spec["criteria"] = arguments["criteria"]
+            for extra in ("at", "rate"):
+                if extra in arguments:
+                    spec[extra] = arguments[extra]
+            out = await self.system_one_async(
+                arguments["state"],
+                {"answer": spec},
+                images=arguments.get("images"),
+                videos=arguments.get("videos"),
+            )
+            return (out.get("answers") or {}).get("answer", {})
+
+        types = self.question_types or ("choice", "noul", "score")
+        return [
+            ToolDefinition(
+                name="decide",
+                description=self.description
+                or (
+                    "Answer typed questions about a state with calibrated "
+                    f"probabilities using {self.model_name} "
+                    f"(types: {', '.join(types)}). Returns a probability per "
+                    "candidate answer; never generates text."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "description": "What the questions are about (text or JSON).",
+                        },
+                        "questions": {
+                            "type": "object",
+                            "description": (
+                                "Map of question id -> {type, instructions, criteria}. "
+                                "Use this instead of the single-question fields "
+                                "to ask several at once."
+                            ),
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["choice", "noul", "score", "box", "track"],
+                            "description": "Question type for a single-question call.",
+                        },
+                        "instructions": {
+                            "type": "string",
+                            "description": "The question, in plain language.",
+                        },
+                        "criteria": {
+                            "description": (
+                                "choice: {option: description}; score: ordered list "
+                                "of levels."
+                            ),
+                        },
+                        "images": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "base64 data URLs (or reachable http(s) URLs).",
+                        },
+                        "videos": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "base64 data URLs (or reachable http(s) URLs).",
+                        },
+                    },
+                    "required": ["state"],
+                },
+                handler=_decide,
+            )
+        ]

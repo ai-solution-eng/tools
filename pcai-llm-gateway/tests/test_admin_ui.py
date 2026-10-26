@@ -963,8 +963,15 @@ def test_console_routing_panel() -> None:
     # GPU-load availability line mirrors the Off-peak panel's honesty gate
     gpu = re.search(r"function paintRoutingGpu\(gpu\) \{.*?\n\}", s, re.DOTALL)
     assert gpu and "available" in gpu.group(0)
-    # muted footer: config storage only, decision model not called yet
-    assert "is not called yet" in s
+    # muted footer: the decision model IS called on routed requests (it is no
+    # longer config-storage-only -- core.decision_routing landed). The copy must
+    # say what shadow vs active actually DO, since that is the operator's whole
+    # question when they open this panel.
+    assert "IS called on routed requests" in s
+    assert "records its pick without serving it" in s
+    # and the shadow help text must not repeat the old "no latency risk" claim:
+    # shadow DOES pay one bounded decision call per routed request.
+    assert "pays one extra decision call" in s
 
 
 def test_console_presented_endpoints_block() -> None:
@@ -1008,3 +1015,113 @@ def test_index_hidden_models_hint() -> None:
     assert "r.headers.get('X-PCAI-Models-Denied') || '0'" in s
     # the dead-key path clears the hint (no stale advice after a 401)
     assert "paintDeniedHint(0);" in s
+
+
+def test_routing_dropdown_offers_decision_pools_not_just_chat() -> None:
+    """REPORTED 2026-10-23: d3-turbo was registered, healthy and correctly
+    typed, yet INVISIBLE in the routing dropdown — the one place it is meant to
+    be chosen. Cause: loadRouting() built the dropdown from `d.chat_models`,
+    which by definition excludes a decision pool, so a correctly-configured
+    decision model could never be selected. The GET has always returned
+    `decision_models`; the console simply never read it."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    fn = re.search(r"async function loadRouting\(\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "loadRouting not extractable"
+    body = fn.group(0)
+    assert "d.decision_models" in body, (
+        "the dropdown must read the decision-capable set — reading chat_models "
+        "hides every decision pool, which is the bug this pins"
+    )
+    # A configured name that is no longer decision-capable must still render
+    # (marked), never be silently dropped from the select.
+    assert "not decision-capable" in body
+
+
+def test_routing_panel_exposes_decision_mode_controls() -> None:
+    """The decision model is only USEFUL if the operator can switch it on.
+    decision_mode / confidence / timeout were API-only, so the panel could
+    configure a model it had no way to activate."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    for ctl in ('id="rt-mode"', 'id="rt-minconf"', 'id="rt-timeout"'):
+        assert ctl in s, f"{ctl} missing — the decision model cannot be enabled from the console"
+    # all three modes must be selectable, with off as the shipped default
+    for mode in ('value="off"', 'value="shadow"', 'value="active"'):
+        assert mode in s
+    # and they must actually be SENT on save, or the control is decorative
+    assert "decision_mode: $('rt-mode').value" in s
+    assert "decision_min_confidence:" in s and "decision_timeout_ms:" in s
+
+
+def test_routing_panel_no_longer_claims_the_model_is_unwired() -> None:
+    """The panel said the decision model "is not wired" and that the stored
+    config had no data-plane reader. That became FALSE when routes_proxy
+    started calling decision_settings() — stale copy that tells an operator
+    their setting does nothing is worse than no copy at all."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert "not yet consulted by the data plane" not in s
+    assert "does not consult it yet" not in s
+    assert "not wired" not in s
+
+
+def test_live_pools_show_model_type() -> None:
+    """The pools table showed model + endpoints only, so the single most
+    load-bearing fact about a pool -- what it SERVES -- was invisible. A
+    decision model cannot serve chat; an embedding pool 400s a chat
+    completion; a chat pool typed `decision` silently vanishes from
+    /v1/models and the ladder."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert "<th>Type</th>" in s
+    assert "model_type" in s
+    # a mixed pool must be called out rather than silently showing one type
+    assert "mixed" in s
+
+
+def test_nav_is_sticky_below_the_header() -> None:
+    """The tab strip scrolled away on a long page, forcing a scroll back to
+    the top to change section. It must stick, and it must stick BELOW the
+    header (not under it) with a z-index under the error strip."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    m = re.search(r"nav \{[^}]*\}", s)
+    assert m, "nav rule not found"
+    rule = m.group(0)
+    assert "position: sticky" in rule
+    assert "top: var(--header-h" in rule, "nav must offset by the header height"
+    assert "z-index: 4" in rule, "nav must sit under the header (5) and errstrip (9)"
+    assert "--header-h:" in s, "the header height variable must be defined"
+
+
+def test_key_actions_are_a_compact_grid_not_a_button_pile() -> None:
+    """Eight stacked ghost buttons made every row ~150px tall and read as a
+    scattered pile. Now a fixed 2-column grid, and `copy prefix` is gone
+    (the prefix is already displayed in the Key column) with budgets folded
+    into the edit dialog so the grid is a tidy 2x3."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert ".rowacts" in s and "grid-template-columns: 1fr 1fr" in s
+    assert '<div class="rowacts">' in s
+    # copy prefix removed entirely (button AND handler)
+    assert "copy prefix" not in s
+    assert "copyKeyPrefix" not in s
+    # budgets no longer a row button; it renders inside the edit dialog
+    assert "showBudgets('${k.id}')" not in s
+    assert "budgetsMarkup(bud)" in s, "budgets must render inside editKey"
+    # and the 2x3 shape: revoke/rotate, edit/MCP, creds/usage
+    for label in ("revoke", "rotate", "edit", "MCP", "creds", "usage"):
+        assert ">" + label + "</button>" in s, f"{label} button missing from the grid"
+
+
+def test_keys_page_has_a_search_filter() -> None:
+    """Hunting a key meant scanning the whole table. The filter is
+    CLIENT-SIDE over the already-loaded list (a server round-trip per
+    keystroke would be worse than useless) and matches the handles an
+    operator actually has: name, user, prefix, subject."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'id="k-search"' in s
+    assert "function filterKeys" in s or "window.filterKeys" in s
+    # rows carry a purpose-built haystack, not their whole textContent
+    assert "data-search=" in s
+    # the filter must survive a reload, or editing a key silently resets it
+    assert "filterKeys();" in s

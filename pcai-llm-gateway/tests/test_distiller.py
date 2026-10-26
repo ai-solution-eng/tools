@@ -102,7 +102,11 @@ async def test_run_map_reduce_single_pass_and_empty_guard() -> None:
 
     async def llm(system: str, user: str, max_tokens: int) -> str:
         calls.append(max_tokens)
-        return "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\nbody"
+        return (
+            "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\n"
+            "## What we did\nbody\n\n## Key decisions & rationale\n1. d.\n\n"
+            "## Gotchas\n- g.\n\n## How to proceed\n- h."
+        )
 
     out = await dist_mod.run_map_reduce("short transcript", llm)
     assert out.startswith("[MEMORY INDEX") and len(calls) == 1
@@ -123,7 +127,11 @@ async def test_run_map_reduce_maps_long_transcripts() -> None:
         if system is dist_mod.MAP_SYSTEM_PROMPT:
             map_calls += 1
             return "note"
-        return "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\nreduced"
+        return (
+            "[MEMORY INDEX | project: general | type: stubs-replaced-ok | topics: t]\n\n"
+            "## What we did\nreduced\n\n## Key decisions & rationale\n1. d.\n\n"
+            "## Gotchas\n- g.\n\n## How to proceed\n- h."
+        )
 
     # 200k-char window; a 450k transcript maps into 3 chunks then reduces
     out = await dist_mod.run_map_reduce("word " * 90000, llm)
@@ -260,7 +268,11 @@ def _stub_llm(monkeypatch: pytest.MonkeyPatch, fail: bool = False) -> list[tuple
             calls.append((user_text[:20], max_tokens))
             if fail:
                 raise RuntimeError("model down")
-            return "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\n## What we did\n\nbody"
+            return (
+                "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\n"
+                "## What we did\nbody\n\n## Key decisions & rationale\n1. d.\n\n"
+                "## Gotchas\n- g.\n\n## How to proceed\n- h."
+            )
 
         return llm_once
 
@@ -417,6 +429,7 @@ class _KVFakeDB:
 
 @pytest.mark.asyncio
 async def test_distiller_config_merge_and_invalidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pcai_llm.config import settings as dist_settings
     from pcai_llm.core import distiller_config as dc
 
     fake = _KVFakeDB()
@@ -429,10 +442,12 @@ async def test_distiller_config_merge_and_invalidate(monkeypatch: pytest.MonkeyP
     assert await dc.offpeak_only() is True
     # unset keys keep env defaults
     assert await dc.debounce_minutes() == 5
-    # max_tokens=0 means the env default
+    # max_tokens=0 means the env default (read live -- the default was
+    # raised 2048 -> 4096 with the 2026-10-23 truncation fix, and this test's
+    # contract is "unset DB keys track the env default", not a specific number)
     fake.rows["max_tokens"] = 0
     await dc.invalidate()
-    assert await dc.max_tokens() == 2048
+    assert await dc.max_tokens() == dist_settings.distiller_max_tokens
 
 
 @pytest.mark.asyncio
@@ -768,7 +783,11 @@ async def test_canonical_real_conversation_distills(monkeypatch: pytest.MonkeyPa
     # silently exercised the FAILURE path instead of the distill path.
     def fake_llm(key, request_id):
         async def llm_once(system, user, max_tokens):
-            return "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\nsummary"
+            return (
+                "[MEMORY INDEX | project: general | type: session-summary | topics: t]\n\n"
+                "## What we did\nsummary\n\n## Key decisions & rationale\n1. d.\n\n"
+                "## Gotchas\n- g.\n\n## How to proceed\n- h."
+            )
 
         return llm_once
 

@@ -20,7 +20,16 @@ HELM_DIR = REPO / "helm"
 def _rendered_scan_script() -> str:
     """The scan-job.yaml shell script from a live render."""
     proc = subprocess.run(
-        ["helm", "template", "mdtest", ".", "-n", "project-user-x", "--show-only", "templates/configmap-job-template.yaml"],
+        [
+            "helm",
+            "template",
+            "mdtest",
+            ".",
+            "-n",
+            "project-user-x",
+            "--show-only",
+            "templates/configmap-job-template.yaml",
+        ],
         cwd=HELM_DIR,
         capture_output=True,
         text=True,
@@ -75,7 +84,7 @@ class TestRenderedScannerContract:
         script = _rendered_scan_script()
         assert "du -sb" in script
         assert "'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n'" in script
-        assert 'MODELSCAN_VERDICT_FILE' in script
+        assert "MODELSCAN_VERDICT_FILE" in script
 
     def test_rendered_verdict_reader_handles_bad_manifest(self):
         """The scanner's embedded verdict reader must never fail a scan on a
@@ -115,7 +124,9 @@ class TestRenderedScannerContract:
 
 class TestMergeCarriesNewFields:
     def test_merge_keeps_newest_bytes_and_scanned(self):
-        fresh = DownloadedModel(model_name="m", backends=["pvc"], last_modified=10, bytes=500, scanned="clean", cachepath="/p")
+        fresh = DownloadedModel(
+            model_name="m", backends=["pvc"], last_modified=10, bytes=500, scanned="clean", cachepath="/p"
+        )
         stale = DownloadedModel(model_name="m", backends=["s3"], last_modified=1)
         merged = merge_models([stale], [fresh])
         assert merged[0].bytes == 500 and merged[0].scanned == "clean" and merged[0].cachepath == "/p"

@@ -632,6 +632,12 @@ ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_policy TEXT NOT NULL D
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_ceiling TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_served TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT '';
+-- The decision model's FULL per-option distribution (JSON object, '' when none).
+-- routing_reason carries only the WINNER score, which cannot answer "how close
+-- was this?" -- a 0.62 winner over a 0.60 runner-up is a coin flip that happened
+-- to clear the floor. Without the distribution an operator cannot tune the
+-- confidence floor against real traffic (2026-10-23).
+ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_probabilities TEXT NOT NULL DEFAULT '';
 
 -- ============================================================================
 -- Server-owned conversations (ROADMAP §7, phase 1: canonical reconciliation).

@@ -59,6 +59,8 @@ Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicac
 | `RAG/rag_benchmark_scale_large_n_100.md` | Multimodal-RAG scale run (large chart, N=100) |
 | `RAG/rag_benchmark_scale_large_n_200.md` | Multimodal-RAG scale run (large chart, N=200) |
 | `benchmark_report.html` | Generated — re-run `results_to_html.py` after adding files |
+| `prefill_inferred/H200x4_32k_logs.md` | Prefill throughput inferred from SGLang server logs (not a `benchmark_chat` run); see below |
+| `prefill_inferred/H200x4_32k_logs.log` | Reconstructed `Prefill batch` step records behind the above |
 
 ## Reading a file
 
@@ -71,6 +73,89 @@ The results table is a GitHub-flavored Markdown table with one row per (`ctx`, `
 - **TTFT-post** — turns 2+: the shared prefix is already cached, so this is the warm/cached path. `TTFT-post << TTFT turn1` = the cache is earning its keep.
 - **failed** — requests that errored (usually `Request timed out.` = the client's request timeout under server saturation); they are excluded from the percentile stats.
 - **tokens/s** — generation throughput; percentiles are *inverted* (P100 = slowest), higher is better everywhere.
+- **prefill tok/s (agg)** — aggregate prefill throughput for the level, `users × ctx / TTFT turn1 P100`. See below.
+
+## Prefill throughput
+
+`tokens/s` is *decode* throughput — it deliberately excludes TTFT. Prefill has
+to be derived from TTFT, and the `prefill tok/s (agg)` column does that:
+
+    aggregate prefill tok/s = users × ctx / (TTFT turn1 P100 in seconds)
+
+All `users` requests fire at once, so the last first-token (P100) marks when all
+`users × ctx` prompt tokens are done. This is an AGGREGATE rate: it is
+flat-to-rising with concurrency, because more users each prefilling the same
+prompt is more total work in a similar window shape. Divide by `users` for the
+per-user rate, which falls ~1/users.
+
+**It does not mean the hardware is at peak.** At ctx=32768 a single user already
+saturates prefill — the aggregate barely moves from n=1 to n=32 — but the
+achieved FLOPS sit around 30% of the 4× H200 BF16 peak. The limiter is memory
+bandwidth and the FP4/FP8 expert weights, not FMA throughput. "The GPU is the
+bottleneck" and "the GPU is at peak" are different claims; only the first is
+supported here.
+
+### Estimates for every model
+
+Every results file carrying a padded (`ctx > 0`) level has a
+`## Derived: aggregate prefill throughput` section appended. Single-user
+(ctx=32768, task=coding) figures, which are the cleanest comparison since P100/P50
+is exactly 1.00 there. Gemma ran only the `mixed` task, so its row is not
+task-matched with the rest:
+
+| setup | agg prefill tok/s (n=1) | at n=32 |
+|:---|---:|---:|
+| GLM-5.3-Flash 8× H200 SMX, HiCache 1.5 TB | 24,573 | 32,668 |
+| GLM-5.3-Flash 4× H200, HiCache ×4 | 15,419 | 26,879 |
+| Qwen3.8-27B 1× H200 (plain) | 13,633 | 17,055 |
+| GLM-5.3-Flash 4× H200 dual-NVLink, HiCache ×6 | 11,903 | 12,698 |
+| DeepSeek-V4.1-Flash 4× H200, offload | 11,516 | 11,918 |
+| Qwen3.8-27B 1× RTX PRO 6000, vLLM NVFP4 | 12,022 | 14,118 |
+| Qwen3.8-27B 3 replicas, SGLang HiCache ×3 | 11,518 | 35,084 |
+| Qwen3.8-27B 1× H200, SGLang HiCache ×1 | 10,980 | 6,338 ⚠ |
+| Qwen3.8-27B 1× RTX PRO 6000, vLLM FP8 | 9,400 | 10,235 |
+| DeepSeek-V4-Flash 4× H200, HiCache ×2 | 20,331 | 28,761 |
+| DeepSeek-V4-Flash 2× RTX PRO 6000, HiCache ×16 | 8,820 | 9,036 |
+| GLM-5.2-753B 8× H200, 1 TB host cache | 7,774 | 5,031 ⚠ |
+| Gemma-4-31B 1× H200 (mixed task only) | 5,377 | 5,853 |
+
+⚠ = straggler-dominated at that level (see below), not a real regression.
+
+Two files carry a *large*-context level, which is the only place the O(S) per-token
+cost shows up directly:
+
+| setup | ctx=32768 | ctx=512k / 524k |
+|:---|---:|---:|
+| GLM-5.3-Flash 4× H200 HiCache ×4 | 15,419 | 21,425 (512k) |
+| GLM-5.3-Flash 8× H200 SMX HiCache 1.5 TB | 24,573 | 25,541 (524k) |
+
+Both hold up at ~20-25k tok/s at half a million tokens, so the expected falloff is
+not visible on these deployments — the compressed/DSA attention keeps the
+per-token cost nearly flat in S.
+
+Two caveats, both encoded in the column:
+
+- **`ctx` is nominal.** The padding rule assumes 4 chars/token; real tokenizers
+  average ~5.3, so the true prompt is ~25% shorter and these figures run ~25%
+  high. Runs after MB-PREFILL record the server-reported `prompt_tokens` and use
+  that instead.
+- **A leading `~` means straggler-dominated.** P100 is one sample. When
+  P100/P50 exceeds 2, a single slow request set the level's number; treat it as
+  a floor. (Measured case: a GLM n=64 level read P100/P50 = 10.4 while its
+  neighbours at the same n read 2.0 and 5.3 — noise, not a hardware cliff.)
+
+For a direct engine-side measurement instead of a TTFT derivation, capture the
+serving pod's logs during a run and use `model_benchmarker.prefill_cli`:
+
+    kubectl logs <pod> -n <ns> -c kserve-container > logs.txt
+    PYTHONPATH=src python -m model_benchmarker.prefill_cli logs.txt \
+        --out results/prefill_inferred/<name>.md \
+        --log-out results/prefill_inferred/<name>.log \
+        --namespace <ns>
+
+That reads SGLang's own `input throughput (token/s)` and token counters. Capture
+the logs *with* the run — container log buffers roll over within hours, and once
+they do the measurement cannot be regenerated.
 
 ## What to look for
 

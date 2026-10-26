@@ -87,6 +87,7 @@ async def write_memory(
     source: str = SOURCE_LABEL,
     fallback_doc: str = "",
     fallback_session_id: str = "",
+    mcp_search: McpCall | None = None,
 ) -> tuple[bool, str]:
     """Write ONE memory document to the calling key memory dataset.
 
@@ -137,6 +138,35 @@ async def write_memory(
         )
         return False, f"document body under the {min_chars}-char floor"
 
+    # NEAR-DUPLICATE SUPPRESSION (2026-10-23; see config
+    # distiller_dedup_superseded for the full rationale). Content-based:
+    # search with the new document's own body, then token-containment
+    # against each hit. Cross-session near-dup -> suppressed; same-session
+    # near-dup -> allowed (the designed re-distill update). Every failure
+    # mode writes through: a broken dedupe probe must never block a memory.
+    if mcp_search is not None and kind == KIND_SUMMARY and session_id:
+        try:
+            verdict = await _near_duplicate_verdict(mcp_search, doc, session_id)
+        except Exception as exc:
+            log.warning(
+                "memory dedup probe failed (key=%s, session=%s): %s - writing anyway",
+                key_id, session_id[:16], type(exc).__name__,
+            )
+            verdict = None
+        if verdict is not None:
+            hit_session, score = verdict
+            if hit_session != session_id:
+                log.info(
+                    "memory dedup: suppressed near-duplicate write "
+                    "(session=%s matches prior session=%s, containment=%.2f)",
+                    session_id[:16], hit_session[:16], score,
+                )
+                return False, (
+                    "near-duplicate of an existing memory from session "
+                    + hit_session[:16]
+                    + f" (containment {score:.2f}); write suppressed"
+                )
+
     try:
         ok, detail = await mcp_call(build_add_memory_arguments(doc, session_id, source, kind))
         if ok:
@@ -162,3 +192,89 @@ async def write_memory(
             log.warning("memory fallback write failed (key=%s)", key_id, exc_info=True)
             detail = detail + "; fallback failed: " + type(exc).__name__
     return ok, detail
+
+
+
+async def _near_duplicate_verdict(
+    mcp_search: McpCall,
+    doc: str,
+    session_id: str,
+) -> tuple[str, float] | None:
+    """(prior_session_id, containment) for the closest stored near-dup, or None.
+
+    Probe: search_memory with the new document's own body as the query (a
+    paraphrase of the same session ranks top-1 for its own text). Hits are
+    filtered to project-summary metadata and scored with token containment.
+    Uses ONLY the real mm-rag MCP surface; search results carry text and
+    metadata but NO point id (documented limitation), so this guard can
+    suppress but never delete -- the delete-half of "replaces the picture"
+    needs mm-rag to expose memory_id on search results (follow-up).
+    """
+    import json as _json
+
+    from .distiller import memory_body_chars
+
+    body = memory_body_chars(doc)
+    query = " ".join(doc.split())[-600:] if body < 200 else " ".join(doc.split())[:600]
+    ok, detail = await mcp_search({"query": query, "top_k": 5})
+    if not ok or not isinstance(detail, str) or not detail.strip():
+        return None
+    try:
+        payload = _json.loads(detail)
+    except Exception:
+        return None
+    rows: list[Any] = []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        rows = payload["results"]
+    best: tuple[str, float] | None = None
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        kind = str(r.get("memory_kind") or r.get("kind") or "")
+        if kind and kind != KIND_SUMMARY:
+            continue
+        hit_session = str(r.get("session_id") or "")
+        if not hit_session or hit_session == session_id:
+            continue  # same-session handled by the re-distill lifecycle
+        hit_text = str(r.get("text") or r.get("content") or "")
+        if not hit_text.strip():
+            continue
+        score = _token_containment(doc, hit_text)
+        if best is None or score > best[1]:
+            best = (hit_session, score)
+    if best is None:
+        return None
+    from ..config import settings
+
+    if best[1] < settings.distiller_dedup_containment:
+        return None
+    return best
+
+
+def _token_containment(new_doc: str, hit_text: str) -> float:
+    """|A ∩ B| / min(|A|, |B|) over lowercase word tokens of the two bodies.
+
+    Containment (not Jaccard) because mm-rag CHUNKS long documents: a hit
+    may be one chunk of the prior document, a strict subset -- containment
+    still reads ~1.0 where Jaccard would read |chunk|/|doc| and miss the
+    duplicate. Both sides drop the machine-generated index header first.
+    """
+    import re
+
+    def toks(s: str) -> set[str]:
+        # Body TEXT tokens: strip the machine-generated index header exactly
+        # the way core.distiller.memory_body_chars does, but keep the string
+        # (that helper returns a LENGTH -- calling .lower() on it was the
+        # AttributeError mypy caught pre-merge).
+        text = s.lstrip()
+        if text.startswith("[MEMORY INDEX"):
+            close = text.find("]")
+            text = text[close + 1:] if close != -1 else text
+        return set(re.findall(r"[a-z0-9_.:/-]+", text.lower()))
+
+    a, b = toks(new_doc), toks(hit_text)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))

@@ -714,6 +714,7 @@ async def settle(
     routing_ceiling: str = "",
     routing_served: str = "",
     routing_reason: str = "",
+    routing_probabilities: str = "",
 ) -> None:
     """Write the immutable usage row. Called for every request outcome.
 
@@ -767,8 +768,10 @@ async def settle(
             (key_id, model, endpoint, prompt_tokens, completion_tokens,
              total_tokens, cached_tokens, cost_usd, status, latency_ms,
              request_id, billing_fraction, guardrail_events,
-             routing_policy, routing_ceiling, routing_served, routing_reason)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             routing_policy, routing_ceiling, routing_served, routing_reason,
+             routing_probabilities)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18)
         """,
         key_id,
         model,
@@ -787,6 +790,7 @@ async def settle(
         routing_ceiling,
         routing_served,
         routing_reason,
+        routing_probabilities,
     )
     # Cache-aware TPM (rate_limit_exclude_cached_tokens): give the key's
     # minute window back the tokens the upstream prefix cache served.

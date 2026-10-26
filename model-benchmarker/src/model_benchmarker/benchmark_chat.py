@@ -379,6 +379,10 @@ class RequestResult:
     # tokens_per_s (and TPOT derived from the same window) is then an
     # approximation, not a measured cadence.
     burst_guarded: bool = False
+    # MB-PREFILL: server-reported prompt tokens (None when the endpoint sends
+    # no usage block). This is the exact prefill input length; the nominal
+    # --context_length is only a padding target and runs ~25% low.
+    prompt_tokens: int | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1015,6 +1019,11 @@ async def stream_once(
     content_deltas = 0
     reasoning_deltas = 0
     usage_tokens: int | None = None
+    # MB-PREFILL: the server's own prompt-token count. The padding target is
+    # only approximate (4 chars/token measures ~5.3 on real tokenizers), so
+    # any throughput derived from prompt length must use THIS value when the
+    # endpoint reports it.
+    usage_prompt_tokens: int | None = None
     content_parts: list[str] = []
     gaps = GapHistogram()  # MB-A: inter-token gaps of THIS request
     last_text_at: float | None = None  # timestamp of the last text-bearing delta
@@ -1041,8 +1050,13 @@ async def stream_once(
         stream = await model.async_client.chat.completions.create(**kwargs)
         async for chunk in stream:
             now = time.perf_counter()
-            if getattr(chunk, "usage", None) is not None and chunk.usage.completion_tokens is not None:
-                usage_tokens = chunk.usage.completion_tokens
+            if getattr(chunk, "usage", None) is not None:
+                if chunk.usage.completion_tokens is not None:
+                    usage_tokens = chunk.usage.completion_tokens
+                # MB-PREFILL: prompt_tokens rides the same usage block; keep the
+                # last non-null value (servers send it once, on the final chunk).
+                if getattr(chunk.usage, "prompt_tokens", None) is not None:
+                    usage_prompt_tokens = chunk.usage.prompt_tokens
             if chunk.choices:
                 delta = chunk.choices[0].delta
                 if delta is not None:
@@ -1121,6 +1135,7 @@ async def stream_once(
         response_text="".join(content_parts),
         itl=itl,
         burst_guarded=burst_guarded,
+        prompt_tokens=usage_prompt_tokens,
     )
 
 
@@ -1481,6 +1496,75 @@ def stats(values: list[float], inverted: bool = False) -> dict[str, float]:
     return {p: float(np.percentile(arr, qmap[p])) for p in PCTS}
 
 
+def aggregate_prefill_tps(group: list[RequestResult], nominal_ctx: int = 0) -> float | None:
+    """Aggregate prefill tokens/second for one concurrency level (MB-PREFILL).
+
+    All ``n`` users fire at once, so the last first-token (max TTFT) marks when
+    all ``n * S`` prompt tokens have been prefilled::
+
+        aggregate_tps = n * S / max(TTFT_i)
+
+    AGGREGATE, not per-user: n users each prefilling S tokens is n*S tokens of
+    work in roughly the same window shape, so this stays flat as concurrency
+    rises while a per-user rate divides by n.
+
+    STABILITY: max TTFT is one sample - the single slowest request - so at high
+    n a lone straggler (a retried connection, a descheduled stream) drags the
+    whole level down.  prefill_is_stable flags that case; callers should render
+    an unstable level as approximate rather than publishing a fake cliff.
+
+    ``S`` prefers the server-reported ``prompt_tokens`` per request (exact) and
+    falls back to ``nominal_ctx`` when the endpoint sends no usage block.  Using
+    the nominal padding target alone overstates S: the padding rule assumes 4
+    chars/token while real tokenizers average ~5.3, so ``--context_length 32768``
+    yields roughly 24.6k actual tokens.
+
+    Returns None when the level has no successful requests or no usable prompt
+    length (e.g. an unpadded ctx=0 run with no usage block).  Note this measures
+    AGGREGATE throughput: it does not fall as concurrency rises the way a
+    per-user rate does, because more users each doing the same prefill is more
+    total work in the same shape of window.
+    """
+    ok = [r for r in group if r.success]
+    if not ok:
+        return None
+    # Turn-1 requests pay the full prefill; later turns reuse the prefix.
+    turn1 = [r for r in ok if r.turn in (0, 1)] or ok
+    sizes = [r.prompt_tokens for r in turn1 if r.prompt_tokens]
+    s_tokens = sum(sizes) / len(sizes) if sizes else float(nominal_ctx)
+    if s_tokens <= 0:
+        return None
+    max_ttft_s = max(r.ttft_s for r in turn1)
+    if max_ttft_s <= 0:
+        return None
+    return len(turn1) * s_tokens / max_ttft_s
+
+
+def prefill_is_stable(group: list[RequestResult], max_ratio: float = 2.0) -> bool:
+    """Whether a level's prefill figure rests on a trustworthy max TTFT.
+
+    ``aggregate_prefill_tps`` divides by the single slowest request.  When that
+    request is a straggler rather than the normal tail, the ratio of max TTFT to
+    median TTFT blows up and the aggregate understates throughput by a multiple.
+    Measured on a real run: a healthy level holds P100/P50 near 1.9 at n=32,
+    while a straggler-dominated n=64 level reached 10.4 - and its neighbours at
+    the same n read 2.0 and 5.3, i.e. the spread is noise, not a hardware cliff.
+
+    Returns True when the level looks clean, False when the caller should mark
+    the value approximate.  Levels with fewer than two requests are always
+    "stable" (there is no spread to measure).
+    """
+    ok = [r for r in group if r.success]
+    turn1 = [r for r in ok if r.turn in (0, 1)] or ok
+    if len(turn1) < 2:
+        return True
+    ttfts = sorted(r.ttft_s for r in turn1)
+    median = ttfts[len(ttfts) // 2]
+    if median <= 0:
+        return True
+    return (ttfts[-1] / median) <= max_ratio
+
+
 def build_level_rows(
     ctx: int,
     users: int,
@@ -1554,6 +1638,8 @@ def build_level_rows(
             goodput=goodput,
             goodput_each=goodput_each,
             n_requests=len(group),
+            prefill_tps=aggregate_prefill_tps(group, nominal_ctx=ctx),
+            prefill_stable=prefill_is_stable(group),
         )
     ]
 
@@ -1635,6 +1721,12 @@ class LevelRow:
     goodput: float | None = None  # fraction of successes meeting ALL SLOs
     goodput_each: dict[str, float] | None = None  # per-metric fraction
     n_requests: int = 0  # successes contributing to this row
+    # MB-PREFILL: aggregate prefill tokens/second at this concurrency level
+    # (n * S / max TTFT). None when no prompt length was measurable.
+    prefill_tps: float | None = None
+    # False when the level's max TTFT is straggler-dominated (P100/P50 above
+    # the stability threshold), so prefill_tps understates the real rate.
+    prefill_stable: bool = True
 
     def as_tuple(self) -> tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float] | None]:
         """Legacy 7-tuple view (print_table / format_table_markdown callers)."""
@@ -1733,6 +1825,9 @@ def format_table_markdown(
     if extended:
         cols.append("ITL P50/P95/P99/P100 (ms)")
         cols.append("TPOT P50/P95/P99/P100 (ms)")
+        # MB-PREFILL: single aggregate figure (n*S/max TTFT), not a percentile
+        # group, so it reads as one cell rather than a slash-joined block.
+        cols.append("prefill tok/s (agg)")
     out = [
         "| " + " | ".join(cols) + " |",
         "|" + "|".join([":---", ":---", ":---", ":---"] + ["---:"] * (len(cols) - 4)) + "|",
@@ -1754,6 +1849,15 @@ def format_table_markdown(
                 cells.append("-")
             else:
                 cells.append(" / ".join(f"{block[p]:.1f}" for p in PCTS))
+        if extended:
+            # A straggler-dominated level renders as approximate: the number is
+            # still the honest n*S/max-TTFT, but max TTFT was not representative.
+            if not row.prefill_tps:
+                cells.append("-")
+            elif row.prefill_stable:
+                cells.append(f"{row.prefill_tps:,.0f}")
+            else:
+                cells.append(f"~{row.prefill_tps:,.0f}")
         out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out)
 

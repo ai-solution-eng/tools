@@ -22,17 +22,53 @@ Contract (the fail-open discipline of mcpf.federation.load_grants):
   resurrect a model the key may no longer use.
 * Retention: housekeeping prunes rows older than
   settings.retention_stickiness_days (default 14; 0 = keep forever).
+
+NAMESPACING (defect fix, 2026-10-23): the table is shared by TWO independent
+features -- the cascade's load-aware HEAD (auto-demand-aware) and the routing
+never-downgrade FLOOR. Both key on (key_id, thread_key), and the thread
+fingerprint is identical for a given conversation, so without a namespace the
+cascade's head silently became routing's floor: a conversation first served by
+auto-demand-aware at GLM would have every later ROUTED turn held at GLM
+regardless of the request. Rows are therefore namespaced by SCOPE at the
+thread-key level (no schema change; thread_key is TEXT). The cascade path keeps
+its historical un-prefixed key so its stored rows and behaviour are unchanged.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 
 from ..db import db
 from . import metrics
 
 log = logging.getLogger(__name__)
+
+# Strong references to in-flight sticky writes. A bare create_task can be
+# garbage-collected mid-flight, and an unbounded burst under load is its own
+# outage -- same discipline as cascade._sticky_write_later. Bounded: past the
+# cap the oldest task is cancelled, because a dropped floor refresh costs one
+# re-decision while unbounded growth costs the process.
+_PENDING: set[asyncio.Task] = set()
+_PENDING_MAX = 1024
+
+# Row namespaces. The cascade path uses NO prefix (its rows predate this and
+# must keep working); routing prefixes so the two features can never read each
+# other's rows. See the module docstring's NAMESPACING note.
+SCOPE_ROUTING = "routing:"
+
+
+def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
+    """Namespace one conversation fingerprint to one feature. PURE.
+
+    None in, None out (no seed / non-chat), so callers keep their
+    "no fingerprint means no stickiness" contract.
+    """
+    if not thread_key:
+        return None
+    return scope + thread_key
 
 
 async def get_sticky(key_id: uuid.UUID, thread_key: str | None) -> str | None:
@@ -95,6 +131,80 @@ async def drop_sticky(key_id: uuid.UUID, thread_key: str | None) -> None:
         )
     except Exception:
         log.warning("stickiness: drop failed (key %s) — stale head left in place", key_id)
+
+
+async def get_sticky_row(key_id: uuid.UUID, thread_key: str | None) -> tuple[str, float] | None:
+    """The conversation sticky head AND its age in seconds, or None.
+
+    Separate from get_sticky (which the cascade path uses and must stay
+    byte-identical) so the routing never-downgrade floor can apply an idle
+    reset without a second query: age comes from the row updated_at, and the
+    floor is refreshed on every served turn, so age means "time since this
+    conversation last routed" -- which is exactly the idle signal.
+
+    NEVER raises (the module contract): any fault returns None, i.e. "no
+    floor", so a stickiness outage degrades to plain routing.
+    """
+    if not thread_key:
+        return None
+    try:
+        row = await db.fetchrow(
+            "SELECT model, EXTRACT(EPOCH FROM (now() - updated_at)) AS age_s "
+            "FROM model_stickiness WHERE key_id = $1 AND thread_key = $2",
+            key_id,
+            thread_key,
+        )
+    except Exception:
+        log.warning("stickiness: aged read failed (key %s) - no floor", key_id, exc_info=True)
+        return None
+    if not row:
+        return None
+    model = row["model"]
+    if not model:
+        return None
+    try:
+        age = float(row["age_s"])
+    except (TypeError, ValueError, KeyError):
+        age = 0.0
+    return str(model), age
+
+
+def make_writer(key_id: uuid.UUID, thread_key: str | None) -> Callable[[str], None] | None:
+    """A fire-and-forget writer bound to one conversation, or None.
+
+    Returned to the router as its sticky_write callable. The router is
+    I/O-free by contract, so it hands back the model it actually SERVED and
+    this schedules the persist without adding latency to the request.
+
+    WHY a bounded task set rather than a bare create_task: a bare task can be
+    garbage-collected mid-flight (the classic fire-and-forget footgun), and an
+    unbounded burst of them under load is its own outage. This mirrors
+    cascade._sticky_write_later, which owns the same discipline for the
+    demand-aware path.
+    """
+    if not thread_key:
+        return None
+
+    def _write(model: str) -> None:
+        if not model:
+            return
+        try:
+            # Enforce the cap BEFORE adding (cascade._sticky_write_later's
+            # idiom): drop the OLDEST task rather than growing without bound
+            # under a write stall. set_sticky is idempotent and a lost floor
+            # refresh costs one re-decision, never correctness.
+            while len(_PENDING) >= _PENDING_MAX:
+                oldest = next(iter(_PENDING))
+                oldest.cancel()
+                _PENDING.discard(oldest)
+            task = asyncio.create_task(set_sticky(key_id, thread_key, model))
+        except RuntimeError:  # no running loop (tests calling synchronously)
+            log.debug("stickiness: no event loop - floor not persisted")
+            return
+        _PENDING.add(task)
+        task.add_done_callback(_PENDING.discard)
+
+    return _write
 
 
 def observe_head_pick(picked: str, reason: str, thread_key: str | None = None, ranks: str = "") -> None:

@@ -82,21 +82,33 @@ def _schema_properties(tool) -> tuple[dict, list[str]]:
 
 
 def pick_query_arg(tool) -> str:
-    """Choose which tool argument receives the sampled reference query."""
+    """Choose which tool argument receives the sampled reference query.
+
+    A name from :data:`QUERY_ARG_NAMES` wins even when it is OPTIONAL in the
+    tool's schema: mm-rag's ``search_dataset`` declares ``dataset_name`` as
+    its only required argument (``query`` is optional so media-only search
+    works), and the old "must be required" filter therefore skipped the real
+    query slot and fell through to the first required string — routing every
+    sampled query into ``dataset_name`` and failing 100% of requests with
+    "Invalid dataset name". Dataset-ish names are never the query slot.
+    """
     props, required = _schema_properties(tool)
     if not props:
         raise TargetError(f"tool '{tool.name}' has no input properties; pass --query-arg explicitly")
     lowered = {name.lower(): name for name in props}
     for cand in QUERY_ARG_NAMES:
-        if cand in lowered:
-            name = lowered[cand]
-            if name in required or not required:
-                return name
+        name = lowered.get(cand)
+        if name is not None and name.lower() not in DATASET_ARG_NAMES:
+            return name
     # fall back: first required string property, then any string property
     for name, spec in props.items():
+        if name.lower() in DATASET_ARG_NAMES:
+            continue
         if name in required and isinstance(spec, dict) and spec.get("type") == "string":
             return name
     for name, spec in props.items():
+        if name.lower() in DATASET_ARG_NAMES:
+            continue
         if isinstance(spec, dict) and spec.get("type") == "string":
             return name
     raise TargetError(
