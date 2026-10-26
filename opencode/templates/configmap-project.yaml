@@ -9,6 +9,89 @@ metadata:
 data:
   opencode.json: |
 {{ .Values.opencodeConfig | indent 4 }}
+  # Run by the unit init container on every start (see configmap-router.yaml).
+  # Applies the settings the chart enforces on units whose state volumes were
+  # seeded earlier: opencode.json is seed-once, and OpenChamber keeps its own
+  # profile (settings.json + preferences.json). Idempotent; never fails a start.
+  apply-defaults.mjs: |
+    import fs from 'node:fs'
+    import path from 'node:path'
+
+    const configHome = process.env.CONFIG_HOME || '/var/opencode/home/.config'
+    const defaultsFile = process.env.DEFAULTS_FILE || '/opt/opencode-defaults/opencode.json'
+    const disableUsageReport = process.env.OPENCHAMBER_REPORT_USAGE !== 'true'
+
+    function readJson(file) {
+      try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
+    }
+    function writeJson(file, value) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      const tmp = `${file}.tmp-${process.pid}`
+      fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 })
+      fs.renameSync(tmp, file)
+    }
+    function run(label, fn) {
+      try { fn() } catch (error) { console.error(`[apply-defaults] ${label}: ${error.message}`) }
+    }
+
+    const defaults = readJson(defaultsFile) || {}
+    const ocDir = path.join(configHome, 'opencode')
+    const ocFile = path.join(ocDir, 'opencode.json')
+    const chDir = path.join(configHome, 'openchamber')
+
+    // 1. opencode.json: provider lock and default model. Merged once per distinct
+    //    value set (marker), so later user edits are not overwritten until the
+    //    chart values change again.
+    run('opencode.json', () => {
+      const wanted = {}
+      for (const key of ['enabled_providers', 'model', 'small_model']) {
+        if (defaults[key] !== undefined) wanted[key] = defaults[key]
+      }
+      if (!Object.keys(wanted).length) return
+      const marker = path.join(ocDir, '.seeded-provider-lock')
+      const stamp = JSON.stringify(wanted)
+      let seen = ''
+      try { seen = fs.readFileSync(marker, 'utf8') } catch { /* no marker yet */ }
+      if (seen === stamp) return
+      const current = readJson(ocFile)
+      if (current) writeJson(ocFile, { ...current, ...wanted })
+      fs.writeFileSync(marker, stamp)
+    })
+
+    // 2. OpenChamber profile settings live in preferences.json (wins) and are
+    //    seeded from settings.json on first read, so write both.
+    function setProfile(key, value) {
+      const settingsFile = path.join(chDir, 'settings.json')
+      writeJson(settingsFile, { ...(readJson(settingsFile) || {}), [key]: value })
+      const prefsFile = path.join(chDir, 'preferences.json')
+      const prefs = readJson(prefsFile)
+      if (prefs && typeof prefs.fields === 'object' && prefs.fields !== null) {
+        prefs.fields[key] = { updatedAt: Date.now(), value }
+        writeJson(prefsFile, prefs)
+      }
+    }
+    function currentProfile(key) {
+      const prefs = readJson(path.join(chDir, 'preferences.json'))
+      if (prefs?.fields?.[key]) return prefs.fields[key].value
+      return (readJson(path.join(chDir, 'settings.json')) || {})[key]
+    }
+
+    if (disableUsageReport) {
+      run('reportUsage', () => {
+        if (currentProfile('reportUsage') !== false) setProfile('reportUsage', false)
+      })
+    }
+
+    // 3. Default model: set when missing, or when it points at a provider the
+    //    lock has disabled. A model the user picked from an enabled provider is kept.
+    run('defaultModel', () => {
+      const model = defaults.model
+      if (typeof model !== 'string' || !model.includes('/')) return
+      const allowed = Array.isArray(defaults.enabled_providers) ? defaults.enabled_providers : null
+      const current = currentProfile('defaultModel')
+      const currentProvider = typeof current === 'string' ? current.split('/')[0] : ''
+      if (!current || (allowed && !allowed.includes(currentProvider))) setProfile('defaultModel', model)
+    })
 {{- range .Values.opencodeSkills }}
   skill-{{ .name }}.md: |
 {{ .content | indent 4 }}

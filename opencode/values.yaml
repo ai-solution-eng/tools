@@ -131,6 +131,9 @@ opencode:
 # serves OpenChamber on chamberPort with a headless opencode server on serverPort.
 openchamber:
   version: "1.17.2"
+  # OpenChamber "Send anonymous usage reports". false (default) forces it off for
+  # every user on each unit start; true leaves the user's own choice alone.
+  reportUsage: false
 
 ui:
   mode: openchamber
