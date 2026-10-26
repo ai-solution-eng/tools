@@ -104,7 +104,11 @@ data:
     // 36: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
     // default rejected pasted/dropped images with HTTP 413 before dsh saw
     // the request. Bumped so existing units re-stamp onto the new nginx.conf.
-    const RUNTIME_REV = '36'
+    // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
+    // values blob) to force every user unit to re-stamp on the next
+    // reconcile — no chart edit needed. Defaults to 36 so an install that
+    // does not set it keeps the historical value (no surprise rollout).
+    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 36 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,

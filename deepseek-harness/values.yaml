@@ -50,6 +50,15 @@ storage:
 nginx:
   clientMaxBodySize: 64m
 
+# Pod-template convergence counter. Bump this to force EVERY user unit to
+# re-stamp onto the current chart-rendered pod template (nginx.conf, supervisor,
+# probes, env) on the next router reconcile — no chart/template edit required.
+# It is folded into the 'dsh-web-helm/user-template-version' annotation; when it
+# changes, the router patches each Deployment and the unit rolls.
+# Historical values live as comments on the template constant (RUNTIME_REV in
+# templates/configmap-router.yaml); keep this in sync with the shipped default.
+RUNTIME_REV: 36
+
 images:
   # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
   # and helm (offline packaging) under /opt/dsh so pods stop installing

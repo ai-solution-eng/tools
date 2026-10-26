@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-project-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+data:
+  # CANONICAL COPY of the web profile's patch layer, rendered from
+  # values.yaml dshCordisPatch. This is the "latest from values" that an
+  # administrator reads (and can hand to the team) without touching a pod:
+  #
+  #   kubectl get cm {{ .Release.Name }}-project-config -n {{ .Release.Namespace }} \
+  #     -o jsonpath='{.data.cordis\.patch\.yml}'
+  #
+  # It is NOT the live per-user file: user units seed from it ONCE at first
+  # boot (see init-dsh-storage in configmap-router.yaml) and are never
+  # overwritten afterwards, so user edits survive upgrades. To roll a new
+  # patch out, run scripts/push_dsh_cordis_patch.sh, which stages it as
+  # cordis.patch-update.yml beside the live file.
+  #
+  # The !!js tags are preserved verbatim — dsh evaluates them at load time;
+  # a ConfigMap stores the bytes untouched.
+  cordis.patch.yml: |
+{{ .Values.dshCordisPatch | indent 4 }}
