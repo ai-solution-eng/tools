@@ -29,6 +29,17 @@ values.yaml       reference-derived + openwork.* block (serverVersion/opencodeVe
 values.yaml.opencode-reference   pristine copy of the opencode chart values, port provenance
 ```
 
+## Pushing config to user envs
+
+`scripts/push_openwork_json_config.sh` **stages** an `opencode.json` into user envs
+(`~/.config/opencode/` under the openwork home — the filename is unchanged from the
+opencode chart). The push lands as `opencode-update.json` beside the live
+`opencode.json`, which is never written: opencode resolves its config from a fixed
+candidate list (`opencode.jsonc`/`opencode.json`/`config.json`, not a glob) and the
+supervisor watches an explicit file list, so the sibling is inert — nothing reloads
+until you promote it (the script prints the exact per-unit command). `--user` scopes a
+push to specific users; `TARGET_NAME=opencode.json` restores the old overwrite behaviour.
+
 ## Machine gates passed (P1)
 
 - `helm lint` — clean
