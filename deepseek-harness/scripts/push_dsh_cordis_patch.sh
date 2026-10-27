@@ -14,6 +14,12 @@ set -euo pipefail
 KUBECTL="${KUBECTL:-kubectl}"
 NAMESPACE="${NAMESPACE:-dsh-web-helm}"
 CONTAINER="${CONTAINER:-dsh-web}"
+# Namespace that holds the release's '<release>-project-config' ConfigMap. This
+# is NOT necessarily the target namespace: platform (SSO) users get their unit
+# in 'project-user-<slug>', while the ConfigMap is rendered into
+# .Release.Namespace. Left empty it auto-detects: the target namespace if the
+# ConfigMap exists there, else the chart's release namespace.
+RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-}"
 PROFILE_DIR="/var/dsh/home/.dsh/profiles/web"
 # The LIVE patch: the one dsh actually loads and the supervisor watches.
 # This script NEVER writes it — a push must leave the running patch untouched.
@@ -37,7 +43,9 @@ PUSH_CMD="mkdir -p $PROFILE_DIR && cat > $TARGET"
 
 usage() {
   cat <<EOF
-usage: push-dsh-cordis-patch.sh (--file cordis.patch.yml | --from-configmap | --from-cluster) [--user ID]... [--apply] [--namespace NS]
+usage: push-dsh-cordis-patch.sh (--file cordis.patch.yml | --from-configmap | --from-cluster)
+                                [--user ID]... [--apply] [--namespace NS]
+                                [--configmap-namespace NS]
 
 STAGES the dsh web profile's patch layer (MCP integrations, session content
 search, title-service caps) into every dsh-web user environment (all
@@ -87,10 +95,18 @@ instead (the old behaviour; a rolling backup was made in that mode).
   --apply              actually run
   (default)            dry-run preview only
   --namespace NS       target namespace (default: $NAMESPACE)
+  --configmap-namespace NS
+                       namespace holding '<release>-project-config' for
+                       --from-configmap. Needed when the target namespace is a
+                       platform user's own (project-user-<slug>): the ConfigMap
+                       lives in the RELEASE namespace, not the user's. Left
+                       unset, the target namespace is tried first and the
+                       release namespace is used as a fallback.
   --help               this help
 
 env overrides: KUBECTL (default: kubectl), NAMESPACE, CONTAINER (default: $CONTAINER),
-               TARGET_NAME (default: cordis.patch-update.yml)
+               TARGET_NAME (default: cordis.patch-update.yml),
+               RELEASE_NAMESPACE (ConfigMap namespace fallback; default: auto)
 EOF
 }
 
@@ -186,6 +202,15 @@ while [ $# -gt 0 ]; do
       ;;
     --list-users)
       LIST_USERS=1
+      shift
+      ;;
+    --configmap-namespace)
+      shift
+      RELEASE_NAMESPACE="${1:-}"
+      if [ -z "$RELEASE_NAMESPACE" ]; then
+        echo "error: --configmap-namespace requires a value" >&2
+        exit 1
+      fi
       shift
       ;;
     --namespace|-n)
@@ -446,18 +471,63 @@ COUNT="${#SEL_NAMES[@]}"
 # templates/configmap-project.yaml). This is the "latest from values" an
 # administrator reads without touching a pod, and the natural source for a
 # push. Falls back with a clear message if the chart predates that ConfigMap.
+#
+# NAMESPACE vs RELEASE NAMESPACE: the ConfigMap is rendered into
+# .Release.Namespace, but a platform (SSO) user's unit lives in its own
+# 'project-user-<slug>' namespace. Looking only in $NAMESPACE therefore failed
+# with NotFound for exactly the users an operator most wants to push to.
+# Resolution order (first hit wins):
+#   1. --configmap-namespace / RELEASE_NAMESPACE, when set (explicit, no probing)
+#   2. $NAMESPACE          (classic/local users: the unit IS in the release ns)
+#   3. the release namespace derived from the router Deployment's namespace
 if [ "$FROM_CONFIGMAP" -eq 1 ]; then
   TMP_PATCH="${TMPDIR:-/tmp}/cordis.patch.$$.yml"
   CM_NAME="${CONFIGMAP_NAME:-dsh-web-helm-project-config}"
-  if ! CM_PATCH="$("$KUBECTL" get configmap -n "$NAMESPACE" "$CM_NAME" \
-        -o jsonpath='{.data.cordis\.patch\.yml}' 2>&1)"; then
-    echo "error: kubectl failed reading ConfigMap '$CM_NAME' in '$NAMESPACE': $CM_PATCH" >&2
+
+  # Release namespace guess: the namespace of the chart's own router Deployment,
+  # found via the app label every chart object carries. Empty if not resolvable.
+  derive_release_namespace() {
+    # Every step is guarded: under 'set -euo pipefail' a failing or empty
+    # cluster-wide query (RBAC/policy-blocked -A, no matches) would otherwise
+    # abort the whole script with a silent exit 1. Failing to DERIVE a
+    # namespace is not an error — the caller still has $NAMESPACE to try.
+    "$KUBECTL" get deploy -A -l "hpe-ezua/app=dsh-web-helm" \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null \
+      | head -1 || true
+  }
+
+  if [ -n "$RELEASE_NAMESPACE" ]; then
+    CM_CANDIDATES="$RELEASE_NAMESPACE"
+  else
+    CM_CANDIDATES="$NAMESPACE"
+    _derived="$(derive_release_namespace)"
+    if [ -n "$_derived" ] && [ "$_derived" != "$NAMESPACE" ]; then
+      CM_CANDIDATES="$CM_CANDIDATES $_derived"
+    fi
+  fi
+
+  CM_FOUND_NS=""
+  CM_PATCH=""
+  CM_ERR=""
+  for _cmns in $CM_CANDIDATES; do
+    if CM_PATCH="$("$KUBECTL" get configmap -n "$_cmns" "$CM_NAME" \
+          -o jsonpath='{.data.cordis\.patch\.yml}' 2>&1)"; then
+      CM_FOUND_NS="$_cmns"
+      break
+    fi
+    CM_ERR="$CM_PATCH"
+    CM_PATCH=""
+  done
+
+  if [ -z "$CM_FOUND_NS" ]; then
+    echo "error: ConfigMap '$CM_NAME' not found in: $CM_CANDIDATES" >&2
+    echo "       last kubectl error: $CM_ERR" >&2
     echo "       (upgrade the chart so templates/configmap-project.yaml is applied," >&2
-    echo "        or use --file / --from-cluster.)" >&2
+    echo "        pass --configmap-namespace <release-ns>, or use --file / --from-cluster.)" >&2
     exit 1
   fi
   if [ -z "$CM_PATCH" ]; then
-    echo "error: ConfigMap '$CM_NAME' has no 'cordis.patch.yml' key (or it is empty)" >&2
+    echo "error: ConfigMap '$CM_NAME' in '$_cmns' has no 'cordis.patch.yml' key (or it is empty)" >&2
     echo "       Is values.dshCordisPatch set? Use --file / --from-cluster instead." >&2
     exit 1
   fi
@@ -467,7 +537,7 @@ if [ "$FROM_CONFIGMAP" -eq 1 ]; then
     exit 1
   fi
   FILE="$TMP_PATCH"
-  echo "source: --from-configmap ($CM_NAME -> cordis.patch.yml)"
+  echo "source: --from-configmap ($CM_NAME in '$_cmns' -> cordis.patch.yml)"
 fi
 
 # --------------------------------------------------- source: --from-cluster
