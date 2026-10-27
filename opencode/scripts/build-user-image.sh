@@ -26,6 +26,26 @@
 #                         ttydVersion const in templates/configmap-router.yaml)
 #   - helm version:       provisioning.helmVersion in the values file (default
 #                         3.22.0; --helm-version overrides)
+#
+# PROXY SUPPORT (behind a corporate proxy / DinD):
+#   Nothing proxy-related is stored in this repo. The script reads the standard
+#   HTTP_PROXY / HTTPS_PROXY / NO_PROXY (or lowercase) variables FROM THE
+#   ENVIRONMENT at run time and forwards them as build-args — the same contract
+#   as the `dockerbuild` wrapper baked into the user image (see
+#   docker/user/Dockerfile). Values are NEVER echoed, so a proxy URL carrying
+#   credentials cannot leak into CI logs or a committed file.
+#
+#   When a proxy is set the script also adds `--network host`, because inside
+#   DinD the daemon's default bridge cannot reach the proxy and Docker's
+#   implicit proxy forwarding does not reach RUN steps. Pass --no-network-host
+#   to suppress it (e.g. on Docker Desktop/macOS, where it is unsupported).
+#
+#     export HTTPS_PROXY=http://user:pass@proxy.example:8080
+#     export NO_PROXY=.cluster.local,.svc,10.0.0.0/8
+#     scripts/build-user-image.sh --values values-g2.yaml --push
+#
+#   NO_PROXY is always extended with 127.0.0.1, ::1 and localhost so buildx's
+#   own gRPC dial to the daemon is never proxied.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,9 +58,14 @@ PLATFORM="linux/amd64"
 IMAGE_REPO=""
 PUSH=0
 LOAD=0
+# 1 = allow '--network host' when a proxy is configured (default). Set 0 with
+# --no-network-host on Docker Desktop/macOS, which does not support it.
+NETWORK_HOST=1
 
 usage() {
-  sed -n '2,27p' "$0"
+  # Print the header comment block (everything above 'set -euo pipefail'),
+  # so the proxy section is included automatically as the header grows.
+  sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -54,6 +79,7 @@ while [ $# -gt 0 ]; do
     --repo) IMAGE_REPO="$2"; shift 2 ;;
     --push) PUSH=1; shift ;;
     --load) LOAD=1; shift ;;
+    --no-network-host) NETWORK_HOST=0; shift ;;
     -h|--help) usage ;;
     *) echo "unknown arg: $1" >&2; usage ;;
   esac
@@ -124,6 +150,54 @@ echo "==> ttyd version:    $TTYD_VERSION"
 echo "==> helm version:    $HELM_VERSION"
 echo "==> apt packages:    $APT_PACKAGES"
 echo "==> image:           ${IMAGE_REPO}:${TAG} (${PLATFORM})"
+
+# --- Proxy (environment only; never stored in the repo) ---------------------
+# Mirrors the 'dockerbuild' wrapper baked into the user image so a build from
+# this script behaves the same as a build from inside a pod. The VALUES ARE
+# NEVER ECHOED: a proxy URL may carry credentials (http://user:pass@host) and
+# this script's output routinely lands in CI logs and chat transcripts.
+PROXY_HTTP="${HTTP_PROXY:-${http_proxy:-}}"
+PROXY_HTTPS="${HTTPS_PROXY:-${https_proxy:-}}"
+PROXY_BYPASS="${NO_PROXY:-${no_proxy:-}}"
+# Remember which variables the CALLER actually set, so the status line does not
+# claim NO_PROXY came "from environment" when the script merely synthesised it.
+PROXY_FROM_ENV=""
+[ -n "$PROXY_HTTP" ] && PROXY_FROM_ENV="${PROXY_FROM_ENV}HTTP_PROXY "
+[ -n "$PROXY_HTTPS" ] && PROXY_FROM_ENV="${PROXY_FROM_ENV}HTTPS_PROXY "
+[ -n "$PROXY_BYPASS" ] && PROXY_FROM_ENV="${PROXY_FROM_ENV}NO_PROXY "
+
+PROXY_ARGS=()
+if [ -n "$PROXY_HTTP" ] || [ -n "$PROXY_HTTPS" ]; then
+  # buildx dials the daemon itself; that dial must never go through the proxy.
+  for _extra in 127.0.0.1 ::1 localhost; do
+    case ",$PROXY_BYPASS," in
+      *",$_extra,"*) ;;
+      *) PROXY_BYPASS="${PROXY_BYPASS:+$PROXY_BYPASS,}$_extra" ;;
+    esac
+  done
+  if [ -n "$PROXY_HTTP" ]; then
+    PROXY_ARGS+=(--build-arg "HTTP_PROXY=$PROXY_HTTP" --build-arg "http_proxy=$PROXY_HTTP")
+  fi
+  if [ -n "$PROXY_HTTPS" ]; then
+    PROXY_ARGS+=(--build-arg "HTTPS_PROXY=$PROXY_HTTPS" --build-arg "https_proxy=$PROXY_HTTPS")
+  fi
+  PROXY_ARGS+=(--build-arg "NO_PROXY=$PROXY_BYPASS" --build-arg "no_proxy=$PROXY_BYPASS")
+  if [ "$NETWORK_HOST" = 1 ]; then
+    PROXY_ARGS+=(--network host)
+  fi
+  # Report only WHICH variables the caller set — never their values.
+  echo "==> proxy:           enabled from environment (${PROXY_FROM_ENV% }) — values not printed"
+  if [ -z "${NO_PROXY:-${no_proxy:-}}" ]; then
+    echo "                     NO_PROXY was unset; forwarding only the loopback bypass list"
+  fi
+  if [ "$NETWORK_HOST" = 1 ]; then
+    echo "                     --network host added (DinD: bridge cannot reach the proxy)"
+  else
+    echo "                     --network host NOT added (--no-network-host)"
+  fi
+else
+  echo "==> proxy:           none (HTTP_PROXY/HTTPS_PROXY unset) — direct build"
+fi
 echo
 
 BUILD_ARGS=(
@@ -135,6 +209,7 @@ BUILD_ARGS=(
   --build-arg "APT_PACKAGES=${APT_PACKAGES}"
   -t "${IMAGE_REPO}:${TAG}"
 )
+[ "${#PROXY_ARGS[@]}" -gt 0 ] && BUILD_ARGS+=("${PROXY_ARGS[@]}")
 [ "$PUSH" = 1 ] && BUILD_ARGS+=(--push)
 [ "$LOAD" = 1 ] && BUILD_ARGS+=(--load)
 
@@ -143,6 +218,9 @@ BUILD_ARGS=(
 if [ "$PUSH" != 1 ]; then
   echo
   echo "==> Built ${IMAGE_REPO}:${TAG} locally. Push with:"
-  echo "    docker buildx build --platform ${PLATFORM} -t ${IMAGE_REPO}:${TAG} --push docker/user"
-  echo "    (or rerun this script with --push)"
+  # Point at the script rather than printing a raw docker command: the raw form
+  # would silently omit the proxy build-args above, and a proxy URL with
+  # credentials must not be echoed into logs.
+  echo "    scripts/build-user-image.sh --values ${VALUES} --push"
+  echo "    (same versions/apt list; re-runs the build and pushes it)"
 fi

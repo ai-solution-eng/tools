@@ -22,6 +22,25 @@ previewDomain: "${DOMAIN_NAME}"
 # session cookie that gates access to that pod's UI/terminal/previews).
 sessionSecret: "9xT2mQvR4pS7kL1nW8yB5dF3hJ6cZ0aG"
 
+# How long a login lasts, in days. The router issues a signed 'oc_sess' cookie
+# at login and each user pod's nginx auth gate validates it; this value is the
+# cookie's Max-Age and the 'exp' claim inside it. When it lapses the user is
+# asked to log in again — NOTHING on disk is deleted: conversations
+# (opencode.db), workspace files, opencode.json/agents/skills and auth.json all
+# survive untouched. There is no age-based conversation retention in this chart
+# or in upstream opencode; clearing chat history is only ever an explicit admin
+# action (POST /__oc_admin/api/sessions/clear).
+# 7 was the historical hardcoded value; 180 keeps an active user logged in for
+# roughly half a year. The router clamps this to [1 hour, 400 days] and falls
+# back to 7 on a non-numeric/zero/negative value — 400 days is the hard cap
+# browsers put on cookie lifetime (RFC 6265bis), so a larger number would just
+# be truncated client-side.
+# NOTE: the expiry is baked into each cookie at issue time. Raising this value
+# does NOT retroactively extend cookies already in users' browsers — they pick
+# up the new lifetime at their next login (their current cookie simply lapses
+# on its old schedule first).
+sessionCookieTtlDays: 180
+
 storageClass: gl4f-filesystem
 storage:
   sharedSize: 20Gi
@@ -49,6 +68,16 @@ storage:
 nginx:
   clientMaxBodySize: 64m
 
+# Pod-template convergence counter. Bump this to force EVERY user unit to
+# re-stamp onto the current chart-rendered pod template (nginx.conf, supervisor,
+# probes, env) on the next router reconcile — no chart/template edit required.
+# Folded into the 'opencode-web-helm/user-template-version' annotation; when it
+# changes the router patches each Deployment and the unit rolls.
+# LEAVE UNSET unless you need a forced rollout: unset renders the historical
+# marker unchanged (no surprise rollout on upgrade). Any value you set here
+# becomes the '-r<value>' suffix.
+# RUNTIME_REV: 20
+
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
   # @openchamber/web, uv, ttyd and helm under /opt/opencode so pods stop
@@ -58,8 +87,21 @@ images:
   # change — the router folds the tag into the pod-template version, so
   # existing units re-stamp automatically on upgrade. Set both entries back to
   # node:22-bookworm-slim to revert to install-on-boot behavior.
-  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
-  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.18.11-1.17.2-dind
+  #
+  # NOTE (opencode 1.19.4 + openchamber 1.24.2): the tag still names
+  # 1.18.11-1.17.2 on purpose. The baked image for the new pair does not exist
+  # yet, and pointing at a missing tag would put every user pod into
+  # ImagePullBackOff. With the tag left as-is the router's npm guard sees BOTH
+  # baked markers (.opencode-version 1.18.11, .openchamber-version 1.17.2)
+  # differ from OPENCODE_VERSION 1.19.4 / OPENCHAMBER_VERSION 1.24.2, so it
+  # installs opencode-ai@1.19.4 AND @openchamber/web@1.24.2 into the state PVC
+  # at boot — the documented fallback (the openchamber install fires because
+  # ui.mode: openchamber stamps OPENCHAMBER_INSTALL=true). After
+  # building+pushing the new image, set BOTH lines to
+  # ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind to get the
+  # fast baked path back.
+  user: ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind
+  init: ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind
   # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
   # Public ghcr.io packages pull anonymously (leave empty).
   pullSecret: ""
@@ -125,12 +167,26 @@ docker:
   brokerForPlatformUnits: true
 
 opencode:
-  version: 1.18.11
+  version: 1.19.4
 
 # Browser-facing UI. "opencode" uses the built-in opencode web UI; "openchamber"
 # serves OpenChamber on chamberPort with a headless opencode server on serverPort.
+#
+# VERSION PAIRING (checked 2026-10-26 against npm + openchamber.dev/changelog):
+#   OpenChamber 2.x  -> depends on @opencode/client 2.1.4 / @opencode/schema
+#                       2.1.4, i.e. it REQUIRES opencode v2. Do not pair 2.x
+#                       with the 1.19 line.
+#   OpenChamber 1.x  -> pins @opencode-ai/sdk 1.18.x; the line ENDS at 1.24.2
+#                       (1.25+ unpublished). 1.24.2 pins sdk 1.18.31, the
+#                       closest 1.x pin to opencode 1.19.4.
+# NOTE: no OpenChamber 1.x pins an sdk >= 1.19, so opencode 1.19.4 + OpenChamber
+# 1.24.2 is the CLOSEST available pairing, not an officially blessed one — the
+# sdk/server gap is one minor version. This chart previously used an exact
+# sdk match (opencode 1.18.11 <-> openchamber 1.17.2, sdk 1.18.11). If 1.24.2
+# misbehaves against 1.19.4, the exact-match fallback is opencode 1.18.31 +
+# openchamber 1.24.2.
 openchamber:
-  version: "1.17.2"
+  version: "1.24.2"
 
 ui:
   mode: openchamber

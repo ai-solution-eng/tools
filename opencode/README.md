@@ -103,9 +103,59 @@ All configuration lives in `values.yaml`:
 | `opencode.version` | The opencode npm version to install (e.g. `1.18.11`) |
 | `openchamber.version` | The OpenChamber npm version to install (used when `ui.mode: openchamber`) |
 | `ui.mode` | `opencode` (default, built-in web UI) or `openchamber` (OpenChamber frontend) |
+| `sessionCookieTtlDays` | How long a login lasts, in **days** (default `180`; historically hardcoded to 7). It sets the signed `oc_sess` cookie's `Max-Age` and its `exp` claim, so it controls only **when a user must log in again** — it deletes nothing. Conversations (`opencode.db`), workspace files, `opencode.json`/agents/skills and `auth.json` all survive. Invalid values (`0`, negative, non-numeric) fall back to 7 so a typo cannot lock everyone out, and the result is clamped to [1 hour, 400 days] — 400 days is the hard cap browsers put on cookie lifetime (RFC 6265bis §5.5), so a larger number would just be truncated client-side. The expiry is baked in at issue time, so raising this does not retroactively extend cookies already in users' browsers — they pick it up at their next login. |
+| `RUNTIME_REV` | **Bump this to force every user unit to re-stamp** onto the current chart-rendered pod template (nginx.conf, supervisor, probes, env) on the next router reconcile — no chart or template edit needed. It is folded into the `opencode-web-helm/user-template-version` annotation; when the value changes the router patches each Deployment and the unit rolls. Leave it **unset** for normal operation: unset renders the historical marker unchanged (no surprise rollout on `helm upgrade`); any value you set becomes the `-r<value>` suffix. Also settable from an EzAppConfig values blob. |
 | `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a prompt body — the request never reaches the app. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
 
 To switch the version of either opencode or OpenChamber, change the number in `values.yaml` and repackage. The chart `version` (in `Chart.yaml`) is bumped manually per release; `appVersion` tracks the opencode major.minor family.
+
+### Conversation retention
+
+**Nothing ages out conversations.** Neither this chart nor upstream opencode
+deletes sessions/messages by age — chat history in `opencode.db` on the user's
+state PVC persists indefinitely and is bounded only by the PVC size
+(`storage.stateSize`). Chat history is removed **only** by an explicit admin
+action: `POST /__oc_admin/api/sessions/clear` (see
+[Admin Console](#admin-console)).
+
+Three things are commonly mistaken for a 7-day session purge — none of them
+deletes a conversation:
+
+| Looks like retention | What it actually is |
+|---|---|
+| `sessionCookieTtlDays` (was hardcoded to 7) | Login-cookie lifetime. When it lapses you log in again; your history is still there. |
+| Upstream's 7-day `RETENTION` constant | Prunes `~/.local/share/opencode/tool-output/tool_*` spill files only (truncated tool output), never `opencode.db`. ([source](https://github.com/anomalyco/opencode/blob/main/packages/opencode/src/tool/truncate.ts)) |
+| The TUI `/sessions` picker hiding sessions older than 30 days | A display filter. `opencode session list` still shows the full history. ([#16733](https://github.com/anomalyco/opencode/issues/16733)) |
+
+Upstream has no retention setting at all — an `opencode session prune` /
+`retention_days` knob is still an open feature request
+([#22110](https://github.com/anomalyco/opencode/issues/22110)), and the config
+schema has no such key.
+
+#### Sessions are pod-local, not browser-local
+
+Conversations belong to **the pod**, not to a browser or a login. Each user gets
+one Deployment + state PVC (`opencode-v2-st-<slug>`), and the chat database
+lives on that volume at `/var/opencode/data/opencode/opencode.db`. Upstream
+scopes sessions by *project directory* inside that DB (`project` /
+`project_directory` / `workspace` / `session` tables, keyed by the project's
+`worktree` path), so history is grouped by which folder you were working in —
+exactly like running opencode on a laptop, where the store is local to the
+machine and the sessions are grouped by project path.
+
+Consequently, **a different browser — including incognito — does not lose
+anything.** The cookie only answers "may this browser reach this pod, and as
+whom"; the moment you authenticate as the same identity, `slugForUser()` maps
+you to the same slug, the same Deployment and the same PVC, and the full history
+is there. Cookies expiring, cookies cleared, or a brand-new device change
+nothing about stored sessions. The workspace directories (`/workspace/personal`,
+`/workspace/shared/<slug>`) are likewise on PVCs and are what the sessions are
+keyed against.
+
+If a hard retention limit is ever required, it has to be implemented
+deliberately (a CronJob pruning `opencode.db` or `opencode session delete` over
+`session list --format json`) — the opencode SQLite schema is internal and
+unstable, so pin `opencode.version` before relying on it.
 
 ### UI modes
 
@@ -450,10 +500,31 @@ Design contract (see `docker/user/Dockerfile`):
 Build & push (single source of truth: the script reads `opencode.version`, `openchamber.version`, `provisioning.aptPackages` and `provisioning.helmVersion` from the values file; the repo name embeds both app versions and the tag is the image revision):
 
 ```sh
-docker buildx build --platform linux/amd64 \
-  -t ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1 --push docker/user
-# or simply: scripts/build-user-image.sh --push
+scripts/build-user-image.sh --values values-g2.yaml --push
+# raw equivalent (no proxy handling — see below):
+#   docker buildx build --platform linux/amd64 \
+#     -t ghcr.io/ai-solution-eng/opencode-openchamber:<opencode>-<openchamber>-dind docker/user
 ```
+
+**Behind a corporate proxy:** nothing proxy-related is stored in this repo. The
+script reads `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (or lowercase) **from the
+environment at run time** and forwards them as `--build-arg`s, and adds
+`--network host` when a proxy is set (inside DinD the default bridge cannot
+reach the proxy, and Docker's implicit proxy forwarding does not reach `RUN`
+steps). The values are never echoed, so a proxy URL carrying credentials does
+not land in CI logs. Pass `--no-network-host` on Docker Desktop/macOS, which
+does not support that flag. `NO_PROXY` is always extended with `127.0.0.1`,
+`::1` and `localhost` so buildx's own dial to the daemon is never proxied.
+
+```sh
+export HTTPS_PROXY=http://user:pass@proxy.example:8080   # your shell only
+export HTTP_PROXY="$HTTPS_PROXY"
+export NO_PROXY=.cluster.local,.svc,10.0.0.0/8,172.0.0.0/8
+scripts/build-user-image.sh --values values-g2.yaml --push
+```
+
+This mirrors the `dockerbuild` wrapper baked into the user image, so a build
+from a laptop and a build from inside a pod behave the same.
 
 Then `helm upgrade` (the values files already point at the matching image).
 
@@ -572,6 +643,7 @@ preview-url 8000
 
 - `scripts/build-user-image.sh` — build/push the baked user image (reads `opencode.version` + `openchamber.version` + `provisioning.aptPackages` from the values file; repo name embeds both versions)
 - `scripts/test-user-image.sh` — sanity-test the baked image locally (no cluster needed)
-- `scripts/push_opencode_json_config.sh` — push an opencode.json into every user env (hot-reloaded)
+- `scripts/show-current-config.sh` — print the **latest** config as rendered from `values.yaml` (read from the `<release>-project-config` ConfigMap; read-only, no pod needed). Use it to hand the current config to the team, or to diff against what a user actually has: `scripts/show-current-config.sh [--out FILE] [--namespace NS]`
+- `scripts/push_opencode_json_config.sh` — **stage** an opencode.json into user envs. Its source is `--from-configmap` by default (the same ConfigMap the script above reads), so `helm upgrade` → `push` needs no pod and no local file. The push lands as `~/.config/opencode/opencode-update.json` beside the live `opencode.json`, which is never written: opencode resolves its config from a fixed candidate list (`opencode.jsonc`/`opencode.json`/`config.json`, not a glob) and the supervisor watches an explicit file list, so a sibling is inert — nothing reloads until you promote it (the script prints the exact per-unit command). `--user` scopes a push; `TARGET_NAME=opencode.json` restores the old overwrite behaviour.
 - `scripts/user_manager.ipynb` — bulk user admin against the router API
 - `scripts/cleanup-opencode-web-helm-stale-quotas.sh` — VAST quota cleanup (dry-run default)

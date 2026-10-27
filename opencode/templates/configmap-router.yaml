@@ -94,7 +94,14 @@ data:
     // v15: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
     // default rejected pasted/dropped images with HTTP 413 before the app saw
     // the request. Bumped so existing units re-stamp onto the new nginx.conf.
-    const userTemplateVersion = `terminal-tab-v15-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}`
+    //
+    // RUNTIME_REV is operator-tunable: set it in values.yaml (or an EzAppConfig
+    // values blob) and every user unit re-stamps on the next reconcile — no
+    // chart edit needed. The suffix is only appended when the value is SET, so
+    // an install that never sets it renders the historical marker EXACTLY and
+    // gets no surprise rollout on upgrade.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default "" }}'
+    const userTemplateVersion = `terminal-tab-v15-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}${userRuntimeRev ? `-r${userRuntimeRev}` : ''}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -399,7 +406,25 @@ data:
     const registrySecretName = process.env.USER_REGISTRY_SECRET || '{{ .Release.Name }}-users'
     const sessionSecret = process.env.SESSION_SECRET || ''
     const sessionCookieName = 'oc_sess'
-    const sessionTtlSeconds = 7 * 24 * 60 * 60
+    // Login lifetime (values: sessionCookieTtlDays, default 7 = the historical
+    // hardcoded value). This is ONLY the signed cookie's Max-Age / 'exp' — it
+    // governs when a user must log in again, and deletes nothing. Conversations
+    // live in opencode.db on the state PVC and are never aged out by the chart
+    // or by upstream opencode; clearing chat history stays an explicit admin
+    // action (POST /__oc_admin/api/sessions/clear).
+    // Guarded so a bad value can never lock everyone out or mint a cookie the
+    // browser rejects: non-numeric/0/negative falls back to 7, and the result
+    // is clamped to [1 hour, 400 days] — 400 days is the hard cap browsers
+    // enforce on cookie lifetime (RFC 6265bis §5.5), so anything above it would
+    // silently be truncated by the browser anyway.
+    // Rendered with toJson (not hand-quoted): the value lands as a JSON
+    // literal — 180, "180", or a safely-escaped string — so a quote or
+    // backslash in values.yaml can never break out of the JS literal and
+    // CrashLoop the router.
+    const sessionTtlDaysRaw = Number({{ .Values.sessionCookieTtlDays | default 7 | toJson }})
+    const sessionTtlDaysFallback = Number.isFinite(sessionTtlDaysRaw) && sessionTtlDaysRaw > 0 ? sessionTtlDaysRaw : 7
+    const sessionTtlDays = Math.min(Math.max(sessionTtlDaysFallback, 1 / 24), 400)
+    const sessionTtlSeconds = Math.floor(sessionTtlDays * 24 * 60 * 60)
     const adminUsername = process.env.ADMIN_USERNAME || ''
     const adminPassword = process.env.ADMIN_PASSWORD || ''
     // Version the per-user PVC names so a new environment provisions a fresh
