@@ -125,6 +125,48 @@ if _REAL:
         "MCP calls denied by the default-deny ACL or server tool policy.",
         ["server"],
     )
+    # Argument-level policy stage (P0-1, 2026-10-26 hardening plan): the ACL
+    # gate answers "may this key use this tool?"; it never sees the ARGUMENTS.
+    # This counter makes the new argument stage visible separately from the
+    # ACL wall, so "the model tried to reach the metadata service" is a
+    # distinguishable series from "the model was not granted the tool".
+    # reason vocabulary (bounded, NOT the caller's text):
+    #   url-destination | cluster-host | scheme | ip-literal | too-deep
+    MCP_POLICY_BLOCKED = Counter(
+        "gateway_mcp_policy_blocked_total",
+        "MCP calls refused by the argument-level policy stage (destination "
+        "deny-list) before the upstream server was contacted.",
+        ["server", "tool", "reason"],
+    )
+    # Structural telemetry for the "retrieved content is data" rule (P2-3):
+    # a call whose arguments carry a payload-shaped blob is FLAGGED here, not
+    # refused (blocking payloads needs an egress proxy; see the plan's
+    # stated limit). signal vocabulary: base64-blob | long-query | long-path
+    MCP_ARG_TELEMETRY = Counter(
+        "gateway_mcp_arg_telemetry_total",
+        "MCP calls whose arguments looked payload-shaped (exfiltration "
+        "telemetry for the argument stage; never a refusal).",
+        ["server", "tool", "signal"],
+    )
+    # P2-1 (attribution): MCP counters carried only {tool, outcome} with no
+    # caller/model dimension, so the plan's "<1 in 100,000 calls" event was
+    # visible as a rate and unattributable. Design rule 3 still forbids a
+    # per-KEY label (keys are unbounded, tenant-churned, and the /metrics port
+    # is public); the two BOUNDED dimensions that answer "who" are used
+    # instead:
+    #   model  - bounded by the endpoint registry; "" normalises to
+    #            "unattributed" (the relay path settles with model="*" today -
+    #            see the P1-1 note in routes_proxy).
+    #   server - bounded by the MCP registry.
+    # Per-KEY attribution stays in usage_ledger / mcp_call_audit, which are
+    # access-controlled and now hash-chained.
+    MCP_CALLS = Counter(
+        "gateway_mcp_calls_total",
+        "MCP tool calls by server, terminal outcome and serving model "
+        "(attribution for the exfiltration class; per-key detail lives in "
+        "the chained mcp_call_audit trail, never in a metric label).",
+        ["server", "outcome", "model"],
+    )
     BUDGET_WARNING = Counter(
         "gateway_budget_warning_total",
         "Responses emitted with an X-Budget-Warning threshold header.",
@@ -193,6 +235,44 @@ if _REAL:
         "Distiller memory writes by path and outcome.",
         ["path", "outcome"],  # outcome: ok | failed | skipped
     )
+    # --- decision-model routing (2026-10-26) -------------------------------
+    # Added because NOTHING could answer "how often does the router call the
+    # decision model, and how often does that change the served model?" -- so
+    # every threshold (confidence floor, switch margin, call cadence) was
+    # tuned blind. These three series close that gap:
+    #   DECISION_CALLS  - one tick per decision attempt, by outcome. A high
+    #                     outcome=abstained rate means the floor is mis-set;
+    #                     outcome=error means the endpoint is unhealthy.
+    #   DECISION_LATENCY- the wall time the seam adds to a routed request
+    #                     (measured ~300ms on a small state, bounded by the
+    #                     configured timeout). This is the user-facing cost.
+    #   ROUTE_SWITCHES  - how often the router CHANGES the served model, split
+    #                     by whether hysteresis held it. switched is the number
+    #                     that decides whether a re-prefill budget is at risk.
+    DECISION_CALLS = Counter(
+        "gateway_decision_calls_total",
+        "Decision-model routing attempts by outcome. outcome: served (the "
+        "model's choice was adopted), held (the choice was rejected by the "
+        "switch hysteresis margin), abstained (below the confidence floor or "
+        "malformed), error (transport/timeout), skipped (fewer than two "
+        "candidates, so no call was made).",
+        ["outcome"],
+    )
+    DECISION_LATENCY = Histogram(
+        "gateway_decision_latency_ms",
+        "Wall time of one decision-model call, in milliseconds.",
+        buckets=(50, 100, 200, 300, 500, 750, 1000, 1500, 2500, 5000),
+    )
+    ROUTE_SWITCHES = Counter(
+        "gateway_route_switches_total",
+        "Routing outcomes that move a conversation between models. outcome: "
+        "switched (the incumbent changed), held (a challenger was blocked by "
+        "the switch hysteresis margin), same (the pick equalled the "
+        "incumbent), cold (no incumbent yet), shadow_would (shadow mode: a "
+        "switch WOULD have happened but nothing was served, so nothing was "
+        "re-prefilled).",
+        ["outcome"],
+    )
 
 else:
     # Deliberate conditional re-definition (import guard) — the mypy-sanctioned
@@ -206,6 +286,9 @@ else:
     BREAKER_TRIPS: Any = _NoopMetric()  # type: ignore[no-redef]
     RELAY_ITERATIONS: Any = _NoopMetric()  # type: ignore[no-redef]
     MCP_ACL_DENIED: Any = _NoopMetric()  # type: ignore[no-redef]
+    MCP_POLICY_BLOCKED: Any = _NoopMetric()  # type: ignore[no-redef]
+    MCP_ARG_TELEMETRY: Any = _NoopMetric()  # type: ignore[no-redef]
+    MCP_CALLS: Any = _NoopMetric()  # type: ignore[no-redef]
     BUDGET_WARNING: Any = _NoopMetric()  # type: ignore[no-redef]
     ADMIN_AUTH_FAILURES: Any = _NoopMetric()  # type: ignore[no-redef]
     UPSTREAM_AUTH_DEGRADED: Any = _NoopMetric()  # type: ignore[no-redef]
@@ -214,6 +297,9 @@ else:
     DISTILL_DUE_ROWS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_LAST_WRITE_TS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_WRITES: Any = _NoopMetric()  # type: ignore[no-redef]
+    DECISION_CALLS: Any = _NoopMetric()  # type: ignore[no-redef]
+    DECISION_LATENCY: Any = _NoopMetric()  # type: ignore[no-redef]
+    ROUTE_SWITCHES: Any = _NoopMetric()  # type: ignore[no-redef]
 
 
 def observe_relay_iterations(model: str, iterations: int) -> None:
@@ -229,6 +315,31 @@ def observe_acl_denial(server: str) -> None:
     MCP_ACL_DENIED.labels(server=server).inc()
 
 
+def observe_mcp_policy_block(server: str, tool: str, reason: str) -> None:
+    """One argument-stage refusal (P0-1). Labels stay bounded: server and
+    tool come from the registry + the grant the caller already holds, and
+    reason is a fixed vocabulary chosen by the policy stage itself — the
+    caller's URL/host text NEVER becomes a label (design rule 3)."""
+    MCP_POLICY_BLOCKED.labels(server=server, tool=tool, reason=reason).inc()
+
+
+def observe_mcp_arg_telemetry(server: str, tool: str, signal: str) -> None:
+    """One payload-shaped-argument observation (P2-3 structural rule).
+    Telemetry only — the call proceeds."""
+    MCP_ARG_TELEMETRY.labels(server=server, tool=tool, signal=signal).inc()
+
+
+def observe_mcp_call(server: str, outcome: str, model: str = "") -> None:
+    """One MCP tool call's terminal outcome, attributed to the SERVING MODEL.
+
+    outcome vocabulary: ok | error | denied | policy_blocked (bounded).
+    model "" becomes "unattributed" — an empty label value is legal but a
+    named bucket is what makes the unattributed share alertable, which is the
+    point of P2-1: you cannot act on a rare event you cannot attribute.
+    """
+    MCP_CALLS.labels(server=server, outcome=outcome, model=model or "unattributed").inc()
+
+
 def observe_tpm_cache_refund(tokens: int, discarded: bool) -> None:
     """One settle-time TPM refund: refunded when the admission-time window
     row was still live (tokens subtracted), discarded when the minute
@@ -237,6 +348,28 @@ def observe_tpm_cache_refund(tokens: int, discarded: bool) -> None:
     belonged to). Summing refunded+discarded reconciles against the ledger
     cached_tokens column."""
     TPM_CACHE_REFUND.labels(outcome="discarded" if discarded else "refunded").inc(max(0, tokens))
+
+
+def observe_decision_call(outcome: str, latency_ms: int | None = None) -> None:
+    """One decision-model routing attempt.
+
+    outcome: served | abstained | error | skipped. latency_ms is recorded only
+    when a call was actually made (skipped makes none, and a 0 in the latency
+    histogram would drag the mean down with non-events).
+    """
+    DECISION_CALLS.labels(outcome=outcome).inc()
+    if latency_ms is not None and latency_ms >= 0:
+        DECISION_LATENCY.observe(latency_ms)
+
+
+def observe_route_switch(outcome: str) -> None:
+    """One routing outcome relative to the conversation's incumbent.
+
+    outcome: switched | held | same | cold. `switched` is the series that
+    decides whether the re-prefill budget is at risk; `held` counts the
+    switches the hysteresis margin blocked (the knob's own effectiveness).
+    """
+    ROUTE_SWITCHES.labels(outcome=outcome).inc()
 
 
 def observe_distill_due(path: str, rows: int) -> None:

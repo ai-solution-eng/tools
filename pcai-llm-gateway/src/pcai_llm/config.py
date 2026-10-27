@@ -191,6 +191,33 @@ class Settings(BaseSettings):
     # generations that actually completed server-side is why this is bounded
     # to one.
     tool_relay_call_retries: int = 1
+
+    # --- reasoning continuity (2026-10-26) -------------------------------
+    # Whether the model is shown its OWN prior reasoning: in-loop (the
+    # assistant rows a relay turn builds between tool calls) and inbound (the
+    # reasoning a client replays in its history).
+    #
+    # WHY THIS EXISTS: with both paths off, a 32-iteration relay turn hands the
+    # model up to 31 consecutive examples of itself emitting tool calls with no
+    # thinking in front of them — an in-context demonstration to skip reasoning.
+    # Measured over 140 real sessions: 86.1% of relayed tool-call steps carried
+    # no reasoning, vs 46.1% going direct to the same model. The model was being
+    # TAUGHT to stop thinking by its own replayed history.
+    #
+    # WHY IT IS SAFE NOW (the 2026-09-18 storm): that incident was UNBOUNDED
+    # growth — a client re-appended each streamed reasoning block per cycle and
+    # one stored event reached 6,630 copies of a single line (~401 KB). The old
+    # answer was to strip reasoning entirely. The bound is the real fix: every
+    # re-fed block is capped at reasoning_history_max_chars, so the worst case
+    # over a 32-iteration turn is 32 x cap (~63 KB at the 2000-char default)
+    # instead of unbounded. Verified against the served endpoint: GLM accepts
+    # its own reasoning back in every shape, including alongside tool_calls.
+    #
+    # 0 disables re-feeding entirely (the pre-2026-10-26 behaviour, kept as the
+    # escape hatch). Raise the cap only with the token budget in mind — this is
+    # input that rides EVERY subsequent iteration of the turn.
+    reasoning_history_enabled: bool = True
+    reasoning_history_max_chars: int = 2000
     # 'explicit' (default, 2026-10-09 operator decision): a key sees ONLY its
     # held (server, tool) pairs — the profile's live-grant presets ∪ its own
     # ACL rows (federation.load_grants), deny rows still winning. The profile
@@ -341,6 +368,44 @@ class Settings(BaseSettings):
     # wrapped-but-not-JSON string raises the upstream's own missing-field
     # error so misshapen calls stay visible instead of being masked.
     mcp_unwrap_arguments: bool = True
+
+    # --- MCP argument-level policy stage (hardening P0-1) -----------------
+    # The gateway's ACLs are PAIR-granular ("may this key use
+    # searxng.fetch_content?") while the exfiltration class this closes is
+    # ARGUMENT-granular: a model hands a URL to a PERMITTED tool and the
+    # gateway's own pod makes the request. This stage walks every string
+    # argument (bounded: depth 6, 200 strings, 8 KiB scanned each) and applies
+    # the fleet's ONE SSRF deny-list (core/url_guard) to DESTINATION-shaped
+    # strings. It runs on BOTH model-driven paths: /mcp (_gated_mcp_call) and
+    # the relay (_relay_executor).
+    #
+    # enforce (default) | warn | off. Enforce is the default because the
+    # deny-list is a DESTINATION deny-list — it does not stop a legitimate
+    # public web fetch. An unrecognised value FAILS CLOSED to enforce (a typo
+    # must never silently disable the stage).
+    mcp_arg_policy: str = "enforce"
+    # Per-tool escape hatch: comma-separated 'server.tool' globs (e.g.
+    # "searxng.*,workbench.*"). Empty = no exemptions. No fleet tool is known
+    # to legitimately take an internal URL today.
+    mcp_arg_policy_exempt: str = ""
+    # Egress-class servers (comma-separated name globs): only for these are
+    # in-cluster names denied and DNS resolved. Empty = the federation table's
+    # egress class (searxng). Every OTHER fleet server legitimately talks to
+    # *.svc.cluster.local, so this must stay narrow.
+    mcp_arg_egress_servers: str = ""
+    # Deny in-cluster hostnames (.svc, .svc.cluster.local, .cluster.local, ...)
+    # on egress-class servers: a model has no business fetching the cluster
+    # control plane through a web fetcher.
+    mcp_arg_deny_cluster_hosts: bool = True
+    # Resolve egress-class HOSTNAMES at argument time (2 s bound) and deny a
+    # name that maps into a denied range. A resolution FAILURE is not evidence
+    # of danger and allows the call (the documented url_guard residual).
+    mcp_arg_policy_resolve: bool = True
+    # Payload-shape telemetry (hardening P2-3): observe base64-blob /
+    # long-query / long-path argument shapes on the metric, NEVER refuse.
+    # A false refusal would break legitimate large payloads; the payload axis
+    # needs an egress proxy, not a heuristic.
+    mcp_arg_telemetry: bool = True
 
     # --- embedding cache ---
     # Dedupes identical (model, input) embedding calls — the RAG-app
@@ -522,13 +587,12 @@ class Settings(BaseSettings):
     # lands mid-ladder or above; tune per fleet from the shadow-ledger data.
     routing_tier1_tokens: int = 1500
     routing_tier2_tokens: int = 6000
-    # Tool-definition JSON bytes per score token. Tool schemas are dense,
-    # key-heavy JSON that tokenizes far worse than prose (braces, quotes and
-    # repeated names dominate), so the plain chars/4 heuristic undercounts
-    # them; 64 bytes ≈ 1 token keeps a 12 KB toolset from masquerading as
-    # 12 K tokens of prose. The byte term also subsumes tool COUNT (more
-    # tools = more bytes), which is why there is no separate per-tool adder.
-    routing_tool_bytes_per_token: int = 64
+    # REMOVED 2026-10-26: routing_tool_bytes_per_token. Tool definitions are
+    # no longer scored at all (see complexity_score's tool_tokens=0 note): an
+    # agent harness ships the same catalog every turn, so the byte term was a
+    # constant that inflated every request toward the ceiling without
+    # separating easy from hard. The knob outlived its consumer and an
+    # operator tuning it saw no effect -- removed rather than left as a decoy.
     # Score adder per message beyond the first. chars/4 already counts the
     # accumulated transcript, but conversation STATE (earlier turns, tool
     # results, corrections) demands a stronger model even when the latest
@@ -594,6 +658,27 @@ class Settings(BaseSettings):
     # last-wins merge order would otherwise let a tenant override spoof
     # identity — the verified vector this closes).
     mcp_caller_attribution: bool = True
+
+    # Read+egress separation (P0-3, 2026-10-26 hardening): the one control
+    # against a key holding BOTH a read-class grant (k8s-ops, logsearch,
+    # mm-rag, sqlhandler read tools, prometheus, seaborn) AND an egress-class
+    # grant (searxng) — the combination that reads data and then sends it,
+    # i.e. the exfiltration channel of the plan's attack. The pure predicate
+    # is mcpf.federation.read_egress_violation over the server classes in
+    # MCP_SERVER_CLASSES (one constant).
+    #   enforce — a granted read+egress pair combination REFUSES the call
+    #             (ledger status 'policy_blocked', metric reason 'read+egress')
+    #   warn    — DEFAULT: metric + one WARNING log line naming the key id and
+    #             the offending (read, egress) pair; the call proceeds.
+    #             Deliberate default: the live session key holds 111/111
+    #             tools, so flipping to enforce without operator review of
+    #             existing grants would take the fleet's own agent offline
+    #             mid-flight. Review the warn log / gateway_mcp_policy_block
+    #             series, split keys with preset stamps, THEN flip here.
+    #   off     — the check is skipped entirely.
+    # An unrecognized value resolves to warn (fail-safe, and a typo'd env
+    # var must not take the gateway down at boot).
+    mcp_separate_read_egress: str = "warn"
 
     # --- identity Phase B (token validation — review §1.1 rung 2) ---
     # Validates Keycloak-issued JWTs on the Authorization: Bearer header via

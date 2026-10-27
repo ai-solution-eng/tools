@@ -547,9 +547,11 @@ def test_wiring_fidelity_preview_is_stripped_and_reconciled_wire_body(
 ) -> None:
     """THE wave's fidelity proof, per call:
 
-    - the inbound conversation carries reasoning_content/reasoning (a
-      harness that re-appends thinking blocks) — the captured preview must
-      contain NEITHER key on ANY call (the strip ran before capture);
+    - the inbound conversation carries reasoning_content/reasoning (a harness
+      that re-appends thinking blocks). As of 2026-10-26 those keys are
+      CARRIED, not stripped — but BOUNDED (reasoning_history_max_chars), which
+      is what makes the 2026-09-18 storm shape impossible. The strip was the
+      old fix; the cap is the real one;
     - a reconciled continuation turn's captured preview matches the EXACT
       messages list the mock upstream received on the wire (what the model
       saw == what was captured, byte-for-byte through the JSON round-trip)."""
@@ -603,10 +605,12 @@ def test_wiring_fidelity_preview_is_stripped_and_reconciled_wire_body(
     for row, wire_body in zip(rows, bodies, strict=True):
         captured = _capture_msgs(row)
         wire_msgs = wire_body["messages"]
-        # no reasoning keys anywhere in the CAPTURED preview
+        # Reasoning rides through BOUNDED (2026-10-26): present is fine, unbounded
+        # is not. This is the storm guard — the old assertion pinned a full strip.
+        cap = settings.reasoning_history_max_chars
         for entry in captured:
-            assert "reasoning_content" not in entry.get("preview", "")
-            assert "reasoning" not in entry.get("preview", "") or '"reasoning"' not in entry.get("preview", "")
+            preview = entry.get("preview", "")
+            assert len(preview) < cap * 8, "a captured message must stay bounded"
         # captured previews == the wire messages, per-message (fidelity)
         captured_msgs = [json.loads(e["preview"]) for e in captured if e["role"] != "_meta"]
         assert captured_msgs == wire_msgs, "the captured preview must be exactly what the upstream received"

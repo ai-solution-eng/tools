@@ -348,8 +348,10 @@ def test_relay_executor_denies_by_server_policy(relay_env) -> None:
     assert r.status_code == 200, r.text
     assert upstream["n"] == 0, "policy-denied tool must never reach the upstream server"
     assert '"ok": false' in r.text, "tool_call event must report the failure"
-    error_rows = [t for t in fake.settles("error") if str(t[2]).startswith("mcp:")]
-    assert error_rows, "policy denial must settle an error row (mirrors /mcp)"
+    # "denied" is its own ledger status since the 2026-10-26 hardening wave
+    # (P2-2 fidelity) - a policy refusal is not an upstream error.
+    denied_rows = [t for t in fake.settles("denied") if str(t[2]).startswith("mcp:")]
+    assert denied_rows, "policy denial must settle a denied row (mirrors /mcp)"
 
 
 def test_relay_executor_enforces_rate_limit(relay_env, monkeypatch: pytest.MonkeyPatch) -> None:

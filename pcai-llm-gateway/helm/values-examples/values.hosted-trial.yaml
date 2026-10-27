@@ -153,7 +153,6 @@ settings:
   routingEnabled: true
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
-  routingToolBytesPerToken: 64
   routingTurnAdderTokens: 100
   # MCP federation surface: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
   # two-tool surface (mcp_catalog + mcp_call only).

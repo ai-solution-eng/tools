@@ -50,6 +50,12 @@ class KeyRecord:
     # via the profile JOIN at authenticate time so every request bills by
     # the CURRENT profile setting — console edits are live immediately.
     offpeak_fraction: float | None = None
+    # MCP-surface admin opt-in (P0-3 hardening, 2026-10-26): DEFAULT FALSE is
+    # the control. admin-tool verbs (sqlhandler admin_*) are refused for any
+    # key whose record carries False — and a row that predates the column or
+    # a test fake that omits the field reads as False (getattr/get-safe), so
+    # no un-flagged key can ever authenticate into admin capability.
+    mcp_admin: bool = False
 
 
 def generate_key() -> tuple[str, str]:
@@ -126,7 +132,7 @@ async def authenticate(plaintext: str) -> KeyRecord | None:
         SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
                k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
                k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-               p.offpeak_fraction
+               k.mcp_admin, p.offpeak_fraction
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
         LEFT JOIN profiles p ON p.id = u.profile_id
@@ -152,6 +158,10 @@ async def authenticate(plaintext: str) -> KeyRecord | None:
         relay_default=bool(row["relay_default"]),
         stream_pcai_events=bool(row["stream_pcai_events"]),
         offpeak_fraction=row["offpeak_fraction"],
+        # row.get (not row[...]): asyncpg Records AND the tests' dict fakes
+        # both implement .get — a SELECT or a fake row missing the column
+        # degrades to False (the control default), never to a KeyError.
+        mcp_admin=bool(row.get("mcp_admin", False)),
     )
 
 
@@ -191,6 +201,10 @@ async def load_key_record(key_id: uuid.UUID) -> KeyRecord | None:
         relay_default=bool(row["relay_default"]),
         stream_pcai_events=bool(row["stream_pcai_events"]),
         offpeak_fraction=row["offpeak_fraction"],
+        # row.get (not row[...]): asyncpg Records AND the tests' dict fakes
+        # both implement .get — a SELECT or a fake row missing the column
+        # degrades to False (the control default), never to a KeyError.
+        mcp_admin=bool(row.get("mcp_admin", False)),
     )
 
 
@@ -238,7 +252,7 @@ async def list_keys(user_id: uuid.UUID | None = None, include_revoked: bool = Fa
         SELECT k.id, k.user_id, u.name AS user_name, k.name, k.key_prefix,
                k.scopes, k.allowed_models, k.rate_limit_rpm, k.rate_limit_tpm,
                k.expires_at, k.revoked_at, k.created_at, k.relay_default,
-               k.stream_pcai_events,
+               k.stream_pcai_events, k.mcp_admin,
                k.bound_via, k.bound_at, s.subject AS subject, s.idp AS subject_idp,
                u.self_mint_enabled AS self_mint_enabled,
                u.profile_id AS user_profile_id, p.name AS user_profile_name

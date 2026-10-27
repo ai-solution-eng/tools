@@ -25,11 +25,9 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-import ipaddress
 import json
 import logging
 import socket
-import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -42,7 +40,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..config import settings
-from ..core import costs, registry, secretbox
+from ..core import costs, registry, secretbox, url_guard
 from ..core import metrics as _metrics
 from ..core.audit import audit_action, stable_actor_label
 from ..core.budgets import (
@@ -61,7 +59,12 @@ from ..core.identity import (
 )
 from ..core.keys import generate_key, hash_key, list_keys, revoke_key
 from ..db import db
-from ..mcpf.federation import load_live_profile_grants
+from ..mcpf.federation import (
+    MCP_SERVER_CLASSES,
+    load_live_profile_grants,
+    preset_catalog_pairs,
+    preset_pairs,
+)
 from ..routing.router import Endpoint
 from ..routing.router import router as model_router
 
@@ -322,6 +325,14 @@ class KeyCreate(BaseModel):
     # OpenAI-compatible clients); the console form posts true explicitly,
     # enrollment (DSH path) opts in at create_key. Existing keys unchanged.
     stream_pcai_events: bool = False
+    # MCP-surface admin opt-in (P0-3, 2026-10-26). DEFAULT FALSE is the
+    # control: sqlhandler's admin_* verbs are refused on the MCP surface for
+    # every key that does not carry this explicit flag, so no routine key
+    # mint (console OR enrollment/self-mint path — core.keys.create_key does
+    # not even accept the field) can ever hold credential-minting verbs.
+    # Flip deliberately, for an operator tooling key only, never a
+    # model-driven one.
+    mcp_admin: bool = False
     # When set: attaches the profile to the user AND stamps the key with the
     # profile's preset budgets + MCP grants ("profiles as defaults").
     profile_id: uuid.UUID | None = None
@@ -408,7 +419,15 @@ class ModelUpsert(BaseModel):
     endpoints: list[EndpointSpec]
     # Routing type — /v1/chat only serves 'chat' pools, /v1/embeddings only
     # 'embedding' pools (a chat request must never hit an embedding endpoint).
-    model_type: str = "chat"
+    #
+    # None = DETECT (2026-10-26). This used to default to "chat", so a caller
+    # that simply omitted the field silently registered an embedder or a
+    # reranker as a chat pool — the console showed "chat" for every model, and a
+    # chat request could be routed to an endpoint that can only 500 on it. An
+    # omitted type now means "ask the endpoint", and only a failed detection
+    # falls back to "chat" (the historical behaviour, now the last resort
+    # instead of the silent default).
+    model_type: str | None = None
 
 
 class McpServerUpsert(BaseModel):
@@ -513,41 +532,15 @@ async def _check_url_async(urls: list[str], what: str) -> None:
 
 
 def _resolve_host_addresses(host: str) -> list[str]:
-    """Resolve `host` via getaddrinfo (ALL families) with a short timeout.
+    """Thin wrapper over core.url_guard.resolve_host_addresses (2026-10-26
+    hardening plan P0-1 moved the deny-list predicates into a shared module so
+    the MCP argument stage reuses ONE implementation).
 
-    Returns the distinct address strings, or raises socket.gaierror when the
-    name does not resolve. A stuck resolver must not hang an admin request:
-    the lookup runs on a daemon thread with a bounded join, and a timeout is
-    surfaced as an EAI_AGAIN gaierror. Callers treat every failure class the
-    same way — warn and skip the check (see `_check_url`).
+    Kept as a module-level function on purpose: tests monkeypatch
+    routes_admin._URL_RESOLVE_TIMEOUT_S and expect this call site to honour it,
+    so the timeout is read HERE, at call time.
     """
-    results: list[list[str]] = []
-    errors: list[BaseException] = []
-
-    def _work() -> None:
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except Exception as exc:  # re-raised on the caller's thread
-            errors.append(exc)
-            return
-        seen: list[str] = []
-        for info in infos:
-            addr = info[4][0]
-            if not isinstance(addr, str):  # getaddrinfo types it str | int (port slot)
-                continue
-            if addr not in seen:
-                seen.append(addr)
-        results.append(seen)
-
-    worker = threading.Thread(target=_work, name="pcai-url-check-resolve", daemon=True)
-    worker.start()
-    worker.join(_URL_RESOLVE_TIMEOUT_S)
-    if worker.is_alive():
-        raise socket.gaierror(socket.EAI_AGAIN, f"resolution of {host!r} timed out after {_URL_RESOLVE_TIMEOUT_S}s")
-    if errors:
-        raise errors[0]
-    return results[0] if results else []
-
+    return url_guard.resolve_host_addresses(host, timeout_s=_URL_RESOLVE_TIMEOUT_S)
 
 def _check_url(url: str, what: str) -> None:
     """Validate an admin-registered upstream URL (model endpoint base_url,
@@ -671,134 +664,20 @@ def _check_url(url: str, what: str) -> None:
         )
 
 
-def _looks_like_ip_literal(host: str) -> bool:
-    """True when `host` is shaped like an IP literal and therefore must never
-    be waved through as a hostname when its decode fails.
-
-    COORDINATOR AMENDMENT (guardrail-validation regression): the original
-    charset test (all of [0-9a-fA-Fx.]) classified ANY short alnum string as
-    an IP shape — `x` (the baseline webhook-validation hostname), `beef`,
-    `dead`, `cafe` are all "IP-shaped" under it, so legitimate hostname
-    registrations 400'd with a misleading "IP-literal form failed
-    validation". Literal INTENT is what matters:
-      * `0x` prefix (hex intent: `0x7f`, `0xZZ`) — literal-shaped, whatever
-        follows;
-      * otherwise: digits and dots ONLY with at least one digit
-        (`127.0.0.1.1.1`, `1.2.3.999`, `9.9.9` are malformed literals;
-        `x`, `beef`, `vllm` are names).
-    Hex-letter hostnames (`beef.example.com` has dots+letters → name;
-    bare `beef` → name; `beef` with a `0x` prefix → literal) keep working.
-    """
-    if not host:
-        return False
-    if host.lower().startswith("0x"):
-        return True
-    return set(host) <= set("0123456789.") and any(c.isdigit() for c in host)
-
-
-def _decode_ip_literal(host: str) -> str | None:
-    """Canonical textual address for `host` when it is an address literal in
-    ANY encoding the OS resolver/inet_aton accepts, else None.
-
-    Covers: canonical v4/v6, pure-integer (`2130706433`), 0x-hex
-    (`0x7f000001`), and the inet_aton short forms — 2-part `a.b` (b is a
-    24-bit value filling the last three octets) and 3-part `a.b.c` (a and b
-    are octets, c is a 16-bit value filling the last two) — plus octal
-    dotted forms (`0177.0.0.1`). The 3-part orientation is the subtle one:
-    `169.254.1` is `169.254.0.1` (LINK-LOCAL/metadata) — decoding it as
-    `169.0.254.1` instead would hand back an allowed address, so each part is
-    range-checked in its own position. Returning None for a malformed literal
-    is what lets the caller refuse it rather than fall through as a hostname."""
-    if not host:
-        return None
-    if ":" in host:
-        # IPv6 literal (urlparse already stripped the brackets): ipaddress is
-        # the authority. A colon-bearing non-address is a name, not a
-        # malformed literal.
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError:
-            return None
-        return host
-    try:
-        if host.isdigit() or (host.lower().startswith("0x") and "." not in host):
-            # Pure-integer or 0x-hex forms encode a 32-bit IPv4 address.
-            n = int(host, 0)
-            return str(ipaddress.IPv4Address(n)) if 0 <= n <= 0xFFFFFFFF else None
-        # Short forms ('127.1', octal '0177.0.0.1'): parse each part.
-        # Leading-zero parts are OCTAL in BSD/inet_aton semantics
-        # (int(p, 0) rejects '0177' outright) — decode them as octal
-        # explicitly so the old resolver behavior can't smuggle a
-        # loopback address past the gate.
-        parts = host.split(".")
-        if not 1 <= len(parts) <= 4:
-            return None
-        ints = []
-        for p in parts:
-            if p.startswith("0") and len(p) > 1 and p.isdigit():
-                ints.append(int(p, 8))
-            else:
-                ints.append(int(p, 0))  # ValueError on non-numeric
-        if len(ints) == 4 and all(0 <= p <= 0xFF for p in ints):
-            return ".".join(str(p) for p in ints)
-        if len(ints) == 3 and 0 <= ints[0] <= 0xFF and 0 <= ints[1] <= 0xFF and 0 <= ints[2] <= 0xFFFF:
-            return f"{ints[0]}.{ints[1]}.{(ints[2] >> 8) & 0xFF}.{ints[2] & 0xFF}"
-        if len(ints) == 2 and 0 <= ints[0] <= 0xFF and 0 <= ints[1] <= 0xFFFFFF:
-            return f"{ints[0]}.{(ints[1] >> 16) & 0xFF}.{(ints[1] >> 8) & 0xFF}.{ints[1] & 0xFF}"
-        return None
-    except (ValueError, OverflowError):
-        return None  # malformed literal (caller refuses) or a hostname
+# --- shared SSRF deny-list (2026-10-26 hardening plan P0-1) ---------------
+# The predicates live in core.url_guard now so the MCP argument-level policy
+# stage reuses the SAME implementation instead of growing a second one. These
+# module-level aliases keep every existing call site and test (which reach for
+# routes_admin._decode_ip_literal / ._looks_like_ip_literal) working unchanged.
+_looks_like_ip_literal = url_guard.looks_like_ip_literal
+_decode_ip_literal = url_guard.decode_ip_literal
 
 
 def _denied_ip_reason(host: str) -> str:
-    """Reason string when `host` is an IP literal inside a denied range
-    (loopback / unspecified / link-local-metadata / operator extra-deny),
-    else ''.
-
-    Audit hardening (finding 4): (a) non-canonical IP encodings — decimal
-    (`2130706433`), hex (`0x7f000001`), shortened (`127.1`), octal
-    (`0177.0.0.1`) — fail ip_address parsing and USED to pass as plain
-    hostnames while the OS resolver maps every one of them to 127.0.0.1;
-    they are now decoded and checked. (b) The unspecified addresses
-    (`0.0.0.0`, `::`) and IPv4-mapped loopback/metadata (`::ffff:127.0.0.1`,
-    `::ffff:169.254.169.254`) parse as addresses but sat OUTSIDE every deny
-    CIDR — on Linux they connect to the local pod, bypassing the loopback
-    hard-deny; v4-mapped addresses are normalized before the range check
-    and the unspecified ranges are denied outright.
-
-    Residual (documented posture, SHRUNK by the registration-time resolution
-    in `_check_url`): a HOSTNAME that resolves into a denied range is now
-    refused at registration; rebinding AFTER registration — the name is
-    re-pointed between this check and the call — remains out of scope
-    (follow_redirects=False and origin-pinned upstreams are the controls
-    there)."""
-    decoded = _decode_ip_literal(host)
-    if decoded is None:
-        return ""  # not an address literal — the caller handles it as a host
-    addr = ipaddress.ip_address(decoded)
-    # Normalize IPv4-mapped IPv6 to the embedded IPv4 (the deny lists are
-    # v4-shaped; ::ffff:127.0.0.1 must hit 127.0.0.0/8).
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-        addr = addr.ipv4_mapped
-    denied: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
-        ipaddress.ip_network("127.0.0.0/8"),
-        ipaddress.ip_network("0.0.0.0/8"),  # unspecified: routes to localhost on Linux
-        ipaddress.ip_network("::1/128"),
-        ipaddress.ip_network("::/128"),  # unspecified v6
-        ipaddress.ip_network("169.254.0.0/16"),  # link-local incl. cloud metadata
-        ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
-        ipaddress.ip_network("100.64.0.0/10"),  # carrier-grade NAT (shared address space)
-    ]
-    for cidr in settings.url_deny_cidrs:
-        try:
-            denied.append(ipaddress.ip_network(cidr))
-        except ValueError:
-            log.warning("ignoring malformed PCAI_LLM_URL_DENY_CIDRS entry %r", cidr)
-    for net in denied:
-        if addr in net:
-            return f"address {addr} is inside denied range {net}"
-    return ""
-
+    """Registration-time deny check - delegates to the shared predicate,
+    passing this gateway's operator-configured extra CIDRs
+    (PCAI_LLM_URL_DENY_CIDRS) exactly as before."""
+    return url_guard.denied_ip_reason(host, extra_cidrs=settings.url_deny_cidrs)
 
 def _check_scopes(scopes: list[str]) -> None:
     _check_list_len(scopes, "scopes")
@@ -842,6 +721,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "POST   /admin/keys/{key_id}/rotate",
             "POST   /admin/keys/{key_id}/budgets",
             "GET    /admin/keys/{key_id}/usage",
+            "GET    /admin/audit/chain",
             "GET    /admin/keys/{key_id}/mcp-grants",
             "PUT    /admin/keys/{key_id}/mcp-grants",
             "PATCH  /admin/keys/{key_id}/mcp-grants/{server}",
@@ -1087,8 +967,8 @@ async def create_key_endpoint(body: KeyCreate, request: Request, _: AdminDep) ->
         row = await conn.fetchrow(
             "INSERT INTO api_keys (user_id, name, key_hash, key_prefix, scopes, "
             "allowed_models, rate_limit_rpm, rate_limit_tpm, expires_at, relay_default, "
-            "stream_pcai_events, max_concurrent) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+            "stream_pcai_events, max_concurrent, mcp_admin) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
             body.user_id,
             body.name,
             key_hash,
@@ -1101,6 +981,7 @@ async def create_key_endpoint(body: KeyCreate, request: Request, _: AdminDep) ->
             body.relay_default,
             body.stream_pcai_events,
             mc,
+            body.mcp_admin,
         )
         assert row is not None
         key_id = row["id"]
@@ -1159,6 +1040,7 @@ async def create_key_endpoint(body: KeyCreate, request: Request, _: AdminDep) ->
             "rate_limit_tpm": tpm,
             "relay_default": body.relay_default,
             "stream_pcai_events": body.stream_pcai_events,
+            "mcp_admin": body.mcp_admin,
             "profile_id": str(body.profile_id) if body.profile_id else None,
             "subject": subject or None,
             "seeded_budgets": len((profile or {}).get("budgets") or []),
@@ -1224,6 +1106,12 @@ class KeyPatch(BaseModel):
     # validating clients a byte-clean OpenAI-spec stream. Live immediately
     # (keys are read per request).
     stream_pcai_events: bool | None = None
+    # MCP-surface admin opt-in (P0-3): the admin_* hard stop reads this flag
+    # per request (keys authenticate from Postgres on every call), so a
+    # PATCH is live immediately — same as every other column here. The
+    # default-False control is preserved: omitted = untouched, and False
+    # (explicit) is always accepted so an operator can strip the flag.
+    mcp_admin: bool | None = None
 
 
 @router.patch("/keys/{key_id}")
@@ -1251,6 +1139,7 @@ async def patch_key(key_id: uuid.UUID, body: KeyPatch, request: Request, _: Admi
         "max_concurrent",
         "relay_default",
         "stream_pcai_events",
+        "mcp_admin",
     ):
         val = getattr(body, col)
         if val is not None:
@@ -1265,7 +1154,8 @@ async def patch_key(key_id: uuid.UUID, body: KeyPatch, request: Request, _: Admi
     row = await db.fetchrow(
         f"UPDATE api_keys SET {', '.join(sets)} WHERE id = ${len(args) + 1} "
         "RETURNING id, user_id, name, scopes, allowed_models, rate_limit_rpm, "
-        "rate_limit_tpm, max_concurrent, expires_at, relay_default, stream_pcai_events",
+        "rate_limit_tpm, max_concurrent, expires_at, relay_default, stream_pcai_events, "
+        "mcp_admin",
         *args,
         key_id,
     )
@@ -1334,7 +1224,7 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
     old = await db.fetchrow(
         "SELECT user_id, name, scopes, allowed_models, rate_limit_rpm, "
         "rate_limit_tpm, max_concurrent, expires_at, relay_default, "
-        "stream_pcai_events, revoked_at, spend_ancestors, "
+        "stream_pcai_events, mcp_admin, revoked_at, spend_ancestors, "
         "subject_id, bound_via, bound_at "
         "FROM api_keys WHERE id = $1",
         key_id,
@@ -1369,8 +1259,9 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
         row = await conn.fetchrow(
             "INSERT INTO api_keys (user_id, name, key_hash, key_prefix, scopes, "
             "allowed_models, rate_limit_rpm, rate_limit_tpm, expires_at, relay_default, "
-            "stream_pcai_events, max_concurrent, spend_ancestors, subject_id, bound_via, bound_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id",
+            "stream_pcai_events, max_concurrent, spend_ancestors, subject_id, bound_via, "
+            "bound_at, mcp_admin) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id",
             old["user_id"],
             old["name"],
             key_hash,
@@ -1393,6 +1284,14 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
             old["subject_id"],
             old["bound_via"],
             old["bound_at"],
+            # mcp_admin carries over like relay_default: an identity attribute
+            # of the credential the admin rotated deliberately — silently
+            # stripping it would be the grants-carry-over bug class again
+            # (2026-09-18), this time for the admin flag.
+            # .get (not [..]): the row is an asyncpg Record in production but a
+            # plain dict in the test fakes, and a MISSING column must degrade to
+            # the fail-closed default rather than raise mid-rotation.
+            old.get("mcp_admin", False),
         )
         assert row is not None  # INSERT ... RETURNING always yields a row
         new_id: uuid.UUID = row["id"]
@@ -1882,6 +1781,38 @@ def _csv_cell(v: Any) -> Any:
 AUDIT_LIMIT_CAP = 500  # hard page bound (default 100) — same discipline as /admin/usage
 
 
+@router.get("/audit/chain")
+async def audit_chain_status(_: AdminDep) -> dict[str, Any]:
+    """Verify BOTH hash-chained audit trails (2026-10-26 hardening plan P2-2).
+
+    The executable form of "is my trail still trustworthy?" — the gateway-side
+    counterpart of applygate's verify_audit_chain. Walks each table by id ASC
+    and re-derives every row_hash from (prev_hash, row fields):
+
+      * ok=false + kind="break"          -> a row's content or row_hash was
+                                            edited (TAMPER).
+      * ok=false + kind="fork-or-legacy" -> a row is internally consistent but
+                                            does not follow its predecessor:
+                                            a concurrent-writer fork, or a row
+                                            written before chaining existed.
+      * first_bad_id names the first offending row, so an auditor can page
+        straight to it with GET /admin/audit.
+
+    Read-only and cheap enough to poll: both trails are control-plane/tool-call
+    volume, not chat volume. Registered ABOVE /audit so the literal path is
+    not shadowed by the /audit handler's sibling routes.
+    """
+    from ..core.chain_audit import verify_admin_audit_chain, verify_mcp_call_chain
+
+    admin_chain = await verify_admin_audit_chain()
+    mcp_chain = await verify_mcp_call_chain()
+    return {
+        "ok": bool(admin_chain.get("ok")) and bool(mcp_chain.get("ok")),
+        "admin_audit": admin_chain,
+        "mcp_call_audit": mcp_chain,
+    }
+
+
 @router.get("/audit")
 async def list_audit(
     _: AdminDep,
@@ -1985,11 +1916,31 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
     # but 400s on every request. model_type is PER-MODEL (one pool, one
     # type — the proxy's per-endpoint[0] gate made mixed pools route chat at
     # embedding endpoints); it lives on ModelUpsert, so the check is here.
-    if body.model_type not in MODEL_TYPES:
+    if body.model_type is not None and body.model_type not in MODEL_TYPES:
         raise HTTPException(
             400,
             f"model_type {body.model_type!r} is invalid — must be one of {sorted(MODEL_TYPES)}",
         )
+    if body.model_type is None:
+        # DETECT (2026-10-26): probe the pool's first endpoint and use the
+        # verdict. Detection is best-effort by design — an unreachable endpoint
+        # must not block registration, so an unknown verdict falls back to
+        # "chat" (the old default) and the reason is surfaced to the operator.
+        detected_type = "chat"
+        detected_reason = "model_type omitted; detection returned unknown — defaulted to chat"
+        try:
+            _found = await _probe_endpoint_type(
+                body.endpoints[0].base_url,
+                body.endpoints[0].api_key_secret,
+                None,
+            )
+            if _found.type:
+                detected_type = _found.type
+                detected_reason = f"detected: {_found.reason}"
+        except Exception:
+            log.exception("model_type detection failed for %r — defaulting to chat", body.model_name)
+        body = body.model_copy(update={"model_type": detected_type})
+        log.info("model_type not supplied for %r — %s (%s)", body.model_name, detected_type, detected_reason)
     await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
     # Panel credentials: resolve each endpoint's api_key to ciphertext (or a
     # clear/set marker) BEFORE the write; plaintext never leaves this block.
@@ -2179,38 +2130,37 @@ async def probe_model(model_name: str, _: AdminDep) -> dict[str, Any]:
     }
 
 
-@router.post("/models/{model_name:path}/detect-type")
-async def detect_model_type(model_name: str, _: AdminDep) -> dict[str, Any]:
-    """Probe an endpoint and report what TYPE it serves, with the evidence.
+async def _probe_endpoint_type(
+    base_url: str,
+    api_key_secret: str | None = None,
+    auth_token_enc: str | None = None,
+) -> Any:
+    """Probe ONE base_url and classify what it serves. NEVER raises.
 
-    WHY: registering a pool meant knowing the taxonomy by hand, and a mis-typed
-    pool fails silently in BOTH directions — a chat pool typed `decision`
-    vanishes from /v1/models and the ladder, while a decision pool typed `chat`
-    accepts a request it can only 500 on. This asks the endpoint instead.
+    Shared by the explicit /detect-type admin action AND by registration
+    (2026-10-26): the register form used to send no `model_type` at all, so
+    every endpoint silently took the ModelUpsert default "chat" — an embedder
+    and a reranker both showed up as `chat` in the console and, worse, a chat
+    request could be routed to them. Detection at register time makes that
+    default unreachable.
 
-    COST DISCIPLINE: each probed surface is a real upstream request (a 1-token
-    chat, a short embedding, two tiny documents, a yes/no decision). That is
-    GPU work, so this is an EXPLICIT admin action — it never runs on a registry
-    refresh and writes nothing. It also emits NO ledger row: detection is
-    metadata, and polluting spend with probe traffic would be dishonest.
-
-    Returns the detected type PLUS every probed status, so an operator can see
-    why the verdict came out as it did. `type: ""` means "could not tell" — an
-    honest unknown rather than a guess, because a wrong guess is the exact
-    failure this exists to prevent.
+    Cost: one small request per surface. Registration is an explicit admin
+    action, so this is the same budget the operator already accepted by
+    clicking Save; the probe emits no ledger row (metadata, not spend).
     """
     from ..core import model_type_detect
     from .routes_proxy import _upstream_headers  # deferred: no import cycle
 
-    pool = model_router.pool(model_name)
-    if pool is None:
-        raise HTTPException(404, f"model {model_name!r} is not registered")
-    ep = pool.pick() or (pool.endpoints[0] if pool.endpoints else None)
-    if ep is None:
-        raise HTTPException(404, f"model {model_name!r} has no endpoints")
+    class _Ep:  # the minimal shape _upstream_headers needs
+        pass
 
-    base = (ep.base_url or "").rstrip("/")
-    headers = _upstream_headers(ep, f"detect-{uuid.uuid4().hex[:12]}")
+    ep_stub = _Ep()
+    ep_stub.base_url = base_url
+    ep_stub.api_key_secret = api_key_secret
+    ep_stub.auth_token_enc = auth_token_enc
+
+    base = (base_url or "").rstrip("/")
+    headers = _upstream_headers(ep_stub, f"detect-{uuid.uuid4().hex[:12]}")
     headers["Content-Type"] = "application/json"
 
     async with httpx2.AsyncClient(
@@ -2244,10 +2194,44 @@ async def detect_model_type(model_name: str, _: AdminDep) -> dict[str, Any]:
 
         found = await model_type_detect.detect(card, _probe)
 
+    if not found.served_id:
+        found.served_id = served
+    return found
+
+
+@router.post("/models/{model_name:path}/detect-type")
+async def detect_model_type(model_name: str, _: AdminDep) -> dict[str, Any]:
+    """Probe an endpoint and report what TYPE it serves, with the evidence.
+
+    WHY: registering a pool meant knowing the taxonomy by hand, and a mis-typed
+    pool fails silently in BOTH directions — a chat pool typed `decision`
+    vanishes from /v1/models and the ladder, while a decision pool typed `chat`
+    accepts a request it can only 500 on. This asks the endpoint instead.
+
+    COST DISCIPLINE: each probed surface is a real upstream request (a 1-token
+    chat, a short embedding, two tiny documents, a yes/no decision). That is
+    GPU work, so this is an EXPLICIT admin action — it never runs on a registry
+    refresh and writes nothing. It also emits NO ledger row: detection is
+    metadata, and polluting spend with probe traffic would be dishonest.
+
+    Returns the detected type PLUS every probed status, so an operator can see
+    why the verdict came out as it did. `type: ""` means "could not tell" — an
+    honest unknown rather than a guess, because a wrong guess is the exact
+    failure this exists to prevent.
+    """
+    pool = model_router.pool(model_name)
+    if pool is None:
+        raise HTTPException(404, f"model {model_name!r} is not registered")
+    ep = pool.pick() or (pool.endpoints[0] if pool.endpoints else None)
+    if ep is None:
+        raise HTTPException(404, f"model {model_name!r} has no endpoints")
+
+    found = await _probe_endpoint_type(ep.base_url, ep.api_key_secret, ep.auth_token_enc)
+
     return {
         "model": model_name,
         "endpoint": ep.base_url,
-        "served_id": found.served_id or served,
+        "served_id": found.served_id,
         "type": found.type,
         "current_type": ep.model_type,
         "reason": found.reason,
@@ -3106,6 +3090,14 @@ class ProfileCreate(BaseModel):
     # at creation. Editing this profile re-scopes running keys on their
     # NEXT call — the explicit trust-model decision the roadmap named.
     live_grants: bool = False
+    # Named grant-profile preset (P0-3, 2026-10-26): when set, the named
+    # preset (observe | egress | mutate | admin — mcpf.federation
+    # MCP_PROFILE_PRESETS, resolved from the ONE server-class constant) is
+    # expanded against the live per-server tool catalogs and UNIONED into
+    # the profile's mcp_grants. Absent (the default) leaves the stored
+    # defaults_json byte-identical in shape — no preset is implied, and no
+    # existing profile/key grant set changes unless an operator stamps one.
+    mcp_grant_preset: Literal["observe", "egress", "mutate", "admin"] | None = None
     limits: LimitPresets | None = None
     # Off-peak billing fraction for keys under this profile (null = inherit
     # the gateway default PCAI_LLM_OFFPEAK_FRACTION during low-demand).
@@ -3144,6 +3136,49 @@ class ProfileCreated(BaseModel):
 
 class UserAssignProfile(BaseModel):
     profile_id: uuid.UUID | None  # null clears the profile
+
+
+# Stamp-time catalog resolution cap (P0-3): one live list_tools per classified
+# server, bounded like the console's "load tools" metadata probe. A wedged
+# server burns at most this long before it is reported unavailable.
+_PRESET_STAMP_TIMEOUT_S = 15.0
+
+
+async def _preset_stamp_catalogs() -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Live per-server tool catalogs for EVERY classified server
+    (mcpf.federation.MCP_SERVER_CLASSES) — the input preset_pairs resolves a
+    named preset against. Returns (catalogs, unavailable): a server that is
+    unregistered, unreachable, or times out lands in 'unavailable' and
+    contributes NO pairs (fail-safe under-provision for a grant stamp — the
+    caller must surface the gap, see create_profile). Live list_tools per
+    server (same bounded shape as GET /mcp-servers/{name}/tools), NOT the
+    per-key ACL rows: a preset stamps what the server OFFERS, not what some
+    key happens to hold.
+    """
+    from .routes_mcp import _fetch_tools, build_mcp_headers  # deferred: no import cycle
+
+    servers = {sv["name"]: sv for sv in await registry.mcp_servers()}
+    catalogs: dict[str, list[dict[str, Any]]] = {}
+    unavailable: list[str] = []
+    for name in sorted(MCP_SERVER_CLASSES):
+        target = servers.get(name)
+        if target is None:
+            unavailable.append(name)
+            continue
+        try:
+            catalogs[name] = await _fetch_tools(
+                target["url"],
+                build_mcp_headers(
+                    target.get("headers", {}),
+                    target.get("auth_secret"),
+                    target.get("auth_token_enc"),
+                ),
+                timeout_s=_PRESET_STAMP_TIMEOUT_S,
+            )
+        except Exception:
+            log.warning("profile preset stamp: catalog fetch for %r failed — server reported unavailable", name)
+            unavailable.append(name)
+    return catalogs, unavailable
 
 
 @router.post("/profiles", status_code=201)
@@ -3219,6 +3254,25 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # Absent/false = stamps-at-create (today's semantics).
     if body.live_grants:
         defaults["live_grants"] = True
+    preset_unavailable: list[str] = []
+    preset_pair_count = 0
+    if body.mcp_grant_preset is not None:
+        # Preset expansion (P0-3): live catalogs -> (server, tool) pairs ->
+        # the named preset's selection. Catalog gaps are REPORTED, never
+        # silently swallowed: a server that is down or unregistered at
+        # stamp time contributes no pairs, so the stamp is a
+        # FAIL-SAFE under-provision (fewer grants, never more) — but the
+        # response and the audit row say so, because a stamp that reads
+        # complete while a class's whole server was unreachable would
+        # mislead the operator about what keys of this profile can call.
+        catalogs, preset_unavailable = await _preset_stamp_catalogs()
+        catalog_pairs = preset_catalog_pairs(catalogs)
+        resolved = preset_pairs(body.mcp_grant_preset, catalog_pairs)
+        preset_pair_count = len(resolved)
+        explicit = [(g[0], g[1]) for g in defaults["mcp_grants"]]
+        merged = list(dict.fromkeys([*explicit, *resolved]))
+        defaults["mcp_grants"] = [[s, t] for s, t in merged]
+        defaults["mcp_grant_preset"] = body.mcp_grant_preset
     if body.limits is not None:
         defaults["limits"] = body.limits.model_dump(exclude_none=True)
     if body.memory is not None:
@@ -3242,6 +3296,10 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     out = dict(row)
     out["budgets"] = defaults["budgets"]
     out["mcp_grants"] = defaults["mcp_grants"]
+    out["mcp_grant_preset"] = defaults.get("mcp_grant_preset")
+    out["preset_grants"] = preset_pair_count
+    out["preset_catalog_ok"] = not preset_unavailable
+    out["preset_unavailable_servers"] = preset_unavailable
     # details: the preset payload IS the profile's durable shape (no secrets
     # — budgets/grants/limits/routing are all operator policy).
     await _audit(
@@ -3260,6 +3318,10 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
             "routing_min_model": body.routing_min_model,
             "memory": defaults.get("memory"),
             "live_grants": bool(defaults.get("live_grants")),
+            "mcp_grant_preset": defaults.get("mcp_grant_preset"),
+            "preset_grants": preset_pair_count,
+            "preset_catalog_ok": not preset_unavailable,
+            "preset_unavailable_servers": preset_unavailable,
         },
     )
     return out
@@ -3294,6 +3356,7 @@ async def list_profiles(_: AdminDep) -> list[dict[str, Any]]:
         d["budgets"] = defaults.get("budgets", [])
         d["mcp_grants"] = defaults.get("mcp_grants", [])
         d["live_grants"] = bool(defaults.get("live_grants"))  # §3a live evaluation flag
+        d["mcp_grant_preset"] = defaults.get("mcp_grant_preset")  # P0-3 preset round-trip
         d["limits"] = defaults.get("limits", {})
         d["memory"] = defaults.get("memory")  # the enrollment-memory preset, round-tripped
         order = list(d.get("model_order") or [])
@@ -3509,10 +3572,59 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
         """,
         *_win,
     )
+    # PER-KEY / PER-MODEL breakdown, for the console's expandable rows.
+    # Same (key NAME, user) grouping as by_key so a rotated credential stays
+    # one logical row; adding model splits it further without changing the
+    # identity. Bounded by the same window as everything else here.
+    by_key_model = await db.fetch(
+        f"""
+        SELECT k.name AS key_name, u.name AS user_name, l.model,
+               count(*)                                            AS requests,
+               COALESCE(SUM(l.prompt_tokens), 0)::bigint           AS input_tokens,
+               COALESCE(SUM(l.completion_tokens), 0)::bigint       AS output_tokens,
+               COALESCE(SUM(l.cached_tokens), 0)::bigint           AS cached_tokens,
+               CASE WHEN COALESCE(SUM(l.prompt_tokens), 0) > 0
+                    THEN ROUND(100.0 * SUM(l.cached_tokens) / SUM(l.prompt_tokens), 1)
+                    ELSE NULL END                                  AS cache_hit_rate_pct,
+               COALESCE(SUM(l.cost_usd), 0)::float                 AS cost_usd,
+               COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float AS billed_cost_usd
+        FROM usage_ledger l
+        LEFT JOIN api_keys k ON k.id = l.key_id
+        LEFT JOIN users u ON u.id = k.user_id
+        {_cond_l}
+        GROUP BY k.name, u.name, l.model
+        ORDER BY cost_usd DESC
+        """,
+        *_win,
+    )
+    # ACTUAL RETAINED HISTORY (2026-10-26). The usage ledger is NEVER pruned
+    # (housekeeping's contract: it is both the audit trail and the budget
+    # engine, so deleting rows would silently raise every key's headroom).
+    # _MAX_WINDOW_DAYS is a QUERY cost guard, not a retention policy -- so
+    # labelling the widest option 'Max (366d)' claimed a data horizon the
+    # deployment does not have. Report the real oldest row instead and let the
+    # console say 'since <date>' honestly. One cheap indexed MIN() on
+    # idx_ledger_ts; bounded by the same window as everything else.
+    oldest = await db.fetchval('SELECT MIN(ts) FROM usage_ledger')
     return {
         "totals": dict(row) if row else {},
         "by_model": [dict(r) for r in by_model],
         "by_key": [dict(r) for r in by_key],
+        "by_key_model": [dict(r) for r in by_key_model],
+        "window": {
+            "since": _since_dt.isoformat() if _since_dt else None,
+            "until": _until_dt.isoformat() if _until_dt else None,
+            "default_days": 30,
+            # The hard CAP this endpoint enforces (a query-cost guard, NOT a
+            # retention policy). Exposed so the console labels its widest
+            # option from the server's limit instead of a drifting copy.
+            "max_days": _MAX_WINDOW_DAYS,
+            # The true start of retained data (None = empty ledger).
+            # Guard the TYPE, not just truthiness: a driver/fake may hand back
+            # a non-datetime (int epoch, str) and .isoformat() would 500 the
+            # whole summary. A label is not worth failing the endpoint over.
+            "oldest_ts": oldest.isoformat() if hasattr(oldest, "isoformat") else None,
+        },
     }
 
 
@@ -4325,6 +4437,33 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
                 f"chat pools: {chat_models}. An embedding/reranker pool can never be a "
                 "routing candidate, and an allowlist of them would intersect to empty "
                 '(silently meaning "every chat model", the opposite of the intent)',
+            )
+    # model_modalities is a {model: [modality...]} map. Validate it the way
+    # allowed_models is validated: an entry naming an unregistered model is a
+    # typo that would silently never match a candidate, and an unknown
+    # modality would be a claim the router cannot act on.
+    modalities = provided.get("model_modalities")
+    if modalities is not None:
+        if not isinstance(modalities, dict):
+            raise HTTPException(400, "model_modalities must be an object of {model: [modality]}")
+        _check_list_len(modalities, "model_modalities")
+        bad_models = [m for m in modalities if m not in chat_models]
+        if bad_models:
+            raise HTTPException(
+                400,
+                f"model_modalities entries are not registered CHAT models: {bad_models} — "
+                f"chat pools: {chat_models}. A capability declared for a model the router "
+                "can never choose is dead config that reads as if it were in effect.",
+            )
+        bad_mods = sorted({
+            str(x) for v in modalities.values() if isinstance(v, (list, tuple)) for x in v
+            if str(x) not in ("text", "image", "video", "audio")
+        })
+        if bad_mods:
+            raise HTTPException(
+                400,
+                f"model_modalities has unknown modalities {bad_mods} — "
+                "allowed: text, image, video, audio",
             )
     merged = await routing_config.set_values(provided)
     await _audit(

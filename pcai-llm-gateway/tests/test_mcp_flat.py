@@ -467,7 +467,10 @@ def test_flat_call_denied_is_error_result(monkeypatch: pytest.MonkeyPatch) -> No
     result = r.json()["result"]
     assert result["isError"] is True
     assert "denied" in result["content"][0]["text"]
-    assert settles == [("mcp:alpha:search", "error")]
+    # "denied" is its own ledger status since the 2026-10-26 hardening wave
+    # (P2-2 fidelity): a policy refusal must be distinguishable from an upstream
+    # failure, and must not pollute the error-rate series.
+    assert settles == [("mcp:alpha:search", "denied")]
 
 
 def test_flat_call_unknown_name_is_tool_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -774,7 +774,11 @@ def test_rotate_carries_binding(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["bound_via"] == VIA_ENROLLMENT
     # the INSERT named and carried all three identity columns
     assert "subject_id" in fake.insert_sql and "bound_via" in fake.insert_sql and "bound_at" in fake.insert_sql
-    assert len(fake.insert_args) == 16  # 12 base cols (stream_pcai_events joined) + spend_ancestors + 3 identity
+    # 12 base cols (stream_pcai_events joined) + spend_ancestors + 3 identity
+    # + mcp_admin (2026-10-26 hardening plan P0-3: the MCP admin opt-in is an
+    # identity attribute and must survive rotation, like subject/bound_via).
+    assert len(fake.insert_args) == 17
+    assert fake.insert_args[16] in (False, None)  # mcp_admin default: not an MCP admin
     assert fake.insert_args[13] == old_subject_id
     assert fake.insert_args[14] == VIA_ENROLLMENT
     assert fake.insert_args[15] == old_bound_at

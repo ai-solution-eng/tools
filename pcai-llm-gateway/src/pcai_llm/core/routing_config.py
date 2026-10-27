@@ -76,6 +76,12 @@ DEFAULTS: dict[str, Any] = {
     # heuristics serve. 0.60 matches the measured distribution (a clear 2-way
     # split scored 0.9997; an ambiguous 3-way model choice scored 0.43).
     "decision_min_confidence": 0.60,
+    # Hysteresis margin for a model SWITCH, in probability points. A challenger
+    # must beat the conversation's current model by this much before the router
+    # pays the re-prefill. 0 blocks nothing (first-wins); 1 blocks every switch.
+    # 0.10 stops a 0.62-vs-0.60 coin flip while leaving a decisive 0.85-vs-0.15
+    # free to switch.
+    "decision_switch_margin": 0.10,
     # Bounded so a hung decision endpoint cannot park a chat request. The
     # deployed d3-turbo answers a small state in ~790ms.
     "decision_timeout_ms": 2500,
@@ -108,6 +114,16 @@ DEFAULTS: dict[str, Any] = {
     # promotes the default flow to routing; the explicit routing /
     # routing__X names are unaffected by it and always route.
     "route_default_model": False,
+    # --- candidate capabilities ------------------------------------------
+    # {model: ["text","image",...]} — what each ROUTABLE model can actually
+    # accept. Chat endpoints do NOT advertise modality (verified 2026-10-26:
+    # deepseek/glm/qwen /v1/models all return only
+    # id/object/created/owned_by/root/parent/max_model_len), so this cannot be
+    # discovered — the operator declares it. Empty = unknown: the router then
+    # makes no capability claims and never excludes a model on modality.
+    # When set, the decision model is TOLD which candidates accept images, so
+    # a VLM request is not routed to a text-only LLM.
+    "model_modalities": {},
 }
 
 # The ONLY placeholder names render_prompt substitutes. Anything else in
@@ -150,6 +166,16 @@ def _encode(value: Any) -> str:
     # bool (handled above).
     if isinstance(value, float):
         return "f:" + repr(value)
+    # DICT before the generic str fallback. Without this tag a dict stores as
+    # "s:" + str(dict) — a Python repr, not even JSON — and every consumer's
+    # isinstance(x, dict) check silently fails, so the feature appears to save
+    # and then does nothing. model_modalities is dict-typed, so this is its
+    # only working write path.
+    if isinstance(value, dict):
+        try:
+            return "d:" + json.dumps(dict(value), default=str)
+        except (TypeError, ValueError):
+            return "d:{}"
     if isinstance(value, (list, tuple)):
         # default=str: a list carrying a non-JSON scalar must still encode —
         # the row is operator input, and a refused write would leave the
@@ -170,12 +196,23 @@ def _decode(raw: Any) -> Any:
         except ValueError:
             return text
     if text.startswith("f:"):
-        # A float row. Junk degrades to 0.0 (the safest numeric floor) rather
-        # than the raw string: every consumer of these knobs does arithmetic.
+        # A float row. Junk decodes to None, NOT 0.0: for the knobs that use
+        # this type, 0.0 is the LEAST safe value (decision_min_confidence 0.0
+        # means the decision model never abstains; decision_switch_margin 0.0
+        # means hysteresis is off). None lets decision_settings' existing
+        # `is not None` fallbacks substitute the measured defaults, so a
+        # truncated or hand-edited row degrades to the shipped behaviour
+        # instead of silently arming an unsupervised router.
         try:
             return float(text[2:])
         except ValueError:
-            return 0.0
+            return None
+    if text.startswith("d:"):
+        try:
+            decoded = json.loads(text[2:])
+        except (ValueError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
     if text.startswith("j:"):
         try:
             decoded = json.loads(text[2:])
@@ -309,12 +346,28 @@ async def decision_settings() -> dict[str, Any]:
     except (TypeError, ValueError):
         timeout_ms = decision_routing.DEFAULT_TIMEOUT_MS
     timeout_ms = max(decision_routing.MIN_TIMEOUT_MS, min(timeout_ms, decision_routing.MAX_TIMEOUT_MS))
+    margin_raw = cfg.get("decision_switch_margin")
+    from . import model_routing as _mr
+
+    try:
+        margin = float(margin_raw) if margin_raw is not None else _mr.DEFAULT_SWITCH_MARGIN
+    except (TypeError, ValueError):
+        margin = _mr.DEFAULT_SWITCH_MARGIN
+    margin = min(1.0, max(0.0, margin))
+    mods_raw = cfg.get("model_modalities")
+    modalities: dict[str, list[str]] = {}
+    if isinstance(mods_raw, dict):
+        for name, mods in mods_raw.items():
+            if isinstance(mods, (list, tuple)) and mods:
+                modalities[str(name)] = [str(m) for m in mods]
     return {
         "mode": mode,
         "model": str(cfg.get("decision_model") or ""),
         "min_confidence": conf,
+        "switch_margin": margin,
         "timeout_ms": timeout_ms,
         "prompt": str(cfg.get("prompt") or ""),
+        "modalities": modalities,
     }
 
 

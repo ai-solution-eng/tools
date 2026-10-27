@@ -63,7 +63,7 @@ service, one control plane, one usage ledger in Postgres.
 
 ## Architecture
 
-![MCP fleet & entry paths — green ①-⑤: pcai-llm-gateway relayed in-cluster; black 1-10: LiteLLM, no relay (harness runs the loop). Model → SQL → model trace.](documentation/architecture.png)
+![pcai-llm-gateway — routing, fallback & MCP fleet. Blue: the gateway routes via d3-turbo, which picks one model (DeepSeek for hard code, GLM for review, Qwen for lighter work). Green: the fallback cascade DeepSeek → GLM → Qwen, re-gated per hop. Orange: the opt-in demand-aware path, where the off-peak evaluator picks the cascade entry and sets the billing fraction. Bottom: the MCP fleet broken out by task group — data handling, visualization, research (searxng web search + fetch), cluster admin, and workbench (scratch write + execution env).](documentation/architecture.png)
 
 *Source: [`documentation/architecture.dot`](documentation/architecture.dot) — re-render with
 `dot -Tpng -Gdpi=150 documentation/architecture.dot -o documentation/architecture.png` (or `-Tsvg`).*
@@ -90,10 +90,11 @@ service, one control plane, one usage ledger in Postgres.
      ▼                          ▼                  ▼
  model endpoints           MCP servers         PostgreSQL
  (vLLM/SGLang pools,       (applygate-mcp,     ledger: usage_ledger,
-  priority/weight,          k8s-mcp, … at      budgets, api_keys,
-  circuit breaker)          *.svc.cluster.local) rate_windows, endpoints,
-                                               traces, conversations,
-                                               enrollments, …
+  priority/weight,          k8s-mcp, mm-rag,   budgets, api_keys,
+  circuit breaker,          sqlhandler,        rate_windows, endpoints,
+  routing ladder +          seaborn,           traces, conversations,
+  fallback chains)          workbench, … at    enrollments, …
+                            *.svc.cluster.local)
 ```
 
 The gateway holds **no Kubernetes API access**: endpoint pools, MCP servers
@@ -187,6 +188,8 @@ automatically at startup. Routes (`/v1`, `/mcp`, `/admin`, `/health`,
 values: [`helm/values-examples/README.md`](helm/values-examples/README.md).
 
 ## Documentation
+
+- **[LiteLLM & Bifrost comparison](documentation/LITELLM-COMPARISON.md)** — the five-minute version of how this gateway differs from LiteLLM and Bifrost (full deep-dive lives in the external `general_documentation/LiteLLM_Comparison/` doc).
 
 - [Deployment](documentation/DEPLOYMENT.md) — chart values, required Secrets, Postgres modes, sizing, exposure, upgrading
 - [Features](documentation/FEATURES.md) — budget semantics, relay protocol, traces, enrollment, off-peak billing, routing, ledger schema

@@ -1,151 +1,181 @@
-// pcai-llm-gateway — MCP fleet & entry-path comparison (whiteboard, 2026-10-13)
+// pcai-llm-gateway — routing, fallback & MCP fleet (whiteboard, 2026-10-26)
 //
 // Render:
-//   dot -Tsvg documentation/architecture.dot -o documentation/architecture.svg
 //   dot -Tpng -Gdpi=150 documentation/architecture.dot -o documentation/architecture.png
+//   dot -Tsvg documentation/architecture.dot -o documentation/architecture.svg
 //
 // "USER" below = the local agent harness (automated), not a human.
 //
-// Two ALTERNATIVE entry designs — never used in tandem. Both traces show the
-// same request shape: model -> SQL -> model.
+// TWO ways a model gets picked, both leaving the gateway:
+//   ROUTING (blue)  — the gateway asks d3-turbo (vLLM-SR System One,
+//                     decision_mode shadow|active). It picks ONE model:
+//                     DeepSeek for hard code, GLM for review/low
+//                     hallucination, Qwen for lighter work. It sees a
+//                     SUMMARY, never message content; confidence under
+//                     0.60 leaves the heuristics standing rather than
+//                     downgrading on a guess.
+//   FALLBACK (green) — no routing decision: walk the cascade
+//                     DeepSeek -> GLM -> Qwen3.8, promoting on budget
+//                     exhaustion or a dead/5xx primary. Every hop is
+//                     re-gated (registered, key-allowed, healthy pool,
+//                     fresh budget headroom) — never a policy bypass.
 //
-//   GREEN ①-⑤  pcai-llm-gateway (relay): the tool loop runs in-cluster.
-//              ① user call · ② relay model · ③ relay tool (call SQL) ·
-//              ④ tool out — SQL result fed back to model · ⑤ return out.
-//              The harness only ever touches ① and ⑤.
+// WITH demand (orange, opt-in): the load-aware head picks the cascade's
+//   ENTRY point once per conversation from per-model off-peak state and
+//   stays sticky for the thread. The SAME off-peak evaluator sets the
+//   billing fraction, so the head pick and the price cannot disagree.
 //
-//   BLACK 1-10 LiteLLM (no relay): every tool call surfaces to the harness,
-//              which calls the MCP itself and re-sends.
-//              1 user call · 2 model · 3 return — tool call surfaces ·
-//              4 MCP (harness calls it) · 5 call SQL · 6 return — SQL result ·
-//              7 return — to harness · 8 data to model (re-send) ·
-//              9 model — 2nd call · 10 full return.
-//              Each model call pays an extra hop through the harness.
-//
-// Note: whiteboard's green flow compresses ④/⑤ into a single "4 return out";
-// they are split here so the tool-out-to-model leg keeps its own number.
+// MCP fleet (bottom): reached only through the gateway's in-cluster relay
+//   — ③ relay tool call, ④ result back to the model — gated per tool
+//   (default DENY). Workbench is its own category: scratch write +
+//   execution env.
 
+// LABEL PLACEMENT NOTE (graphviz 16): labelangle/labeldistance are ignored on a
+// plain edge label — they only apply to headlabel/taillabel. The blue router text
+// is therefore a taillabel (rides high, next to d3-turbo) and the green fallback
+// text stays a plain label (sits low on the long gateway->DeepSeek edge). Also:
+// rank=same naming a node INSIDE a compound cluster trips a mincross assertion,
+// and the Models cluster title is set to labelloc=b so it cannot collide with
+// those edge labels.
+//
 digraph pcai_llm_gw {
   rankdir=TB;
+  splines=spline;
   compound=true;
-  nodesep=0.5;
-  ranksep=1.0;
+  nodesep=0.40;
+  ranksep=1.25;
   fontname="Helvetica";
   labelloc=t;
   fontsize=14;
-  label="pcai-llm-gateway — MCP fleet & entry paths (model → SQL → model trace)\nUSER = local agent harness · green ①-⑤: pcai-llm-gw, relayed in-cluster · black 1-10: LiteLLM, no relay — harness runs the loop";
+  label="pcai-llm-gateway — routing, fallback & MCP fleet\nUSER = local agent harness · blue: routing via d3-turbo · green: fallback cascade · orange: demand-aware (opt-in)";
 
-  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.18,0.10"];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.15,0.09"];
   edge [fontname="Helvetica", fontsize=9, penwidth=1.4, arrowsize=0.8];
 
-  // ---------- actor + entries ----------
-  user [label="USER — local agent harness",
-        fillcolor="#dbeafe", color="#1d4ed8"];
-
-  gateway [label="pcai-llm-gateway\n/v1 OpenAI proxy · /mcp federation\ntool relay in-cluster · budget + per-tool ACLs",
+  // ---------- actor + entry ----------
+  user    [label="USER — local agent harness", fillcolor="#dbeafe", color="#1d4ed8"];
+  gateway [label="Gateway\n/v1 OpenAI proxy · /mcp federation\nbudget + per-tool ACL gates",
            fillcolor="#fbcfe8", color="#9d174d", penwidth=2.2];
 
-  litellm [label="LiteLLM\n(alternative entry — no relay)",
-           fillcolor="#f3f4f6", color="#374151", style="rounded,filled,dashed"];
+  // ---------- router ----------
+  d3 [label="d3-turbo\nvLLM-SR System One\nsees a SUMMARY, not the prompt",
+      fillcolor="#e0e7ff", color="#4338ca", penwidth=1.8];
 
-  // ---------- models ----------
+  // ---------- models: the cascade order, top = strongest ----------
   subgraph cluster_models {
-    label="Models (endpoint pools)"; labeljust=l; fontname="Helvetica-Bold"; fontsize=12;
-    style="rounded"; color="#dc2626";
-    glm  [label="GLM 5.3 F",        fillcolor="#fee2e2", color="#dc2626"];
-    dsk  [label="DeepSeek 4.1 F",   fillcolor="#fee2e2", color="#dc2626"];
-    qwen [label="Qwen3.8-27B",       fillcolor="#fee2e2", color="#dc2626"];
+    label="Models — endpoint pools (cascade order)"; labeljust=l; labelloc=b;
+    fontname="Helvetica-Bold"; fontsize=12; style="rounded"; color="#dc2626";
+    deepseek [label="DeepSeek 4.1 F\nstrongest — hard code", fillcolor="#fee2e2", color="#dc2626"];
+    glm      [label="GLM 5.3 F\nreview · lowest hallucination", fillcolor="#fee2e2", color="#dc2626"];
+    qwen     [label="Qwen3.8-27B\ncheaper / faster", fillcolor="#fee2e2", color="#dc2626"];
   }
 
-  // ---------- MCP fleet ----------
-  subgraph cluster_mcp {
-    label="MCP fleet"; labeljust=l; fontname="Helvetica-Bold"; fontsize=12;
-    style="rounded"; color="#6b7280";
-
-    subgraph cluster_data {
-      label="Data Handling — memory, knowledge, SQL"; labeljust=l;
-      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#16a34a";
-      rag_mem  [label="MM RAG — memory\n(long-term · short-term)", fillcolor="#dcfce7", color="#16a34a"];
-      rag_know [label="MM RAG — knowledge\n(unstructured)", fillcolor="#dcfce7", color="#16a34a"];
-      sql      [label="SQL handler",                  fillcolor="#dcfce7", color="#16a34a"];
-    }
-    subgraph cluster_viz {
-      label="Visualization — charting"; labeljust=l; fontname="Helvetica-Bold"; fontsize=11;
-      style="rounded"; color="#db2777";
-      seaborn [label="Seaborn", fillcolor="#fce7f3", color="#db2777"];
-    }
-    subgraph cluster_research {
-      label="Research — web search & fetching"; labeljust=l; fontname="Helvetica-Bold";
-      fontsize=11; style="rounded"; color="#d97706";
-      searx [label="searxng\nweb search + fetch_content", fillcolor="#fef3c7", color="#d97706"];
-    }
-    subgraph cluster_admin {
-      label="Cluster Admin — read-only ops, logs, deploy"; labeljust=l;
-      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#6b7280";
-      k8s  [label="k8s-ops\n(read-only)",       fillcolor="#f3f4f6", color="#6b7280"];
-      logs [label="logsearch\n(namespace-wide)", fillcolor="#f3f4f6", color="#6b7280"];
-      ag   [label="applygate\n(manifest handler)", fillcolor="#f3f4f6", color="#6b7280"];
-      ez   [label="ezapp deploy\nupdater",       fillcolor="#f3f4f6", color="#6b7280"];
-    }
-  }
+  // ---------- demand signal (orange = the opt-in demand path) ----------
+  eval [label="off-peak evaluator\nPrometheus MCP query\nDCGM GPU util · 30 s loop\nhysteresis 20% / 35%",
+        fillcolor="#ffedd5", color="#ea580c"];
+  frac [label="billing fraction\nbudget gates consume\ntokens x fraction —\nledger keeps TRUE usage",
+        fillcolor="#ffedd5", color="#ea580c"];
 
   // =============================================
-  // GREEN — pcai-llm-gateway (relayed, ①-⑤):
-  // model -> SQL -> model never leaves the cluster;
-  // the harness touches only ① and ⑤
+  // ROUTING (blue) — gateway asks d3-turbo,
+  // d3-turbo picks ONE model
+  // =============================================
+  edge [color="#1d4ed8", fontcolor="#1d4ed8", penwidth=1.8];
+
+  gateway -> d3 [label="Routing"];
+  d3 -> deepseek [label="hard code"];
+  d3 -> glm      [label="", taillabel="review / low hall.", labeldistance=1.4, labelangle=-25];
+  d3 -> qwen     [label="lighter", splines=curved];
+
+  // =============================================
+  // FALLBACK (green) — the cascade walks down
   // =============================================
   edge [color="#16a34a", fontcolor="#15803d", penwidth=2.0];
 
-  user -> gateway [label="①  User Call"];
-
-  gateway -> glm [label="②  Relay Model — model call\l④  Tool Out — SQL result fed back\l       to model, loop continues in-cluster\l",
-                  dir=both, lhead=cluster_models];
-
-  gateway -> sql [label="③  Relay Tool — Call SQL\l     (SQL result ③ → ④)\l",
-                  dir=both, lhead=cluster_data];
-  gateway -> k8s [label="③ / ④", style=dashed, dir=both, lhead=cluster_admin];
-  gateway -> seaborn [label="③ / ④", style=dashed, dir=both, lhead=cluster_viz];
-  gateway -> searx [label="③ / ④", style=dashed, dir=both, lhead=cluster_research];
-
-  gateway -> user [label="⑤  Return Out — final response",
-                   constraint=false, style=dashed];
+  user    -> gateway [label="①  User Call"];
+  gateway -> deepseek [label="Fall back\l(no routing decision)\l"];
+  deepseek -> glm [label="budget / 5xx"];
+  glm      -> qwen [label="budget / 5xx"];
+  gateway  -> user [label="⑤  Return Out", constraint=false, style=dashed];
 
   // =============================================
-  // BLACK — LiteLLM (no relay, 1-10): the HARNESS
-  // runs the loop — model -> SQL -> model crosses
-  // the harness boundary twice
+  // DEMAND (orange, opt-in) — picks the cascade
+  // ENTRY point, and sets the price
   // =============================================
-  edge [color="#111111", fontcolor="#111111", penwidth=1.4];
+  edge [color="#ea580c", fontcolor="#ea580c", penwidth=1.5, style=dashed];
 
-  user -> litellm [label="1  User Call"];
+  eval -> deepseek [label="load-aware head (opt-in)\npicks the entry, sticky per thread"];
+  eval -> frac     [label="ACTIVE window", style=solid];
 
-  litellm -> glm [label="2  Model\l8  Data to Model — harness re-sends\l       request + SQL output\l9  Model — 2nd call\l",
-                  dir=both, lhead=cluster_models];
+  // =============================================
+  // MCP fleet — the task-group blocks
+  // =============================================
+  subgraph cluster_mcp {
+    label="MCP fleet — reached only through the in-cluster relay ③ call · ④ result back (per-tool default-DENY ACL)";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=12;
+    style="rounded"; color="#6b7280";
 
-  litellm -> user [label="3  Return — tool call surfaces\l10  Full Return — final response\l",
-                   constraint=false, style=dashed];
+    subgraph cluster_data {
+      label="Data handling — memory, knowledge, SQL"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#16a34a";
+      rag_mem  [label="mm-rag — memory\nlong-term · short-term", fillcolor="#dcfce7", color="#16a34a"];
+      rag_know [label="mm-rag — knowledge\n(unstructured)",       fillcolor="#dcfce7", color="#16a34a"];
+      sql      [label="SQL handler",                              fillcolor="#dcfce7", color="#16a34a"];
+    }
+    subgraph cluster_viz {
+      label="Visualization — charting"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#db2777";
+      seaborn [label="Seaborn", fillcolor="#fce7f3", color="#db2777"];
+    }
+    subgraph cluster_search {
+      label="Research — web search + page fetch"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#0891b2";
+      sx_search [label="searxng — search\nmulti-engine aggregate",  fillcolor="#cffafe", color="#0891b2"];
+      sx_fetch  [label="searxng — fetch_content\npage → clean markdown", fillcolor="#cffafe", color="#0891b2"];
+    }
+    subgraph cluster_admin {
+      label="Cluster admin — read-only ops, logs, deploy"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#6b7280";
+      k8s  [label="k8s-ops\n(read-only)",         fillcolor="#f3f4f6", color="#6b7280"];
+      logs [label="logsearch\n(namespace-wide)",  fillcolor="#f3f4f6", color="#6b7280"];
+      ag   [label="applygate\n(manifest handler)", fillcolor="#f3f4f6", color="#6b7280"];
+      ez   [label="ezapp deploy\nupdater",        fillcolor="#f3f4f6", color="#6b7280"];
+    }
+    subgraph cluster_wb {
+      label="Workbench — scratch write + execution env"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#7c3aed";
+      wb_ws   [label="workspace\nPVC-backed files",           fillcolor="#ede9fe", color="#7c3aed"];
+      wb_run  [label="run_command\nallowlisted argv only",    fillcolor="#ede9fe", color="#7c3aed"];
+      wb_sand [label="sandbox_run\nno net · no GPU · no creds", fillcolor="#ede9fe", color="#7c3aed"];
+    }
+  }
 
-  user -> k8s [label="4  MCP — harness calls the MCP itself\l5  Call SQL · 6  Return — SQL result\l7  Return — to harness\l",
-               dir=both, style=dashed, lhead=cluster_mcp];
+  edge [color="#16a34a", fontcolor="#15803d", penwidth=2.0];
+  gateway -> rag_mem [label="③  relay tool (MCP)\l④  result → model\l",
+                      dir=both, lhead=cluster_mcp];
 
-  { rank=same; gateway; litellm; }
+  // ---------- layout constraints ----------
+  // gateway and d3-turbo side by side; demand signal beside the models.
+  // (rank=same only at top level — inside a compound cluster it trips a
+  //  dot mincross assertion.)
+  { rank=same; gateway; d3; }
+  // rank the MCP band beneath the model cascade
+  qwen -> rag_mem [style=invis, weight=10];
+
+  // park the legend in the otherwise-empty right-hand region
+  frac -> legend [style=invis];
 
   // ---------- legend ----------
   subgraph cluster_legend {
-    label="Legend — model → SQL → model, side by side"; labeljust=l; fontsize=11;
-    style="rounded"; color="#9ca3af";
+    label="Legend"; labeljust=l; fontsize=11; style="rounded"; color="#9ca3af";
     legend [shape=plaintext, style="",
             label=<<table border="0" cellborder="0" cellspacing="2">
-              <tr><td align="left"><font color="#16a34a">━ ①-⑤</font></td>
-                  <td align="left"><b>pcai-llm-gateway</b> — tool loop relays in-cluster:</td></tr>
-              <tr><td> </td>
-                  <td align="left">the harness sees only the user call (①) and the final response (⑤).</td></tr>
-              <tr><td align="left"><font color="#111111">━ 1-10</font></td>
-                  <td align="left"><b>LiteLLM</b> — relayless: every tool call surfaces to the harness,</td></tr>
-              <tr><td> </td>
-                  <td align="left">which calls the MCP itself and re-sends — <b>two extra harness hops</b></td></tr>
-              <tr><td> </td>
-                  <td align="left">(model → harness → MCP → harness → model) per tool call.</td></tr>
+              <tr><td align="left"><font color="#1d4ed8">━ routing</font></td>
+                  <td align="left">gateway asks d3-turbo; it picks ONE model from the ladder window</td></tr>
+              <tr><td align="left"><font color="#16a34a">━ fallback</font></td>
+                  <td align="left">no routing decision — walk DeepSeek → GLM → Qwen, re-gated per hop</td></tr>
+              <tr><td align="left"><font color="#ea580c">┈ demand</font></td>
+                  <td align="left">opt-in — load-aware head picks the cascade ENTRY, sticky per thread</td></tr>
             </table>>];
   }
 }

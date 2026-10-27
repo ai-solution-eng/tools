@@ -368,7 +368,10 @@ def test_rotate_key_full_contract(client, monkeypatch: pytest.MonkeyPatch) -> No
     # subject_id/bound_via/bound_at, which the rotate regression test below
     # pins for a BOUND key)
     insert_args = db.insert_args
-    assert len(insert_args) == 16
+    # 16 as of the Phase A identity columns; 17 since 2026-10-26 (P0-3 adds
+    # mcp_admin, the MCP admin opt-in, which rotation must carry like every
+    # other identity attribute).
+    assert len(insert_args) == 17
     assert insert_args[0] == old["user_id"]
     assert insert_args[1] == "ci-bot"  # same NAME (feedback: "same name")
     assert insert_args[4] == ["proxy", "mcp"]  # scopes

@@ -40,8 +40,12 @@ Tool surface — TWO layers, ONE gate chain:
 Preserved choke point (the reason this stays safe): tools/call accepts BOTH
 flattened names and the gateway tool names, and EVERY path funnels through
 the same gate chain in ``_gated_mcp_call`` — validation → RPM rate limit →
-registry lookup → per-key ACL (default-deny) → server tool-policy → proxied
-call → ledger settle. The flat surface re-exposes upstream tools by NAME
+registry lookup → per-key ACL (default-deny) → ARGUMENT/GRANT POLICY STAGE
+(mcpf.arg_policy.gate_call: admin-tool refusal → argument destination policy →
+payload telemetry → read+egress separation, hardening P0-1) → server
+tool-policy → proxied call → ledger settle. The SAME stage runs on the relay
+path (routes_proxy._relay_executor), which is where a model's own tool calls
+execute. The flat surface re-exposes upstream tools by NAME
 only; it does not create a second enforcement path. ``_mcp_call`` is now a
 thin wrapper over that chain (failover disabled — an explicit target never
 silently moves), while flattened calls additionally FAILOVER on
@@ -124,6 +128,7 @@ from ..core.identity import (
 )
 from ..core.keys import KeyRecord, authenticate
 from ..db import db
+from ..mcpf import arg_policy
 from ..mcpf.federation import is_allowed, load_grants, server_allows, visible_tools
 from . import auth
 
@@ -830,14 +835,57 @@ async def _settle_quiet(
     status: str,
     started: float,
     request_id: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    detail: str = "",
+    model: str = "",
 ) -> None:
     """Best-effort ledger settle for one gated call attempt (ledger truth:
     refusals and errors are recorded like real calls, but a settle failure
-    must never mask the caller's actual result — swallowed + logged)."""
+    must never mask the caller's actual result — swallowed + logged).
+
+    ALSO the single write point for the two P2 records this wave adds on BOTH
+    MCP paths:
+
+    * gateway_mcp_calls_total{server,outcome,model} (P2-1). Ticked here for
+      ok / error / denied only. A policy_blocked outcome is NOT ticked here:
+      mcpf.arg_policy._count_block already counts it with its bounded reason,
+      and ticking it twice would double every refusal in the one series an
+      operator alerts on. "denied" is its own outcome (not "error") so an
+      error-rate alert never fires on policy activity.
+    * the hash-chained mcp_call_audit row (P2-2) - server, tool, an arguments
+      DIGEST (never the arguments), outcome, model, request id. This is the
+      "which model asked for what" trail the plan says is the one you need
+      for this attack class, and it is chained so an edited row is
+      detectable.
+
+    model is "" on the /mcp surface (an off-cluster MCP client is a program,
+    not a model turn) and the SERVED MODEL on the relay path once the
+    executor passes it - the honest split, not a guess."""
+    _server, _, _rest = endpoint.partition(":")[2].partition(":")
     try:
-        await settle(key_id, "*", endpoint, 0, 0, status, int((time.monotonic() - started) * 1000), request_id)
+        await settle(
+            key_id, model or "*", endpoint, 0, 0, status,
+            int((time.monotonic() - started) * 1000), request_id,
+        )
     except Exception:
         log.exception("mcp: settle failed (%s %s)", status, endpoint)
+    # "denied" is a distinct outcome, not an error: an operator alerting on the
+    # error rate must not fire on policy activity (P2-2 fidelity, wave-2 review).
+    if status in ("ok", "error", "denied"):
+        _metrics.observe_mcp_call(_server, status, model)
+    from ..core.chain_audit import write_mcp_call
+
+    await write_mcp_call(
+        key_id=key_id,
+        server=_server,
+        tool=_rest,
+        arguments=arguments if arguments is not None else {},
+        outcome=status,
+        model=model,
+        request_id=request_id,
+        detail=detail,
+    )
 
 
 async def _gated_mcp_call(
@@ -894,26 +942,43 @@ async def _gated_mcp_call(
     # the only burst guard (F6, audit). Once per REQUEST, not per attempt.
     gate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, 0)
     if not gate.ok:
-        await _settle_quiet(key.id, endpoint, "error", started, request_id)
+        await _settle_quiet(key.id, endpoint, "error", started, request_id, arguments=arguments)
         raise ToolError(f"rate limited: {gate.reason}")
 
     servers = await registry.mcp_servers()  # priority-ordered (priority ASC, name ASC)
     target = next((s for s in servers if s["name"] == server), None)
     if target is None:
-        await _settle_quiet(key.id, endpoint, "error", started, request_id)
+        await _settle_quiet(key.id, endpoint, "error", started, request_id, arguments=arguments)
         raise ToolError(f"unknown server {server!r}: not in the enabled registry")
 
     # --- ACL gate (default-deny; denials are results, not HTTP errors) ---
     grants = await load_grants(key.id)
     if not is_allowed(grants, server, tool):
         _metrics.observe_acl_denial(server)
-        await _settle_quiet(key.id, endpoint, "error", started, request_id)
+        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments)
         raise ToolError(f"denied: key is not granted tool {tool!r} on server {server!r}")
+
+    # --- argument/grant-level policy stage (hardening P0-1, SPEC 3.2) ---
+    # Runs AFTER the ACL gate (an ungranted tool must never learn policy
+    # details) and BEFORE the tool-policy gate + the upstream session: a
+    # refusal here must not open a session to the server it refuses to reach.
+    # The SAME mcpf.arg_policy.gate_call runs on the relay path
+    # (routes_proxy._relay_executor) — one implementation, two call sites.
+    decision = arg_policy.gate_call(
+        server,
+        tool,
+        arguments,
+        key_mcp_admin=getattr(key, "mcp_admin", False),
+        grants=grants,
+    )
+    if decision.refused:
+        await _settle_quiet(key.id, endpoint, "policy_blocked", started, request_id, arguments=arguments)
+        raise ToolError(decision.message)
 
     # --- server tool-policy gate (defense-in-depth over the key ACL) ---
     if not server_allows(target, tool):
         _metrics.observe_acl_denial(server)
-        await _settle_quiet(key.id, endpoint, "error", started, request_id)
+        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments)
         raise ToolError(
             f"denied: {server!r} policy is '{target.get('tool_policy')}' and tool {tool!r} is not in its allowlist"
         )
@@ -929,6 +994,28 @@ async def _gated_mcp_call(
         # Each attempt settles under its ACTUAL endpoint — a failover hit is
         # billed/audited against the server that really served it.
         candidate_endpoint = f"mcp:{candidate_name}:{tool}"
+        # THE ARGUMENT STAGE IS PER-SERVER, so a failover target must run it
+        # again (cross-validation wave 1, P3): server CLASS is what decides
+        # whether a cluster-internal URL is a refusal (egress-class servers
+        # only), so the primary's verdict does NOT transfer to a different
+        # server. The primary's run above already covered the common case;
+        # this re-run only happens for a candidate whose name differs. An
+        # ineligible candidate is SKIPPED (not fatal): the caller gets the
+        # same "upstream call failed" answer it would have got with no
+        # failover, plus the refusal in 'attempts' when more than one
+        # candidate was tried.
+        if candidate_name != server:
+            candidate_decision = arg_policy.gate_call(
+                candidate_name,
+                tool,
+                arguments,
+                key_mcp_admin=getattr(key, "mcp_admin", False),
+                grants=grants,
+            )
+            if candidate_decision.refused:
+                await _settle_quiet(key.id, candidate_endpoint, "policy_blocked", started, request_id, arguments=arguments)
+                transport_errors.append(f"{candidate_name}: {candidate_decision.reason}")
+                continue
         call_headers = await resolve_mcp_headers(candidate, key_id=key.id)
 
         async def do(session: ClientSession) -> Any:
@@ -941,14 +1028,14 @@ async def _gated_mcp_call(
             # as error and — on flattened calls — hand off to the next
             # candidate. Never an HTTP error; reported INSIDE the result.
             log.warning("mcp call: upstream %r/%r failed: %s", candidate_name, tool, exc)
-            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id)
+            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id, arguments=arguments)
             transport_errors.append(f"{candidate_name}: {type(exc).__name__}")
             continue
 
         if result.is_error:
             # Upstream tool-error results are REAL ANSWERS (the tool ran and
             # refused/failed) — never a failover trigger.
-            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id)
+            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id, arguments=arguments)
             return json.dumps(
                 {
                     "ok": False,
@@ -958,7 +1045,7 @@ async def _gated_mcp_call(
                 },
                 indent=2,
             )
-        await _settle_quiet(key.id, candidate_endpoint, "ok", started, request_id)
+        await _settle_quiet(key.id, candidate_endpoint, "ok", started, request_id, arguments=arguments)
         return json.dumps(
             {
                 "ok": True,

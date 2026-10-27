@@ -37,10 +37,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
 from ..db import db
+from .chain_audit import (  # noqa: F401  (ADMIN_AUDIT_CHAIN_FIELDS = the chain contract)
+    ADMIN_AUDIT_CHAIN_FIELDS,
+    canonical,
+    is_unique_violation,
+)
+
+log = logging.getLogger(__name__)
 
 # <redacted> is the documented tombstone (schema.py REDACTION rule): a
 # human-readable marker that survives JSON round-trips and reads honestly
@@ -190,35 +198,110 @@ async def audit_action(
     to remember; redaction-at-the-single-writer is the enforceable point.
     """
     payload = details_redact(details or {})
-    try:
-        target = db if conn is None else conn
-        await target.execute(
-            """
-            INSERT INTO admin_audit
-                (actor_key_id, actor_subject, actor_source, action,
-                 resource_type, resource_id, details, request_id, source_ip)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
-            """,
+    details_json = json.dumps(payload, default=str)
+    # Hash chain (2026-10-26 hardening plan P2-2): the row commits with a
+    # prev_hash/row_hash pair so an edited or deleted row is detectable after
+    # the fact. The prev row is read INSIDE the inserting statement, so the
+    # chain cannot be raced by two writers on one connection; concurrent
+    # writers can still FORK (accepted residual, documented in
+    # core.chain_audit and reported distinctly by verify_admin_audit_chain).
+    # details_sha256 chains the REDACTED payload by digest - see schema.py for
+    # why the JSONB column itself is not chained.
+    details_sha = hashlib.sha256(details_json.encode("utf-8")).hexdigest()
+    chain_parts = canonical(
+        [
             actor_key_id,
             actor_subject or "",
             actor_source,
             action,
             resource_type,
             resource_id,
-            json.dumps(payload, default=str),
+            details_sha,
             request_id,
             source_ip,
-        )
+        ]
+    )
+    # FORK GUARD (wave-2 review P2-3): the schema carries a partial UNIQUE index
+    # on admin_audit.prev_hash, so a concurrent admin mutation that loses the
+    # read-modify-write race gets a unique violation instead of forking the
+    # chain; re-running re-reads prev and chains onto the winner.
+    last_exc: BaseException | None = None
+    for _attempt in range(3):
+        try:
+            target = db if conn is None else conn
+            await target.execute(
+                """
+                INSERT INTO admin_audit
+                    (actor_key_id, actor_subject, actor_source, action,
+                     resource_type, resource_id, details, request_id, source_ip,
+                     details_sha256, prev_hash, row_hash)
+                SELECT $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, p.prev_hash,
+                       encode(sha256(convert_to(p.prev_hash || $11, 'UTF8')), 'hex')
+                  FROM (SELECT coalesce((SELECT row_hash FROM admin_audit
+                                          ORDER BY id DESC LIMIT 1), '') AS prev_hash) p
+                """,
+                actor_key_id,
+                actor_subject or "",
+                actor_source,
+                action,
+                resource_type,
+                resource_id,
+                details_json,
+                request_id,
+                source_ip,
+                details_sha,
+                "|" + chain_parts,
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            if not is_unique_violation(exc):
+                break
+    if last_exc is not None:
+        pass  # fall through to the degraded path below
+    try:
+        if last_exc is not None:
+            raise last_exc
     except Exception:
+        # DEGRADED PATH, deliberate: the chain is an ENHANCEMENT to a trail
+        # that must exist. If the chained INSERT cannot run (a database
+        # without the built-in sha256(bytea), a pre-migration schema), losing
+        # the audit row would be strictly worse than losing its tamper
+        # evidence - retry WITHOUT the chain columns and say so loudly. The
+        # verifier reports these rows as kind="unchained", the honest label.
+        log.warning(
+            "admin_audit: chained insert failed - retrying UNCHAINED (rows verify as kind=unchained)",
+            exc_info=True,
+        )
+        try:
+            target = db if conn is None else conn
+            await target.execute(
+                """
+                INSERT INTO admin_audit
+                    (actor_key_id, actor_subject, actor_source, action,
+                     resource_type, resource_id, details, request_id, source_ip)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+                """,
+                actor_key_id,
+                actor_subject or "",
+                actor_source,
+                action,
+                resource_type,
+                resource_id,
+                details_json,
+                request_id,
+                source_ip,
+            )
+            return
+        except Exception:
+            pass  # fall through to the never-fatal log below
         # Loud, never fatal (module docstring: the tradeoff in full). The
         # admin operation above this call has already done its real work;
         # raising here would turn a SUCCEEDED mutation into a reported
         # failure — an operator-visible lie that invites a destructive
         # retry. The exception log is the compensating control for the
         # lost row.
-        import logging
-
-        logging.getLogger(__name__).exception(
+        log.exception(
             "admin_audit WRITE FAILED (mutation %s on %s/%s succeeded; audit row lost) — check database health",
             action,
             resource_type,

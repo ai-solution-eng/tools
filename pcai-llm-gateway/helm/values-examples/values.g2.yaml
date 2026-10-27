@@ -155,12 +155,21 @@ settings:
   # One extra attempt per relay TURN when a bounded model call expires on timeout; the retry
   # budget comes out of the remaining wall clock. 0 = fail immediately.
   toolRelayCallRetries: 1
+  # Reasoning continuity (2026-10-26): show the model its OWN prior reasoning — both
+  # in-loop (between tool calls) and inbound (what the client replays). With this off,
+  # a 32-iteration relay turn hands the model ~31 consecutive examples of itself calling
+  # tools with no thinking, which teaches it to skip reasoning. The CAP is the storm
+  # guard: the 2026-09-18 incident was UNBOUNDED per-cycle re-append growth (one event
+  # reached 6,630 copies of a line, ~401 KB); at 2000 chars a 32-iteration turn tops out
+  # near 63 KB. Set enabled=false to restore the old full strip byte-for-byte.
+  # COST: this is input that rides every subsequent iteration of the turn.
+  reasoningHistoryEnabled: true
+  reasoningHistoryMaxChars: 2000
   # Complexity routing (pseudo-models `routing` / `routing__<model>`): per-profile
   # routing_policy ('off'|'shadow'|'active') gates behavior — these are the scoring knobs.
   routingEnabled: true
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
-  routingToolBytesPerToken: 64
   routingTurnAdderTokens: 100
   # MCP federation: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
   # two-tool surface (mcp_catalog + mcp_call only).

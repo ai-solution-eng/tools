@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 from ..config import settings
+from ..core import metrics as _metrics  # decision-routing counters (no-op shims without prometheus_client)
 from ..db import db
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,21 @@ DEFAULT_ALIAS = "auto"
 # explicit large-completion ask one tier, never enough to dominate the score.
 _MAX_TOKENS_CAP = 4096
 _MAX_TOKENS_DIVISOR = 8
+
+# Default hysteresis margin for a model SWITCH (probability points).
+# Switching discards the incumbent's KV cache and re-prefills the whole
+# context; measured ~300x the compute of one decision call for a 76K agent
+# payload. A challenger that merely edges the incumbent out must not be able
+# to trigger that. 0.10 is deliberately modest: it blocks 0.62-vs-0.60 coin
+# flips while leaving a decisive 0.85-vs-0.15 free to switch.
+DEFAULT_SWITCH_MARGIN = 0.10
+
+# Flat per-image complexity charge. Vision is genuinely heavier than the same
+# text alone, but scoring it by base64 length was a real bug: a 1.5MB PNG once
+# contributed ~500K "tokens" and force-routed every vision request to the
+# ceiling. A flat charge keeps a vision request modestly above its text
+# equivalent without letting payload size choose the tier.
+_IMAGE_TOKEN_EQUIVALENT = 800
 
 # Policy lookup TTL (seconds). The profile's routing knobs change on operator
 # action, not per request; the costs/offpeak override caches use the same
@@ -155,6 +171,36 @@ def is_routable_name(name: str, route_default: bool) -> bool:
     return bool(route_default) and name == DEFAULT_ALIAS
 
 
+def _count_images(body: dict[str, Any]) -> int:
+    """Number of image parts across all messages. PURE, never raises.
+
+    Counts the OpenAI vision shape ({"type":"image_url", ...}). Mirrors
+    decision_routing._content_parts but stays local: this module must not
+    import decision_routing (it is the import-light core).
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    total = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # Must agree with decision_routing._content_parts: an image part
+            # without a usable url is NOT an image there, so counting it here
+            # would make complexity say "image" while the state says
+            # has_image=false -- two sources of truth for one fact.
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                iu = part.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if isinstance(url, str) and url:
+                    total += 1
+    return total
+
+
 def complexity_score(body: dict[str, Any]) -> int:
     """Token-denominated complexity score of one chat request. Pure.
 
@@ -164,9 +210,12 @@ def complexity_score(body: dict[str, Any]) -> int:
       never disagree about what a "token" is. The system prompt is just a
       message and rides along: in RAG/agent traffic it is usually the
       largest single block.
-    * tool definitions: serialized JSON bytes // routing_tool_bytes_per_token
-      (dense schema JSON tokenizes far worse than prose; the byte term also
-      scales with the NUMBER of tools).
+    * tool definitions: DELIBERATELY NOT COUNTED (see the tool_tokens=0 note
+      in the body). An agent harness ships the same catalog every turn, so
+      tool bytes are a constant that inflates every request toward the
+      ceiling without separating easy from hard.
+    * images: a FLAT _IMAGE_TOKEN_EQUIVALENT per image part, never a
+      base64-length term (which once scored a 1.5MB PNG at ~500K tokens).
     * conversation depth: routing_turn_adder_tokens per message beyond the
       first (state demands capability even when this turn is short).
     * requested max_tokens: capped + discounted (see the constants above).
@@ -193,14 +242,17 @@ def complexity_score(body: dict[str, Any]) -> int:
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             )
 
+    # TOOLS ARE DELIBERATELY NOT COUNTED (2026-10-26).
+    # An agent harness ships the SAME tool catalog every turn, so tool bytes are
+    # a constant, not a per-request signal. Measured: a 28-tool catalog added a
+    # fixed ~199 tokens to every request while the queries spanned a greeting to
+    # a Raft implementation -- a constant cannot separate easy from hard, it
+    # only inflates every request toward the ceiling. It broke the decision
+    # model identically: with tool_count=28 it chose the strongest model even
+    # at 50 prompt tokens.
+    # tool_count still rides in the decision STATE (a model may weigh it); it
+    # just no longer drives the deterministic score.
     tool_tokens = 0
-    tools_raw = body.get("tools")
-    if tools_raw:
-        try:
-            tool_bytes = len(json.dumps(tools_raw, default=str).encode("utf-8"))
-        except (TypeError, ValueError):  # exotic payloads: approximate, never raise
-            tool_bytes = len(str(tools_raw).encode("utf-8", "replace"))
-        tool_tokens = tool_bytes // max(int(settings.routing_tool_bytes_per_token), 1)
 
     turn_tokens = max(len(messages) - 1, 0) * max(int(settings.routing_turn_adder_tokens), 0)
 
@@ -209,7 +261,14 @@ def complexity_score(body: dict[str, Any]) -> int:
     if isinstance(max_tokens, int) and max_tokens > 0:
         mt_tokens = min(max_tokens, _MAX_TOKENS_CAP) // _MAX_TOKENS_DIVISOR
 
-    return prompt_est + tool_tokens + turn_tokens + mt_tokens
+    # Images are a real complexity signal but must NOT be scored by base64
+    # length (a 1.5MB PNG once scored ~500K "tokens" and force-routed every
+    # vision call to the ceiling). A flat per-image charge puts a vision request
+    # modestly above its text equivalent without letting payload size pick the
+    # tier.
+    image_tokens = _count_images(body) * _IMAGE_TOKEN_EQUIVALENT
+
+    return prompt_est + tool_tokens + turn_tokens + mt_tokens + image_tokens
 
 
 def _cut_points() -> tuple[int, int]:
@@ -496,6 +555,12 @@ class DecisionOutcome:
     # this the operator can only see the winner and cannot tune the floor
     # against real data (2026-10-23).
     probabilities: dict[str, float] = field(default_factory=dict)
+    # Wall time the seam spent on this call, in ms. Carried so the caller can
+    # record the user-facing cost of routing without re-measuring it: the
+    # decision is on the request's critical path, so this IS added latency.
+    # None = not measured (no call was made); the metrics helper refuses to
+    # observe None so a non-event cannot drag the histogram mean down.
+    latency_ms: int | None = None
 
 
 @dataclass
@@ -543,6 +608,8 @@ async def resolve_routed_model(
     sticky_write: Callable[[str], None] | None = None,
     route_default: bool = False,
     routable_models: list[str] | None = None,
+    incumbent: str | None = None,
+    switch_margin: float = 0.0,
 ) -> tuple[str, RouteDecision]:
     """Resolve one (pseudo-)model request to the model name to serve next.
 
@@ -674,22 +741,143 @@ async def resolve_routed_model(
             # profile/ACL never offered.
             candidates = _window(cheap_first, ceiling, min_model)
             if available is not None:
-                candidates = [m for m in candidates if available(m)] or candidates
+                _avail = [m for m in candidates if available(m)]
+                if not _avail:
+                    # Every candidate in the window is unavailable right now.
+                    # Offering them anyway invites a pick that admission then
+                    # refuses -- a guaranteed 503 -- so skip the model and let
+                    # the heuristic's ceiling walk serve this turn.
+                    log.info("routing: no available candidate in window - decision skipped")
+                candidates = _avail
             if len(candidates) >= 2:
                 try:
                     decision = await decide(candidates, body, score)
                 except Exception as exc:  # the seam is total; belt and braces
                     log.warning("routing: decision seam failed (%s) - heuristics stand", exc)
                     decision = None
-                if decision is not None and decision.ok and decision.choice in candidates:
+                    _metrics.observe_decision_call("error")
+            else:
+                # Fewer than two candidates means there is nothing to choose
+                # between: the window collapsed (e.g. the sticky floor reached
+                # the ceiling). No call is made -- recording it keeps
+                # `skipped` legible instead of silently shrinking the sample.
+                _metrics.observe_decision_call("skipped")
+            if decision is not None and decision.ok and decision.choice in candidates:
+                # --- switch hysteresis ---------------------------------
+                # A decision that LANDS is not automatically a switch: when
+                # the conversation already has an incumbent, a challenger
+                # must beat it by a real margin. Switching discards the
+                # incumbent's KV cache and re-prefills the whole context --
+                # measured at ~300x one decision call for a 76K agent
+                # payload -- so paying that for a 0.62-vs-0.60 coin flip is
+                # a net loss. The margin is drawn from the SAME probability
+                # distribution the model already returns, so this needs no
+                # new signal and no new call.
+                #
+                # Applies ONLY when an incumbent exists and the challenger
+                # differs: a cold start (no incumbent) always takes the
+                # model's pick, and agreeing with the incumbent is free.
+                _held = False
+                if incumbent and decision.choice != incumbent:
+                    _p = decision.probabilities or {}
+                    # Only trust the distribution when it is a real probability
+                    # vector. The endpoint is expected to return 0..1, but an
+                    # unvalidated scale (e.g. percentages) would make
+                    # `_ch - _in` large against a 0..1 margin and silently
+                    # DISABLE hysteresis entirely. A truncated/partial dict is
+                    # equally untrustworthy: a missing incumbent key looked
+                    # identical to "the model considered and rejected it".
+                    _usable = bool(_p) and all(
+                        isinstance(v, (int, float)) and 0.0 <= float(v) <= 1.0 for v in _p.values()
+                    )
+                    # Default the comparison operands so the log line below is
+                    # always well-formed (an unreadable distribution never sets
+                    # them).
+                    _ch = float(decision.confidence)
+                    _in = 0.0
+                    if _usable and decision.choice in _p and incumbent in _p:
+                        _ch, _in = float(_p[decision.choice]), float(_p[incumbent])
+                        _margin_ok = (_ch - _in) >= switch_margin
+                    else:
+                        # Unreadable distribution (wrong scale, partial, or the
+                        # incumbent missing). The margin cannot be computed in
+                        # comparable units, so HOLD: an unreadable vector must
+                        # never authorise a switch it cannot justify. Falling
+                        # back to `confidence - 0.0` was wrong -- the winner's
+                        # confidence alone clears a 0.10 margin almost always,
+                        # which silently disabled hysteresis in exactly the
+                        # case it was meant to guard.
+                        _margin_ok = False
+                    if not _margin_ok:
+                        _held = True
+                        log.info(
+                            "routing: switch held by hysteresis (incumbent=%s %.3f vs %s %.3f,"
+                            " margin %.2f) - staying on the incumbent",
+                            incumbent,
+                            _in,
+                            decision.choice,
+                            _ch,
+                            switch_margin,
+                        )
+                if not _held:
                     choice = RoutingChoice(decision.choice, f"decision:{decision.confidence:.2f}")
-                    probs = dict(decision.probabilities or {})
-                elif decision is not None:
-                    # The model ANSWERED but was not served (abstained below the
-                    # floor, or named an option outside the window). Record its
-                    # distribution anyway: that is exactly the data an operator
-                    # needs to decide whether the floor is set right.
-                    probs = dict(decision.probabilities or {})
+                elif incumbent in candidates:
+                    # A HELD switch must actually stay on the incumbent. Leaving
+                    # `choice` as the heuristic pick made the hold a lie: with the
+                    # never-downgrade floor permitting escalation, an incumbent
+                    # GLM + heuristic DS + held Qwen challenger served DS -- the
+                    # switch the margin exists to prevent -- while logging
+                    # "staying on the incumbent". Guarded by `in candidates` so an
+                    # unvalidated incumbent (a raw sticky row) can never escape the
+                    # window; the never-downgrade floor below re-checks it anyway.
+                    choice = RoutingChoice(incumbent, "hysteresis:held")
+                # else: the incumbent is outside this request's candidate window
+                # (ACL/health/ceiling change), so there is nothing to stay on and
+                # the heuristic pick stands -- the honest fallback.
+                probs = dict(decision.probabilities or {})
+                # Observability. Two honesty rules the dual review (2026-10-26)
+                # forced, both about not reporting a decision that did not happen:
+                #   * `held` must mean the hold was APPLIED. When the incumbent is
+                #     outside the candidate window there is nothing to stay on and
+                #     the heuristic pick stands, so a switch can still occur --
+                #     ticking `held` there reported the margin blocking a switch
+                #     that actually happened.
+                #   * `served` must mean the model's choice is what SERVES. This
+                #     point is upstream of the never-downgrade floor, so a floor
+                #     override could still replace the pick; the caller re-labels
+                #     it from the final reason (see DECISION_CALLS below).
+                _hold_applied = _held and incumbent in candidates
+                if _hold_applied:
+                    _metrics.observe_route_switch("held")
+                elif _held:
+                    # Margin fired but could not be applied: the incumbent is not
+                    # servable this turn, so this IS a switch.
+                    _metrics.observe_route_switch("switched")
+                elif incumbent is None:
+                    _metrics.observe_route_switch("cold")
+                elif decision.choice == incumbent:
+                    _metrics.observe_route_switch("same")
+                elif policy == "shadow":
+                    # Shadow never serves the pick, so nothing is re-prefilled;
+                    # counting it as `switched` inflates the go/no-go number an
+                    # operator uses to decide whether to arm `active`.
+                    _metrics.observe_route_switch("shadow_would")
+                else:
+                    _metrics.observe_route_switch("switched")
+                _metrics.observe_decision_call("served" if not _hold_applied else "held", decision.latency_ms)
+            elif decision is not None:
+                # The call RETURNED but was not served. Split the two very
+                # different causes: an endpoint that timed out or failed is an
+                # OUTAGE, not a confidence problem, and conflating them is what
+                # makes an operator mis-tune the floor during an outage.
+                # decide() never raises (it maps transport/timeout to ok=False),
+                # so THIS branch -- not the except above -- is where real
+                # failures land.
+                probs = dict(decision.probabilities or {})
+                if decision.reason in ("timeout", "call_failed"):
+                    _metrics.observe_decision_call("error", decision.latency_ms)
+                else:
+                    _metrics.observe_decision_call("abstained", decision.latency_ms)
 
         # --- never-downgrade floor (optional; sticky_floor is None when off) --
         # Applied AFTER the decision-model seam so the floor constrains BOTH

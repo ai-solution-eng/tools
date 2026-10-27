@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Admin</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
 <style>
   :root {
     color-scheme: dark;
@@ -452,6 +452,21 @@
       <h2>Register a model endpoint pool</h2>
       <div class="row">
         <label>Virtual model name <input id="mo-name" placeholder="llama-8b"></label>
+        <label>Type
+          <select id="mo-type" title="What this endpoint actually SERVES. /v1/chat only routes to 'chat' pools and /v1/embeddings only to 'embedding' pools, so a wrong type fails silently in both directions.">
+            <option value="" selected>auto-detect</option>
+            <option value="chat">chat</option>
+            <option value="embedding">embedding</option>
+            <option value="reranker">reranker</option>
+            <option value="voice">voice</option>
+            <option value="decision">decision</option>
+          </select>
+        </label>
+      </div>
+      <div class="muted" style="margin:-4px 0 8px;font-size:12px">
+        Leave <b>auto-detect</b> and the gateway probes the endpoint to decide. Picking a type
+        skips the probe. A wrong type is silent: a chat pool typed <code>embedding</code> disappears
+        from <code>/v1/chat</code>, and an embedder typed <code>chat</code> accepts requests it can only fail.
       </div>
       <div id="mo-eps">
         <div class="ep-row">
@@ -542,8 +557,18 @@
       <tr><th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted)">Cache rate</th><th>Cost (USD)</th><th>Billed cost</th></tr>
     </thead><tbody></tbody></table>
     <h3>By key <span class="muted">— chargeback view; who consumed what</span></h3>
+    <div class="row" style="margin-bottom:6px">
+      <label>Window
+        <select id="usage-window">
+          <option value="1">Last 24 hours</option>
+          <option value="7">Last 7 days</option>
+          <option id="usage-window-max" value="366" selected>Max</option>
+        </select>
+      </label>
+      <span class="muted" id="usage-window-note"></span>
+    </div>
     <table id="usage-by-key"><thead>
-      <tr><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th>Cost (USD)</th><th>Billed cost</th></tr>
+      <tr><th style="width:1.4em"></th><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted) — per KEY, so a key that leans on a cacheable model shows its own rate">Cache rate</th><th>Cost (USD)</th><th>Billed cost</th></tr>
     </thead><tbody></tbody></table>
     <h2 style="margin-top:18px">Pricing (USD per 1M tokens) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time</span></h2>
     <div class="card">
@@ -740,12 +765,18 @@
         <tr><th>Confidence floor</th>
           <td><input id="rt-minconf" type="number" min="0" max="1" step="0.05" style="width:110px">
             <span class="muted">below this the model is treated as ABSTAINING and the heuristics serve. d3-turbo is calibrated but not always certain — a measured 3-way model choice scored <span class="mono">0.43</span>, while a clear 2-way split scored <span class="mono">0.9997</span>. Default <span class="mono">0.60</span>.</span></td></tr>
+        <tr><th>Switch margin</th>
+          <td><input id="rt-switchmargin" type="number" min="0" max="1" step="0.01" style="width:110px">
+            <span class="muted">hysteresis for changing model mid-conversation: a challenger must beat the current model by this much before the router pays the switch. Switching discards the KV cache and re-prefills the whole context (measured ~300&times; one decision call at 76K tokens), so a 0.62-vs-0.60 coin flip is a net loss. <span class="mono">0</span> = first-wins, <span class="mono">1</span> = never switch. Default <span class="mono">0.10</span>.</span></td></tr>
         <tr><th>Decision timeout (ms)</th>
           <td><input id="rt-timeout" type="number" min="250" max="30000" step="50" style="width:110px">
             <span class="muted">a hung decision endpoint must never park a chat request; on timeout the heuristics serve. d3-turbo answered a small state in <span class="mono">~790ms</span>.</span></td></tr>
         <tr><th>Models the router may use</th>
           <td><div id="rt-allowed" class="chkrow"></div>
             <span class="muted">none checked = every chat model is routable. This set also bounds what the DECISION MODEL may pick: it is offered only the floor..ceiling window already filtered by this allowlist and endpoint health, and an answer naming anything outside it is discarded.</span></td></tr>
+        <tr><th>Model capabilities</th>
+          <td><div id="rt-modalities" class="chkrow"></div>
+            <span class="muted">tick the models that accept IMAGES. Chat endpoints do not advertise modality (their <span class="mono">/v1/models</span> returns only id/limits), so this cannot be discovered — it must be declared. Unticked = no capability claim is made and the router will not exclude a model on modality. When set, an image request is not routed to a text-only LLM.</span></td></tr>
         <tr><th>Decision prompt</th>
           <td><textarea id="rt-prompt" rows="8" style="width:100%;font-family:ui-monospace,monospace" placeholder="system prompt for the decision model — the placeholders below are substituted at render time"></textarea>
             <div id="rt-legend" class="muted" style="margin-top:4px"></div></td></tr>
@@ -2240,7 +2271,12 @@ $('mo-save').onclick = guarded('mo-save', async () => {
     api_key: r.querySelector('.mo-key').value || null,
   })).filter(e => e.base_url);
   try {
-    await api('/models', { method: 'POST', body: { model_name: $('mo-name').value, endpoints } });
+    const chosenType = ($('mo-type') && $('mo-type').value) || '';
+    const payload = { model_name: $('mo-name').value, endpoints };
+    // Only pin the type when the operator chose one; '' = let the gateway
+    // detect. Omitting the field entirely is what makes detection run.
+    if (chosenType) payload.model_type = chosenType;
+    await api('/models', { method: 'POST', body: payload });
     banner('model pool saved', '', 3000); await loadModels();
   } catch (e) { banner(esc(e.message), 'error', 6000); }
 });
@@ -2306,7 +2342,63 @@ function refreshFilterSelects() {
   }
 }
 async function loadUsage() {
-  const sum = await api('/usage/summary');
+  // WINDOW (2026-10-26): the endpoint is bounded to the last 30 days by
+  // default, which made a growing lifetime total look like it was DROPPING --
+  // old rows rolled out of the window as new ones rolled in, so the figure
+  // the operator watched (14M tokens) slid downward with no error anywhere.
+  // The selector makes the window explicit and the note states it in words.
+  const winSel = $('usage-window');
+  if (winSel && !winSel.dataset.bound) {
+    winSel.dataset.bound = '1';
+    // Default to Max: this table is a chargeback view, and a silently
+    // truncated 30-day default is exactly what made a growing lifetime total
+    // look like it was DROPPING. 'How much has this key used, ever' is the
+    // question; narrower windows are a drill-down, not the resting state.
+    winSel.value = sessionStore.get('pcai-admin-usage-window') || '366';
+    winSel.addEventListener('change', () => {
+      sessionStore.set('pcai-admin-usage-window', winSel.value);
+      loadUsage();
+    });
+  }
+  const winDays = winSel ? winSel.value : '366';
+  const winSince = new Date(Date.now() - Number(winDays) * 86400000).toISOString();
+  const sum = await api('/usage/summary?since=' + encodeURIComponent(winSince));
+  const winNote = $('usage-window-note');
+  const maxDays = sum && sum.window && sum.window.max_days;
+  const oldest = sum && sum.window && sum.window.oldest_ts;
+  // Label the widest option by REAL RETENTION, not by the query cap.
+  // The ledger is never pruned, so _MAX_WINDOW_DAYS is a cost guard --
+  // calling it 'Max (366d)' claimed a data horizon the deployment may not
+  // have. If the ledger is younger than the cap, say so; if it is older,
+  // the cap IS the limit and the label reflects that.
+  const maxOpt = $('usage-window-max');
+  if (maxOpt && maxDays) {
+    maxOpt.value = String(maxDays);
+    let label = 'Max (' + maxDays + 'd)';
+    if (oldest) {
+      const ageDays = Math.floor((Date.now() - new Date(oldest).getTime()) / 86400000);
+      label = ageDays < maxDays ? 'Max (' + Math.max(1, ageDays) + 'd retained)' : 'Max (' + maxDays + 'd cap)';
+    }
+    maxOpt.textContent = label;
+    if (winSel && winSel.value === '366') winSel.value = String(maxDays);
+  }
+  if (winNote) {
+    if (sum && sum.window && sum.window.since) {
+      const from = new Date(sum.window.since).toLocaleString();
+      const atMax = maxDays && Number(winDays) >= Number(maxDays);
+      let tail;
+      if (!atMax) {
+        tail = ' — totals RESET at the window edge, they are not lifetime figures';
+      } else if (oldest) {
+        tail = ` — retained history starts ${new Date(oldest).toLocaleDateString()}, so this is the full ledger`;
+      } else {
+        tail = ' — the ledger is empty';
+      }
+      winNote.textContent = `showing ${from} → now` + tail;
+    } else {
+      winNote.textContent = '';
+    }
+  }
   const t = sum.totals || {};
   $('usage-summary').querySelector('tbody').innerHTML =
     `<tr><td>${fmtInt(t.requests)}</td><td>${fmtInt(t.input_tokens)}</td>
@@ -2324,15 +2416,62 @@ async function loadUsage() {
   // used to split one credential's spend across every generation. `generations`
   // keeps that visible — a rotated key shows a xN badge instead of silently
   // looking like a single long-lived key.
-  $('usage-by-key').querySelector('tbody').innerHTML = (sum.by_key || []).map(r =>
-    `<tr><td class="mono">${esc(r.key_name || '—')}${(r.generations || 1) > 1
+  // Expandable per-key rows: the parent line is the chargeback rollup, and
+  // clicking the caret reveals the PER-MODEL split for that key (from
+  // sum.by_key_model). Grouped by (key name, user) exactly like the parent so
+  // a rotated credential keeps one identity. Rendered as sibling <tr>s with a
+  // data-parent attribute so the toggle is a single class flip.
+  const perKeyModel = {};
+  (sum.by_key_model || []).forEach(m => {
+    const k = (m.key_name || '') + '\u0000' + (m.user_name || '');
+    (perKeyModel[k] = perKeyModel[k] || []).push(m);
+  });
+  const keyRows = [];
+  (sum.by_key || []).forEach((r, i) => {
+    const k = (r.key_name || '') + '\u0000' + (r.user_name || '');
+    const kids = perKeyModel[k] || [];
+    const canExpand = kids.length > 0;
+    keyRows.push(
+      `<tr class="ukey-parent" data-kidx="${i}"${canExpand ? ' style="cursor:pointer"' : ''}>
+       <td class="mono">${canExpand ? `<span class="ukey-caret" data-kidx="${i}">▸</span>` : ''}</td>
+       <td class="mono">${esc(r.key_name || '—')}${(r.generations || 1) > 1
         ? ` <span class="muted" title="${r.generations} key generations (rotations) rolled up">×${r.generations}</span>`
         : ''}</td><td>${esc(r.user_name || '—')}</td>
-     <td>${fmtInt(r.requests)}</td><td>${fmtInt(r.input_tokens)}</td>
-     <td>${fmtInt(r.output_tokens)}</td>
-     <td>${fmtInt(r.cached_tokens)}</td>
-     <td>${fmtUSD(r.cost_usd)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`).join('')
-    || '<tr><td colspan="8" class="muted">no requests recorded yet</td></tr>';
+       <td>${fmtInt(r.requests)}</td><td>${fmtInt(r.input_tokens)}</td>
+       <td>${fmtInt(r.output_tokens)}</td>
+       <td>${fmtInt(r.cached_tokens)}</td>
+       <td>${r.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : r.cache_hit_rate_pct + '%'}</td>
+       <td>${fmtUSD(r.cost_usd)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`);
+    if (canExpand) {
+      keyRows.push(`<tr class="ukey-child" data-kidx="${i}" style="display:none">
+        <td></td><td colspan="9" style="padding:0 0 0 1.6em">
+        <table style="width:100%;margin:2px 0 6px"><thead><tr>
+          <th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th>Cache rate</th><th>Cost (USD)</th><th>Billed cost</th>
+        </tr></thead><tbody>` + kids.map(m => `<tr>
+          <td class="mono">${esc(m.model || '—')}</td><td>${fmtInt(m.requests)}</td>
+          <td>${fmtInt(m.input_tokens)}</td><td>${fmtInt(m.output_tokens)}</td>
+          <td>${fmtInt(m.cached_tokens)}</td>
+          <td>${m.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : m.cache_hit_rate_pct + '%'}</td>
+          <td>${fmtUSD(m.cost_usd)}</td><td>${fmtUSD(m.billed_cost_usd)}</td></tr>`).join('') + `</tbody></table>
+        </td></tr>`);
+    }
+  });
+  const byKeyBody = $('usage-by-key').querySelector('tbody');
+  byKeyBody.innerHTML = keyRows.join('') || '<tr><td colspan="10" class="muted">no requests recorded yet</td></tr>';
+  // Delegate the toggle: a caret or the parent row flips every child of that
+  // index and rotates the caret. Bound once per render via onclick on the tbody
+  // (re-assigning is idempotent).
+  byKeyBody.onclick = (ev) => {
+    const el = ev.target.closest('[data-kidx]');
+    if (!el) return;
+    const idx = el.getAttribute('data-kidx');
+    const kids = byKeyBody.querySelectorAll('.ukey-child[data-kidx="' + idx + '"]');
+    if (!kids.length) return;
+    const open = kids[0].style.display !== 'none';
+    kids.forEach(k2 => { k2.style.display = open ? 'none' : ''; });
+    const caret = byKeyBody.querySelector('.ukey-caret[data-kidx="' + idx + '"]');
+    if (caret) caret.textContent = open ? '▸' : '▾';
+  };
   const costs = await api('/costs');
   $('costs-table').querySelector('tbody').innerHTML = (costs || []).map(c =>
     `<tr><td class="mono">${esc(c.model_name)}</td><td>${fmtPrice(c.input_per_m)}</td>
@@ -3253,6 +3392,36 @@ function paintRoutingLegend(placeholders) {
 // Routing-allowlist checkboxes over the chat pools. A stored entry that is
 // NOT a chat pool still renders, marked — saving must never silently rewrite
 // an override the operator set (the distiller panel's rule).
+
+// Image-capability checkboxes, one per routable model. Chat endpoints do not
+// advertise modality (their /v1/models returns only id/limits), so this map is
+// operator-declared: the ONLY way the router can know a model accepts images.
+// Unticked = no claim made (an unknown capability must never exclude a model).
+function paintRoutingModalities(models, declared) {
+  const box = $('rt-modalities');
+  if (!box) return;
+  const have = (declared && typeof declared === 'object') ? declared : {};
+  const imageOk = m => Array.isArray(have[m]) && have[m].includes('image');
+  box.innerHTML = (models || []).map(m =>
+    '<label><input type="checkbox" class="rt-modality-image" value="' + esc(m) + '"' +
+    (imageOk(m) ? ' checked' : '') +
+    ' title="this model accepts image input"> ' + esc(m) + ' <span class="muted">accepts images</span></label>'
+  ).join('') || '<span class="muted">no models registered</span>';
+}
+
+// Read the ticked set back into the {model: ["text","image"]} shape the
+// router expects. Unticked models are OMITTED entirely (not stored as
+// ["text"]) so an undeclared model keeps meaning 'capability unknown'.
+// Returns null when nothing is ticked, matching the null-on-empty discipline
+// the other knobs use so a cleared form actually clears the stored map.
+function readRoutingModalities() {
+  const out = {};
+  document.querySelectorAll('.rt-modality-image').forEach(el => {
+    if (el.checked) out[el.value] = ['text', 'image'];
+  });
+  return Object.keys(out).length ? out : null;
+}
+
 function paintRoutingAllowed(models, stored, chat) {
   const box = $('rt-allowed');
   if (!box) return;
@@ -3331,8 +3500,17 @@ async function loadRouting() {
   const mode = ['off', 'shadow', 'active'].includes(c.decision_mode) ? c.decision_mode : 'off';
   $('rt-mode').value = mode;
   $('rt-minconf').value = c.decision_min_confidence != null ? c.decision_min_confidence : 0.60;
+  $('rt-switchmargin').value = c.decision_switch_margin != null ? c.decision_switch_margin : 0.10;
   $('rt-timeout').value = c.decision_timeout_ms != null ? c.decision_timeout_ms : 2500;
+  // DECLARE BEFORE USE. `const` is hoisted but uninitialised (temporal dead
+  // zone), so reading storedAllowed above its declaration throws
+  // "can't access lexical declaration 'storedAllowed' before initialization"
+  // and aborts the WHOLE panel render -- which is why the page stayed broken
+  // across refreshes rather than recovering.
   const storedAllowed = Array.isArray(c.allowed_models) ? c.allowed_models : [];
+  // Same model universe the allowlist row paints: every chat pool plus any
+  // stored entry not in it, so a declared capability is never invisible.
+  paintRoutingModalities(chat.concat(storedAllowed.filter(m => !chat.includes(m))), c.model_modalities || {});
   paintRoutingAllowed(chat.concat(storedAllowed.filter(m => !chat.includes(m))), storedAllowed, chat);
   $('rt-prompt').value = c.prompt || '';
   $('rt-inject').checked = c.inject_gpu_load === true;
@@ -3390,7 +3568,11 @@ async function saveRouting() {
     // NaN from a cleared input is sent as null so the stored value stands
     // rather than being overwritten with 0.
     decision_min_confidence: $('rt-minconf').value === '' ? null : Number($('rt-minconf').value),
+    decision_switch_margin: $('rt-switchmargin').value === '' ? null : Number($('rt-switchmargin').value),
     decision_timeout_ms: $('rt-timeout').value === '' ? null : Number($('rt-timeout').value),
+    // Only models ticked as image-capable are declared; an empty map is sent as
+    // null (no capability claim) rather than {} so the stored value clears.
+    model_modalities: readRoutingModalities(),
     // Explicit null when nothing is ticked: an OMITTED key never reaches
     // set_values (the handler builds `provided` from exclude_unset, so absent
     // != null) — omitting it would silently KEEP the stored allowlist while
