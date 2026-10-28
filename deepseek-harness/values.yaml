@@ -334,7 +334,9 @@ dshCordisPatch: |
     - id: typert-gateway
       config:
         websocketHeartbeatIntervalMs: 60000
-
+    - id: ui-settings-account
+      config:
+        contactFormUrl: https://github.com/ai-solution-eng/tools/tree/main/deepseek-harness
 router:
   resources:
     requests:
