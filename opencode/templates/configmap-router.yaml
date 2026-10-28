@@ -109,6 +109,13 @@ data:
     // reportUsage:false into OpenChamber's settings.json + preferences.json.
     // OpenChamber has no env var for this, so it cannot be done with pod env.
     // Bumped so existing units re-stamp and pick the enforcement up.
+    // v18: non-root-safe platform units (tr211). On clusters where admission
+    // forces the tenant uid onto every pod in project-user-*, the unit is
+    // already that uid: the init cannot setpriv/chown (now guarded on id -u = 0)
+    // and the startup cannot groupadd/useradd or setpriv --init-groups (now
+    // short-circuited), while the stock nginx sidecar could not create its
+    // root-owned cache/log dirs (now emptyDirs, pid under /tmp). Bumped so
+    // existing units re-stamp onto the new init/startup/nginx config.
     //
     // RUNTIME_REV is operator-tunable: set it in values.yaml (or an EzAppConfig
     // values blob) and every user unit re-stamps on the next reconcile — no
@@ -116,7 +123,7 @@ data:
     // an install that never sets it renders the historical marker EXACTLY and
     // gets no surprise rollout on upgrade.
     const userRuntimeRev = '{{ .Values.RUNTIME_REV | default "" }}'
-    const userTemplateVersion = `terminal-tab-v17-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}${userRuntimeRev ? `-r${userRuntimeRev}` : ''}`
+    const userTemplateVersion = `terminal-tab-v18-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}${userRuntimeRev ? `-r${userRuntimeRev}` : ''}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1687,7 +1694,7 @@ data:
         // every boot, and NEVER the platform volumes (/mnt/shared, /mnt/user):
         // those keep their platform ownership; access is enforced by unix
         // permissions against the identity, exactly like a notebook.
-        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/opencode/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/opencode /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
+        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ] && [ "$(id -u)" = "0" ]; then export HOME=/var/opencode/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/opencode /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
         '$RUN_AS_USER ln -sfn /workspace /var/opencode/home/workspace',
         // Per-user folder in the shared workspace: every real unit creates
         // /workspace/shared/<slug> — named after the login username (SSO or
@@ -1786,7 +1793,7 @@ data:
         // the platform unix identity, byte-identical to a Kubeflow notebook.
         // Without identity (classic local units) it runs as root, exactly as
         // before.
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): on clusters where admission forces the tenant uid onto the pod we are ALREADY that uid - groupadd/useradd cannot run and setpriv --init-groups fails (no passwd entry), so the unit crash-loops. Start the stack directly instead.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
         "chmod 0755 /var/opencode/bin/opencode-startup.sh",
       ]
       const initCommand = initCommandParts.join(' && ')
@@ -2042,6 +2049,12 @@ data:
                   ],
                   volumeMounts: [
                     { name: 'preview-config', mountPath: '/etc/nginx/nginx.conf', subPath: 'nginx.conf' },
+                    // Non-root-safe (tr211): the stock image writes its cache and
+                    // logs under root-owned /var/cache/nginx and /var/log/nginx,
+                    // which a tenant-uid nginx cannot create. emptyDirs are
+                    // writable by the container's fsGroup/uid.
+                    { name: 'nginx-cache', mountPath: '/var/cache/nginx' },
+                    { name: 'nginx-logs', mountPath: '/var/log/nginx' },
                   ],
                 },
                 {
@@ -2072,6 +2085,10 @@ data:
                 { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
                 { name: 'preview-config', configMap: { name: '{{ .Release.Name }}-preview-config', defaultMode: 365 } },
+                // Non-root-safe (tr211): writable cache/log dirs for the stock
+                // nginx preview sidecar (see its volumeMounts).
+                { name: 'nginx-cache', emptyDir: {} },
+                { name: 'nginx-logs', emptyDir: {} },
                 // DinD image store — node-local emptyDir (overlay2 fails on
                 // VAST network volumes; see the docker-dind sidecar note).
                 ...(dockerSidecarHere ? [{ name: 'docker-data', emptyDir: { sizeLimit: dockerDiskSize } }] : []),

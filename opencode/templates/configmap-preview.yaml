@@ -8,6 +8,9 @@ metadata:
     hpe-ezua/app: {{ .Chart.Name }}
 data:
   nginx.conf: |
+    # Non-root-safe (tr211): a tenant-uid nginx cannot write the default
+    # /var/run/nginx.pid. /tmp is world-writable inside the container.
+    pid /tmp/nginx.pid;
     worker_processes 1;
     events {
       worker_connections 1024;
