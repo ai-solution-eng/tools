@@ -57,7 +57,7 @@ nginx:
 # changes, the router patches each Deployment and the unit rolls.
 # Historical values live as comments on the template constant (RUNTIME_REV in
 # templates/configmap-router.yaml); keep this in sync with the shipped default.
-RUNTIME_REV: 36
+RUNTIME_REV: 37
 
 images:
   # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
@@ -225,11 +225,9 @@ dshCordisPatch: |
           pcai-model-endpoint:
             apiKeyEnv: PCAI_LLM_KEY
             api: openai-completions
-            baseURL: https://pcai-llm-gateway.pcai-se-ai-application.hst.rdlabs.hpecorp.net/v1
+            baseURL: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1
             headers:
-              X-PCAI-Execute-Tools: "1"
-              X-PCAI-Relay-Deltas: "1"
-              X-PCAI-Stream-Events: "1"          
+              X-PCAI-Execute-Tools: "1"       
             reasoning: max
             # Route-level capability defaults (pi-ai: entry ?? installed catalog ?? these).
             # NOTE maxTokens stays per-entry on purpose: an entry maxTokens is also the
@@ -333,7 +331,9 @@ dshCordisPatch: |
       name: "@deepseek-ai/dsh-client-ui-settings-general"
       config:
         welcomeNoticeVersion: 2026-09-28.1
-
+    - id: typert-gateway
+      config:
+        websocketHeartbeatIntervalMs: 60000
 
 router:
   resources:
@@ -371,6 +371,29 @@ proxy:
 # ============================================================
 no_proxy:
   enabled: false
+
+# ============================================================
+# Egress hardening (agent internet sandboxing)
+# ============================================================
+# Phase 0 of agent-egress-sandbox-design.md: remove the agent's runtime
+# internet dependencies that cost nothing to remove. These are ENV DEFAULTS
+# only — no NetworkPolicy, no traffic is blocked, fully reversible.
+#
+#   DSH_TELEMETRY_DISABLED=1
+#     The harness ships an OTEL exporter pointed at
+#     https://dsh-otel-collector.deepseeksvc.com/v1/logs with
+#     mode=FEEDBACK_ONLY: session logs are released ONLY after a user
+#     explicitly submits feedback — ordinary activity is never captured
+#     (dsh-base/cordis.patch.yml). The chart never set the kill switch, so
+#     the row is enabled and a feedback submit would attempt an internet
+#     POST. Set this to remove the latent egress path and keep the
+#     anonymous user id ($DSH_HOME/.anonymous-user-id) from leaving the
+#     cluster. Any non-empty value disables the exporter.
+#
+# Set enabled: false to restore the previous behaviour.
+egress:
+  offlineDefaults:
+    enabled: true
 
 # ============================================================
 # Platform (PCAI/Kubeflow) workspace integration — study Option B

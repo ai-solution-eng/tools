@@ -104,11 +104,17 @@ data:
     // 36: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
     // default rejected pasted/dropped images with HTTP 413 before dsh saw
     // the request. Bumped so existing units re-stamp onto the new nginx.conf.
+    // 37: data-manager upgrades (parity with opencode) — intermediate
+    // breadcrumb segments are now clickable (closure bug: every crumb
+    // navigated to the directory already open, so clicking e.g. ".dsh" did
+    // nothing), and the edit dialog previews images / PDF / audio / video via
+    // a new inline+Range mode on /api/download. Bumped so existing units
+    // re-stamp onto the new data_manager.mjs + data_manager.html.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
-    // reconcile — no chart edit needed. Defaults to 36 so an install that
+    // reconcile — no chart edit needed. Defaults to 37 so an install that
     // does not set it keeps the historical value (no surprise rollout).
-    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 36 }}'
+    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 37 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -1997,6 +2003,15 @@ data:
                     ...platformIdentityEnv,
                     { name: 'DSH_PLATFORM_ROOTS', value: platformRootsMode },
                     { name: 'DSH_PLATFORM_ROOTS_READONLY', value: platformReadOnly ? 'true' : 'false' },
+                    {{- if and .Values.egress .Values.egress.offlineDefaults .Values.egress.offlineDefaults.enabled }}
+                    // Phase 0 egress hardening — see agent-egress-sandbox-design.md
+                    // and the `egress` block in values.yaml. The harness ships an
+                    // OTEL exporter (mode FEEDBACK_ONLY: it exports only after an
+                    // explicit user feedback submit) pointed at an internet
+                    // collector. Disabling it removes a latent egress path.
+                    // Env default only — no traffic is blocked here.
+                    { name: 'DSH_TELEMETRY_DISABLED', value: '1' },
+                    {{- end }}
                     {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                     {{- range .Values.certificatesPolicy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
