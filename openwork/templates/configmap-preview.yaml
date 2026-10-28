@@ -972,6 +972,25 @@ data:
       }
     }
     
+    // Content types used ONLY for ?inline=1 (preview). Deliberately excludes
+    // html: that can execute script in the data-manager origin, so it stays on
+    // the download path. SVG IS included — through <img> its scripts never run,
+    // and the inline response also carries a sandbox CSP + nosniff.
+    const PREVIEW_MIME = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+      webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp',
+      avif: 'image/avif', ico: 'image/x-icon',
+      pdf: 'application/pdf',
+      mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+      m4v: 'video/x-m4v', ogv: 'video/ogg',
+      mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
+      m4a: 'audio/mp4', flac: 'audio/flac', aac: 'audio/aac',
+    }
+    function previewMimeFor(filePath) {
+      const ext = path.extname(filePath).slice(1).toLowerCase()
+      return PREVIEW_MIME[ext] || null
+    }
+
     async function handleDownload(req, res, url) {
       const filePath = url.searchParams.get('path')
       const customName = url.searchParams.get('name')
@@ -987,6 +1006,53 @@ data:
           return
         }
         const filename = customName || path.basename(safePath)
+        const inlineMime = url.searchParams.get('inline') ? previewMimeFor(safePath) : null
+
+        // ?inline=1 serves bytes for PREVIEW: real content-type, inline
+        // disposition, and HTTP Range support so <video>/<audio>/pdf can seek
+        // without pulling the whole file. Anything without a preview MIME
+        // falls through to the plain attachment download.
+        if (inlineMime) {
+          const headers = {
+            'content-type': inlineMime,
+            'content-disposition': 'inline; filename="' + filename.replace(/"/g, '\\"') + '"',
+            'x-content-type-options': 'nosniff',
+            'content-security-policy': "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'",
+            'cache-control': 'private, max-age=60',
+            'accept-ranges': 'bytes',
+          }
+          const rangeHeader = req.headers.range
+          if (rangeHeader) {
+            const m = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim())
+            if (m && (m[1] || m[2])) {
+              let start
+              let end
+              if (m[1]) {
+                start = parseInt(m[1], 10)
+                end = m[2] ? parseInt(m[2], 10) : stat.size - 1
+              } else {
+                start = Math.max(0, stat.size - parseInt(m[2], 10))
+                end = stat.size - 1
+              }
+              if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
+                res.writeHead(416, { 'content-range': 'bytes */' + stat.size })
+                res.end()
+                return
+              }
+              end = Math.min(end, stat.size - 1)
+              headers['content-range'] = 'bytes ' + start + '-' + end + '/' + stat.size
+              headers['content-length'] = String(end - start + 1)
+              res.writeHead(206, headers)
+              fs.createReadStream(safePath, { start, end }).pipe(res)
+              return
+            }
+          }
+          headers['content-length'] = String(stat.size)
+          res.writeHead(200, headers)
+          fs.createReadStream(safePath).pipe(res)
+          return
+        }
+
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
           'content-length': stat.size,
@@ -1738,6 +1804,14 @@ data:
     #edit-dialog { width: 96vw; height: 94vh; max-width: none; max-height: none; }
     #edit-dialog .dlg-body { padding: 0; flex: 1; overflow: hidden; display: flex; flex-direction: column; }
     #editor-container { flex: 1; overflow: hidden; min-height: 300px; }
+    /* Media preview (image / PDF / audio / video) inside the edit dialog */
+    .preview-wrap { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: var(--surface-2); overflow: auto; padding: 8px; }
+    .preview-el { max-width: 100%; max-height: 100%; }
+    .preview-image { object-fit: contain; }
+    .preview-video { width: 100%; max-height: 100%; background: #000; }
+    .preview-audio { width: min(640px, 100%); }
+    .preview-pdf { width: 100%; height: 100%; border: 0; background: #fff; }
+    .preview-error { padding: 24px; color: var(--text-muted); text-align: center; font-size: 13px; }
     #editor-textarea {
       width: 100%;
       height: 100%;
@@ -2034,6 +2108,11 @@ data:
       let accum = currentRoot.path;
       parts.forEach(part => {
         accum += '/' + part;
+        // Capture the path for THIS crumb. Closing over the mutable 'accum'
+        // made every intermediate crumb navigate to the final directory (the
+        // one already open), so clicking e.g. ".dsh" in
+        // Personal/.dsh/skills/probe appeared to do nothing.
+        const target = accum;
         const sep = document.createElement('span');
         sep.className = 'crumb-sep';
         sep.textContent = '/';
@@ -2041,7 +2120,8 @@ data:
         const crumb = document.createElement('span');
         crumb.className = 'crumb';
         crumb.textContent = part;
-        crumb.onclick = () => navigateTo(accum);
+        crumb.title = target;
+        crumb.onclick = () => navigateTo(target);
         bc.appendChild(crumb);
       });
     }
@@ -2581,6 +2661,61 @@ data:
     }
     initMonaco();
     
+    // Extensions the server can serve inline (mirrors PREVIEW_MIME in
+    // data_manager.mjs). Images/PDF/video/audio render in the dialog instead of
+    // the "binary file, use download" placeholder.
+    const PREVIEW_IMAGE = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'];
+    const PREVIEW_VIDEO = ['mp4', 'webm', 'mov', 'm4v', 'ogv'];
+    const PREVIEW_AUDIO = ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'];
+    const PREVIEW_PDF = ['pdf'];
+
+    function previewKind(ext) {
+      const e = String(ext || '').toLowerCase();
+      if (PREVIEW_IMAGE.includes(e)) return 'image';
+      if (PREVIEW_VIDEO.includes(e)) return 'video';
+      if (PREVIEW_AUDIO.includes(e)) return 'audio';
+      if (PREVIEW_PDF.includes(e)) return 'pdf';
+      return null;
+    }
+
+    function previewUrl(filePath) {
+      return API + '/download?inline=1&path=' + encodeURIComponent(filePath);
+    }
+
+    function renderPreview(container, filePath, kind, name) {
+      const url = previewUrl(filePath);
+      const wrap = document.createElement('div');
+      wrap.className = 'preview-wrap';
+      let el;
+      if (kind === 'image') {
+        el = document.createElement('img');
+        el.alt = name || 'preview';
+      } else if (kind === 'video') {
+        el = document.createElement('video');
+        el.controls = true;
+        el.playsInline = true;
+      } else if (kind === 'audio') {
+        el = document.createElement('audio');
+        el.controls = true;
+      } else {
+        // PDF: native viewer via <iframe>. Range support on the endpoint lets
+        // the browser's viewer jump to a page without downloading everything.
+        el = document.createElement('iframe');
+        el.title = name || 'PDF preview';
+      }
+      el.src = url;
+      el.className = 'preview-el preview-' + kind;
+      el.onerror = () => {
+        wrap.innerHTML = '';
+        const msg = document.createElement('div');
+        msg.className = 'preview-error';
+        msg.textContent = 'Could not preview this file. Use Download to open it locally.';
+        wrap.appendChild(msg);
+      };
+      wrap.appendChild(el);
+      container.appendChild(wrap);
+    }
+
     async function openEditor(filePath, entry) {
       editorCurrentPath = filePath;
       document.getElementById('edit-title').textContent = entry.name;
@@ -2588,6 +2723,16 @@ data:
     
       const container = document.getElementById('editor-container');
       container.innerHTML = '';
+    
+      // Previewable media never goes through /read (which returns text and
+      // bails on binary) — render it straight from the inline endpoint.
+      const kind = previewKind(entry.ext);
+      if (kind) {
+        renderPreview(container, filePath, kind, entry.name);
+        document.getElementById('edit-meta').textContent = kind.toUpperCase() + ' preview' + (entry.size ? ' \u00b7 ' + fmt(entry.size) : '');
+        document.getElementById('btn-editor-save').disabled = true;
+        return;
+      }
     
       try {
         const data = await api('/read?path=' + encodeURIComponent(filePath));

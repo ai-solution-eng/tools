@@ -31,6 +31,9 @@ values.yaml.opencode-reference   pristine copy of the opencode chart values, por
 
 ## Pushing config to user envs
 
+`scripts/show-current-config.sh` prints the latest config as rendered from `values.yaml`
+(read from the `<release>-project-config` ConfigMap, read-only, no pod needed).
+
 `scripts/push_openwork_json_config.sh` **stages** an `opencode.json` into user envs
 (`~/.config/opencode/` under the openwork home — the filename is unchanged from the
 opencode chart). The push lands as `opencode-update.json` beside the live

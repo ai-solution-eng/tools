@@ -91,8 +91,18 @@ data:
     // v15: nginx client_max_body_size (nginx.clientMaxBodySize) — the 1 MB
     // default rejected pasted/dropped images with HTTP 413 before the app saw
     // the request. Bumped so existing units re-stamp onto the new nginx.conf.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 1 }}'
-    const userTemplateVersion = `terminal-tab-v15-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+    // v16: data-manager upgrades (parity with opencode + DSH) — intermediate
+    // breadcrumb segments are now clickable (closure bug: every crumb
+    // navigated to the directory already open, so clicking e.g. ".dsh" did
+    // nothing), and the edit dialog previews images / PDF / audio / video via
+    // a new inline+Range mode on /api/download. Bumped so existing units
+    // re-stamp onto the new data_manager.mjs + data_manager.html.
+    // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
+    // values blob) and every user unit re-stamps on the next reconcile. The
+    // default matches the value shipped in values.yaml, so an install that does
+    // not set it keeps rendering the same marker.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 12 }}'
+    const userTemplateVersion = `terminal-tab-v16-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1951,6 +1961,16 @@ data:
                     {{- range .Values.no_proxy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
                     {{- end }}
+                    {{- end }}
+                    {{- if and .Values.egress .Values.egress.offlineDefaults .Values.egress.offlineDefaults.enabled }}
+                    // Phase 0 egress hardening — see agent-egress-sandbox-design.md
+                    // and the `egress` block in values.yaml. Drop the engine's
+                    // runtime internet dependencies: the models.dev catalogue
+                    // fetch, the autoupdate check and share uploads.
+                    // Env defaults only; nothing is blocked.
+                    { name: 'OPENCODE_DISABLE_MODELS_FETCH', value: '1' },
+                    { name: 'OPENCODE_DISABLE_AUTOUPDATE', value: '1' },
+                    { name: 'OPENCODE_DISABLE_SHARE', value: '1' },
                     {{- end }}
                     ...platformIdentityEnv,
                     { name: 'OPENCODE_PLATFORM_ROOTS', value: platformRootsMode },

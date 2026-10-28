@@ -121,7 +121,9 @@ openwork:
   # page only receives the client token — cloud provider sync needs the host
   # token pasted once in the UI settings panel (or stays cloud-only in Den).
   webBootstrapToken: true
-  disableCloudModels: false   # OpenWork Cloud sign-in/handoff enabled (origin approved in OpenWork Labs org settings)
+  disableCloudModels: true    # Phase 0 egress hardening: the cloud handoff is an
+                              # internet dependency (app.openworklabs.com). Flip to
+                              # false only if OpenWork Cloud is deliberately wanted.
   corsOrigins: ""              # empty => rendered from ezua.virtualService.endpoint
   readOnly: false
   logFormat: json
@@ -129,7 +131,7 @@ openwork:
   tokenSecret: ""
 
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
-RUNTIME_REV: 11
+RUNTIME_REV: 12
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
@@ -334,6 +336,24 @@ no_proxy:
       value: ""
     - name: no_proxy
       value: ""
+
+# ============================================================
+# Egress hardening (agent internet sandboxing)
+# ============================================================
+# Phase 0 of agent-egress-sandbox-design.md: remove the agent's runtime
+# internet dependencies that cost nothing to remove. ENV DEFAULTS only —
+# no NetworkPolicy, no traffic is blocked, fully reversible.
+#
+#   OPENCODE_DISABLE_MODELS_FETCH=1  models.dev catalogue fetch (hourly)
+#   OPENCODE_DISABLE_AUTOUPDATE=1    engine self-update check
+#   OPENCODE_DISABLE_SHARE=1         share/session upload
+#
+# OpenWork's own cloud egress is controlled separately by
+# openwork.disableCloudModels (above). Set enabled: false to restore
+# pre-Phase-0 behaviour.
+egress:
+  offlineDefaults:
+    enabled: true
 
 # ============================================================
 # Platform (PCAI/Kubeflow) workspace integration

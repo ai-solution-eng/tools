@@ -44,7 +44,7 @@ OVERWRITE_CMD="mkdir -p $CONFIG_DIR && if [ -f $LIVE ]; then cp -p $LIVE $BACKUP
 
 usage() {
   cat <<EOF
-usage: push_openwork_json_config.sh [--file config.json | --from-defaults] [--apply] [--namespace NS]
+usage: push_openwork_json_config.sh [--file config.json | --from-configmap | --from-defaults] [--apply] [--namespace NS]
 
 STAGES opencode.json (models, providers, MCP servers, permissions) into every
 openwork-web user environment (all deployments labeled
@@ -68,8 +68,16 @@ behaviour; a rolling backup to opencode-backup.json is taken in that mode).
   (default)            dry-run preview only
   --apply              actually run
   --file PATH          stage this local JSON file into every pod
-  --from-defaults      stage the chart-mounted defaults ($DEFAULTS) instead,
-                       i.e. run a helm upgrade of openworkConfig first
+  --from-configmap     (recommended, and the default) stage the LATEST config as
+                       rendered from values.yaml — read from the
+                       '<release>-project-config' ConfigMap (key: opencode.json).
+                       Needs no running pod. This is the canonical copy an admin
+                       can also read directly:
+                         kubectl get cm <release>-project-config -n NS -o jsonpath=...
+                       (the data key is opencode.json)
+  --from-defaults      stage the copy mounted inside a user pod ($DEFAULTS)
+                       instead — same bytes, but requires a running pod and a
+                       helm upgrade first
   --list-users         list the user units and the --user IDs, then exit
   --user ID            stage ONLY to the unit(s) of this user — repeatable and
                        comma-separated (--user me --user you / --user me,you).
@@ -89,7 +97,17 @@ EOF
 APPLY=0
 FILE=""
 FROM_DEFAULTS=0
+FROM_CONFIGMAP=0
 LIST_USERS=0
+
+# Scratch file for --from-configmap (the extracted config). Removed on exit.
+TMP_PATCH=""
+cleanup_tmp() {
+  if [ -n "$TMP_PATCH" ] && [ -f "$TMP_PATCH" ]; then
+    rm -f "$TMP_PATCH"
+  fi
+}
+trap cleanup_tmp EXIT
 USERS=()
 
 normalize_user() {
@@ -132,6 +150,10 @@ while [ $# -gt 0 ]; do
       ;;
     --from-defaults)
       FROM_DEFAULTS=1
+      shift
+      ;;
+    --from-configmap)
+      FROM_CONFIGMAP=1
       shift
       ;;
     --user)
@@ -178,14 +200,18 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$LIST_USERS" -eq 0 ]; then
-  if [ "$FROM_DEFAULTS" -eq 1 ] && [ -n "$FILE" ]; then
-    echo "error: --file and --from-defaults are mutually exclusive" >&2
+  _sources=0
+  [ -n "$FILE" ] && _sources=$((_sources + 1))
+  [ "$FROM_DEFAULTS" -eq 1 ] && _sources=$((_sources + 1))
+  [ "$FROM_CONFIGMAP" -eq 1 ] && _sources=$((_sources + 1))
+  if [ "$_sources" -gt 1 ]; then
+    echo "error: --file, --from-defaults and --from-configmap are mutually exclusive" >&2
     exit 1
   fi
-  # --from-defaults is the default source when no --file is given (historical
-  # behaviour: copy the ConfigMap-mounted defaults).
-  if [ "$FROM_DEFAULTS" -eq 0 ] && [ -z "$FILE" ]; then
-    FROM_DEFAULTS=1
+  # --from-configmap is the default when no --file/--from-defaults is given:
+  # read the latest config straight from the release ConfigMap (no pod needed).
+  if [ "$_sources" -eq 0 ]; then
+    FROM_CONFIGMAP=1
   fi
 
   if [ -n "$FILE" ]; then
@@ -213,6 +239,34 @@ if [ "$LIST_USERS" -eq 0 ]; then
       *) echo "note: JSON pre-check skipped (python3 unavailable) — opencode still validates before restarting" >&2 ;;
     esac
   fi
+fi
+
+# ----------------------------------------------- source: --from-configmap
+# The canonical copy of the config as rendered from values.yaml lives in the
+# release's '<release>-project-config' ConfigMap (templates/configmap-project.yaml).
+# Reading it needs no running pod, so this is the natural source for a push.
+if [ "$FROM_CONFIGMAP" -eq 1 ]; then
+  TMP_PATCH="${TMPDIR:-/tmp}/opencode-config.$$.json"
+  CM_NAME="${CONFIGMAP_NAME:-openwork-web-helm-project-config}"
+  if ! CM_CFG="$("$KUBECTL" get configmap -n "$NAMESPACE" "$CM_NAME" \
+        -o jsonpath='{.data.opencode\.json}' 2>&1)"; then
+    echo "error: kubectl failed reading ConfigMap '$CM_NAME' in '$NAMESPACE': $CM_CFG" >&2
+    echo "       (upgrade the chart so templates/configmap-project.yaml is applied," >&2
+    echo "        or use --file / --from-defaults.)" >&2
+    exit 1
+  fi
+  if [ -z "$CM_CFG" ]; then
+    echo "error: ConfigMap '$CM_NAME' has no 'opencode.json' key (or it is empty)" >&2
+    echo "       Is values.opencodeConfig set? Use --file / --from-defaults instead." >&2
+    exit 1
+  fi
+  printf '%s' "$CM_CFG" > "$TMP_PATCH"
+  if [ ! -s "$TMP_PATCH" ]; then
+    echo "error: the ConfigMap payload was empty" >&2
+    exit 1
+  fi
+  FILE="$TMP_PATCH"
+  echo "source: --from-configmap ($CM_NAME -> opencode.json)"
 fi
 
 # ------------------------------------------------------------------ inventory
@@ -366,7 +420,9 @@ fi
 # ---------------------------------------------------------------------- push
 if [ "$APPLY" -eq 0 ]; then
   echo "DRY RUN - nothing executed"
-  if [ -n "$FILE" ]; then
+  if [ "$FROM_CONFIGMAP" -eq 1 ]; then
+    echo "mode: stage the latest config from values (--from-configmap) -> opencode-update.json"
+  elif [ -n "$FILE" ]; then
     echo "mode: stage local file '$FILE'"
   else
     echo "mode: stage the chart-mounted defaults ($DEFAULTS)"
