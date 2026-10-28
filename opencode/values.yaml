@@ -187,6 +187,15 @@ opencode:
 # openchamber 1.24.2.
 openchamber:
   version: "1.24.2"
+  # OpenChamber "Send anonymous usage reports". false (default) forces it OFF for
+  # every user on each unit start; true leaves the user's own choice alone.
+  #
+  # OpenChamber exposes no env var for this - it is a profile setting - so the
+  # unit init writes it into settings.json AND preferences.json (preferences
+  # wins, and is seeded from settings on first read) via apply-defaults.mjs in
+  # the project ConfigMap. Part of Phase 0 egress hardening: an anonymous usage
+  # report is an outbound call we do not need.
+  reportUsage: false
 
 ui:
   mode: openchamber
@@ -352,6 +361,27 @@ proxy:
 # ============================================================ 
 no_proxy:
   enabled: false
+
+# ============================================================
+# Egress hardening (agent internet sandboxing)
+# ============================================================
+# Phase 0 of agent-egress-sandbox-design.md: remove the agent's runtime
+# internet dependencies that cost nothing to remove. ENV DEFAULTS only —
+# no NetworkPolicy, no traffic is blocked, fully reversible.
+#
+#   OPENCODE_DISABLE_MODELS_FETCH=1
+#     The opencode engine fetches its provider/model catalogue from
+#     models.dev on startup and hourly. Not needed with in-cluster model
+#     endpoints.
+#   OPENCODE_DISABLE_AUTOUPDATE=1
+#     Stops the engine's self-update check against opencode.ai.
+#   OPENCODE_DISABLE_SHARE=1
+#     Stops share/session upload to opncd.ai.
+#
+# Set enabled: false to restore pre-Phase-0 behaviour.
+egress:
+  offlineDefaults:
+    enabled: true
 
 # ============================================================
 # Platform (PCAI/Kubeflow) workspace integration

@@ -9,6 +9,47 @@ metadata:
 data:
   opencode.json: |
 {{ .Values.opencodeConfig | indent 4 }}
+  # Runs in the unit init container on every start. OpenChamber keeps its
+  # profile in settings.json + preferences.json (preferences wins and is seeded
+  # from settings on first read), so both are written. Idempotent; never fails
+  # a start. Deliberately minimal: this chart enforces only openchamber.reportUsage
+  # - no provider lock, no default-model rewrite.
+  apply-defaults.mjs: |
+    import fs from 'node:fs'
+    import path from 'node:path'
+
+    const configHome = process.env.CONFIG_HOME || '/var/opencode/home/.config'
+    const disableUsageReport = process.env.OPENCHAMBER_REPORT_USAGE !== 'true'
+
+    function readJson(file) {
+      try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
+    }
+    function writeJson(file, value) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      const tmp = `${file}.tmp-${process.pid}`
+      fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\\n', { mode: 0o600 })
+      fs.renameSync(tmp, file)
+    }
+
+    if (disableUsageReport) {
+      const chDir = path.join(configHome, 'openchamber')
+      const settingsFile = path.join(chDir, 'settings.json')
+      const prefsFile = path.join(chDir, 'preferences.json')
+      const settings = readJson(settingsFile) || {}
+      const prefs = readJson(prefsFile)
+      const current = prefs?.fields?.reportUsage?.value ?? settings.reportUsage
+      if (current !== false) {
+        try {
+          writeJson(settingsFile, { ...settings, reportUsage: false })
+          if (prefs && typeof prefs.fields === 'object' && prefs.fields !== null) {
+            prefs.fields.reportUsage = { updatedAt: Date.now(), value: false }
+            writeJson(prefsFile, prefs)
+          }
+        } catch (error) {
+          console.error(`[apply-defaults] reportUsage: ${error.message}`)
+        }
+      }
+    }
 {{- range .Values.opencodeSkills }}
   skill-{{ .name }}.md: |
 {{ .content | indent 4 }}
