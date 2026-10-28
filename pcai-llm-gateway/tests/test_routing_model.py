@@ -107,14 +107,45 @@ def test_score_system_prompt_counts() -> None:
     assert with_sys - without == 100 + settings.routing_turn_adder_tokens
 
 
-def test_score_tools_add_bytes_term() -> None:
+def test_score_tools_are_not_counted() -> None:
+    """Tools carry NO score weight (2026-10-26 decision, reverses the old term).
+
+    An agent harness ships the same catalog every turn, so tool bytes are a
+    constant — they cannot separate an easy request from a hard one, they only
+    inflate every request toward the ceiling. Measured before removal: a 28-tool
+    catalog added a fixed ~199 tokens to a greeting and to a Raft implementation
+    alike, and the decision model chose the strongest model at 50 prompt tokens
+    purely because tool_count was 28.
+    """
     base = model_routing.complexity_score({"messages": [{"role": "user", "content": "hi"}]})
     tools = [{"type": "function", "function": {"name": "f", "parameters": {"x": "y" * 640}}}]
 
     with_tools = model_routing.complexity_score({"messages": [{"role": "user", "content": "hi"}], "tools": tools})
-    assert with_tools > base
-    # the byte term dominates: 64 bytes ≈ 1 score token
-    assert with_tools - base >= 10
+    assert with_tools == base
+
+
+def test_score_images_add_flat_charge() -> None:
+    """Images add a FLAT per-image charge, never a base64-length term.
+
+    Scoring base64 length was a real bug: a 1.5MB PNG contributed ~500K
+    "tokens" and force-routed every vision request to the ceiling.
+    """
+    def img_body(n: int) -> dict:
+        parts: list[dict] = [{"type": "text", "text": "what is this?"}]
+        parts += [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 100_000}}
+            for _ in range(n)
+        ]
+        return {"messages": [{"role": "user", "content": parts}]}
+
+    one = model_routing.complexity_score(img_body(1))
+    two = model_routing.complexity_score(img_body(2))
+    text_only = model_routing.complexity_score(
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this?"}]}]}
+    )
+    # exactly one flat charge per image, regardless of how big the payload is
+    assert one - text_only == model_routing._IMAGE_TOKEN_EQUIVALENT
+    assert two - one == model_routing._IMAGE_TOKEN_EQUIVALENT
 
 
 def test_score_turns_add() -> None:

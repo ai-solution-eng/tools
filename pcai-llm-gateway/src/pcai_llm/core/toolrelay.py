@@ -56,6 +56,30 @@ KEEPALIVE_S = 15.0
 TOOL_RELAY_RETRY_MIN_BUDGET_S = 10.0
 
 
+# Reasoning-delta key spellings an OpenAI-compatible upstream may use. pi-ai
+# (the client library DSH uses) accepts all three — "reasoning_content"
+# (vLLM/llama.cpp), "reasoning" (many OpenAI-compatible servers) and
+# "reasoning_text". The relay recognised ONLY "reasoning_content", and its SSE
+# prefilter is a raw BYTE scan that runs BEFORE json.loads — so a delta under
+# either other spelling was discarded without ever being parsed: the model's
+# thinking was generated, billed upstream, and silently thrown away before it
+# reached the client (audit 2026-10-26, CUT 1).
+REASONING_KEYS = ("reasoning_content", "reasoning", "reasoning_text")
+
+
+def _reasoning_text_of(delta: dict) -> str:
+    """The reasoning text carried by ONE upstream delta, or "".
+
+    First non-empty spelling wins — an upstream that emits both would
+    otherwise duplicate the trace. Mirrors pi-ai's own resolution order.
+    """
+    for key in REASONING_KEYS:
+        value = delta.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _cached_tokens(usage: dict | None) -> int:
     """Upstream prompt-cache hits for one model call (usage detail passthrough
     — parent addendum): vLLM/SGLang report prefix-cache hits as
@@ -436,22 +460,28 @@ async def parse_sse_payloads(byte_iter):
     Handles lines straddling chunk boundaries (same reassembly rule as the
     proxy's _relay_sse) and skips non-data / [DONE] lines.
 
-    Pre-filter (perf audit): lines carrying NONE of the fields the relay
-    reads (`content` / `reasoning_content` / `tool_calls` / top-level
-    `usage`) skip decode + json.loads entirely — empty keepalive deltas
-    (`{"delta":{}}`) and comment/heartbeat lines are the no-op majority of
-    a chatty stream. A naive `"tool_calls"`-only filter would silently drop
-    final-answer content deltas, so all four markers gate the fast path.
+    NO FIELD PRE-FILTER (audit 2026-10-26, CUT 1). This function used to skip
+    any line that did not contain one of four literal BYTE markers
+    (`"tool_calls"`, `"usage"`, `"content"`, `"reasoning_content"`) BEFORE
+    json.loads ran. That gate was unsound: a delta carrying `reasoning` or
+    `reasoning_text` (both accepted by pi-ai, the DSH client library) matched
+    no marker and was discarded unparsed, so the model's thinking vanished with
+    no error and no log line. Any escaped spelling (`reasoning\u005fcontent`)
+    was lost the same way, and so would be any field added later.
+
+    The cheap, sound gate is the `data:` prefix itself — it must be present for
+    a line to be parseable at all, and it rejects SSE comment/keepalive lines
+    (`: keepalive`) in the same byte comparison. Every remaining line is
+    parsed; the per-line cost on the old fast-path majority (`{"delta":{}}`,
+    a few dozen bytes) is negligible, and correctness on the reasoning channel
+    is worth far more than the micro-optimisation it replaces.
     """
-    interesting = (b'"tool_calls"', b'"usage"', b'"content"', b'"reasoning_content"')
     buf = bytearray()
     async for chunk in byte_iter:
         buf += chunk
         while (idx := buf.find(b"\n")) != -1:
             line = bytes(buf[:idx])
             del buf[: idx + 1]
-            if not any(marker in line for marker in interesting):
-                continue
             text = line.decode("utf-8", errors="replace").strip()
             if not text.startswith("data:"):
                 continue
@@ -463,8 +493,6 @@ async def parse_sse_payloads(byte_iter):
             except json.JSONDecodeError:
                 continue
     if buf:
-        if not any(marker in buf for marker in interesting):
-            return
         text = buf.decode("utf-8", errors="replace").strip()
         if text.startswith("data:"):
             payload = text[5:].strip()
@@ -475,44 +503,203 @@ async def parse_sse_payloads(byte_iter):
                     pass
 
 
-async def stream_model_call(resp: httpx2.Response) -> AsyncIterator[tuple[str, Any]]:
+async def stream_model_call(
+    resp: httpx2.Response,
+    id_prefix: str = "",
+    id_counter: list[int] | None = None,
+) -> AsyncIterator[tuple[str, Any]]:
     """Consume one upstream chat stream (an httpx2 streaming Response); yield
     typed events: ('reasoning', text) | ('content', text) | ('usage', dict) |
     ('tool_calls', [assembled]) — tool_call argument fragments are assembled
     across deltas (vLLM streams them in pieces).
+
+    `id_prefix` + `id_counter` scope the SYNTHETIC ids minted for calls the
+    upstream never numbered (see below). Both must span the whole relay TURN,
+    not one model call: the relay makes one model call per iteration, so a
+    per-call counter restarts at 1 every iteration and two iterations both mint
+    "…_1" — which the client's join (keyed on call id for the whole response)
+    would collapse onto one card, re-creating the very defect the synthetic ids
+    exist to prevent. relay_stream owns the counter (a one-element list, so the
+    generator can mutate it) and passes the request id as the prefix; the
+    defaults keep direct/test callers working.
     """
-    acc: dict[int, dict] = {}
+    # Assembly state. Order is the upstream's FIRST-SEEN order (a list), never a
+    # sort of the index space — see the ordering note at the end of this function.
+    order: list[dict] = []
+    by_index: dict[int, dict] = {}
+    by_id: dict[str, dict] = {}
+    # Synthetic ids for calls the upstream never numbered, so the wire deltas,
+    # the pcai telemetry events and the client's join all agree on one key
+    # (audit 2026-10-26, F-4: an empty id made the DSH renderer join BOTH
+    # telemetry events to ONE card, losing one result and mis-attributing the
+    # other). Prefixed by the caller's turn-scoped id — see the docstring.
+    # Caller-owned across the whole turn; a local counter would restart per
+    # model call (see the docstring).
+    counter = id_counter if id_counter is not None else [0]
+    # A synthetic id must be unmistakably NOT an upstream id (review P1c: the old
+    # fixed default "call_relay" could equal a real upstream id such as
+    # "call_relay_1", fusing two different calls onto one). The prefix is the
+    # caller's turn id; when absent, a per-call random tag keeps it unique.
+    mint_prefix = id_prefix or f"relay{uuid.uuid4().hex[:8]}"
     usage = None
     async for obj in parse_sse_payloads(resp.aiter_bytes()):
-        choices = obj.get("choices") or []
-        delta = (choices[0].get("delta") or {}) if choices else {}
-        if delta.get("reasoning_content"):
-            yield ("reasoning", delta["reasoning_content"])
+        # TYPE GUARD (review E-1, P0). parse_sse_payloads yields whatever
+        # json.loads returned, so a legal-but-non-object SSE data line
+        # (`data: null`, `data: [1,2]`, `data: 42`, `data: "x"`) reaches this
+        # loop. The old byte-marker prefilter happened to reject those before
+        # parsing — an ACCIDENTAL type guard that vanished when the prefilter
+        # was removed, and the resulting AttributeError killed the whole SSE
+        # stream with no guard event, no error chunk, no [DONE] and no settle.
+        # The guard is now explicit.
+        if not isinstance(obj, dict):
+            continue
+        choices = obj.get("choices")
+        if not isinstance(choices, list) or not choices:
+            choices = []
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        delta = first_choice.get("delta")
+        if not isinstance(delta, dict):
+            delta = {}
+        reasoning_text = _reasoning_text_of(delta)
+        if reasoning_text:
+            yield ("reasoning", reasoning_text)
         if delta.get("content"):
             yield ("content", delta["content"])
         for tcd in delta.get("tool_calls") or []:
-            idx = tcd.get("index", 0)
-            slot = acc.setdefault(
-                idx,
-                {
-                    "id": "",
+            fn = tcd.get("function")
+            if not isinstance(fn, dict):
+                fn = {}
+            raw_id = tcd.get("id")
+            frag_id = raw_id if isinstance(raw_id, str) else ("" if raw_id is None else str(raw_id))
+            frag_name = fn.get("name") or ""
+            # INDEX COERCION (review E-3). A non-int index ("0", 0.0) used to be
+            # discarded as "absent", after which the fragment fell through to the
+            # most-recently-opened call and MERGED two distinct calls into one —
+            # the exact F-2 symptom, on a shape the pre-fix code handled fine.
+            # Accept anything that is unambiguously an index.
+            raw_index = tcd.get("index")
+            index: int | None = None
+            if isinstance(raw_index, bool):
+                index = None
+            elif isinstance(raw_index, int):
+                index = raw_index
+            elif isinstance(raw_index, float) and raw_index.is_integer():
+                index = int(raw_index)
+            elif isinstance(raw_index, str) and raw_index.strip().lstrip("-").isdigit():
+                index = int(raw_index.strip())
+
+            # Resolve WHICH call this fragment belongs to (audit 2026-10-26,
+            # F-2/F-3). The OpenAI streaming contract does not require an index
+            # on every fragment, and several servers stamp it only on the first
+            # delta — so keying blindly on the index (the old get("index", 0))
+            # merged distinct parallel calls into slot 0, CONCATENATING their
+            # names and arguments: a call that either fails JSON parsing or,
+            # worse, parses as valid JSON and executes the wrong thing.
+            # Resolution order:
+            #   1. a fragment carrying an id we already know -> that call;
+            #   2. an explicit index we already know         -> that call;
+            #   3. a fragment carrying a NEW id              -> a NEW call (even
+            #      if its index collides with an open slot: the id is the
+            #      authoritative identity);
+            #   4. otherwise                                 -> the open call at
+            #      that index, or, with no index, the most recently opened call.
+            #
+            # KNOWN LIMIT (review P1a, accepted): if an upstream reuses one index
+            # for a second call while the FIRST call is still streaming id-less
+            # fragments, those tail fragments land on the newer call. The stream
+            # carries no signal that disambiguates them (no id, and the index is
+            # shared by construction), so no assignment is derivable — the choice
+            # is which call gets corrupted. We take the newer one and never
+            # raise: a malformed upstream must not kill the turn. Every
+            # well-formed upstream numbers its calls distinctly, so this needs
+            # an upstream that reuses indexes AND omits ids on continuations.
+            # LATE-ID ADOPTION (review E-2): an upstream may reveal a call's id
+            # only on a LATER fragment. The id is then unknown to by_id, but the
+            # call is already open under its index — creating a fresh slot would
+            # SPLIT one call into two (the second with an empty name, which
+            # became an unknown-tool error). So an unknown id adopts the open,
+            # still-id-less call at that index when there is one.
+            slot = None
+            if frag_id and frag_id in by_id:
+                # 1. an id we already know -> that call.
+                slot = by_id[frag_id]
+            elif frag_id:
+                # 2. an id we do NOT know. It may be a call that only revealed
+                #    its id on a later fragment: adopt the open, still-unclaimed
+                #    call at this index. A CLAIMED slot belongs to a different
+                #    id, so this really is a new call (slot stays None).
+                if index is not None:
+                    candidate = by_index.get(index)
+                    if candidate is not None and not candidate.get("_claimed"):
+                        slot = candidate
+            elif index is not None:
+                # 3. no id: continue the call at this index (the ordinary
+                #    continuation-fragment case, and the F-3 repeat-name case).
+                slot = by_index.get(index)
+            elif order:
+                # 4. no id, no index: the most recently opened call.
+                slot = order[-1]
+
+            if slot is None:
+                counter[0] += 1
+                slot = {
+                    "id": frag_id or f"{mint_prefix}_call{counter[0]}",
                     "type": "function",
                     "function": {"name": "", "arguments": ""},
-                },
-            )
-            if tcd.get("id"):
-                slot["id"] = tcd["id"]
-            fn = tcd.get("function") or {}
-            if fn.get("name"):
-                slot["function"]["name"] += fn["name"]
-            if fn.get("arguments"):
-                slot["function"]["arguments"] += fn["arguments"]
+                }
+                if frag_id:
+                    slot["_claimed"] = True
+                order.append(slot)
+                if index is not None:
+                    by_index[index] = slot
+                by_id[slot["id"]] = slot
+
+            if frag_id and slot["id"] != frag_id:
+                # The upstream only revealed the id on a later fragment (or this
+                # fragment adopted the open call at its index): bind the id and
+                # mark the slot claimed so a DIFFERENT id never adopts it.
+                slot["id"] = frag_id
+                slot["_claimed"] = True
+                by_id[frag_id] = slot
+
+            # NAME ASSEMBLY (F-3 + review P2). Two opposite upstream shapes:
+            #   * REPEAT — every fragment restates the whole name ("bash","bash"):
+            #     concatenating produced "bashbash", which missed both the ACL
+            #     parse and the alias path and became an unknown-tool error.
+            #   * SPLIT  — the name arrives in pieces ("ba","sh"): setting it
+            #     once would truncate to "ba" and execute the wrong tool.
+            # Append only when the fragment EXTENDS what we already have (split);
+            # ignore it when it merely restates it (repeat).
+            if frag_name:
+                current_name = slot["function"]["name"]
+                piece = str(frag_name)
+                if not current_name or (piece != current_name and piece.startswith(current_name)):
+                    # Empty slot, or the fragment carries a LONGER form of the
+                    # name we have so far (split across fragments).
+                    slot["function"]["name"] = piece
+                elif not current_name.endswith(piece) and not piece.startswith(current_name):
+                    # A genuinely new tail piece: append it.
+                    slot["function"]["name"] = current_name + piece
+            frag_args = fn.get("arguments")
+            if frag_args:
+                # Defensive: a non-string `arguments` (some servers send a
+                # pre-parsed object) would raise TypeError on += and kill the
+                # stream mid-turn. Coerce, and never lose the fragment.
+                slot["function"]["arguments"] += (
+                    frag_args if isinstance(frag_args, str) else json.dumps(frag_args, default=str)
+                )
         if isinstance(obj.get("usage"), dict):
             usage = obj["usage"]
     if usage is not None:
         yield ("usage", usage)
-    if acc:
-        yield ("tool_calls", [acc[i] for i in sorted(acc)])
+    if order:
+        # Strip the internal claim marker: the wire shape must stay a clean
+        # OpenAI tool_call.
+        for slot in order:
+            slot.pop("_claimed", None)
+        # FIRST-SEEN order, not a sort of the index space: the upstream arrival
+        # order is the model intent order, and a synthetic slot has no index.
+        yield ("tool_calls", order)
 
 
 def sse_event(obj: dict) -> bytes:
@@ -1221,6 +1408,11 @@ async def relay_stream(
 
     done_state: list[dict] | None = None
 
+    # Monotone wire-index cursor for stamped render deltas (see the emission
+    # site). MUST NOT reset per iteration — the client's block map is keyed by
+    # this index for the whole response.
+    render_index_next = 0
+
     async def _flush_conversation_state(iterations_final: int) -> None:
         """Handback terminals ONLY: persist the awaiting-client
         state — the conversation UP TO AND INCLUDING the assistant
@@ -1464,7 +1656,24 @@ async def relay_stream(
             # budget is bounded at all.
             remaining = guard.deadline - time.monotonic()
             retry_budget = min(remaining, settings.upstream_timeout_s)
-            if retries_left > 0 and retry_budget >= TOOL_RELAY_RETRY_MIN_BUDGET_S:
+            # NOTHING-EMITTED GATE (audit 2026-10-26, F-6). Reasoning and content
+            # deltas stream LIVE during the attempt, so an attempt that produced
+            # output before expiring cannot be re-run without the client seeing
+            # that output twice for one logical step — the retry's premise ("the
+            # upstream was queued/wedged and said nothing") only holds when the
+            # accumulators are empty. The transport-failure path below already
+            # gates on exactly this tuple; the timeout path did not, and
+            # PCAI_LLM_TOOL_RELAY_CALL_RETRIES=1 is live in the deployment.
+            # "Silent" means silent TO THE CLIENT (review E-4): reasoning that was
+            # suppressed by stream_thinking never reached anyone, so it does not
+            # make the attempt non-retryable.
+            reasoning_seen = bool(reasoning_acc) and stream_thinking
+            attempt_silent = not (content_acc or reasoning_seen or tool_calls)
+            if (
+                retries_left > 0
+                and attempt_silent
+                and retry_budget >= TOOL_RELAY_RETRY_MIN_BUDGET_S
+            ):
                 retries_left -= 1
                 detail = (
                     f"model call timed out — retrying "
@@ -1565,10 +1774,22 @@ async def relay_stream(
             # are EXCLUDED at the routes layer — buffering breaks
             # transparency; here the relay owns assembly, so the retry is a
             # bounded internal re-roll of one model call.
+            # The gate must key on what the CLIENT SAW, not on what the upstream
+            # produced (review E-4). Reasoning is only visible to the client when
+            # stream_thinking is on — with it off the deltas are suppressed
+            # (_reasoning_delta returns b""), so re-rolling cannot duplicate
+            # anything the user saw, and suppressing the recovery would turn a
+            # recoverable empty answer into a guaranteed empty one.
+            # F-8 (audit 2026-10-26): the old predicate checked only content_acc,
+            # and its comment ("nothing was emitted yet for it") was false for the
+            # reasoning channel whenever thinking WAS streaming. Both halves now
+            # hold: no content, and no reasoning the client could have seen.
+            reasoning_seen_by_client = bool(reasoning_acc) and stream_thinking
             zero_completion = (
                 settings.zero_completion_retry
                 and not zero_retry_used
                 and not content_acc
+                and not reasoning_seen_by_client
                 and usage is not None
                 and int((usage or {}).get("completion_tokens") or 0) == 0
             )
@@ -1686,13 +1907,32 @@ async def relay_stream(
             yield b"data: [DONE]\n\n"
             return
 
-        relay_msgs.append(
-            {
-                "role": "assistant",
-                "content": "".join(content_acc) or None,
-                "tool_calls": tool_calls,
-            }
-        )
+        # REASONING CONTINUITY (2026-10-26, CUT 4a). The reasoning this iteration
+        # produced was collected and then DISCARDED, so across a 32-iteration
+        # turn the model saw up to 31 consecutive examples of itself emitting
+        # tool calls with no thinking in front of them — an in-context
+        # demonstration to stop reasoning. Feeding the block back keeps the
+        # chain intact.
+        #
+        # BOUNDED BY CONSTRUCTION: the block is capped (reasoning_history_max_chars),
+        # so the 2026-09-18 storm shape — unbounded per-cycle growth, one event
+        # at 6,630 copies / ~401 KB — cannot recur: worst case is
+        # 32 x cap (~63 KB at the default) for a whole turn. The cap is applied
+        # to the TAIL (the most recent reasoning, which is what the next call
+        # actually needs), and the cut is marked so the model can tell.
+        _assistant_row: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_acc) or None,
+            "tool_calls": tool_calls,
+        }
+        if settings.reasoning_history_enabled:
+            _reasoning_block = "".join(reasoning_acc)
+            _cap = max(0, int(settings.reasoning_history_max_chars))
+            if _reasoning_block and _cap:
+                if len(_reasoning_block) > _cap:
+                    _reasoning_block = "…[earlier reasoning trimmed]…" + _reasoning_block[-_cap:]
+                _assistant_row["reasoning_content"] = _reasoning_block
+        relay_msgs.append(_assistant_row)
         if content_acc:
             # intermediate text: per-iteration collapsible event
             yield _pcai({"pcai": {"event": "iteration", "iteration": iteration, "text": "".join(content_acc)}})
@@ -1745,8 +1985,18 @@ async def relay_stream(
         # executable; a client that honors the stamp treats stamped calls as
         # display-only, so double execution stays structurally impossible.
         if render_deltas:
-            for _i, _tc in enumerate(mcp_calls):
-                yield _rendered_delta(_tc, _i)
+            # INDEX SPACE IS GLOBAL, NOT PER-ITERATION (audit 2026-10-26, F-1).
+            # This used to enumerate from 0 on every iteration, so iteration 2's
+            # calls reused wire indexes 1000,1001,... — and the client's block
+            # map (pi-ai toolCallBlocksByIndex) is keyed by that index and is
+            # never cleared, so iteration 2's argument fragments were appended
+            # to iteration 1's blocks: two calls fused into one card whose
+            # arguments were invalid JSON, while the gateway had really executed
+            # both. The counter is now monotone for the whole response; the
+            # per-iteration enumeration only decides WITHIN-iteration order.
+            for _tc in mcp_calls:
+                yield _rendered_delta(_tc, render_index_next)
+                render_index_next += 1
 
         # CLIENT-side loop guard (see signature): a handback call whose exact
         # fingerprint repeats across requests gets its refusal fed to the model
@@ -1833,6 +2083,24 @@ async def relay_stream(
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                 }
             )
+            # OpenAI-standard final usage chunk (audit 2026-10-26, F-7): the
+            # relay forces include_usage=True at the routes layer precisely so
+            # OpenAI-compatible clients (DSH's context meter) see per-call
+            # consumption — but BOTH handback terminals used to close with
+            # finish_reason + [DONE] and no usage chunk at all. DSH is a
+            # handback client, so every DSH turn hit it: measured over 140 real
+            # sessions, 21,693 of 21,696 relayed tool-call steps reported
+            # totalTokens=0 while direct glm53-flash reported usage on all 449.
+            if include_usage and last_usage:
+                yield sse_event(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [],
+                        "usage": last_usage,
+                    }
+                )
             await _flush_conversation_state(iteration + 1)
             yield b"data: [DONE]\n\n"
             return
@@ -2246,6 +2514,24 @@ async def relay_stream(
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                 }
             )
+            # OpenAI-standard final usage chunk (audit 2026-10-26, F-7): the
+            # relay forces include_usage=True at the routes layer precisely so
+            # OpenAI-compatible clients (DSH's context meter) see per-call
+            # consumption — but BOTH handback terminals used to close with
+            # finish_reason + [DONE] and no usage chunk at all. DSH is a
+            # handback client, so every DSH turn hit it: measured over 140 real
+            # sessions, 21,693 of 21,696 relayed tool-call steps reported
+            # totalTokens=0 while direct glm53-flash reported usage on all 449.
+            if include_usage and last_usage:
+                yield sse_event(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [],
+                        "usage": last_usage,
+                    }
+                )
             await _flush_conversation_state(iteration + 1)
             yield b"data: [DONE]\n\n"
             return

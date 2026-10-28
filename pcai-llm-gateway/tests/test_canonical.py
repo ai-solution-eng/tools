@@ -915,24 +915,68 @@ def test_wiring_feature_switch_inert(wiring_env, monkeypatch: pytest.MonkeyPatch
     assert len(fake.canonical_writes) == before_writes
 
 
-def test_wiring_reasoning_stripped_before_reconciliation(wiring_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The strip runs BEFORE reconciliation: an incoming history carrying
-    reasoning_content (a harness that re-appends it) reconciles and persists
-    WITHOUT the reasoning keys — the store can never become a reasoning
-    re-injection path (it only ever sees post-strip data)."""
+def test_wiring_reasoning_is_bounded_not_stripped(
+    wiring_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reasoning is CAPPED on the way through, not deleted (2026-10-26).
+
+    SUPERSEDES test_wiring_reasoning_stripped_before_reconciliation. That test
+    pinned a full strip, which was the fix for the 2026-09-18 relay storm
+    (a client re-appending each streamed reasoning block per cycle; one stored
+    event reached 6,630 copies of a line, ~401 KB). The strip removed the
+    symptom but also the model's own chain of thought: replayed turns became
+    "assistant emitted tool calls, no thinking", which teaches the model to
+    skip reasoning. Measured: 86.1% of relayed tool-call steps carried no
+    reasoning vs 46.1% direct.
+
+    The BOUND is the real fix: growth is now linear in message count and
+    capped, so the unbounded storm shape cannot recur.
+    """
     make, fake = wiring_env
     key = _key()
     tc = make(key)
     dirty = _turn1()
-    dirty[1]["reasoning_content"] = "chain of thought that must not return"
+    long_reasoning = "x" * 5000
+    dirty[1]["reasoning_content"] = long_reasoning
+    dirty[2]["reasoning"] = "more scratch"
+    r = tc.post("/v1/chat/completions", json={"model": MODEL, "messages": dirty}, headers=RELAY_HEADERS)
+    assert r.status_code == 200, r.text
+
+    seen = _bodies(fake)[0]["messages"]
+    carried = [m for m in seen if m.get("reasoning_content")]
+    assert carried, "reasoning must reach the model, not be stripped"
+    cap = settings.reasoning_history_max_chars
+    for m in carried:
+        assert len(m["reasoning_content"]) <= cap + 64  # cap + trim marker
+    # The short "reasoning" key rides through intact (under the cap).
+    assert any(m.get("reasoning") == "more scratch" for m in seen)
+
+    # The STORE is bounded too: it can never become an unbounded
+    # re-injection path (the storm's amplification surface).
+    key_id, thread_id = _sole_row(fake, key.id)
+    stored = json.loads(fake.rows[(key_id, thread_id)])
+    for m in stored:
+        for rk in ("reasoning_content", "reasoning"):
+            if m.get(rk):
+                assert len(m[rk]) <= cap + 64
+
+
+def test_wiring_reasoning_strip_is_still_available_as_an_escape_hatch(
+    wiring_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reasoning_history_enabled=False restores the pre-2026-10-26 strip
+    byte-for-byte — the one-knob rollback if a client re-appends unbounded."""
+    monkeypatch.setattr(settings, "reasoning_history_enabled", False)
+    make, fake = wiring_env
+    key = _key()
+    tc = make(key)
+    dirty = _turn1()
+    dirty[1]["reasoning_content"] = "chain of thought"
     dirty[2]["reasoning"] = "more scratch"
     r = tc.post("/v1/chat/completions", json={"model": MODEL, "messages": dirty}, headers=RELAY_HEADERS)
     assert r.status_code == 200, r.text
     seen = _bodies(fake)[0]["messages"]
     assert all("reasoning_content" not in m and "reasoning" not in m for m in seen)
-    key_id, thread_id = _sole_row(fake, key.id)
-    stored = json.loads(fake.rows[(key_id, thread_id)])
-    assert all("reasoning_content" not in m and "reasoning" not in m for m in stored)
 
 
 def test_wiring_non_relay_request_captures_but_never_rewrites(wiring_env, monkeypatch: pytest.MonkeyPatch) -> None:

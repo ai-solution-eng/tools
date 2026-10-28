@@ -92,6 +92,14 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+-- mcp_admin (2026-10-26 hardening plan P0-3): the sqlhandler admin_* tools
+-- (admin_grants / admin_key_mint / admin_key_revoke / admin_policy_set) are
+-- reachable over the federated /mcp surface today for ANY key holding the
+-- grant — including a model-driven key. Minting a key mints a credential
+-- that outlives the session AND bypasses the gateway ACL entirely, so the
+-- MCP surface refuses admin_* unless the key carries this explicit opt-in.
+-- DEFAULT FALSE is the control: existing keys do NOT acquire the capability.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS mcp_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- ============================================================================
 -- Identity (Phase A of the fleet identity architecture — the identity
@@ -225,7 +233,7 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
 -- are checked — VALIDATE later if desired).
 ALTER TABLE usage_ledger DROP CONSTRAINT IF EXISTS ck_ledger_status;
 ALTER TABLE usage_ledger ADD CONSTRAINT ck_ledger_status
-    CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked')) NOT VALID;
+    CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked','policy_blocked','denied')) NOT VALID;
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cached_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6);
 
@@ -815,6 +823,70 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit(actor_key_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_admin_audit_resource ON admin_audit(resource_type, resource_id, ts DESC);
+
+-- ============================================================================
+-- Hash-chained audit (2026-10-26 hardening plan P2-2)
+-- ============================================================================
+-- applygate's audit file is hash-chained; the GATEWAY's own record of who
+-- asked for what was not. For the exfiltration attack class the model-side
+-- record is the one that matters, and it was the weaker trail: an operator
+-- with DB access could edit or delete rows and nothing would notice.
+--
+-- Two trails get chained:
+--   * admin_audit    - control plane (key minting, grants, registry edits).
+--   * mcp_call_audit - the MCP tool calls themselves (server/tool/argument
+--     DIGEST/outcome), i.e. the 'which model asked for what' record. Its
+--     volume is tool-call-rate, not chat-rate, so per-row chaining is
+--     affordable there in a way it is NOT on usage_ledger (whose INSERT arg
+--     tuple is positional and whose write is on the hot path - deliberately
+--     out of scope for this wave; see documentation/HARDENING-2026-10-26.md).
+--
+-- Chain shape: row_hash = sha256(prev_hash || '|' || canonical row text).
+-- The first row's prev_hash is ''. Verification walks id ASC and reports the
+-- first row whose prev_hash differs from the previous row's row_hash
+-- (tamper, deletion, or a concurrent-write fork).
+ALTER TABLE admin_audit ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_audit ADD COLUMN IF NOT EXISTS row_hash  TEXT NOT NULL DEFAULT '';
+-- details_sha256: the chain covers the REDACTED details payload by DIGEST,
+-- computed in Python at write time. Chaining over the JSONB column itself
+-- would depend on jsonb's text rendering (key order, spacing) matching the
+-- verifier's, which is not a contract worth betting the trail on.
+ALTER TABLE admin_audit ADD COLUMN IF NOT EXISTS details_sha256 TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_admin_audit_row_hash ON admin_audit(row_hash);
+
+CREATE TABLE IF NOT EXISTS mcp_call_audit (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    key_id      UUID,                       -- calling virtual key (no FK: ledger convention)
+    server      TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    -- DIGEST, never the arguments: the trail must answer 'what was asked'
+    -- without becoming a second copy of the payload (and without storing
+    -- whatever the model may have been exfiltrating).
+    args_sha256 TEXT NOT NULL DEFAULT '',
+    args_bytes  INTEGER NOT NULL DEFAULT 0,
+    outcome     TEXT NOT NULL,              -- ok|error|denied|policy_blocked
+    model       TEXT NOT NULL DEFAULT '',   -- serving model when known ('' = unattributed)
+    request_id  TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',   -- bounded reason token / short error class
+    prev_hash   TEXT NOT NULL DEFAULT '',
+    row_hash    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_call_audit_ts ON mcp_call_audit(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_call_audit_key ON mcp_call_audit(key_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_call_audit_tool ON mcp_call_audit(server, tool, ts DESC);
+
+-- FORK GUARD (wave-2 review P2-3): prev_hash is read in the inserting statement,
+-- so two concurrent writers can chain from the SAME prev - a FORK, not a tamper.
+-- A partial unique index makes the second writer FAIL instead, and the writer
+-- retries (it re-reads prev on the next attempt). Without this the verifier is
+-- permanently red on a busy gateway, i.e. the tamper detector is red from birth
+-- and cannot be distinguished from a real edit. Partial: the empty prev (the
+-- first row, and every row written by the degraded unchained path) is exempt.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_call_audit_prev
+    ON mcp_call_audit(prev_hash) WHERE prev_hash <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_admin_audit_prev
+    ON admin_audit(prev_hash) WHERE prev_hash <> '';
 
 -- ============================================================================
 -- Load-aware cascade stickiness (auto entry, off-peak-driven). ADDITIVE /

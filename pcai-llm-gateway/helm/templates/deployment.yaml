@@ -201,6 +201,13 @@ spec:
             # remaining wall clock (>=10s left to attempt). 0 = fail fast.
             - name: PCAI_LLM_TOOL_RELAY_CALL_RETRIES
               value: {{ .Values.settings.toolRelayCallRetries | int | quote }}
+            # Reasoning continuity (2026-10-26): re-feed the model its own prior
+            # reasoning, CAPPED. The cap is what keeps the 2026-09-18 unbounded
+            # re-append storm structurally impossible.
+            - name: PCAI_LLM_REASONING_HISTORY_ENABLED
+              value: {{ if hasKey .Values.settings "reasoningHistoryEnabled" }}{{ .Values.settings.reasoningHistoryEnabled | quote }}{{ else }}"true"{{ end }}
+            - name: PCAI_LLM_REASONING_HISTORY_MAX_CHARS
+              value: {{ .Values.settings.reasoningHistoryMaxChars | default 2000 | int | quote }}
             # How relay tools are granted: 'scope' (mcp-scoped keys get all
             # policy-admitted server tools) or 'explicit' (hand-granted
             # (server, tool) pairs only — console: Keys ▸ MCP).
@@ -238,8 +245,7 @@ spec:
               value: {{ .Values.settings.routingTier1Tokens | int | quote }}
             - name: PCAI_LLM_ROUTING_TIER2_TOKENS
               value: {{ .Values.settings.routingTier2Tokens | int | quote }}
-            - name: PCAI_LLM_ROUTING_TOOL_BYTES_PER_TOKEN
-              value: {{ .Values.settings.routingToolBytesPerToken | int | quote }}
+
             - name: PCAI_LLM_ROUTING_TURN_ADDER_TOKENS
               value: {{ .Values.settings.routingTurnAdderTokens | int | quote }}
             # Conversation stickiness (never-downgrade) + default-model promotion.
@@ -258,6 +264,39 @@ spec:
               value: {{ .Values.settings.mcpCatalogCacheS | quote }}
             - name: PCAI_LLM_MCP_FAILOVER_ATTEMPTS
               value: {{ .Values.settings.mcpFailoverAttempts | int | quote }}
+            # --- argument-level policy stage (hardening P0-1) ---
+            # Rendered only when the operator sets them: the app defaults are
+            # already the intended posture (enforce / deny cluster hosts /
+            # resolve / telemetry on), so a default install renders the same
+            # env as before this wave.
+            {{- if hasKey .Values.settings "mcpArgPolicy" }}
+            - name: PCAI_LLM_MCP_ARG_POLICY
+              value: {{ .Values.settings.mcpArgPolicy | quote }}
+            {{- end }}
+            {{- if .Values.settings.mcpArgPolicyExempt }}
+            - name: PCAI_LLM_MCP_ARG_POLICY_EXEMPT
+              value: {{ .Values.settings.mcpArgPolicyExempt | quote }}
+            {{- end }}
+            {{- if .Values.settings.mcpArgEgressServers }}
+            - name: PCAI_LLM_MCP_ARG_EGRESS_SERVERS
+              value: {{ .Values.settings.mcpArgEgressServers | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "mcpArgDenyClusterHosts" }}
+            - name: PCAI_LLM_MCP_ARG_DENY_CLUSTER_HOSTS
+              value: {{ .Values.settings.mcpArgDenyClusterHosts | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "mcpArgPolicyResolve" }}
+            - name: PCAI_LLM_MCP_ARG_POLICY_RESOLVE
+              value: {{ .Values.settings.mcpArgPolicyResolve | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "mcpArgTelemetry" }}
+            - name: PCAI_LLM_MCP_ARG_TELEMETRY
+              value: {{ .Values.settings.mcpArgTelemetry | quote }}
+            {{- end }}
+            {{- if hasKey .Values.settings "mcpSeparateReadEgress" }}
+            - name: PCAI_LLM_MCP_SEPARATE_READ_EGRESS
+              value: {{ .Values.settings.mcpSeparateReadEgress | quote }}
+            {{- end }}
             # --- router extras (review §4a/4b/4c; ledger authoritative) ---
             # Per-model fallback chains: max fallback MODELS tried after the
             # primary cannot serve (no healthy endpoint / upstream 5xx). 0 =

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pcai-llm-gateway"
-version = "3.0.3"
+version = "3.2.1"
 description = "Multi-tenant LLM + MCP gateway for HPE PCAI: OpenAI-compatible proxy over aggregated model endpoints, MCP federation with per-tool ACLs, virtual API keys with token budgets and an atomic usage ledger."
 readme = "README.md"
 requires-python = ">=3.11"

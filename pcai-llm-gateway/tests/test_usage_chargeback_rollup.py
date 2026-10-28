@@ -47,8 +47,20 @@ class _RollupDB:
     async def fetchrow(self, sql: str, *a: Any):
         return {"requests": 0}
 
+    async def fetchval(self, sql: str, *a: Any):
+        # MIN(ts) drives the console's retained-history label; None = empty
+        # ledger. Without this stub /admin/usage/summary 500s on
+        # AttributeError before any grouping assertion runs.
+        if "min(ts)" in sql.lower():
+            return None
+        return 0
+
     async def fetch(self, sql: str, *a: Any):
-        if "GROUP BY k.name" in sql or "key_name" in sql:
+        # Capture the PARENT by-key rollup specifically. The per-model
+        # breakdown (2026-10-26) groups by k.name too, so a looser predicate
+        # let the child query overwrite the parent's SQL and broke the
+        # grouping assertions below. `AS generations` is unique to the parent.
+        if "AS generations" in sql:
             self.by_key_sql = sql
         return []
 

@@ -49,7 +49,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits Chart.yaml appVersion.
-  tag: v3.0.3
+  tag: v3.2.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -193,6 +193,17 @@ settings:
   # Bounded model-call retries PER RELAY TURN; spends only the REMAINING wall clock
   # and fires when >=10s of it is left. 0 = fail fast.
   toolRelayCallRetries: 1
+  # Reasoning continuity (2026-10-26): show the model its OWN prior reasoning —
+  # both in-loop (between tool calls) and inbound (what the client replays).
+  # With this off, a long relay turn hands the model dozens of consecutive
+  # examples of itself calling tools with no thinking, which teaches it to skip
+  # reasoning (measured: 86.1% of relayed tool-call steps carried none, vs 46.1%
+  # direct). The CAP is the storm guard: the 2026-09-18 incident was UNBOUNDED
+  # per-cycle growth (one event reached 6,630 copies of a line, ~401 KB); with a
+  # 2000-char cap a 32-iteration turn tops out near 63 KB. Set enabled=false to
+  # restore the old full strip byte-for-byte.
+  reasoningHistoryEnabled: true
+  reasoningHistoryMaxChars: 2000
   # 'scope' = every mcp-scoped key gets the policy-admitted tools of all enabled
   # servers; 'explicit' = only hand-granted (server, tool) pairs.
   toolRelayGrantMode: explicit    # 'explicit' (default): keys see ONLY held (profile-preset ∪ own ACL) pairs — the profile is the envelope
@@ -218,7 +229,6 @@ settings:
   routingEnabled: true
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
-  routingToolBytesPerToken: 64
   routingTurnAdderTokens: 100
   # Conversation stickiness (never-downgrade): a routed conversation holds a capability
   # FLOOR and may escalate above it but never fall below it. Off by default - it changes
@@ -236,6 +246,22 @@ settings:
   mcpFlatTools: true
   mcpCatalogCacheS: 60.0
   mcpFailoverAttempts: 2
+  # Argument-level destination policy (hardening P0-1): runs on BOTH MCP paths
+  # (/mcp and the relay, i.e. the tool calls a model makes during a chat turn).
+  # enforce | warn | off; an unrecognised value fails CLOSED to enforce.
+  # Blocks WHERE a tool may send a request, not WHAT it sends.
+  mcpArgPolicy: enforce
+  # Comma-separated server.tool globs exempt from the argument stage ("" = none).
+  mcpArgPolicyExempt: ""
+  # Egress-class server globs ("" = the federation egress class, searxng).
+  mcpArgEgressServers: ""
+  mcpArgDenyClusterHosts: true
+  mcpArgPolicyResolve: true
+  mcpArgTelemetry: true
+  # Read+egress separation (P0-3): warn (default) | enforce | off. warn flags
+  # a key holding BOTH a read and an egress grant; enforce refuses every call
+  # from such a key, so split the keys first (see documentation/DEPLOYMENT.md).
+  mcpSeparateReadEgress: warn
   # Per-model fallback chains are admin-curated (GET/PUT /admin/models/{name}/fallbacks);
   # this caps the fallback models tried. 0 = chains never walked.
   modelFallbackMax: 2

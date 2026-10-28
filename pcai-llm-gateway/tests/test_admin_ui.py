@@ -31,6 +31,10 @@ class FakeConn:
     async def fetchrow(self, sql: str, *a: Any):
         return {"id": uuid.uuid4()}
 
+    async def fetchval(self, sql, *a):
+        # MIN(ts) for the retained-history label; None = empty ledger
+        return None
+
     async def execute(self, sql: str, *a: Any):
         self._db.executed.append((sql, a))
         return "OK"
@@ -56,6 +60,11 @@ class FakeDB:
     def acquire(self):
         return FakeConn(self)
 
+    def acquire_bounded(self):
+        # The settlement path takes this; without it the real pool raises
+        # 'database not connected' and /admin/usage/summary 500s.
+        return FakeConn(self)
+
     async def fetchrow(self, sql: str, *a: Any):
         self.fetchrows.append((sql, a))
         if "FROM profiles" in sql:
@@ -77,6 +86,9 @@ class FakeDB:
         return []
 
     async def fetchval(self, sql: str, *a: Any):
+        # MIN(ts) drives the retained-history label; None = empty ledger.
+        if "min(ts)" in sql.lower():
+            return None
         if "count(*)" in sql.lower():
             return 0
         return 1
@@ -257,6 +269,8 @@ def test_settle_computes_cost_and_excludes_cache_hit(monkeypatch: pytest.MonkeyP
             return None
 
         async def fetchval(self, sql, *a):
+            if "min(ts)" in sql.lower():
+                return None
             return 0
 
     fake = CostDB()
@@ -474,6 +488,10 @@ def test_usage_summary_wire_contract_json_numbers(monkeypatch: pytest.MonkeyPatc
                 "billed_cost_usd": 126.5955,
             }
 
+        async def fetchval(self, sql, *a):
+            # MIN(ts) for the retained-history label; None = empty ledger
+            return None
+
         async def fetch(self, sql: str, *a: Any):
             if "GROUP BY model" in sql:
                 assert "::bigint" in sql, "by-model token sums must be ::bigint too"
@@ -565,17 +583,25 @@ def test_usage_summary_queries_are_interpolated_and_windowed(monkeypatch: pytest
             captured.append(("fetchrow", sql, args))
             return {}
 
+        async def fetchval(self, sql, *a):
+            # MIN(ts) for the retained-history label; None = empty ledger
+            return None
+
         async def fetch(self, sql, *args):
             captured.append(("fetch", sql, args))
             return []
 
     monkeypatch.setattr(ra, "db", CapDB())
     asyncio.run(ra.usage_summary(None, since=None))
-    assert len(captured) == 3
+    # FOUR queries since 2026-10-26: totals, by_model, by_key, and the
+    # per-key-per-model breakdown that powers the expandable rows.
+    assert len(captured) == 4
     for kind, sql, args in captured:
         assert "{" not in sql, f"{kind}: literal brace in SQL (not an f-string): {sql[:120]}"
         assert len(args) == 2, f"{kind}: expected the 2 window params, got {len(args)}"
         assert "WHERE ts >=" in sql or "WHERE l.ts >=" in sql, f"{kind}: window condition missing"
+    # the breakdown must GROUP BY model or it cannot split a key's traffic
+    assert any("GROUP BY k.name, u.name, l.model" in sql for _k, sql, _a in captured)
 
 
 # ---------------------------------------------------------------------------

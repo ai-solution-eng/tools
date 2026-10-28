@@ -344,6 +344,69 @@ def _routing_available(key: KeyRecord) -> Callable[[str], bool]:
     return _ok
 
 
+async def _routing_incumbent_state(
+    key: Any, body: dict[str, Any]
+) -> tuple[str | None, str | None, Any]:
+    """(incumbent, sticky_floor, sticky_writer) for one routed request.
+
+    Extracted from the request path so the bootstrap chain is TESTABLE.
+    It was inline, and that is why the same defect shipped twice: unit tests
+    passed an incumbent in directly, so nothing exercised the code that
+    PRODUCES one -- gating the writer behind sticky_routing left the incumbent
+    permanently None while every test stayed green.
+
+    Contract:
+      * incumbent -- the conversation's current model, read UNCONDITIONALLY
+        (hysteresis is a cost guard and must work with never-downgrade off).
+      * sticky_floor -- the never-downgrade floor, opt-in via sticky_routing
+        (it CHANGES which model serves, unlike the incumbent which only
+        informs a cost decision).
+      * writer -- built UNCONDITIONALLY whenever a conversation fingerprint
+        exists. This function is the only producer of a routing-scoped
+        sticky row; without the writer the incumbent can never exist.
+
+    Fail-open: any fault returns (None, None, None) -- plain routing.
+    """
+    incumbent: str | None = None
+    floor: str | None = None
+    writer = None
+    try:
+        from ..core import routing_config as _rc
+        from ..core import stickiness as _sticky
+
+        cfg = await _rc.get_config()
+        # NAMESPACED: model_stickiness is shared with the cascade's
+        # load-aware head (auto-demand-aware), which keys on the SAME
+        # conversation fingerprint. Without this prefix a cascade head
+        # silently became routing's capability floor and pinned every
+        # later routed turn to it (defect fix 2026-10-23).
+        thread = _sticky.scoped_thread_key(
+            canonical.thread_key(body.get("messages") or [], key.id),
+            _sticky.SCOPE_ROUTING,
+        )
+        if not thread:
+            return None, None, None
+        sticky_on = bool(cfg.get("sticky_routing"))
+        idle = int(cfg.get("sticky_routing_idle_reset_s") or 0)
+        row = await _sticky.get_sticky_row(key.id, thread)
+        if row is not None:
+            model, age = row
+            if idle > 0 and age > idle:
+                # Idle reset: the thread went quiet long enough that the old
+                # model says nothing about the new work -- neither a floor NOR
+                # an incumbent worth defending.
+                await _sticky.drop_sticky(key.id, thread)
+            else:
+                incumbent = model
+                if sticky_on:
+                    floor = model
+        # UNCONDITIONAL (see the docstring): this is the only writer.
+        writer = _sticky.make_writer(key.id, thread)
+    except Exception:
+        log.warning("routing: incumbent/sticky lookup failed - plain routing", exc_info=True)
+        return None, None, None
+    return incumbent, floor, writer
+
 def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..., Any] | None:
     """Build the System One caller for the configured decision model.
 
@@ -370,7 +433,13 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
     url = base + "/systemone"
     instructions = policy.get("prompt") or decision_routing.DEFAULT_INSTRUCTIONS
 
-    async def _call(state: str, _instructions: str, candidates: list[str], timeout_ms: int) -> Any:
+    async def _call(
+        state: str,
+        _instructions: str,
+        candidates: list[str],
+        timeout_ms: int,
+        images: list[str] | None = None,
+    ) -> Any:
         # The operator prompt, when set, REPLACES the default instructions;
         # the {{models}}/{{gpu_load}} placeholders are rendered by
         # routing_config so the same text the panel previews is the text the
@@ -379,9 +448,15 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
 
         text = instructions
         if "{{" in text:
-            gpu = await routing_config.gpu_load_snapshot()
+            # Honour the operator's inject_gpu_load flag, exactly as the panel
+            # preview does (routes_admin.preview_routing_prompt). Forcing
+            # inject=True here made the live call disagree with the preview: a
+            # site with injection OFF still sent real GPU numbers, so the text
+            # the operator approved was not the text the model received.
+            cfg = await routing_config.get_config()
+            gpu = {**await routing_config.gpu_load_snapshot(), "inject": bool(cfg.get("inject_gpu_load"))}
             text = routing_config.render_prompt(
-                text, gpu={**gpu, "inject": True}, models=candidates, decision_model=decision_model
+                text, gpu=gpu, models=candidates, decision_model=decision_model
             )
         payload = {
             "model": decision_model,
@@ -396,9 +471,28 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
                 }
             },
         }
+        # Images so a vision-capable decision model can READ the request rather
+        # than infer "there is an image" from a boolean. data: URLs pass
+        # through untouched; a remote http(s) URL is passed as-is and the
+        # endpoint fetches it (the model card documents both forms).
+        if images:
+            payload["images"] = list(images)
         headers = dict(_upstream_headers(ep, uuid.uuid4().hex[:12]))
         headers["Content-Type"] = "application/json"
-        resp = await model_router.client.post(url, json=payload, headers=headers, timeout=timeout_ms / 1000.0)
+        try:
+            resp = await model_router.client.post(
+                url, json=payload, headers=headers, timeout=timeout_ms / 1000.0
+            )
+        except Exception as exc:
+            # httpx2's TimeoutException does NOT inherit builtin TimeoutError
+            # (it is TransportError -> HTTPError), so decision_routing's
+            # `except TimeoutError` would classify a real timeout as
+            # call_failed. Translate here: decision_routing must stay
+            # import-light (no httpx2 import), and this keeps the reason
+            # taxonomy honest for the metric split above.
+            if "imeout" in type(exc).__name__:
+                raise TimeoutError(str(exc)) from exc
+            raise
         resp.raise_for_status()
         return resp.json()
 
@@ -1249,6 +1343,9 @@ def _relay_fallback_tail(serving: str, order: list[str], registered: set[str], a
 async def _relay_executor(
     key: KeyRecord,
     request_id: str,
+    *,
+    grants: set[tuple[str, str]] | None = None,
+    served_model: str = "",
 ):
     """Build the relay's MCP executor: ledger-settled, ACL-rechecked,
     in-cluster call to the upstream MCP server.
@@ -1258,11 +1355,72 @@ async def _relay_executor(
     here too — tightening a server to 'allowlist' or exhausting the key's
     rate budget must cut off the RELAY path exactly as it cuts off /mcp,
     otherwise the automated path is a policy bypass.
+
+    THIS IS THE MODEL-DRIVEN PATH. Every tool call a model makes during a
+    relay turn lands in `execute` below, so the argument-level policy stage
+    (hardening P0-1) runs HERE as well as in /mcp's `_gated_mcp_call`: the
+    SAME `mcpf.arg_policy.gate_call` (admin-tool refusal -> argument
+    destination policy -> payload telemetry -> read+egress separation), same
+    order, same 'policy_blocked' ledger status. A refusal returns
+    (False, message) — this path's contract, which the relay surfaces to the
+    model as a tool error — and never opens an upstream session.
+
+    grants: the key's effective (server, tool) grant set, already computed by
+    the caller (relay_grants). Only the read+egress separation needs it; the
+    relay route already enforced the key ACL before calling us. None skips
+    that one item (a direct caller that has no grant set in hand).
     """
     from mcp import ClientSession
 
+    from ..core.chain_audit import write_mcp_call
+    from ..mcpf import arg_policy
     from ..mcpf.federation import server_allows
     from .routes_mcp import _upstream_session, resolve_mcp_headers
+
+    _ctor_model = served_model
+
+    async def record(
+        server: str, tool: str, arguments: dict, status: str, model: str = ""
+    ) -> None:
+        served_model = model or _ctor_model
+        # ONE terminal outcome for a relay tool call: ledger row + P2-1 metric
+        # + P2-2 chained audit row.
+        #
+        # The ledger row names a model when one is known (served_model) instead
+        # of always the historical star placeholder - that placeholder is why
+        # the ledger could not attribute a tool call to a model at all, which is
+        # the P1-1 prerequisite.
+        #
+        # STATUS (honest): on the RELAY path served_model is still empty, so
+        # these rows read model="*" exactly as before. Threading the relay
+        # turn's served model here was attempted and REVERTED: the executor's
+        # 3-arg contract is shared with core.clientside and faked by ~25 tests,
+        # and a keyword-only model= broke 16 of them. The seam is ready (the
+        # model= parameter exists and wins when supplied); the wiring needs a
+        # contract change done deliberately, with those fakes updated. Until
+        # then the MCP attribution this wave DOES deliver is the chained
+        # mcp_call_audit row (server/tool/digest/outcome/request_id), which is
+        # per-call and greppable even without the model label.
+        #
+        # policy_blocked is counted by mcpf.arg_policy._count_block, so the
+        # metric is ticked here only for ok/error (no double count).
+        try:
+            await settle(
+                key.id, served_model or "*", f"mcp:{server}:{tool}", 0, 0, status, 0, request_id
+            )
+        except Exception:
+            log.exception("relay: settle failed (%s %s/%s)", status, server, tool)
+        if status in ("ok", "error", "denied"):
+            _metrics.observe_mcp_call(server, status, served_model)
+        await write_mcp_call(
+            key_id=key.id,
+            server=server,
+            tool=tool,
+            arguments=arguments,
+            outcome=status,
+            model=served_model,
+            request_id=request_id,
+        )
 
     async def execute(server: str, tool: str, arguments: dict) -> tuple[bool, Any]:
         servers = {sv["name"]: sv for sv in await registry.mcp_servers()}
@@ -1273,7 +1431,7 @@ async def _relay_executor(
         # cross-request loop guard BEFORE anything touches an upstream
         guard_reason = loop_guard_check(key.id, server, tool, arguments)
         if guard_reason:
-            await settle(key.id, "*", f"mcp:{server}:{tool}", 0, 0, "error", 0, request_id)
+            await record(server, tool, arguments, "denied")
             return False, guard_reason
 
         # rate gate FIRST (same order as /mcp: burst-guard before anything
@@ -1281,15 +1439,32 @@ async def _relay_executor(
         # the RPM axis
         rate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, 0)
         if not rate.ok:
-            await settle(key.id, "*", f"mcp:{server}:{tool}", 0, 0, "error", 0, request_id)
+            await record(server, tool, arguments, "denied")
             return False, f"rate limited: {rate.reason}"
 
         # per-server tool-policy gate (defense-in-depth over the key ACL,
         # which relay_stream already enforced before calling us)
         if not server_allows(target, tool):
             _metrics.observe_acl_denial(server)
-            await settle(key.id, "*", f"mcp:{server}:{tool}", 0, 0, "error", 0, request_id)
+            await record(server, tool, arguments, "denied")
             return False, "denied by server policy"
+
+        # argument/grant-level policy stage (hardening P0-1): the SAME call,
+        # in the SAME order, as /mcp's gate chain — admin-tool refusal,
+        # argument destination policy, payload telemetry, read+egress
+        # separation. Runs AFTER the tool-policy gate and BEFORE
+        # resolve_mcp_headers/_upstream_session: a refusal must not build
+        # credentials or open a session to the server it refuses to reach.
+        decision = arg_policy.gate_call(
+            server,
+            tool,
+            arguments,
+            key_mcp_admin=getattr(key, "mcp_admin", False),
+            grants=grants,
+        )
+        if decision.refused:
+            await record(server, tool, arguments, "policy_blocked")
+            return False, decision.message
 
         # Header build WITH the calling key: resolve_mcp_headers merges the
         # key's per-key MCP credential overrides after the server-level auth
@@ -1303,10 +1478,10 @@ async def _relay_executor(
             result = await _upstream_session(target["url"], headers, do)
         except Exception as exc:
             log.warning("relay: %s/%s failed: %s", server, tool, exc)
-            await settle(key.id, "*", f"mcp:{server}:{tool}", 0, 0, "error", 0, request_id)
+            await record(server, tool, arguments, "error")
             return False, f"upstream failed: {type(exc).__name__}"
         ok = not result.is_error
-        await settle(key.id, "*", f"mcp:{server}:{tool}", 0, 0, "ok" if ok else "error", 0, request_id)
+        await record(server, tool, arguments, "ok" if ok else "error")
         content = [b.model_dump(mode="json", exclude_none=True) for b in result.content]
         return ok, content
 
@@ -2529,6 +2704,25 @@ async def chat_completions(
         # special cases and the cascade reuse ONE lookup; resolve_cascade
         # re-fetches internally for its own walk (unchanged).
         order = await profile_order_for_key(key.id) if _routable else []
+        # --- conversation incumbent -----------------------------------------
+        # Read BEFORE the decision seam because the seam needs the
+        # conversation's CURRENT model for two things:
+        #   1. switch_cost/current_model in the decision state, so the model can
+        #      weigh the re-prefill a switch would cost; and
+        #   2. hysteresis, so a challenger must beat the incumbent by a margin.
+        # Read UNCONDITIONALLY -- hysteresis must work even when
+        # never-downgrade (sticky_routing) is off, and that is the default.
+        # Fail-open: a stickiness fault means "no incumbent" (plain routing).
+        # The incumbent AND the never-downgrade floor are read here, ONCE, and
+        # the sticky WRITER is built unconditionally. That last part is load-
+        # bearing: this block is the only writer of a `routing:`-scoped row, so
+        # gating it behind sticky_routing (default False) left _incumbent
+        # permanently None and made the whole hysteresis feature inert in the
+        # shipped default (dual review 2026-10-26, HIGH). Hysteresis is a COST
+        # guard -- it must work without opting into never-downgrade.
+        _incumbent, _sticky_floor, _sticky_write = await _routing_incumbent_state(key, body)
+
+
         # --- decision-model seam -------------------------------------------
         # Built only for a pseudo-model request on an opted-in profile: a
         # direct (pinned) request never consults the router at all, and
@@ -2536,6 +2730,7 @@ async def chat_completions(
         # decision_mode "off" (the default) passes decide=None, so this whole
         # block is inert and the heuristic path is byte-identical.
         decide_fn = None
+        _policy: dict[str, Any] = {}
         if _routable:
             from ..core import routing_config as _rc
 
@@ -2545,11 +2740,41 @@ async def chat_completions(
                 if _caller is not None:
                     from ..core import decision_routing as _dr
 
-                    async def decide_fn(candidates, _body, score, _c=_caller, _p=_policy):
+                    async def decide_fn(candidates, _body, score, _c=_caller, _p=_policy, _inc=_incumbent):
                         from ..core import routing_config as _rc2
 
                         gpu = await _rc2.gpu_load_snapshot()
-                        state = _dr.build_state(_body, complexity=score, candidates=candidates, gpu=gpu)
+                        # Images the decision model may READ. Only offered when
+                        # the request carries them; bounded so a 40-image dump
+                        # cannot blow the decision latency budget.
+                        _imgs = _dr.extract_user_turn(_body)[1][: _dr.MAX_DECISION_IMAGES]
+                        state = _dr.build_state(
+                            _body,
+                            complexity=score,
+                            candidates=candidates,
+                            gpu=gpu,
+                            modalities=_p.get("modalities") or None,
+                            # What this conversation is ALREADY served by, so
+                            # the model can weigh the re-prefill a switch costs.
+                            current_model=_inc,
+                        )
+                        # The decision is otherwise unobservable after the
+                        # fact: nothing logs what the model was shown, so a
+                        # wrong pick can only be explained by reproducing the
+                        # request by hand. The user's turn is ELIDED: this runs
+                        # on every decision (a few per minute per active key)
+                        # and the gateway is multi-tenant, so logging it whole
+                        # would put user content into INFO logs at volume.
+                        try:
+                            _shown = json.loads(state)
+                            _req = _shown.get("request") or {}
+                            for _field in ("user_message", "user_task"):
+                                _val = _req.get(_field)
+                                if isinstance(_val, str):
+                                    _req[_field] = f"{_val[:80]}...({len(_val)} chars)"
+                            log.info("decision state: %s", json.dumps(_shown, sort_keys=True))
+                        except Exception:
+                            log.info("decision state: <%d chars, unparseable>", len(state))
                         result = await _dr.decide(
                             _c,
                             state=state,
@@ -2557,6 +2782,7 @@ async def chat_completions(
                             candidates=candidates,
                             min_confidence=_p["min_confidence"],
                             timeout_ms=_p["timeout_ms"],
+                            images=_imgs,
                         )
                         return model_routing.DecisionOutcome(
                             ok=result.ok,
@@ -2567,61 +2793,11 @@ async def chat_completions(
                             # records how CLOSE the call was, not just the winner
                             # (2026-10-23: needed to tune the confidence floor).
                             probabilities=dict(result.probabilities),
+                            # Measured seam latency, for the decision-latency
+                            # histogram (the user-facing cost of routing).
+                            latency_ms=result.latency_ms or None,
                         )
 
-        # --- conversation stickiness (never-downgrade) ----------------------
-        # OFF by default (sticky_routing). When on, the conversation's last
-        # SERVED routed model is passed down as a capability floor: the router
-        # may escalate above it but never below it, so a thread that opened
-        # with "hi" cannot pin a later hard refactor to the cheap model.
-        #
-        # The floor keys on the SAME conversation fingerprint the canonical
-        # store uses (core.canonical.thread_key). It is computed here rather
-        # than reusing the cascade's _cascade_thread because that one is built
-        # BELOW this block (post-routing); the fingerprint is a pure hash of
-        # the key and the first user message, so recomputing it is cheap and
-        # cannot disagree.
-        #
-        # Fail-open at every step: a stickiness or fingerprint fault simply
-        # means "no floor" (plain routing), never a failed request.
-        _sticky_floor: str | None = None
-        _sticky_write = None
-        try:
-            from ..core import routing_config as _rcs
-
-            _sk_cfg = await _rcs.get_config()
-            if bool(_sk_cfg.get("sticky_routing")):
-                from ..core import stickiness as _sticky
-
-                # NAMESPACED: model_stickiness is shared with the cascade's
-                # load-aware head (auto-demand-aware), which keys on the SAME
-                # conversation fingerprint. Without this prefix a cascade head
-                # silently became routing's capability floor and pinned every
-                # later routed turn to it (defect fix 2026-10-23).
-                _sk_thread = _sticky.scoped_thread_key(
-                    canonical.thread_key(body.get("messages") or [], key.id),
-                    _sticky.SCOPE_ROUTING,
-                )
-                if _sk_thread:
-                    _sk_idle = int(_sk_cfg.get("sticky_routing_idle_reset_s") or 0)
-                    _sk_row = await _sticky.get_sticky_row(key.id, _sk_thread)
-                    if _sk_row is not None:
-                        _sk_model, _sk_age = _sk_row
-                        if _sk_idle > 0 and _sk_age > _sk_idle:
-                            # Idle reset: the thread went quiet long enough that
-                            # the old floor says nothing about the new work.
-                            await _sticky.drop_sticky(key.id, _sk_thread)
-                        else:
-                            _sticky_floor = _sk_model
-                    # The writer persists whatever the router SERVES, so an
-                    # ESCALATION ratchets the floor up and a held floor is
-                    # refreshed (which is also what makes the idle timer mean
-                    # "last activity" rather than "last escalation").
-                    _sticky_write = _sticky.make_writer(key.id, _sk_thread)
-        except Exception:
-            log.warning("routing: sticky floor unavailable - plain routing", exc_info=True)
-            _sticky_floor = None
-            _sticky_write = None
 
         model, route_ctx = await model_routing.resolve_routed_model(
             key,
@@ -2636,6 +2812,8 @@ async def chat_completions(
             sticky_write=_sticky_write,
             route_default=_rdef,
             routable_models=_routable_models,
+            incumbent=_incumbent,
+            switch_margin=float(_policy.get("switch_margin") or 0.0) if _policy else 0.0,
         )
         # ACTIVE mode: the routed model IS the request's effective pinned
         # model — the admission failover below must classify it as pinned.
@@ -2738,18 +2916,43 @@ async def chat_completions(
     # down — same posture as the webhook engine); blocks/masks apply.
     guardrail_pre: list[Any] = []
     guardrail_post: list[Any] = []
-    # Strip reasoning_content / reasoning from INBOUND message history before
-    # anything downstream sees it (guardrails, token gates, the upstream).
-    # Chat models don't consume reasoning blocks; some reject them outright.
-    # Clients whose agent loop re-appends streamed reasoning (DSH 2026-09-18)
-    # otherwise inflate every handback cycle's input by the whole accumulated
-    # block — streamed OUT for review, never sent BACK in. Deliberately
-    # message-shape-preserving: only the reasoning key is dropped, everything
-    # else (content, tool_calls, ids) rides untouched.
+    # Inbound reasoning (2026-10-26, CUT 2). This used to DELETE every
+    # reasoning key from the incoming history. That was the answer to the
+    # 2026-09-18 "relay storm": a client re-appended each streamed reasoning
+    # block once per agent-loop cycle, so one stored event grew to 6,630 copies
+    # of a single line (~401 KB) and every subsequent prefill paid for it.
+    #
+    # Deleting it fixed the symptom by removing the model's own chain of
+    # thought: a relayed turn then replayed as "assistant emitted tool calls,
+    # no thinking", which teaches the model to skip reasoning. Measured over 140
+    # real sessions: 86.1% of relayed tool-call steps carried no reasoning vs
+    # 46.1% direct.
+    #
+    # The BOUND is the real fix, not the deletion. Each replayed block is capped
+    # at reasoning_history_max_chars, so growth is linear and small (a 40-message
+    # history cannot exceed 40 x cap) instead of unbounded. Verified against the
+    # served endpoint: GLM accepts its own reasoning back in every shape,
+    # including alongside tool_calls.
+    #
+    # reasoning_history_enabled=False restores the old strip byte-for-byte, and
+    # a cap of 0 also strips — either is a one-knob rollback if a client turns
+    # out to re-append without bound.
+    _reason_cap = max(0, int(settings.reasoning_history_max_chars))
+    _keep_reasoning = bool(settings.reasoning_history_enabled) and _reason_cap > 0
     for _m in body["messages"]:
-        if isinstance(_m, dict):
-            _m.pop("reasoning_content", None)
-            _m.pop("reasoning", None)
+        if not isinstance(_m, dict):
+            continue
+        for _rk in ("reasoning_content", "reasoning"):
+            _rv = _m.get(_rk)
+            if _rv is None:
+                continue
+            if not _keep_reasoning or not isinstance(_rv, str):
+                _m.pop(_rk, None)
+                continue
+            if len(_rv) > _reason_cap:
+                # Keep the TAIL (the most recent reasoning is what the next call
+                # needs) and mark the cut so the model knows it is partial.
+                _m[_rk] = "…[earlier reasoning trimmed]…" + _rv[-_reason_cap:]
 
     guard_events: list[dict[str, Any]] = []
     try:
@@ -3025,7 +3228,10 @@ async def chat_completions(
 
         if relay_requested:
             catalog, relay_grants = await _relay_catalog(key, relay_grants, requested_servers)
-            execute = await _relay_executor(key, request_id)
+            # relay_grants rides along for the argument stage's read+egress
+            # separation — already computed here, so no extra DB round-trip
+            # on the hot path.
+            execute = await _relay_executor(key, request_id, grants=relay_grants)
 
             def client_loop_guard(name: str, args: dict) -> str | None:
                 """Cross-request loop guard for CLIENT calls — same counter
@@ -3107,6 +3313,15 @@ async def chat_completions(
                 request, key, body
             )
 
+            # Synthetic tool-call id counter for the WHOLE relay turn (audit
+            # 2026-10-26, F-4). stream_model_call mints an id when an upstream
+            # omits one; the counter must not restart per model call (one call
+            # per iteration) or two iterations mint the same id and the client
+            # joins both onto one card. relay_stream owns the turn but the
+            # counter has to reach stream_model_call, which is built here — so
+            # it lives at this scope and every call closes over it.
+            relay_id_counter: list[int] = [0]
+
             def stream_once(msgs: list[dict], tools: list[dict] | None, pool_for: Any = None):
                 """One model call as an async GENERATOR of typed events.
                 `pool_for` overrides the request's pool — the relay's mid-loop
@@ -3167,7 +3382,17 @@ async def chat_completions(
                             yield ("error", str(resp.status_code))
                             yield ("content", f"(model error {resp.status_code})")
                             return
-                        async for ev in toolrelay.stream_model_call(resp):
+                        # id_prefix=request_id scopes the SYNTHETIC call ids
+                        # the relay mints when an upstream omits them (audit
+                        # 2026-10-26, F-4). It must be unique per TURN, not per
+                        # model call: stream_model_call runs once per iteration,
+                        # so a per-call counter would restart at 1 every
+                        # iteration and two iterations would mint the same id —
+                        # which the client joins by, collapsing two calls onto
+                        # one card.
+                        async for ev in toolrelay.stream_model_call(
+                            resp, id_prefix=request_id, id_counter=relay_id_counter
+                        ):
                             yield ev
                     finally:
                         await resp.aclose()

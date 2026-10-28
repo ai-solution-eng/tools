@@ -27,6 +27,7 @@ The contract these tests pin:
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -101,14 +102,94 @@ def test_parse_tolerates_a_junk_probabilities_map() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_state_is_a_summary_not_the_conversation() -> None:
+def test_state_is_bounded_not_the_whole_conversation() -> None:
     """The endpoint validated_input_tokens is 32768 and the decision costs
-    ~790ms; shipping the prompt would blow both. The state carries STRUCTURE."""
+    ~790ms; shipping a 100k-char prompt would blow both. The state carries the
+    user's LAST turn, capped -- never the full conversation."""
     body = {"messages": [{"role": "user", "content": "x" * 100000}], "tools": [{}] * 3, "max_tokens": 4096}
     state = dr.build_state(body, complexity=25000, candidates=["a", "b"])
-    assert len(state) < dr.MAX_STATE_CHARS
-    assert "x" * 1000 not in state  # the prompt text itself is NOT included
+    assert len(state) <= dr.MAX_STATE_CHARS
+    assert "x" * (dr.MAX_USER_TEXT_CHARS + 10) not in state  # capped
     assert "estimated_prompt_tokens" in state and "tool_count" in state
+
+
+def test_state_carries_the_user_text() -> None:
+    """The user's words are the ONLY per-request signal that carries intent.
+
+    Tools / system prompt / depth are constant for an agent harness. Measured
+    2026-10-26: nine queries from a greeting to a Raft implementation all scored
+    713-722 and the decision model returned an identical 0.34 for every one.
+    """
+    state = json.loads(
+        dr.build_state(
+            {"messages": [{"role": "user", "content": "review this diff for race conditions"}]},
+            complexity=700,
+            candidates=["a", "b"],
+        )
+    )
+    assert state["request"]["user_message"] == "review this diff for race conditions"
+
+
+def test_state_uses_the_last_user_turn() -> None:
+    """In an agent loop the newest user turn is the task in flight."""
+    state = json.loads(
+        dr.build_state(
+            {
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "now do the hard thing"},
+                ]
+            },
+            complexity=700,
+            candidates=["a"],
+        )
+    )
+    assert state["request"]["user_message"] == "now do the hard thing"
+
+
+def test_state_flags_images_and_modalities() -> None:
+    """An image request must be VISIBLE to the router, and a VLM candidate must
+    be distinguishable from a text-only one -- otherwise a vision request gets
+    routed to a text-only LLM."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this chart?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ]
+    }
+    state = json.loads(
+        dr.build_state(
+            body,
+            complexity=900,
+            candidates=["textonly", "vlm"],
+            modalities={"textonly": ["text"], "vlm": ["text", "image"]},
+        )
+    )
+    assert state["request"]["has_image"] is True
+    assert state["request"]["image_count"] == 1
+    assert state["request"]["user_message"] == "what is in this chart?"
+    by_name = {c["model"]: c for c in state["candidates"]}
+    assert by_name["textonly"]["modalities"] == ["text"]
+    assert "image" in by_name["vlm"]["modalities"]
+
+
+def test_state_omits_modalities_when_undeclared() -> None:
+    """Unknown capability must make NO claim -- not claim text-only, which
+    would silently exclude a model that could actually serve."""
+    state = json.loads(dr.build_state({"messages": []}, complexity=10, candidates=["a"]))
+    assert "modalities" not in state["candidates"][0]
+
+
+def test_state_text_free_body_has_no_user_message_key() -> None:
+    state = json.loads(dr.build_state({"messages": [{"role": "system", "content": "s"}]},
+                                      complexity=10, candidates=["a"]))
+    assert "user_message" not in state["request"]
 
 
 def test_state_carries_gpu_and_cost_per_candidate() -> None:

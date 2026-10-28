@@ -93,6 +93,18 @@ not deploy-time settings:
 - **Native wire tool deltas** — `settings.toolRelayStreamWireTools`
   (default false): keep false for executing stream clients (DSH); true
   only for render-without-execute clients.
+- **Reasoning continuity** — `settings.reasoningHistoryEnabled` (default
+  true) + `settings.reasoningHistoryMaxChars` (default 2000). Shows the
+  model its OWN prior reasoning, both in-loop (between tool calls) and
+  inbound (what the client replays). With it off, a long relay turn hands
+  the model dozens of consecutive examples of itself calling tools with no
+  thinking — measured 86.1% of relayed tool-call steps carried none, vs
+  46.1% direct — which teaches it to skip reasoning. The CAP is the storm
+  guard: the 2026-09-18 incident was UNBOUNDED per-cycle re-append growth
+  (one event reached 6,630 copies of a line, ~401 KB); at 2000 chars a
+  32-iteration turn tops out near 63 KB. `enabled: false` restores the old
+  full strip byte-for-byte. Note this is input that rides EVERY subsequent
+  iteration, so lower the cap if token spend matters more than continuity.
 - **Client tool dispatch** — `settings.clientToolDispatch` (default false)
   + `settings.clientToolDispatchTimeoutS` (120): set true only where a
   harness actually registers local tool offers.
