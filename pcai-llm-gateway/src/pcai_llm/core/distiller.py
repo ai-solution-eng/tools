@@ -56,6 +56,7 @@ DEFAULT_DISTILL_TOKENS = 2048
 KIND_SUMMARY = "project-summary"
 KIND_FALLBACK = "session_history"
 
+
 class DistillTruncatedError(Exception):
     """The distill reply hit the max_tokens cap mid-document.
 
@@ -66,6 +67,17 @@ class DistillTruncatedError(Exception):
     tests and operators need the cause named, and the map stage must NEVER
     see this for an intermediate part (partial notes are legitimate
     intermediates -- only the final document must be complete).
+    """
+
+
+class DistillBudgetExceeded(Exception):
+    """The caller's wall-clock budget lapsed mid-distill (audit D-6).
+
+    Raised BEFORE the next model call, never mid-call, so no spend is
+    abandoned half-done: the row simply stays due and the next sweep
+    resumes it from scratch. Distinct from DistillUnavailable (no route at
+    all) and from a model failure: nothing is wrong with the model, the
+    sweep just ran out of its share of the housekeeping loop.
     """
 
 
@@ -80,20 +92,66 @@ REQUIRED_SECTIONS = (
 )
 
 
+def _section_headers(doc: str) -> list[str]:
+    """The document's own '## ' header LINES, stripped (audit D-8).
+
+    Markdown's own rule for an ATX heading: at most THREE leading spaces.
+    Four or more is an indented code block, so a header QUOTED inside a
+    fenced/indented example is not a section of this document.
+    """
+    headers: list[str] = []
+    for line in doc.splitlines():
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if indent <= 3 and stripped.startswith("## "):
+            headers.append(stripped.strip())
+    return headers
+
+
+def _header_matches(header: str, section: str) -> bool:
+    """True when a document header line IS the required section.
+
+    Prefix match, but on the HEADER LINE and bounded at a word break, so
+    "## Key decisions & rationale" matches "## Key decisions" while a header
+    that merely embeds the words ("## Notes on ## Gotchas") does not.
+
+    COSMETIC VARIANTS ARE FORGIVEN (cross-validation XV-3): a model may
+    terminate the header with a colon ("## What we did:") or wrap it in bold
+    ("## **What we did**"). Both ARE the required section, and rejecting them
+    raised DistillTruncatedError on a COMPLETE document — which re-ran the
+    whole map-reduce on every sweep. Only these shapes are forgiven: the
+    header must still be the line's opening text.
+    """
+    if header == section or header.startswith(section + " "):
+        return True
+    if not header.startswith(section):
+        return False
+    tail = header[len(section):].replace("*", "").strip()
+    return tail == "" or tail.startswith(":")
+
+
 def document_is_complete(doc: str) -> bool:
     """True when the distilled document carries all four contract sections.
 
     Belt-and-suspenders for the finish_reason guard: some proxies/models
     drop finish_reason (returning None or "stop" on a capped reply), and a
     document cut mid-section is still detectable structurally. Case-
-    sensitive exact-prefix match on the section headers the prompt mandates.
+    sensitive match on the section headers the prompt mandates.
     A missing-header document is not necessarily truncated (a caller-supplied
     inline transcript may legitimately produce a shorter shape), so this is
     the SECOND signal, never the only one.
+
+    LINE-ANCHORED (audit D-8): this used to be `all(s in doc for s in ...)`,
+    a plain substring test, so any PROSE that happened to mention a header
+    ("...as we wrote under ## Gotchas...") satisfied it and a document with
+    no real sections passed the truncation net. Only a line that OPENS with
+    the header counts now.
     """
     if not isinstance(doc, str):
         return False
-    return all(s in doc for s in REQUIRED_SECTIONS)
+    headers = _section_headers(doc)
+    return all(any(_header_matches(h, s) for h in headers) for s in REQUIRED_SECTIONS)
+
 
 DISTILL_SYSTEM_PROMPT = (
     "You distill AI-coding-assistant session transcripts into durable memory documents for a personal knowledge base.\n"
@@ -119,7 +177,16 @@ DISTILL_SYSTEM_PROMPT = (
     "- topics: 3-8 lowercase tags for embedding retrieval.\n"
     "- Never invent. If the transcript does not establish something, omit it.\n"
     "- Omit pleasantries, transient debugging dead-ends that resolved themselves, and tool-output noise.\n"
-    "- Target 300-1200 words. Preserve exact commands, paths, digests, error messages, and config values verbatim."
+    # SHORTER IS BETTER (operator decision 2026-10-29). The old 300-1200 word
+    # target invited documents that ran past the output cap and were then
+    # REJECTED whole by document_is_complete() (missing trailing sections), so
+    # a rambling summary cost the memory write entirely. A tighter target keeps
+    # all four sections inside the cap; verbatim facts are still required, just
+    # fewer of them per section.
+    "- Target 250-600 words TOTAL, roughly 60-150 words per section. A short,"
+    " complete document beats a long one that runs out of room before '## How to proceed'.\n"
+    "- Preserve exact commands, paths, digests, error messages, and config values"
+    " verbatim - but pick the few that carry recall value, not every one seen."
 )
 
 MAP_SYSTEM_PROMPT = (
@@ -180,7 +247,11 @@ def build_transcript(messages: list[dict[str, Any]], title: str = "") -> str:
     lines = ["# Session History", ""]
     if title:
         lines = ["# Session History - " + title, ""]
-    total = sum(len(line) for line in lines)
+    # total = the EXACT length of the document rendered so far, separators
+    # included (audit D-9: the cap is enforced against this before every
+    # append, so MAX_HISTORY_CHARS is a real bound, not an after-the-fact
+    # comparison).
+    total = len("\n\n".join(lines))
 
     def _text_of(content: Any) -> str:
         if isinstance(content, str):
@@ -292,39 +363,77 @@ def build_transcript(messages: list[dict[str, Any]], title: str = "") -> str:
                 )
         if not block:
             continue
-        lines.append(block)
-        total += len(block)
-        if total > MAX_HISTORY_CHARS:
+        # CAP CHECKED BEFORE THE APPEND (audit D-9): the old order appended the
+        # block and THEN compared, so one oversized block (a 2 MB tool result)
+        # pushed the render past MAX_HISTORY_CHARS by its full length and the
+        # rest of the transcript was dropped without the bound ever holding.
+        # The remaining room is the bound now: a block that does not fit is cut
+        # to the space left, and the loop stops after it.
+        if total + 2 + len(block) > MAX_HISTORY_CHARS:
+            room = max(0, MAX_HISTORY_CHARS - total - 2)
+            if room > 0:
+                lines.append(block[:room] + "  …[truncated]")
             lines.append("\n_[history truncated]_")
             break
+        lines.append(block)
+        total += 2 + len(block)
     return "\n\n".join(lines)
 
 
 def split_transcript(transcript: str, max_chars: int) -> list[str]:
     """Split into windows of at most max_chars, preferring block boundaries.
 
-    Direct port of the plugin splitTranscript: a single oversized block (a
-    huge tool result) is hard-split rather than dropped; empty windows are
-    filtered so the map count is honest.
+    Port of the plugin splitTranscript, with the two defects the 2026-10-29
+    audit measured (D-7 / F5) fixed:
+
+    * SPLIT AT HALF THE WINDOW, NOT AT THE WHOLE WINDOW. The oversized-block
+      test was `len(block) > max_chars`, so a block of 0.6-1.0 windows was
+      treated as a normal block and could not share a window with a peer.
+    * THE OPEN WINDOW IS FILLED, NOT FLUSHED. The old loop flushed the
+      pending window and emitted every hard-split piece as its OWN chunk, so
+      the short remainder of every oversized block became a chunk of its own
+      and the next block started from scratch. That is the measured defect:
+      a 3.24M-char transcript of ~150k blocks produced 12+ chunks where 7
+      suffice (audit D-7/F5 - 27 map calls for a transcript whose bound is
+      24). The fill cuts each piece to the room actually left, so block tails
+      and block heads share a window; only the FINAL window is partial.
+
+    A single oversized block (a huge tool result) is still hard-split rather
+    than dropped, empty windows are still filtered so the map count is
+    honest, and every chunk still honours max_chars. Block ORDER is preserved
+    and no character is dropped or duplicated.
     """
+    if max_chars <= 0:
+        return [transcript] if transcript else []
     blocks = transcript.split("\n\n")
     chunks: list[str] = []
     current = ""
+    # Half a window is the split threshold: a block this big cannot share a
+    # window with a peer, so it is cut into pieces that fill the open window.
+    split_at = max(1, max_chars // 2)
+
+    def _flush() -> None:
+        nonlocal current
+        if current != "":
+            chunks.append(current)
+            current = ""
+
     for block in blocks:
-        if len(block) > max_chars:
-            if current != "":
-                chunks.append(current)
-                current = ""
-            for i in range(0, len(block), max_chars):
-                chunks.append(block[i : i + max_chars])
+        if len(block) > split_at:
+            while block:
+                room = max_chars - (len(current) + 2 if current else 0)
+                if room <= 0:
+                    _flush()
+                    continue
+                piece, block = block[:room], block[room:]
+                current = piece if current == "" else current + "\n\n" + piece
             continue
         if len(current) + len(block) + 2 > max_chars:
-            chunks.append(current)
+            _flush()
             current = block
         else:
             current = block if current == "" else current + "\n\n" + block
-    if current != "":
-        chunks.append(current)
+    _flush()
     return [chunk for chunk in chunks if chunk.strip()]
 
 
@@ -380,30 +489,86 @@ def memory_body_chars(doc: str) -> int:
         return len(doc.strip())
 
 
+def map_window(transcript_len: int) -> int:
+    """The map-stage window for a transcript of this length (chars).
+
+    Adaptive: MAP_CHUNK_CHARS floor, grown so the WHOLE transcript is
+    covered within MAX_MAP_CHUNKS calls, capped at MAX_MAP_CHUNK_CHARS.
+    When even the cap cannot fit the transcript inside MAX_MAP_CHUNKS
+    windows the chunk count is allowed to exceed the bound - every character
+    must reach the model, so coverage beats the call bound (the splitter
+    still keeps each window at the cap, which is the cost floor).
+    """
+    need = -(-transcript_len // max(1, MAX_MAP_CHUNKS - 1))
+    return min(MAX_MAP_CHUNK_CHARS, max(MAP_CHUNK_CHARS, need))
+
+
+def plan_chunks(transcript: str) -> list[str]:
+    """The map-stage chunks for a transcript: window + chunk-count bound.
+
+    map_window() bounds the CALL count for a transcript made of one huge
+    block; block-boundary packing can still cost a few extra chunks (whole
+    blocks do not tile a window evenly), which is how the measured 3.24M
+    transcript reached 27 map calls against a bound of 24 (audit D-7/F5).
+    Grow the window and re-split until the count honours MAX_MAP_CHUNKS, up
+    to the documented per-call cap. If the transcript cannot fit even at the
+    cap, COVERAGE WINS: every character must reach the model, so the excess
+    chunks are accepted (the splitter still keeps each one at the cap, which
+    is the cost floor).
+    """
+    window = map_window(len(transcript))
+    chunks = split_transcript(transcript, window)
+    for _ in range(6):
+        if len(chunks) <= MAX_MAP_CHUNKS or window >= MAX_MAP_CHUNK_CHARS:
+            break
+        window = min(MAX_MAP_CHUNK_CHARS, (window * 5) // 4 + 1)
+        chunks = split_transcript(transcript, window)
+    return chunks
+
+
+def _check_deadline(deadline: float | None) -> None:
+    """Raise DistillBudgetExceeded once the sweep's wall-clock budget is out.
+
+    The housekeeping sweep's per-pass budget used to be checked only BETWEEN
+    rows (audit D-6), so one row's 24-30 map calls x 120 s could hold the
+    shared loop for ~an hour. The engine now re-checks it before every model
+    call, so the overrun is bounded by ONE call instead of one row.
+    """
+    if deadline is None:
+        return
+    import time as _time
+
+    if _time.monotonic() > deadline:
+        raise DistillBudgetExceeded(
+            "distill sweep budget exhausted mid-row - deferring the rest of this transcript"
+        )
+
+
 async def run_map_reduce(
     transcript: str,
     llm_once: LlmOnce,
     *,
     max_distill_tokens: int = DEFAULT_DISTILL_TOKENS,
+    deadline: float | None = None,
 ) -> str:
     """Distill one transcript into the final memory document.
 
     Single-pass for ordinary transcripts; adaptive-window map-reduce above
     MAP_CHUNK_CHARS (window grows so the WHOLE transcript is always covered
-    within MAX_MAP_CHUNKS calls, floor MAP_CHUNK_CHARS - the plugin
-    adaptive discipline, kept verbatim including the (MAX_MAP_CHUNKS - 1)
-    margin for block-boundary slack).
+    within MAX_MAP_CHUNKS calls, floor MAP_CHUNK_CHARS, cap
+    MAX_MAP_CHUNK_CHARS - see map_window).
+
+    deadline (monotonic, optional): the caller's wall-clock budget. When it
+    lapses mid-transcript DistillBudgetExceeded is raised BEFORE the next
+    model call, so a scheduled sweep cannot be held by one long row (audit
+    D-6). None = unbounded (explicit /v1/distill calls: a human is waiting).
 
     Raises: whatever llm_once raises (model failure) - the caller owns the
     fallback (write the raw transcript as session_history).
     """
     input_text = transcript
     if len(transcript) > MAP_CHUNK_CHARS:
-        window = min(
-            MAX_MAP_CHUNK_CHARS,
-            max(MAP_CHUNK_CHARS, -(-len(transcript) // (MAX_MAP_CHUNKS - 1))),
-        )
-        chunks = split_transcript(transcript, window)
+        chunks = plan_chunks(transcript)
         notes: list[str] = []
         # MAP-STAGE MARKER (2026-10-23): partial notes are legitimate
         # intermediates, so a capped map call must NOT raise
@@ -412,6 +577,7 @@ async def run_map_reduce(
         llm_once._distill_map_stage = True  # type: ignore[attr-defined]
         try:
             for i, chunk in enumerate(chunks):
+                _check_deadline(deadline)
                 note = await llm_once(
                     MAP_SYSTEM_PROMPT,
                     "Session part " + str(i + 1) + " of " + str(len(chunks)) + ":\n\n" + chunk,
@@ -422,6 +588,7 @@ async def run_map_reduce(
             llm_once._distill_map_stage = False  # type: ignore[attr-defined]
         input_text = "These are sequential notes from one session, part 1 first.\n\n" + "\n\n".join(notes)
 
+    _check_deadline(deadline)
     text = await llm_once(
         DISTILL_SYSTEM_PROMPT,
         "Distill this AI-coding-assistant session transcript:\n\n" + input_text,

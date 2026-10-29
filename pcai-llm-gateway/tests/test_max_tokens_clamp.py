@@ -182,6 +182,75 @@ def test_setting_field_exists_and_defaults_empty() -> None:
     assert "PCAI_LLM_" + "max_tokens_ceiling".upper() == "PCAI_LLM_MAX_TOKENS_CEILING"
 
 
+
+# ---------------------------------------------------------------------------
+# audit F5 (2026-10-29) — the MODERN cap field must be clamped too
+# ---------------------------------------------------------------------------
+
+
+def test_f5_max_completion_tokens_is_clamped() -> None:
+    """F5 — `max_completion_tokens` bypassed the per-model ceiling.
+
+    PRE-FIX (config.py:953): `value = body.get("max_tokens")` was the only
+    field consulted, so a body carrying the modern OpenAI cap field
+    (`max_completion_tokens: 999999`) passed through untouched — the 400 the
+    clamp exists to prevent came straight back, with the ceiling configured.
+    """
+    body = {"model": MODEL, "max_completion_tokens": 999_999}
+    out = clamp_max_tokens(body, MODEL, {MODEL: CEILING})
+    assert out["max_completion_tokens"] == CEILING
+    assert body["max_completion_tokens"] == 999_999, "the caller's body must never be mutated"
+
+
+def test_f5_both_spellings_are_clamped_in_one_copy() -> None:
+    """A body carrying BOTH cap fields gets both lowered, in ONE new dict."""
+    body = {"model": MODEL, "max_tokens": CLIENT_CAP, "max_completion_tokens": 999_999, "stream": True}
+    out = clamp_max_tokens(body, MODEL, {MODEL: CEILING})
+    assert out is not body
+    assert out["max_tokens"] == CEILING
+    assert out["max_completion_tokens"] == CEILING
+    assert out["stream"] is True and out["model"] == MODEL
+    assert body["max_tokens"] == CLIENT_CAP and body["max_completion_tokens"] == 999_999
+
+
+def test_f5_max_completion_tokens_contract_edges() -> None:
+    """The whole documented contract applies to the new field: no raise, the
+    zero-copy fast path, non-int/bool/0/negative untouched."""
+    ceilings = {MODEL: CEILING}
+    # at or below the ceiling: no-op, SAME object
+    for value in (1, CEILING):
+        body = {"model": MODEL, "max_completion_tokens": value}
+        assert clamp_max_tokens(body, MODEL, ceilings) is body
+    # non-numeric / bool / non-positive: untouched
+    for value in ("999999", 999999.5, None, True, 0, -5):
+        body = {"model": MODEL, "max_completion_tokens": value}
+        assert clamp_max_tokens(body, MODEL, ceilings) is body, f"{value!r} must be untouched"
+        assert body["max_completion_tokens"] == value
+    # an uncapped model and an ignored (non-positive) ceiling stay inert
+    body = {"model": "other", "max_completion_tokens": 999_999}
+    assert clamp_max_tokens(body, "uncapped", ceilings) is body
+    assert clamp_max_tokens(body, MODEL, {MODEL: 0}) is body
+
+
+def test_f5_proxy_forwards_the_clamped_modern_field(env, ceilings) -> None:
+    """End-to-end: the upstream must receive the CEILING, not 999999, when the
+    client used `max_completion_tokens` — and the client's body is untouched."""
+    _fake, _key_rec, make = env
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["body"] = json.loads(request.content)
+        return _chat_response()
+
+    tc = make(handler)
+    body = {"model": MODEL, "max_completion_tokens": 999_999, "messages": [{"role": "user", "content": "hi"}]}
+    snapshot = json.dumps(body, sort_keys=True)
+    r = tc.post("/v1/chat/completions", json=body, headers=_h())
+
+    assert r.status_code == 200, r.text
+    assert seen["body"]["max_completion_tokens"] == CEILING
+    assert json.dumps(body, sort_keys=True) == snapshot, "the client's request body was mutated"
+
 # ---------------------------------------------------------------------------
 # integration harness (test_ttft_gate.py shape: MockTransport + FakeDB)
 # ---------------------------------------------------------------------------

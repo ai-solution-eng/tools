@@ -49,7 +49,13 @@ from ..config import settings
 from ..core import conversations, distiller_config, enroll_memory, memory_write, traces
 from ..core.budgets import check_budgets, settle
 from ..core.cascade import resolve_cascade
-from ..core.distiller import DistillTruncatedError, build_transcript, run_map_reduce
+from ..core.distiller import (
+    MAX_HISTORY_CHARS,
+    DistillBudgetExceeded,
+    DistillTruncatedError,
+    build_transcript,
+    run_map_reduce,
+)
 from ..core.keys import KeyRecord
 from ..db import db
 from ..routing.router import router as model_router
@@ -591,8 +597,12 @@ async def distill_inline(
     # actually it, so genuine caller content is never eaten.
     if not isinstance(transcript, str) or transcript_body_chars(transcript) < MIN_TRANSCRIPT_CHARS:
         return _error(400, "transcript is required (at least " + str(MIN_TRANSCRIPT_CHARS) + " characters)")
-    if len(transcript) > 8_000_000:
-        return _error(413, "transcript exceeds the 8,000,000 character cap")
+    # The cap is core.distiller's own transcript bound, NOT a second literal
+    # (audit D-12/F10): the two numbers were the same value written twice, so
+    # a change to the distiller's bound would have left this gate disagreeing
+    # with the renderer's truncation point.
+    if len(transcript) > MAX_HISTORY_CHARS:
+        return _error(413, f"transcript exceeds the {MAX_HISTORY_CHARS:,} character cap")
     session_id = body.get("session_id")
     if session_id is not None and not isinstance(session_id, str):
         return _error(400, "session_id must be a string")
@@ -706,6 +716,7 @@ async def distill_conversation(
         mcp_call = await _mcp_call_for(key)
     except DistillUnavailable as exc:
         return _error(503, str(exc))
+    verdict: list[str] = []
     ok, detail = await memory_write.write_memory(
         key.id,
         mcp_call,
@@ -722,12 +733,17 @@ async def distill_conversation(
         fallback_doc=transcript if distilled else "",
         fallback_session_id=str(cid),
         mcp_search=await _mcp_search_for(key),
+        verdict_out=verdict,
     )
     kind = memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK
     # seed the marker on success: an explicit distill claims the conversation
     # so the scheduled sweep does not re-distill it (duplicate spend). Marker
     # seq = transcript length at distill time (current message count).
-    if ok:
+    #
+    # A SUPPRESSED write claims it too (audit D-2): the near-duplicate verdict
+    # is permanent, so leaving the row unclaimed would make the SWEEP re-run
+    # the same map-reduce that was just suppressed.
+    if ok or (verdict and verdict[-1] == memory_write.VERDICT_SUPPRESSED):
         from ..core import distill_schedule
 
         await distill_schedule.mark_distilled(cid, key.id, len(conv.get("messages") or []))
@@ -740,13 +756,21 @@ async def distill_conversation(
 _ = db
 
 
-async def distill_due_conversation(row: dict[str, Any]) -> None:
+async def distill_due_conversation(row: dict[str, Any], *, deadline: float | None = None) -> bool:
     """The scheduled (housekeeping) distill for one due conversation row
     (core.distill_schedule.sweep). The SAME engine as the explicit
     conversation path - canonical prompt, attachment gate, degrade - plus
     the marker write so the sweep does not re-distill until it continues.
     offpeak_only gates the CALLER (housekeeping), not this engine: an
-    operator-configured quiet-hours policy is enforced in one place."""
+    operator-configured quiet-hours policy is enforced in one place.
+
+    deadline (monotonic, optional): the sweep's per-pass wall-clock budget,
+    re-checked before every model call (audit D-6) so one long row cannot
+    hold the shared housekeeping loop for its full map-reduce.
+
+    Returns True ONLY when a memory write landed (audit D-4). Every skip path
+    returns False, so the sweep can keep writes_total{ok} and the last-write
+    gauge honest."""
     from ..core import distill_schedule, distiller_config
 
     cid = row["conversation_id"]
@@ -769,7 +793,7 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
             cid,
             key_id,
         )
-        return
+        return False
     if not await memory_attached(key, "probe-sched-" + uuid.uuid4().hex[:12]):
         # Same gate-backoff contract as the canonical path: no write landed,
         # so no distilled marker -- but the row must leave the oldest-first
@@ -783,7 +807,7 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
                 key_id,
                 int(distill_schedule.gate_backoff_seconds()),
             )
-        return
+        return False
     conv = await conversations.get(key_id, cid)
     if conv is None:
         # gone/purged: the FK on conversation_distills (REFERENCES conversations
@@ -793,7 +817,7 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
         # P1-1). Drop any marker row explicitly and warn once.
         await distill_schedule.drop_marker(cid)
         log.warning("scheduled distill conv=%s: conversation gone/purged - marker row dropped (stop retrying)", cid)
-        return
+        return False
     transcript = build_transcript(conv.get("messages") or [], str(conv.get("title") or ""))
     if transcript_body_chars(transcript) < MIN_TRANSCRIPT_CHARS:
         # Same contract as the canonical path: an empty transcript is an
@@ -808,12 +832,24 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
                 transcript_body_chars(transcript),
                 int(distill_schedule.gate_backoff_seconds()),
             )
-        return
+        return False
     request_id = "distill-sched-" + uuid.uuid4().hex[:12]
     llm_once = _llm_once_for(key, request_id)
     try:
-        doc = await run_map_reduce(transcript, llm_once, max_distill_tokens=await distiller_config.max_tokens())
+        doc = await run_map_reduce(
+            transcript,
+            llm_once,
+            max_distill_tokens=await distiller_config.max_tokens(),
+            deadline=deadline,
+        )
         distilled = True
+    except DistillBudgetExceeded:
+        # The sweep's budget lapsed mid-row: no marker (nothing was written),
+        # no backoff (the row is healthy, the PASS ran out of time) and no
+        # raw-transcript degrade (this is not a model failure - writing a
+        # partially-mapped transcript would be noise). The next pass resumes.
+        log.info("scheduled distill conv=%s: sweep budget exhausted mid-row - deferred", cid)
+        return False
     except DistillUnavailable:
         # nothing tried; back off like a gate skip (audit P2-1): without a
         # marker the sweep re-attempts the FULL map-reduce chain every pass
@@ -821,18 +857,26 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
         # gate_failed_at mechanism exists to prevent. Safe since P0-1: the
         # skip marker keeps the row due once the backoff lapses.
         await distill_schedule.mark_gate_skip(cid, key_id)
-        return
+        return False
     except Exception:
         if not _raw_fallback_enabled():
             # Leave the row DUE: the conversation is still in the store, so
             # nothing is lost and the next sweep retries. Writing the raw
             # transcript here would land 100+ mm-rag chunks of noise.
             log.warning(
-                "scheduled distill failed (conv=%s); raw fallback disabled - left due for retry",
+                "scheduled distill failed (conv=%s); raw fallback disabled - deferring %ss",
                 cid,
+                int(distill_schedule.gate_backoff_seconds()),
                 exc_info=True,
             )
-            return
+            # GATE-SKIP BACKOFF (audit D-5): "left due" alone means the FULL
+            # map-reduce is re-spent every pass (default: every 60 s) on the
+            # window head, which is the head-of-line starvation the backoff
+            # exists to prevent. Nothing was written, so this is NOT a
+            # distilled marker -- the row returns to the due set when the
+            # window lapses.
+            await distill_schedule.mark_gate_skip(cid, key_id)
+            return False
         log.warning("scheduled distill failed (conv=%s); degrading to raw transcript", cid, exc_info=True)
         doc = transcript
         distilled = False
@@ -843,7 +887,7 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
         # the map-reduce already spent, and without a marker the sweep
         # re-spends it every pass until the server returns.
         await distill_schedule.mark_gate_skip(cid, key_id)
-        return
+        return False
     ok, detail = await memory_write.write_memory(
         key_id,
         mcp_call,
@@ -860,6 +904,7 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
     if ok:
         await distill_schedule.mark_distilled(cid, key_id, int(row.get("msg_count") or 0))
     log.info("scheduled distill conv=%s ok=%s detail=%s", cid, ok, detail[:80])
+    return bool(ok)
 
 
 # (the scheduled path loads the KeyRecord once for the attachment gate and
@@ -867,13 +912,19 @@ async def distill_due_conversation(row: dict[str, Any]) -> None:
 # N+1 finding resolved structurally)
 
 
-async def distill_due_canonical(row: dict[str, Any]) -> None:
+async def distill_due_canonical(row: dict[str, Any], *, deadline: float | None = None) -> bool:
     """The scheduled distill for ONE relay-captured canonical row (the store
     every harness feeding the gateway converges into - relayed or not).
     Same engine contract as the conversations path: attachment gate before
     any spend, canonical prompt, session_history degrade, marker ONLY on a
     successful write (a transient RAG outage must not silently mark the
-    session distilled)."""
+    session distilled).
+
+    deadline (monotonic, optional): the sweep's per-pass wall-clock budget,
+    re-checked before every model call (audit D-6).
+
+    Returns True ONLY when a memory write landed (audit D-4); every skip path
+    returns False."""
     from ..core import distill_schedule, distiller_config
 
     key_id = row["key_id"]
@@ -886,7 +937,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
     # one-shot SDK calls) are never distilled.
     if len(messages) < 4:
         await distill_schedule.mark_canonical_distilled(key_id, thread_id)
-        return
+        return False
 
     # FULL attachment gate (capability probe) before any model spend - the
     # same gate every entry point runs.
@@ -903,7 +954,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
             thread_id[:16],
             key_id,
         )
-        return
+        return False
     if not await memory_attached(key, "probe-sched-" + uuid.uuid4().hex[:12]):
         # The gate itself is failing (e.g. an empty registry snapshot makes
         # resolve_memory_server() return None for EVERY key). No write landed,
@@ -924,7 +975,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
                 key_id,
                 int(distill_schedule.gate_backoff_seconds()),
             )
-        return
+        return False
 
     transcript = build_transcript(messages)
     if transcript_body_chars(transcript) < MIN_TRANSCRIPT_CHARS:
@@ -962,7 +1013,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
                 for m in messages[:3]
             ]
             log.warning("canonical distill thread=%s: shape sample %s", thread_id[:16], _shapes)
-        return
+        return False
 
     # UNCHANGED-CONTENT SKIP (2026-10-11 duplication fix, part 2): a continued
     # conversation re-becomes due on every turn; if the rendered transcript is
@@ -976,12 +1027,26 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
             "canonical distill thread=%s: transcript unchanged since last distill - skipping",
             thread_id[:16],
         )
-        return
+        return False
     request_id = "distill-canon-" + uuid.uuid4().hex[:12]
     llm_once = _llm_once_for(key, request_id)
     distilled = True
     try:
-        doc = await run_map_reduce(transcript, llm_once, max_distill_tokens=await distiller_config.max_tokens())
+        doc = await run_map_reduce(
+            transcript,
+            llm_once,
+            max_distill_tokens=await distiller_config.max_tokens(),
+            deadline=deadline,
+        )
+    except DistillBudgetExceeded:
+        # Sweep budget lapsed mid-row (audit D-6): leave the row due, write
+        # nothing, back off nothing -- the row is healthy, the PASS ran out of
+        # time, and the next pass picks it up from the start.
+        log.info(
+            "canonical distill thread=%s: sweep budget exhausted mid-row - deferred",
+            thread_id[:16],
+        )
+        return False
     except DistillUnavailable as exc:
         # 2026-10-10 RCA: this exit was SILENT. A distill that spent nothing and
         # wrote nothing looked identical to a successful pass -- the row stayed
@@ -997,7 +1062,7 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
         # Safe since P0-1: the skip marker keeps the row due once the backoff
         # lapses.
         await distill_schedule.mark_canonical_gate_skip(key_id, thread_id)
-        return
+        return False
     except Exception:
         if not _raw_fallback_enabled():
             # Leave the row DUE (no marker): canonical_conversations still holds
@@ -1005,11 +1070,18 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
             # Writing the raw transcript would be CHUNKED by mm-rag into 100+
             # fragments -- measured 2026-10-10: 126 chunks from one session.
             log.warning(
-                "canonical distill thread=%s: model failed; raw fallback disabled - left due for retry",
+                "canonical distill thread=%s: model failed; raw fallback disabled - deferring %ss",
                 thread_id[:16],
+                int(distill_schedule.gate_backoff_seconds()),
                 exc_info=True,
             )
-            return
+            # GATE-SKIP BACKOFF (audit D-5): with the config-RECOMMENDED
+            # distiller_raw_fallback=false this branch is the common one, and
+            # "left due" alone re-spent the whole map-reduce every 60 s on the
+            # window head. Not a distilled marker: nothing was written, and the
+            # row returns to the due set when the window lapses.
+            await distill_schedule.mark_canonical_gate_skip(key_id, thread_id)
+            return False
         log.warning(
             "canonical distill failed (thread=%s); degrading to raw transcript",
             thread_id[:16],
@@ -1026,7 +1098,8 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
             exc,
         )
         await distill_schedule.mark_canonical_gate_skip(key_id, thread_id)
-        return
+        return False
+    verdict: list[str] = []
     ok, detail = await memory_write.write_memory(
         key_id,
         mcp_call,
@@ -1036,7 +1109,24 @@ async def distill_due_canonical(row: dict[str, Any]) -> None:
         fallback_doc=transcript if distilled else "",
         fallback_session_id=thread_id[:64],
         mcp_search=await _mcp_search_for(key),
+        verdict_out=verdict,
     )
     if ok:
         await distill_schedule.mark_canonical_distilled(key_id, thread_id, row.get("updated_at"), _content_hash)
+    elif verdict and verdict[-1] == memory_write.VERDICT_SUPPRESSED:
+        # NEAR-DUPLICATE SUPPRESSION IS A VERDICT, NOT A FAILURE (audit D-2).
+        # The condition is PERMANENT: re-distilling the same row produces the
+        # same near-copy and is suppressed again, so treating it as a failure
+        # left the row due and re-ran the whole ~25-call map-reduce on every
+        # sweep forever (measured: 4 passes -> 4 map-reduces, 0 writes, 0
+        # markers). Mark the row with the ROW-STATE SNAPSHOT exactly like a
+        # successful distill: the store already holds the memory this document
+        # duplicates, so nothing is lost, and a conversation that CONTINUES
+        # re-becomes due normally (updated_at moves past the snapshot).
+        await distill_schedule.mark_canonical_distilled(key_id, thread_id, row.get("updated_at"), _content_hash)
+        log.info(
+            "canonical distill thread=%s: write suppressed as a near-duplicate - marked so it stops re-distilling",
+            thread_id[:16],
+        )
     log.info("canonical distill thread=%s ok=%s detail=%s", thread_id[:16], ok, detail[:80])
+    return bool(ok)

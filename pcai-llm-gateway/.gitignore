@@ -28,3 +28,10 @@ relay-visibility-r2/pod-check/
 relay-visibility-r2/shadow/
 relay-visibility-r2/shadow2/
 -o
+
+# Local-only scratch (session artifacts, one-off scripts, empty probe files)
+.memory-rca/
+.scratch-*/
+.scratch_rp.bak
+.splice.py
+new_env.txt

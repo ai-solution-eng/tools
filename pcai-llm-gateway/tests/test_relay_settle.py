@@ -742,7 +742,16 @@ async def test_list_models_pcai_type_and_primary(monkeypatch) -> None:
     by_id = {m["id"]: m for m in res["data"]}
     assert by_id["emb-model"]["pcai"]["type"] == "embedding"
     assert by_id["GLM-5.3-Flash"]["pcai"]["type"] == "chat"
-    assert by_id["Qwen3.8-27B"]["pcai"] == {"type": "chat", "primary": True}
+    # 2026-10-28: the entry shape gained pcai.capacity (this key's budget
+    # headroom for that model right now). Assert it explicitly rather than
+    # loosening the comparison: the fail-open shape is part of the contract
+    # (no DB in this test -> "not evaluated" must read as available, never
+    # as blocked).
+    assert by_id["Qwen3.8-27B"]["pcai"] == {
+        "type": "chat",
+        "primary": True,
+        "capacity": {"ok": True, "remaining_tokens": None, "blocked_by": ""},
+    }
     assert by_id["GLM-5.3-Flash"]["pcai"].get("primary") is None  # not first
     # auto entry still precedes with its own cascade type
     assert res["data"][0]["id"] == "auto" and res["data"][0]["pcai"]["type"] == "cascade"

@@ -346,6 +346,13 @@ def first_float(result: Any) -> float | None:
     JSON text (Prometheus vector/scalar payloads) is parsed structurally;
     plain text falls back to the first numeric token — EXCEPT error-shaped
     text (a 400's status code is not a GPU utilization).
+
+    D-3 (audit 2026-10-29): a SUCCESSFUL Prometheus answer with an EMPTY
+    result set is NO SAMPLE, not a zero. The response still carries numbers
+    (elapsed_ms, seriesFetched), and the old whole-payload fallback read one
+    of those as the utilization sample — near zero, below enter_pct, so the
+    discount engaged exactly when demand was UNKNOWN. Fail-safe (module
+    contract: unknown demand = full price) means empty result -> None.
     """
     for text in _collect_texts(result):
         if _ERROR_TEXT_RE.search(text):
@@ -354,16 +361,26 @@ def first_float(result: Any) -> float | None:
             parsed = json.loads(text)
         except (ValueError, TypeError):
             parsed = None
+        if isinstance(parsed, dict):
+            data = parsed.get("data")
+            if isinstance(data, dict) and data.get("result") == []:
+                # Prometheus answered OK but returned zero series: no signal.
+                return None
         if parsed is not None:
             found = _extract(parsed)
             if found is not None:
                 return found
-        m = _NUM_RE.search(text)
-        if m:
-            try:
-                return float(m.group(0))
-            except ValueError:  # pragma: no cover - regex guarantees a number
-                continue
+        if not isinstance(parsed, dict):
+            # The regex fallback scans free text / non-dict JSON. On a parsed
+            # Prometheus-shaped dict it must NOT run: any number left in a
+            # dict we could not find a sample in is response METADATA
+            # (elapsed_ms, took, seriesFetched) — D-3.
+            m = _NUM_RE.search(text)
+            if m:
+                try:
+                    return float(m.group(0))
+                except ValueError:  # pragma: no cover - regex guarantees a number
+                    continue
     return None
 
 

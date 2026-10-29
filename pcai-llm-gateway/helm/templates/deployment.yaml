@@ -195,6 +195,11 @@ spec:
               value: {{ .Values.settings.toolRelayEnabled | quote }}
             - name: PCAI_LLM_TOOL_RELAY_MAX_ITERATIONS
               value: {{ .Values.settings.toolRelayMaxIterations | int | quote }}
+            # full = every MCP tool definition inline (pre-2026-10-28, ~34k
+            # prompt tokens for 111 tools); hybrid = one discovery tool + a
+            # server directory, with per-server promotion on describe.
+            - name: PCAI_LLM_TOOL_RELAY_SURFACE
+              value: {{ .Values.settings.toolRelaySurface | default "full" | quote }}
             - name: PCAI_LLM_TOOL_RELAY_WALL_CLOCK_S
               value: {{ .Values.settings.toolRelayWallClockS | int | quote }}
             # Per-turn retries for a timed-out relay model call; spends only
@@ -207,7 +212,10 @@ spec:
             - name: PCAI_LLM_REASONING_HISTORY_ENABLED
               value: {{ if hasKey .Values.settings "reasoningHistoryEnabled" }}{{ .Values.settings.reasoningHistoryEnabled | quote }}{{ else }}"true"{{ end }}
             - name: PCAI_LLM_REASONING_HISTORY_MAX_CHARS
-              value: {{ .Values.settings.reasoningHistoryMaxChars | default 2000 | int | quote }}
+              # hasKey, NOT `| default 2000`: Helm's default treats 0 as empty, so an
+              # operator setting the documented 0 ("disable re-feeding entirely",
+              # config.py) was silently handed 2000 instead. Absent still means 2000.
+              value: {{ if hasKey .Values.settings "reasoningHistoryMaxChars" }}{{ .Values.settings.reasoningHistoryMaxChars | int | quote }}{{ else }}"2000"{{ end }}
             # How relay tools are granted: 'scope' (mcp-scoped keys get all
             # policy-admitted server tools) or 'explicit' (hand-granted
             # (server, tool) pairs only — console: Keys ▸ MCP).
@@ -402,6 +410,15 @@ spec:
             # "| default" — Helm treats false as empty (the 2026-10-10 lesson).
             - name: PCAI_LLM_DISTILLER_DISABLE_THINKING
               value: {{ if hasKey .Values.settings "distillerDisableThinking" }}{{ .Values.settings.distillerDisableThinking | quote }}{{ else }}"true"{{ end }}
+            # Distill OUTPUT cap (tokens). The app default is 4096, which a
+            # long session can overrun — and an overrun is rejected WHOLE by
+            # document_is_complete() (missing trailing sections), so the memory
+            # write is lost rather than shortened (2026-10-29). Raise this AND/OR
+            # keep the prompt target short. Defaults to the app value (4096) —
+            # NOTE: this is NOT the RAG chunk size (distillerMinDocChars is a
+            # floor on the input; the 8192 chunking lives in mm-rag).
+            - name: PCAI_LLM_DISTILLER_MAX_TOKENS
+              value: {{ if hasKey .Values.settings "distillerMaxTokens" }}{{ .Values.settings.distillerMaxTokens | int | quote }}{{ else }}"4096"{{ end }}
             # --- off-peak billing (optional; safe defaults, off by default) ---
             - name: PCAI_LLM_OFFPEAK_ENABLED
               value: {{ .Values.settings.offpeakEnabled | quote }}

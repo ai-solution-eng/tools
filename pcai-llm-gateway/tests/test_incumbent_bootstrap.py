@@ -49,12 +49,21 @@ def _install(monkeypatch, *, sticky_on: bool):
     monkeypatch.setattr(st, "get_sticky_row", _get)
     monkeypatch.setattr(st, "drop_sticky", _drop)
 
-    def _writer(key_id, thread_key):
+    def _writer(key_id, thread_key, defer=False):
+        """Mirrors stickiness.make_writer's real contract, including DEFER
+        (audit 2026-10-29 XV-3): with defer the writer persists nothing and
+        hands back a finisher the caller invokes with the SERVING model."""
         if not thread_key:
             return None
 
-        def _w(model):
+        def _persist(model):
             rows[(key_id, thread_key)] = model
+
+        def _w(model):
+            if defer:
+                return lambda actual: _persist(actual or model)
+            _persist(model)
+            return None
 
         return _w
 
@@ -128,11 +137,15 @@ def test_turn_one_persists_the_model_turn_two_reads_it(monkeypatch) -> None:
             available=None, decide=_decide1, incumbent=None,
             switch_margin=0.10, sticky_write=writer)
 
-    served1, _ = asyncio.run(_turn1())
+    served1, ctx1 = asyncio.run(_turn1())
     assert served1 == "mid"
 
-    # the writer must have persisted it under the REAL thread key
+    # DEFERRED COMMIT (audit 2026-10-29 XV-3): the router hands the finisher
+    # out instead of persisting, so the floor records what ADMISSION served.
+    assert ctx1.sticky_finish is not None, "the router must defer the sticky write"
     thread = _real_thread()
+    assert rows.get((_Key.id, thread)) is None, "nothing may be persisted at pick time"
+    ctx1.sticky_finish(served1)  # what routes_proxy does once admission settles
     assert rows.get((_Key.id, thread)) == "mid", f"turn 1 must persist; rows={rows}"
 
     # turn 2 reads the incumbent back through the REAL helper

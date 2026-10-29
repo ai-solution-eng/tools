@@ -506,4 +506,4 @@ GET/PUT /admin/distiller/config
 - [FEATURES.md](FEATURES.md) § Enrollment-time memory datasets (opt-in at redemption) — the automatic path
 - [DEPLOYMENT.md](DEPLOYMENT.md) § Underlying detail — the full env table
 - [API.md](API.md) § 2.6 Session distiller — request/response shapes
-- [VERIFICATION.md](VERIFICATION.md) — smoke tests for enrollment memory
+- [VERIFICATION.md](changelogs/VERIFICATION.md) — smoke tests for enrollment memory

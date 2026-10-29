@@ -323,6 +323,11 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL UNIQUE,
+    -- Operator-authored one-liner: what this server is FOR. Rendered to the
+    -- model in the hybrid tool surface's server directory (2026-10-28), which
+    -- is what lets a model pick a server without a discovery round trip.
+    -- Empty is fine (the directory then shows name + tool count).
+    description TEXT NOT NULL DEFAULT '',
     url         TEXT NOT NULL,                  -- e.g. http://applygate-mcp.ns.svc.cluster.local:9102/mcp
     headers_json TEXT NOT NULL DEFAULT '{}',    -- static headers (never secrets inline; by-ref names)
     -- Bearer auth: K8s Secret NAME (by-ref); resolved from env
@@ -349,6 +354,11 @@ ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS allowed_tools_json TEXT NOT NUL
 -- Additive migration: every existing row lands at the neutral default 0 and
 -- keeps its previous (name ASC) relative order.
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0;
+-- 2026-10-28: operator-authored one-liner shown to the model in the hybrid
+-- tool surface's server directory. The CREATE TABLE above only runs on a
+-- FRESH database, so an existing deployment needs this ALTER or the column
+-- never appears and the registry's row.get() silently yields "".
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 -- Migration: servers registered while the default was 'allowlist'+EMPTY admit
 -- NOTHING (every grant picker offered zero tools — the 'can't add mcp servers'
 -- incident). An EMPTY allowlist carries no operator intent, so such rows flip
@@ -929,4 +939,64 @@ ALTER TABLE canonical_distills ADD COLUMN IF NOT EXISTS sweep_lease TEXT;
 ALTER TABLE canonical_distills ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
 ALTER TABLE conversation_distills ADD COLUMN IF NOT EXISTS sweep_lease TEXT;
 ALTER TABLE conversation_distills ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
+
+-- ============================================================================
+-- Agent profiles (2026-10-29) — named tool surfaces exposed as model endpoints.
+-- ADDITIVE / idempotent, same discipline as every migration above.
+-- ============================================================================
+-- WHY: exposing all ~111 granted MCP tools to every key cost 34,459 prompt
+-- tokens per relayed request and made tool SELECTION a 111-way choice for a
+-- task that needed four servers. The hybrid surface (core.tool_surface) removed
+-- the token cost; an agent removes the CHOICE — it is a named bundle of servers
+-- a request opts into by naming it as its model.
+--
+-- SHAPE: an agent is a MODEL-NAME entry point (GET /v1/models advertises it
+-- alongside the real pools, pcai.type=agent). A request naming it resolves to
+-- the 'model' column when set, else through the profile's chat cascade exactly
+-- as 'auto' does, and its tool surface is the INTERSECTION of the key's grants
+-- and 'servers'.
+--
+-- SERVER-LEVEL, NOT (server, tool) PAIRS — deliberately, and NOT a repeat of
+-- the mistake the mcp_servers.tool_policy comment warns about. That warning is
+-- about a table that CREATES grants: a server-level allowlist there is bypassed
+-- by the server gaining a tool. An agent creates nothing: it is a FILTER over
+-- grants the key already holds (mcp_tool_acls / live profile grants) plus the
+-- per-server policy (mcpf.federation.server_allows), which stay the boundary.
+-- A server that gains a tool still grants that tool to nobody new; the agent
+-- merely does not hide it from a key that already holds it. That is why the
+-- admin UI can offer 'pick servers' without weakening anything.
+--
+-- 'model' '' = cascade (the agent picks tools + prompt, not the model).
+-- 'system_prompt' '' = none (the injection seam is phase 2; the column ships
+-- now so an agent authored today keeps its prompt when that lands).
+CREATE TABLE IF NOT EXISTS agent_profiles (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL UNIQUE,         -- the model id clients request
+    description   TEXT NOT NULL DEFAULT '',     -- what this agent is FOR (shown in /v1/models)
+    servers       TEXT[] NOT NULL DEFAULT '{}', -- MCP server names this agent may see
+    model         TEXT NOT NULL DEFAULT '',     -- '' = profile cascade; else a pinned model
+    system_prompt TEXT NOT NULL DEFAULT '',     -- prepended system message (phase 2)
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_profiles_enabled ON agent_profiles(enabled, name);
+
+-- Which profiles OFFER which agents. A key inherits its USER's profile, so this
+-- join is the whole authorization story: the profile is the envelope (what this
+-- class of caller may ever reach) and the agent is the role inside it.
+-- Deliberately its OWN table rather than a profiles.defaults_json key:
+-- create_profile rebuilds defaults_json from the request body, so a binding
+-- stored there is silently deleted by any older console POST (the same
+-- destructive-by-omission hazard live_grants already has).
+-- NO row for a profile = it offers no agents. A key with NO profile offers
+-- every ENABLED agent — the repo's empty-ACL convention (api_keys.allowed_models
+-- empty = all models), which is what keeps an admin/CLI key usable without
+-- inventing a profile for it.
+CREATE TABLE IF NOT EXISTS profile_agents (
+    profile_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    agent_id   UUID NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
+    PRIMARY KEY (profile_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_agents_agent ON profile_agents(agent_id);
 """

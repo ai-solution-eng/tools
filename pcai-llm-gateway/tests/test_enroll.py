@@ -993,3 +993,36 @@ def test_enroll_invalid_preset_refuses_without_burning_the_code(env) -> None:
     assert "limit_tokens" in r.json()["detail"] or "limit_usd" in r.json()["detail"]
     # nothing was stamped (the refusal precedes every preset write)
     assert not [s for s, _ in fake.bulk if "INSERT INTO" in s]
+
+# ---------------------------------------------------------------------------
+# SSO default profile -> the USER row (2026-10-29)
+# ---------------------------------------------------------------------------
+
+
+async def test_bind_user_profile_writes_only_when_null() -> None:
+    """The tenant default profile has to reach users.profile_id, or every
+    profile-scoped feature (cascade ordering, routing policy, off-peak
+    fraction, agents) sees "no profile" while the key carries the stamped
+    presets. It is a DEFAULT, not an override: a user an operator placed by hand
+    keeps their profile, so the UPDATE is conditional."""
+    from pcai_llm.api import routes_enroll
+
+    calls: list[tuple[str, tuple]] = []
+
+    class _Conn:
+        async def execute(self, sql: str, *a: Any):
+            calls.append((sql, a))
+            return "UPDATE 1"
+
+    uid, pid = uuid.uuid4(), uuid.uuid4()
+    await routes_enroll._bind_user_profile(_Conn(), uid, {"id": pid, "name": "poweruser"})
+    assert len(calls) == 1
+    sql, args = calls[0]
+    assert "UPDATE users SET profile_id" in sql
+    assert "profile_id IS NULL" in sql, "must never re-scope a hand-assigned user"
+    assert args == (uid, pid)
+
+    # No tenant default profile -> no write at all (the bare mint grant).
+    calls.clear()
+    await routes_enroll._bind_user_profile(_Conn(), uid, None)
+    assert calls == []

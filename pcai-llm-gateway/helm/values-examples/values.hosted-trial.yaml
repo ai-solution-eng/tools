@@ -17,7 +17,7 @@
 # Major tuning setups (copy the shape from the pointer):
 #   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
 #     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
-#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/SSO-ROLLOUT-G2.md (the G2 runbook)
+#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/changelogs/SSO-ROLLOUT-G2.md (the G2 runbook)
 #   Chart-generated Secrets (trial-friendly): adminApiKey.create / secretsMasterKey.create /
 #     database.embedded.auth.create — DEPLOYMENT.md § Required Secrets
 #   Embedded Postgres: database.embedded.* — DEPLOYMENT.md § Postgres

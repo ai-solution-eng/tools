@@ -17,7 +17,7 @@
 # Major tuning setups (copy the shape from the pointer):
 #   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
 #     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
-#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/SSO-ROLLOUT-G2.md (the G2 runbook)
+#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/changelogs/SSO-ROLLOUT-G2.md (the G2 runbook)
 #   Embedded Postgres: database.embedded.* — DEPLOYMENT.md § Postgres
 #   Fernet master key (panel credential storage): secretsMasterKey.* — DEPLOYMENT.md
 #   Metrics + alert rules: metrics.enabled + metrics.prometheusRule — DEPLOYMENT.md
@@ -160,11 +160,14 @@ settings:
   # a 32-iteration relay turn hands the model ~31 consecutive examples of itself calling
   # tools with no thinking, which teaches it to skip reasoning. The CAP is the storm
   # guard: the 2026-09-18 incident was UNBOUNDED per-cycle re-append growth (one event
-  # reached 6,630 copies of a line, ~401 KB); at 2000 chars a 32-iteration turn tops out
-  # near 63 KB. Set enabled=false to restore the old full strip byte-for-byte.
+  # reached 6,630 copies of a line, ~401 KB). At 2000 chars a 32-iteration turn topped
+  # out near 63 KB; this site runs 32768 chars (~8K tokens per re-fed block) for agent
+  # continuity, so the same worst case is ~1.05 MB / ~262K tokens per turn — it only
+  # binds on very long thinking blocks, but it IS 16x the default. Set enabled=false to
+  # restore the old full strip byte-for-byte.
   # COST: this is input that rides every subsequent iteration of the turn.
   reasoningHistoryEnabled: true
-  reasoningHistoryMaxChars: 2000
+  reasoningHistoryMaxChars: 32768
   # Complexity routing (pseudo-models `routing` / `routing__<model>`): per-profile
   # routing_policy ('off'|'shadow'|'active') gates behavior — these are the scoring knobs.
   routingEnabled: true

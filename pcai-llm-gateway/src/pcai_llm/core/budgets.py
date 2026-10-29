@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import uuid
 from collections.abc import Iterable, Mapping
@@ -116,6 +117,16 @@ def split_preset_budgets(
             raw_usd = b["limit_usd"]
             if isinstance(raw_usd, bool) or not isinstance(raw_usd, (int, float)) or raw_usd <= 0:
                 raise ValueError("limit_usd must be a positive number")
+            # NON-FINITE (audit F1, 2026-10-29): "nan <= 0" is False, so a NaN
+            # limit passed the positivity check above and was persisted — after
+            # which "spent >= nan" is ALWAYS False (the USD gate could never
+            # refuse that row) and "int(spent*100/nan)" raised ValueError on
+            # every admission (500). json.loads parses bare NaN/Infinity, so an
+            # admin payload or a console bug reached this. Floats only: an int
+            # this large is caught by the column bound below, and
+            # math.isfinite(10**400) raises OverflowError.
+            if isinstance(raw_usd, float) and not math.isfinite(raw_usd):
+                raise ValueError("limit_usd must be a finite number")
             if raw_usd > MAX_LIMIT_USD:
                 raise ValueError(f"limit_usd {raw_usd} exceeds the column maximum {MAX_LIMIT_USD}")
             usd_rows.append((model, str(period), float(raw_usd)))
@@ -332,7 +343,14 @@ async def check_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> G
     est_billable = int(est_tokens * (1.0 - _frac))
     for b in await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, model):
         spent = int(b["spent"])
-        if spent + est_billable > b["limit_tokens"]:
+        # HARD STOP AT THE CAP (audit C1, 2026-10-29): the projected test below
+        # charges only est*(1-frac) (est/10 at the deployed 0.9 fraction), so
+        # at spent == limit it ADMITTED every small request — and the two
+        # zero-estimate paths (the relay's per-iteration gate and /mcp) were
+        # admitted forever. The USD gate and model_capacity both treat
+        # spent >= limit as exhausted; the token gate must agree, or the three
+        # surfaces that describe one budget contradict each other.
+        if spent >= b["limit_tokens"] or spent + est_billable > b["limit_tokens"]:
             # WHICH budget family refused — the metric label (tokens|usd)
             # lets an operator tell "tenant hit its token cap" from
             # "tenant hit its dollar cap" without joining the ledger.
@@ -351,6 +369,17 @@ async def check_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> G
     for cb in await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, model):
         spent_usd = float(cb["spent"] or 0)
         limit = float(cb["limit_usd"])
+        # NON-FINITE ROW (audit F1, 2026-10-29): split_preset_budgets now
+        # rejects NaN/Infinity at every write site, but a row persisted by a
+        # pre-fix build (or written straight into cost_budgets) must not be
+        # able to (a) admit forever — "spent >= nan" is always False — or
+        # (b) 500 on the percentage below. Fail CLOSED with a named refusal.
+        if not math.isfinite(limit) or not math.isfinite(spent_usd):
+            _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
+            return GateResult(
+                False,
+                f"{cb['period']} cost budget has a non-finite limit or spend ({limit!r} / {spent_usd!r})",
+            )
         if spent_usd >= limit:
             _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
             return GateResult(False, f"{cb['period']} cost budget ${limit:.2f} exceeded (spent ${spent_usd:.4f})")
@@ -394,9 +423,19 @@ async def check_rate_limit(key_id: uuid.UUID, rpm: int, tpm: int, est_tokens: in
         charge,
     )
     assert row is not None  # upsert with RETURNING always yields a row
-    remaining_requests = max(0, rpm - row["requests"])
-    remaining_tokens = max(0, tpm - row["tokens"])
-    if row["requests"] > rpm:
+    # rpm/tpm <= 0 = UNLIMITED (audit C6, 2026-10-29). Profile presets are raw
+    # JSON and _profile_limits (routes_enroll) does not validate them, so a
+    # preset of {"rate_limit_rpm": 0} minted keys whose FIRST request got
+    # "RPM limit 0 exceeded (1 this minute)" — and every request after it, for
+    # the life of the key. A non-positive limit follows the max_concurrent
+    # convention (0 = not configured), never "refuse everything". The window
+    # counters are still incremented: only the REFUSAL is skipped, so the
+    # numbers stay truthful for accounting and for a later limit change.
+    rpm_limited = rpm > 0
+    tpm_limited = tpm > 0
+    remaining_requests = max(0, rpm - row["requests"]) if rpm_limited else None
+    remaining_tokens = max(0, tpm - row["tokens"]) if tpm_limited else None
+    if rpm_limited and row["requests"] > rpm:
         _metrics.RATE_LIMITED.labels(scope="rpm").inc()
         await _release_rejected_charge(key_id, start, charge)
         return GateResult(
@@ -405,7 +444,7 @@ async def check_rate_limit(key_id: uuid.UUID, rpm: int, tpm: int, est_tokens: in
             remaining_requests=remaining_requests,
             remaining_tokens=remaining_tokens,
         )
-    if row["tokens"] > tpm:
+    if tpm_limited and row["tokens"] > tpm:
         _metrics.RATE_LIMITED.labels(scope="tpm").inc()
         await _release_rejected_charge(key_id, start, charge)
         return GateResult(
@@ -527,6 +566,14 @@ async def _reconcile_predicted_charge(
     negative = overcharged (refund it). Clamped at 0 on the refund side by
     the same UPDATE the cache refund uses.
     """
+    # RELEASE FIRST, DECIDE SECOND (audit C3, 2026-10-29): the guards below
+    # return without popping, and every 429/refusal path settles with
+    # prompt_tokens == 0 — so each refused request left its admission charge
+    # in _predict_charges forever (only an hour-TTL prune past the 8192
+    # watermark reclaimed it), and a later request reusing that request_id
+    # reconciled against ANOTHER request's charge. The pop is unconditional;
+    # a zero-prompt settle has nothing to reconcile but must still release.
+    remembered = _predict_charges.pop(request_id, None) if request_id else None
     if not _predict_enabled() or not bool(getattr(settings, "rate_limit_predict_reconcile", True)):
         return
     if prompt_tokens <= 0 or not request_id:
@@ -534,7 +581,6 @@ async def _reconcile_predicted_charge(
     # The charge this request ACTUALLY made at admission. Recomputing it from
     # the ratio here would be wrong: the ratio is refreshed from the ledger,
     # which now contains this very row - the prediction would grade itself.
-    remembered = _predict_charges.pop(request_id, None)
     if remembered is None:
         return  # no recorded charge (prediction off at admission, or expired)
     charged = remembered[0]
@@ -857,6 +903,102 @@ async def budget_status(key_id: uuid.UUID) -> list[dict]:
                 "window_start": _window_start(datetime.now(UTC), cb["period"]).isoformat(),
             }
         )
+    return out
+
+
+async def model_capacity(key_id: uuid.UUID, models: list[str]) -> dict[str, dict]:
+    """Per-model budget capacity for ONE key, right now.
+
+    Returns {model: {"ok": bool, "remaining_tokens": int | None, "blocked_by": str}}.
+    remaining_tokens is None when the key carries no token budget for that model
+    (unlimited). blocked_by is "" when ok, else a short human reason.
+
+    READ "ok" AS "HAS HEADROOM", NOT "WILL ADMIT THIS REQUEST". This is a
+    visibility filter, not the gate: check_budgets also charges an ADMISSION
+    ESTIMATE (est_tokens discounted by budget_cached_exempt_fraction, 0.9 on
+    this deployment), so a model with 5k tokens left reports ok=True here and
+    is still refused for a 100k-token request. The divergence is deliberate —
+    the alternative is guessing the caller's next prompt size — and it is why
+    the admission gate remains the only enforcement point.
+    """
+    # FAST PATH (perf): the overwhelming majority of keys carry NO budget rows
+    # at all, and budget_status would pay BOTH lineage fetchrows plus BOTH
+    # ledger aggregates to discover that. Probe the tiny indexed catalog first
+    # — the same short-circuit check_budgets uses (see its REMEDIATION P4
+    # note) — so the common case costs ONE cheap probe instead of four
+    # round-trips on the pool the data plane shares.
+    try:
+        if await _budget_rows_exist(key_id, None) is False:
+            return {m: {"ok": True, "remaining_tokens": None, "blocked_by": ""} for m in models}
+    except Exception:
+        # An unknown catalog must never skip the real check below.
+        log.warning("model_capacity: budget-row probe failed; falling back to the aggregates", exc_info=True)
+    # WHY this delegates to budget_status instead of issuing its own SQL:
+    # budget_status already runs EXACTLY the two aggregate queries the gate
+    # runs (one per budget family, lineage-scoped, cache-weighted — see
+    # _budget_sums), and the operator's question ("which models still have
+    # token capacity at that moment?") is answered entirely from those rows.
+    # A third hand-rolled aggregate here would be a second copy of the
+    # spend math that can silently drift from what check_budgets ENFORCES —
+    # visibility that disagrees with the gate is worse than no visibility.
+    # It also keeps the cost at TWO queries for the whole model list: the
+    # naive shape (check_budgets per model) would be 2*len(models) ledger
+    # SUMs on the connection pool the data plane shares, from a UI endpoint.
+    #
+    # FAIL-OPEN is deliberate and is the routing contract: a budget lookup
+    # fault must never make models disappear from model_list (an empty or
+    # all-blocked answer would reroute/refuse traffic on a DB blip). The
+    # gate itself still enforces on admission, so the worst case is a model
+    # shown as available that the gate then refuses — never the reverse.
+    try:
+        rows = await budget_status(key_id)
+    except Exception:
+        log.warning("model_capacity: budget lookup failed; reporting all models as unlimited", exc_info=True)
+        return {m: {"ok": True, "remaining_tokens": None, "blocked_by": ""} for m in models}
+
+    # Matching semantics MIRROR check_budgets byte-for-byte:
+    # * a row applies to model m when row["model"] == m or row["model"] == "*"
+    #   (the same predicate the ledger JOIN uses: l.model = b.model OR
+    #   b.model = '*');
+    # * token exhaustion is spent >= limit — the gate's admission test is
+    #   spent + est > limit, so a row with even ONE token of headroom
+    #   (spent + 1 <= limit) admits and is therefore NOT exhausted. Reporting
+    #   "0 remaining" for a row that still admits would be a false block;
+    # * USD exhaustion is spent_usd >= limit_usd (post-paid: the gate cannot
+    #   know in-flight cost, so the equality case is already exhausted);
+    # * NO matching row anywhere -> UNLIMITED. This mirrors check_budgets'
+    #   any_rows-is-False short-circuit: a key without budget rows is not
+    #   "exhausted", it is uncapped. This is the overwhelmingly common case
+    #   and must never render as blocked.
+    out: dict[str, dict] = {}
+    for m in models:
+        matched = [r for r in rows if r["model"] == m or r["model"] == "*"]
+        if not matched:
+            out[m] = {"ok": True, "remaining_tokens": None, "blocked_by": ""}
+            continue
+
+        # Several rows can match one model (e.g. a '*' month cap plus an
+        # exact-model day cap, or the same model capped in two periods): the
+        # key is blocked if ANY of them is exhausted, and the reported
+        # headroom is the MINIMUM across the token rows — the tightest cap is
+        # what actually runs out first.
+        blocked_by = ""
+        remaining: int | None = None
+        for r in matched:
+            if r["kind"] == "tokens":
+                limit = int(r["limit"])
+                spent = int(r["spent"])
+                left = max(0, limit - spent)
+                remaining = left if remaining is None else min(remaining, left)
+                if spent >= limit and not blocked_by:
+                    blocked_by = f"{r['period']} token budget {limit} exhausted (spent {spent})"
+            elif r["kind"] == "usd":
+                limit_usd = float(r["limit_usd"])
+                spent_usd = float(r["spent_usd"] or 0)
+                if spent_usd >= limit_usd and not blocked_by:
+                    blocked_by = f"{r['period']} cost budget ${limit_usd:.2f} exhausted (spent ${spent_usd:.4f})"
+
+        out[m] = {"ok": not blocked_by, "remaining_tokens": remaining, "blocked_by": blocked_by}
     return out
 
 

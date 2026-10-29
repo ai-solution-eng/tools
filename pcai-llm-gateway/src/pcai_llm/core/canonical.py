@@ -101,18 +101,54 @@ def thread_key(msgs: list[dict], key_id: Any) -> str | None:
     one conversation across trace threads and store rows.
     """
     seed = None
+    stripped = ""
+
+    # Strip the harness runtime preamble (a per-turn clock reading) BEFORE
+    # hashing. It changes every turn, so hashing it raw gave every turn a
+    # DIFFERENT thread and made conversation stickiness structurally
+    # impossible (measured 2026-10-28: 100% "cold" route switches, because no
+    # conversation ever had an incumbent).
+    from .decision_routing import strip_harness_context
+
+    # LAZY: this runs synchronously on the request path, so it stops at the
+    # first message that carries real words instead of materialising the text
+    # of every user message (measured 9.9ms on an 81-message history).
     for m in msgs or []:
-        if isinstance(m, dict) and m.get("role") == "user":
-            seed = m.get("content")
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if seed is None:
+            seed = content
+        # List-shaped content (multimodal parts) is FLATTENED before stripping:
+        # json.dumps of the parts list puts the text behind quotes, where a
+        # line-anchored pattern can never match -- which silently re-split every
+        # multimodal conversation even after the string case was fixed.
+        if isinstance(content, list):
+            text = "\n".join(
+                p.get("text")
+                for p in content
+                if isinstance(p, dict) and isinstance(p.get("text"), str)
+            )
+        elif isinstance(content, str):
+            text = content
+        elif content is None:
+            text = ""
+        else:
+            text = str(content)
+        stripped = strip_harness_context(text)
+        if stripped:
             break
     if seed is None:
         return None
-    if not isinstance(seed, str):
-        try:
-            seed = json.dumps(seed, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            seed = str(seed)
-    return hashlib.sha256(f"{key_id}|{seed}".encode()).hexdigest()[:16]
+    if not stripped:
+        # EVERY user message was pure harness context (a preamble-only or
+        # image-only conversation). Hashing the raw seed would hash the clock
+        # and re-split the thread on every turn -- the exact defect above. A
+        # shared constant is the honest fallback: such conversations collapse
+        # onto one fingerprint per key (one sticky row), which is a far smaller
+        # error than "no conversation ever has an incumbent".
+        stripped = "<harness-context-only>"
+    return hashlib.sha256(f"{key_id}|{stripped}".encode()).hexdigest()[:16]
 
 
 def message_hash(message: Any) -> str:

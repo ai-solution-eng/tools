@@ -25,6 +25,8 @@ import time
 
 from ..config import settings
 from ..db import db
+from ..routing.router import router as model_router
+from . import context_window, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +37,13 @@ CADENCE_S = 60.0
 # existing prunes are cheap by comparison). Mirrors the "prunes piggyback a
 # rarer hook" discipline the old registry-refresh wiring used.
 _CANONICAL_PRUNE_INTERVAL_S = 3600.0
-_last_canonical_prune = 0.0
+# NONE = "never pruned in this process" (audit C8, 2026-10-29). The old 0.0
+# sentinel was compared against time.monotonic(), which is HOST UPTIME — on a
+# node that has been up for less than an hour the throttle therefore swallowed
+# the first prune for up to an hour after every pod start (core/costs.py:22-27
+# documents and fixes the same defect class with float("-inf")). A sentinel
+# that cannot be confused with a monotonic reading is the honest fix.
+_last_canonical_prune: float | None = None
 
 _task: asyncio.Task | None = None
 
@@ -104,7 +112,7 @@ async def _prune_canonical_store() -> None:
     if days <= 0:
         return
     now = time.monotonic()
-    if now - _last_canonical_prune < _CANONICAL_PRUNE_INTERVAL_S:
+    if _last_canonical_prune is not None and now - _last_canonical_prune < _CANONICAL_PRUNE_INTERVAL_S:
         return
     _last_canonical_prune = now
     try:
@@ -116,6 +124,26 @@ async def _prune_canonical_store() -> None:
                     SELECT 1 FROM canonical_distills d
                     WHERE d.key_id = c.key_id
                       AND d.thread_id = c.thread_id
+                      -- THE PROOF MUST BE ABOUT THIS CONTENT (audit F3,
+                      -- 2026-10-29): canonical_distills has a PRIMARY KEY and
+                      -- NO foreign key to canonical_conversations, so a marker
+                      -- can outlive the row it described and be re-created for
+                      -- a NEW conversation that reuses the (key_id, thread_id)
+                      -- pair — e.g. the marker left behind by an earlier
+                      -- capture, or one written before the row was replaced.
+                      -- Such a marker proves nothing about the CURRENT text,
+                      -- and matching it deleted never-distilled transcripts,
+                      -- defeating the "cannot lose an un-distilled
+                      -- conversation" contract this prune is built on. The
+                      -- state snapshot must be the row's CURRENT updated_at
+                      -- (the exact value mark_canonical_distilled stores, and
+                      -- the complement of the due query's
+                      -- "distilled_row_state < c.updated_at"). A marker whose
+                      -- snapshot was stamped with now() by an older build never
+                      -- matches, so that row is simply not reclaimed — the
+                      -- conservative direction for the one prune that can lose
+                      -- input data.
+                      AND d.distilled_row_state = c.updated_at
                       AND d.distilled_at < now() - make_interval(days => $1)
                       -- a row currently suppressed by a gate skip was never
                       -- re-distilled after its last change: pruning it here
@@ -162,11 +190,45 @@ async def _distill_sweep() -> None:
         log.warning("housekeeping: distill sweep skipped", exc_info=True)
 
 
+async def _context_window_sweep() -> None:
+    """Re-attempt context-window discovery for any upstream still unknown.
+
+    WHY (live defect, 2026-10-29 — found in the 3.4.5 rollout). Discovery runs
+    inside registry.refresh(), which fires on BOOT and on a committed admin
+    mutation ONLY. A probe that timed out or 401'd during that one moment left
+    the POD permanently blind: immediately after the cut, one replica knew all
+    three windows and the other knew only GLM's, so 3 of 8 forced-Qwen requests
+    still returned "(model error 400)" while the sibling replica served the
+    same requests fine. A window is a fact the upstream publishes continuously,
+    so a pod that missed it has to keep asking.
+
+    Cost in the steady state is ZERO I/O: every upstream with a known window is
+    filtered out here, and context_window.probe additionally enforces
+    PROBE_RETRY_SECONDS so a permanently broken upstream is retried once a
+    minute at most. Error-swallowed like every other housekeeping step.
+    """
+    entries: list[tuple[str, dict[str, str]]] = []
+    for name in model_router.models():
+        pool = model_router.pool(name)
+        if pool is None:
+            continue
+        for ep in pool.endpoints:
+            if context_window.cached(ep.base_url) is None:
+                entries.append((ep.base_url, upstream_auth.upstream_headers(ep)))
+    if not entries:
+        return
+    await context_window.refresh_windows(entries)
+
+
 async def _loop() -> None:
     while True:
         try:
             await _sweep_once()
             await _distill_sweep()
+            try:
+                await _context_window_sweep()
+            except Exception:
+                log.warning("housekeeping: context-window sweep skipped", exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover — defensive, the loop never dies

@@ -84,9 +84,43 @@ def _headers_of(request: Request) -> Mapping[str, str]:
     return request.headers  # type: ignore[return-value]
 
 
+async def _browser_caller(headers: Mapping[str, str] | None) -> identity.Caller | None:
+    """ATTRIBUTION-ONLY browser-header rung (audit C4, 2026-10-29).
+
+    ``resolve_caller``'s rung 1 (oauth2-proxy identity headers) is gated on
+    ``headers is not None``, and both auth surfaces called it as
+    ``resolve_caller(None, token=…)`` — so on the documented chained-edge
+    deployment the rung never ran on the data plane at all, and a
+    proxy-identified user was attributed as ``key-anon`` (key fingerprint) in
+    the ledger, the trace explorer and ``X-MCP-Caller``.
+
+    WHY this does NOT authorize: a header is not a credential. The caller this
+    returns is only ever written to ``request.state.caller`` / the ASGI scope
+    state for attribution; the AUTHORIZATION anchor (``key``) still comes from
+    the token's shadow key or ``authenticate``, exactly as before. Passing the
+    headers straight into the token-rung ``resolve_caller`` call would have
+    made the browser rung outrank the token rung and — worse — fed the BROWSER
+    subject into ``resolve_shadow_key``, i.e. turned a posture-dependent header
+    into an authorization lookup. It stays attribution-only.
+
+    Trust-gated inside ``resolve_caller`` (flag + the enforcing proxy are the
+    documented precondition), and a no-op when the flag is off or the headers
+    are absent — the pre-fix behaviour byte-for-byte.
+    """
+    if headers is None:
+        return None
+    try:
+        return await identity.resolve_caller(None, headers=headers)
+    except Exception:
+        # Attribution must never fail a request the gates admitted (the same
+        # posture as the key-binding stamp and key_override_headers).
+        return None
+
+
 async def _token_ladder(
     plaintext: str,
     authenticate: EnvelopeAuth,
+    headers: Mapping[str, str] | None = None,
 ) -> tuple[KeyRecord | None, identity.Caller | None]:
     """One run of the token ladder for ONE bearer credential — the exact
     sequence both auth surfaces have always run (JWT-shape gate → token
@@ -102,20 +136,26 @@ async def _token_ladder(
     fail-closed posture both surfaces share.
     """
     key: KeyRecord | None = None
-    caller = None
+    # Rung 1 FIRST (attribution only — see _browser_caller): with trusted
+    # proxy headers present the browser identity is the freshest assertion, so
+    # it wins the ATTRIBUTION slot exactly as resolve_caller's own precedence
+    # says. The authorization anchor below is untouched by it.
+    caller = await _browser_caller(headers)
     if identity._JWT_SHAPE_RE.match(plaintext) and identity.token_validation_configured():
         try:
-            caller = await identity.resolve_caller(None, token=plaintext)
+            token_caller = await identity.resolve_caller(None, token=plaintext)
         except Exception:
             # JWKS/infrastructure failure: fail CLOSED (the _McpAuthASGI
             # posture — an unavailable IdP is a refusal, never a bypass).
             raise fastapi.HTTPException(401, "token validation unavailable") from None
-        if caller is not None and caller.subject is not None:
+        if caller is None:
+            caller = token_caller
+        if token_caller is not None and token_caller.subject is not None:
             # Token verified. Authorization still needs a ledger key: the
             # subject's shadow key (newest non-revoked, or first-sighting
             # provisioning when the flag is on). DB failures propagate —
             # same posture as authenticate (never a silent open door).
-            key = await identity.resolve_shadow_key(caller.subject)
+            key = await identity.resolve_shadow_key(token_caller.subject)
     if key is None:
         # Fall-through (invalid-token and no-token paths land here): the
         # credential may still be a virtual key.
@@ -178,15 +218,18 @@ async def resolve_bearer_key(
             raise fastapi.HTTPException(401, "invalid, revoked, or expired key") from None
         # Attribution with the co-forwarded Bearer: NON-FATAL by design —
         # the envelope already authorized the request; a token resolution
-        # failure here must not fail an authorized call.
-        if plaintext and identity._JWT_SHAPE_RE.match(plaintext) and identity.token_validation_configured():
+        # failure here must not fail an authorized call. The browser rung is
+        # consulted FIRST (attribution only, audit C4) so a proxy-identified
+        # user is not attributed as key-anon on the SSO envelope path.
+        caller = await _browser_caller(headers)
+        if caller is None and plaintext and identity._JWT_SHAPE_RE.match(plaintext) and identity.token_validation_configured():
             try:
                 caller = await identity.resolve_caller(None, token=plaintext)
             except Exception:
                 caller = None
         return key, caller
 
-    key, caller = await _token_ladder(plaintext, authenticate)
+    key, caller = await _token_ladder(plaintext, authenticate, headers)
     if key is None:
         if caller is not None and request is not None:
             request.state.caller = caller  # resolved identity, refused authorization

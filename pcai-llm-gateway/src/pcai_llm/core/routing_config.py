@@ -60,7 +60,45 @@ DEFAULTS: dict[str, Any] = {
     "decision_model": "",
     "allowed_models": [],
     "prompt": "",
-    "inject_gpu_load": False,
+    # --- GLOBAL routing arming + ladder (2026-10-28) ----------------------
+    # WHY these live here and not only on the profile: routing was armed
+    # per-profile (profiles.routing_policy) and its ladder was borrowed from
+    # profiles.model_order, which is a CASCADE ordering. Two consequences the
+    # operator hit in production:
+    #   * the routing panel read decision_mode=active while the profile was
+    #     still shadow, so nothing was ever served and the UI gave no hint;
+    #   * a profile with an empty model_order made bare `routing` 404
+    #     ("routing requires a profile model ordering"), so the feature
+    #     silently did not exist for that profile.
+    # The GLOBAL value is the fleet default; a profile that explicitly arms
+    # itself (shadow/active) still wins, so a site can opt one profile in
+    # early. One-way by construction: a profile left at "off" INHERITS, so it
+    # cannot force routing off while the fleet default is armed -- if that is
+    # ever needed, make profiles.routing_policy nullable and treat NULL as
+    # inherit rather than overloading "off".
+    "routing_policy": "off",
+    # The GLOBAL capability ladder (MOST-CAPABLE FIRST -- the same convention
+    # as profiles.model_order, because the router takes order[0] as the
+    # CEILING and builds cheap_first as reversed(order). Getting this
+    # backwards makes the WEAKEST model the ceiling), used by the router when
+    # the calling profile declares no model_order. Empty = no ladder = bare
+    # `routing` still 404s, exactly as before.
+    "model_order": [],
+    # The GLOBAL routing floor: the weakest model the router may serve when a
+    # calling profile declares no routing_min_model of its own (R3, audit
+    # 2026-10-29: without this knob a fleet-armed heuristic router was pinned
+    # to the ceiling and could NEVER downgrade — the feature the panel just
+    # enabled was inert for every floorless profile). Most-capable-FIRST name,
+    # matching the ladder convention; empty = no global floor (the shipped
+    # "no floor -> no downgrade" behaviour, unchanged).
+    "routing_min_model": "",
+    # ON by default: the shipped prompt has a "## Current GPU load" section that
+    # asks the model to weigh load, and with injection off that section renders
+    # as the literal string "(gpu load injection is off)" -- the prompt and the
+    # text actually sent disagreed on every deployment that never flipped this.
+    # Turning it on is the automatic behaviour; an operator who wants the model
+    # to ignore load sets it false and the section says so explicitly.
+    "inject_gpu_load": True,
     "gpu_load_source": "offpeak",
     "max_prompt_chars": 8000,
     # --- decision-model execution (the LLM-as-router seam) -----------------

@@ -929,14 +929,16 @@ def test_sso_default_profile_wiring_accepts_usd_preset(tc) -> None:
 
 NAV_GROUP_TABS = [
     "keys|profiles|enroll",
-    "models|mcp",
+    # agents sit with the registry tabs: an agent IS a model entry in the data
+    # plane (GET /v1/models, pcai.type="agent"), so it belongs next to Models.
+    "models|agents|mcp",
     "usage|traces|audit|guardrails",
     "offpeak|distiller|routing",
 ]
 
 
 def test_console_nav_groups_with_green_separators() -> None:
-    """5a: the eleven tabs are grouped into exactly FOUR .navgroup divs —
+    """5a: the twelve tabs are grouped into exactly FOUR .navgroup divs —
     identity, inventory, observability (Usage folded in with
     traces/audit/guardrails — the Lead's ruling), background GPU-economy
     (off-peak, distiller, routing) — separated by a thin green rule. The
@@ -998,6 +1000,101 @@ def test_console_routing_panel() -> None:
     # and the shadow help text must not repeat the old "no latency risk" claim:
     # shadow DOES pay one bounded decision call per routed request.
     assert "pays one extra decision call" in s
+
+
+# ---------------------------------------------------------------------------
+# Agent profiles (2026-10-29): the Agents tab, the profile picker, and the
+# presented-models section. Source-shape pins in this file's seam style — the
+# API behavior is pinned backend-side (tests/test_agents.py).
+# ---------------------------------------------------------------------------
+
+
+def test_console_agents_tab() -> None:
+    """The Agents tab is a full CRUD surface: it must be reachable from the nav,
+    lazy-load on activation, and drive the three /admin/agents verbs. The server
+    picker is the ONLY place an operator says what an agent may see, so its
+    checkboxes are pinned by class (the save reads exactly that class)."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'data-tab="agents"' in s and 'id="tab-agents"' in s
+    assert "if (name === 'agents') loadAgents().catch(" in s
+    assert "api('/agents')" in s
+    assert 'api("/agents", { method: "POST", body: {' in s
+    assert 'encodeURIComponent(name), { method: "DELETE" }' in s
+    # the picker + save contract
+    assert 'id="ag-servers"' in s
+    assert 'class="ag-srv"' in s
+    assert 'document.querySelectorAll("#ag-servers input.ag-srv")' in s
+    assert 'id="ag-prompt"' in s and 'id="ag-model"' in s
+    # the honest legend: an agent HIDES tools, it never grants them
+    assert "can only ever HIDE tools, never add one" in s
+    # the empty state must not read as "broken" on a fresh install
+    fn = re.search(r"function agRenderTable\(\) \{.*?\n\}", s, re.DOTALL)
+    assert fn and "no agents yet" in fn.group(0)
+    # handlers are DATA-ATTRIBUTE bound, never inline: JSON.stringify emits
+    # literal double quotes, which terminate a double-quoted attribute and made
+    # every edit/delete button dead (cross-validation 2026-10-29).
+    assert 'data-agent-edit="' in s and 'data-agent-del="' in s
+    assert "JSON.stringify(a.name)" not in s
+    assert "tb.querySelectorAll('[data-agent-edit]')" in s
+    # a failed agent-list load must NOT clear a profile's selection
+    assert "state.agentsLoaded ? pAgentSelection() : undefined" in s
+    # starting from a preset/profile must reset the picker, not carry ticks over
+    assert s.count("pRenderAgents([])") >= 1
+
+
+
+def test_console_profile_agents_picker() -> None:
+    """A profile decides which agents its keys may use, so the editor must carry
+    the selection AND always send it: POST /admin/profiles is a full upsert, and
+    an omitted `agents` means "leave untouched" — unticking every box would
+    otherwise silently keep the old selection."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'id="p-agents"' in s
+    assert 'class="p-agent"' in s
+    fn = re.search(r"function pAgentSelection\(\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "pAgentSelection not extractable"
+    # sent only when the list actually loaded — an empty picker must not clear
+    # a selection this console never saw (cross-validation 2026-10-29)
+    assert "agents: state.agentsLoaded ? pAgentSelection() : undefined," in s
+    # editProfile must paint the saved selection, not the previous one
+    assert "pRenderAgents(p.agents || []);" in s
+    # the profiles table reports it per row
+    assert "<th>Agents</th>" in s
+    # the profiles table's action cell is the SAME blocky .rowacts grid the Keys
+    # table uses (operator request 2026-10-29) — and it carries the new
+    # apply-grants action
+    assert 'class="rowacts"' in s
+    assert "propagateGrants(this,'" in s
+    assert "propagate-grants" in s
+    # .rowacts is a fixed 168px two-column grid with ellipsis, so the labels
+    # must stay terse nouns — "apply limits" truncated to "apply lim…"
+    # (operator report 2026-10-29). The verb lives in the tooltip.
+    assert 'title="APPLY this profile' in s and ">limits</button>" in s
+    assert ">grants</button>" in s
+    assert ">apply limits</button>" not in s and ">apply grants</button>" not in s
+    # off-peak is visible per profile: it is the one profile knob that changes
+    # how fast a budget drains, so it must not be a hidden editor field
+    assert "<th>Off-peak</th>" in s
+    # stamped vs live grants is visible, so an operator knows whether the
+    # propagate button is even needed
+    assert "stamped" in s and "LIVE grants" in s
+
+
+
+def test_console_presented_endpoints_lists_agents() -> None:
+    """An agent IS a model entry in the data plane, so the panel that claims to
+    show what /v1/models advertises must list them — with the servers, the
+    resolved model, and the profiles that offer each one."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert "const agentRows = (d.agents || []).map(" in s
+    assert "Agents <span class=\"muted\">— tool surfaces selectable as a model</span>" in s
+    assert "no agents defined" in s
+    for col in ("Servers", "Offered by", "Presented"):
+        assert col in s
 
 
 def test_console_presented_endpoints_block() -> None:

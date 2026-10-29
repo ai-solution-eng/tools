@@ -164,6 +164,21 @@ class Settings(BaseSettings):
     # Client opts in with header X-PCAI-Execute-Tools. The loop runs
     # in-cluster; guards below are the AgentBuilder lessons ported.
     tool_relay_enabled: bool = True
+    # --- tool surface (2026-10-28) -------------------------------------
+    # How the granted MCP catalogue is offered to the model.
+    #   "full"   -> every tool definition inline. Measured cost: 34,459
+    #               prompt tokens for a 111-tool / 10-server catalogue
+    #               (75,698 chars of description prose alone). That is a
+    #               floor on every relayed request and it overflowed a 262k
+    #               model window on a 236k conversation (upstream 400).
+    #   "hybrid" -> ONE `pcai_tools` discovery tool inline; a server's real
+    #               definitions are added only after the model asks to see
+    #               them (promotion), so a turn pays discovery once and then
+    #               has real tools for the iterations that need them.
+    # Default "full": the surface is what the model can SEE, and a model that
+    # cannot see a tool will not call it. Flip per site, after watching a
+    # turn actually discover and use a server, not on faith.
+    tool_relay_surface: str = "full"
     # 16 MODEL rounds (not tool calls — a round may batch several parallel
     # calls): a serial research turn (search, then a fetch per page, then
     # synthesize) burns ~1 round per call and exhausted 8 mid-research. The
@@ -902,13 +917,42 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
 
 
-def clamp_max_tokens(body: dict, model: str, ceilings: dict[str, int]) -> dict:
-    """Lower `body["max_tokens"]` to `model`'s ceiling; never raise it.
+# The two client-visible completion-cap spellings an OpenAI-compatible body
+# can carry. Both must be clamped (audit F5, 2026-10-29): max_completion_tokens
+# is the modern field and bypassed the per-model ceiling entirely.
+_MAX_TOKEN_CAP_KEYS = ("max_tokens", "max_completion_tokens")
+
+
+def clamp_max_tokens(
+    body: dict,
+    model: str,
+    ceilings: dict[str, int],
+    *,
+    context_limit: int | None = None,
+) -> dict:
+    """Lower `body["max_tokens"]` / `body["max_completion_tokens"]` so the
+    attempt can actually be ADMITTED; never raise either.
 
     THE single clamp used by every upstream-forwarding site (routes_proxy's
     non-streaming, streaming and relay paths, plus toolrelay's per-iteration
-    body) — one implementation so the sites cannot drift (settings.
-    max_tokens_ceiling, see its comment for the live defect this guards).
+    body) — one implementation so the sites cannot drift.
+
+    THE RULE IS AN INEQUALITY, NOT A CONSTANT (2026-10-29). An upstream admits
+    a request only when `prompt_tokens + max_tokens <= max_model_len`. The
+    ceiling map encoded the SECOND term and silently froze the first at
+    whatever prompt size the operator imagined: G2's `Qwen3.8-27B: 196608`
+    against a 262144 window assumes a prompt <= 65536, while a DSH agent turn
+    is 81515-92912 prompt tokens (its MCP tool catalog is the bulk), so every
+    Qwen-served turn computed 196608 + ~85000 and was rejected with a 400
+    BEFORE sampling. Given `context_limit` — learned from the upstream's own
+    /v1/models card by core.context_window — the cap becomes
+    `window - estimated prompt - margin`, and the same request asks for ~160k
+    instead of dying.
+
+    `context_limit` is OPTIONAL and fail-open: None (window not learned yet,
+    the normal case on a fresh pod) reproduces the ceiling-only behaviour
+    byte-for-byte. The operator ceiling survives as a COST policy; when both
+    apply the TIGHTER one wins, and a clamp never raises what was asked for.
 
     Contract (hot path — this runs on EVERY proxied request):
       * returns a NEW dict when a clamp is needed; the caller's `body` is
@@ -916,29 +960,60 @@ def clamp_max_tokens(body: dict, model: str, ceilings: dict[str, int]) -> dict:
         afterwards, and must keep seeing the CLIENT's numbers);
       * returns the SAME object, zero-copy, whenever nothing needs to change:
           - `model` has no ceiling entry (the common case: opt-in feature);
-          - `max_tokens` is absent (nothing to clamp);
+          - NEITHER cap key is present (nothing to clamp);
           - the entry is 0/negative (ignored, fail-safe) or not a real int
             (a malformed map value must not mute the model);
-          - `max_tokens` is not an int (bool excluded — `True` is not a
+          - a cap value is not an int (bool excluded — `True` is not a
             token count) or not positive: the estimator already guards
             non-numeric values, and clamping them here could only make
             things worse;
           - the value is already <= the ceiling (a cap never RAISES a small
             client value, and equal is a no-op);
-      * everything else in the body is byte-identical — only the one key is
-        replaced.
+      * everything else in the body is byte-identical — only the cap key(s)
+        that actually needed lowering are replaced.
+
+    BOTH SPELLINGS (audit F5, 2026-10-29): `max_completion_tokens` is the
+    modern OpenAI cap field and every current client library emits it, so a
+    clamp that only knew `max_tokens` was trivially bypassed — the 400 it
+    exists to prevent came back with the ceiling configured and the client
+    sending 999999 under the new name. Both keys are clamped; a body carrying
+    both gets both lowered (the upstream honours the field it knows).
     """
-    if not ceilings:
-        return body
-    ceiling = ceilings.get(model)
+    # Lazy import: core.context_window is import-light by design, but going
+    # through `pcai_llm.core` at module scope would execute the package
+    # __init__ (which pulls budgets -> config) and cycle back into this
+    # module mid-definition. One sys.modules lookup per call is the price.
+    from .core.context_window import completion_cap, estimate_context_tokens
+
+    ceiling = (ceilings or {}).get(model)
     # bool is an int subclass: True would read as ceiling 1 and clamp every
     # request to one token — reject it with the other malformed entries.
     if not isinstance(ceiling, int) or isinstance(ceiling, bool) or ceiling <= 0:
+        ceiling = None
+    if ceiling is None and context_limit is None:
         return body
-    value = body.get("max_tokens")
-    if not isinstance(value, int) or isinstance(value, bool) or value <= ceiling:
-        return body
-    return {**body, "max_tokens": ceiling}
+    # Solved per REQUEST, not per model: the same virtual model needs a
+    # different cap for a 700-token prompt and an 85000-token one.
+    estimate = estimate_context_tokens(body) if context_limit is not None else 0
+    out = body
+    for key in _MAX_TOKEN_CAP_KEYS:
+        value = body.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            continue
+        cap = completion_cap(
+            context_limit=context_limit,
+            est_prompt=estimate,
+            requested=value,
+            ceiling=ceiling,
+        )
+        # None = no opinion (window unknown, or the PROMPT alone overflows and
+        # no completion cap can rescue it — the candidate gate owns that case).
+        if cap is None or cap >= value:
+            continue
+        if out is body:  # first clamp: copy once, never mutate the caller's dict
+            out = dict(body)
+        out[key] = cap
+    return out
 
 
 # database_url is sourced from env at runtime (pydantic-settings), which

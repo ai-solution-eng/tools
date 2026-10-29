@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pcai_llm.core import decision_routing
 
-TEMPLATE = Path(__file__).resolve().parents[1] / "documentation" / "routing_text.md"
+TEMPLATE = Path(__file__).resolve().parents[1] / "documentation" / "changelogs" / "routing_text.md"
 
 
 def test_default_instructions_match_the_documented_template() -> None:

@@ -129,7 +129,8 @@ from ..core.identity import (
 from ..core.keys import KeyRecord, authenticate
 from ..db import db
 from ..mcpf import arg_policy
-from ..mcpf.federation import is_allowed, load_grants, server_allows, visible_tools
+from ..mcpf.federation import is_allowed, load_grants, server_allows
+from ..routing.router import upstream_client
 from . import auth
 
 log = logging.getLogger(__name__)
@@ -527,7 +528,7 @@ async def _upstream_session[T](
     # unconditional; the site CA bundle rides when configured.
     verify: str | bool = settings.upstream_ca_bundle or True
     async with (
-        httpx2.AsyncClient(
+        upstream_client(
             timeout=httpx2.Timeout(eff_timeout, connect=10.0),
             follow_redirects=False,
             headers=headers,
@@ -751,8 +752,47 @@ def resolve_flat_name(name: str, server_names: list[str]) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-async def _mcp_catalog() -> str:
+# One-line summary length in the catalog DIRECTORY. The directory is an index,
+# not the documentation: full text arrives with detail="full". 120 chars keeps
+# a 111-tool directory near ~2k tokens instead of ~69k.
+_CATALOG_SUMMARY_CHARS = 120
+
+
+def _catalog_summary(text: Any, cap: int = _CATALOG_SUMMARY_CHARS) -> str:
+    """Whitespace-collapsed, hard-capped one-liner. PURE.
+
+    Collapsing newlines is also the injection bound: an upstream description
+    cannot forge extra lines in the directory (it stays one line).
+    """
+    s = " ".join(str(text or "").split())
+    if len(s) <= cap:
+        return s
+    return s[: cap - 1].rstrip() + "\u2026"
+
+
+async def _mcp_catalog(server: str | None = None) -> str:
     """Catalog of the calling key's visible MCP tools across enabled servers.
+
+    2026-10-28 — SIZE (measured): the previous payload was 274,925 chars
+    (~69k tokens) because every tool was emitted TWICE (once under
+    servers[].tools with its full inputSchema+annotations, once under a
+    "granted" union) and every description rode verbatim. That is twice the
+    flat surface it replaced, so turning mcp_flat_tools OFF was a REGRESSION
+    until this changed. Measured after: ~18-24k chars (~4.6-6k tokens) for
+    all 10 servers / 111 tools, ~2-3k chars for one server.
+
+    THE CONTRACT IS ONE OPTIONAL PARAMETER:
+      * no argument     -> every server, every tool, with descriptions.
+      * server="<name>" -> that server only.
+    There is deliberately NO detail/schema switch: inputSchema is dropped
+    from this payload, and mcp_call takes the arguments directly (the
+    upstream validates them). A caller that needs an exact schema reads the
+    tool description here, which is the same text the model sees.
+
+    WHY: a model calling this with no arguments must get something it can
+    afford to keep in context for the rest of the session. Making the
+    firehose the default is what made the two-tool surface worse than the
+    flat one it replaced.
 
     For each enabled registry server (PRIORITY-ORDERED: priority ASC, name
     ASC — the fleet failover order): fetch its (TTL-cached) tool list, then
@@ -761,12 +801,13 @@ async def _mcp_catalog() -> str:
     never a raised error — so one dead upstream cannot hide the rest of the
     catalog.
 
-    Returns:
-        JSON string: {"servers": [{"server", "url", "tools": [{"tool",
-        "description"}...]} | {"server", "error"}], "granted": [{"server",
-        "tool", "description"}...]} — each server's "tools" list carrying
-        ONLY the (server, tool) pairs the calling key holds (REMEDIATION
-        11c; see the per-server filter below).
+    Returns ONE "servers" key (no duplicated flat union any more):
+        {"servers": [
+            {"server", "url", "tools": [{"tool", "description"}, ...]},
+            {"server", "error"},          # upstream unreachable
+        ]}
+    Each server's "tools" carries ONLY the (server, tool) pairs the calling
+    key holds (REMEDIATION 11c; see the per-server filter below).
     """
     key = _current_key()
     servers = await registry.mcp_servers()  # priority-ordered (priority ASC, name ASC)
@@ -783,7 +824,6 @@ async def _mcp_catalog() -> str:
     for g_server, g_tool in grants:
         granted_by_server.setdefault(g_server, set()).add(g_tool)
     out_servers: list[dict[str, Any]] = []
-    catalog: list[dict[str, str]] = []
     # Perf (audit P2-2): the fetch stays UNCONDITIONAL over every enabled
     # server (deliberate, test-pinned: the 15 s metadata bound is exercised
     # fleet-wide and the TTL cache warms for all servers, not just this
@@ -792,15 +832,19 @@ async def _mcp_catalog() -> str:
     # max(per-server bound) instead of N x bound.
     fetches = [_cached_upstream_tools(server) for server in servers]
     listings = await asyncio.gather(*fetches, return_exceptions=True)
-    for server, listing in zip(servers, listings):
-        granted_tools = granted_by_server.get(server["name"]) or set()
+    # NOTE: the loop variable MUST NOT be named `server` — it would shadow the
+    # `server` PARAMETER, so the narrowing below would read the last iterated
+    # server instead of the caller's argument (2026-10-28: that shadowing made
+    # every call behave as if a server had been requested).
+    for srv, listing in zip(servers, listings):
+        granted_tools = granted_by_server.get(srv["name"]) or set()
         if isinstance(listing, BaseException):
             # Skip-and-warn: catalog availability must not depend on the
             # healthiest denominator of upstreams. REDACTED: raw exception
             # text can carry internal hostnames — tenants get a stable
             # marker, the detail goes to the log only.
-            log.warning("mcp_catalog: server %r unavailable: %s", server["name"], type(listing).__name__)
-            out_servers.append({"server": server["name"], "error": "unavailable"})
+            log.warning("mcp_catalog: server %r unavailable: %s", srv["name"], type(listing).__name__)
+            out_servers.append({"server": srv["name"], "error": "unavailable"})
             continue
         tools = listing
         # REMEDIATION 11c closure: per-server "tools" carries ONLY the
@@ -809,24 +853,59 @@ async def _mcp_catalog() -> str:
         # URL — which operators may need for debugging — stay visible, but
         # the rest of its raw inventory does not (it used to: any single
         # grant exposed the full tool listing + the in-cluster URL).
+        # ACL filter: the key sees ONLY its granted (server, tool) pairs, never
+        # the server's raw inventory (REMEDIATION 11c — a single grant used to
+        # expose the whole tool list). No separate flat union is built any more:
+        # servers[].tools IS the list (2026-10-28), which is what removed the
+        # duplicated half of the payload.
         granted_tools_here = [tool for tool in tools if tool["tool"] in granted_tools]
-        catalog.extend(
-            {
-                "server": server["name"],
-                "tool": tool["tool"],
-                "description": tool["description"],
-            }
-            for tool in granted_tools_here
-        )
-        out_servers.append({"server": server["name"], "url": server["url"], "tools": granted_tools_here})
-    granted = visible_tools(catalog, grants)
+        out_servers.append({"server": srv["name"], "url": srv["url"], "tools": granted_tools_here})
     # Tenant-visible inventory is ACL-FILTERED: servers/URLs the key has no
     # grant on are dropped entirely (previously the full fleet inventory +
     # internal URLs leaked to any mcp-scoped key). A server with ZERO
     # granted tools therefore never appears in "servers" at all.
     granted_servers = {g_server for g_server, _ in grants}
     visible_servers = [sv for sv in out_servers if sv["server"] in granted_servers]
-    return json.dumps({"servers": visible_servers, "granted": granted}, indent=2)
+
+    # --- narrowing (2026-10-28) -------------------------------------------
+    wanted = str(server or "").strip()
+    if wanted:
+        visible_servers = [sv for sv in visible_servers if sv["server"] == wanted]
+        if not visible_servers:
+            known = sorted(sv["server"] for sv in out_servers if sv["server"] in granted_servers)
+            return json.dumps(
+                {
+                    "error": f"no granted tools on server {wanted!r}",
+                    "servers_available": known,
+                },
+                indent=2,
+            )
+
+    # ONE payload, ONE shape, each tool emitted ONCE (2026-10-28). The old
+    # output repeated every tool twice — once under servers[].tools with its
+    # full inputSchema+annotations, once under "granted" — for 274,925 chars
+    # (~69k tokens), twice the flat surface it was meant to replace. Schemas
+    # are DROPPED here: this is the directory, and mcp_call does not need them
+    # (the model supplies arguments it can infer from the description).
+    # An UNREACHABLE server keeps its error marker (the skip-and-warn
+    # contract: one dead upstream must never hide the rest, and the caller
+    # must be able to tell "no tools" from "could not ask"). Rebuilding the
+    # entry naively dropped it — caught by test_catalog_unavailable_marker.
+    out: list[dict[str, Any]] = []
+    for sv in visible_servers:
+        if sv.get("error"):
+            out.append({"server": sv["server"], "error": sv["error"]})
+            continue
+        entry: dict[str, Any] = {"server": sv["server"]}
+        if sv.get("url"):
+            # url only when there is one, and never as "" (which would read
+            # as "configured but blank").
+            entry["url"] = sv["url"]
+        entry["tools"] = [
+            {"tool": t["tool"], "description": _catalog_summary(t.get("description"))} for t in sv.get("tools") or []
+        ]
+        out.append(entry)
+    return json.dumps({"servers": out}, indent=2)
 
 
 async def _settle_quiet(
@@ -865,8 +944,14 @@ async def _settle_quiet(
     _server, _, _rest = endpoint.partition(":")[2].partition(":")
     try:
         await settle(
-            key_id, model or "*", endpoint, 0, 0, status,
-            int((time.monotonic() - started) * 1000), request_id,
+            key_id,
+            model or "*",
+            endpoint,
+            0,
+            0,
+            status,
+            int((time.monotonic() - started) * 1000),
+            request_id,
         )
     except Exception:
         log.exception("mcp: settle failed (%s %s)", status, endpoint)
@@ -942,7 +1027,11 @@ async def _gated_mcp_call(
     # the only burst guard (F6, audit). Once per REQUEST, not per attempt.
     gate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, 0)
     if not gate.ok:
-        await _settle_quiet(key.id, endpoint, "error", started, request_id, arguments=arguments)
+        # F6 (audit 2026-10-29): settle the SAME outcome the chat path stamps
+        # for a rate-gate refusal (routes_proxy settles "rate_limited"). "error"
+        # made a tenant exceeding ITS OWN rpm budget inflate the error-rate
+        # alert — an operator-owned policy event, not a gateway failure.
+        await _settle_quiet(key.id, endpoint, "rate_limited", started, request_id, arguments=arguments)
         raise ToolError(f"rate limited: {gate.reason}")
 
     servers = await registry.mcp_servers()  # priority-ordered (priority ASC, name ASC)
@@ -1013,7 +1102,9 @@ async def _gated_mcp_call(
                 grants=grants,
             )
             if candidate_decision.refused:
-                await _settle_quiet(key.id, candidate_endpoint, "policy_blocked", started, request_id, arguments=arguments)
+                await _settle_quiet(
+                    key.id, candidate_endpoint, "policy_blocked", started, request_id, arguments=arguments
+                )
                 transport_errors.append(f"{candidate_name}: {candidate_decision.reason}")
                 continue
         call_headers = await resolve_mcp_headers(candidate, key_id=key.id)
@@ -1212,6 +1303,17 @@ class _GatewayMCPServer(MCPServer):
         degrades to the gateway tools — a broken OPTIONAL surface must never
         break discovery."""
         base = await super().list_tools()
+        # SERVER DIRECTORY (2026-10-28). Without it the model must spend a
+        # discovery call to learn that mm-rag even exists — measured live: an
+        # agent turn burned five steps guessing flat names before it thought to
+        # call mcp_catalog. The directory costs ~250 tokens for ten servers and
+        # removes that whole detour. Built HERE because list_tools() runs per
+        # request, so it reflects the live registry (descriptions included).
+        try:
+            base = await self._with_server_directory(base)
+        except Exception:
+            # A broken directory must never break discovery.
+            log.warning("mcp tools/list: server directory unavailable", exc_info=True)
         if not settings.mcp_flat_tools:
             return base
         try:
@@ -1237,6 +1339,56 @@ class _GatewayMCPServer(MCPServer):
             result = await _gated_mcp_call(server, tool, arguments, failover=True)
             return CallToolResult(content=[TextContent(type="text", text=result)])
         return await super().call_tool(name, arguments, context)
+
+    async def _with_server_directory(self, tools: list[MCPTool]) -> list[MCPTool]:
+        """Append the live MCP server directory to the two gateway tools.
+
+        WHY: the gateway tools describe HOW to call MCP but not WHAT is
+        reachable, so a model that has never seen this fleet's server names
+        either guesses (flat names that no longer exist in two-tool mode) or
+        spends a discovery call finding out. One line per server removes both.
+
+        Descriptions are operator-authored text (mcp_servers.description) and
+        reach the model verbatim, so they are collapsed to one capped line —
+        a description cannot forge extra directory lines.
+        """
+        servers = await registry.mcp_servers()
+        if not servers:
+            return tools
+        # ACL FILTER — the directory obeys the same default-deny as the catalog:
+        # a server this key holds NO grant on is not named at all (naming it
+        # would leak fleet inventory to a tenant, the exact disclosure
+        # REMEDIATION 11c closed for servers[]/urls). Any failure here falls back
+        # to naming NOTHING rather than naming everything.
+        try:
+            granted = await load_grants(_current_key().id)
+            granted_servers = {g_server for g_server, _ in granted}
+            servers = [sv for sv in servers if sv["name"] in granted_servers]
+        except Exception:
+            log.warning("mcp tools/list: grant lookup failed (directory omitted)", exc_info=True)
+            return tools
+        if not servers:
+            return tools
+        lines: list[str] = []
+        for sv in servers:
+            desc = _catalog_summary(sv.get("description"))
+            # The NAME goes through the same one-line collapse as the
+            # description: McpServerUpsert.name has no charset validation, so
+            # a name containing a newline could otherwise render a FORGED
+            # directory entry that is indistinguishable from a real server
+            # (proven in review 2026-10-28). Admin-only write path, but the
+            # fix is one call.
+            name = _catalog_summary(sv["name"])
+            lines.append(f"  - {name}" + (f": {desc}" if desc else ""))
+        directory = "\n".join(lines)
+        note = "\n\nMCP servers reachable from this key:\n" + directory
+        # mcp_call ONLY. It is the tool the model reaches for, and the directory
+        # is ~207 tokens — paying it twice (mcp_catalog too) buys nothing:
+        # mcp_catalog's own description already says it lists what is callable.
+        return [
+            t.model_copy(update={"description": (t.description or "") + note}) if t.name == "mcp_call" else t
+            for t in tools
+        ]
 
     async def _flat_tools(self) -> list[MCPTool]:
         """The calling key's granted tools as individual MCP tools.
@@ -1300,27 +1452,50 @@ def _new_gateway_server() -> _GatewayMCPServer:
     server = _GatewayMCPServer(
         "pcai-llm-gateway",
         title="PCAI LLM Gateway MCP",
+        # The surface differs by mode, so the SYSTEM PROMPT must too: telling a
+        # model to call "<server>__<tool>" names that are not in its tool list is
+        # worse than saying nothing (2026-10-28). Two-tool mode states the
+        # contract up front: discover with mcp_catalog, invoke with mcp_call.
         instructions=(
-            "Federated MCP surface for this gateway key. tools/list exposes "
-            "your granted upstream tools directly as individual "
-            "'<server>__<tool>' entries. NAME RESOLUTION: a client harness "
-            "may namespace these under its own connection prefix (e.g. "
-            "'mcp__<gateway-connection>__<server>__<tool>') — CALL THE NAME "
-            "EXACTLY AS YOUR CLIENT'S TOOL LIST SHOWS IT, never the bare "
-            "'<server>__<tool>' form learned from docs or memory; if a call "
-            "errors 'unknown tool', retry with the client-prefixed form "
-            "before anything else. mcp_catalog lists the same inventory "
-            "with server URLs and "
-            "mcp_call(server, tool, arguments) invokes a tool by explicit "
-            "name (compat surface for off-cluster consumers; an explicit "
-            "target never silently fails over, while a flat call retries "
-            "the next priority-ordered enabled server that also exposes the "
-            "tool when the primary is unreachable). EVERY call — flat or "
-            "explicit — passes one gate chain: per-key ACL (default-deny), "
-            "server tool policy, RPM limit, ledger settle. Operators: "
-            "PCAI_LLM_MCP_FLAT_TOOLS=0 reverts to the two-tool surface; "
-            "listings are TTL-cached (PCAI_LLM_MCP_CATALOG_CACHE_S) and "
-            "invalidated on registry changes."
+            (
+                "Federated MCP surface for this gateway key, in TWO-TOOL mode. "
+                "Two tools are exposed:\n"
+                "  mcp_catalog -- call with NO argument for every MCP server "
+                "with every tool name and its description; pass "
+                'server="<name>" for one server\'s tools.\n'
+                "  mcp_call(server, tool, arguments) -- invoke one tool by "
+                "explicit name.\n"
+                "FLOW: mcp_catalog() -> pick a tool -> mcp_call(...). Call "
+                "mcp_catalog BEFORE concluding a capability is unavailable. "
+                "Upstream tools are NOT listed in your tool list directly in "
+                "this mode. Every call passes one gate chain: per-key ACL "
+                "(default-deny), server tool policy, RPM limit, ledger settle. "
+                "Operators: PCAI_LLM_MCP_FLAT_TOOLS=1 restores the flat "
+                "per-tool surface."
+            )
+            if not settings.mcp_flat_tools
+            else (
+                "Federated MCP surface for this gateway key. tools/list exposes "
+                "your granted upstream tools directly as individual "
+                "'<server>__<tool>' entries. NAME RESOLUTION: a client harness "
+                "may namespace these under its own connection prefix (e.g. "
+                "'mcp__<gateway-connection>__<server>__<tool>') — CALL THE NAME "
+                "EXACTLY AS YOUR CLIENT'S TOOL LIST SHOWS IT, never the bare "
+                "'<server>__<tool>' form learned from docs or memory; if a call "
+                "errors 'unknown tool', retry with the client-prefixed form "
+                "before anything else. mcp_catalog lists the same inventory "
+                "with server URLs and "
+                "mcp_call(server, tool, arguments) invokes a tool by explicit "
+                "name (compat surface for off-cluster consumers; an explicit "
+                "target never silently fails over, while a flat call retries "
+                "the next priority-ordered enabled server that also exposes the "
+                "tool when the primary is unreachable). EVERY call — flat or "
+                "explicit — passes one gate chain: per-key ACL (default-deny), "
+                "server tool policy, RPM limit, ledger settle. Operators: "
+                "PCAI_LLM_MCP_FLAT_TOOLS=0 reverts to the two-tool surface; "
+                "listings are TTL-cached (PCAI_LLM_MCP_CATALOG_CACHE_S) and "
+                "invalidated on registry changes."
+            )
         ),
     )
     server.add_tool(
@@ -1328,10 +1503,13 @@ def _new_gateway_server() -> _GatewayMCPServer:
         name="mcp_catalog",
         title="MCP Catalog",
         description=(
-            "List the MCP tools this key may call, per enabled server in "
-            "fleet priority order, filtered by the key's per-tool ACL "
-            "grants (default-deny). Unreachable servers appear with an "
-            "error entry instead of failing the call."
+            "List the MCP tools this key may call, per enabled server in fleet "
+            "priority order, filtered by the key's per-tool ACL grants "
+            "(default-deny). Unreachable servers appear with an error entry "
+            "instead of failing the call.\n"
+            "Call with NO argument to get every server with every tool name and "
+            'its description. Pass server="<name>" to get just that server\'s '
+            "tools. Then invoke with mcp_call(server, tool, arguments)."
         ),
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )

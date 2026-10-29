@@ -182,47 +182,89 @@ async def write_mcp_call(*, key_id: Any,
             )
 
 async def _verify(table: str, fields: list[str]) -> dict[str, Any]:
-    """Walk one chained table by id ASC and report the first break or fork."""
+    """Walk one chained table by id ASC and report the worst real break.
+
+    SEVERITY-ORDERED VERDICT (audit C5, 2026-10-29). The walk used to RETURN at
+    the first row whose hash did not match, which made one degraded row (a
+    never-fatal unchained write, or a pre-migration row with row_hash = '')
+    the operator's ONLY verdict — every later row was never examined, so a
+    real edit further down the trail was reported as "unchained", i.e. as a
+    schema problem rather than as tamper. Three classes, in the order they must
+    be surfaced:
+
+      * break           - the row's hash does not match its OWN content
+                          (edited fields, or an edited row_hash): TAMPER.
+      * fork-or-legacy  - the row is internally consistent but does not follow
+                          THIS row: two concurrent writers chained from the
+                          same prev (the accepted residual), a row written
+                          before chaining existed, or a spliced-in row.
+      * unchained       - row_hash was never written (the degraded path). Not
+                          tamper; the remedy is the DB/schema.
+
+    A degraded row is COUNTED and stepped over (`prev` advances to its own
+    hash — '' is the true predecessor state the next row chained from), so the
+    verdict is the most severe class present anywhere in the trail, and
+    `unchained` reports how many degraded rows were seen. `first_bad_id`
+    names the first row OF THE REPORTED CLASS and `checked` is the number of
+    rows the walk examined (the whole trail).
+
+    NOT DONE (deliberate, still open): keyset paging. The fetch is one
+    unbounded `ORDER BY id ASC`, so a large never-pruned trail materialises in
+    one result set on the pool the data plane shares — an operational concern
+    tracked separately from this correctness fix.
+    """
     rows = await db.fetch(
         f"SELECT id, prev_hash, row_hash, {", ".join(fields)} FROM {table} ORDER BY id ASC"
     )
     prev = ""
     checked = 0
+    unchained = 0
+    first_unchained: dict[str, Any] | None = None
+    first_fork: dict[str, Any] | None = None
+    first_break: dict[str, Any] | None = None
     for row in rows:
         want = chain_hash(prev, [row[f] for f in fields])
         got = row["row_hash"] or ""
         if got != want:
-            # Two failure shapes, reported distinctly so an operator does not
-            # chase a ghost:
-            #   break           - the row's hash does not match its OWN content
-            #                     (edited fields, or an edited row_hash).
-            #   fork-or-legacy  - the row is internally consistent but does not
-            #                     follow THIS row: two concurrent writers
-            #                     chained from the same prev (the accepted
-            #                     residual), or rows written before chaining
-            #                     existed ('' prev/row_hash).
-            self_consistent = chain_hash(row["prev_hash"] or "", [row[f] for f in fields]) == got
-            if not got:
-                # row_hash was never written: a DEGRADED row from the
-                # never-fatal fallback path (the chained INSERT failed and the
-                # unchained retry succeeded). Distinct from tamper, and
-                # distinct from a fork - the operator's remedy is different
-                # (fix the DB/schema, not investigate an edit).
-                kind = "unchained"
-            else:
-                kind = "fork-or-legacy" if self_consistent else "break"
-            return {
+            # A degraded row's hash is '' - it can never be "internally
+            # consistent", so the self-consistency probe is skipped for it.
+            self_consistent = bool(got) and chain_hash(row["prev_hash"] or "", [row[f] for f in fields]) == got
+            finding = {
                 "ok": False,
                 "table": table,
-                "checked": checked,
                 "first_bad_id": row["id"],
-                "kind": kind,
+                "kind": "unchained" if not got else ("fork-or-legacy" if self_consistent else "break"),
                 "expected": want,
                 "found": got,
             }
+            if not got:
+                unchained += 1
+                if first_unchained is None:
+                    first_unchained = finding
+            elif not self_consistent:
+                if first_break is None:
+                    first_break = finding
+            elif first_fork is None:
+                first_fork = finding
+        # ADVANCE UNCONDITIONALLY: a degraded row's '' IS the predecessor state
+        # the following row chained from, so stepping over it keeps every later
+        # row's expectation correct (this is what lets the walk reach a real
+        # edit that sits after a degraded row).
         prev = got
         checked += 1
-    return {"ok": True, "table": table, "checked": checked, "first_bad_id": None, "kind": ""}
+    # `checked` is the number of rows this verification EXAMINED (the whole
+    # trail now, always) — in both the ok and the not-ok shape.
+    worst = first_break or first_fork or first_unchained
+    if worst is None:
+        return {
+            "ok": True,
+            "table": table,
+            "checked": checked,
+            "first_bad_id": None,
+            "kind": "",
+            "unchained": 0,
+        }
+    return {**worst, "checked": checked, "unchained": unchained}
 
 
 async def verify_admin_audit_chain() -> dict[str, Any]:

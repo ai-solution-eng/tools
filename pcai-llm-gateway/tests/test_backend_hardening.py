@@ -1420,3 +1420,52 @@ def test_retention_prunes_when_configured(monkeypatch: pytest.MonkeyPatch) -> No
     assert "make_interval" in trace_del and "make_interval" in conv_del
     # ledger untouched
     assert not any("DELETE FROM usage_ledger" in s for s in sqls)
+
+# ---------------------------------------------------------------------------
+# F6 (audit 2026-10-29): /mcp rate-limit refusals settle "rate_limited"
+# ---------------------------------------------------------------------------
+
+
+def test_f6_mcp_rate_limit_refusal_settles_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rate-gate refusal on /mcp settled outcome "error" — inflating the
+    error-rate alert for what is tenant policy activity, not a gateway
+    failure. The chat path settles "rate_limited" (routes_proxy:639); the
+    /mcp surface must agree. Refusal itself still raises ToolError."""
+    from types import SimpleNamespace
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from pcai_llm.api.auth import KeyRecord
+
+    settled: list[tuple[str, str]] = []
+
+    async def fake_settle_quiet(key_id, endpoint, status, started, request_id, **kwargs):
+        settled.append((endpoint, status))
+
+    async def gate_full(*a, **k):
+        return SimpleNamespace(ok=False, reason="RPM limit exceeded (60/min)")
+
+    key = KeyRecord(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        name="k",
+        key_prefix="hllm-F6",
+        scopes=["mcp"],
+        allowed_models=[],
+        rate_limit_rpm=60,
+        rate_limit_tpm=100_000,
+        max_concurrent=0,
+        expires_at=None,
+    )
+    monkeypatch.setattr(routes_mcp, "_current_key", lambda: key)
+    monkeypatch.setattr(routes_mcp, "check_rate_limit", gate_full)
+    monkeypatch.setattr(routes_mcp, "_settle_quiet", fake_settle_quiet)
+
+    token = routes_mcp._caller.set(key)
+    try:
+        with pytest.raises(ToolError, match="rate limited"):
+            asyncio.run(routes_mcp._gated_mcp_call("prometheus", "query", {"query": "up"}))
+    finally:
+        routes_mcp._caller.reset(token)
+
+    assert settled == [("mcp:prometheus:query", "rate_limited")], settled

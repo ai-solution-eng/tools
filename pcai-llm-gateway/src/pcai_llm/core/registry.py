@@ -25,6 +25,7 @@ from typing import Any
 from ..db import db
 from ..routing.router import Endpoint
 from ..routing.router import router as model_router
+from . import context_window, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,23 @@ async def refresh() -> None:
         len(by_model),
     )
 
+    # --- learn each upstream's CONTEXT WINDOW (2026-10-29) ----------------
+    # Every vLLM/SGLang /v1/models card publishes max_model_len, and without it
+    # the gateway cannot solve the admission inequality
+    # (prompt + max_tokens <= window) — the Qwen 400 that produced
+    # "(model error 400)" as an assistant answer. Learned HERE rather than on
+    # the request path because the window is a property of the ENDPOINT set and
+    # because a transparent proxy must not add an upstream call per request.
+    # Concurrent, bounded, backoff-gated (context_window.PROBE_RETRY_SECONDS),
+    # and FAIL-OPEN: discovery can only ever add knowledge.
+    try:
+        entries = [
+            (ep.base_url, upstream_auth.upstream_headers(ep)) for endpoints in by_model.values() for ep in endpoints
+        ]
+        await context_window.refresh_windows(entries)
+    except Exception as exc:
+        log.warning("registry refresh: context-window discovery skipped (%s)", exc)
+
     # --- MCP servers -> federation cache --------------------------------
     # Order: (priority ASC, name ASC) — lower priority = preferred, the same
     # convention as model_endpoints.priority. This ordering IS the fleet
@@ -120,7 +138,7 @@ async def refresh() -> None:
     server_rows = await db.fetch(
         """
         SELECT id, name, url, headers_json, auth_secret, auth_token_enc, enabled,
-               tool_policy, allowed_tools_json, priority
+               tool_policy, allowed_tools_json, priority, description
         FROM mcp_servers WHERE enabled = TRUE
         ORDER BY priority ASC, name ASC
         """
@@ -157,6 +175,10 @@ async def refresh() -> None:
                 "id": str(row["id"]),
                 "name": row["name"],
                 "url": row["url"],
+                # Operator-authored one-liner shown to the model in the
+                # hybrid tool surface's server directory (2026-10-28).
+                # Empty is fine: the directory falls back to name + count.
+                "description": row.get("description", "") or "",
                 "headers": {str(k): str(v) for k, v in headers.items()},
                 # K8s Secret NAME (by-ref) — resolved to a Bearer header at
                 # call time via PCAI_LLM_MCP_KEY__<NAME>; never a literal key.

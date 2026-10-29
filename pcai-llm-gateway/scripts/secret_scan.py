@@ -35,8 +35,8 @@ ROOT = Path(__file__).resolve().parent.parent
 IGNORE: list[str] = json.loads((ROOT / "hardlink_config.json").read_text())["ignore"] + [
     # the scanner's own artifacts + docs that quote patterns
     "scripts/secret_scan.py",
-    "AUDIT.md",
-    "REMEDIATION.md",
+    "documentation/Audits/AUDIT.md",
+    "documentation/Audits/REMEDIATION.md",
 ]
 
 PATTERNS: dict[str, re.Pattern[str]] = {

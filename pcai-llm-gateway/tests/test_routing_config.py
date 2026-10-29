@@ -688,3 +688,70 @@ def test_put_audit_records_prompt_length_not_its_body(admin_env) -> None:
     details = audited[-1]["details"]
     assert details["values"]["prompt"] == "<18000 chars>"
     assert big not in str(details)
+
+
+# ---------------------------------------------------------------------------
+# R3 (audit 2026-10-29): the 2026-10-28 global-arming path added a ladder but
+# no routing_min_model knob, so a fleet-armed heuristic router was pinned to
+# the ceiling and could NEVER downgrade -- the feature the panel just enabled
+# was inert for every floorless profile. The knob rides the DEFAULTS panel
+# surface; model_routing.global_min_model reads it.
+# ---------------------------------------------------------------------------
+
+
+def test_r3_routing_min_model_in_defaults_and_copy() -> None:
+    import pcai_llm.core.routing_config as rc
+
+    assert rc.DEFAULTS.get("routing_min_model") == ""
+    d = rc.defaults()
+    assert d["routing_min_model"] == ""
+    # mutating the copy must not touch the module default (existing contract)
+    d["routing_min_model"] = "X"
+    assert rc.DEFAULTS["routing_min_model"] == ""
+
+
+async def test_r3_set_values_roundtrips_the_global_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The panel write path must accept and store the new knob."""
+    import pcai_llm.core.routing_config as rc
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.queries: list[Any] = []
+
+        async def execute(self, *a: Any, **k: Any) -> None:
+            self.queries.append(a)
+
+        def transaction(self) -> Self:
+            return self
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    conn = _Conn()
+
+    class _Acquire:
+        async def __aenter__(self) -> _Conn:
+            return conn
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    def _acquire_bounded() -> _Acquire:  # async-CM factory, matching db.acquire_bounded
+        return _Acquire()
+
+    async def _fake_fetch(*a: Any, **k: Any) -> list[Any]:
+        return [{"key": "routing_min_model", "value": rc._encode("GLM-5.3-Flash")}]
+
+    monkeypatch.setattr(rc.db, "acquire_bounded", _acquire_bounded)
+    monkeypatch.setattr(rc.db, "fetch", _fake_fetch)
+    await rc.invalidate()
+    try:
+        merged = await rc.set_values({"routing_min_model": "GLM-5.3-Flash"})
+        assert merged["routing_min_model"] == "GLM-5.3-Flash"
+        # the key rides as $1 parameter: (sql, key, encoded_value)
+        assert any(len(q) >= 2 and q[1] == "routing_min_model" for q in conn.queries)
+    finally:
+        await rc.invalidate()

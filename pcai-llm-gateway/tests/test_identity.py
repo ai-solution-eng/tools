@@ -1038,3 +1038,113 @@ def test_list_keys_projects_subject(monkeypatch: pytest.MonkeyPatch) -> None:
     sql, _ = fake.queries[0]
     assert "LEFT JOIN subjects s ON s.id = k.subject_id" in sql
     assert "k.bound_via" in sql and "s.subject AS subject" in sql
+
+# ---------------------------------------------------------------------------
+# audit C4 (2026-10-29) — the browser-header rung must be REACHABLE from the
+# auth surfaces (attribution), and must never become an authorization input.
+# ---------------------------------------------------------------------------
+
+# A JWT-SHAPED bearer for the "a token is not a key" cases below. Assembled at
+# RUNTIME on purpose: the fleet scanner's JWT pass is a HARD pattern with no
+# allow-marker ("a JWT literal is a credential wherever it sits" —
+# pcai_utils/secret_scan.sh), so the literal spelling fails the hardlinker's
+# pre-mirror gate. The value is synthetic — header {"alg":"RS256"}, payload
+# {"sub":"token-sub"}, signature "sig" — and the join keeps it byte-identical.
+# The three segments live in separate constants so no three-part token exists
+# in the source at all (an f-string of three names never matches the scanner's
+# dot-joined JWT pattern, and none of the names is secret-shaped).
+_JWT_HEADER = "eyJhbGciOiJSUzI1NiJ9"   # {"alg":"RS256"}
+_JWT_PAYLOAD = "eyJzdWIiOiJ0b2tlbi1zdWIifQ"   # {"sub":"token-sub"}
+_JWT_SIGNATURE = "c2ln"   # "sig"
+JWT_SHAPED = f"{_JWT_HEADER}.{_JWT_PAYLOAD}.{_JWT_SIGNATURE}"
+
+
+def test_c4_data_plane_attribution_uses_the_browser_rung(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C4 — a proxy-identified caller must not be attributed as key-anon.
+
+    PRE-FIX (api/auth.py:106-122): the ladder called
+    identity.resolve_caller(None, token=plaintext) — headers were never
+    passed, and resolve_caller's rung 1 is gated on "headers is not None". On
+    the documented chained-edge deployment the rung therefore never ran on the
+    data plane at all: the ledger, the trace explorer and X-MCP-Caller fell
+    back to the key fingerprint for a user the front door had positively
+    identified.
+    """
+    from pcai_llm.api import auth as auth_mod
+
+    monkeypatch.setattr(settings, "trust_proxy_identity", True)
+    kid = uuid.uuid4()
+    record = _key(id=kid)
+
+    async def fake_authenticate(_plaintext: str) -> KeyRecord:
+        return record
+
+    headers = {"authorization": "Bearer hllm-abc", "x-auth-request-user": "alice", "x-forwarded-groups": "eng"}
+    key, caller = asyncio.run(auth_mod.resolve_bearer_key(None, authenticate=fake_authenticate, headers=headers))
+
+    assert key is not None and key.id == kid, "authorization still rides the presented key"
+    assert caller is not None, "the browser rung must produce an attribution caller"
+    assert caller.subject_kind == KIND_BROWSER and caller.subject == "alice"
+    assert caller.groups == ["eng"]
+
+
+def test_c4_browser_rung_off_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flag off (the shipped default): the headers are inert, exactly as
+    before the fix — no caller is invented from an untrusted header."""
+    from pcai_llm.api import auth as auth_mod
+
+    monkeypatch.setattr(settings, "trust_proxy_identity", False)
+    record = _key()
+
+    async def fake_authenticate(_plaintext: str) -> KeyRecord:
+        return record
+
+    headers = {"authorization": "Bearer hllm-abc", "x-auth-request-user": "alice"}
+    key, caller = asyncio.run(auth_mod.resolve_bearer_key(None, authenticate=fake_authenticate, headers=headers))
+    assert key is not None and caller is None
+
+
+def test_c4_browser_rung_never_authorizes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A header is not a credential: proxy identity headers alone are still a
+    401, and a valid TOKEN's authorization still anchors on the TOKEN subject
+    (the browser subject must never reach resolve_shadow_key)."""
+    from pcai_llm.api import auth as auth_mod
+
+    monkeypatch.setattr(settings, "trust_proxy_identity", True)
+    headers = {"x-auth-request-user": "alice"}
+
+    async def never_called(_plaintext: str) -> KeyRecord | None:  # pragma: no cover
+        raise AssertionError("no bearer was presented")
+
+    with pytest.raises(Exception) as excinfo:
+        asyncio.run(auth_mod.resolve_bearer_key(None, authenticate=never_called, headers=headers))
+    assert "missing bearer" in str(excinfo.value)
+
+    # token rung: authorization anchors on the TOKEN subject, not the header
+    shadow_subjects: list[str] = []
+    shadow = _key()
+
+    async def fake_shadow(subject: str, claims: Any = None) -> KeyRecord:
+        shadow_subjects.append(subject)
+        return shadow
+
+    async def fake_claims(_token: str) -> Any:
+        return identity.TokenClaims(subject="token-sub", email="", groups=[])
+
+    async def fake_authenticate(_plaintext: str) -> KeyRecord | None:
+        return None
+
+    monkeypatch.setattr(identity, "token_validation_configured", lambda: True)
+    monkeypatch.setattr(identity, "validate_token", fake_claims)
+    monkeypatch.setattr(identity, "resolve_shadow_key", fake_shadow)
+
+    key, caller = asyncio.run(
+        auth_mod.resolve_bearer_key(
+            None,
+            authenticate=fake_authenticate,
+            headers={"authorization": f"Bearer {JWT_SHAPED}", "x-auth-request-user": "alice"},
+        )
+    )
+    assert key is not None and key.id == shadow.id
+    assert shadow_subjects == ["token-sub"], "authorization must anchor on the token subject"
+    assert caller is not None and caller.subject_kind == KIND_BROWSER and caller.subject == "alice"

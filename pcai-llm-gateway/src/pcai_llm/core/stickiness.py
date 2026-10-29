@@ -40,6 +40,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 from ..db import db
 from . import metrics
@@ -169,7 +170,9 @@ async def get_sticky_row(key_id: uuid.UUID, thread_key: str | None) -> tuple[str
     return str(model), age
 
 
-def make_writer(key_id: uuid.UUID, thread_key: str | None) -> Callable[[str], None] | None:
+def make_writer(
+    key_id: uuid.UUID, thread_key: str | None, defer: bool = False
+) -> Callable[[str], Any] | None:
     """A fire-and-forget writer bound to one conversation, or None.
 
     Returned to the router as its sticky_write callable. The router is
@@ -181,11 +184,33 @@ def make_writer(key_id: uuid.UUID, thread_key: str | None) -> Callable[[str], No
     unbounded burst of them under load is its own outage. This mirrors
     cascade._sticky_write_later, which owns the same discipline for the
     demand-aware path.
+
+    DEFER (audit 2026-10-29 P3, XV-3): the router picks a model BEFORE the
+    budget gates and admission failover run, so an eager write here records a
+    model that may never serve — and never-downgrade then holds the NEXT turn
+    at it. With `defer=True` the writer returns a one-argument finisher
+    instead of persisting: the caller invokes finisher(actual_model) once the
+    serving model is known, and the row can never name a model that did not
+    bill. Default False keeps every existing caller eager (byte-identical).
     """
     if not thread_key:
         return None
 
-    def _write(model: str) -> None:
+    def _write(model: str) -> Any:
+        if not model:
+            return None
+        if defer:
+            # Nothing is persisted until the caller knows what served. A
+            # finisher that is never invoked writes nothing — which is the
+            # correct outcome for a request that never got that far.
+            def _finish(actual_model: str) -> None:
+                _persist(str(actual_model or model))
+
+            return _finish
+        _persist(model)
+        return None
+
+    def _persist(model: str) -> None:
         if not model:
             return
         try:

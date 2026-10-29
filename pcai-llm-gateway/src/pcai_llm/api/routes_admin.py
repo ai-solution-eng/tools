@@ -40,6 +40,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..config import settings
+from ..core import agents as agents_mod
 from ..core import costs, registry, secretbox, url_guard
 from ..core import metrics as _metrics
 from ..core.audit import audit_action, stable_actor_label
@@ -65,7 +66,7 @@ from ..mcpf.federation import (
     preset_catalog_pairs,
     preset_pairs,
 )
-from ..routing.router import Endpoint
+from ..routing.router import Endpoint, upstream_client
 from ..routing.router import router as model_router
 
 log = logging.getLogger(__name__)
@@ -446,6 +447,12 @@ class McpServerUpsert(BaseModel):
     tool_policy: str = "all"
     allowed_tools: list[str] = Field(default_factory=list, max_length=200)
     enabled: bool = True
+    # What this server is FOR, in one line (2026-10-28). Shown to the model in
+    # the hybrid tool surface's server directory, which is what lets it pick a
+    # server without a discovery round trip. Empty is fine (the directory then
+    # shows name + tool count). Treat it as PROMPT TEXT: it reaches the model
+    # verbatim (whitespace-collapsed, capped at _CATALOG_SUMMARY_CHARS = 120).
+    description: str = Field(default="", max_length=200)
     # Fleet priority (lower = preferred — the model_endpoints convention):
     # orders the registry snapshot, hence mcp_catalog / tools/list output
     # and the flattened-call failover chain.
@@ -712,7 +719,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
         "console": "GET /admin (browser UI, unlocked with the admin key)",
         "auth": "Authorization: Bearer <admin key> — operator-provisioned "
         "via the pcai-llm-gateway-admin Secret (see documentation/DEPLOYMENT.md)",
-        "docs": "documentation/VERIFICATION.md §3 (bootstrap flow)",
+        "docs": "documentation/changelogs/VERIFICATION.md §3 (bootstrap flow)",
         "endpoints": [
             "GET    /admin/keys",
             "POST   /admin/keys",
@@ -762,6 +769,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "PATCH  /admin/guardrails/{guardrail_id}",
             "DELETE /admin/guardrails/{guardrail_id}",
             "GET    /admin/routing/config",
+            "GET    /admin/routing/stats",
             "PUT    /admin/routing/config",
             "POST   /admin/routing/prompt-preview",
             "GET    /admin/presented-models",
@@ -853,6 +861,51 @@ async def set_sso_default_profile(
         details={"profile_id": str(body.profile_id) if body.profile_id else None},
     )
     return dict(row)
+
+
+@router.post("/tenants/{tenant_id}/bind-sso-users")
+async def bind_sso_users(tenant_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Bind every UNPROFILED user of this tenant to its SSO default profile.
+
+    WHY (2026-10-29): the tenant default only reaches users created AFTER it was
+    set — and, before this change, it only reached the KEY as stamped presets,
+    never the user row. A fleet that already signed in keeps profile_id NULL, so
+    every profile-scoped feature (cascade ordering, routing policy, off-peak
+    fraction, the agents menu) keeps ignoring them, and propagate-grants — which
+    selects users.profile_id — matches nothing. This is the explicit backfill.
+
+    EXPLICIT, like propagate-limits: it rewrites user rows, so it is the
+    operator saying "apply now", never a side effect of saving the setting.
+
+    ONLY NULL: a user an operator placed by hand is never re-scoped. Re-run it
+    after adding people; it is idempotent (already-bound users are untouched).
+    """
+    row = await db.fetchrow("SELECT sso_default_profile_id FROM tenants WHERE id = $1", tenant_id)
+    if row is None:
+        raise HTTPException(404, f"tenant {tenant_id} not found")
+    profile_id = row["sso_default_profile_id"]
+    if profile_id is None:
+        raise HTTPException(
+            400,
+            "tenant has no SSO default profile — set one (PUT /admin/tenants/{id}/sso-default-profile)"
+            " before binding users to it",
+        )
+    pending = await db.fetchval(
+        "SELECT count(*) FROM users WHERE tenant_id = $1 AND profile_id IS NULL", tenant_id
+    )
+    tag = await db.execute(
+        "UPDATE users SET profile_id = $2 WHERE tenant_id = $1 AND profile_id IS NULL",
+        tenant_id,
+        profile_id,
+    )
+    await _audit(
+        request,
+        action="tenant.sso_users.bind",
+        resource_type="tenant",
+        resource_id=str(tenant_id),
+        details={"bound": int(pending or 0), "profile_id": str(profile_id), "tag": tag},
+    )
+    return {"bound": int(pending or 0), "profile_id": str(profile_id), "tag": tag}
 
 
 @router.get("/tenants/{tenant_id}/users")
@@ -2104,11 +2157,12 @@ async def probe_model(model_name: str, _: AdminDep) -> dict[str, Any]:
         # upstreams (MLIS/KServe front) — a false "fail" for a healthy pool.
         from .routes_proxy import _upstream_headers  # deferred: no import cycle
 
-        async with httpx2.AsyncClient(
+        # L-1: the shared factory pins trust_env=False — the probe is an
+        # in-cluster call and must ignore ambient proxy env (upstream TLS
+        # contract comment moved to routing.router.upstream_client).
+        async with upstream_client(
             timeout=httpx2.Timeout(5.0, connect=5.0),
             follow_redirects=False,
-            # Same upstream-TLS contract as the model router (config.py):
-            # verification unconditional; site CA bundle when configured.
             verify=settings.upstream_ca_bundle or True,
         ) as client:
             resp = await client.get(
@@ -2163,7 +2217,7 @@ async def _probe_endpoint_type(
     headers = _upstream_headers(ep_stub, f"detect-{uuid.uuid4().hex[:12]}")
     headers["Content-Type"] = "application/json"
 
-    async with httpx2.AsyncClient(
+    async with upstream_client(
         timeout=httpx2.Timeout(20.0, connect=5.0),
         follow_redirects=False,
         verify=settings.upstream_ca_bundle or True,
@@ -2771,8 +2825,8 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
         token_write = False  # omitted — keep existing (COALESCE)
     row = await db.fetchrow(
         "INSERT INTO mcp_servers (name, url, headers_json, auth_secret, auth_token_enc, "
-        "tool_policy, allowed_tools_json, enabled, priority) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
+        "tool_policy, allowed_tools_json, enabled, priority, description) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
         "ON CONFLICT (name) DO UPDATE SET url = $2, headers_json = $3, "
         "auth_secret = $4, "
         + (
@@ -2782,10 +2836,11 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
             # omitted: keep the existing stored token
             else "auth_token_enc = COALESCE($5, mcp_servers.auth_token_enc), "
         )
-        + "tool_policy = $6, allowed_tools_json = $7, enabled = $8, priority = $9 "
+        + "tool_policy = $6, allowed_tools_json = $7, enabled = $8, priority = $9, "
+        "description = $10 "
         "RETURNING id, name, url, auth_secret, "
         "(auth_token_enc IS NOT NULL) AS auth_configured, "
-        "tool_policy, allowed_tools_json, enabled, priority",
+        "tool_policy, allowed_tools_json, enabled, priority, description",
         body.name,
         body.url,
         # headers_json is a TEXT column — serialize explicitly. (asyncpg has
@@ -2797,6 +2852,7 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
         json.dumps(body.allowed_tools),
         body.enabled,
         body.priority,
+        body.description or "",
     )
     assert row is not None
     await _refresh_registry_best_effort()
@@ -3085,6 +3141,18 @@ class ProfileCreate(BaseModel):
     # created with this profile ("profiles as defaults").
     budgets: list[BudgetPreset] = Field(default_factory=list, max_length=100)
     mcp_grants: list[McpGrant] = Field(default_factory=list, max_length=200)
+    # Agents this profile OFFERS (agent_profiles names). THREE-STATE on purpose:
+    # None = the caller did not speak (an older console) -> leave the existing
+    # selection untouched; [] = clear it. A plain default-empty list would make
+    # every older POST silently wipe the profile's agents — the same
+    # destructive-by-omission hazard the separate profile_agents table exists
+    # to avoid (db/schema.py).
+    # SCOPE: only `agents` is protected this way. The OTHER preset fields below
+    # (model_order, budgets, mcp_grants, live_grants, limits, memory) are still
+    # rebuilt from the body into defaults_json on every upsert, so a partial POST
+    # from an older console DOES reset them — a pre-existing hazard this change
+    # did not take on (tracked in the changelog as a residual).
+    agents: list[str] | None = Field(None, max_length=100)
     # §3a live grants: mcp_grants evaluate AT CALL TIME for every key of
     # this profile (per-key rows stay exceptions) instead of stamping once
     # at creation. Editing this profile re-scopes running keys on their
@@ -3181,6 +3249,184 @@ async def _preset_stamp_catalogs() -> tuple[dict[str, list[dict[str, Any]]], lis
     return catalogs, unavailable
 
 
+# ============================================================================
+# Agent profiles (2026-10-29) — named tool surfaces exposed as model endpoints.
+# ============================================================================
+# An agent is a bundle of MCP servers a request can select by naming it as its
+# MODEL (core.agents is the resolver; GET /v1/models advertises them with
+# pcai.type="agent"). The tool surface a request then sees is the INTERSECTION
+# of the key's grants and the agent's servers — the profile narrows the agent,
+# the agent narrows the profile, and the key stays the hard boundary.
+#
+# WHY A SEPARATE TABLE and not a profiles.defaults_json key: create_profile
+# rebuilds defaults_json from the request body, so anything stored there is
+# silently deleted by any older console POST (the destructive-by-omission
+# hazard live_grants already carries). See db/schema.py for the full rationale,
+# including why server-level selection is safe HERE (an agent only ever HIDES
+# grants) but not for a table that creates them.
+
+
+class AgentUpsert(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field("", max_length=400)
+    servers: list[str] = Field(default_factory=list, max_length=100)
+    # '' = let the profile chat cascade pick the serving model (the agent then
+    # chooses TOOLS + prompt, not the model). A pinned name must be a
+    # registered CHAT model and is still bounded by the key's allowed_models at
+    # request time — an agent is never an ACL bypass.
+    model: str = Field("", max_length=200)
+    system_prompt: str = Field("", max_length=8000)
+    enabled: bool = True
+
+
+def _validate_agent_name(name: str, registered: set[str]) -> str:
+    """Refuse a name the resolver would never reach. Returns the cleaned name."""
+    clean = name.strip()
+    if not clean:
+        raise HTTPException(400, "agent name must not be blank")
+    if clean != name:
+        raise HTTPException(400, f"agent name {name!r} has surrounding whitespace — model ids are exact")
+    if clean in agents_mod.RESERVED_NAMES:
+        raise HTTPException(
+            400,
+            f"agent name {clean!r} is reserved (the resolver handles it before any agent lookup:"
+            f" {sorted(agents_mod.RESERVED_NAMES)}) — pick another name",
+        )
+    if clean.startswith("routing"):
+        # routing / routing__<model> are the complexity-router pseudo-models.
+        raise HTTPException(400, f"agent name {clean!r} collides with the routing pseudo-model namespace")
+    if clean in registered:
+        # A registered model of that name wins every resolution (classify_request
+        # says 'pinned'), so the agent would be advertised and unreachable.
+        raise HTTPException(400, f"agent name {clean!r} is already a registered model — pick another name")
+    return clean
+
+
+async def _validate_agent_servers(servers: list[str]) -> list[str]:
+    """Every named server must exist in the live registry. Returns the deduped list."""
+    wanted = list(dict.fromkeys(str(s) for s in servers))
+    if not wanted:
+        return []
+    live = {str(sv["name"]) for sv in await registry.mcp_servers()}
+    unknown = [s for s in wanted if s not in live]
+    if unknown:
+        # FAIL LOUD: an agent naming a server that does not exist would resolve
+        # to a narrower surface than the operator wrote, silently.
+        raise HTTPException(400, f"agent servers not registered: {unknown} — registered: {sorted(live)}")
+    return wanted
+
+
+def _validate_agent_model(model: str) -> str:
+    """'' (cascade) or a registered CHAT model. Anything else is dead config."""
+    name = model.strip()
+    if not name:
+        return ""
+    if name not in model_router.models():
+        raise HTTPException(400, f"agent model {name!r} is not a registered model")
+    pool = model_router.pool(name)
+    if pool is not None and pool.endpoints and pool.endpoints[0].model_type != "chat":
+        raise HTTPException(
+            400,
+            f"agent model {name!r} is a {pool.endpoints[0].model_type} endpoint, not chat —"
+            " an agent serves /v1/chat/completions (leave empty to use the profile cascade)",
+        )
+    return name
+
+
+@router.post("/agents", status_code=201)
+async def upsert_agent(body: AgentUpsert, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Create or update an agent by name (upsert — the console saves one form).
+
+    Validates against the LIVE registry rather than trusting the body: a name
+    that shadows a model or a reserved alias, a server that does not exist, or
+    a pinned model that cannot serve chat are all refused here, where the
+    operator can see why — never stored as config that silently does nothing.
+    """
+    name = _validate_agent_name(body.name, set(model_router.models()))
+    servers = await _validate_agent_servers(body.servers)
+    model = _validate_agent_model(body.model)
+    row = await db.fetchrow(
+        "INSERT INTO agent_profiles (name, description, servers, model, system_prompt, enabled) "
+        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "ON CONFLICT (name) DO UPDATE SET description = $2, servers = $3, model = $4, "
+        "system_prompt = $5, enabled = $6, updated_at = now() "
+        "RETURNING id, name, description, servers, model, system_prompt, enabled",
+        name,
+        body.description,
+        servers,
+        model,
+        body.system_prompt,
+        body.enabled,
+    )
+    assert row is not None
+    out = dict(row)
+    out["servers"] = list(out.get("servers") or [])
+    # The prompt is operator prose up to 8 000 chars: audit its LENGTH, never
+    # its body (the append-only trail must not carry prompt text — same
+    # discipline as the routing-prompt audit row).
+    await _audit(
+        request,
+        action="agent.upsert",
+        resource_type="agent",
+        resource_id=name,
+        details={
+            "description": body.description,
+            "servers": servers,
+            "model": model,
+            "enabled": body.enabled,
+            "system_prompt_chars": len(body.system_prompt),
+        },
+    )
+    return out
+
+
+@router.get("/agents")
+async def list_agents(_: AdminDep) -> list[dict[str, Any]]:
+    """Every agent, with the profiles that OFFER it.
+
+    The reverse index is the question an operator actually asks ("who can use
+    this agent?"), and it is one join away — so it ships with the listing
+    instead of leaving the console to N+1 it.
+    """
+    out = []
+    offered: dict[str, list[str]] = {}
+    try:
+        for link in await db.fetch(
+            "SELECT pa.agent_id, p.name FROM profile_agents pa JOIN profiles p ON p.id = pa.profile_id"
+        ):
+            offered.setdefault(str(link["agent_id"]), []).append(str(link["name"]))
+    except Exception:
+        log.warning("agents: profile join failed — listing agents without profile attribution", exc_info=True)
+    for agent in await agents_mod.list_all():
+        entry = {
+            "id": str(agent.id),
+            "name": agent.name,
+            "description": agent.description,
+            "servers": list(agent.servers),
+            "model": agent.model,
+            "system_prompt": agent.system_prompt,
+            "system_prompt_chars": len(agent.system_prompt),
+            "enabled": agent.enabled,
+            "profiles": sorted(offered.get(str(agent.id), [])),
+        }
+        out.append(entry)
+    return out
+
+
+@router.delete("/agents/{name}", status_code=204)
+async def delete_agent(name: str, request: Request, _: AdminDep) -> Response:
+    """Delete an agent. profile_agents rows cascade; keys are untouched.
+
+    A key that named this agent as its model starts 404ing on that name
+    immediately (it is an unregistered alias again, and an unprofiled ordering
+    makes it a 404) — which is the honest outcome: the agent is gone.
+    """
+    deleted = await db.fetchrow("DELETE FROM agent_profiles WHERE name = $1 RETURNING id", name)
+    if deleted is None:
+        raise HTTPException(404, f"agent {name!r} does not exist")
+    await _audit(request, action="agent.delete", resource_type="agent", resource_id=name, details={})
+    return Response(status_code=204)
+
 @router.post("/profiles", status_code=201)
 async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> dict[str, Any]:
     """Create/update a profile: named key-creation defaults.
@@ -3197,10 +3443,97 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # of limit_tokens / limit_usd per entry, period in day|week|month,
     # positive value. One validator, so a profile saved here can never be
     # a preset the redeem or the create-key seeding would refuse.
-    try:
-        split_preset_budgets([b.model_dump() for b in body.budgets])
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
+    if "budgets" in body.model_fields_set:
+        try:
+            split_preset_budgets([b.model_dump() for b in body.budgets])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+    # --- MERGE, NOT REPLACE (2026-10-29) -------------------------------------
+    # This endpoint is an upsert and used to rebuild EVERY preset from the body,
+    # so a partial POST — `{"name":"poweruser","agents":["Admin-Agent"]}` — silently
+    # wiped model_order, budgets, mcp_grants and live_grants. The console always
+    # sends the whole form, so only curl/scripts were exposed; that is exactly
+    # the path an operator takes to add one agent, which makes the hazard a
+    # trap rather than a theoretical one.
+    #
+    # RULE: a field the caller did NOT send keeps its stored value. Sending an
+    # explicit value — including [] or null — still REPLACES or CLEARS it, so
+    # the operator can always say "empty this" on purpose.
+    #
+    # model_fields_set is the discriminator, NOT a None check: `offpeak_fraction`
+    # and `limits` use null as a REAL value ("inherit" / "clear"), so an absent
+    # field and an explicit null must not collapse into the same thing.
+    #
+    # Read-modify-write, not one statement: the JSON document needs a merge that
+    # COALESCE cannot express per-key, and this is an admin endpoint (a
+    # concurrent double-save is an operator double-click, not a data plane
+    # concern). The upsert below stays the single writer.
+    provided = set(body.model_fields_set)
+    prev = await db.fetchrow(
+        "SELECT id, model_order, defaults_json, offpeak_fraction, routing_policy, "
+        "routing_min_model FROM profiles WHERE name = $1",
+        body.name,
+    )
+    # .get, not [] — asyncpg Records and the test fakes both implement it, and a
+    # row that omits an optional column must degrade to the control default
+    # rather than 500 (the same discipline as core.keys.key_record_from_row).
+    prev_defaults: dict[str, Any] = {}
+    if prev is not None:
+        try:
+            prev_defaults = json.loads(prev.get("defaults_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            prev_defaults = {}
+    # Start from the STORED document so keys this build does not know about
+    # survive a save (a future field, or a hand edit) — the same reason the
+    # three-state agents list lives in its own table.
+    defaults: dict[str, Any] = dict(prev_defaults)
+    model_order = (
+        list(body.model_order)
+        if "model_order" in provided
+        else (list(prev.get("model_order") or []) if prev is not None else [])
+    )
+    routing_policy = (
+        body.routing_policy
+        if "routing_policy" in provided
+        else (str(prev.get("routing_policy") or "off") if prev is not None else "off")
+    )
+    routing_min_model = (
+        body.routing_min_model
+        if "routing_min_model" in provided
+        else (str(prev.get("routing_min_model") or "") if prev is not None else "")
+    )
+    offpeak_fraction = (
+        body.offpeak_fraction
+        if "offpeak_fraction" in provided
+        else (prev.get("offpeak_fraction") if prev is not None else None)
+    )
+    if "budgets" in provided:
+        # exclude_none keeps each stored preset to its ONE limit key, so a
+        # reader can branch on presence instead of on a null test.
+        defaults["budgets"] = [b.model_dump(exclude_none=True) for b in body.budgets]
+    defaults.setdefault("budgets", [])
+    if "mcp_grants" in provided:
+        defaults["mcp_grants"] = [[g.server, g.tool] for g in body.mcp_grants]
+    defaults.setdefault("mcp_grants", [])
+    if "live_grants" in provided:
+        # §3a live grants: TRUE = the grant list evaluates AT CALL TIME for every
+        # key of this profile (per-key rows stay exceptions); absent/false =
+        # stamps-at-create. Sending false explicitly CLEARS the stored flag.
+        if body.live_grants:
+            defaults["live_grants"] = True
+        else:
+            defaults.pop("live_grants", None)
+    if "limits" in provided:
+        if body.limits is not None:
+            defaults["limits"] = body.limits.model_dump(exclude_none=True)
+        else:
+            defaults.pop("limits", None)
+    if "memory" in provided:
+        if body.memory is not None:
+            defaults["memory"] = body.memory.model_dump()
+        else:
+            defaults.pop("memory", None)
+
     # THE ORDERING IS ALSO AN ACL — REFUSE A STALE ID (2026-10-23 defect).
     # /v1/enroll derives an enrolled key's allowed_models as
     # [m for m in model_order if m in registered] (routes_enroll ~line 481),
@@ -3225,7 +3558,11 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # before endpoints, and a site draining its registry. The defect this
     # guards needs a registry to hide models FROM.
     registered_models = model_router.models()
-    stale = [m for m in body.model_order if m not in registered_models]
+    # Validate the EFFECTIVE ordering, but only when the caller actually sent
+    # one: a partial save (say, agents only) must not be refused because a model
+    # stored months ago has since left the registry — that would make an
+    # unrelated edit impossible to save. It was validated when it was written.
+    stale = [m for m in model_order if m not in registered_models] if "model_order" in provided else []
     if stale and registered_models:
         raise HTTPException(
             400,
@@ -3236,24 +3573,16 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # outside model_order is unusable downstream (core.model_routing pins the
     # floor to the ceiling and warns per user = "no downgrade"), so refuse it
     # here instead of persisting a config that silently never downgrades.
-    if body.routing_min_model and body.routing_min_model not in body.model_order:
+    if (
+        ("routing_min_model" in provided or "model_order" in provided)
+        and routing_min_model
+        and routing_min_model not in model_order
+    ):
         raise HTTPException(
             400,
             "routing_min_model must be one of the profile's models "
-            f"{body.model_order} (or empty = no downgrade), got {body.routing_min_model!r}",
+            f"{model_order} (or empty = no downgrade), got {routing_min_model!r}",
         )
-    defaults = {
-        # exclude_none keeps each stored preset to its ONE limit key, so a
-        # reader can branch on presence instead of on a null test.
-        "budgets": [b.model_dump(exclude_none=True) for b in body.budgets],
-        "mcp_grants": [[g.server, g.tool] for g in body.mcp_grants],
-    }
-    # §3a live grants: when true, mcp_grants above evaluate AT CALL TIME for
-    # every key of this profile (per-key rows stay exceptions) — an admin
-    # edit of THIS profile re-scopes running keys on their next call.
-    # Absent/false = stamps-at-create (today's semantics).
-    if body.live_grants:
-        defaults["live_grants"] = True
     preset_unavailable: list[str] = []
     preset_pair_count = 0
     if body.mcp_grant_preset is not None:
@@ -3270,13 +3599,13 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
         resolved = preset_pairs(body.mcp_grant_preset, catalog_pairs)
         preset_pair_count = len(resolved)
         explicit = [(g[0], g[1]) for g in defaults["mcp_grants"]]
-        merged = list(dict.fromkeys([*explicit, *resolved]))
-        defaults["mcp_grants"] = [[s, t] for s, t in merged]
+        merged_pairs = list(dict.fromkeys([*explicit, *resolved]))
+        defaults["mcp_grants"] = [[s, t] for s, t in merged_pairs]
         defaults["mcp_grant_preset"] = body.mcp_grant_preset
-    if body.limits is not None:
-        defaults["limits"] = body.limits.model_dump(exclude_none=True)
-    if body.memory is not None:
-        defaults["memory"] = body.memory.model_dump()
+    elif "mcp_grant_preset" in provided:
+        # An explicit null clears the recorded preset NAME without touching the
+        # pairs it once expanded to (the operator is editing the grants now).
+        defaults.pop("mcp_grant_preset", None)
     row = await db.fetchrow(
         "INSERT INTO profiles (name, model_order, defaults_json, offpeak_fraction, "
         "routing_policy, routing_min_model) "
@@ -3286,12 +3615,49 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
         "RETURNING id, name, model_order, defaults_json, offpeak_fraction, "
         "routing_policy, routing_min_model",
         body.name,
-        body.model_order,
+        model_order,
         json.dumps(defaults),
-        body.offpeak_fraction,
-        body.routing_policy,
-        body.routing_min_model,
+        offpeak_fraction,
+        routing_policy,
+        routing_min_model,
     )
+    # --- agent selection (2026-10-29) ---------------------------------------
+    # Written to its OWN table, in ONE statement (delete+insert), because
+    # create_profile rebuilds defaults_json from this request body — an agent
+    # list stored there would be wiped by any older console POST.
+    # The three-state body.agents (None = untouched, [] = clear) is what keeps
+    # "an older console saves a budget change" from erasing the selection.
+    if body.agents is not None:
+        wanted = list(dict.fromkeys(str(a) for a in body.agents))
+        if wanted:
+            known = {
+                str(r["name"]): r["id"]
+                for r in await db.fetch("SELECT id, name FROM agent_profiles WHERE name = ANY($1::text[])", wanted)
+            }
+            missing = [a for a in wanted if a not in known]
+            if missing:
+                # FAIL LOUD: a profile offering a non-existent agent would look
+                # configured while offering nothing (the stale-model_order
+                # defect class this endpoint already refuses for models).
+                raise HTTPException(
+                    400,
+                    f"agents not defined: {missing} — create them under POST /admin/agents first",
+                )
+        assert row is not None
+        await db.execute(
+            "WITH gone AS (DELETE FROM profile_agents WHERE profile_id = $1) "
+            "INSERT INTO profile_agents (profile_id, agent_id) "
+            "SELECT $1, a.id FROM agent_profiles a WHERE a.name = ANY($2::text[])",
+            row["id"],
+            wanted,
+        )
+    # P3 (audit 2026-10-29): the router's per-user policy cache had no
+    # invalidator, so a floor/policy change lagged up to 60s per user in this
+    # process. The DB write is done — drop the cache now (the seam added in
+    # core.model_routing alongside the cache itself).
+    from ..core import model_routing  # local: the module is deliberately import-light
+
+    model_routing.clear_policy_cache()
     assert row is not None
     out = dict(row)
     out["budgets"] = defaults["budgets"]
@@ -3300,8 +3666,15 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     out["preset_grants"] = preset_pair_count
     out["preset_catalog_ok"] = not preset_unavailable
     out["preset_unavailable_servers"] = preset_unavailable
+    # Round-trip the agent selection so the console can re-render the form from
+    # a save response (None = the caller did not speak, so report what is
+    # stored — an empty list would read as "cleared").
+    out["agents"] = body.agents if body.agents is not None else None
     # details: the preset payload IS the profile's durable shape (no secrets
-    # — budgets/grants/limits/routing are all operator policy).
+    # — budgets/grants/limits/routing are all operator policy). Records the
+    # EFFECTIVE values (post-merge), because that is what the row now holds;
+    # `provided` names the fields this call actually changed, which is what
+    # makes a partial save legible in the trail.
     await _audit(
         request,
         action="profile.upsert",
@@ -3309,15 +3682,17 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
         resource_id=str(row["id"]),
         details={
             "name": body.name,
-            "model_order": body.model_order,
+            "model_order": model_order,
             "budgets": defaults.get("budgets", []),
             "mcp_grants": defaults.get("mcp_grants", []),
             "limits": defaults.get("limits", {}),
-            "offpeak_fraction": body.offpeak_fraction,
-            "routing_policy": body.routing_policy,
-            "routing_min_model": body.routing_min_model,
+            "offpeak_fraction": offpeak_fraction,
+            "routing_policy": routing_policy,
+            "routing_min_model": routing_min_model,
+            "provided": sorted(provided),
             "memory": defaults.get("memory"),
             "live_grants": bool(defaults.get("live_grants")),
+            "agents": body.agents,
             "mcp_grant_preset": defaults.get("mcp_grant_preset"),
             "preset_grants": preset_pair_count,
             "preset_catalog_ok": not preset_unavailable,
@@ -3343,6 +3718,18 @@ async def list_profiles(_: AdminDep) -> list[dict[str, Any]]:
     """
     registered = model_router.models()
     registered_set = set(registered)
+    from ..core.cascade import serves_chat  # local: keeps this module import-light
+
+    # Agents per profile (2026-10-29): the same reverse index the agents
+    # listing carries, from the profile side — one query, no N+1.
+    offered: dict[str, list[str]] = {}
+    try:
+        for link in await db.fetch(
+            "SELECT pa.profile_id, a.name FROM profile_agents pa JOIN agent_profiles a ON a.id = pa.agent_id"
+        ):
+            offered.setdefault(str(link["profile_id"]), []).append(str(link["name"]))
+    except Exception:
+        log.warning("profiles: agent selection lookup failed — reporting none", exc_info=True)
     out = []
     for r in await db.fetch(
         "SELECT id, name, model_order, defaults_json, offpeak_fraction, "
@@ -3361,6 +3748,13 @@ async def list_profiles(_: AdminDep) -> list[dict[str, Any]]:
         d["memory"] = defaults.get("memory")  # the enrollment-memory preset, round-tripped
         order = list(d.get("model_order") or [])
         d["stale_models"] = [m for m in order if m not in registered_set]
+        # THE DOUBLE DUTY, reported (2026-10-29): model_order is BOTH the chat
+        # cascade AND the source of every enrolled key's allowed_models, so a
+        # non-chat entry is legitimate (it grants the pool to enrolled keys) and
+        # can never be a cascade step (core.cascade.serves_chat skips it). The
+        # panel shows these separately so "why is the embedding model in the
+        # auto chain?" is answerable from the console instead of the source.
+        d["non_chat_models"] = [m for m in order if m in registered_set and not serves_chat(m)]
         # The exact expression routes_enroll uses. Duplicated deliberately:
         # importing the redeem path here would invert the dependency (the
         # admin plane must not depend on the enrollment route module), and a
@@ -3368,6 +3762,10 @@ async def list_profiles(_: AdminDep) -> list[dict[str, Any]]:
         # cross-module import cycle. If that expression changes, this display
         # becomes wrong — which is why the comment names its source.
         d["acl_effect"] = {"mode": "derived", "models": [m for m in order if m in registered_set]}
+        # The agents this profile OFFERS, name-sorted. [] = none, which is the
+        # honest answer for every profile that predates the feature (a key of
+        # such a profile sees no agent entries in /v1/models).
+        d["agents"] = sorted(offered.get(str(d["id"]), []))
         out.append(d)
     return out
 
@@ -3417,6 +3815,85 @@ async def propagate_profile_limits(profile_id: uuid.UUID, request: Request, _: A
         details={"fields": [s.split(" =")[0] for s in sets], "tag": tag},
     )
     return {"propagated": tag, "fields": [s.split(" =")[0] for s in sets]}
+
+@router.post("/profiles/{profile_id}/propagate-grants")
+async def propagate_profile_grants(profile_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Push the profile's MCP grant presets onto ALL keys of attached users.
+
+    EXPLICIT action (never a save side effect): replacing live keys' tool ACLs
+    silently would be a surprise — this endpoint is the operator saying "apply
+    now", the grants twin of propagate-limits.
+
+    WHY A BUTTON WHEN live_grants EXISTS: live grants are the drift-free answer
+    (the profile's list IS the key's list on every call, no propagation at all).
+    This is the STAMPED model every existing key was minted under, and an
+    operator who does not want to switch a profile's evaluation mode still needs
+    a way to re-sync keys created before the grants changed. Prefer
+    live_grants for anything you expect to keep editing.
+
+    DESTRUCTIVE BY DESIGN: each attached key's grant rows are REPLACED by the
+    profile's list — per-key exceptions included, because this is a re-stamp and
+    not a merge. Refuses when the profile declares NO grants: an accidental
+    click must never zero a fleet's tool surface (clearing stays per-key, or an
+    explicit profile edit).
+    """
+    if not await _exists("profiles", profile_id):
+        raise HTTPException(404, f"profile {profile_id} not found")
+    prow = await db.fetchrow("SELECT defaults_json FROM profiles WHERE id = $1", profile_id)
+    try:
+        defaults = json.loads((prow["defaults_json"] if prow else None) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        defaults = {}
+    pairs = {
+        (str(g[0]), str(g[1]))
+        for g in (defaults.get("mcp_grants") or [])
+        if isinstance(g, (list, tuple)) and len(g) == 2
+    }
+    if not pairs:
+        raise HTTPException(
+            400,
+            "profile has no mcp_grants to propagate — an empty list would REPLACE every"
+            " attached key's grants with nothing (clear them per key instead)",
+        )
+    # ONE statement, delete-then-insert inside a CTE: a half-applied fleet is
+    # not a reachable state. The pairs ride as two ALIGNED arrays through a
+    # single unnest($2, $3) — that covers a full server x tool grid and a
+    # hand-picked list with the same shape, so there is no second code path to
+    # get wrong. ON CONFLICT flips a surviving allowed=FALSE row back to TRUE
+    # (a deny row for a pair the profile now grants must not outlive the stamp).
+    pair_servers = [p[0] for p in sorted(pairs)]
+    pair_tools = [p[1] for p in sorted(pairs)]
+    tag = await db.execute(
+        "WITH gone AS ("
+        "  DELETE FROM mcp_tool_acls WHERE key_id IN ("
+        "    SELECT k.id FROM api_keys k JOIN users u ON u.id = k.user_id"
+        "     WHERE u.profile_id = $1 AND k.revoked_at IS NULL)) "
+        "INSERT INTO mcp_tool_acls (key_id, server, tool, allowed) "
+        "SELECT k.id, p.srv, p.tool, TRUE "
+        "  FROM api_keys k JOIN users u ON u.id = k.user_id "
+        "  CROSS JOIN unnest($2::text[], $3::text[]) AS p(srv, tool) "
+        " WHERE u.profile_id = $1 AND k.revoked_at IS NULL "
+        "ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = TRUE",
+        profile_id,
+        pair_servers,
+        pair_tools,
+    )
+    keys = await db.fetchval(
+        "SELECT count(*) FROM api_keys k JOIN users u ON u.id = k.user_id "
+        " WHERE u.profile_id = $1 AND k.revoked_at IS NULL",
+        profile_id,
+    )
+    await _audit(
+        request,
+        action="profile.grants.propagate",
+        resource_type="profile",
+        resource_id=str(profile_id),
+        # Pair COUNT and key COUNT, never the pair list: the trail already
+        # records the profile's grants on its own upsert row.
+        details={"grants": len(pairs), "keys": int(keys or 0), "tag": tag},
+    )
+    return {"propagated": int(keys or 0), "grants": len(pairs), "tag": tag}
+
 
 
 @router.delete("/profiles/{profile_id}")
@@ -3814,6 +4291,20 @@ class DistillerConfigPatch(BaseModel):
     enabled: bool | None = None
     debounce_minutes: int | None = Field(None, ge=1, le=1440)
     max_tokens: int | None = Field(None, ge=0, le=32768)
+
+    @field_validator("max_tokens")
+    @classmethod
+    def _max_tokens_not_degenerate(cls, v: int | None) -> int | None:
+        # F10 (audit 2026-10-29): ge=0 alone admitted max_tokens=1, and a cap
+        # that small makes EVERY distill raise DistillTruncatedError (the
+        # four-section memory contract can never complete) — the sweep then
+        # retries the doomed distill on every pass. 0 stays legal: it is the
+        # documented "back to env default" sentinel (core.distiller_config).
+        if v is not None and 0 < v < 512:
+            raise ValueError(
+                "max_tokens below 512 can never fit a complete distilled document; use 0 for the env default"
+            )
+        return v
 
 
 @router.get("/distiller/config")
@@ -4249,6 +4740,14 @@ class RoutingConfigPatch(BaseModel):
     enabled: bool | None = None
     decision_model: str | None = None
     allowed_models: list[str] | None = None
+    # --- GLOBAL arming + ladder (2026-10-28) ---------------------------
+    # Fleet-level defaults, so routing is armed once instead of per profile.
+    # Declared here for TYPE checking only: the semantic checks live in
+    # core.model_routing.global_policy()/global_ladder(), which are fail-safe
+    # by construction (an unknown policy reads 'off', a non-list ladder reads
+    # as no ladder), so a bad value can never arm routing by accident.
+    routing_policy: str | None = None
+    model_order: list[str] | None = None
     prompt: str | None = Field(None, max_length=20000)
     inject_gpu_load: bool | None = None
     gpu_load_source: str | None = None
@@ -4355,6 +4854,154 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         "effective_enabled": bool(cfg.get("enabled")) and settings.routing_enabled,
         "placeholders": list(routing_config.PLACEHOLDERS),
         "gpu": await routing_config.gpu_load_snapshot(),
+    }
+
+
+def _hist_quantile(buckets: list[tuple[float, float]], count: float, q: float) -> float | None:
+    """Linear interpolation inside the bucket that holds q. None when empty.
+
+    Returning the bucket's UPPER BOUND (the naive version) over-reported the
+    median by ~5x on a measured distribution (90x10ms + 10x3000ms reported
+    p50=50.0 against a true 10.0). Interpolating between the previous cumulative
+    and this bucket is what Prometheus' histogram_quantile does; a panel must
+    not invent its own arithmetic and then be trusted over the alert thresholds
+    it was built to explain.
+    """
+    if not buckets or count <= 0:
+        return None
+    ordered = sorted(buckets)
+    target = q * count
+    prev_le = 0.0
+    prev_cum = 0.0
+    for le, cumulative in ordered:
+        if cumulative >= target:
+            span = cumulative - prev_cum
+            if span <= 0:
+                return le
+            return prev_le + (le - prev_le) * ((target - prev_cum) / span)
+        prev_le, prev_cum = le, cumulative
+    return ordered[-1][0]
+
+
+def _prom_samples(family: str) -> list[Any]:
+    """Every sample of one Prometheus metric family, or [] on any fault.
+
+    prometheus_client strips the _total suffix from a COUNTER's family name
+    (family "gateway_decision_calls", sample "gateway_decision_calls_total"),
+    so matching on the family alone silently reports zeros for every counter —
+    a stats panel that is quietly empty is worse than no panel. Both spellings
+    are accepted. Never raises: observability must not be able to 500 the
+    console.
+    """
+    try:
+        from prometheus_client import REGISTRY
+    except Exception:
+        return []
+    try:
+        for metric in REGISTRY.collect():
+            if metric.name == family or metric.name + "_total" == family:
+                return list(metric.samples)
+    except Exception:
+        return []
+    return []
+
+
+@router.get("/routing/stats")
+async def get_routing_stats(_: AdminDep) -> dict[str, Any]:
+    """Live routing counters for the panel: what the router actually did.
+
+    Read straight off the Prometheus registry the gateway already exports, so
+    the panel and /metrics can never disagree. Counters are PER PROCESS (a
+    2-replica deployment shows one pod at a time — `pod` names which), which
+    is why every rate is reported alongside the raw counts it came from.
+
+    Also reports where the decision-model PROMPT came from. That was the one
+    thing nobody could answer from outside: an empty routing_config row falls
+    back to decision_routing.DEFAULT_INSTRUCTIONS silently, so "is the model
+    using my prompt?" had no observable answer anywhere in the gateway.
+    """
+    import os
+
+    from ..core import routing_config
+
+    _samples = _prom_samples
+
+    def _counter(family: str, key: str) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for s in _samples(family):
+            if s.name != family:
+                continue
+            label = s.labels.get(key)
+            if label:
+                out[str(label)] = float(s.value)
+        return out
+
+    decision = _counter("gateway_decision_calls_total", "outcome")
+    switches = _counter("gateway_route_switches_total", "outcome")
+    # Histogram: count/sum are separate samples; buckets are le-labelled.
+    latency_count = 0.0
+    latency_sum = 0.0
+    buckets: list[tuple[float, float]] = []
+    for s in _samples("gateway_decision_latency_ms"):
+        if s.name == "gateway_decision_latency_ms_count":
+            latency_count += float(s.value)
+        elif s.name == "gateway_decision_latency_ms_sum":
+            latency_sum += float(s.value)
+        elif s.name == "gateway_decision_latency_ms_bucket":
+            le = s.labels.get("le")
+            if le is not None and le != "+Inf":
+                try:
+                    buckets.append((float(le), float(s.value)))
+                except ValueError:
+                    continue
+
+
+    head_picks: dict[str, float] = {}
+    for s in _samples("gateway_cascade_head_picks_total"):
+        if s.name != "gateway_cascade_head_picks_total":
+            continue
+        key = f"{s.labels.get('picked', '')}|{s.labels.get('reason', '')}"
+        head_picks[key] = float(s.value)
+
+    cfg = await routing_config.get_config()
+    prompt = str(cfg.get("prompt") or "")
+    calls = sum(decision.values())
+    served = decision.get("served", 0.0)
+    return {
+        "pod": os.environ.get("HOSTNAME", ""),
+        "counters": {
+            "decision": decision,
+            "switches": switches,
+            "cascade_head_picks": head_picks,
+        },
+        "decision_latency_ms": {
+            "count": latency_count,
+            "mean": (latency_sum / latency_count) if latency_count else None,
+            "p50": _hist_quantile(buckets, latency_count, 0.50),
+            "p95": _hist_quantile(buckets, latency_count, 0.95),
+        },
+        "derived": {
+            "decision_calls": calls,
+            "served_rate": (served / calls) if calls else None,
+            "abstain_rate": (decision.get("abstained", 0.0) / calls) if calls else None,
+            "switch_rate": (
+                switches.get("switched", 0.0) / calls if calls else None
+            ),
+        },
+        "config": {
+            "decision_mode": str(cfg.get("decision_mode") or "off"),
+            "decision_model": str(cfg.get("decision_model") or ""),
+            "min_confidence": cfg.get("decision_min_confidence"),
+            "switch_margin": cfg.get("decision_switch_margin"),
+            "inject_gpu_load": bool(cfg.get("inject_gpu_load")),
+        },
+        "prompt": {
+            # THE question this endpoint exists to answer: an empty row falls
+            # back to the built-in template with nothing logging it.
+            "source": "operator" if prompt.strip() else "default",
+            "chars": len(prompt),
+            "preview": prompt.strip()[:160],
+        },
     }
 
 
@@ -4466,6 +5113,13 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
                 "allowed: text, image, video, audio",
             )
     merged = await routing_config.set_values(provided)
+    # P3 (audit 2026-10-29): the per-user policy cache must drop on a GLOBAL
+    # routing write too — the kill switch (routing_policy), the global floor
+    # (routing_min_model) and the ladder all ride through profile_routing_config's
+    # 60s cache. Without this, a panel save lags per user for up to a minute.
+    from ..core import model_routing  # local: keeps the heavy core import local
+
+    model_routing.clear_policy_cache()
     await _audit(
         request,
         action="routing.config",
@@ -4563,11 +5217,18 @@ async def presented_models(_: AdminDep) -> dict[str, Any]:
     raw_offpeak = snapshot.get("models")
     offpeak_models: dict[str, Any] = raw_offpeak if isinstance(raw_offpeak, dict) else {}
     chat_models = _routing_chat_models()
-    # DERIVED ordering (no profile on an admin key): chat models first, then
-    # the rest, each group name-sorted. Chat-first because the cascade aliases
-    # are chat concepts — an embedding pool in the head slot would be a
-    # nonsensical "default model".
-    order = chat_models + [m for m in sorted(registered) if m not in set(chat_models)]
+    # DERIVED ordering (no profile on an admin key): the CHAT pools in the
+    # registry's own (name-sorted) order. CHAT ONLY (2026-10-29): this used to
+    # append every non-chat pool to the tail, so the panel rendered
+    # "auto: GLM -> Qwen -> cohere-transcribe -> fish-s2-pro ->
+    # qwen3-vl-embedding -> ..." — a walk the data plane can never perform.
+    # `auto` is a chat alias (core.cascade.serves_chat enforces that on the
+    # request path), so an embedding pool in this list is a displayed step that
+    # cannot happen, and `alias_present`/`primary` derived from it would claim
+    # a default model the chat path refuses. Non-chat pools still appear in
+    # `models` below with their real `type` — the panel just no longer
+    # pretends they are cascade steps.
+    order = list(chat_models)
     routing_eligible_set = set(await routing_config.routing_allowed_models(chat_models))
 
     models_out: list[dict[str, Any]] = []
@@ -4652,11 +5313,52 @@ async def presented_models(_: AdminDep) -> dict[str, Any]:
         ),
     ]
 
-    presented = len(models_out) + sum(1 for a in aliases if a["present"]) + sum(1 for r in routing_out if r["present"])
+    # --- AGENTS (2026-10-29) -------------------------------------------------
+    # An agent IS a model entry in the data plane (/v1/models, pcai.type="agent"),
+    # so a panel that claims to show "what /v1/models advertises" and omits them
+    # would be lying by omission. Admin view = no key, so 'offered' is not
+    # knowable here: every ENABLED agent is listed with its server set and the
+    # profiles that offer it, and the reason says a profile decides actual
+    # presentation (the same honesty rule the aliases use).
+    agents_out: list[dict[str, Any]] = []
+    try:
+        offered_by: dict[str, list[str]] = {}
+        for link in await db.fetch(
+            "SELECT pa.agent_id, p.name FROM profile_agents pa JOIN profiles p ON p.id = pa.profile_id"
+        ):
+            offered_by.setdefault(str(link["agent_id"]), []).append(str(link["name"]))
+        for a in await agents_mod.list_all():
+            agents_out.append(
+                {
+                    "id": a.name,
+                    "type": "agent",
+                    "description": a.description,
+                    "servers": list(a.servers),
+                    "model": a.model or "auto",
+                    "enabled": a.enabled,
+                    "profiles": sorted(offered_by.get(str(a.id), [])),
+                    "present": bool(a.enabled),
+                    "reason": (
+                        "profile offers it — a key with no profile sees every enabled agent"
+                        if a.enabled
+                        else "agent disabled — no key sees it"
+                    ),
+                }
+            )
+    except Exception:
+        log.warning("presented-models: agent listing failed (reporting none)", exc_info=True)
+
+    presented = (
+        len(models_out)
+        + sum(1 for a in aliases if a["present"])
+        + sum(1 for r in routing_out if r["present"])
+        + sum(1 for a in agents_out if a["present"])
+    )
     return {
         "aliases": aliases,
         "models": models_out,
         "routing": routing_out,
+        "agents": agents_out,
         "env": {
             "routing_enabled": bool(settings.routing_enabled),
             "load_aware_cascade": bool(settings.load_aware_cascade),

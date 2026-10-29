@@ -73,6 +73,7 @@ import httpx2
 
 from ..config import settings
 from ..db import db
+from ..routing.router import upstream_client
 from . import registry, secretbox
 
 log = logging.getLogger(__name__)
@@ -202,11 +203,12 @@ async def create_memory_dataset(
     headers["Content-Type"] = "application/json"
     url = f"{_api_base_url(str(server.get('url') or ''))}/api/datasets"
     try:
-        async with httpx2.AsyncClient(
+        # L-1: the shared factory pins trust_env=False — ambient proxy env
+        # must never touch enrollment's RAG write (upstream TLS contract
+        # comment moved to routing.router.upstream_client).
+        async with upstream_client(
             timeout=httpx2.Timeout(_PROVISION_TIMEOUT_S, connect=5.0),
             follow_redirects=False,
-            # Same upstream-TLS contract as the model router (config.py):
-            # verification unconditional; site CA bundle when configured.
             verify=settings.upstream_ca_bundle or True,
         ) as client:
             resp = await client.post(url, json={"name": dataset, "password": dataset_password}, headers=headers)

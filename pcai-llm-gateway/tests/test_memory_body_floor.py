@@ -166,3 +166,27 @@ async def test_floor_zero_disables_the_guard(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "distiller_min_doc_chars", 0)
     ok, _ = await mw.write_memory(None, mcp_call, synthesize_memory_index("Greeting"), session_id="s")
     assert ok is True and len(written) == 1
+
+
+# ---------------------------------------------------------------------------
+# AUDIT 2026-10-29 D-2: the floor reports its own verdict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_floor_reports_the_floored_verdict(monkeypatch):
+    """A floored document is neither a landed write nor a transient failure:
+    the verdict channel names it so a caller can tell the three apart (the
+    distiller sweep marks on 'suppressed' only)."""
+    from pcai_llm.config import settings
+    from pcai_llm.core import memory_write as mw
+
+    monkeypatch.setattr(settings, "distiller_min_doc_chars", 250, raising=False)
+
+    async def fake_call(args):
+        raise AssertionError("a floored document must not reach the memory server")
+
+    verdict: list[str] = []
+    ok, _ = await mw.write_memory(None, fake_call, "## Gotchas", session_id="s", verdict_out=verdict)
+    assert ok is False
+    assert verdict == [mw.VERDICT_FLOORED] == ["floored"]

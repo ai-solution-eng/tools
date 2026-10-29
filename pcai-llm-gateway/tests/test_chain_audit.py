@@ -205,6 +205,95 @@ async def test_verify_does_not_flag_an_empty_chain(monkeypatch):
     assert result["ok"] is True and result["checked"] == 0
 
 
+
+@pytest.mark.asyncio
+async def test_c5_edit_after_a_degraded_row_is_reported_as_break(monkeypatch):
+    """C5 — a REAL edit must not be labelled "unchained" because a degraded row
+    happens to precede it.
+
+    PRE-FIX (_verify returned at the first mismatching row): the trail
+    [ok, ok, degraded(row_hash=''), EDITED] returned
+    {"kind": "unchained", "first_bad_id": 3} — the operator's only verdict was
+    "fix the schema", and the tampered row 4 was never examined.
+    """
+    rows = _chained_rows(2)
+    # row 3: the degraded shape (a never-fatal unchained write)
+    fields3 = ["key-9", "srv", "tool", f"{9:064x}", 19, "ok", "m", "r9", ""]
+    row3 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields3)}
+    row3.update({"id": 3, "prev_hash": "", "row_hash": ""})
+    rows.append(row3)
+    # row 4: chained correctly from the degraded row's '' hash, then EDITED
+    fields4 = ["key-4", "srv", "tool", f"{4:064x}", 14, "ok", "m", "r4", ""]
+    row4 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields4)}
+    row4.update({"id": 4, "prev_hash": "", "row_hash": chain_hash("", fields4)})
+    row4["outcome"] = "policy_blocked"  # the edit: content no longer matches row_hash
+    rows.append(row4)
+    monkeypatch.setattr(chain_audit, "db", RowsFake(rows))
+
+    result = await chain_audit.verify_mcp_call_chain()
+    assert result["ok"] is False
+    assert result["kind"] == "break", "a real edit must be reported as tamper, not as a degraded write"
+    assert result["first_bad_id"] == 4
+    assert result["unchained"] == 1, "the degraded row is still counted (it is not tamper, but it is not clean)"
+    assert result["checked"] == 4, "the walk must reach the edited row (it used to stop at the degraded one)"
+
+
+@pytest.mark.asyncio
+async def test_c5_degraded_row_still_walks_past_itself(monkeypatch):
+    """A degraded row followed by CONSISTENT rows keeps the trail's later rows
+    verifiable: the verdict is still "unchained" (unchanged contract) and the
+    count is reported, so the operator sees the whole picture."""
+    rows = _chained_rows(2)
+    fields3 = ["key-9", "srv", "tool", f"{9:064x}", 19, "ok", "m", "r9", ""]
+    row3 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields3)}
+    row3.update({"id": 3, "prev_hash": "", "row_hash": ""})
+    rows.append(row3)
+    fields4 = ["key-4", "srv", "tool", f"{4:064x}", 14, "ok", "m", "r4", ""]
+    row4 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields4)}
+    row4.update({"id": 4, "prev_hash": "", "row_hash": chain_hash("", fields4)})
+    rows.append(row4)
+    monkeypatch.setattr(chain_audit, "db", RowsFake(rows))
+
+    result = await chain_audit.verify_mcp_call_chain()
+    assert result["ok"] is False
+    assert result["kind"] == "unchained"
+    assert result["first_bad_id"] == 3
+    assert result["unchained"] == 1
+    assert result["checked"] == 4, "the consistent row after the degraded one must have been checked"
+
+
+@pytest.mark.asyncio
+async def test_c5_clean_trail_reports_zero_unchained(monkeypatch):
+    """The ok shape gains the count (additive — consumers read .get("ok"))."""
+    monkeypatch.setattr(chain_audit, "db", RowsFake(_chained_rows(3)))
+    result = await chain_audit.verify_mcp_call_chain()
+    assert result["ok"] is True and result["unchained"] == 0 and result["checked"] == 3
+
+
+@pytest.mark.asyncio
+async def test_c5_break_outranks_an_earlier_fork(monkeypatch):
+    """Severity order: a tampered row is reported even when a benign fork
+    (the accepted concurrency residual) sits earlier in the trail."""
+    rows = _chained_rows(2)
+    # row 3: a FORK (chained from row 1's hash, internally consistent)
+    fork_prev = rows[0]["row_hash"]
+    fields3 = ["key-9", "srv", "tool", f"{9:064x}", 19, "ok", "m", "r9", ""]
+    row3 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields3)}
+    row3.update({"id": 3, "prev_hash": fork_prev, "row_hash": chain_hash(fork_prev, fields3)})
+    rows.append(row3)
+    # row 4: a real edit
+    fields4 = ["key-4", "srv", "tool", f"{4:064x}", 14, "ok", "m", "r4", ""]
+    row4 = {name: value for name, value in zip(chain_audit.MCP_CALL_CHAIN_FIELDS, fields4)}
+    row4.update({"id": 4, "prev_hash": row3["row_hash"], "row_hash": chain_hash(row3["row_hash"], fields4)})
+    row4["detail"] = "rewritten"
+    rows.append(row4)
+    monkeypatch.setattr(chain_audit, "db", RowsFake(rows))
+
+    result = await chain_audit.verify_mcp_call_chain()
+    assert result["ok"] is False
+    assert result["kind"] == "break" and result["first_bad_id"] == 4
+
+
 @pytest.mark.asyncio
 async def test_admin_audit_insert_carries_the_chain(monkeypatch):
     fake = RowsFake()

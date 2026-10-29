@@ -7,6 +7,7 @@ anything reaches Postgres.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -102,6 +103,375 @@ def client(monkeypatch: pytest.MonkeyPatch):
 
 def _h() -> dict[str, str]:
     return {"Authorization": "Bearer admin-secret-123"}
+
+
+# ---------------------------------------------------------------------------
+# propagate-grants (2026-10-29): the "send the profile's grants to every key"
+# button — the stamped-grants twin of apply limits
+# ---------------------------------------------------------------------------
+
+
+class _GrantPropDB:
+    """Just enough for POST /admin/profiles/{id}/propagate-grants."""
+
+    def __init__(self, grants: list | None = None, exists: bool = True) -> None:
+        self.grants = grants if grants is not None else [["k8s-ops", "get_pods"], ["prometheus", "query"]]
+        self.exists = exists
+        self.executed: list[tuple[str, tuple]] = []
+
+    async def fetchval(self, sql: str, *a: Any):
+        if "SELECT 1 FROM profiles" in sql:
+            return 1 if self.exists else None
+        return 3  # the attached-key count
+
+    async def fetchrow(self, sql: str, *a: Any):
+        if "defaults_json" in sql:
+            return {"defaults_json": json.dumps({"mcp_grants": self.grants})}
+        return None
+
+    async def fetch(self, sql: str, *a: Any):
+        return []
+
+    async def execute(self, sql: str, *a: Any):
+        self.executed.append((sql, a))
+        return "INSERT 0 2"
+
+
+def _grant_env(monkeypatch: pytest.MonkeyPatch, db: _GrantPropDB):
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    monkeypatch.setattr(routes_admin, "db", db)
+    app = FastAPI()
+    app.include_router(routes_admin.router)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_propagate_grants_restamps_every_attached_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ONE statement: delete the attached keys' rows, then re-stamp the profile's
+    pairs. A half-applied fleet must not be a reachable state, so the delete and
+    the insert ride the same statement."""
+    db = _GrantPropDB()
+    tc = _grant_env(monkeypatch, db)
+    r = tc.post(f"/admin/profiles/{uuid.uuid4()}/propagate-grants", headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["grants"] == 2 and body["propagated"] == 3
+    sqls = [s for s, _ in db.executed]
+    stamp = next(s for s in sqls if "mcp_tool_acls" in s)
+    assert "DELETE FROM mcp_tool_acls" in stamp and "INSERT INTO mcp_tool_acls" in stamp
+    assert "WITH gone AS" in stamp, "delete + insert must be one statement"
+    # the pairs ride as two ALIGNED arrays (one unnest of two arrays)
+    assert "unnest($2::text[], $3::text[])" in stamp
+
+
+def test_propagate_grants_refuses_an_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An accidental click must never zero a fleet's tool surface — clearing is
+    per-key, or an explicit profile edit."""
+    db = _GrantPropDB(grants=[])
+    tc = _grant_env(monkeypatch, db)
+    r = tc.post(f"/admin/profiles/{uuid.uuid4()}/propagate-grants", headers=_h())
+    assert r.status_code == 400 and "no mcp_grants" in r.text
+    assert not any("mcp_tool_acls" in s for s, _ in db.executed), "nothing may be written"
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/profiles is a MERGE (2026-10-29)
+# ---------------------------------------------------------------------------
+# It used to rebuild every preset from the body, so a partial POST — the natural
+# way to add one agent — silently wiped model_order, budgets, mcp_grants and
+# live_grants. Absent now means "leave alone"; an explicit value (including []
+# or null) still replaces or clears.
+
+
+class _MergeDB:
+    """A profile that already exists, plus the upsert args this POST produced."""
+
+    def __init__(self, prev: dict[str, Any]) -> None:
+        self.prev = prev
+        self.inserted: tuple | None = None
+
+    async def fetchrow(self, sql: str, *a: Any):
+        if "FROM profiles WHERE name" in sql:
+            return self.prev
+        if "INSERT INTO profiles" in sql:
+            self.inserted = a
+            return {
+                "id": self.prev["id"],
+                "name": a[0],
+                "model_order": a[1],
+                "defaults_json": a[2],
+                "offpeak_fraction": a[3],
+                "routing_policy": a[4],
+                "routing_min_model": a[5],
+            }
+        return None
+
+    async def fetch(self, sql: str, *a: Any):
+        return []
+
+    async def execute(self, sql: str, *a: Any):
+        return "OK"
+
+    async def fetchval(self, sql: str, *a: Any):
+        return 1
+
+
+def _prev_profile(**over: Any) -> dict[str, Any]:
+    defaults = {
+        "budgets": [{"model": "*", "period": "month", "limit_tokens": 1000}],
+        "mcp_grants": [["k8s-ops", "get_pods"]],
+        "live_grants": True,
+        "limits": {"rate_limit_rpm": 30},
+        "memory": {"provision": True},
+        "future_key": "kept",
+    }
+    row = {
+        "id": uuid.uuid4(),
+        "model_order": ["GLM-5.3-Flash"],
+        "defaults_json": json.dumps(defaults),
+        "offpeak_fraction": 0.5,
+        "routing_policy": "active",
+        "routing_min_model": "",
+    }
+    row.update(over)
+    return row
+
+
+def _merge_env(monkeypatch: pytest.MonkeyPatch, prev: dict[str, Any]):
+    db = _MergeDB(prev)
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    monkeypatch.setattr(routes_admin, "db", db)
+    app = FastAPI()
+    app.include_router(routes_admin.router)
+    return TestClient(app, raise_server_exceptions=False), db
+
+
+def test_partial_profile_post_preserves_everything_else(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE REGRESSION: adding one agent must not touch anything else. Before
+    this, `{"name":"poweruser","agents":[...]}` zeroed the model order, every
+    budget, all grants and the live_grants flag."""
+    tc, db = _merge_env(monkeypatch, _prev_profile())
+    r = tc.post("/admin/profiles", json={"name": "poweruser"}, headers=_h())
+    assert r.status_code == 201, r.text
+    assert db.inserted is not None
+    assert db.inserted[1] == ["GLM-5.3-Flash"], "model_order kept"
+    d = json.loads(db.inserted[2])
+    assert d["budgets"] == [{"model": "*", "period": "month", "limit_tokens": 1000}]
+    assert d["mcp_grants"] == [["k8s-ops", "get_pods"]]
+    assert d["live_grants"] is True
+    assert d["limits"] == {"rate_limit_rpm": 30}
+    assert d["memory"] == {"provision": True}
+    assert d["future_key"] == "kept", "keys this build does not know must survive a save"
+    assert db.inserted[3] == 0.5, "offpeak_fraction kept"
+    assert db.inserted[4] == "active", "routing_policy kept"
+
+
+def test_explicit_empty_still_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator can always say "empty this" on purpose."""
+    tc, db = _merge_env(monkeypatch, _prev_profile())
+    r = tc.post(
+        "/admin/profiles",
+        json={"name": "poweruser", "model_order": [], "budgets": [], "mcp_grants": []},
+        headers=_h(),
+    )
+    assert r.status_code == 201, r.text
+    assert db.inserted[1] == []
+    d = json.loads(db.inserted[2])
+    assert d["budgets"] == [] and d["mcp_grants"] == []
+
+
+def test_explicit_null_clears_a_preset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """null is a REAL value for limits/memory/offpeak ("inherit" / "clear"), so
+    it must be distinguishable from an absent field — which is why the merge
+    keys on model_fields_set rather than on a None check."""
+    tc, db = _merge_env(monkeypatch, _prev_profile())
+    r = tc.post(
+        "/admin/profiles",
+        json={"name": "poweruser", "limits": None, "memory": None, "offpeak_fraction": None},
+        headers=_h(),
+    )
+    assert r.status_code == 201, r.text
+    d = json.loads(db.inserted[2])
+    assert "limits" not in d and "memory" not in d
+    assert db.inserted[3] is None
+
+
+def test_live_grants_can_be_turned_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored flag was write-only-true before the merge: a body that omitted
+    it dropped it, and a body that sent false was indistinguishable from
+    absent. Now false clears it explicitly."""
+    tc, db = _merge_env(monkeypatch, _prev_profile())
+    r = tc.post("/admin/profiles", json={"name": "poweruser", "live_grants": False}, headers=_h())
+    assert r.status_code == 201, r.text
+    assert "live_grants" not in json.loads(db.inserted[2])
+
+
+def test_partial_post_is_not_refused_by_a_stale_stored_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stored ordering naming a model that has since left the registry must not
+    block an unrelated edit — the stale check runs only on an ordering the caller
+    actually sent."""
+    tc, db = _merge_env(monkeypatch, _prev_profile(model_order=["Ghost-Model"]))
+
+    class _Reg:
+        """The live registry no longer serves the stored id."""
+
+        def models(self):
+            return ["GLM-5.3-Flash"]
+
+        def pool(self, name: str):
+            return None
+
+    monkeypatch.setattr(routes_admin, "model_router", _Reg())
+    r = tc.post("/admin/profiles", json={"name": "poweruser", "agents": []}, headers=_h())
+    assert r.status_code == 201, r.text
+    assert db.inserted[1] == ["Ghost-Model"], "the stored ordering is left alone"
+
+
+def test_bind_sso_users_backfills_only_unprofiled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backfill for a fleet that signed in before the tenant default existed.
+    Only NULL rows are touched — a hand-assigned user is never re-scoped — and
+    the reported count is what was pending, not what now matches."""
+
+    class _TenDB:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple]] = []
+
+        async def fetchrow(self, sql: str, *a: Any):
+            return {"sso_default_profile_id": uuid.uuid4()}
+
+        async def fetchval(self, sql: str, *a: Any):
+            return 4  # users still unprofiled
+
+        async def fetch(self, sql: str, *a: Any):
+            return []
+
+        async def execute(self, sql: str, *a: Any):
+            self.executed.append((sql, a))
+            return "UPDATE 4"
+
+    db = _TenDB()
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    monkeypatch.setattr(routes_admin, "db", db)
+    app = FastAPI()
+    app.include_router(routes_admin.router)
+    tc = TestClient(app, raise_server_exceptions=False)
+
+    r = tc.post(f"/admin/tenants/{uuid.uuid4()}/bind-sso-users", headers=_h())
+    assert r.status_code == 200, r.text
+    assert r.json()["bound"] == 4
+    sql = next(s for s, _ in db.executed if "UPDATE users" in s)
+    assert "profile_id IS NULL" in sql, "hand-assigned users must never be re-scoped"
+
+
+def test_bind_sso_users_requires_a_default_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _TenDB:
+        async def fetchrow(self, sql: str, *a: Any):
+            return {"sso_default_profile_id": None}
+
+        async def fetchval(self, sql: str, *a: Any):
+            return 0
+
+        async def fetch(self, sql: str, *a: Any):
+            return []
+
+        async def execute(self, sql: str, *a: Any):
+            raise AssertionError("nothing may be written without a default profile")
+
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    monkeypatch.setattr(routes_admin, "db", _TenDB())
+    app = FastAPI()
+    app.include_router(routes_admin.router)
+    tc = TestClient(app, raise_server_exceptions=False)
+    r = tc.post(f"/admin/tenants/{uuid.uuid4()}/bind-sso-users", headers=_h())
+    assert r.status_code == 400 and "no SSO default profile" in r.text
+
+
+def test_propagate_grants_404s_an_unknown_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _GrantPropDB(exists=False)
+    tc = _grant_env(monkeypatch, db)
+    assert tc.post(f"/admin/profiles/{uuid.uuid4()}/propagate-grants", headers=_h()).status_code == 404
+
+# ---------------------------------------------------------------------------
+# F10 (audit 2026-10-29): a degenerate distiller max_tokens must not validate
+# ---------------------------------------------------------------------------
+
+
+def test_f10_distiller_config_rejects_degenerate_max_tokens(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """max_tokens=1 passed the old ge=0 bound and made EVERY distill raise
+    DistillTruncatedError (the four-section memory contract can never
+    complete) — the sweep then retried the doomed distill on every pass.
+    Small positive caps are refused; 0 stays legal (the documented "back to
+    env default" sentinel, core.distiller_config.max_tokens)."""
+
+    class _DistillerConfigDB:
+        """Just enough db for distiller_config.set_values' transaction."""
+
+        def __init__(self) -> None:
+            self.rows: list[tuple[str, str]] = []
+
+        def acquire_bounded(self):
+            outer = self
+
+            class _Conn:
+                def transaction(self):
+                    return self
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc: object):
+                    return False
+
+                async def execute(self, sql: str, *args: Any):
+                    if "DELETE FROM distiller_config" in sql:
+                        outer.rows = [r for r in outer.rows if r[0] != args[0]]
+                        return "DELETE 0"
+                    outer.rows.append((args[0], args[1]))
+                    return "INSERT 0 1"
+
+            return _Conn()
+
+        async def fetch(self, sql: str, *args: Any):
+            return [{"key": k, "value": v} for k, v in self.rows]
+
+    import pcai_llm.core.budgets as budgets_mod
+    import pcai_llm.core.keys as keys_mod
+    from pcai_llm.core import distiller_config
+
+    fake = _DistillerConfigDB()
+    monkeypatch.setattr(routes_admin, "db", fake)
+    monkeypatch.setattr(distiller_config, "db", fake)
+    monkeypatch.setattr(keys_mod, "db", fake)
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    asyncio.run(distiller_config.invalidate())
+
+    tc, _ = client
+
+    # 1 (and any positive value below the smallest completable document) -> 422
+    r = tc.put("/admin/distiller/config", json={"max_tokens": 1}, headers=_h())
+    assert r.status_code == 422, r.text
+    assert "512" in r.text and "0" in r.text
+
+    # the 0 sentinel (env default) and sane caps still write
+    r = tc.put("/admin/distiller/config", json={"max_tokens": 0}, headers=_h())
+    assert r.status_code == 200, r.text
+    assert r.json()["config"]["max_tokens"] == 0
+    r = tc.put("/admin/distiller/config", json={"max_tokens": 4096}, headers=_h())
+    assert r.status_code == 200, r.text
+    assert r.json()["config"]["max_tokens"] == 4096
+    asyncio.run(distiller_config.invalidate())
+
+
+def test_f10_distiller_config_model_validator_rejects_one_directly() -> None:
+    """Unit pin on the validator itself (pre-fix: DistillerConfigPatch(
+    max_tokens=1) validated happily — verified against the pre-fix module)."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as ei:
+        routes_admin.DistillerConfigPatch(max_tokens=1)
+    assert "512" in str(ei.value)
+    # the sentinel and legitimate caps pass
+    assert routes_admin.DistillerConfigPatch(max_tokens=0).max_tokens == 0
+    assert routes_admin.DistillerConfigPatch(max_tokens=2048).max_tokens == 2048
 
 
 def test_admin_disabled_503(monkeypatch: pytest.MonkeyPatch) -> None:

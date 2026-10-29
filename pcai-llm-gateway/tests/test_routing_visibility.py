@@ -112,6 +112,20 @@ def env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(model_fallbacks, "db", fake)
     routes_proxy._in_flight.clear()
 
+    # The routing-config read must be deterministic here: the module-level
+    # 60s cache is warmed/cold depending on which OTHER test files ran before
+    # this one, and a cold cache makes get_config hit the real (unconnected)
+    # DB and log a "routing config refresh failed" warning -- which also
+    # starts with "routing " and broke this file's exactly-one-line count
+    # depending on distant test order (found during the 2026-10-29 wave).
+    # Pin the config to its defaults: no DB, no warning, stable order.
+    import pcai_llm.core.routing_config as _rc
+
+    async def _pinned_cfg():
+        return dict(_rc.DEFAULTS)
+
+    monkeypatch.setattr(_rc, "get_config", _pinned_cfg)
+
     def make(handler, models: dict[str, str]) -> TestClient:
         r = Router.with_mock(handler)
         for name, base in models.items():

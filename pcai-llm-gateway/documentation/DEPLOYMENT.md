@@ -14,7 +14,7 @@
 > AuthorizationPolicy still applies — sed-resolve first; § Gateway
 > exposure). New § Deployment profiles: Internal G2 vs Hosted trial. The
 > G2-specific runbook with exact values, commands and per-step verification
-> is [`SSO-ROLLOUT-G2.md`](SSO-ROLLOUT-G2.md).
+> is [`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
 
 Deployment is a values problem: import the packaged chart into PCAI once,
 create the **required Secrets** out-of-band (three depending on mode), then
@@ -78,7 +78,7 @@ The admin surface is API + console; the chat page at `/` is for key holders.
 ```bash
 export BASE=https://pcai-llm-gateway.<your-domain>
 export ADMIN_KEY=<the key from step 2>
-# Full copy-paste sequence in documentation/VERIFICATION.md §3
+# Full copy-paste sequence in documentation/changelogs/VERIFICATION.md §3
 # (tenant, user, hllm- key with scopes ["proxy","mcp"], model pool, budget).
 # Template users: scripts/seed_registry.py automates the fleet's
 # model + MCP seeding (set GATEWAY_URL/ADMIN_KEY; fleet-specific).
@@ -95,7 +95,7 @@ curl -s $BASE/v1/chat/completions -H "Authorization: Bearer hllm-<key>" \
 ### 5. Verify the newer surfaces after an upgrade
 
 The upgrade path only guarantees the pod rolls; each feature wave deserves
-one smoke check (full battery in [`VERIFICATION.md`](VERIFICATION.md) §7):
+one smoke check (full battery in [`VERIFICATION.md`](changelogs/VERIFICATION.md) §7):
 
 - **Mint → redeem → trace waterfall**: `POST /admin/enrollments` (code shown
   once) → `POST /v1/enroll` with that code (key shown once) → chat through
@@ -164,7 +164,7 @@ paste it into the *Helm Values* editor, adjust the `# SITE:` lines, apply.
 
 The G2-specific, live-verified execution of the SSO + policy posture (exact
 values, exact commands, verified starting state, per-step verification) is
-[`SSO-ROLLOUT-G2.md`](SSO-ROLLOUT-G2.md).
+[`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
 
 ## Required Secrets
 
@@ -443,7 +443,7 @@ helm upgrade pcai-llm-gateway helm -n <namespace> -f .scratch/values.g2.resolved
 live VirtualService — the garbage value never reached the cluster. A render
 path WITHOUT the webhook, e.g. `helm template`, would instead register a
 gateway host that matches nothing: the route silently vanishes.) The
-G2-specific sequence around this step is [`SSO-ROLLOUT-G2.md`](SSO-ROLLOUT-G2.md).
+G2-specific sequence around this step is [`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
 
 ## Network isolation (optional — off by default)
 
@@ -508,7 +508,7 @@ UNSAFE — individually. The pieces move as ONE ordered rollout; doing the
 steps out of order either exposes spoofable identity headers or flips
 flags nothing enforces. The steps below assume `ezua.enabled=true` and
 `metrics.enabled=true` (the G2 convention). **G2-specific runbook:**
-[`SSO-ROLLOUT-G2.md`](SSO-ROLLOUT-G2.md) — the same steps with exact
+[`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md) — the same steps with exact
 values, exact commands, the live-verified starting state and who executes
 each step.
 

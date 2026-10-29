@@ -71,7 +71,7 @@ helm upgrade --install pcai-llm-gateway helm -n <namespace> \
 ## Documentation
 
 - Deployment guide: [`../../documentation/DEPLOYMENT.md`](../../documentation/DEPLOYMENT.md)
-- Post-deploy verification: [`../../documentation/VERIFICATION.md`](../../documentation/VERIFICATION.md)
+- Post-deploy verification: [`../../documentation/changelogs/VERIFICATION.md`](../../documentation/changelogs/VERIFICATION.md)
 - Field reference for every key: [`../values.yaml`](../values.yaml)
 
 ## Keys managed at runtime, not in values
