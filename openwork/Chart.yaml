@@ -3,7 +3,7 @@ name: openwork-web-helm
 description: Multi-user OpenWork (openwork-server web) deployment with per-user PVC-backed workspaces on HPE Private Cloud AI
 type: application
 appVersion: "0.18.59"
-version: 0.1.19
+version: 0.1.25
 keywords:
   - openwork
   - opencode

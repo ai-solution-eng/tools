@@ -17,3 +17,5 @@ ezappconfig-openwork-web-helm.yaml
 
 # NFS silly-rename temp files (nfs server rename artifacts)
 .nfs*
+__pycache__/
+*.pyc

@@ -131,13 +131,25 @@ openwork:
   tokenSecret: ""
 
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
-RUNTIME_REV: 12
+RUNTIME_REV: 16
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
 # is the only non-loopback listener. There is no chamber mode in this chart.
 nginx:
   clientMaxBodySize: 64m
+
+# Data Manager (in-pod file browser at /data-manager) uploads.
+dataManager:
+  # Per-request body cap for the /data-manager locations ONLY (nginx
+  # client_max_body_size override). The http{}-level nginx.clientMaxBodySize
+  # above stays as the UI cap (pasted images); this one is what a model or
+  # dataset tree needs. nginx becomes the binding limit, so keep
+  # maxUploadMb at or above this.
+  clientMaxBodySize: 2g
+  # Server-side per-file guard (DATA_MANAGER_MAX_UPLOAD_MB). Raise it together
+  # with clientMaxBodySize, never below it.
+  maxUploadMb: 2048
 
 ui:
   mode: openwork
@@ -151,12 +163,6 @@ provisioning:
     enabled: true
     heading: "Setting up your account\u2026"
     subtext: "This usually takes a few minutes on first launch. Please wait."
-
-# ============================================================
-warmPool:
-  enabled: false
-  size: 2
-  refreshIntervalSeconds: 15
 
 auth:
   username: opencode
