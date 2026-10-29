@@ -235,8 +235,16 @@ def _separate_read_egress_mode() -> str:
 
 
 # --- bounds (spec D1: depth 6, 200 strings, 8 KiB per string) --------------
-MAX_DEPTH = 6
-MAX_STRINGS = 200
+# BUMPED (xv round 2, finding 6): the original bounds refused ORDINARY
+# arguments in enforce mode — a depth-8 Kubernetes manifest
+# (spec.template.spec.containers[0].resources.limits...) and a 201-element
+# batch array are real fleet payloads, and a depth/count refusal is
+# unfixable by the model (it cannot flatten a manifest). 12/2000 still
+# fail CLOSED above them: padding a denied destination past 2000 benign
+# strings costs the attacker 10x more than the old bound, and the bound
+# keeps capping the per-call scan work.
+MAX_DEPTH = 12
+MAX_STRINGS = 2000
 MAX_SCAN_CHARS = 8 * 1024
 
 # --- BOUNDED reason vocabulary ---------------------------------------------
@@ -244,12 +252,14 @@ MAX_SCAN_CHARS = 8 * 1024
 # mcp_policy_blocked_total{reason} label. The caller's URL/host text is never
 # a label (cardinality + reflected-input hygiene), and the refusal message
 # carries a fixed sentence per reason.
+REASON_TOO_COMPLEX = "arguments-too-complex"  # exceeded a scan bound: refused, never partially scanned (audit C-1)
 REASON_SCHEME = "url-scheme"  # non-http(s) scheme (file:, gopher:, ...)
 REASON_DESTINATION = "url-destination"  # denied range / loopback name / unparseable
 REASON_IP_LITERAL = "ip-literal"  # IP-shaped but not decodable
 REASON_CLUSTER_HOST = "cluster-host"  # in-cluster name on an egress-class server
 
 REASONS = (
+    REASON_TOO_COMPLEX,
     REASON_SCHEME,
     REASON_DESTINATION,
     REASON_IP_LITERAL,
@@ -262,6 +272,7 @@ REASONS = (
 )
 
 _REASON_TEXT = {
+    REASON_TOO_COMPLEX: "the {key} argument tree exceeds the policy scan bounds",
     REASON_SCHEME: "the {key} argument uses a non-http(s) URL scheme",
     REASON_DESTINATION: "the {key} argument targets a denied destination",
     REASON_IP_LITERAL: "the {key} argument is a malformed IP literal",
@@ -404,41 +415,65 @@ def is_egress_server(server: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class _ScanResult(list[tuple[str, str]]):
+    """iter_string_arguments' return: the scanned strings plus an overflow
+    flag. Audit C-1 — the scan bounds fail CLOSED: an argument tree beyond
+    either bound is refused by the gate, never partially scanned."""
+
+    overflowed: bool = False
+
+
 def iter_string_arguments(
     arguments: Any,
     *,
     max_depth: int = MAX_DEPTH,
     max_strings: int = MAX_STRINGS,
-) -> list[tuple[str, str]]:
+) -> _ScanResult:
     """Every string VALUE in arguments as (nearest-key-hint, value).
 
     Bounded three ways (spec D1): depth 6, 200 strings, each string truncated
     to MAX_SCAN_CHARS by the classifier. Iterative, so a hostile deeply-nested
     payload cannot blow the Python stack. Keys are hints only - they name the
     argument for the refusal message and for the destination-ish bare-host
-    rule; a key is never scanned as a value."""
-    out: list[tuple[str, str]] = []
+    rule; a key is never scanned as a value.
+
+    FAIL-CLOSED (audit C-1): the bounds are a REFUSAL TRIGGER, not a
+    truncation. This walk used to stop silently at the 200th string and skip
+    depth-exceeded subtrees, so padding the arguments with benign values
+    parked a denied destination past the scan in a stage whose own posture is
+    "a security predicate that fails open is not a control". Exceeding either
+    bound now marks .overflowed (the scan still returns what it saw); the
+    gate refuses with REASON_TOO_COMPLEX instead of trusting a partial scan.
+    The walk remains O(nodes) and iterative - the bound exists to cap the
+    work per call, and the tree is already fully materialised by the body
+    reader, so refusing costs nothing."""
+    out = _ScanResult()
     stack: list[tuple[Any, str, int]] = [(arguments, "", 0)]
-    while stack and len(out) < max_strings:
+    overflow = False
+    while stack:
         node, hint, depth = stack.pop()
         if depth > max_depth:
+            overflow = True
             continue
         if isinstance(node, dict):
             for key, value in node.items():
-                if len(out) >= max_strings:
-                    break
                 if isinstance(value, str):
-                    out.append((str(key), value))
+                    if len(out) < max_strings:
+                        out.append((str(key), value))
+                    else:
+                        overflow = True
                 elif isinstance(value, (dict, list, tuple)):
                     stack.append((value, str(key), depth + 1))
         elif isinstance(node, (list, tuple)):
             for item in node:
-                if len(out) >= max_strings:
-                    break
                 if isinstance(item, str):
-                    out.append((hint, item))
+                    if len(out) < max_strings:
+                        out.append((hint, item))
+                    else:
+                        overflow = True
                 elif isinstance(item, (dict, list, tuple)):
                     stack.append((item, hint, depth + 1))
+    out.overflowed = overflow
     return out
 
 
@@ -611,7 +646,22 @@ def check_arguments_detail(
         return "", ""
     if is_exempt(server, tool):
         return "", ""
-    for key, value in iter_string_arguments(arguments):
+    scanned = iter_string_arguments(arguments)
+    if scanned.overflowed:
+        # Audit C-1: a tree past the depth/string bounds is REFUSED, not
+        # partially scanned — a denied destination parked past the old
+        # 200-string truncation point was silently admitted.
+        reason = REASON_TOO_COMPLEX
+        message = (
+            "refused by the MCP argument policy (" + REASON_TOO_COMPLEX + "): "
+            "the argument tree exceeds the policy scan bounds"
+        )
+        if resolved == "warn":
+            _metrics.observe_mcp_policy_block(server, tool, reason)
+            log.warning("mcp arg policy (warn, not refused): %s/%s %s", server, tool, message)
+            return "", ""
+        return reason, message
+    for key, value in scanned:
         reason = check_string(server, tool, key, value)
         if not reason:
             continue

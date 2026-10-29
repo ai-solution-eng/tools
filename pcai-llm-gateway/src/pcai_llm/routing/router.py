@@ -14,11 +14,34 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx2
 
 from ..config import settings
 from ..core import metrics as _metrics  # breaker gauge/counters (no-op shims w/o prometheus_client)
+
+
+def upstream_client(**kwargs: Any) -> httpx2.AsyncClient:
+    """The ONE constructor for every client that talks to an UPSTREAM
+    service (model pools, admin probes, MCP sessions, enrollment RAG).
+
+    L-1 (audit 2026-10-29): httpx2 defaults to trust_env=True, so ambient
+    proxy environment leaks into these clients two ways —
+
+    * a bracketed-IPv6 NO_PROXY entry (``[::1]``) makes URLPattern() raise
+      httpx2.InvalidURL inside AsyncClient.__init__ — and in Router.start()
+      that is the app lifespan, so the POD CRASH-LOOPS, not a 500;
+    * a valid HTTP_PROXY silently reroutes every upstream call (prompts,
+      API keys, completions) through a host this gateway does not control.
+
+    Upstream targets are in-cluster, admin-registered URLs: proxies and
+    other ambient env must never apply. trust_env is pinned False here and
+    EVERY construction site must build through this factory (one place to
+    audit). verify/limits/timeout policy stays with the caller as before.
+    """
+    kwargs["trust_env"] = False
+    return httpx2.AsyncClient(**kwargs)
 
 
 @dataclass
@@ -129,7 +152,7 @@ class Router:
         # is matched to the uvicorn keep-alive (75s) so pooled consumers
         # don't re-handshake mid-stream.
         if settings.upstream_pool_max_connections > 0:
-            self._client = httpx2.AsyncClient(
+            self._client = upstream_client(
                 timeout=httpx2.Timeout(settings.upstream_timeout_s, connect=10.0),
                 verify=verify,
                 limits=httpx2.Limits(
@@ -140,7 +163,7 @@ class Router:
             )
         else:
             # byte-identical legacy path (no limits kwarg = httpx defaults)
-            self._client = httpx2.AsyncClient(
+            self._client = upstream_client(
                 timeout=httpx2.Timeout(settings.upstream_timeout_s, connect=10.0), verify=verify
             )
 
@@ -206,7 +229,9 @@ class Router:
         inject an in-process upstream without monkeypatching private state.
         """
         r = cls()
-        r._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        # L-1: through the shared factory — the seam must exercise the SAME
+        # trust posture production traffic gets (ambient proxy env ignored).
+        r._client = upstream_client(transport=httpx2.MockTransport(handler))
         return r
 
 

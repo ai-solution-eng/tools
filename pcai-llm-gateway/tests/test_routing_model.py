@@ -230,12 +230,54 @@ def test_unavailable_walks_up_within_window() -> None:
 
 
 def test_nothing_available_serves_ceiling() -> None:
-    assert _pick(10, available=lambda m: False).model == "llm-0"
+    # R-F1 (audit 2026-10-29): this used to serve the ceiling unchecked --
+    # an unservable answer admission then 403'd. The pure contract is now the
+    # nothing-available SENTINEL; whether it refuses (active) or degrades to
+    # legacy (shadow) is the caller's policy answer -- pinned at the resolve
+    # level in tests/test_sticky_routing.py's test_rf1_active_still_refuses_
+    # when_nothing_can_serve / test_rf1_shadow_never_refuses_on_an_
+    # unavailable_window twins.
+    r = _pick(10, available=lambda m: False)
+    assert r.model == "" and r.reason == "nothing_available"
 
 
 def test_available_floor_wins() -> None:
     r = _pick(10, available=lambda m: True)
     assert r.model == "llm-2"
+
+
+# ---------------------------------------------------------------------------
+# R-F1 (audit 2026-10-29): the ceiling was returned UNCHECKED by available()
+# -- with no floor the walk can never leave the ceiling, so a key whose ACL
+# excluded the ladder head got a model admission then 403'd on EVERY routed
+# request. Post-fix: walk DOWN the window; refuse with RoutingRefused(503)
+# only when nothing can serve.
+# ---------------------------------------------------------------------------
+
+
+def test_rf1_ceiling_unavailable_walks_down_to_acl_model() -> None:
+    """ACL allows only the ladder head; a huge request must still serve it.
+
+    Pre-fix this returned 'Deepseek' (the ceiling, unchecked) for every score
+    -- a model the key cannot use, so admission 403'd every routed request.
+    """
+    healthy = {"llm-2"}  # only the ladder head (the floor end) can serve
+    for score in (10, settings.routing_tier1_tokens + 1, settings.routing_tier2_tokens + 1):
+        r = _pick(score, available=lambda m: m in healthy)
+        assert r.model == "llm-2", f"score={score}: must serve the only ACL-allowed model"
+
+
+def test_rf1_ceiling_unavailable_walks_down_to_window_member() -> None:
+    """Ceiling cooling + top rung cooling -> the best still-servable member."""
+    r = _pick(settings.routing_tier2_tokens + 1, available=lambda m: m == "llm-1")
+    assert r.model == "llm-1"
+    assert r.reason == "prompt_tokens>=tier2", "the tier decision rides out on the downgraded pick"
+
+
+def test_rf1_no_availability_predicate_unchanged() -> None:
+    """Without an availability seam the mapping is byte-identical (no refusal)."""
+    r = _pick(settings.routing_tier2_tokens + 1)
+    assert r.model == "llm-0" and r.reason == "prompt_tokens>=tier2"
 
 
 # ---------------------------------------------------------------------------
@@ -529,10 +571,11 @@ def test_off_policy_routing_is_plain_alias(env) -> None:
     tc, db, upstream = env(policy="off")
     r = _chat(tc, "routing")
     assert r.status_code == 200, r.text
-    # the alias walk serves model_order[0]; the upstream still received the
-    # alias name (today's transparent-proxy behavior, untouched)
-    assert upstream[0]["model"] == "routing"
-    assert r.json()["model"] == "routing"
+    # the alias walk serves model_order[0]; the upstream sees the RESOLVED
+    # name (C-6, audit 2026-10-29: the wire body names the model serving the
+    # attempt, so a strict upstream cannot 400 an alias)
+    assert upstream[0]["model"] == "llm-0"
+    assert r.json()["model"] == "llm-0"
     assert "x-pcai-route" not in {k.lower() for k in r.headers}
     row = db.rows[-1]
     assert row[1] == "llm-0"  # ledger records what actually served
@@ -543,7 +586,7 @@ def test_off_policy_routing_named_is_plain_alias(env) -> None:
     tc, _db, upstream = env(policy="off")
     r = _chat(tc, "routing__llm-1")
     assert r.status_code == 200, r.text
-    assert upstream[0]["model"] == "routing__llm-1"  # alias: name rides through
+    assert upstream[0]["model"] == "llm-0"  # alias walk serves the ceiling; C-6 resolves the name
     assert "x-pcai-route" not in {k.lower() for k in r.headers}
 
 
@@ -562,9 +605,9 @@ def test_shadow_stamps_would_serve_keeps_truth(env) -> None:
     r = _chat(tc, "routing")
     assert r.status_code == 200, r.text
     assert r.headers["x-pcai-route"] == "shadow ceiling=llm-0 would=llm-2 reason=prompt_tokens<tier1"
-    # served EXACTLY as 'off' would: pseudo name rides through, alias walk
-    # serves the ceiling model
-    assert upstream[0]["model"] == "routing"
+    # served EXACTLY as 'off' would: the alias walk serves the ceiling model,
+    # and (C-6) the upstream sees that resolved name
+    assert upstream[0]["model"] == "llm-0"
     row = db.rows[-1]
     assert row[1] == "llm-0"  # model column = actually-served (ledger truth)
     assert row[13] == "shadow"
@@ -708,7 +751,7 @@ def test_master_switch_off_reads_off_and_serves_legacy(env, monkeypatch: pytest.
     tc, db, upstream = env(policy="active", min_model="llm-2")
     r = _chat(tc, "routing")
     assert r.status_code == 200, r.text
-    assert upstream[0]["model"] == "routing"  # alias behavior (as 'off')
+    assert upstream[0]["model"] == "llm-0"  # alias behavior (as 'off'); C-6 resolves the name
     assert r.headers["x-pcai-route"] == "off"  # opted-in profile, switch down
     assert db.rows[-1][13] == ""  # nothing stamped: routing did not run
 
@@ -721,7 +764,7 @@ def test_router_error_degrades_to_legacy(env, monkeypatch: pytest.MonkeyPatch) -
     tc, db, upstream = env(policy="active", min_model="llm-2")
     r = _chat(tc, "routing")
     assert r.status_code == 200, r.text  # never fails the request
-    assert upstream[0]["model"] == "routing"  # legacy alias path
+    assert upstream[0]["model"] == "llm-0"  # legacy alias path (C-6: upstream sees the resolved name)
     assert db.rows[-1][1] == "llm-0"  # ...which serves the ceiling first
     assert "x-pcai-route" not in {k.lower() for k in r.headers}
 

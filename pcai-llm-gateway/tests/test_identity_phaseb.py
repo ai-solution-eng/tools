@@ -606,6 +606,160 @@ def test_shadow_key_revoked_key_not_reused(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # ---------------------------------------------------------------------------
+
+class ExpiryShadowDB(ShadowDB):
+    """ShadowDB + the two behaviours the audit C2/F2 fixes depend on:
+
+    * an api_keys row can carry expires_at (the operator's way to bound a
+      provisioned identity), served to the caller regardless of the SQL
+      predicate — so the MAPPER's gate is what the test exercises;
+    * users really carries UNIQUE (tenant_id, name): a duplicate INSERT
+      raises, exactly like Postgres (the pre-fix provisioning path did a
+      blind INSERT and swallowed the violation into a None).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.expires_at_by_key: dict[str, Any] = {}
+
+    async def fetchrow(self, sql: str, *args: Any):
+        if "FROM api_keys k" in sql and "bound_via" in sql:
+            row = await super().fetchrow(sql, *args)
+            if row is not None:
+                row["expires_at"] = self.expires_at_by_key.get(row["id"])
+            return row
+        if "SELECT id FROM users WHERE tenant_id" in sql:
+            for u in self.users:
+                if u["tenant_id"] == args[0] and u["name"] == args[1]:
+                    return {"id": u["id"]}
+            return None
+        if "INSERT INTO users" in sql:
+            for u in self.users:
+                if u["tenant_id"] == args[0] and u["name"] == args[1]:
+                    raise RuntimeError(
+                        "duplicate key value violates unique constraint \"users_tenant_id_name_key\""
+                    )
+        return await super().fetchrow(sql, *args)
+
+
+class CannedRowDB:
+    """db seam that answers every fetchrow with ONE canned row (the shadow
+    SELECT shape), so the mapper — not the fake — decides the verdict."""
+
+    def __init__(self, row: dict[str, Any]) -> None:
+        self.row = row
+
+    async def fetchrow(self, sql: str, *args: Any):
+        return self.row
+
+    async def fetch(self, sql: str, *args: Any):
+        return []
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        return "UPDATE 0"
+
+
+def _shadow_row(key_id: Any, expires_at: Any = None) -> dict[str, Any]:
+    """The _SHADOW_KEY_SQL row shape for one key."""
+    return {
+        "id": key_id,
+        "user_id": uuid.uuid4(),
+        "name": "token-shadow",
+        "key_prefix": "hllm-XX",
+        "scopes": ["proxy", "mcp"],
+        "allowed_models": [],
+        "rate_limit_rpm": 60,
+        "rate_limit_tpm": 100_000,
+        "max_concurrent": 0,
+        "expires_at": expires_at,
+        "revoked_at": None,
+        "relay_default": False,
+        "stream_pcai_events": False,
+        "mcp_admin": True,
+        "offpeak_fraction": None,
+    }
+
+
+def test_c2_expired_shadow_key_does_not_authorize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C2 — an EXPIRED token-shadow key must not authorize.
+
+    PRE-FIX (core/identity.py:_row_to_key_record): the shadow door had its own
+    row→record mapping which copied `expires_at` into the KeyRecord and never
+    compared it, so find_shadow_key returned a LIVE record for a row whose
+    expires_at was 2020-01-01 — while core.keys.load_key_record refused the
+    identical row. Expiry was enforced on the API-key door and not on the
+    JWT/SSO door.
+    """
+    from pcai_llm.core import keys as keys_mod
+
+    expired = datetime(2020, 1, 1, tzinfo=UTC)
+    kid = uuid.uuid4()
+
+    # THE defect, through the real find_shadow_key: the fake serves the
+    # expired row and the mapper must refuse it.
+    monkeypatch.setattr(identity, "db", CannedRowDB(_shadow_row(kid, expired)))
+    assert asyncio.run(identity.find_shadow_key("user-alice-1")) is None
+
+    # the shared mapper is the one gate (both doors), and it also carries
+    # mcp_admin now (the pre-fix shadow SELECT never selected the column, so
+    # the record hard-coded False for a row that says TRUE)
+    live = keys_mod.key_record_from_row(_shadow_row(kid, None))
+    assert live is not None and live.mcp_admin is True
+    assert keys_mod.key_record_from_row(_shadow_row(kid, expired)) is None
+
+    # and the SELECT filters expiry itself, so an expired NEWEST key falls
+    # through to the next live candidate instead of resolving to nothing
+    assert "k.expires_at IS NULL OR k.expires_at > now()" in identity._SHADOW_KEY_SQL
+    assert "k.mcp_admin" in identity._SHADOW_KEY_SQL
+
+
+def test_c2_resolve_shadow_key_reprovisions_past_an_expired_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An expired shadow key must not wedge the subject: with provisioning on,
+    the next sighting mints a fresh key (the same lifecycle as a revoke)."""
+    fake = ExpiryShadowDB()
+    monkeypatch.setattr(identity, "db", fake)
+    monkeypatch.setattr(settings, "token_shadow_keys", True)
+    first = asyncio.run(identity.resolve_shadow_key("user-alice-1", None))
+    assert first is not None
+    # The fake's lookup still RETURNS the row (the SQL predicate is a real-DB
+    # filter); the mapper's expiry gate is what must refuse it.
+    fake.expires_at_by_key[first.id] = datetime(2020, 1, 1, tzinfo=UTC)
+    assert asyncio.run(identity.find_shadow_key("user-alice-1")) is None
+
+
+def test_f2_shadow_reprovision_after_revoke_reuses_the_user_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2 — re-provisioning after a console revoke must not collide on
+    users UNIQUE (tenant_id, name).
+
+    PRE-FIX (_provision_shadow_key): a blind `INSERT INTO users` raised
+    UniqueViolationError on the SECOND provisioning of the same human, the
+    best-effort handler swallowed it into None, and that subject 401'd FOREVER
+    on valid tokens. Console revocation is the DOCUMENTED off switch, so this
+    hit the normal lifecycle — and two subjects sharing an email collided the
+    same way.
+    """
+    fake = ExpiryShadowDB()
+    monkeypatch.setattr(identity, "db", fake)
+    monkeypatch.setattr(settings, "token_shadow_keys", True)
+    claims = identity.TokenClaims(subject="user-alice-1", email="alice@corp", groups=[])
+    first = asyncio.run(identity.resolve_shadow_key("user-alice-1", claims))
+    assert first is not None
+
+    fake.keys[0]["revoked"] = True  # the documented off switch
+    second = asyncio.run(identity.resolve_shadow_key("user-alice-1", claims))
+    assert second is not None, "a revoked shadow key must be re-provisionable"
+    assert second.id != first.id
+    assert len(fake.users) == 1, "the per-subject user row is REUSED, never re-inserted"
+
+    # two subjects sharing one email (display_name) both provision
+    other = asyncio.run(
+        identity.resolve_shadow_key(
+            "user-bob-1", identity.TokenClaims(subject="user-bob-1", email="alice@corp", groups=[])
+        )
+    )
+    assert other is not None and other.id != second.id
+
+
 # 4. require_key: the token rung live on /v1 (fall-through at the surface)
 # ---------------------------------------------------------------------------
 

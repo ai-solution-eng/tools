@@ -95,7 +95,15 @@ if _REAL:
     )
     BUDGET_REJECTIONS = Counter(
         "gateway_budget_rejections_total",
-        "Calls refused by a period budget gate.",
+        # HONEST SCOPE (audit C7, 2026-10-29): this counts GATE EVALUATIONS that
+        # returned a refusal, not refused REQUESTS. check_budgets is called once
+        # per cascade candidate (cascade.py x2, routes_proxy x2, toolrelay x2,
+        # routes_distill x1), so one cascading request can contribute several.
+        # It was documented as "calls refused". Counting requests instead needs
+        # the refusing family plumbed through GateResult to each terminal raise
+        # site — a follow-up, not a silent re-meaning of an existing series.
+        "Budget-gate candidate refusals (one per refusing candidate; a "
+        "cascading request may contribute several).",
         ["kind"],  # tokens | usd (which budget family refused)
     )
     RATE_LIMITED = Counter(

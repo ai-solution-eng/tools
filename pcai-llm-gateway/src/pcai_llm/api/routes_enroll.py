@@ -664,6 +664,34 @@ LIMIT 1
 
 _FOR_ME_REVOKE_SQL = "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL"
 
+async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, Any] | None) -> None:
+    """Bind an SSO-created user to the tenant default profile when it has none.
+
+    WHY (2026-10-29): the tenant default profile used to land ONLY as stamped
+    presets on the key row, so everything that reads users.profile_id — the
+    cascade ordering (core.cascade.profile_order_for_key), the routing policy,
+    the off-peak fraction (keys.authenticate's LEFT JOIN), and the agents menu
+    (core.agents.for_key) — saw NO profile. "SSO defaults to <profile>" has to
+    mean the user ROW or the profile is only half applied: the key gets its
+    budgets and grants while every profile-scoped feature silently ignores it.
+
+    ONLY WHEN NULL: an operator who assigned a profile by hand (Keys > Profile)
+    keeps it. The tenant setting is a DEFAULT, not an override — a mint must
+    never silently re-scope a user an operator already placed.
+
+    Runs INSIDE the mint transaction (same conn), so a failed stamp and a
+    failed bind roll back together: no key is issued against a half-applied
+    profile.
+    """
+    if profile is None:
+        return
+    await conn.execute(
+        "UPDATE users SET profile_id = $2 WHERE id = $1 AND profile_id IS NULL",
+        user_id,
+        profile["id"],
+    )
+
+
 
 async def _sso_default_profile(conn: Any, tenant_id: uuid.UUID) -> dict[str, Any] | None:
     """The tenant's configured SSO self-mint default profile (admin sets it
@@ -982,6 +1010,11 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
             # fresh key row would otherwise silently DROP the budgets/grants
             # the original mint stamped — grants dying at first rotation).
             if profile is not None:
+                # The profile must reach the USER row too, not just the key's
+                # stamped presets — otherwise the cascade ordering, routing
+                # policy, off-peak fraction and agents menu all see "no profile"
+                # (see _bind_user_profile). Only when the user has none.
+                await _bind_user_profile(conn, rotate_user_id, profile)
                 try:
                     await _stamp_profile_grants(conn, key_id, profile)
                 except ProfilePresetConfigError as exc:
@@ -1049,6 +1082,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                 conn=conn,
             )
             if profile is not None:
+                await _bind_user_profile(conn, user["id"], profile)
                 try:
                     await _stamp_profile_grants(conn, key_id, profile)
                 except ProfilePresetConfigError as exc:

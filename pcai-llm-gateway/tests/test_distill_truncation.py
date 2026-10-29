@@ -129,3 +129,68 @@ async def test_complete_final_document_is_returned():
     doc = await run_map_reduce("small transcript", llm_once)
     # run_map_reduce strips the reply; synthesize_memory_index is a no-op here
     assert doc == COMPLETE_DOC.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# AUDIT 2026-10-29 D-8 (P3): document_is_complete was a SUBSTRING test
+# ---------------------------------------------------------------------------
+
+
+def test_d8_prose_mentioning_a_header_does_not_pass():
+    """AUDIT D-8: `all(s in doc for s in REQUIRED_SECTIONS)` accepted any
+    document whose PROSE mentioned the header strings - a cut document that
+    happens to say "as noted under ## Gotchas" passed the truncation net.
+
+    Pre-fix:
+        document_is_complete("## What we did\\n...see ## Gotchas, ## Key
+        decisions and ## How to proceed elsewhere...") -> True
+    """
+    prose = (
+        "## What we did\n"
+        "We discussed ## Key decisions & rationale, ## Gotchas and "
+        "## How to proceed but the reply was cut before writing them.\n"
+    )
+    assert document_is_complete(prose) is False
+
+
+def test_d8_renamed_header_does_not_pass():
+    """A renamed section is not the contract section: a document that renamed
+    "## Key decisions & rationale" to "## Key choices" is missing a required
+    section (and is usually the shape a model produces when it was cut)."""
+    renamed = COMPLETE_DOC.replace("## Key decisions & rationale", "## Key choices")
+    assert document_is_complete(renamed) is False
+
+
+def test_d8_header_inside_a_fenced_block_does_not_count():
+    """Only a real HEADER LINE counts. A document whose body merely quotes a
+    header line (a fenced block) is not a document with that section."""
+    quoted = (
+        "## What we did\n"
+        "The model emitted this:\n"
+        "    ## Key decisions & rationale\n"
+        "## Gotchas\n- g\n"
+        "## How to proceed\n- h\n"
+    )
+    assert document_is_complete(quoted) is False
+
+
+def test_d8_section_with_suffix_still_matches():
+    """The prompt's own header carries a suffix ("## Key decisions &
+    rationale"), and a model may append more words. A prefix match on the
+    header LINE keeps those passing - the net must not reject real documents."""
+    assert document_is_complete(COMPLETE_DOC) is True
+    extra = COMPLETE_DOC.replace("## Gotchas", "## Gotchas (learned the hard way)")
+    assert document_is_complete(extra) is True
+
+
+def test_d8_headers_anywhere_in_the_document_count():
+    """Order is not part of the contract (the four sections may appear in any
+    order); presence as a LINE is."""
+    reordered = (
+        "[MEMORY INDEX | project: x | type: session-summary | topics: a]\n"
+        "## How to proceed\n- h\n"
+        "## Gotchas\n- g\n"
+        "## Key decisions & rationale\n1. d\n"
+        "## What we did\nx\n"
+    )
+    assert document_is_complete(reordered) is True

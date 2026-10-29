@@ -287,3 +287,75 @@ def test_containment_ignores_the_index_header():
     header = "[MEMORY INDEX | project: x | type: session-summary | topics: a,b,c,d,e,f,g]"
     score = _token_containment(header + "\nalpha", header + "\nbeta")
     assert score < 0.75
+
+
+# ---------------------------------------------------------------------------
+# AUDIT 2026-10-29 D-2 (P1): suppression must be REPORTED as its own verdict
+# ---------------------------------------------------------------------------
+# The suppression is a PERMANENT condition (re-distilling the same row produces
+# the same near-copy and is suppressed again), but it travelled through the
+# (False, detail) failure channel, so the sweep could not tell it from a
+# transient RAG outage: no marker was written, the row stayed due, and every
+# pass re-ran the whole map-reduce (measured: 4 passes -> 4 map-reduces, 0
+# writes, 0 markers).
+
+
+@pytest.mark.asyncio
+async def test_d2_suppression_reports_the_suppressed_verdict():
+    from pcai_llm.core.memory_write import VERDICT_SUPPRESSED
+
+    calls: list[dict] = []
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        calls.append(args)
+        return True, "stored"
+
+    verdict: list[str] = []
+    ok, _detail = await write_memory(
+        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
+        verdict_out=verdict,
+    )
+    assert ok is False and calls == []
+    assert verdict == [VERDICT_SUPPRESSED] == ["suppressed"]
+
+
+@pytest.mark.asyncio
+async def test_d2_a_landed_write_reports_the_written_verdict():
+    from pcai_llm.core.memory_write import VERDICT_WRITTEN
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        return True, "stored"
+
+    verdict: list[str] = []
+    ok, _ = await write_memory(
+        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        mcp_search=_search_stub([_hit("session-old", DOC_OTHER)]),
+        verdict_out=verdict,
+    )
+    assert ok is True and verdict == [VERDICT_WRITTEN]
+
+
+@pytest.mark.asyncio
+async def test_d2_a_transient_failure_reports_the_failed_verdict():
+    """The distinction the sweep depends on: a REFUSED write is transient
+    (retry), a SUPPRESSED write is permanent (mark)."""
+    from pcai_llm.core.memory_write import VERDICT_FAILED
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        return False, "rag refused"
+
+    verdict: list[str] = []
+    ok, _ = await write_memory(UUID, mcp_add, SIBLING_B9, session_id="s", verdict_out=verdict)
+    assert ok is False and verdict == [VERDICT_FAILED]
+
+
+@pytest.mark.asyncio
+async def test_d2_verdict_is_optional_and_backward_compatible():
+    """Callers that do not pass verdict_out see exactly the old contract."""
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        return True, "stored"
+
+    ok, detail = await write_memory(UUID, mcp_add, SIBLING_B9, session_id="s")
+    assert (ok, detail) == (True, "stored")

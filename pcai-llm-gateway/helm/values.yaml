@@ -18,7 +18,7 @@
 # Major tuning setups (copy the shape from the pointer):
 #   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
 #     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
-#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/SSO-ROLLOUT-G2.md (the G2 runbook)
+#     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/changelogs/SSO-ROLLOUT-G2.md (the G2 runbook)
 #   Chart-generated Secrets (trial-friendly): adminApiKey.create / secretsMasterKey.create /
 #     database.embedded.auth.create — DEPLOYMENT.md § Required Secrets
 #   Embedded Postgres: database.embedded.* — DEPLOYMENT.md § Postgres
@@ -49,7 +49,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits Chart.yaml appVersion.
-  tag: v3.2.1
+  tag: v3.4.4
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -188,6 +188,19 @@ settings:
   # on: it is what bounds a cache-busting caller to one cheap admission.
   rateLimitPredictReconcile: true
   toolRelayEnabled: true
+  # How the granted MCP catalogue is offered to the model.
+  #   full   -> every tool definition inline. Measured: 34,459 prompt tokens
+  #             for a 111-tool / 10-server catalogue (75,698 chars of
+  #             description prose alone) — a floor on every relayed request,
+  #             and enough to overflow a 262k model window.
+  #   hybrid -> ONE `pcai_tools` discovery tool inline, carrying a server
+  #             DIRECTORY (name + mcp_servers.description). `list` returns
+  #             tool summaries; `describe` returns full schemas and promotes
+  #             that server so its tools are directly callable next turn.
+  # Default full: the surface is what the model can SEE, and a model that
+  # cannot see a tool will not call it. Flip per site after watching a turn
+  # actually discover and use a server.
+  toolRelaySurface: full
   toolRelayMaxIterations: 32
   toolRelayWallClockS: 900
   # Bounded model-call retries PER RELAY TURN; spends only the REMAINING wall clock
@@ -307,6 +320,11 @@ settings:
   # runtime via the Memory Distiller panel (DB-backed, no redeploy needed).
   # Inert by construction for keys without the memory pair attached.
   distillerEnabled: false
+  # Distill OUTPUT cap in tokens (NOT the RAG chunk size — that 8192 lives in
+  # mm-rag). An overrun is rejected whole by document_is_complete(), so the
+  # memory write is lost rather than shortened. Keep the prompt target short
+  # and leave this as headroom.
+  distillerMaxTokens: 4096
   distillerMemoryServer: "mm-rag"
   distillerMemoryTool: "add_memory"
   distillerMemoryProbeTool: "memory_status"

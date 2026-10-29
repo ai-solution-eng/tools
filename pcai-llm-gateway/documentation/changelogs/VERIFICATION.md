@@ -308,7 +308,7 @@ curl -s https://pcai-llm-gateway.<your-domain>/metrics | grep -E '^gateway_'
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Pod in `CreateContainerConfigError` | A referenced Secret is missing (admin key always; `pcai-llm-gateway-db` in external mode; the PG auth Secret in embedded mode). | Create them (commands in [`DEPLOYMENT.md`](DEPLOYMENT.md) / NOTES.txt) or flip the `*.create: true` flags and re-apply — then re-apply the release. |
+| Pod in `CreateContainerConfigError` | A referenced Secret is missing (admin key always; `pcai-llm-gateway-db` in external mode; the PG auth Secret in embedded mode). | Create them (commands in [`DEPLOYMENT.md`](../DEPLOYMENT.md) / NOTES.txt) or flip the `*.create: true` flags and re-apply — then re-apply the release. |
 | `/ready` returns 503, pod NotReady | Postgres unreachable or credentials wrong. | Check the `database-url` value in the Secret (host/port/db/user); verify the DB allows connections from the cluster. |
 | Startup log lacks `database connected and schema ensured` | Schema application failed — usually missing CREATE privilege on the database. | Grant CREATE on the target database; the gateway applies its schema at startup and needs it. |
 | `/v1/models` returns an empty list | No endpoint pools registered. | Register endpoints via `/admin/models` (step 2). |
@@ -319,5 +319,5 @@ curl -s https://pcai-llm-gateway.<your-domain>/metrics | grep -E '^gateway_'
 | MCP tools/list empty | Per-tool ACLs are default-DENY and none were granted for this key. | Grant tools in the console (**Keys ▸ MCP**, or **Profiles ▸ Default MCP grants** to preset them) or `PUT /admin/keys/{key_id}/mcp-grants`. |
 | Gateway host matches nothing (route "vanished") | Endpoint blanked or edited to an empty/host-mismatched string (an unresolved `${DOMAIN_NAME}` on a plain-Helm site registers a host that matches nothing). | Keep `${DOMAIN_NAME}` when pasting into PCAI (it envsubsts pasted values before rendering); plain `helm -f` sites write the literal domain in `ezua.virtualService.endpoint`. |
 | 413 on proxied calls | Body exceeds `maxBodyBytes` (default 32 MiB). | Raise `settings.maxBodyBytes` in values and re-apply. |
-| 503 `{"error": "database busy..."}` | Postgres pool saturated (bounded acquire timed out — fail-fast by design). | Raise `settings.dbPoolMax` (mind the shared Postgres' `max_connections`), then pod limits, then `replicaCount` — see [`DEPLOYMENT.md`](DEPLOYMENT.md) § Sizing. |
+| 503 `{"error": "database busy..."}` | Postgres pool saturated (bounded acquire timed out — fail-fast by design). | Raise `settings.dbPoolMax` (mind the shared Postgres' `max_connections`), then pod limits, then `replicaCount` — see [`DEPLOYMENT.md`](../DEPLOYMENT.md) § Sizing. |
 | Relay chat returns 400 "tool execution requested but this key has no MCP grants" | The relay pre-flight found no grants and the key is not mcp-scoped (in `scope` grant mode). | Grant tools (console **Keys ▸ MCP**, or Profiles ▸ Default MCP grants) or `PUT /admin/keys/{key_id}/mcp-grants` — then retry. |

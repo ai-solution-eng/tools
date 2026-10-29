@@ -234,6 +234,41 @@ def _pool_servable(model: str) -> bool:
     return pool is not None and bool(pool.healthy())
 
 
+def serves_chat(model: str) -> bool:
+    """Can this model's pool serve a CHAT request? (pure-ish: reads the router)
+
+    WHY THIS EXISTS (2026-10-29, "auto -> only chat models"): a profile's
+    ``model_order`` is a MODEL ACL *and* the chat cascade ordering — the
+    double duty routes_admin.list_profiles reports as ``acl_effect``. It
+    therefore legitimately carries embedding / reranker / transcribe pools so
+    enrolled keys can reach them (routes_enroll derives ``allowed_models``
+    from it), and the seeder ships exactly that
+    (scripts/seed_registry.py: ``model_order`` = every DEPLOYED entry,
+    embedding included). Walking that list as a CHAT ladder without a type
+    filter resolves ``auto`` to an embedding pool, and the chat path then
+    refuses the request ("is a embedding endpoint, not chat") instead of
+    falling through to the next chat model that still has headroom.
+
+    UNKNOWN IS KEPT — deliberately. A name with no pool, or a pool with no
+    endpoints (a drained registry, a mid-refresh snapshot), returns True: the
+    walk's own ``not_registered`` attempt and the caller's pool checks
+    already handle those, and reclassifying them here would change existing
+    error semantics for a case this predicate is not about. Only a pool we can
+    SEE serving something other than chat is excluded, so the blast radius of
+    this filter is exactly the defect it fixes.
+
+    "Chat" is ``any(endpoint.model_type == "chat")`` rather than
+    ``endpoints[0]``: the registry convention is one pool = one type
+    (routes_admin's model table says so), but ``any`` is the predicate that
+    stays correct if a pool ever mixes types — and it matches
+    routes_proxy._routing_available, the other availability gate.
+    """
+    pool = model_router.pool(model)
+    if pool is None or not pool.endpoints:
+        return True
+    return any(e.model_type == "chat" for e in pool.endpoints)
+
+
 def _head_first(head: str, candidates: list[str], unhealthy: list[str]) -> list[str]:
     """The decided head first, then the remaining candidates in their
     existing relative order, with the UNHEALTHY ones demoted to the very
@@ -500,6 +535,25 @@ async def resolve_cascade(
     if not candidates:
         return Resolution(False, reason="profile ordering grants no models this key may use")
 
+    # CHAT-ONLY WALK (2026-10-29, "auto -> only chat models"). The ordering is
+    # an ACL as well as a ladder, so it can hold non-chat pools (the seeder's
+    # default profile does). ``auto`` is a CHAT alias: handing it an
+    # embedding entry resolves the request onto a pool the chat path refuses,
+    # which turns a working cascade into a 400 instead of falling through to
+    # the next chat model with headroom. Skip them and SAY SO in the attempt
+    # breakdown — a 429 must never hide a skip (same discipline as
+    # ``not_registered`` below).
+    skipped = [m for m in candidates if not serves_chat(m)]
+    if skipped:
+        skip_set = set(skipped)
+        candidates = [m for m in candidates if m not in skip_set]
+        if not candidates:
+            return Resolution(
+                False,
+                reason=(f"profile ordering has no CHAT models this key may use (skipped non-chat entries: {skipped})"),
+                attempts=[{"model": m, "status": "not_chat"} for m in skipped],
+            )
+
     # Load-aware head (opt-in, DEMAND-AWARE ALIAS ONLY):
     # reorder the candidate list so the conversation's sticky/load-ranked
     # head is tried FIRST. Everything below is untouched — the budget walk,
@@ -527,7 +581,9 @@ async def resolve_cascade(
         except Exception:  # pragma: no cover - _reorder_head is fail-open by construction
             log.warning("cascade: load-aware head failed — using the profile order", exc_info=True)
 
-    attempts: list[dict] = []
+    # The skipped non-chat entries lead the breakdown so the 429 body reports
+    # the WHOLE ordering, not just the part this walk was willing to try.
+    attempts: list[dict] = [{"model": m, "status": "not_chat"} for m in skipped]
     for candidate in candidates:
         if candidate not in registered:
             attempts.append({"model": candidate, "status": "not_registered"})

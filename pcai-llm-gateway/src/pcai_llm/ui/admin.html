@@ -247,6 +247,7 @@
   </div>
   <div class="navgroup">
     <button data-tab="models">Models</button>
+    <button data-tab="agents">Agents</button>
     <button data-tab="mcp">MCP</button>
   </div>
   <div class="navgroup">
@@ -387,6 +388,8 @@
         </label>
         <span class="muted" style="align-self:end">off = the profile declares nothing (the redeemer's answer, else the deployment default, applies)</span>
       </div>
+      <h3>Agents offered <span class="muted">— a key of this profile may select these as its model (GET /v1/models lists them); none checked = this profile offers no agents</span></h3>
+      <div id="p-agents" class="row" style="gap:14px;flex-wrap:wrap"></div>
       <h3>Default budgets <span class="muted">— per model; '*' = any model</span></h3>
       <div class="row">
         <label>Model
@@ -411,7 +414,7 @@
     </div>
     <h2>Profiles</h2>
     <table id="profiles-table"><thead>
-      <tr><th>Name</th><th>Model order</th><th>Budgets</th><th>MCP grants</th><th>Routing</th><th></th></tr>
+      <tr><th>Name</th><th>Model order</th><th>Budgets</th><th>MCP grants</th><th>Off-peak</th><th>Agents</th><th>Routing</th><th></th></tr>
     </thead><tbody></tbody></table>
   </section>
 
@@ -427,6 +430,9 @@
         <label>Tool policy
           <select id="m-policy"><option value="allowlist">selected tools only</option><option value="all">all tools</option></select>
         </label>
+        <label style="flex:1 1 320px; min-width:0">What it is for <input id="m-desc" maxlength="200"
+          placeholder="e.g. cluster reads and diagnostics"
+          title="One line shown to the MODEL in the router's server directory (hybrid tool surface). This is prompt text — keep it factual."></label>
         <label>Priority <input id="m-priority" type="number" value="0" title="lower = preferred: catalog/listing order + flat-call failover order"></label>
         <label><input type="checkbox" id="m-enabled" checked> enabled</label>
         <button class="btn" id="m-save">Save + refresh</button>
@@ -507,6 +513,39 @@
     </div>
   </section>
 
+  <!-- ============ AGENTS ============ -->
+  <section id="tab-agents">
+    <div class="card">
+      <h2>Agents <span class="muted">— named tool surfaces, selectable as a MODEL</span></h2>
+      <p class="muted" style="margin:0 0 10px">
+        An agent is a bundle of MCP servers plus an optional system prompt. A request that names it as its
+        <span class="mono">model</span> sees the INTERSECTION of the key's grants and the agent's servers —
+        an agent can only ever HIDE tools, never add one. Its prompt is prepended to every model call of that
+        turn: after the client's own system message when it sent one, never merged into it, and never written
+        into the stored conversation. A profile decides which agents a key may use (Profiles ▸ Agents offered).
+      </p>
+      <div class="row">
+        <label>Name <span class="muted">— the model id clients request (exact, case-sensitive)</span>
+          <input id="ag-name" placeholder="Admin-Agent" style="width:220px"></label>
+        <label>Model <span class="muted">— empty = the profile's cascade (like auto)</span>
+          <select id="ag-model"></select></label>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+          <input type="checkbox" id="ag-enabled" checked style="width:auto"> enabled</label>
+        <button class="btn" id="ag-save">Save agent</button>
+        <button class="ghost mini" id="ag-reset">clear form</button>
+      </div>
+      <label style="margin-top:10px">Description <span class="muted">— rides GET /v1/models so a client can pick an agent without reading this page</span>
+        <input id="ag-desc" placeholder="cluster sweeps: prometheus, logs, k8s, applygate"></label>
+      <h3>MCP servers <span class="muted">— the agent's whole visible surface; leave every box unchecked for a chat-only agent</span></h3>
+      <div id="ag-servers" class="row" style="gap:14px;flex-wrap:wrap"></div>
+      <label style="margin-top:10px">System prompt <span class="muted">— prepended to every model call of an agent turn (the client's own system message stays first)</span>
+        <textarea id="ag-prompt" rows="6" style="width:100%;font-family:ui-monospace,monospace"></textarea></label>
+    </div>
+    <h2>Defined agents</h2>
+    <table id="agents-table"><thead>
+      <tr><th>Name</th><th>Description</th><th>Servers</th><th>Model</th><th>Prompt</th><th>Offered by</th><th>Enabled</th><th></th></tr>
+    </thead><tbody></tbody></table>
+  </section>
   <!-- ============ GUARDRAILS ============ -->
   <section id="tab-guardrails">
     <div class="card">
@@ -644,7 +683,7 @@
   <!-- ============ ENROLL (invite codes) ============ -->
   <section id="tab-enroll">
     <div class="card">
-      <h2>SSO self-mint default profile <span class="muted">— every key a user mints via “Sign in with SSO” gets this tenant's profile: budgets, MCP grants, and rate-limit presets stamped on mint AND on every rotate (rotation issues a new key row, so re-stamping keeps grants alive). Scopes stay the fixed least-privilege grant (proxy + mcp) — profiles never widen scopes.</span></h2>
+      <h2>SSO self-mint default profile <span class="muted">— every key a user mints via “Sign in with SSO” gets this tenant's profile. TWO things happen on mint AND on every rotate: the profile's budgets, MCP grants and rate-limit presets are <b>stamped</b> onto the key row (rotation issues a new key, so re-stamping keeps grants alive), and the <b>user row is bound</b> to the profile when it has none — that binding is what makes the cascade ordering, routing policy, off-peak fraction and the agents menu follow. Scopes stay the fixed least-privilege grant (proxy + mcp) — profiles never widen scopes.</span></h2>
       <div class="row">
         <label>Tenant
           <select id="sso-tenant"></select>
@@ -653,8 +692,9 @@
           <select id="sso-profile"><option value="">— none (bare mint grant) —</option></select>
         </label>
         <button class="btn" id="sso-prof-save">Save</button>
+        <button class="ghost mini" id="sso-bind" title="Bind every user of this tenant who has NO profile to the SSO default above — the backfill for people who signed in before the default existed. Hand-assigned users are never re-scoped; idempotent, so run it again after adding people.">bind existing users</button>
       </div>
-      <p class="muted" style="margin-top:6px">The mint's tenant is the deployment's <code>tokenShadowTenantId</code>. Clearing the profile returns mints to the bare grant (60 rpm · 100k tpm, no budgets/grants). Edit the profile itself under <b>Profiles</b>.</p>
+      <p class="muted" style="margin-top:6px">The mint's tenant is the deployment's <code>tokenShadowTenantId</code>. Clearing the profile returns mints to the bare grant (60 rpm · 100k tpm, no budgets/grants). Edit the profile itself under <b>Profiles</b>. Users who signed in BEFORE this setting existed still have no profile — <b>bind existing users</b> backfills them (idempotent; a user an operator placed by hand is never re-scoped). Until they are bound, their keys carry the stamped presets but the cascade ordering, routing policy, off-peak fraction and agents menu ignore the profile — and <b>apply grants</b> on the Profiles tab matches none of their keys.</p>
     </div>
     <div class="card">
       <h2>Mint an enrollment code <span class="muted">— self-service key issuance; the code is the credential</span></h2>
@@ -796,6 +836,9 @@
           <td><input id="rt-stickyidle" type="number" min="0" max="86400" style="width:110px">
             <span class="muted">seconds of inactivity after which a conversation forgets its floor and re-decides from scratch. Without it a long thread climbs monotonically to the ceiling. <span class="mono">0</span> = never reset (climb forever).</span></td></tr>
       </tbody></table>
+      <h3 style="margin:18px 0 6px">Live statistics <span class="muted">— routing counters from this gateway process</span>
+        <button class="ghost mini" id="rt-stats-reload" title="Reload GET /admin/routing/stats">↻ refresh</button></h3>
+      <div id="rt-stats" class="muted">loading…</div>
       <div class="row" style="margin-top:10px">
         <button id="rt-save">Save</button>
         <button class="ghost" id="rt-preview">Preview rendered prompt</button>
@@ -867,7 +910,13 @@ $('theme').onclick = () => { const n = document.documentElement.dataset.theme ==
   store.set(THEME_KEY, n); applyTheme(n); };
 
 const key = () => $('adminkey').value.trim();
-const state = { profiles: [], models: [], mcpServers: [], tenants: [], users: [], traceUsers: [], guardrails: [] };
+// agentsLoaded distinguishes "this profile offers no agents" from "the agent
+// list could not be read": the profile save must SEND an empty selection only
+// in the first case. Sending [] on a failed load would clear the profile's
+// whole selection — the exact destructive-by-omission hazard the server's
+// three-state `agents` field exists to prevent (cross-validation 2026-10-29).
+const state = { profiles: [], models: [], mcpServers: [], agents: [], agentsLoaded: false,
+                tenants: [], users: [], traceUsers: [], guardrails: [] };
 
 function banner(msg, cls = '', timeout) {
   const b = $('banner');
@@ -1025,6 +1074,13 @@ window.newUser = async btn => withBtn(btn, async () => {
 
 async function loadProfiles() {
   state.profiles = await api('/profiles');
+  // The profile editor's agent picker reads state.agents, which the Agents tab
+  // owns. Load it here too (one fetch, only when empty) so opening Profiles
+  // first does not render an empty picker that reads as "no agents exist".
+  if (!state.agentsLoaded) {
+    try { state.agents = await api('/agents'); state.agentsLoaded = true; }
+    catch (e) { state.agents = []; state.agentsLoaded = false; }
+  }
   $('k-profile').innerHTML = '<option value="">— none —</option>' +
     state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
   renderProfilesTable();
@@ -1262,7 +1318,11 @@ async function loadKeys() {
       : (k.expires_at && new Date(k.expires_at) < new Date() ? '<span class="pill off">expired</span>' : '<span class="pill on">active</span>');
     // data-search: the filter haystack, built from the handle fields only —
     // NOT the whole row, so a search for "ok" cannot match the status pill.
-    const hay = [k.name, k.user_name, k.key_prefix, k.subject, k.profile_name]
+    // user_profile_name, NOT profile_name: the projection is
+    // core.keys.list_keys' `p.name AS user_profile_name` (profiles are
+    // USER-scoped, api_keys has no profile column), so the old field name made
+    // "filter the Keys table by profile" silently match nothing.
+    const hay = [k.name, k.user_name, k.key_prefix, k.subject, k.user_profile_name]
       .filter(Boolean).join(' ').toLowerCase();
     return `<tr data-search="${esc(hay)}">
       <td>${esc(k.name)}</td>
@@ -1776,6 +1836,11 @@ $('p-preset').onchange = () => {
     pState.budgets = JSON.parse(JSON.stringify(p.budgets || []));
     pState.grants = JSON.parse(JSON.stringify(p.mcp_grants || []));
     if (!$('p-name').value.trim()) $('p-name').value = p.name;   // convenience only
+    // Starting from a saved profile carries its AGENT selection too — the
+    // picker is part of the profile, and leaving the previous edit's ticks in
+    // place would silently stamp them onto the new profile
+    // (cross-validation 2026-10-29).
+    pRenderAgents(p.agents || []);
     pRenderOrder(); pRenderBudgets(); pReloadTools().catch(() => {});
     banner(`started from profile <b>${esc(p.name)}</b> — adjust then Save`, '', 4000);
     return;
@@ -1783,6 +1848,9 @@ $('p-preset').onchange = () => {
   const p = PRESETS[v]; if (!p) return;
   pState.budgets = JSON.parse(JSON.stringify(p.budgets));
   pState.grants = JSON.parse(JSON.stringify(p.mcp_grants));
+  // A built-in starter declares no agents; clear the previous edit's ticks
+  // rather than carrying them into a brand-new profile.
+  pRenderAgents([]);
   pRenderBudgets();
   pReloadTools().catch(e => banner(esc(e.message), 'error', 6000));
   banner(`preset loaded: ${$('p-preset').selectedOptions[0].text} — adjust then Save`, '', 4000);
@@ -2023,13 +2091,39 @@ $('p-save').onclick = guarded('p-save', async () => {
       routing_min_model: $('p-routing-min').value.trim(),
       live_grants: $('p-live-grants').checked,
       memory: $('p-memory').checked ? { provision: true } : null,
+      // Sent WHENEVER the list actually loaded — the endpoint is a full upsert,
+      // so an omitted `agents` means "leave untouched" and unticking every box
+      // would otherwise silently keep the old selection. When the list could NOT
+      // be read (older backend / transient fault) the key is omitted on purpose:
+      // the picker rendered zero boxes, and sending that as [] would CLEAR a
+      // selection this console never saw (cross-validation 2026-10-29).
+      agents: state.agentsLoaded ? pAgentSelection() : undefined,
       limits: Object.keys(lim).length ? lim : null } });
     banner(`profile <b>${esc(name)}</b> saved`, '', 3000);
     await loadProfiles();
   } catch (e) { banner(esc(e.message), 'error', 6000); }
 });
 
+function pRenderAgents(selected) {
+  const box = $("p-agents");
+  if (!box) return;
+  const on = new Set(selected || []);
+  box.innerHTML = (state.agents || []).map(a =>
+    '<label style="display:flex;align-items:center;gap:6px;font-weight:400">' +
+    '<input type="checkbox" class="p-agent" style="width:auto" value="' + esc(a.name) + '"' +
+    (on.has(a.name) ? " checked" : "") + "> " + esc(a.name) +
+    ((a.servers || []).length ? ' <span class="muted">(' + esc(a.servers.join(", ")) + ")</span>" : ' <span class="muted">(chat only)</span>') +
+    "</label>"
+  ).join("") || '<span class="muted">no agents defined yet — create one on the Agents tab</span>';
+}
+function pAgentSelection() {
+  return [...document.querySelectorAll("#p-agents input.p-agent")].filter(cb => cb.checked).map(cb => cb.value);
+}
 function renderProfileEditorSelects() {
+  // The agent picker is populated from state.agents, which loadAgents() owns.
+  // Called here (not only from loadAgents) so a profile edit that happens
+  // before the Agents tab was ever opened still renders the list.
+  pRenderAgents(pAgentSelection());
 }
 async function pReloadTools() {
   const tree = document.getElementById('p-granttree');
@@ -2049,6 +2143,23 @@ window.propagateLimits = (btn, id) => withBtn(btn, async () => {
   } catch (e) { banner(esc(e.message), 'error', 6000); }
 });
 
+// Re-stamp a profile's MCP grants onto every attached key (2026-10-29).
+// DESTRUCTIVE: the endpoint REPLACES each key's grant rows, per-key
+// exceptions included — so it confirms with the count and names the profile.
+// The drift-free alternative is "Live grants" in the editor: that evaluates
+// the profile list at CALL time and needs no propagation at all.
+window.propagateGrants = (btn, id) => withBtn(btn, async () => {
+  const p = state.profiles.find(x => x.id === id);
+  const name = p ? p.name : "this profile";
+  const n = p && p.mcp_grants ? p.mcp_grants.length : 0;
+  if (!confirm("Re-stamp " + n + " grant(s) from profile \"" + name + "\" onto EVERY attached key?\n\n" +
+               "This REPLACES their current grant rows (per-key exceptions included).")) return;
+  try {
+    const r = await api("/profiles/" + id + "/propagate-grants", { method: "POST" });
+    banner("grants applied — " + r.grants + " pair(s) onto " + r.propagated + " key(s)", "", 4500);
+    await loadKeys();
+  } catch (e) { banner(esc(e.message), "error", 7000); }
+});
 function editProfile(id) {
   const p = state.profiles.find(x => x.id === id); if (!p) return;
   const name = p.name;
@@ -2066,6 +2177,7 @@ function editProfile(id) {
   $('p-mc').value = L.max_concurrent ?? '';
   pState = { order: [...(p.model_order || [])], budgets: JSON.parse(JSON.stringify(p.budgets || [])), grants: JSON.parse(JSON.stringify(p.mcp_grants || [])) };
   pRenderOrder(); pRenderBudgets();
+  pRenderAgents(p.agents || []);
   pReloadTools().catch(e => banner(esc(e.message), 'error', 6000));
   banner(`editing <b>${esc(name)}</b> — change and Save`, '', 3000);
   document.querySelector('nav button[data-tab=profiles]').click();
@@ -2093,14 +2205,30 @@ function renderProfilesTable() {
      <td>${(p.budgets || []).map(b => `<span class="pill">${esc(b.model)} ${esc(b.period)} ${b.limit_usd !== undefined
         ? ('$' + (b.limit_usd ?? 0).toFixed(2))
         : (b.limit_tokens ?? 0).toLocaleString()}</span>`).join('') || '<span class="pill on">unlimited</span>'}</td>
-     <td>${(p.mcp_grants || []).length} tool(s)</td>
+     <td>${(p.mcp_grants || []).length} tool(s)${p.live_grants
+       ? ' <span class="pill on" title="LIVE grants: this list is evaluated at CALL time for every key of this profile — edits apply with no propagation step">live</span>'
+       : ' <span class="muted" title="STAMPED grants: keys keep the list they were created with — use apply grants (or turn on Live grants) to re-sync them">stamped</span>'}</td>
+     <td>${p.offpeak_fraction != null
+       ? '<span class="pill on">' + esc(String(p.offpeak_fraction)) + 'x</span>'
+       : '<span class="muted" title="inherits the gateway default during low-demand windows">inherit</span>'}</td>
+     <td>${(p.agents || []).length
+       ? (p.agents || []).map(a => '<span class="pill">' + esc(a) + '</span>').join(' ')
+       : '<span class="muted">—</span>'}</td>
      <td>${(p.routing_policy || 'off') === 'off'
        ? '<span class="muted">off</span>'
        : `<span class="pill on">${esc(p.routing_policy)}</span>${p.routing_min_model ? ` <span class="mono">min ${esc(p.routing_min_model)}</span>` : ''}`}</td>
-     <td><button class="ghost mini" onclick="editProfile('${p.id}')">edit</button>
-     <button class="ghost mini" onclick="propagateLimits(this,'${p.id}')" title="push this profile's RPM/TPM/concurrency presets onto all keys of attached users (live immediately)">apply limits</button>
-         <button class="ghost mini danger" onclick="deleteProfile(this,'${p.id}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">no profiles yet — pick a preset above</td></tr>';
+     <td><div class="rowacts">
+       <!-- Labels are TERSE NOUNS on purpose: .rowacts is a fixed 168px
+            two-column grid with text-overflow:ellipsis, so "apply limits"
+            rendered as "apply lim…" (operator report 2026-10-29). Same
+            vocabulary the Keys table uses (MCP / creds / usage); the verb and
+            the consequences live in the tooltips. -->
+       <button class="ghost mini" onclick="editProfile('${p.id}')" title="Edit this profile">edit</button>
+       <button class="ghost mini" onclick="propagateLimits(this,'${p.id}')" title="APPLY this profile's RPM/TPM/concurrency presets onto every attached key (live immediately)">limits</button>
+       <button class="ghost mini" onclick="propagateGrants(this,'${p.id}')" title="APPLY (re-stamp) this profile's MCP grants onto every attached key — REPLACES their grant rows, per-key exceptions included. Prefer Live grants if you expect to keep editing.">grants</button>
+       <button class="ghost mini danger" onclick="deleteProfile(this,'${p.id}')">delete</button>
+     </div></td></tr>`).join('')
+    || '<tr><td colspan="8" class="muted">no profiles yet — pick a preset above</td></tr>';
 }
 
 window.deleteProfile = (btn, id) => withBtn(btn, async () => {
@@ -2227,7 +2355,7 @@ window.viewTools = async el => {
 };
 $('m-save').onclick = guarded('m-save', async () => {
   try {
-    await api('/mcp-servers', { method: 'POST', body: { name: $('m-name').value, url: $('m-url').value, auth_secret: $('m-secret').value.trim() || null, auth_token: $('m-token').value || null, tool_policy: $('m-policy').value, priority: parseInt($('m-priority').value, 10) || 0, enabled: $('m-enabled').checked } });
+    await api('/mcp-servers', { method: 'POST', body: { name: $('m-name').value, url: $('m-url').value, description: ($('m-desc').value || '').trim(), auth_secret: $('m-secret').value.trim() || null, auth_token: $('m-token').value || null, tool_policy: $('m-policy').value, priority: parseInt($('m-priority').value, 10) || 0, enabled: $('m-enabled').checked } });
     banner('MCP server saved + registry refreshed', '', 3000); await loadMcpServers();
   } catch (e) { banner(esc(e.message), 'error', 6000); }
 });
@@ -2774,6 +2902,20 @@ async function loadEnrollTab() {
 $('sso-prof-save').onclick = guarded('sso-prof-save', async () => {
   const tid = $('sso-tenant').value;
   if (!tid) return banner('create a tenant first (Keys ▸ + new tenant)', 'error', 5000);
+// Backfill (2026-10-29): the tenant default only reaches users created after
+// it was set. Binding them is what makes the profile REAL for the fleet —
+// cascade ordering, routing policy, off-peak fraction and the agents menu all
+// read users.profile_id — and it is what makes "apply grants" match their keys.
+$("sso-bind").onclick = guarded("sso-bind", async () => {
+  const tid = $("sso-tenant").value;
+  if (!tid) return banner("pick a tenant first", "error", 4000);
+  if (!$("sso-profile").value) return banner("set the SSO default profile first", "error", 4000);
+  try {
+    const r = await api("/tenants/" + tid + "/bind-sso-users", { method: "POST" });
+    banner("bound " + r.bound + " user(s) to the SSO default profile", "", 4500);
+    await loadKeys();   // the Profile column is the proof
+  } catch (e) { banner(esc(e.message), "error", 7000); }
+});
   const body = { profile_id: $('sso-profile').value || null };
   const t = await api(`/tenants/${tid}/sso-default-profile`, { method: 'PUT', body });
   const local = state.tenants.find(x => x.id === tid) || {};
@@ -3624,6 +3766,46 @@ async function previewRouting() {
     out.textContent = 'preview unavailable — ' + (e && e.message ? e.message : 'unknown error');
   }
 }
+// ---- routing statistics (GET /admin/routing/stats) ----------------------
+// Answers "what is the router actually doing" without opening Grafana, and
+// — the reason it exists — "is the model using MY prompt or the built-in
+// default", which nothing in the gateway could previously report.
+async function loadRoutingStats() {
+  const box = $('rt-stats');
+  if (!box) return;
+  try {
+    const d = await api('/routing/stats');
+    const c = d.counters || {};
+    const dec = c.decision || {}, sw = c.switches || {};
+    const der = d.derived || {}, lat = d.decision_latency_ms || {}, pr = d.prompt || {};
+    const num = (v) => (v == null ? '—' : Number(v).toFixed(0));
+    const pct = (v) => (v == null ? '—' : (100 * Number(v)).toFixed(1) + '%');
+    const rows = [
+      ['Decision calls', num(der.decision_calls),
+        'abstained ' + num(dec.abstained) + ' · served ' + num(dec.served) +
+        ' · error ' + num(dec.error) + ' · skipped ' + num(dec.skipped)],
+      ['Abstain / served rate', pct(der.abstain_rate), 'served ' + pct(der.served_rate)],
+      ['Route switches', num(sw.switched),
+        'cold ' + num(sw.cold) + ' · held ' + num(sw.held) + ' · same ' + num(sw.same)],
+      ['Decision latency', lat.mean == null ? '—' : Math.round(lat.mean) + ' ms mean',
+        'p50 ' + num(lat.p50) + ' ms · p95 ' + num(lat.p95) + ' ms · n=' + num(lat.count)],
+      ['Decision mode', esc((d.config || {}).decision_mode || '—'),
+        esc((d.config || {}).decision_model || '(no model)') + ' · floor ' + esc(String((d.config || {}).min_confidence))],
+      ['Prompt in use', esc(pr.source || '—'),
+        pr.source === 'default'
+          ? 'BUILT-IN DEFAULT — routing_config has no saved prompt'
+          : num(pr.chars) + ' chars from routing_config'],
+      ['Process', esc(d.pod || '—'), 'counters are per process since start'],
+    ];
+    box.innerHTML = '<table><tbody>' + rows.map((r) =>
+      '<tr><th style="width:200px">' + r[0] + '</th><td><b>' + r[1] +
+      '</b> <span class="muted">— ' + r[2] + '</span></td></tr>').join('') + '</tbody></table>';
+  } catch (e) {
+    box.textContent = 'statistics unavailable — ' + (e && e.message ? e.message : 'unknown error');
+  }
+}
+const rtStatsBtn = $('rt-stats-reload');
+if (rtStatsBtn) rtStatsBtn.addEventListener('click', () => loadRoutingStats().catch(() => {}));
 const rtReloadBtn = $('rt-reload');
 if (rtReloadBtn) rtReloadBtn.addEventListener('click', loadRouting);
 const rtSaveBtn = $('rt-save');
@@ -3631,7 +3813,7 @@ if (rtSaveBtn) rtSaveBtn.addEventListener('click', guarded('rt-save', saveRoutin
 const rtPreviewBtn = $('rt-preview');
 if (rtPreviewBtn) rtPreviewBtn.addEventListener('click', previewRouting);
 // initial paint follows the same lazy pattern as the other panels
-document.addEventListener('DOMContentLoaded', () => { try { loadRouting(); } catch (e) { reportError('routing panel: ' + e.message); } });
+document.addEventListener('DOMContentLoaded', () => { try { loadRouting(); } catch (e) { reportError('routing panel: ' + e.message); } try { loadRoutingStats(); } catch (e) { /* stats are optional */ } });
 
 // ---- presented endpoints (admin view of what /v1/models advertises) ------
 // GET /admin/presented-models is registry truth + config truth with NO key
@@ -3681,6 +3863,14 @@ async function loadPresentedModels() {
     '<td><span class="pill">' + esc(r.type || 'routing') + '</span></td>' +
     '<td>' + presentPill(r.present, r.reason) + '</td>' +
     '<td class="muted">' + esc(r.reason || '') + '</td></tr>').join('');
+  const agentRows = (d.agents || []).map(a =>
+    '<tr><td class="mono"><b>' + esc(a.id) + '</b></td>' +
+    '<td><span class="pill">' + esc(a.type || 'agent') + '</span></td>' +
+    '<td class="muted">' + ((a.servers || []).length ? (a.servers || []).map(esc).join(', ') : 'none — chat only') + '</td>' +
+    '<td class="mono">' + esc(a.model || 'cascade') + '</td>' +
+    '<td class="muted">' + ((a.profiles || []).length ? (a.profiles || []).map(esc).join(', ') : 'unassigned') + '</td>' +
+    '<td>' + presentPill(a.present, a.reason) + '</td>' +
+    '<td class="muted">' + esc(a.reason || '') + '</td></tr>').join('');
   const modelRows = (d.models || []).map(m => {
     const op = m.offpeak || {};
     return '<tr><td class="mono">' +
@@ -3717,12 +3907,142 @@ async function loadPresentedModels() {
     '<h3>Routing pseudo-models <span class="muted">— per-model router aliases</span></h3>' +
     '<table><thead><tr><th>Id</th><th>Type</th><th>Presented</th><th>Reason</th></tr></thead>' +
     '<tbody>' + (routingRows || '<tr><td colspan="4" class="muted">no routing entries</td></tr>') + '</tbody></table>' +
+    // Agents are model entries in the data plane (pcai.type="agent"), so a panel
+    // that claims to show what /v1/models advertises must list them.
+    '<h3>Agents <span class="muted">— tool surfaces selectable as a model</span></h3>' +
+    '<table><thead><tr><th>Id</th><th>Type</th><th>Servers</th><th>Model</th><th>Offered by</th><th>Presented</th><th>Reason</th></tr></thead>' +
+    '<tbody>' + (agentRows || '<tr><td colspan="7" class="muted">no agents defined</td></tr>') + '</tbody></table>' +
     '<h3>Registered pools <span class="muted">— real endpoint pools</span></h3>' +
     '<table><thead><tr><th>Model</th><th>Type</th><th>Endpoints</th><th>Ceiling</th><th>Off-peak</th><th>Flags</th><th>Presented</th></tr></thead>' +
     '<tbody>' + (modelRows || '<tr><td colspan="7" class="muted">none registered</td></tr>') + '</tbody></table>';
 }
 const peReloadBtn = $('pe-reload');
 if (peReloadBtn) peReloadBtn.addEventListener('click', loadPresentedModels);
+// ---------- agents (2026-10-29) ----------
+// An agent is a named tool surface selectable as a MODEL: GET /v1/models
+// advertises it (pcai.type="agent"), the request path narrows the offered
+// catalog + dispatch gate to its servers, and its system prompt is prepended
+// per model call. Everything here is CRUD over /admin/agents; the tool-scope
+// intersection itself lives server-side (core.agents) and is never re-derived
+// in the browser.
+async function loadAgents() {
+  if (!state.mcpServers || !state.mcpServers.length) {
+    try { state.mcpServers = await api("/mcp-servers"); } catch (e) { state.mcpServers = []; }
+  }
+  try {
+    state.agents = await api("/agents");
+    state.agentsLoaded = true;
+  } catch (e) {
+    // Degrade, do not die: an older backend has no /admin/agents, and a
+    // transient 500 must not blank the tab. agentsLoaded=false keeps the
+    // profile save from clearing a selection it could not read.
+    state.agents = [];
+    state.agentsLoaded = false;
+    banner("agent list unavailable — " + esc(e.message) + " (the tab renders empty; profile saves will not touch the selection)", "error", 7000);
+  }
+  agRenderServerPicker();
+  agRenderModelOptions();
+  agRenderTable();
+}
+function agRenderServerPicker(selected) {
+  const box = $("ag-servers");
+  if (!box) return;
+  const on = new Set(selected || []);
+  box.innerHTML = (state.mcpServers || []).map(sv =>
+    '<label style="display:flex;align-items:center;gap:6px;font-weight:400">' +
+    '<input type="checkbox" class="ag-srv" style="width:auto" value="' + esc(sv.name) + '"' +
+    (on.has(sv.name) ? " checked" : "") + "> " + esc(sv.name) +
+    (sv.enabled === false ? ' <span class="pill off">disabled</span>' : "") +
+    "</label>"
+  ).join("") || '<span class="muted">no MCP servers registered</span>';
+}
+function agRenderModelOptions(selected) {
+  const sel = $("ag-model");
+  if (!sel) return;
+  const keep = selected !== undefined ? selected : sel.value;
+  sel.innerHTML = '<option value="">— profile cascade (auto) —</option>' +
+    (state.models || []).map(m => '<option value="' + esc(m) + '">' + esc(m) + "</option>").join("");
+  sel.value = keep || "";
+}
+function agRenderTable() {
+  const tb = $("agents-table") && $("agents-table").querySelector("tbody");
+  if (!tb) return;
+  tb.innerHTML = (state.agents || []).map(a => {
+    const srv = (a.servers || []).length
+      ? (a.servers || []).map(s => '<span class="pill">' + esc(s) + "</span>").join(" ")
+      : '<span class="muted">none — chat only</span>';
+    const prompt = a.system_prompt_chars
+      ? '<span class="pill on" title="the prompt body is operator prose; the API reports its length, not a token bill">' +
+        esc(String(a.system_prompt_chars)) + " chars</span>"
+      : '<span class="muted">—</span>';
+    const profiles = (a.profiles || []).length
+      ? (a.profiles || []).map(p => '<span class="pill">' + esc(p) + "</span>").join(" ")
+      : '<span class="pill off" title="no profile offers this agent: only a key with NO profile can use it">unassigned</span>';
+    return "<tr><td class=\"mono\"><b>" + esc(a.name) + "</b></td>" +
+      '<td class="muted">' + (a.description ? esc(a.description) : "—") + "</td>" +
+      "<td>" + srv + "</td>" +
+      '<td class="mono">' + (a.model ? esc(a.model) : '<span class="muted">cascade</span>') + "</td>" +
+      "<td>" + prompt + "</td>" +
+      "<td>" + profiles + "</td>" +
+      "<td>" + (a.enabled ? '<span class="pill on">on</span>' : '<span class="pill off">off</span>') + "</td>" +
+      // data-attributes + listeners, NOT inline onclick: JSON.stringify emits
+      // literal double quotes, which terminate a double-quoted attribute and
+      // made every edit/delete button dead (found by cross-validation
+      // 2026-10-29). esc() is attribute-safe (audit #3) and the handler is
+      // bound after render.
+      '<td><button class="ghost mini" data-agent-edit="' + esc(a.name) + '">edit</button> ' +
+      '<button class="ghost mini danger" data-agent-del="' + esc(a.name) + '">delete</button></td></tr>';
+  }).join("") || '<tr><td colspan="8" class="muted">no agents yet — name one above and pick its servers</td></tr>';
+  // Bound AFTER the innerHTML write: a listener on a re-rendered node cannot
+  // outlive its element, and the name rides a data attribute so an agent called
+  // `he said "hi"` cannot break out of the attribute.
+  tb.querySelectorAll('[data-agent-edit]').forEach(b => { b.onclick = () => agEdit(b.dataset.agentEdit); });
+  tb.querySelectorAll('[data-agent-del]').forEach(b => { b.onclick = () => agDelete(b, b.dataset.agentDel); });
+}
+window.agEdit = (name) => {
+  const a = (state.agents || []).find(x => x.name === name);
+  if (!a) return;
+  $("ag-name").value = a.name;
+  $("ag-desc").value = a.description || "";
+  $("ag-prompt").value = a.system_prompt || "";
+  $("ag-enabled").checked = a.enabled !== false;
+  agRenderServerPicker(a.servers || []);
+  agRenderModelOptions(a.model || "");
+  banner("editing <b>" + esc(a.name) + "</b> — change and Save (the name IS the model id: renaming creates a new agent)", "", 4000);
+};
+window.agDelete = (btn, name) => withBtn(btn, async () => {
+  if (!confirm("Delete agent \"" + name + "\"? A key still naming it falls back to the ordinary alias path.")) return;
+  try {
+    await api("/agents/" + encodeURIComponent(name), { method: "DELETE" });
+    banner("agent <b>" + esc(name) + "</b> deleted", "", 3500);
+    await loadAgents();
+    await loadProfiles();
+  } catch (e) { banner(esc(e.message), "error", 6000); }
+});
+function agResetForm() {
+  $("ag-name").value = ""; $("ag-desc").value = ""; $("ag-prompt").value = "";
+  $("ag-enabled").checked = true;
+  agRenderServerPicker([]);
+  agRenderModelOptions("");
+}
+$("ag-reset").addEventListener("click", agResetForm);
+$("ag-save").onclick = guarded("ag-save", async () => {
+  const name = $("ag-name").value.trim();
+  if (!name) return banner("agent needs a name (it becomes the model id)", "error", 4000);
+  const servers = [...document.querySelectorAll("#ag-servers input.ag-srv")].filter(cb => cb.checked).map(cb => cb.value);
+  try {
+    await api("/agents", { method: "POST", body: {
+      name: name,
+      description: $("ag-desc").value.trim(),
+      servers: servers,
+      model: $("ag-model").value,
+      system_prompt: $("ag-prompt").value,
+      enabled: $("ag-enabled").checked } });
+    banner("agent <b>" + esc(name) + "</b> saved", "", 3000);
+    await loadAgents();
+    await loadProfiles();   // the Offered-by column is the profile side
+  } catch (e) { banner(esc(e.message), "error", 7000); }
+});
 // ---------- tabs + boot ----------
 // Tab switching is shared by the nav clicks AND the boot restore below —
 // one activation path so a restored tab runs the exact same lazy loaders a
@@ -3741,6 +4061,9 @@ function activateTab(name) {
   // (5b) lazy-load on activation like every other tab. Both swallow their
   // own fetch errors into muted state; the .catch is belt-and-braces only.
   if (name === 'models') loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000));
+  // Agents tab: the CRUD table + the server picker (which needs the MCP
+  // registry, loaded here if boot did not reach it yet).
+  if (name === 'agents') loadAgents().catch(e => banner(esc(e.message), 'error', 5000));
   if (name === 'routing') loadRouting().catch(e => banner(esc(e.message), 'error', 5000));
   if (name === 'guardrails') {
     gApplyEngineUI();   // (re)fit the create form's hint + config template

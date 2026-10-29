@@ -286,30 +286,100 @@ def test_reason_vocabulary_is_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_depth_beyond_the_bound_is_not_scanned() -> None:
+def test_c1_depth_beyond_the_bound_refuses_fail_closed() -> None:
+    """Audit C-1: a subtree past MAX_DEPTH used to be SKIPPED silently, so a
+    denied destination hidden below the bound was admitted (0 strings
+    scanned, gate allows). The bound now fails CLOSED. (Bound raised to 12
+    in xv round 2: real fleet manifests nest ~8 deep.)"""
     deep: dict = {"url": "http://127.0.0.1/"}
-    for _ in range(8):
+    for _ in range(ap.MAX_DEPTH + 1):
         deep = {"nested": deep}
-    assert ap.check_arguments("searxng", "fetch_content", deep) == ""
+    reason, message = ap.check_arguments_detail("searxng", "fetch_content", deep)
+    assert reason == ap.REASON_TOO_COMPLEX
+    assert "scan bounds" in message
+    scanned = ap.iter_string_arguments(deep)
+    assert scanned.overflowed, "the overflow flag must be set even when nothing was scanned"
 
 
-def test_depth_within_the_bound_is_scanned() -> None:
+def test_c1_realistic_k8s_manifest_depth_is_allowed() -> None:
+    """xv round 2, finding 6: a depth-8 Kubernetes Deployment manifest
+    (spec.template.spec.containers[0].resources.limits...) is an ORDINARY
+    argument — the old depth-6 bound refused it in enforce mode and the
+    refusal is unfixable by the model (it cannot flatten a manifest)."""
+    manifest = {
+        "manifest": (
+            "apiVersion: apps/v1\nkind: Deployment\n"
+            "spec:\n  template:\n    spec:\n      containers:\n"
+            "      - name: app\n        resources:\n          limits:\n"
+            "            memory: 512Mi\n"
+        )
+    }
+    assert ap.check_arguments("applygate", "apply_manifest", manifest) == ""
+    # nested-dict form of the same depth is allowed too
+    deep_ok: dict = {"yaml": "x"}
+    for _ in range(8):
+        deep_ok = {"spec": deep_ok}
+    assert ap.iter_string_arguments(deep_ok).overflowed is False
+    assert ap.check_arguments("applygate", "apply_manifest", deep_ok) == ""
+
+
+def test_c1_batch_array_over_the_old_bound_is_allowed() -> None:
+    """xv round 2, finding 6: a 201-element string batch is ordinary (the
+    OLD bound was 200) — a batch API must not need 200-item pages."""
+    batch = {"ids": [f"doc-{i}" for i in range(500)]}
+    assert ap.check_arguments("mm-rag", "dataset_add_documents", batch) == ""
+    assert ap.iter_string_arguments(batch).overflowed is False
+
+
+def test_c1_depth_within_the_bound_is_scanned() -> None:
     nested: dict = {"url": "http://127.0.0.1/"}
     for _ in range(4):
         nested = {"nested": nested}
     assert ap.check_arguments("searxng", "fetch_content", nested) != ""
+    assert ap.iter_string_arguments(nested).overflowed is False
 
 
-def test_string_count_is_bounded() -> None:
-    """At most MAX_STRINGS strings are scanned per call (a hostile payload
-    cannot turn the gate into a scanner). The bound is a BOUND, not a promise
-    that the tail is unreachable: a denied value PAST it is simply not
-    scanned."""
-    arguments = {"items": [f"filler-{i}" for i in range(ap.MAX_STRINGS)] + ["http://127.0.0.1/"]}
-    assert ap.check_arguments("searxng", "fetch_content", arguments) == ""
-    # ... and a denied value INSIDE the bound is still caught
+def test_c1_flooded_string_count_refuses_fail_closed() -> None:
+    """Audit C-1: the scan used to STOP at the 200th string, so 200 benign
+    list entries parked a denied destination past the truncation point and
+    the call was admitted - fail-OPEN in a stage documented fail-closed
+    (this was pinned as intended behaviour at tests/test_arg_policy.py:303).
+    Overflow is now a refusal, not a truncation."""
+    flooded = {"items": [f"filler-{i}" for i in range(ap.MAX_STRINGS)] + ["http://127.0.0.1/"]}
+    reason, _message = ap.check_arguments_detail("searxng", "fetch_content", flooded)
+    assert reason == ap.REASON_TOO_COMPLEX
+    assert ap.iter_string_arguments(flooded).overflowed is True
+    # ... and a denied value INSIDE the bound is still caught directly
     arguments_in = {"items": ["http://127.0.0.1/"] + [f"filler-{i}" for i in range(5)]}
-    assert ap.check_arguments("searxng", "fetch_content", arguments_in) != ""
+    assert _reason("searxng", "fetch_content", arguments_in) == ap.REASON_DESTINATION
+
+
+def test_c1_flooded_toolcall_through_the_gate_carries_the_bounded_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole gate (not just the scan) refuses, with the CLOSED reason
+    vocabulary and one metric bump labelled arguments-too-complex."""
+    bumped: list[tuple] = []
+    monkeypatch.setattr(ap._metrics, "observe_mcp_policy_block", lambda *a: bumped.append(a))
+    monkeypatch.setattr(ap._metrics, "observe_mcp_call", lambda *a: bumped.append(a))
+    flooded = {"paths": [f"/data/doc{i}.txt" for i in range(ap.MAX_STRINGS)] + ["http://169.254.169.254/"]}
+    decision = ap.gate_call("mm-rag", "dataset_add_documents", flooded)
+    assert decision.refused
+    assert decision.reason == ap.REASON_TOO_COMPLEX
+    assert "exceeds the policy scan bounds" in decision.message
+    assert "169.254.169.254" not in decision.message, "refusal text never echoes the destination"
+    assert bumped == [
+        ("mm-rag", "dataset_add_documents", ap.REASON_TOO_COMPLEX),
+        ("mm-rag", "policy_blocked", ""),
+    ]
+
+
+def test_c1_a_large_but_legitimate_tree_still_passes() -> None:
+    """The bound still caps per-call work: a tree just UNDER both bounds with
+    only benign payload strings is allowed (the refusal is for overflow, not
+    for size itself)."""
+    ok_tree = {"texts": [f"note {i}" for i in range(ap.MAX_STRINGS - 1)]}
+    assert ap.check_arguments("mm-rag", "add_memory", ok_tree) == ""
 
 
 def test_string_length_is_capped_for_scanning() -> None:

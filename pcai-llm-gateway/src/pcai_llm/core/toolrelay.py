@@ -35,13 +35,18 @@ import anyio
 import httpx2
 
 from ..config import clamp_max_tokens, settings
-from . import clientside, effective, offpeak, traces
+from . import clientside, effective, offpeak, tool_surface, traces
 from .budgets import check_budgets, settle
 from .canonical import thread_key
 
 log = logging.getLogger(__name__)
 
 TOOLSEP = "__"
+
+# Per-turn ceiling on tool-surface discovery calls. High enough for a real
+# agent turn (list, a few server lists, a couple of describes), low enough
+# that a spinner cannot burn the wall clock on them.
+_META_CALL_MAX = 12
 
 # SSE keepalive cadence inside a relay model call (seconds). A comment line
 # every KEEPALIVE_S keeps proxy/VPN idle timers (and the operator's eyes)
@@ -190,6 +195,31 @@ class RelayResult:
     iterations: int = 0
     aborted: str = ""  # guard reason when aborted
 
+
+def with_system_prefix(msgs: list[dict], prefix: str) -> list[dict]:
+    """The message list a model call ACTUALLY sees: ``prefix`` prepended. PURE.
+
+    WHERE IT GOES: AFTER a leading system/developer message when the client sent
+    one — the client framing owns the tool protocol and must stay first — else at
+    index 0. Two system messages rather than a merge: the client text stays
+    byte-intact for its own hashing and prefix cache, and every chat template
+    this fleet serves concatenates consecutive system turns in order.
+
+    WHY IT IS NOT APPLIED TO relay_msgs: that list is the input boundary the
+    handback flush slices at (``final_messages[:n] == relay_projection``,
+    routes_proxy._persist_conversation_state). Growing it here would shift the
+    boundary, skip the pending-tail write, and make X-PCAI-Continue 400 on the
+    next request — the exact defect toolrelay.py:941 documents. Callers prepend
+    per CALL instead, which is also what keeps the canonical store (the client
+    conversation of record) free of gateway-authored text.
+    """
+    if not prefix:
+        return msgs
+    head = {"role": "system", "content": prefix}
+    lead = 0
+    if msgs and isinstance(msgs[0], dict) and str(msgs[0].get("role") or "") in ("system", "developer"):
+        lead = 1
+    return [*msgs[:lead], head, *msgs[lead:]]
 
 def tools_payload(catalog: list[dict]) -> list[dict]:
     """OpenAI tools array from the granted (server, tool) catalog.
@@ -410,6 +440,12 @@ class RelayGuard:
         # guard derives its deadline through it so the two cannot drift.
         self.deadline = wall_clock_deadline(wall_clock_s=wall_clock_s)
         self.seen: set[tuple] = set()
+        # Discovery calls are counted, not fingerprinted (2026-10-28): the
+        # meta-tool is idempotent and REPETITIVE by design (list, then list
+        # again for a server, then describe), so the identical-call abort
+        # fired on legitimate discovery and killed the turn. A spinner still
+        # needs bounding, so a per-turn budget replaces the fingerprint.
+        self.meta_calls = 0
 
     def check(self, iteration: int, tool_calls: list[dict]) -> str:
         """Return an abort reason, or '' to continue."""
@@ -419,6 +455,12 @@ class RelayGuard:
             return "tool relay wall-clock budget exceeded"
         for tc in tool_calls:
             fn = tc.get("function", {})
+            if fn.get("name") == tool_surface.META_TOOL:
+                # Local, idempotent discovery: never a "loop", but bounded.
+                self.meta_calls += 1
+                if self.meta_calls > _META_CALL_MAX:
+                    return f"discovery budget exceeded ({_META_CALL_MAX} tool-surface calls)"
+                continue
             # PARSE the arguments before fingerprinting (audit finding 20):
             # `arguments` arrives as the model's JSON *string* — hashing the
             # raw string made '{"a":1}' and '{ "a" : 1}' different calls, so
@@ -479,7 +521,20 @@ async def parse_sse_payloads(byte_iter):
     buf = bytearray()
     async for chunk in byte_iter:
         buf += chunk
-        while (idx := buf.find(b"\n")) != -1:
+        while True:
+            # LINE TERMINATORS (audit 2026-10-29, C-7). SSE (WHATWG) accepts
+            # CR, LF and CRLF. This cursor split on LF only, so a CR-only
+            # upstream — or an intermediary rewriting line endings — parsed as
+            # ONE giant unparseable line: json.loads failed on the whole
+            # concatenation, every event was dropped, and the client received a
+            # successful EMPTY completion instead of an answer. Find whichever
+            # terminator comes first; CRLF stays one break (the trailing LF is
+            # consumed as the next, empty line and skipped by the prefix test).
+            nl = buf.find(b"\n")
+            cr = buf.find(b"\r")
+            if nl == -1 and cr == -1:
+                break
+            idx = cr if (cr != -1 and (nl == -1 or cr < nl)) else nl
             line = bytes(buf[:idx])
             del buf[: idx + 1]
             text = line.decode("utf-8", errors="replace").strip()
@@ -501,6 +556,20 @@ async def parse_sse_payloads(byte_iter):
                     yield json.loads(payload)
                 except json.JSONDecodeError:
                     pass
+
+
+def _sole_open_unclaimed(order: list[dict]) -> dict | None:
+    """The one still-id-less open call in `order`, when exactly one exists.
+
+    C-3 (audit 2026-10-29): identity adoption used to REQUIRE an index on the
+    id-bearing fragment, so an upstream that split id and index across fragments
+    forked ONE call into two. Two or more open unclaimed calls is genuinely
+    ambiguous — guessing would bind one call's identity to ANOTHER call's
+    fragments, which is worse than the fork it replaces — so return None and let
+    the caller open a new call.
+    """
+    open_slots = [s for s in order if not s.get("_claimed")]
+    return open_slots[0] if len(open_slots) == 1 else None
 
 
 async def stream_model_call(
@@ -565,7 +634,22 @@ async def stream_model_call(
             yield ("reasoning", reasoning_text)
         if delta.get("content"):
             yield ("content", delta["content"])
-        for tcd in delta.get("tool_calls") or []:
+        # ELEMENT TYPE GUARD (audit 2026-10-29, ZC-4). The E-1 guard above
+        # validates the top-level object and choices[0], but the PER-FRAGMENT
+        # element was still trusted to be a dict: {"delta":{"tool_calls":[42]}}
+        # reached tcd.get() and raised AttributeError, which is neither
+        # TimeoutError nor httpx2.HTTPError — so it escaped relay_stream and
+        # killed the client's SSE stream (no guard event, no error chunk, no
+        # [DONE], no settle): exactly the blast radius E-1 describes, one level
+        # lower. The container gets the same treatment (a bare object there
+        # would be iterated as its KEY STRINGS). A malformed upstream must
+        # never kill the turn.
+        _tc_frags = delta.get("tool_calls")
+        if not isinstance(_tc_frags, list):
+            _tc_frags = []
+        for tcd in _tc_frags:
+            if not isinstance(tcd, dict):
+                continue
             fn = tcd.get("function")
             if not isinstance(fn, dict):
                 fn = {}
@@ -632,10 +716,56 @@ async def stream_model_call(
                     candidate = by_index.get(index)
                     if candidate is not None and not candidate.get("_claimed"):
                         slot = candidate
+                if slot is None and index is None:
+                    # C-3: the id-bearing fragment carried NO index at all, so
+                    # there was nothing to look up and the E-2 adoption above
+                    # could not fire. Without this the fork is exactly the one
+                    # the E-2 note describes: the id-less prefix keeps the
+                    # arguments and loses the name (unknown-tool error), while
+                    # the id-bearing fragment keeps the name with NO arguments —
+                    # json.loads("" or "{}") yields {} and the tool EXECUTES with
+                    # defaults. Adopt the sole open, unclaimed call.
+                    # An index that maps to NOTHING is deliberately NOT adopted:
+                    # a new index means a new call (the E-3/parallel-call case),
+                    # not a late id.
+                    slot = _sole_open_unclaimed(order)
             elif index is not None:
                 # 3. no id: continue the call at this index (the ordinary
                 #    continuation-fragment case, and the F-3 repeat-name case).
                 slot = by_index.get(index)
+                if slot is None and not frag_name:
+                    # C-3, the MIRROR shape (the one the audit REPRODUCED): the
+                    # id+name arrived FIRST and without an index, so no by_index
+                    # entry was ever created — this arguments fragment then
+                    # forked a second, nameless call while the real one kept the
+                    # name and executed with {} arguments. A NAMELESS fragment
+                    # cannot be opening a new call (a call is born with its
+                    # name), so adopt the open call when it has no arguments
+                    # yet. Both guards matter: an already-argumented call
+                    # receiving arguments at an unseen index is a DIFFERENT
+                    # call, and two open unclaimed calls are ambiguous.
+                    # FUSION GUARD (cross-validation XV-1): adopt ONLY while NO
+                    # call has claimed an index yet. The mirror shape opens its
+                    # call WITHOUT an index, so by_index is still empty when the
+                    # arguments arrive. Once any call owns an index, an unseen
+                    # index is a GENUINE new call — adopting there fused two
+                    # parallel calls into one (name 'tool_atool_b', args of call
+                    # 2), and neither tool then executed. This strictly narrows
+                    # the adoption surface: the fork fix above (id-bearing
+                    # fragment with no index) is untouched.
+                    # EXACTLY ONE OPEN CALL, AND NOBODY OWNS AN INDEX YET. The
+                    # mirror shape's call carries an id (so it is _claimed and
+                    # _sole_open_unclaimed would refuse it), which is why the
+                    # rule is positional rather than claim-based. Two or more
+                    # calls, or any call already mapped to an index, means this
+                    # unseen index is a GENUINE new call — adopting there fused
+                    # two parallel calls into one (name 'tool_atool_b', args of
+                    # call 2) and neither tool then executed (cross-validation
+                    # XV-1).
+                    candidate = order[0] if (len(order) == 1 and not by_index) else None
+                    if candidate is not None and not candidate["function"]["arguments"]:
+                        slot = candidate
+                        by_index[index] = slot
             elif order:
                 # 4. no id, no index: the most recently opened call.
                 slot = order[-1]
@@ -817,6 +947,14 @@ async def relay_stream(
     # within one turn cannot reset the cap per request and burn unbounded
     # model calls under one logical turn.
     iterations_prior: int = 0,
+    # iterations_out: OUT-PARAM (audit C-8, 2026-10-29). The loop publishes the
+    # number of COMPLETED model calls here as it goes, so the caller can
+    # histogram the depth actually reached on EVERY exit path — normal end,
+    # guard abort, client disconnect (the generator is closed mid-stream) —
+    # instead of re-deriving it by byte-matching the emitted SSE. The old
+    # derivation read 0 for every X-PCAI-Stream-Events: 0 client, i.e. for
+    # every strict OpenAI client. None = the caller does not want it.
+    iterations_out: list[int] | None = None,
     # conversation_state(thread_ref, final_messages, iterations_final):
     # called ONCE at loop end (handback terminals) with the FULL final
     # relay_msgs list AND the iteration count the loop reached. The routes
@@ -872,6 +1010,13 @@ async def relay_stream(
     # calls even if it never notices the stamp.
     render_deltas: bool = False,
     render_index_base: int = 1000,
+    # Gateway-authored system text prepended to EVERY model call of this turn
+    # (an agent profile's prompt; '' = none, byte-for-byte today's behaviour).
+    # Applied per CALL by with_system_prefix — never to relay_msgs, whose length
+    # is the handback boundary — and it therefore rides into the effective-prompt
+    # capture (the admin's "what the model actually saw" view) and into the
+    # settle-time token estimate, so neither under-reports by its size.
+    system_prefix: str = "",
 ):
     """The streaming relay loop — yields SSE bytes for the client.
 
@@ -967,7 +1112,38 @@ async def relay_stream(
         if wall_clock_deadline is None
         else max(0.0, wall_clock_deadline - time.monotonic()),
     )
-    tools = tools_payload(catalog) if grants else []
+    # --- TOOL SURFACE (2026-10-28) ---------------------------------------
+    # Inlining every granted tool cost 34,459 prompt tokens for a 111-tool /
+    # 10-server catalogue (measured) -- a floor on EVERY relayed request, and
+    # the reason a 236k conversation overflowed a 262k model window. In hybrid
+    # mode the model is offered ONE discovery tool and pays for a server's real
+    # definitions only after asking to see them (promotion below).
+    #
+    # "full" is the pre-change behaviour byte-for-byte, so rollback is config:
+    # PCAI_LLM_TOOL_RELAY_SURFACE=full.
+    _surface_mode = str(getattr(settings, "tool_relay_surface", "full") or "full").strip().lower()
+    if _surface_mode not in tool_surface.MODES:
+        log.warning("toolrelay: unknown tool_relay_surface %r - using 'full'", _surface_mode)
+        _surface_mode = tool_surface.MODE_FULL
+    # Promoted servers for THIS relay turn. Mutated by the meta-tool handler in
+    # the dispatch loop; read by _tools_now() on the next iteration.
+    _promoted: set[str] = set()
+
+    def _tools_now() -> list[dict]:
+        """The tools to offer RIGHT NOW (gateway surface + client tools).
+
+        Recomputed per iteration so a server promoted by a meta-tool call is
+        callable on the very next model call. The client half never changes.
+        """
+        gw = tool_surface.build_tools(catalog, mode=_surface_mode, promoted=_promoted, sep=TOOLSEP) if grants else []
+        # COLLISION: if the client offers its own tool named META_TOOL, our
+        # discovery tool can never be called (client_names wins the partition),
+        # and two same-named entries would make the offer ambiguous. Drop OURS:
+        # the warning below already tells the operator to rename.
+        if any(t.get("function", {}).get("name") == tool_surface.META_TOOL for t in offered_client):
+            gw = [t for t in gw if t.get("function", {}).get("name") != tool_surface.META_TOOL]
+        return gw + offered_client
+
     # mixed-mode: the caller's OWN tools ride along under the MCP catalog —
     # a model call that names one hands back to the client (partition below).
     # Membership is by EXACT offered name, which also covers harness MCP
@@ -984,8 +1160,22 @@ async def relay_stream(
     # the client's twins so the CLIENT executes the whole batch and every
     # call gets a proper role=tool result in the replayed history.
     offered_client, twin_rewrite = shadow_client_mcp(client_tools or [], catalog)
-    merged_tools = tools + offered_client
     client_names = {t.get("function", {}).get("name", "") for t in (client_tools or [])}
+    # NAME COLLISION (2026-10-28): if the CLIENT offers its own tool called
+    # `pcai_tools`, _is_client_call() claims that name (client_names wins the
+    # partition), so a discovery call is handed back to the client instead of
+    # being handled locally — discovery is unreachable for the whole request and
+    # the hybrid surface offers NO MCP tools at all. Granted MCP tools can never
+    # collide (they always carry TOOLSEP), so the client is the only vector.
+    # Loud, because the symptom (a model that stops reaching for tools) is
+    # otherwise indistinguishable from the model just choosing not to.
+    if tool_surface.META_TOOL in client_names:
+        log.warning(
+            "toolrelay: the client offered a tool named %r, shadowing the tool-surface"
+            " discovery tool — MCP tools will be unreachable this request. Rename the"
+            " client tool, or run this key with tool_relay_surface=full.",
+            tool_surface.META_TOOL,
+        )
     # Per-turn baseline (2026-09-25): a handback continuation resumes the
     # TURN's budget (not its request-scoped state — traces, retries stay per
     # request); a fresh user turn arrives with iterations_prior=0 (the
@@ -1095,7 +1285,14 @@ async def relay_stream(
     ) -> tuple[int, int]:
         """Settle ONE model call per the documented contract; returns the
         token counts recorded. Also writes the step's agent-trace row
-        (phase='chat', status matching the settle) — best-effort."""
+        (phase='chat', status matching the settle) — best-effort.
+
+        The AGENT PROMPT is applied to the message list HERE for the same reason
+        _bounded_call applies it to the wire: the estimate fallback and the
+        effective-prompt capture must describe the request that was actually
+        sent, not the client list without the gateway own prefix.
+        """
+        msgs = with_system_prefix(msgs, system_prefix)
         u = usage or {}
         prompt = int(u.get("prompt_tokens") or 0)
         completion = int(u.get("completion_tokens") or 0)
@@ -1150,6 +1347,12 @@ async def relay_stream(
             # effective-prompt capture (additive, best-effort, strictly AFTER
             # the upstream call completed — observation never blocks the wire)
             await _capture_prompt(msgs, _last_offered_tools[0], call_attempt)
+        if iterations_out is not None:
+            # C-8: publish the completed-call count at the ONE point every
+            # model call passes through, so EVERY terminal (plain finish,
+            # handback, guard abort, client disconnect) reports the depth it
+            # reached. call_iteration is 0-based, so +1 is the count.
+            iterations_out[:] = [max(iterations_out[0] if iterations_out else 0, call_iteration + 1)]
         return prompt, completion
 
     async def _bounded_call(msgs: list[dict], tools_arg: list[dict] | None, budget_s: float):
@@ -1167,7 +1370,10 @@ async def relay_stream(
         """
         budget_s = max(1.0, min(budget_s, settings.upstream_timeout_s))
         call_deadline = time.monotonic() + budget_s
-        ait = stream_once(msgs, tools_arg).__aiter__()
+        # THE one place a model call is assembled: the agent prompt (if any) is
+        # prepended HERE, so what goes upstream and what the capture records are
+        # the same list by construction.
+        ait = stream_once(with_system_prefix(msgs, system_prefix), tools_arg).__aiter__()
         pending = asyncio.ensure_future(anext(ait))
         try:
             while True:
@@ -1511,7 +1717,7 @@ async def relay_stream(
         # bounded-call timeout retries) — recomputed at the TOP of the inner
         # loop so a `continue` retry advances it; capture context: this
         # attempt's exact offered tools (see the cell comment above).
-        _last_offered_tools[0] = merged_tools or None
+        _last_offered_tools[0] = _tools_now() or None
         while True:
             attempt = total_retries - retries_left + 1
             reasoning_acc: list[str] = []
@@ -1546,7 +1752,7 @@ async def relay_stream(
 
             try:
                 async for kind, payload in _bounded_call(
-                    relay_msgs, merged_tools or None, guard.deadline - time.monotonic()
+                    relay_msgs, _tools_now() or None, guard.deadline - time.monotonic()
                 ):
                     if kind == "heartbeat":
                         yield b": keepalive\n\n"
@@ -1669,11 +1875,7 @@ async def relay_stream(
             # make the attempt non-retryable.
             reasoning_seen = bool(reasoning_acc) and stream_thinking
             attempt_silent = not (content_acc or reasoning_seen or tool_calls)
-            if (
-                retries_left > 0
-                and attempt_silent
-                and retry_budget >= TOOL_RELAY_RETRY_MIN_BUDGET_S
-            ):
+            if retries_left > 0 and attempt_silent and retry_budget >= TOOL_RELAY_RETRY_MIN_BUDGET_S:
                 retries_left -= 1
                 detail = (
                     f"model call timed out — retrying "
@@ -1696,7 +1898,15 @@ async def relay_stream(
             # never let the exception kill the stream: a terminal answer lets
             # the client stop retrying a dead model.
             failed_model = model
-            if not (content_acc or reasoning_acc or tool_calls):
+            # SAME client-visibility predicate as the timeout gate above
+            # (audit 2026-10-29, ZC-2). This branch keyed on the RAW
+            # reasoning_acc, so an attempt that reasoned before the endpoint
+            # died was never replaced — even when stream_thinking is OFF and
+            # the client saw NONE of it (X-PCAI-Stream-Thinking: 0 is DSH's
+            # live posture, so the 2026-10-06 outage protection was silently
+            # disabled there). One concept, one policy: "silent" means silent
+            # TO THE CLIENT on both triggers.
+            if not (content_acc or (bool(reasoning_acc) and stream_thinking) or tool_calls):
                 picked = await _next_failover()
                 if picked is not None:
                     fb_model, fb_stream, markers = picked
@@ -1803,12 +2013,13 @@ async def relay_stream(
                 )
                 # re-run THIS iteration's model call once; its events replace
                 # the empty answer (nothing was emitted yet for it)
-                _last_offered_tools[0] = merged_tools or None
+                _last_offered_tools[0] = _tools_now() or None
                 retry_started = time.monotonic()
                 retry_usage: dict | None = None
+                retry_failed = ""
                 try:
                     async for kind, payload in _bounded_call(
-                        relay_msgs, merged_tools or None, guard.deadline - time.monotonic()
+                        relay_msgs, _tools_now() or None, guard.deadline - time.monotonic()
                     ):
                         if kind == "heartbeat":
                             yield b": keepalive\n\n"
@@ -1835,6 +2046,36 @@ async def relay_stream(
                             model_error = True
                 except TimeoutError as exc:
                     call_timed_out = str(exc) or "model call budget exceeded"
+                except httpx2.HTTPError as exc:
+                    # TRANSPORT FAILURE ON THE RETRY (audit 2026-10-29, ZC-1).
+                    # This branch had NO httpx2 handling at all: _bounded_call
+                    # re-raises the pending __anext__ failure (ConnectError /
+                    # DNS / TLS / a reset between chunks) and pre-fix it escaped
+                    # relay_stream — the SSE died with no [DONE], no error
+                    # envelope, and the retry was never settled (the exact
+                    # ledger under-count the settle-in-finally fix exists to
+                    # prevent). Same treatment as the main attempt loop above:
+                    # record the failure, settle it as an error row below, and
+                    # close the stream cleanly.
+                    retry_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
+                    model_error = True
+                    # Same task-reap hazard the main loop documents: re-raise a
+                    # FRESH instance so _bounded_call's finally cannot surface
+                    # the already-retrieved exception a second time.
+                    exc = type(exc)(str(exc))
+                except Exception as exc:  # the relay must never die on an upstream fault
+                    # ANYTHING ELSE ON THE RETRY (cross-validation XV-2). The
+                    # two clauses above cover the expected transport shapes, but
+                    # the retry is a fresh stream parse: a malformed payload, a
+                    # client-side error or a cancellation raised between chunks
+                    # would still escape relay_stream, killing the SSE with no
+                    # [DONE] and leaving THIS attempt unsettled (the first
+                    # attempt settles in its own finally; the retry does not).
+                    # Same treatment as the transport clause: record, settle
+                    # below, close cleanly. The relay's contract is that a
+                    # malformed upstream must never kill the turn.
+                    retry_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
+                    model_error = True
                 # settle the RETRY as its own real model call (both attempts
                 # in the ledger; the empty first attempt already settled above)
                 if not call_timed_out:
@@ -1871,6 +2112,38 @@ async def relay_stream(
                                 {
                                     "index": 0,
                                     "delta": {"content": "(model error: relay model call timed out)"},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    )
+                    yield b"data: [DONE]\n\n"
+                    return
+                if retry_failed:
+                    # ZC-1: the retry's transport failure gets the same CLEAN
+                    # close the main attempt loop's failure path gives — guard
+                    # event + visible error chunk + [DONE] — never an exception
+                    # escaping relay_stream (a dead socket is what made the
+                    # client burn its retry budget on a dead model).
+                    detail = f"upstream call failed on {model}: {retry_failed}"
+                    log.error(
+                        "relay: upstream failure %s on model=%s iteration=%d during the zero-completion retry (request_id=%s)",
+                        retry_failed,
+                        model,
+                        iteration,
+                        request_id,
+                    )
+                    yield _pcai({"pcai": {"event": "guard", "detail": detail}})
+                    yield _reasoning_delta(f"\n[relay] {detail}\n")
+                    yield sse_event(
+                        {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "(model error: upstream call failed)"},
                                     "finish_reason": "stop",
                                 }
                             ],
@@ -1976,7 +2249,12 @@ async def relay_stream(
         # are informational: clients reassemble them for display; the relay
         # still owns execution and the turn's one true finish_reason.
         if settings.relay_stream_wire_tools:
+            # Same exclusion as the stamped-render path below: the discovery
+            # meta-tool is relay-internal and must never be advertised as a
+            # callable tool on the wire (2026-10-28).
             for _i, _tc in enumerate(tool_calls):
+                if str(_tc.get("function", {}).get("name", "")) == tool_surface.META_TOOL:
+                    continue
                 yield _tc_delta(_tc, _i)
 
         # Stamped inert render deltas (Wave R1): in-cluster MCP calls re-emitted
@@ -1995,6 +2273,14 @@ async def relay_stream(
             # both. The counter is now monotone for the whole response; the
             # per-iteration enumeration only decides WITHIN-iteration order.
             for _tc in mcp_calls:
+                # NEVER render the DISCOVERY meta-tool (2026-10-28). Rendering
+                # it tells the client a `pcai_tools` tool exists, and the client
+                # then believes it can call it — measured live: the harness
+                # tried `tools.pcai_tools(...)` and got "not a function",
+                # burning turns on a tool that only exists inside the relay.
+                # Every other relayed call still renders (native visibility).
+                if str(_tc.get("function", {}).get("name", "")) == tool_surface.META_TOOL:
+                    continue
                 yield _rendered_delta(_tc, render_index_next)
                 render_index_next += 1
 
@@ -2202,6 +2488,24 @@ async def relay_stream(
             if wrap_timed_out:
                 yield _pcai({"pcai": {"event": "guard", "detail": "wrap-up model call timed out"}})
                 yield _reasoning_delta("\n[relay] wrap-up model call timed out\n")
+            # OpenAI-standard final usage chunk (audit 2026-10-29, ZC-6). The
+            # F-7 fix covered the handback and final-answer terminals and
+            # MISSED this third one: a guard-aborted turn settled the wrap-up
+            # call in the ledger but put no usage on the wire, so every aborted
+            # turn reported 0 usage to OpenAI-compatible clients (DSH's context
+            # meter). Same chunk shape as the other terminals; the wrap-up
+            # call's OWN usage, since that is the last real model call of the
+            # turn.
+            if include_usage and wrap_usage:
+                yield sse_event(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [],
+                        "usage": wrap_usage,
+                    }
+                )
             yield b"data: [DONE]\n\n"
             return
 
@@ -2240,6 +2544,32 @@ async def relay_stream(
                 continue
             fn = tc.get("function", {})
             fn_name = str(fn.get("name", ""))
+            # --- discovery meta-tool (hybrid surface, 2026-10-28) ----------
+            # Handled LOCALLY: it is not a granted MCP tool, so parse_tool_name
+            # returns None and the legacy path would answer "unknown tool".
+            # `describe` promotes a server, and _tools_now() then offers that
+            # server's real tools on the NEXT model call -- the model pays for
+            # definitions only where it needs them.
+            if fn_name == tool_surface.META_TOOL and _surface_mode == tool_surface.MODE_HYBRID:
+                _meta_text, _promoted = tool_surface.handle_meta_call(fn.get("arguments"), catalog, _promoted)
+                relay_msgs.append(
+                    # Cap like every other tool result: a describe payload is
+                    # re-prefilled on every later iteration, so an uncapped one
+                    # is exactly the "big result" hazard this cap exists for.
+                    {"role": "tool", "tool_call_id": tc.get("id", ""), "content": _relay_content(_meta_text)}
+                )
+                yield _pcai(
+                    {
+                        "pcai": {
+                            "event": "tool",
+                            "iteration": iteration,
+                            "tool": fn_name,
+                            "status": "ok",
+                            "detail": "promoted=" + ",".join(sorted(_promoted)),
+                        }
+                    }
+                )
+                continue
             parsed = parse_tool_name(fn_name)
             if parsed is None:
                 # parse-None (no separator): a harness-prefixed ghost name
@@ -2533,7 +2863,14 @@ async def relay_stream(
                     }
                 )
             await _flush_conversation_state(iteration + 1)
+            if iterations_out is not None:
+                iterations_out[:] = [iteration + 1]
             yield b"data: [DONE]\n\n"
             return
 
         iteration += 1
+        if iterations_out is not None:
+            # Published after EVERY completed call, not at the end: the caller
+            # may close this generator at any point (client disconnect), and a
+            # finally-style publish would never run then.
+            iterations_out[:] = [iteration]

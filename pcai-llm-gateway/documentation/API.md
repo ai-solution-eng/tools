@@ -242,6 +242,22 @@ fleet switch on — `routing` plus `routing__{X}` for each registered chat
 model the key may use (each `pcai.type: "routing"`). Off-policy keys see
 none of the routing names.
 
+**Agents** (2026-10-29) are advertised as model entries too:
+`{"id": "<agent name>", "pcai": {"type": "agent", "description", "servers", "model"}}`,
+filtered by the key's PROFILE (the same resolver the request path uses, so the
+listing cannot offer an agent the request would then 403). `model` is the
+agent's pinned model, or `"auto"` when it rides the profile cascade. An agent
+pinned to a model this key may not call, or to one that cannot serve chat, is
+not advertised. Naming an agent as `model` selects it: its tool surface is the
+INTERSECTION of the key's grants and the agent's servers, and its system prompt is
+prepended to every model call of the turn — after a leading client system/developer
+message when one is present, never merged into it, and never written into the stored
+conversation. An agent the profile does not offer is a **403**
+`{"type": "agent_not_offered"}` — never a silent cascade with the profile's
+full surface. A case-only typo of an agent id is a **404**
+`{"type": "agent_name_case", "did_you_mean": "<name>"}` for the same reason: model
+ids are exact, so the typo would otherwise ride the ordinary alias path.
+
 **Silent truncation is now announced.** The response carries
 `X-PCAI-Models-Denied: <n>` — the number of registered models this key's
 `allowed_models` filtered out (`0` when the ACL is empty = allow-all).
@@ -544,7 +560,7 @@ JSON discovery index.
 | POST | `/admin/costs` | `{model_name, input_per_m, output_per_m, cached_per_m}` (USD per 1M tokens) | `{model_name, priced: true}` |
 | GET | `/admin/costs` | — | all configured prices |
 | DELETE | `/admin/costs/{model_name}` | — | `{deleted: bool}` (404 when not priced) — removes the price row; ledger history stays put (costs were computed AND stored per row at request time; removal affects future requests only, which ledger NULL = unpriced). `{model_name:path}` carries slash-containing names ("Qwen/Qwen3.8-27B-FP8") |
-| POST | `/admin/profiles` | `{name, model_order?, budgets? [{model, period, limit_tokens\|limit_usd}], mcp_grants? [{server, tool}], offpeak_fraction? (0–1, null = inherit), routing_policy? (off\|shadow\|active, default off — anything else 422), routing_min_model? (default "" = no downgrade; must be "" or name a model IN `model_order`, else 400), memory? ({provision: bool} — the enrollment-memory preset; null = undeclared)}` — upsert by name; each `budgets` entry carries exactly ONE limit kind (`limit_tokens` = token budget → `budgets`, `limit_usd` = dollar budget → `cost_budgets`), period `day\|week\|month`, positive | profile incl. expanded presets (both budget kinds round-trip) + both routing fields + the memory preset |
+| POST | `/admin/profiles` | `{name, model_order?, budgets? [{model, period, limit_tokens\|limit_usd}], mcp_grants? [{server, tool}], offpeak_fraction? (0–1, null = inherit), routing_policy? (off\|shadow\|active, default off — anything else 422), routing_min_model? (default "" = no downgrade; must be "" or name a model IN `model_order`, else 400), memory? ({provision: bool} — the enrollment-memory preset; null = undeclared), agents? ([agent names] — THREE-STATE: omitted = leave the selection untouched, [] = clear, [names] = replace; an unknown name is a 400)}` — upsert by name, and a **MERGE**: a field the caller OMITS keeps its stored value (this used to rebuild every preset from the body, so a partial POST silently wiped the model order, budgets and grants). Sending an explicit `[]` or `null` still REPLACES or CLEARS that field, and unknown keys already in `defaults_json` survive; each `budgets` entry carries exactly ONE limit kind (`limit_tokens` = token budget → `budgets`, `limit_usd` = dollar budget → `cost_budgets`), period `day\|week\|month`, positive | profile incl. expanded presets (both budget kinds round-trip) + both routing fields + the memory preset |
 | GET | `/admin/profiles` | — | all profiles (cascade + presets + fraction + `routing_policy`/`routing_min_model`); `budgets` round-trips both limit kinds (`limit_tokens` and `limit_usd`) exactly as POST accepted them |
 | DELETE | `/admin/profiles/{profile_id}` | `?force=true` detaches attached users | `{deleted, detached_users}` (409 while users are attached, without force) |
 | PUT | `/admin/users/{user_id}/profile` | `{profile_id: <uuid|null>}` (null clears) | the user row |
@@ -554,7 +570,32 @@ JSON discovery index.
 | GET | `/admin/traces/{request_id}` | — | one request's timeline (404 when nothing traced) |
 | GET | `/admin/offpeak` | — | read-only evaluator snapshot: `{enabled, active, fraction, enter_pct, exit_pct, check_s, promql, mcp_server, tool, last_value_pct, last_check, last_error, state_since}` |
 | PUT | `/admin/offpeak/models/{model_name}/fraction` | `{fraction: <0–1>}` or `{fraction: null}` (clear — falls back to profile fraction, then the gateway default). Precedence while the model's governing evaluator is ACTIVE: override → profile → default; inactive bills 1.0. `{model_name:path}` carries slash-containing names | the updated row |
-| GET | `/admin/presented-models` | — | the admin-side "what does `/v1/models` advertise" view: `{aliases: [{id, type, order, demand_aware, present, reason}], models: [{id, type, primary, endpoints, healthy, max_tokens_ceiling, offpeak{value_pct,active,fraction}, demand_aware_excluded, routing_eligible}], routing: [{id, type, present, reason}], env{routing_enabled, load_aware_cascade}, counts{presented,registered}}`. Registry truth + config truth — an admin key holds no profile, so `order` is derived (chat-first, then name) and each alias `reason` says so |
+| GET | `/admin/presented-models` | — | the admin-side "what does `/v1/models` advertise" view: `{aliases: [{id, type, order, demand_aware, present, reason}], models: [{id, type, primary, endpoints, healthy, max_tokens_ceiling, offpeak{value_pct,active,fraction}, demand_aware_excluded, routing_eligible}], routing: [{id, type, present, reason}], agents: [{id, type, description, servers, model, enabled, profiles, present, reason}], env{routing_enabled, load_aware_cascade}, counts{presented,registered}}`. Registry truth + config truth — an admin key holds no profile, so `order` is derived (the CHAT pools, name-sorted — non-chat pools are never cascade steps) and each alias `reason` says so. `agents` lists every enabled agent with the profiles that offer it |
+
+#### Agents — `/admin/agents`
+
+An **agent** is a named tool surface a request selects by naming it as its
+`model`. It exists because exposing every granted MCP tool to every key cost
+~34k prompt tokens per relayed request and made tool selection a 111-way
+choice; the hybrid surface removed the token cost, an agent removes the choice.
+
+An agent can only ever **hide** tools: the effective surface is the
+intersection of the key's grants and the agent's `servers`, so a server that
+gains a tool still grants that tool to nobody new. The profile is the envelope,
+the agent is the role inside it, and the key stays the hard boundary — which is
+also why the read+egress gate keeps evaluating the key's WHOLE grant set, not
+the agent-narrowed one.
+
+| Method | Path | Body / notes | Response |
+|---|---|---|---|
+| POST | `/admin/agents` | `{name, description?, servers? [names], model? ("" = profile cascade), system_prompt?, enabled? (default true)}` — upsert by name. Refused (400) when the name shadows a registered model, `auto`, `auto-demand-aware`, or the `routing*` namespace; when a server is not registered; or when a pinned `model` is not a registered CHAT model | the agent row |
+| GET | `/admin/agents` | — | every agent + `profiles` (the profiles that offer it) + `system_prompt_chars` (the prompt body is operator prose; the listing shows its length, not a token bill) |
+| DELETE | `/admin/agents/{name}` | — | 204 (404 when it does not exist). `profile_agents` rows cascade; a key still naming the deleted agent falls back to the ordinary alias path |
+
+The profile side is `POST /admin/profiles` with `agents` (see §4.5); the
+selection lives in its own table (`profile_agents`) because `create_profile`
+rebuilds `defaults_json` from the request body, which would silently delete a
+binding stored there.
 
 ### 4.6 Model routing (decision-model prep)
 

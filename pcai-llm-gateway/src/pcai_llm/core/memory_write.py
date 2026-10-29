@@ -48,6 +48,18 @@ SOURCE_LABEL = "gateway:distiller"
 # metadata-bound pattern the MCP catalogs use).
 WRITE_TIMEOUT_S = 30.0
 
+# WRITE VERDICTS (audit D-2). write_memory answers (ok, detail); a caller that
+# has to act differently on a SUPPRESSED write than on a FAILED one (the
+# distiller sweep: a near-duplicate is a permanent condition, so the row must
+# be marked instead of re-running a 25-call map-reduce every pass forever)
+# passes verdict_out and reads these back. Kept out of the return tuple on
+# purpose: the tuple is the long-standing (ok, detail) contract every caller
+# and test already speaks, and widening it would break all of them.
+VERDICT_SUPPRESSED = "suppressed"
+VERDICT_FLOORED = "floored"
+VERDICT_WRITTEN = "written"
+VERDICT_FAILED = "failed"
+
 McpCall = Callable[[dict[str, Any]], Awaitable[tuple[bool, str]]]
 """async (add_memory_arguments) -> (ok, detail).
 
@@ -88,6 +100,7 @@ async def write_memory(
     fallback_doc: str = "",
     fallback_session_id: str = "",
     mcp_search: McpCall | None = None,
+    verdict_out: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Write ONE memory document to the calling key memory dataset.
 
@@ -101,8 +114,20 @@ async def write_memory(
     Returns (ok, detail): detail is a short human string for logs and the
     route response - never the document itself (already in the store),
     never credential material.
+
+    verdict_out (optional): when passed, exactly one of VERDICT_WRITTEN /
+    VERDICT_FLOORED / VERDICT_SUPPRESSED / VERDICT_FAILED is appended, so a
+    caller can tell a PERMANENT refusal (a near-duplicate that will be
+    produced again by every retry) from a TRANSIENT failure (which must leave
+    the row due). The (ok, detail) tuple is unchanged.
     """
+
+    def _verdict(v: str) -> None:
+        if verdict_out is not None:
+            verdict_out.append(v)
+
     if not doc or not doc.strip():
+        _verdict(VERDICT_FAILED)
         return False, "empty document"
     # MINIMUM LENGTH FLOOR (2026-10-17). Deliberately a *small* guard, not a
     # junk filter: a distill that produced only section headers or a stub is
@@ -136,6 +161,7 @@ async def write_memory(
             min_chars,
             key_id,
         )
+        _verdict(VERDICT_FLOORED)
         return False, f"document body under the {min_chars}-char floor"
 
     # NEAR-DUPLICATE SUPPRESSION (2026-10-23; see config
@@ -161,6 +187,7 @@ async def write_memory(
                     "(session=%s matches prior session=%s, containment=%.2f)",
                     session_id[:16], hit_session[:16], score,
                 )
+                _verdict(VERDICT_SUPPRESSED)
                 return False, (
                     "near-duplicate of an existing memory from session "
                     + hit_session[:16]
@@ -170,6 +197,7 @@ async def write_memory(
     try:
         ok, detail = await mcp_call(build_add_memory_arguments(doc, session_id, source, kind))
         if ok:
+            _verdict(VERDICT_WRITTEN)
             return True, detail
     except Exception as exc:
         log.warning("memory write failed (key=%s): %s", key_id, type(exc).__name__, exc_info=True)
@@ -186,11 +214,13 @@ async def write_memory(
                 )
             )
             if ok2:
+                _verdict(VERDICT_WRITTEN)
                 return True, "summary failed; wrote raw transcript as session_history"
             detail = detail + "; fallback: " + detail2
         except Exception as exc:
             log.warning("memory fallback write failed (key=%s)", key_id, exc_info=True)
             detail = detail + "; fallback failed: " + type(exc).__name__
+    _verdict(VERDICT_WRITTEN if ok else VERDICT_FAILED)
     return ok, detail
 
 

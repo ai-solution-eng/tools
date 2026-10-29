@@ -64,6 +64,55 @@ def generate_key() -> tuple[str, str]:
     return plaintext, hash_key(plaintext)
 
 
+def key_record_from_row(row: Any) -> KeyRecord | None:
+    """THE one row→record mapper, with the fail-closed gate INSIDE it.
+
+    Every door that turns an api_keys row into an authorization anchor goes
+    through here — authenticate() (the bearer-key door), load_key_record()
+    (the by-id/scheduled-distill door) and identity.find_shadow_key() (the
+    JWT/SSO token door). Returns None for a row that must not authorize:
+    missing, revoked, or EXPIRED.
+
+    WHY one mapper (audit C2, 2026-10-29): the shadow-key lookup used to have
+    its own copy of this mapping that copied expires_at into the record and
+    never compared it, so an expired token-shadow key kept authorizing through
+    the token rung while core.keys refused the very same row. Expiry was
+    enforced on one door and not the other; two mappers are two places for
+    that check to be forgotten.
+
+    Optional columns are read with .get (asyncpg Records AND the tests' dict
+    fakes both implement it): a SELECT or a fake row missing mcp_admin /
+    expires_at degrades to the CONTROL DEFAULT (False / no expiry), never to a
+    KeyError.
+    """
+    if row is None:
+        return None
+    if row.get("revoked_at") is not None:
+        return None
+    expires_at = row.get("expires_at")
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        return None
+    return KeyRecord(
+        id=row["id"],
+        user_id=row["user_id"],
+        name=row["name"],
+        key_prefix=row["key_prefix"],
+        scopes=list(row["scopes"]),
+        allowed_models=list(row["allowed_models"]),
+        rate_limit_rpm=row["rate_limit_rpm"],
+        rate_limit_tpm=row["rate_limit_tpm"],
+        max_concurrent=row["max_concurrent"],
+        expires_at=expires_at,
+        relay_default=bool(row["relay_default"]),
+        stream_pcai_events=bool(row["stream_pcai_events"]),
+        offpeak_fraction=row["offpeak_fraction"],
+        # row.get (not row[...]): asyncpg Records AND the tests' dict fakes
+        # both implement .get — a SELECT or a fake row missing the column
+        # degrades to False (the control default), never to a KeyError.
+        mcp_admin=bool(row.get("mcp_admin", False)),
+    )
+
+
 async def create_key(
     user_id: uuid.UUID,
     name: str,
@@ -140,29 +189,8 @@ async def authenticate(plaintext: str) -> KeyRecord | None:
         """,
         hash_key(plaintext),
     )
-    if row is None or row["revoked_at"] is not None:
-        return None
-    if row["expires_at"] is not None and row["expires_at"] <= datetime.now(UTC):
-        return None
-    return KeyRecord(
-        id=row["id"],
-        user_id=row["user_id"],
-        name=row["name"],
-        key_prefix=row["key_prefix"],
-        scopes=list(row["scopes"]),
-        allowed_models=list(row["allowed_models"]),
-        rate_limit_rpm=row["rate_limit_rpm"],
-        rate_limit_tpm=row["rate_limit_tpm"],
-        max_concurrent=row["max_concurrent"],
-        expires_at=row["expires_at"],
-        relay_default=bool(row["relay_default"]),
-        stream_pcai_events=bool(row["stream_pcai_events"]),
-        offpeak_fraction=row["offpeak_fraction"],
-        # row.get (not row[...]): asyncpg Records AND the tests' dict fakes
-        # both implement .get — a SELECT or a fake row missing the column
-        # degrades to False (the control default), never to a KeyError.
-        mcp_admin=bool(row.get("mcp_admin", False)),
-    )
+    # Revocation + expiry are enforced INSIDE the shared mapper (audit C2).
+    return key_record_from_row(row)
 
 
 async def load_key_record(key_id: uuid.UUID) -> KeyRecord | None:
@@ -183,29 +211,8 @@ async def load_key_record(key_id: uuid.UUID) -> KeyRecord | None:
         """,
         key_id,
     )
-    if row is None or row["revoked_at"] is not None:
-        return None
-    if row["expires_at"] is not None and row["expires_at"] <= datetime.now(UTC):
-        return None
-    return KeyRecord(
-        id=row["id"],
-        user_id=row["user_id"],
-        name=row["name"],
-        key_prefix=row["key_prefix"],
-        scopes=list(row["scopes"]),
-        allowed_models=list(row["allowed_models"]),
-        rate_limit_rpm=row["rate_limit_rpm"],
-        rate_limit_tpm=row["rate_limit_tpm"],
-        max_concurrent=row["max_concurrent"],
-        expires_at=row["expires_at"],
-        relay_default=bool(row["relay_default"]),
-        stream_pcai_events=bool(row["stream_pcai_events"]),
-        offpeak_fraction=row["offpeak_fraction"],
-        # row.get (not row[...]): asyncpg Records AND the tests' dict fakes
-        # both implement .get — a SELECT or a fake row missing the column
-        # degrades to False (the control default), never to a KeyError.
-        mcp_admin=bool(row.get("mcp_admin", False)),
-    )
+    # Same mapper, same gate (audit C2): revoked/expired rows are None here too.
+    return key_record_from_row(row)
 
 
 async def revoke_key(key_id: uuid.UUID) -> bool:

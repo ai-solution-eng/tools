@@ -289,6 +289,72 @@ def test_first_float_no_number_returns_none() -> None:
     assert offpeak.first_float(None) is None
     assert offpeak.first_float("") is None
 
+# ---------------------------------------------------------------------------
+# D-3 (audit 2026-10-29): an EMPTY Prometheus result is NO SAMPLE, not zero
+# ---------------------------------------------------------------------------
+
+
+def test_d3_first_float_empty_result_is_no_sample() -> None:
+    """A SUCCESSFUL answer with an EMPTY result set still carries numbers
+    (elapsed_ms, seriesFetched). PRE-FIX first_float fell back to a regex
+    over the WHOLE payload and returned one of those metadata numbers as the
+    utilization sample (verified on the pre-fix module: 3.0 and 0.0 for the
+    two shapes below) — near zero, below enter_pct, so the discount engaged
+    exactly when demand was UNKNOWN: the fail-safe inverted. Empty result =
+    None, whatever else the envelope contains."""
+    assert (
+        offpeak.first_float(
+            {"status": "success", "data": {"resultType": "vector", "result": []}, "elapsed_ms": 3}
+        )
+        is None
+    )
+    assert (
+        offpeak.first_float(
+            {"status": "success", "data": {"resultType": "vector", "result": []}, "stats": {"seriesFetched": 0}}
+        )
+        is None
+    )
+    assert offpeak.first_float({"status": "success", "data": {"resultType": "scalar", "result": []}}) is None
+
+
+def test_d3_first_float_metadata_only_dict_is_no_sample() -> None:
+    """A parsed dict with NO sample in it must not fall back to scanning the
+    whole payload text: any number left in a Prometheus envelope is response
+    metadata, never a utilization. Plain text keeps the regex fallback."""
+    # no "data" key: _extract finds the only number (took) -> that IS the sample
+    assert offpeak.first_float({"status": "success", "took": 12}) == 12.0
+    # a dict whose ONLY numbers ride in metadata keys we deliberately don't scan
+    assert offpeak.first_float({"status": "error", "elapsed_ms": 12, "errorType": "timeout"}) is None
+    assert offpeak.first_float({"status": "success", "data": {"resultType": "matrix", "result": []}}) is None
+    # non-dict shapes keep the legacy fallback (free text / bare lists)
+    assert offpeak.first_float(_text_block("gpu_utilization 37.5")) == 37.5
+    assert offpeak.first_float([1730000000, "9.75"]) == 9.75
+
+
+def test_d3_real_samples_still_parse_after_empty_guard() -> None:
+    """The empty-result guard must not eat REAL samples."""
+    payload = '{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1730000000,"23.5"]}]}}'
+    assert offpeak.first_float(_text_block(payload)) == 23.5
+    assert offpeak.first_float({"status": "success", "data": {"resultType": "scalar", "result": [1730000000, "7.5"]}}) == 7.5
+
+
+def test_d3_empty_result_evaluator_fails_safe_full_price(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Evaluator-level: an empty Prometheus result must land in _fail_state
+    (idle + full price + last_error), NOT in _apply_state(≈0) -> discount ON."""
+    monkeypatch.setattr(settings, "offpeak_enabled", True)
+    _fake_registry(monkeypatch, [_prom_server()])
+    calls: list[dict[str, Any]] = []
+    _fake_opener(
+        monkeypatch,
+        calls,
+        result={"status": "success", "data": {"resultType": "vector", "result": []}, "elapsed_ms": 3},
+    )
+    asyncio.run(offpeak.evaluate_once())
+    st = offpeak.state
+    assert st.active is False and st.fraction == 1.0 and offpeak.fraction() == 1.0
+    assert st.last_value_pct is None, "no sample was parsed — nothing to stamp"
+    assert st.last_error is not None and "no numeric value" in st.last_error
+
 
 # ---------------------------------------------------------------------------
 # settle stores the fraction / gate math is fraction-weighted
@@ -387,9 +453,9 @@ def test_gate_math_sums_are_fraction_weighted(monkeypatch: pytest.MonkeyPatch) -
     asyncio.run(budgets_mod.settle(kid, MODEL, "chat", 800, 0, "ok", 5, "rid-2", billing_fraction=0.5))
     assert sum(r["total_tokens"] for r in fake.ledger) == 1600, "ledger keeps TRUE usage"
 
-    fake.token_budgets = [{"model": "*", "period": "month", "limit_tokens": 1200}]
+    fake.token_budgets = [{"model": "*", "period": "month", "limit_tokens": 1201}]
     res = asyncio.run(budgets_mod.check_budgets(kid, MODEL, 0))
-    assert res.ok, "weighted spend (1200) fits the 1200 limit; unweighted (1600) would not"
+    assert res.ok, "weighted spend (1200) fits the 1201 limit; unweighted (1600) would not"
 
     fake.token_budgets = [{"model": "*", "period": "month", "limit_tokens": 1100}]
     res = asyncio.run(budgets_mod.check_budgets(kid, MODEL, 0))
@@ -409,6 +475,25 @@ def test_gate_math_sums_are_fraction_weighted(monkeypatch: pytest.MonkeyPatch) -
     assert any("SUM(l.cost_usd * l.billing_fraction)" in sql for sql in fake.captured_sql), (
         "cost budget SUM must be fraction-weighted"
     )
+
+
+def test_c1_token_gate_refuses_at_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C1 (audit 2026-10-29): spent >= limit is an EXHAUSTED budget even at
+    zero estimate. The old gate admitted it: spent + est*(1-frac) > limit
+    with est=0 is spent > limit, so a fully-spent budget kept admitting on
+    the zero-estimate relay/MCP paths forever. Weighted spend 1200 vs limit
+    1200 must now refuse (the 1201 variant that still admits lives in
+    test_gate_math_sums_are_fraction_weighted)."""
+    fake = WeightedLedgerDB()
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    monkeypatch.setattr(costs_mod, "db", fake)
+    kid = uuid.uuid4()
+    asyncio.run(budgets_mod.settle(kid, MODEL, "chat", 800, 0, "ok", 5, "rid-1", billing_fraction=1.0))
+    asyncio.run(budgets_mod.settle(kid, MODEL, "chat", 800, 0, "ok", 5, "rid-2", billing_fraction=0.5))
+    fake.token_budgets = [{"model": "*", "period": "month", "limit_tokens": 1200}]
+    res = asyncio.run(budgets_mod.check_budgets(kid, MODEL, 0))
+    assert not res.ok, "spent == limit is exhausted; zero-estimate must refuse (audit C1)"
+    assert "1200" in res.reason
 
 
 def test_cost_budget_gate_is_fraction_weighted(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -195,12 +195,12 @@ values: [`helm/values-examples/README.md`](helm/values-examples/README.md).
 - [Features](documentation/FEATURES.md) — budget semantics, relay protocol, traces, enrollment, off-peak billing, routing, ledger schema
 - [API](documentation/API.md) — every endpoint: method/path/auth/body/response for the data plane and the admin plane
 - [Memory](documentation/MEMORY.md) — mint a RAG key, create + ★ a memory dataset, attach it to a gateway key, distiller contract, other memory MCPs
-- [Verification](documentation/VERIFICATION.md) — smoke tests, admin flows, feature checks, troubleshooting
+- [Verification](documentation/changelogs/VERIFICATION.md) — smoke tests, admin flows, feature checks, troubleshooting
 - [Roadmap](documentation/ROADMAP.md) — brainstormed candidates, explicitly not committed
 
 ## Changelog
 
-Version history: [CHANGELOG.md](CHANGELOG.md).
+Version history: [CHANGELOG.md](documentation/CHANGELOG.md).
 
 ## License
 

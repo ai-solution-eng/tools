@@ -353,3 +353,72 @@ def test_a_raising_decide_seam_cannot_fail_the_request(monkeypatch: pytest.Monke
 
     _model, route = _resolve(decide, ["big", "small"])
     assert route.policy == "active"  # still served, heuristics stand
+
+
+def test_strip_harness_context_removes_system_reminder_blocks() -> None:
+    """A <system-reminder> block must not reach the router as "the user turn".
+
+    Measured live 2026-10-28: the decision state carried
+    "<system-reminder>\nA skill is a reusable set of task-speci..." and the
+    model answered at confidence 0.10-0.29; the same question with clean text
+    scored 0.74. Everything below the 0.60 floor is discarded, so the block
+    was silently handing every decision to the size heuristic.
+    """
+    from pcai_llm.core.decision_routing import strip_harness_context
+
+    dirty = "<system-reminder>\nA skill is a reusable set.\n</system-reminder>\nTesting. 1,2,3."
+    assert strip_harness_context(dirty) == "Testing. 1,2,3."
+    # Entirely plumbing -> empty, so the caller can tell "no user words this
+    # turn" from an empty message.
+    assert strip_harness_context("<system-reminder>only plumbing</system-reminder>") == ""
+    # Case-insensitive and attribute-bearing openers are the same block.
+    assert strip_harness_context('<SYSTEM-REMINDER type="x">noise</SYSTEM-REMINDER>hi') == "hi"
+
+
+# ---------------------------------------------------------------------------
+# R1 (audit 2026-10-29): NaN/inf decision confidence bypassed the abstain
+# floor. Only `confidence < min_confidence` was tested, and float("nan") <
+# x is False for every x -- so a misbehaving endpoint returning bare NaN
+# (json.loads parses it) or +inf sailed past the operator's ONLY distrust
+# lever. Post-fix: a non-finite confidence is not a strong answer, it is NO
+# answer -- abstain with reason "nonfinite_confidence".
+# ---------------------------------------------------------------------------
+
+
+def test_r1_nan_confidence_abstains() -> None:
+    """The audit's exact repro: confidence "NaN" served an unsupervised pick."""
+    payload = _answer("b", float("nan"))
+    r = dr.parse_choice(payload, ["a", "b"], min_confidence=0.6)
+    assert not r.ok, "NaN confidence must not pass the floor"
+    assert r.reason == "nonfinite_confidence"
+
+
+def test_r1_inf_confidence_abstains() -> None:
+    payload = _answer("b", float("inf"))
+    r = dr.parse_choice(payload, ["a", "b"], min_confidence=0.6)
+    assert not r.ok and r.reason == "nonfinite_confidence"
+
+
+def test_r1_bare_json_nan_literal_abstains() -> None:
+    """json.loads accepts BARE NaN/Infinity -- no exotic encoding needed."""
+    raw = json.loads('{"answers":{"answer":{"choice":"b","confidence":NaN,"probabilities":{"b":1.0}}}}')
+    r = dr.parse_choice(raw, ["a", "b"], min_confidence=0.6)
+    assert not r.ok and r.reason == "nonfinite_confidence"
+
+
+def test_r1_junk_string_confidence_still_abstains() -> None:
+    """The pre-existing junk path (float("abc") -> 0.0) is unchanged."""
+    raw = {"answers": {"answer": {"choice": "b", "confidence": "not-a-number"}}}
+    r = dr.parse_choice(raw, ["a", "b"], min_confidence=0.6)
+    assert not r.ok
+
+
+def test_r1_finite_confidence_still_served() -> None:
+    """The fix must not over-reject: a real answer still lands."""
+    r = dr.parse_choice(_answer("b", 0.99), ["a", "b"], min_confidence=0.6)
+    assert r.ok and r.choice == "b"
+
+
+def test_r1_negative_inf_abstains() -> None:
+    r = dr.parse_choice(_answer("b", float("-inf")), ["a", "b"], min_confidence=0.6)
+    assert not r.ok and r.reason == "nonfinite_confidence"

@@ -53,7 +53,7 @@ long doc (§2 master table, §6, §8). ✔ ships · ◐ partial/config-dependent
 | 8 | **SSO self-service** | `GET /v1/identity` whoami probe + `POST /v1/keys/for-me`: one key per browser identity, fixed scopes/limits, transactional rotate, spend lineage survives rotation (`spend_ancestors`); grants stay admin-controlled — [FEATURES.md:360-407](FEATURES.md), [schema.py:146](../src/pcai_llm/db/schema.py) | SSO-driven key generation is 💰 enterprise; invitation flows are admin-run (long doc §2 row 8, §3.2) | IdP integration 💰 enterprise; no self-service mint (long doc §2 row 8) |
 | 9 | **Deployment surface** | One stateless container + external Postgres (embedded single-node PG 16 for units without a site DB); values-only Helm; credentials by-reference; exposure via the PCAI Istio gateway; the gateway itself holds no Kubernetes API access — [README.md:168-187](../README.md), [README.md:99-103](../README.md), [values.yaml:72-87](../helm/values.yaml) | Postgres + Redis recommended for production; some governance/UI behind enterprise (long doc §2 row 19) | Redis for clustering/HA; clustering/RBAC/IdP/audit 💰 enterprise (long doc §2 row 19) |
 | 10 | **Provider breadth** | Registered local endpoint pools (vLLM/SGLang, priority/weight, circuit breaker) — deliberately no cloud API translation — [FEATURES.md:841-868](FEATURES.md) | **✔ wins: 100+ providers** — the category leader (long doc §2 row 20, §6) | 20+ native providers (long doc §2 row 20) |
-| 11 | **Ecosystem & community** | Single-team internal product; HPE-internal support; the self-audit loop (`AUDIT.md` → `REMEDIATION.md` with per-fix regression tests) is the differentiator | **✔ wins: large community, hosted UI, plugins, mature gateway knobs** (long doc §2 row 21, §6) | Go performance (~11 µs added at 5k rps), WASM plugins, community (long doc §2 rows 21, 24) |
+| 11 | **Ecosystem & community** | Single-team internal product; HPE-internal support; the self-audit loop (`Audits/AUDIT.md` → `Audits/REMEDIATION.md` with per-fix regression tests) is the differentiator | **✔ wins: large community, hosted UI, plugins, mature gateway knobs** (long doc §2 row 21, §6) | Go performance (~11 µs added at 5k rps), WASM plugins, community (long doc §2 rows 21, 24) |
 | 12 | **Design center** | In-cluster MCP + agentic relay; fleet identity + metering plane (long doc §8) | Provider breadth, cloud spend (long doc §8) | Raw throughput, router knobs (long doc §8) |
 
 ## Reading the diagram with this table
@@ -150,8 +150,8 @@ private model+tool fleet safely *shareable* (long doc §7).
 - This repo: [README.md](../README.md) · [FEATURES.md](FEATURES.md) (budget
   semantics, relay, off-peak billing, MCP federation, routing, session memory
   distiller, router extras, ledger schema) · [API.md](API.md) ·
-  [MEMORY.md](MEMORY.md) · [DEPLOYMENT.md](DEPLOYMENT.md) · `AUDIT.md` +
-  `REMEDIATION.md` (the self-audit trail row 11 above references).
+  [MEMORY.md](MEMORY.md) · [DEPLOYMENT.md](DEPLOYMENT.md) · `Audits/AUDIT.md` +
+  `Audits/REMEDIATION.md` (the self-audit trail row 11 above references).
 - Diagram: [architecture.png](architecture.png) — source
   [architecture.dot](architecture.dot); re-render with
   `dot -Tpng -Gdpi=150 documentation/architecture.dot -o documentation/architecture.png`.

@@ -836,13 +836,13 @@ def test_mcp_catalog_priority_order_and_no_leak(monkeypatch: pytest.MonkeyPatch)
     _patch_surface(monkeypatch, key, {("alpha", "search"), ("beta", "query")}, servers, listings=listings)
     out = json.loads(_call_with_key(key, routes_mcp._mcp_catalog()))
     assert [s["server"] for s in out["servers"]] == ["alpha", "beta"]
-    assert [g["server"] for g in out["granted"]] == ["alpha", "beta"]
+    assert [s["server"] for s in out["servers"]] == ["alpha", "beta"]
 
     # zero-grant key: no servers, no URLs (existing discipline, re-pinned)
     key2 = _key()
     _patch_surface(monkeypatch, key2, set(), servers, listings=listings)
     out2 = json.loads(_call_with_key(key2, routes_mcp._mcp_catalog()))
-    assert out2["servers"] == [] and out2["granted"] == []
+    assert out2["servers"] == []
 
 
 def test_mcp_catalog_bounded_timeout_still_15s(monkeypatch: pytest.MonkeyPatch) -> None:

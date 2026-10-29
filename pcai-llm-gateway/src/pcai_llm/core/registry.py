@@ -120,7 +120,7 @@ async def refresh() -> None:
     server_rows = await db.fetch(
         """
         SELECT id, name, url, headers_json, auth_secret, auth_token_enc, enabled,
-               tool_policy, allowed_tools_json, priority
+               tool_policy, allowed_tools_json, priority, description
         FROM mcp_servers WHERE enabled = TRUE
         ORDER BY priority ASC, name ASC
         """
@@ -157,6 +157,10 @@ async def refresh() -> None:
                 "id": str(row["id"]),
                 "name": row["name"],
                 "url": row["url"],
+                # Operator-authored one-liner shown to the model in the
+                # hybrid tool surface's server directory (2026-10-28).
+                # Empty is fine: the directory falls back to name + count.
+                "description": row.get("description", "") or "",
                 "headers": {str(k): str(v) for k, v in headers.items()},
                 # K8s Secret NAME (by-ref) — resolved to a Bearer header at
                 # call time via PCAI_LLM_MCP_KEY__<NAME>; never a literal key.

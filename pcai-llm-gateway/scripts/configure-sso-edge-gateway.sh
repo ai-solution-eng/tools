@@ -1,7 +1,7 @@
 #!/bin/bash
 # configure-sso-edge-gateway.sh — step 3 of the SSO self-mint rollout
 # (documentation/DEPLOYMENT.md § "SSO self-mint rollout (coupled, ordered)"
-# and documentation/SSO-ROLLOUT-G2.md): chain the gateway's host through
+# and documentation/changelogs/SSO-ROLLOUT-G2.md): chain the gateway's host through
 # the PLATFORM oauth2-proxy at the ezaf-gateway, with the exact path
 # classification, and verify it — the PCAI_LLM flavor of the fleet's
 # configure-oidc-rag.sh / configure-oidc-sql.sh.
@@ -40,7 +40,7 @@
 #     pcai-llm manifest: .scratch/pcai-llm-edge-authz.yaml →
 #     istio-system/pcai-llm-gateway-edge-chain. --attach lists these.
 #
-# ── PATH CLASSIFICATION (documentation/SSO-ROLLOUT-G2.md — LOAD-BEARING) ──
+# ── PATH CLASSIFICATION (documentation/changelogs/SSO-ROLLOUT-G2.md — LOAD-BEARING) ──
 #   CHAINED (the proxy auths + injects headers):
 #     /            (browser shell)          /ui
 #     /v1/identity (whoami — identity IS the injected headers)

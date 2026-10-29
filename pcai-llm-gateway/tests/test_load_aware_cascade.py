@@ -117,6 +117,29 @@ def _install_router(monkeypatch: pytest.MonkeyPatch) -> CascadeFakeRouter:
     return router
 
 
+@pytest.fixture
+def health_gate(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records every ``_pool_servable`` probe — the HEALTH-GATE seam.
+
+    WHY this seam and not ``router.lookups`` (2026-10-29): the inertness tests
+    used to observe "no ``pool()`` call at all". The chat-only filter
+    (``auto`` must not walk an embedding pool — core.cascade.serves_chat) now
+    consults the router once per candidate for its TYPE. That consult cannot
+    move the head: it only removes candidates that could never serve chat. The
+    invariant these tests actually pin is that the load-aware HEALTH/load
+    machinery never runs, so it is observed at its own seam — which stays
+    strict, and is where a regression would actually show up.
+    """
+    calls: list[str] = []
+
+    def _probe(model: str) -> bool:
+        calls.append(model)
+        return True  # the gate "passes"; the point is that it never runs
+
+    monkeypatch.setattr(cascade_mod, "_pool_servable", _probe)
+    return calls
+
+
 class CascadeFakeDB:
     """The two seams resolve_cascade touches: profiles.model_order and the
     model_stickiness row set (cascade's own db handle)."""
@@ -987,9 +1010,11 @@ def test_health_predicate_is_not_called_when_the_feature_is_off(
     assert calls == [], "feature off -> the health predicate is never called"
 
 
-def test_no_pool_lookup_when_the_feature_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Same gate, observed at the ROUTER seam: feature off -> the candidate
-    pools are never consulted (no `pool()` call at all)."""
+def test_no_pool_lookup_when_the_feature_is_off(monkeypatch: pytest.MonkeyPatch, health_gate) -> None:
+    """Same gate, observed at the HEALTH-GATE seam: feature off -> the health
+    partition never probes a pool. (The router itself IS consulted once per
+    candidate — for its TYPE, by the chat-only filter — so a bare
+    ``lookups == []`` would now measure the wrong thing; see health_gate.)"""
     router = _install_router(monkeypatch)
     monkeypatch.setattr(settings, "load_aware_cascade", False)
 
@@ -1001,18 +1026,21 @@ def test_no_pool_lookup_when_the_feature_is_off(monkeypatch: pytest.MonkeyPatch)
 
     res = asyncio.run(resolve_cascade(uuid.uuid4(), DEMAND_AWARE_ALIAS, REGISTERED, [], 100, thread_key=THREAD))
     assert res.ok and res.model == GLM
-    assert router.lookups == [], "feature off -> no pool lookup performed at all"
+    assert health_gate == [], "feature off -> the health gate never runs"
+    # ...and the ONLY router consults are the one-per-candidate TYPE checks.
+    assert router.lookups == [GLM, DS], "type consult only — no health probe"
 
 
-async def test_no_pool_lookup_without_a_thread_key(env) -> None:
+async def test_no_pool_lookup_without_a_thread_key(env, health_gate) -> None:
     """The other inertness gate (brief rule 2): no conversation fingerprint ->
-    the head machinery never runs, so no pool lookup either."""
+    the head machinery never runs, so the health gate never probes a pool."""
     fake, key_id = env
     fake.router.cool(GLM)  # would change the head if the gate ran
     res = await resolve_cascade(key_id, DEMAND_AWARE_ALIAS, REGISTERED, [], 100, thread_key=None)
     await drain_sticky_writes()  # P3: the sticky write is fire-and-forget — flush before asserting
     assert res.ok and res.model == GLM
-    assert fake.router.lookups == [], "no thread key -> no pool lookup performed at all"
+    assert health_gate == [], "no thread key -> the health gate never runs"
+    assert fake.router.lookups == [GLM, DS], "type consult only — no health probe"
 
 
 def test_head_first_keeps_the_set_and_demotes_unhealthy() -> None:
@@ -1076,7 +1104,7 @@ def test_classify_request_cannot_tell_the_two_aliases_apart() -> None:
     assert classify_request(DEMAND_AWARE_ALIAS, REGISTERED, []) == "alias"
 
 
-async def test_legacy_auto_is_inert_with_the_feature_on(env) -> None:
+async def test_legacy_auto_is_inert_with_the_feature_on(env, health_gate) -> None:
     """THE HEADLINE REGRESSION TEST (the operator's requirement): feature ON,
     thread key in hand, signal configured and pointing at Deepseek — and the
     LEGACY `auto` still resolves the pure profile-order head with NO sticky
@@ -1097,13 +1125,14 @@ async def test_legacy_auto_is_inert_with_the_feature_on(env) -> None:
     assert fake.reads == [], "no sticky read"
     assert fake.writes == [] and fake.rows == {}, "no sticky write"
     assert fake.drops == [], "no sticky drop"
-    assert fake.router.lookups == [], "no pool lookup — the health gate never runs"
+    assert health_gate == [], "no health probe — the load-aware gate never runs"
     assert _counter(DS, "load") == before, "no head-pick counter tick"
     assert _counter(GLM, "unhealthy") == before_unhealthy, "not even an exclusion tick"
 
 
 async def test_legacy_auto_is_BYTE_IDENTICAL_to_the_feature_off_resolution(
     monkeypatch: pytest.MonkeyPatch,
+    health_gate,
 ) -> None:
     """THE STRONGEST FORM OF THE HEADLINE REQUIREMENT: with the feature ON,
     the legacy `auto` resolution equals the resolution the SAME environment
@@ -1142,7 +1171,11 @@ async def test_legacy_auto_is_BYTE_IDENTICAL_to_the_feature_off_resolution(
     # ... and neither arm touched a single seam.
     assert on_fake.reads == off_fake.reads == []
     assert on_fake.writes == off_fake.writes == []
-    assert on_fake.router.lookups == off_fake.router.lookups == []
+    # Same router consults in both arms (the chat-type check is unconditional),
+    # and NEITHER arm ran the health gate: the equality is the contract, the
+    # empty health_gate is the proof that the load-aware machinery is inert.
+    assert on_fake.router.lookups == off_fake.router.lookups
+    assert health_gate == []
 
 
 async def test_legacy_auto_ignores_an_existing_sticky_record(env) -> None:
@@ -1214,7 +1247,7 @@ def test_demand_aware_falls_back_to_legacy_when_the_feature_is_off(
     assert fake.reads == [] and fake.writes == [] and fake.router.lookups == []
 
 
-def test_demand_aware_without_a_thread_key_is_inert(env) -> None:
+def test_demand_aware_without_a_thread_key_is_inert(env, health_gate) -> None:
     """The other gate on the same path: no conversation fingerprint -> no
     head machinery, for the new alias too."""
     fake, key_id = env
@@ -1223,7 +1256,8 @@ def test_demand_aware_without_a_thread_key_is_inert(env) -> None:
 
     res = asyncio.run(resolve_cascade(key_id, DEMAND_AWARE_ALIAS, REGISTERED, [], 100, thread_key=None))
     assert res.ok and res.model == GLM
-    assert fake.reads == [] and fake.writes == [] and fake.router.lookups == []
+    assert fake.reads == [] and fake.writes == []
+    assert health_gate == [], "no health probe — the head machinery never runs"
 
 
 def test_a_real_model_named_like_the_alias_is_pinned_and_shadows_it() -> None:

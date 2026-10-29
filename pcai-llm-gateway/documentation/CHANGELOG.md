@@ -57,6 +57,279 @@ feature is listed under the LATER version.
   not the size of the budget.
 ## Unreleased
 
+- **Profile → keys, for real (2026-10-29).** The tenant SSO default profile only ever
+  landed as STAMPED PRESETS on the minted key; it never reached `users.profile_id`. So the
+  Keys table's Profile column read `none` for every SSO user — correctly — and everything
+  that reads the user row silently ignored the profile: the cascade ordering
+  (`profile_order_for_key`, so `auto` 404'd for those keys), the routing policy, the
+  off-peak fraction (`keys.authenticate`'s LEFT JOIN), and the agents menu.
+
+  *The mint now binds the user* (`_bind_user_profile`, both the create and rotate
+  branches, inside the same transaction), **only when `profile_id IS NULL`** — an operator
+  who placed a user by hand is never re-scoped; the tenant setting is a default, not an
+  override.
+  *`POST /admin/tenants/{id}/bind-sso-users` is the explicit backfill* for a fleet that
+  already signed in (idempotent, NULL-only, reports the count) — the console button is
+  **bind existing users** next to the SSO default selector. Without it, existing SSO users
+  stay unprofiled and `apply grants` matches none of their keys.
+  *`POST /admin/profiles/{id}/propagate-grants`* re-stamps a profile's MCP grants onto
+  every attached key in ONE statement (delete-then-insert in a CTE, so a half-applied fleet
+  is not reachable). Destructive by design — per-key exceptions included — and it REFUSES an
+  empty grant list, because an accidental click must not zero a fleet's tool surface. The
+  Profiles table's **apply grants** button confirms with the pair/key counts first.
+  *The zero-click alternative is unchanged and now visible*: `live_grants` evaluates the
+  profile's list at CALL time for every key, so an edit applies immediately with no
+  propagation. The grants cell carries a **live** / **stamped** pill so an operator knows
+  which mode a profile is in before reaching for the button.
+
+  Console: the Profiles table's action cell is the same blocky `.rowacts` grid the Keys
+  table uses (edit / apply limits / apply grants / delete), and it gained an **Off-peak**
+  column — the one profile knob that changes how fast a budget drains, which should not be
+  an editor-only field.
+
+  Suite: **2420 → 2426 tests, 0 failed**; ruff check clean.
+
+- **Agent profiles (2026-10-29) — named tool surfaces exposed as model endpoints.** The
+  hybrid surface (2026-10-28) removed the 34,459-token cost of showing every granted MCP
+  tool; it did not remove the CHOICE — a 111-tool catalogue still asks the model to pick
+  from 111 names for a task that needed four servers. An agent is that choice, made once
+  by the operator.
+
+  An agent is a row in `agent_profiles`: a name, a description, a set of MCP **servers**,
+  an optional pinned **model**, and (schema-ready, injection is phase 2) a system prompt.
+  It is advertised by `GET /v1/models` as a model entry (`pcai.type: "agent"`), so
+  selecting one is just naming it as `model` — no header, no new client API, and a
+  harness that pins provider+model can pin an agent. Unpinned agents ride the SAME
+  profile cascade `auto` does.
+
+  **An agent can only ever hide tools.** The effective surface is the intersection of the
+  key's grants and the agent's servers; a server that gains a tool still grants that tool
+  to nobody new. The three sets stay distinct: the OFFERED catalog and the DISPATCH gate
+  narrow to the agent, the read+egress gate keeps the key's WHOLE grant set (agents are
+  switchable per request, so narrowing the gate would let one key split read and egress
+  across two agents while the conversation carries the data between them). Naming an
+  agent the key's profile does not offer is a **403**, never a silent cascade with the
+  profile's full surface — that widening is the failure mode the feature exists to
+  prevent, and a registry read fault degrades to "no narrowing" (loudly) rather than
+  turning every alias request into a dependency on the read.
+
+  Admin surface: `POST/GET/DELETE /admin/agents` (upsert-by-name; refused when a name
+  shadows a registered model or the `auto`/`routing*` namespace, when a server is not
+  registered, or when a pinned model cannot serve chat), `agents` on
+  `POST /admin/profiles` (three-state: omitted = untouched, `[]` = clear), and an
+  `agents` section on `GET /admin/presented-models`. The profile→agent selection lives in
+  its own table (`profile_agents`) because `create_profile` rebuilds `defaults_json` from
+  the request body — a binding stored there would be silently deleted by any older
+  console POST.
+
+  **System prompt (shipped).** `system_prompt` is prepended to every model call of a
+  turn, and it is applied in the ONE place a model call is assembled —
+  `toolrelay.with_system_prefix`, called from `_bounded_call` (the wire) and from
+  `_settle_model_call` (so the settle-time estimate and the effective-prompt capture
+  describe the request that was actually sent). It lands AFTER a leading
+  system/developer message when the client sent one — the client's framing owns the tool
+  protocol and stays first, and two system messages beat a merge because the client's
+  text stays byte-intact for its own hashing and prefix cache. It is deliberately NOT
+  applied to `relay_msgs`: that list's length is the handback boundary
+  (`final_messages[:n] == relay_projection`), so growing it would skip the pending-tail
+  flush and make `X-PCAI-Continue` 400 — the defect toolrelay.py:941 documents. The
+  plain (non-relay) path gets the same prompt from a COPIED body after the canonical
+  capture was scheduled and after guardrails ran, and `_reconcile_relay_messages`
+  reserves its token estimate (`len // 4`) in the context-budget trim so the budget
+  cannot under-count by exactly the prompt's size.
+
+  **Console (shipped).** A twelfth tab — **Agents** — sits with the registry tabs (an agent
+  IS a model entry): name, description, a server picker, an optional pinned model, the
+  system prompt, and a table with edit/delete. `Profiles ▸ Agents offered` carries the
+  selection and always SENDS it (the endpoint is a full upsert, so an omitted `agents`
+  would mean "leave untouched" and unticking every box would silently keep the old
+  selection), the profiles table gained an Agents column, and `Models ▸ Presented
+  endpoints` gained an AGENTS section — the panel claims to show what `/v1/models`
+  advertises, and an agent is a model entry there.
+
+  **Near miss (shipped).** Model ids are exact, so `admin-agent` is not `Admin-Agent` —
+  but a client that lowercases ids would fall through to the ordinary alias path and be
+  served the profile's FULL surface, which is the one widening an agent exists to
+  prevent. A case-only difference is now a 404 `{"type": "agent_name_case",
+  "did_you_mean": "Admin-Agent"}`.
+
+  **Cross-validation (GLM-5.3-Flash × DeepSeek-V4.1-Flash-1017, direction-matched).** GLM
+  (calibrated abstainer) checked the seven load-bearing factual claims against the diff — the
+  three-set split, the handback boundary, `serves_chat`'s unknown-is-kept rule, the `offered`
+  SQL, hide-only narrowing, the name validation, and the plain-path injection order — and
+  returned OK on all seven with file:line evidence. DS (confident asserter, reviewed for
+  EXECUTION completeness) found six real defects, all fixed here:
+
+  * **The Agents table's edit and delete buttons were dead for every agent.**
+    `onclick="agEdit(" + JSON.stringify(name) + ")"` emits literal double quotes, which
+    terminate the double-quoted attribute — `onclick="agEdit("`. Replaced with
+    `data-agent-edit`/`data-agent-del` attributes (esc() is attribute-safe) bound after
+    render. The console source-shape test passed while the buttons were broken, which is
+    precisely that kind of test's blind spot.
+  * **The approval-passthrough branch could ship `tools: []` upstream.** It narrowed the
+    catalog AFTER the emptiness guard, so an agent excluding everything left an empty
+    array (a hard 400 on strict upstreams) instead of no tools key.
+  * **The excluded-server 400 lived on one of the two tool paths.** Hoisted above both, so
+    the relay and passthrough branches cannot drift.
+  * **A failed `/admin/agents` read would have CLEARED a profile's agent selection.** The
+    picker rendered zero boxes and the save posted `agents: []` — defeating the server's
+    three-state guard in exactly the case it exists for. The save now omits the key unless
+    the list actually loaded (`state.agentsLoaded`).
+  * **The profile preset handler never reset the agent picker**, so editing profile A and
+    then starting from a preset silently stamped A's agents onto the new profile.
+  * **`loadAgents` threw before rendering** on an older backend, leaving the tab empty with
+    only a banner; it now degrades (and says so).
+
+  **`POST /admin/profiles` is a MERGE (2026-10-29).** The residual named in the first
+  cut is closed. It was an upsert that rebuilt every preset from the body, so
+  `{"name":"poweruser","agents":["Admin-Agent"]}` — the natural way to add one agent —
+  silently zeroed `model_order`, every budget, all 90 grants and the `live_grants` flag.
+  The console always sends the whole form, so only curl and scripts were exposed; that is
+  exactly the path an operator takes for a one-field edit. A field the caller OMITS now
+  keeps its stored value; an explicit value — including `[]` and `null` — still replaces
+  or clears it (`model_fields_set` is the discriminator, because `null` is a REAL value
+  for `limits`/`memory`/`offpeak_fraction`), unknown keys already in `defaults_json`
+  survive, the stale-model check now runs only on an ordering the caller actually sent
+  (so a stored model that left the registry cannot block an unrelated save), and the audit
+  row records the EFFECTIVE values plus the `provided` field list. Read-modify-write, not
+  one statement: the JSON merge is per-key and `COALESCE` cannot express it.
+
+  Suite: **2388 → 2420 tests, 0 failed**; ruff check clean; the console script parses
+  under `node --check`.
+
+- **`auto` walks CHAT models only (2026-10-29).** A profile's `model_order` is a MODEL ACL
+  *and* the chat cascade ordering, so it legitimately carries embedding/reranker/transcribe
+  pools — the seeder ships exactly that (`scripts/seed_registry.py` orders the default profile
+  over every `DEPLOYED` entry, embedding included). Three places consumed it as a chat ladder
+  without a type filter:
+
+  * **the cascade walk** (`core.cascade.resolve_cascade`) — `auto` could resolve onto an
+    embedding pool, and `/v1/chat/completions` then refused the request ("is a embedding
+    endpoint, not chat") instead of falling through to the next chat model with headroom. That
+    is a hard 400 for a request that had a perfectly good candidate behind it.
+  * **the routing ladder** (`routes_proxy.chat_completions`) — `order[0]` is the CEILING and
+    `reversed(order)` the cheap-first walk, so a non-chat head pinned every `routing` request
+    to a pool the chat path refuses.
+  * **the admin "Presented endpoints" panel** (`routes_admin.presented_models`) — the `auto`
+    cascade rendered every registered model, so the panel showed a walk
+    (`GLM → Qwen → cohere-transcribe → fish-s2-pro → qwen3-vl-embedding → ...`) the data plane
+    can never perform, and `primary`/`alias_present` derived from it claimed a default model
+    the chat path refuses.
+
+  One predicate, `core.cascade.serves_chat` — `any(endpoint.model_type == "chat")`, with
+  UNKNOWN KEPT (a name with no pool, or a pool with no endpoints, still passes: the walk's own
+  `not_registered` attempt and the caller's pool checks own that case, so the filter's blast
+  radius is exactly the defect). Skips are REPORTED, not silent: they lead the 429 attempt
+  breakdown as `{"status": "not_chat"}`, and a profile whose whole ordering is non-chat now
+  refuses with a reason that names the skipped entries instead of a bare 404.
+
+  `/v1/models` gains `pcai.primary` only for chat pools, and `GET /admin/profiles` gains
+  `non_chat_models` — the double duty made visible instead of inferred (`model_order` still
+  GRANTS those pools to enrolled keys; it just no longer pretends they are cascade steps).
+  Suite: **2381 → 2388 tests, 0 failed**; ruff check clean.
+
+- **Audit remediation wave, 2026-10-29 (routing / distilling / relay / core).** An
+  8-auditor sweep (GLM-5.3-Flash breadth × DeepSeek-V4.1-Flash-1017 depth, four zones) produced
+  [documentation/Audits/AUDIT-2026-10-29.md](Audits/AUDIT-2026-10-29.md); six implementers then fixed
+  the findings zone-by-zone on disjoint write scopes, and four direction-matched cross-validators
+  (the opposite model family from each author) reviewed the result — which is where the most
+  important defects of the wave were found: three of the first-round fixes were themselves wrong.
+  Suite: **2228 → 2381 tests, 0 failed**; ruff clean; mypy unchanged at its 8 known typing-only errors.
+
+  **Security / correctness (P1).**
+  *The post-call guardrail masked replay leaked the text it had just masked.* It classified
+  "carries text?" on `delta.content` alone, so `reasoning_content`, the `pcai` thinking event and
+  tool-call argument deltas were replayed verbatim — and a first-round fix that re-masked per
+  fragment was WORSE (a secret split across two SSE chunks was recoverable end-to-end, and it
+  re-introduced reasoning/tool-JSON into the answer). The shipped shape drops whole chunks over a
+  WIDENED classifier (content, all three reasoning spellings, tool-call args, pcai text/result/args),
+  ships a consolidated final built from CONTENT deltas only, makes exactly one guard call per
+  request, and applies the same shape to the non-streaming path.
+  *An expired SSO shadow key kept authorizing* — `find_shadow_key` never read `expires_at` while
+  `keys.load_key_record` refused the same row. One mapper (`keys.key_record_from_row`) with
+  revocation AND expiry inside now serves `authenticate`, `load_key_record` and `find_shadow_key`.
+  *`limit_usd: NaN` was accepted* (`nan <= 0` is False) → the USD gate could never refuse the row and
+  `int(spent*100/limit)` 500'd every admission. Non-finite limits are rejected at write and refused
+  at read.
+  *The token-budget gate admitted an EXHAUSTED budget* (`spent + est*(1-frac) > limit` vs the USD
+  gate's `spent >= limit`), so the zero-estimate relay and `/mcp` paths admitted forever. All three
+  gates now agree at `spent == limit`.
+  *Off-peak's fail-safe was inverted*: `first_float` fell back to a regex over the whole Prometheus
+  payload, so a successful "no data" answer yielded its `elapsed_ms` as the utilisation sample and
+  the DISCOUNT turned on when demand was unknown. `data.result == []` is now "no sample".
+  *The routing ceiling was never passed to `available()`*, so a key whose ACL excluded the ladder
+  head got a 403 on EVERY `routing` request instead of a downgrade.
+  *The distill sweep's title-row filter was inert* — asyncpg hands back JSONB as a `str` and the
+  detector starts with `isinstance(messages, list)`, so title-stub memories kept being distilled
+  (and the fix has to decode into a `dict`, because an asyncpg `Record` rejects item assignment —
+  the first-round fix was silently swallowed there).
+  *Dedup suppression never marked*, so a suppressed row re-ran a ~25-call map-reduce every sweep
+  forever; suppression now has its own verdict and writes the marker.
+  *`httpx2.AsyncClient()` honoured ambient proxy env*: a bracketed-IPv6 `NO_PROXY` entry (`[::1]`)
+  made `URLPattern()` raise `InvalidURL` inside `Router.start()` — a pod crash-loop — and a valid
+  `HTTP_PROXY` silently rerouted every upstream call. One shared `routing.router.upstream_client()`
+  factory now pins `trust_env=False` at all five construction sites, with a drift-guard test.
+
+  **Relay.** Non-dict elements inside `delta.tool_calls` killed the stream (`AttributeError` one
+  level below the E-1 guard); the zero-completion retry had no transport handling (no `[DONE]`, no
+  settle) and now catches any exception with a settle; the transport-failover gate keyed on raw
+  reasoning instead of client visibility (failover silently dead under `X-PCAI-Stream-Thinking: 0`);
+  the guard-abort wrap-up terminal omitted the usage chunk; SSE parsing splits on CR/CRLF as well as
+  LF (three parsers); late-id tool-call adoption no longer forks one call into two — and no longer
+  fuses two parallel calls into one, which the first-round fix did; the loop guard evicts by
+  staleness with the state bounded per fingerprint; the upstream body's `model` is rewritten to the
+  serving model on failover hops; `tool_choice: required` is downgraded to `auto` after the first
+  relay call instead of wedging the loop; the arg-policy scan bounds rose to depth 12 / 2000 strings
+  and now fail CLOSED above them (a depth-8 Kubernetes manifest and a 500-element array are
+  accepted; the previous fail-open let a flooded argument list hide a denied URL).
+
+  **Routing.** Operator allowlist and key ACL now bound the ceiling the router may serve (a floor
+  demotion could serve an allowlist-excluded model, and a servable pinned request could 503); the
+  fleet-level `routing_min_model` knob exists so globally-armed routing can downgrade; `routing__X`
+  off-ladder honours the floor; NaN/inf decision confidence no longer bypasses the abstain floor;
+  `_policy_cache` gained an invalidator wired into both admin write paths; the never-downgrade floor
+  is measured in an availability-filtered window and is committed AFTER admission via a deferred
+  `sticky_finish` (the floor can no longer name a model that never served); transient
+  unavailability degrades to legacy behaviour instead of pre-empting admission failover.
+
+  **Distilling.** JSONB decoded at the boundary; title rows get the bounded gate-skip backoff instead
+  of pinning the oldest-first window; the sweep budget no longer abandons the first row of a pass
+  (a large row could be starved forever); `split_transcript` packs block remainders and the window
+  grows until `MAX_MAP_CHUNKS` is honoured; `document_is_complete` matches header LINES (and
+  forgives a trailing colon / bold) instead of a substring; `MAX_HISTORY_CHARS` is enforced before
+  the append; `writes_total{ok}` and the last-write gauge only advance on a real write;
+  `distiller_sweep_budget_s <= 0` means unbounded instead of "disable the feed silently".
+
+  **Core.** Canonical prune's marker check no longer matches orphaned marker rows (it deleted
+  never-distilled transcripts); shadow-key re-provision after a revoke reuses the user row instead of
+  colliding on `UNIQUE(tenant_id, name)`; `_predict_charges` releases on a zero-prompt settle;
+  `clamp_max_tokens` covers `max_completion_tokens`; the chain verifier steps over degraded rows
+  instead of mislabelling a real edit; `rpm`/`tpm <= 0` means unlimited instead of a permanent 429;
+  the canonical-prune throttle no longer skips the first hour after a pod start; `/mcp` rate-limit
+  refusals settle `rate_limited`.
+
+  **Known residuals** (recorded, not fixed — each with the reason it was not):
+  *The relay iteration histogram was fixed after the wave:* `relay_stream` now publishes its own
+  completed-call count through `iterations_out`, so the histogram reads the loop's accounting
+  instead of byte-matching the `pcai model_usage` event (which was 0 for every strict OpenAI
+  client). The "inflatable by model text" half of that finding was an audit **erratum** —
+  `json.dumps` escapes the quotes, so the matcher could not be perturbed that way.
+  *`gateway_budget_rejections_total` still counts gate EVALUATIONS, not refused requests.* It is a
+  valid candidate-level signal — `check_budgets` is called once per cascade candidate, so one
+  request can contribute several — but it was documented as "calls refused". The help text and the
+  counter's comment now say what it actually measures. Counting requests needs the refusing family
+  plumbed through `GateResult` to each terminal raise site (routes_proxy, cascade, toolrelay,
+  routes_distill); that is a follow-up, not a silent re-meaning of an existing series.
+  *`routes_identity.py` still resolves the caller without headers* — deliberately. Passing them
+  would make the browser rung outrank the token rung and would feed a posture-dependent header into
+  `resolve_shadow_key`, i.e. turn a header into an AUTHORIZATION input. The rung was made reachable
+  for attribution only.
+  *`limit_usd` has no DB `CHECK` constraint* — the obvious one would not work: in Postgres
+  `'NaN'::numeric > 0` is TRUE, so `CHECK (limit_usd > 0)` accepts exactly the value it is meant to
+  reject. The read-side `math.isfinite` guard is the real enforcement; a constraint would need
+  `limit_usd <> 'NaN'::numeric AND limit_usd <> 'Infinity'::numeric` plus a migration, and it still
+  would not apply to existing rows.
+
 - **Model-routing console panel: a DB-backed operator layer over the router, ready for a
   decision model (`vllm-sr` / `d3-turbo`).** `core.model_routing` has been heuristic-only
   and env-tuned; there was no way to say "the router may use these models, not those",
@@ -1445,7 +1718,7 @@ client-handback tracing, and per-model off-peak evaluators.
 - **Console polish**: grant-tree restyle with quote-safe CSS selectors (a
   `'` in a server/tool name no longer throws querySelector and silently
   kills the tree); `Tokens (in + out)` trace-column label;
-  [DEPLOYMENT.md](documentation/DEPLOYMENT.md) env-table refresh.
+  [DEPLOYMENT.md](DEPLOYMENT.md) env-table refresh.
 
 ## 0.4.1 — 2026-09-16
 

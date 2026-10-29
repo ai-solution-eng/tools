@@ -19,8 +19,8 @@ Two surfaces fix that:
 
 The honesty contract these tests pin: the admin view reports REGISTRY truth +
 CONFIG truth, never one key's filtered view. An admin key holds no profile, so
-'order' is DERIVED (chat-first, then name) and every alias reason says so
-rather than presenting a derivation as fact.
+'order' is DERIVED (the CHAT pools, name-sorted) and every alias reason says
+so rather than presenting a derivation as fact.
 
 Mock-upstream discipline mirrors test_routing_model.py: an in-process Router
 with endpoints set directly, no live Postgres.
@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 from pcai_llm.api import routes_admin, routes_proxy
 from pcai_llm.api.auth import KeyRecord
 from pcai_llm.config import settings
+from pcai_llm.core import cascade as cascade_mod
 from pcai_llm.core import routing_config as rc
 from pcai_llm.routing.router import Endpoint, Router
 
@@ -111,7 +112,14 @@ def proxy_env(monkeypatch: pytest.MonkeyPatch):
 
         monkeypatch.setattr(auth_mod, "authenticate", fake_authenticate)
         monkeypatch.setattr(routes_proxy, "db", _ProxyDB(order))
-        monkeypatch.setattr(routes_proxy, "model_router", _router())
+        # ONE router instance for both handles: in production routes_proxy and
+        # core.cascade import the SAME registry singleton, and the listing now
+        # consults core.cascade.serves_chat (chat-only primary/cascade), so a
+        # fixture that patches only the proxy's handle would give the two
+        # modules different registries — a shape production cannot have.
+        _r = _router()
+        monkeypatch.setattr(routes_proxy, "model_router", _r)
+        monkeypatch.setattr(cascade_mod, "model_router", _r)
         monkeypatch.setattr(routes_proxy, "profile_order_for_key", _order_fn(order))
         app = FastAPI()
         app.include_router(routes_proxy.router)
@@ -159,6 +167,16 @@ def test_body_is_unchanged_by_the_header(proxy_env) -> None:
     assert body["object"] == "list"
     for entry in body["data"]:
         assert set(entry) == {"id", "object", "created", "owned_by", "pcai"}
+
+
+def test_primary_is_never_a_non_chat_model(proxy_env) -> None:
+    """``pcai.primary`` means "what ``auto`` would resolve to", and ``auto``
+    is a CHAT walk. A profile ordering that heads with an embedding pool (the
+    seeder's default profile does) must not mark it primary — the console would
+    preselect it in the chat dropdown and the first send would 400."""
+    tc = proxy_env(order=["emb", "llm-chat"])
+    body = tc.get("/v1/models", headers=KEY_H).json()
+    assert [m["id"] for m in body["data"] if m["pcai"].get("primary")] == ["llm-chat"]
 
 
 def test_routing_entries_are_gated_by_the_fleet_switch(proxy_env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,7 +228,10 @@ def test_presented_models_reports_the_whole_surface(admin_env, monkeypatch: pyte
     # the alias pair, both present, with the DERIVED ordering (chat-first)
     aliases = {a["id"]: a for a in d["aliases"]}
     assert set(aliases) == {"auto", "auto-demand-aware"}
-    assert aliases["auto"]["order"] == ["llm-big", "llm-chat", "emb"]
+    # CHAT ONLY (2026-10-29): the cascade is a chat walk — the embedding pool
+    # is NOT a step in it (it used to be appended to the tail, which rendered
+    # "auto: ... → qwen3-vl-embedding" for a walk the data plane cannot make).
+    assert aliases["auto"]["order"] == ["llm-big", "llm-chat"]
     assert aliases["auto"]["demand_aware"] is False
     assert aliases["auto-demand-aware"]["demand_aware"] is True
     for a in d["aliases"]:
@@ -231,6 +252,22 @@ def test_presented_models_reports_the_whole_surface(admin_env, monkeypatch: pyte
     assert models["emb"]["routing_eligible"] is False
 
     assert d["counts"]["registered"] == 3
+
+
+def test_presented_models_aliases_absent_when_no_chat_pool(admin_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CHAT ONLY (2026-10-29): an embedding-only registry has no cascade to
+    advertise — ``auto`` would 400 on every request. The panel must say so
+    instead of deriving an order from pools the chat path can never serve."""
+    _fake_config(monkeypatch)
+    r = Router()
+    r.set_endpoints("emb", [Endpoint(id="e9", model_name="emb", base_url="http://c/v1", model_type="embedding")])
+    monkeypatch.setattr(routes_admin, "model_router", r)
+    d = admin_env.get("/admin/presented-models", headers=ADMIN_H).json()
+    assert [a["present"] for a in d["aliases"]] == [False, False]
+    assert d["aliases"][0]["order"] == []
+    assert [m["id"] for m in d["models"]] == ["emb"]
+    # no chat pool -> no ``routing__<model>`` either (a chat concept)
+    assert [x["id"] for x in d["routing"]] == ["routing"]
 
 
 def test_presented_models_aliases_absent_when_registry_empty(admin_env, monkeypatch: pytest.MonkeyPatch) -> None:

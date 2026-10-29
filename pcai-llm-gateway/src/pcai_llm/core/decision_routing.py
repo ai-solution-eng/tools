@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -96,7 +98,7 @@ MAX_DECISION_IMAGES = 2
 
 DECISION_MODES = ("off", "shadow", "active")
 
-# The shipped router prompt: the SAME text as documentation/routing_text.md
+# The shipped router prompt: the SAME text as documentation/changelogs/routing_text.md
 # (asserted by tests/test_routing_prompt_default.py). An EMPTY operator prompt
 # falls back to this constant, and the previous three-sentence default silently
 # replaced the whole operator template on every deployment that had not saved
@@ -208,6 +210,100 @@ def _content_parts(content: Any) -> tuple[str, list[str]]:
     return " ".join(texts), images
 
 
+# --- harness context stripping -------------------------------------------
+# An agent harness prepends a per-STEP runtime line to every turn, e.g.
+#   "Time sampled while preparing turn 5, step 1: 2026-10-28T17:12:18-04:00"
+#   "Elapsed since the preceding model-visible message: 2m 59s."
+# Measured on this fleet's own traffic (2026-10-28): every routing state
+# carried that clock reading as user_message, user_task was absent on all 21
+# sampled states, and the decision model was therefore classifying
+# 90-message / 99k-token agent work from a timestamp -- abstaining on 86.6%
+# of calls. The block carries no task signal and has the same shape every
+# turn, so it is stripped BEFORE the text reaches the state (and before the
+# sticky thread fingerprint is computed, which had the same defect).
+# The clock line is stripped as a PREFIX, not as a whole line: a one-line
+# message ("Time sampled ... <ts> Fix the bug in routes_proxy.") must keep its
+# human half, which a whole-line delete would have thrown away.
+_PREAMBLE_PREFIX_RE = re.compile(
+    # The timestamp token itself contains no spaces, so \S* consumes it whole
+    # whether or not the zone is bracket-suffixed. The bracketed form was the
+    # ONLY one matched before, so a bracket-less variant left the entire
+    # preamble in the state -- the original defect, restored.
+    r"^\s*Time sampled while preparing turn \d+, step \d+: \S*[ \t]*"
+)
+# Lines that are ENTIRELY a harness sentence. Case-SENSITIVE on purpose: the
+# harness emits this exact casing, and IGNORECASE ate human lines that merely
+# started with the same words ("Browser time zone for this request: is that a
+# real header?").
+# Each alternative matches the harness's FULL sentence shape, not just its
+# opening words: "Browser time zone for this request: is that a real header?"
+# is a human question and must survive.
+_HARNESS_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"Elapsed since the preceding (?:model-visible message|step context):.*"
+    # THREE variants, all live in this fleet (request-zone.ts):
+    #   resolved -> "<tz>. Interpret otherwise-unqualified dates and times in this zone."
+    #   mixed    -> "mixed [...]. Ask the user to clarify otherwise-unqualified ..."
+    #   missing  -> "unavailable. Ask the user to clarify otherwise-unqualified ..."
+    # Only the first was matched, so the "unavailable" form survived as
+    # user_message AND became the thread_key seed for wordless sessions.
+    r"|Browser time zone for this request: (?:unavailable|mixed .*|\S+?)\. "
+    r"(?:Interpret otherwise-unqualified dates and times in this zone"
+    r"|Ask the user to clarify otherwise-unqualified dates and times)\.?"
+    r"|The current browser's time zone is \S+\.?"
+    r"|Current runtime context\. This snapshot supersedes earlier runtime-context"
+    r" snapshots\.?"
+    r")\s*$"
+)
+
+
+# Harness WRAPPER BLOCKS (2026-10-28). A user turn in this fleet often carries a
+# <system-reminder>...</system-reminder> block (skill catalogue, tool list,
+# permission notices) PREPENDED to the human's words. Measured live, the
+# router's decision state read:
+#   "user_message": "<system-reminder>\nA skill is a reusable set of task-speci..."
+# i.e. the model was asked to classify harness plumbing. Confidence on that
+# state: 0.10-0.29. The SAME question with clean text scored 0.74 on the same
+# decision model, so the block was suppressing every decision below the 0.60
+# floor and handing the pick to the size heuristic. The block is not the user
+# speaking, so it is removed WHOLE before the line filter runs.
+_BLOCK_TAG_RE = re.compile(
+    r"<(system-reminder|system_reminder|available_tools|available_skills)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_harness_context(text: str) -> str:
+    """Drop harness runtime-context lines from one user message's text. PURE.
+
+    Conservative by construction: only the KNOWN preamble shapes are removed
+    (a clock reading, the elapsed-time line, the browser-time-zone note, the
+    runtime-context header). Every other LINE survives; the only whole-text
+    change is that runs of 3+ blank lines collapse to one blank line, so the
+    output is not guaranteed to be a byte-wise substring of the input. Text
+    that is ENTIRELY preamble collapses to "" so the caller can tell "no user
+    words this turn" from "empty message".
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    # Wrapper blocks first: their INNER lines must never be line-filtered into
+    # the state (a reminder body can contain anything, including text that looks
+    # like a preamble). Removing the whole block is also what makes the
+    # "entirely plumbing -> empty string" signal work.
+    text = _BLOCK_TAG_RE.sub("\n", text)
+    kept: list[str] = []
+    for line in text.splitlines():
+        # Prefix first, so preamble+human text on ONE line keeps the human half.
+        was_prefixed = bool(_PREAMBLE_PREFIX_RE.match(line))
+        line = _PREAMBLE_PREFIX_RE.sub("", line, count=1)
+        if _HARNESS_LINE_RE.match(line):
+            continue
+        if was_prefixed and not line.strip():
+            continue
+        kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 def extract_user_turn(body: dict[str, Any]) -> tuple[str, list[str]]:
     """The LAST user message's (text, images). PURE.
 
@@ -224,6 +320,10 @@ def extract_user_turn(body: dict[str, Any]) -> tuple[str, list[str]]:
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
             text, images = _content_parts(msg.get("content"))
+            # Strip the harness preamble FIRST: a message that is nothing but
+            # "Time sampled while preparing turn N..." is not a user turn, and
+            # returning it made the router classify a clock reading.
+            text = strip_harness_context(text)
             if text or images:
                 return text, images
     return "", []
@@ -245,6 +345,11 @@ def extract_user_task(body: dict[str, Any]) -> str:
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "user":
             text, _images = _content_parts(msg.get("content"))
+            # Same stripping as the last turn: in this fleet the opening user
+            # message IS the harness preamble, so without this the "task" field
+            # was either the clock reading or (when it equalled user_message)
+            # omitted entirely -- which is what made every state blind.
+            text = strip_harness_context(text)
             if text:
                 return text
     return ""
@@ -439,6 +544,18 @@ def parse_choice(payload: Any, candidates: list[str], *, min_confidence: float) 
         confidence = float(answer.get("confidence", probabilities.get(choice, 0.0)))
     except (TypeError, ValueError):
         confidence = 0.0
+    # R1 (audit 2026-10-29): json.loads parses BARE NaN/Infinity, and
+    # `float("nan") < floor` is False — so a misbehaving endpoint returning
+    # NaN (or +inf) confidence sailed PAST the abstain floor and the gate
+    # was dead exactly when the endpoint was misbehaving. A non-finite
+    # confidence is not a strong answer, it is NO answer: abstain.
+    if not math.isfinite(confidence):
+        return DecisionResult(
+            choice=choice,
+            confidence=confidence,
+            probabilities=probabilities,
+            reason="nonfinite_confidence",
+        )
 
     if confidence < min_confidence:
         return DecisionResult(

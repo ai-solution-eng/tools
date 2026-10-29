@@ -44,6 +44,41 @@ log = logging.getLogger(__name__)
 # settings.distiller_gate_backoff_s (default 900s).
 
 
+# Per-ROW model-time allowance for one sweep pass (audit D-6, forward-progress
+# rule). The sweep budget bounds the SHARED housekeeping loop; it must never
+# bound a single row so tightly that the row can never finish. One row is up to
+# ~25 map calls x distiller_llm_timeout_s (120 s default) = ~50 minutes of model
+# time, and the due query is OLDEST-FIRST: a row that always aborts mid-map
+# never writes a marker, never backs off, and is re-selected first on EVERY
+# pass — starving everything behind it forever. That is the 2026-10-09
+# head-of-line stall shape this module already carries two scars from.
+#
+# The rule the sweep implements:
+#   * the FIRST row of a pass is never cut by the sweep budget at all
+#     (unbounded — the pass exists to make progress, and row #1 is the row
+#     that has been waiting longest);
+#   * every later row gets max(sweep_budget, ROW_BUDGET_S) from ITS OWN start,
+#     so a large row still gets a generous slice before the loop is released;
+#   * the shared budget keeps gating whether another row is STARTED.
+# A row is therefore never starved indefinitely by the sweep budget alone.
+ROW_BUDGET_S = 900.0
+
+
+def row_budget_seconds() -> float:
+    """The per-row model-time allowance: max(sweep budget, ROW_BUDGET_S).
+
+    <= 0 sweep budget means "no limit" (audit F2), which also means every row
+    is unbounded. Kept as a function so a test/operator can see the rule in
+    one place rather than reconstructing it from the loop.
+    """
+    from ..config import settings
+
+    budget = settings.distiller_sweep_budget_s
+    if budget <= 0:
+        return 0.0  # 0 = unbounded
+    return max(budget, ROW_BUDGET_S)
+
+
 def gate_backoff_seconds() -> float:
     """The gate-skip suppression window (settings-tunable; 0 = retry next
     pass, which lets a broken gate pin the oldest-first window — not
@@ -174,14 +209,56 @@ async def due_conversations(limit: int = 20) -> list[dict[str, Any]]:
         return []
 
 
-def _exclude_title_rows(rows: list[Any], limit: int) -> list[Any]:
+def decode_jsonb_messages(messages: Any) -> Any:
+    """Decode a JSONB payload that asyncpg handed back as a STRING.
+
+    The pool registers no JSONB codec (db.create_pool has no `init`;
+    canonical.py documents the convention), so a `jsonb` column arrives as
+    the raw JSON TEXT, not a Python list. Every predicate that asks "is this
+    a list of messages?" is therefore False on the real row shape — the
+    title detector silently never fired in production (audit F1/B-F1, the
+    2026-10-20 title-stub leak reopened).
+
+    Decodes at the BOUNDARY (the one place the row leaves the driver) so
+    every downstream consumer sees the shape the code was written for.
+    Anything that is not a JSON array of dicts is returned UNCHANGED: a
+    malformed payload must never be silently replaced, and build_transcript
+    already has its own recovery for the double-encoded shapes.
+    """
+    if not isinstance(messages, str):
+        return messages
+    import json
+
+    try:
+        parsed = json.loads(messages)
+    except (ValueError, TypeError):
+        return messages
+    # A LIST OF DICTS only (cross-validation XV-2): the column holds message
+    # rows. A JSON array of scalars is a different payload shape, and
+    # rewriting it into a message list would corrupt it. Anything else is
+    # handed through unchanged — build_transcript has its own recovery for
+    # the double-encoded shapes.
+    if isinstance(parsed, list) and all(isinstance(m, dict) for m in parsed):
+        return parsed
+    return messages
+
+
+def _exclude_title_rows(rows: list[Any], limit: int, dropped_out: list[Any] | None = None) -> list[Any]:
     """Drop stored session-title rows from the due window, then trim to LIMIT.
 
     2026-10-17: rows captured from auxiliary session-title calls before the
     capture guard existed are still in canonical_conversations and would keep
     distilling into bogus memories forever. They are dropped from the due set
     but deliberately NOT marked distilled — if the detector is ever narrowed,
-    they become eligible again instead of being silently buried.
+    they become eligible again instead of being silently buried. (The sweep
+    stamps the bounded gate-skip backoff instead, so a dropped row cannot pin
+    the oldest-first window; see distill_schedule.sweep.)
+
+    JSONB DECODED FIRST (audit F1): the row's `messages` arrives as a STRING
+    from asyncpg, and `is_title_messages` starts with
+    `if not isinstance(messages, list) ... return False` — so this whole
+    filter was INERT in production (every row classified as "not a title")
+    while passing every unit test, because the tests inject a list.
 
     Never raises: an unclassifiable row is KEPT (a real conversation is far
     dearer than one stray title memory), and a detector fault must not stop
@@ -192,12 +269,23 @@ def _exclude_title_rows(rows: list[Any], limit: int) -> list[Any]:
 
     kept: list[Any] = []
     for row in rows:
+        # NEVER MUTATE THE RECORD (cross-validation XV-1). asyncpg hands back a
+        # Record, which is IMMUTABLE: item assignment raises TypeError. Doing
+        # it in place was swallowed by the `except` below — so the filter
+        # stayed INERT on real rows (exactly the defect being fixed) — and on
+        # the filter-off path it raised on every sweep and stopped the feed.
+        # dict(row) is also the shape downstream expects (the sweep already
+        # passes dict(row) into the engine).
+        decoded = row if isinstance(row, dict) else dict(row)
         try:
-            is_title = title_requests.is_title_messages(row["messages"])
+            decoded["messages"] = decode_jsonb_messages(decoded.get("messages"))
+            is_title = title_requests.is_title_messages(decoded["messages"])
         except Exception:
             is_title = False  # unclassifiable -> keep
         if not is_title:
-            kept.append(row)
+            kept.append(decoded)
+        elif dropped_out is not None:
+            dropped_out.append(decoded)
     return kept[: max(1, limit)]
 
 
@@ -210,14 +298,27 @@ def _memory_server_name() -> str:
 async def sweep() -> int:
     """One housekeeping pass: distill due conversations. Returns the count
     of distills ATTEMPTED (not succeeded - failures are logged and the
-    marker stays absent, so the next sweep retries)."""
+    marker stays absent, so the next sweep retries).
+
+    Writes are counted separately (audit D-4): the engine returns True only
+    when a memory actually landed, and only THAT stamps writes_total{ok} and
+    the last-write timestamp. The sweep used to stamp both on passes that
+    wrote NOTHING (gate skips, noise skips, unchanged-content skips), so the
+    "time since the feed last wrote" alert stayed quiet while the feed was
+    dead."""
     import time
 
     from ..api.routes_distill import distill_due_canonical, distill_due_conversation
     from ..config import settings
 
     rows = await due_conversations()
-    canonical_rows = await due_canonical_conversations()
+    # Title rows dropped by the due query are reported back so the sweep can
+    # stamp them with the bounded gate-skip backoff: they are never marked
+    # distilled (nothing was written), but an unmarked row is re-selected
+    # OLDEST-FIRST every pass, so once the detector actually fires (audit F1)
+    # a pile of legacy title rows would pin the window and starve newer rows.
+    dropped_titles: list[dict[str, Any]] = []
+    canonical_rows = await due_canonical_conversations(dropped_out=dropped_titles)
     # Publish the due depth BEFORE claiming (2026-10-14): this is the series
     # that makes a stalled feed alertable. A sweep that RAISES leaves the
     # previous value standing rather than zeroing it, so the gauge cannot
@@ -231,7 +332,13 @@ async def sweep() -> int:
     # path was missed -- the surviving duplicate-summary source.
     rows = await _claim_conversations(rows)
     canonical_rows = await _claim_canonical_rows(canonical_rows)
+    for row in dropped_titles:
+        try:
+            await mark_canonical_gate_skip(row["key_id"], str(row["thread_id"]))
+        except Exception:
+            log.warning("title-row backoff write skipped (thread=%s)", str(row.get("thread_id", ""))[:16], exc_info=True)
     attempted = 0
+    written = 0
     started = time.monotonic()
     # Per-sweep wall-clock budget: the housekeeping loop shares this task
     # with the retention prunes, and one conversation's map-reduce can be
@@ -239,9 +346,47 @@ async def sweep() -> int:
     # block the loop for hours). When the budget is out, remaining due rows
     # simply wait for the next pass — they stay due (no marker on
     # failure/skip), so nothing is lost.
+    #
+    # <= 0 MEANS UNBOUNDED (audit F2). It used to mean "break before the first
+    # row": the loop compared elapsed (>= 0) > 0 on the very first iteration,
+    # so an operator setting 0 for "no limit" silently disabled the entire
+    # memory feed while every dashboard stayed green. A negative or zero
+    # budget is now read as the explicit no-limit choice it looks like.
+    #
+    # The budget is ALSO handed to the engine as a monotonic deadline, which
+    # it re-checks before every model call (audit D-6): a row with 24-30 map
+    # calls x 120 s used to hold this shared loop for ~48 minutes because the
+    # check only ran BETWEEN rows.
+    #
+    # FORWARD-PROGRESS RULE (audit D-6 follow-up): a per-call check against
+    # the SHARED budget alone livelocks the biggest conversations — a row
+    # whose map stage needs more than one sweep budget is aborted every pass,
+    # writes no marker, backs off nothing, and is re-selected OLDEST-FIRST
+    # forever. So:
+    #   * row #1 of a pass is NEVER cut by the sweep budget (unbounded
+    #     deadline): the pass exists to make progress, and row #1 is the row
+    #     that has waited longest;
+    #   * rows #2+ get row_budget_seconds() = max(sweep_budget, ROW_BUDGET_S)
+    #     measured from their OWN start, so a large row still gets a generous
+    #     slice before the shared loop is released;
+    #   * the shared budget keeps deciding whether another row is STARTED.
+    # Only rows #2+ can raise DistillBudgetExceeded, which is exactly the case
+    # where the shared loop genuinely must be released.
     budget = settings.distiller_sweep_budget_s
+    unbounded = budget <= 0
+    row_allowance = row_budget_seconds()  # 0.0 = unbounded
+
+    def _out_of_budget() -> bool:
+        return (not unbounded) and time.monotonic() - started > budget
+
+    def _row_deadline(row_index: int) -> float | None:
+        """None = this row may run to completion (row #1, or no budget)."""
+        if row_index == 0 or row_allowance <= 0:
+            return None
+        return time.monotonic() + row_allowance
+
     for row in rows:
-        if time.monotonic() - started > budget:
+        if _out_of_budget():
             log.info(
                 "distill sweep: budget %ss exhausted after %d of %d due — deferring the rest",
                 budget,
@@ -251,8 +396,9 @@ async def sweep() -> int:
             break
         attempted += 1
         try:
-            await distill_due_conversation(dict(row))
-            metrics.observe_distill_write("conversations", "ok")
+            # row #1 is exempt from the sweep budget (see the forward-progress
+            # rule above); attempted == 1 means this IS the first row.
+            wrote = await distill_due_conversation(dict(row), deadline=_row_deadline(attempted - 1))
         except Exception:
             metrics.observe_distill_write("conversations", "failed")
             log.warning(
@@ -260,8 +406,15 @@ async def sweep() -> int:
                 row.get("conversation_id"),
                 exc_info=True,
             )
+        else:
+            # D-4: only a REAL write counts as ok. The engine returns True only
+            # when a memory landed; a gate skip, a noise skip or a
+            # suppressed-duplicate mark is "skipped" and must never advance the
+            # last-write gauge (that is the gauge the feed alert watches).
+            written += 1 if wrote else 0
+            metrics.observe_distill_write("conversations", "ok" if wrote else "skipped")
     for row in canonical_rows:
-        if time.monotonic() - started > budget:
+        if _out_of_budget():
             log.info(
                 "distill sweep: budget %ss exhausted before canonical rows — deferring the rest",
                 budget,
@@ -269,8 +422,7 @@ async def sweep() -> int:
             break
         attempted += 1
         try:
-            await distill_due_canonical(dict(row))
-            metrics.observe_distill_write("canonical", "ok")
+            wrote = await distill_due_canonical(dict(row), deadline=_row_deadline(attempted - 1))
         except Exception:
             metrics.observe_distill_write("canonical", "failed")
             log.warning(
@@ -278,12 +430,16 @@ async def sweep() -> int:
                 row.get("thread_id", "")[:16],
                 exc_info=True,
             )
+        else:
+            written += 1 if wrote else 0
+            metrics.observe_distill_write("canonical", "ok" if wrote else "skipped")
     if rows or canonical_rows:
         log.info(
-            "distill sweep: %d conversation rows + %d canonical rows due, %d attempted",
+            "distill sweep: %d conversation rows + %d canonical rows due, %d attempted, %d written",
             len(rows),
             len(canonical_rows),
             attempted,
+            written,
         )
     return attempted
 
@@ -494,7 +650,9 @@ async def _claim_conversations(rows: list[dict[str, Any]]) -> list[dict[str, Any
     return won
 
 
-async def due_canonical_conversations(limit: int = 20) -> list[dict[str, Any]]:
+async def due_canonical_conversations(
+    limit: int = 20, dropped_out: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     """Canonical rows due for distill: quiet (updated_at past the debounce),
     memory-attached, and never-distilled OR updated since the last distill
     (a continued conversation re-distills - the DSH lifecycle). Oldest first.
@@ -564,5 +722,16 @@ async def due_canonical_conversations(limit: int = 20) -> list[dict[str, Any]]:
         return []
 
     if settings.canonical_skip_title_requests:
-        return _exclude_title_rows(rows, limit)
-    return rows
+        return _exclude_title_rows(rows, limit, dropped_out)
+    # Still decode at the boundary when the filter is off: the ENGINE reads
+    # row["messages"] too, and a JSONB string there is the same production
+    # shape the filter was blind to.
+    # Copy, never mutate (see _exclude_title_rows): a Record rejects item
+    # assignment, and raising here would stop the whole canonical feed.
+    return [
+        {
+            **(row if isinstance(row, dict) else dict(row)),
+            "messages": decode_jsonb_messages(row.get("messages")),
+        }
+        for row in rows
+    ]

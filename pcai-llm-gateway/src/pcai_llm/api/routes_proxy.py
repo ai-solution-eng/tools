@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -41,6 +42,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config import clamp_max_tokens, settings
+from ..core import agents as agents_mod
 from ..core import (
     canonical,
     clientside,
@@ -65,6 +67,7 @@ from ..core.cascade import (
     classify_request,
     profile_order_for_key,
     resolve_cascade,
+    serves_chat,
 )
 from ..core.keys import KeyRecord
 from ..db import db
@@ -77,6 +80,7 @@ log = logging.getLogger(__name__)
 router = fastapi.APIRouter(prefix="/v1", tags=["proxy"])
 
 _RETRY_AFTER_RATE_LIMITED = "5"  # seconds; client should back off briefly
+
 
 
 # --------------------------------------------------------------------------
@@ -177,17 +181,88 @@ def _assistant_message_text(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _sse_line_tokens(chunk: bytes) -> list[bytes]:
+    """Every SSE line in one raw byte chunk, with the framing normalised.
+
+    SSE (WHATWG) accepts CR, LF and CRLF as line terminators — an upstream
+    that frames with bare CR is spec-legal. A splitter that only knows `\n`
+    parses a CR-only stream as ONE line, json.loads fails on it, and the
+    answer vanishes as a successful empty 200 (audit C-7: the toolrelay twin
+    got this fix; these are the proxy's own scanners).
+    """
+    return re.split(rb"\r\n|\r|\n", chunk)
+
+
+def _sse_text_of_payload(obj: Any) -> list[str]:
+    """EVERY model-text channel carried by ONE parsed SSE chat chunk.
+
+    This is the DROP predicate for the masked replay (audit ZC-3): content,
+    all three reasoning spellings the relay itself recognises
+    (toolrelay.REASONING_KEYS), tool-call argument fragments, and the pcai
+    thinking/tool events. A chunk carrying text on ANY of these is dropped
+    whole on the masked path — a fragment can never be re-masked safely
+    (the guard saw the assembled text, not the fragment). pcai error
+    envelopes carry no model text and are skipped.
+    """
+    texts: list[str] = []
+    try:
+        delta = obj["choices"][0].get("delta") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        delta = None
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            texts.append(content)
+        for rk in toolrelay.REASONING_KEYS:
+            rtxt = delta.get(rk)
+            if isinstance(rtxt, str) and rtxt:
+                texts.append(rtxt)
+        for tc in delta.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str) and args:
+                texts.append(args)
+    payload = obj.get("pcai")
+    if isinstance(payload, dict):
+        for field in ("text", "result", "args"):
+            v = payload.get(field)
+            if isinstance(v, str) and v:
+                texts.append(v)
+    return texts
+
+
+def _sse_answer_texts_of_payload(obj: Any) -> list[str]:
+    """What the ASSISTANT SAID as its REPLY in one parsed SSE chat chunk —
+    the post_call guard's input AND the only text the masked final ships.
+
+    Content deltas ONLY, deliberately (xv round 2, findings 2/4): the
+    consolidated masked final must carry the assistant ANSWER, not reasoning
+    or tool JSON glued into delta.content, and tool-call arguments / tool
+    results are caller data or tool output — a blocked keyword in a grep
+    pattern or a tool's stdout must not discard an otherwise clean answer.
+    Reasoning is safe to exclude from the VERDICT because the masked path
+    drops every reasoning chunk wholesale: it can neither leak nor steer the
+    verdict, exactly like pre-fix — the widened drop predicate is the fix.
+    """
+    try:
+        delta = obj["choices"][0].get("delta") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return []
+    content = delta.get("content")
+    return [content] if isinstance(content, str) and content else []
+
 def _sse_delta_texts(chunk: bytes) -> list[str]:
     """Assistant text deltas carried in one raw SSE byte chunk.
 
     Byte chunks may straddle SSE line boundaries — a delta JSON split
     across two chunks simply fails json.loads and is skipped; the FINAL
     assembled text is a best-effort guard input, not a transcript (the
-    upstream re-parse in _proxy_json is the exact one). `pcai` relay
-    events and usage-only chunks carry no assistant text and are skipped.
+    upstream re-parse in _proxy_json is the exact one). pcai thinking/tool
+    events DO carry model text and are read (audit ZC-3) — error envelopes
+    and usage-only chunks are skipped.
     """
     out: list[str] = []
-    for line in chunk.split(b"\n"):
+    for line in _sse_line_tokens(chunk):
         line = line.strip()
         if not line.startswith(b"data:"):
             continue
@@ -198,15 +273,9 @@ def _sse_delta_texts(chunk: bytes) -> list[str]:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
-        if not isinstance(obj, dict) or "pcai" in obj or "error" in obj:
+        if not isinstance(obj, dict) or "error" in obj:
             continue
-        try:
-            delta = obj["choices"][0].get("delta") or {}
-        except (KeyError, IndexError, TypeError, AttributeError):
-            continue
-        content = delta.get("content")
-        if isinstance(content, str) and content:
-            out.append(content)
+        out.extend(_sse_text_of_payload(obj))
     return out
 
 
@@ -323,15 +392,32 @@ def _estimate_embedding_tokens(body: dict[str, Any]) -> int:
     return len(str(body.get("input") or "")) // 4
 
 
-def _routing_available(key: KeyRecord) -> Callable[[str], bool]:
+def _routing_available(key: KeyRecord, capacity: dict[str, dict] | None = None) -> Callable[[str], bool]:
     """Availability predicate for the complexity-router's ladder walk.
 
     A ladder model is servable for THIS key when it is registered (a pool
     exists), inside the key's allowed_models (the ACL is a hard boundary —
-    a routing pseudo-name must never become an ACL bypass), and has a
-    healthy chat-typed endpoint. Built per request because it closes over
-    the key; core.model_routing stays a pure decision module.
+    a routing pseudo-name must never become an ACL bypass), has a healthy
+    chat-typed endpoint, and — when `capacity` is supplied — still has
+    budget headroom for this key RIGHT NOW. Built per request because it
+    closes over the key; core.model_routing stays a pure decision module.
+
+    WHY capacity belongs here and not only in the admission gate: the
+    decision model is offered exactly this predicate's survivors as
+    `{{model_list}}`, and the heuristic picks from the same window. Without
+    it the router can be told a model is available, pick it, and then have
+    admission 429 the request — the operator sees "routing chose a model I
+    have no budget for". Filtering at the source makes model_list mean what
+    it says: the models this key can actually use at this moment.
+
+    `capacity` is the map from budgets.model_capacity (model -> {ok,
+    remaining_tokens, blocked_by}). A missing entry means "not evaluated"
+    and is treated as available: capacity is a FILTER, never a gate — the
+    admission gate still enforces, and a capacity lookup fault must never
+    silently empty the ladder (see model_capacity's fail-open contract).
     """
+
+    cap = capacity or {}
 
     def _ok(name: str) -> bool:
         if key.allowed_models and name not in key.allowed_models:
@@ -339,7 +425,10 @@ def _routing_available(key: KeyRecord) -> Callable[[str], bool]:
         p = model_router.pool(name)
         if p is None or not p.healthy():
             return False
-        return any(e.model_type == "chat" for e in p.healthy())
+        if not any(e.model_type == "chat" for e in p.healthy()):
+            return False
+        state = cap.get(name)
+        return not (state is not None and not state.get("ok", True))
 
     return _ok
 
@@ -401,7 +490,12 @@ async def _routing_incumbent_state(
                 if sticky_on:
                     floor = model
         # UNCONDITIONAL (see the docstring): this is the only writer.
-        writer = _sticky.make_writer(key.id, thread)
+        # DEFERRED (audit 2026-10-29 P3, XV-3): the writer returns a finisher
+        # instead of persisting, because this runs BEFORE the budget gates and
+        # admission failover decide what actually serves. The caller commits
+        # finisher(serving_model) once admission settles, so the never-
+        # downgrade floor can never name a model that did not bill.
+        writer = _sticky.make_writer(key.id, thread, defer=True)
     except Exception:
         log.warning("routing: incumbent/sticky lookup failed - plain routing", exc_info=True)
         return None, None, None
@@ -760,6 +854,14 @@ async def _proxy_json(
         # the requested model's). `body` itself is untouched (settle/estimate
         # read it), and the helper is zero-copy when no clamp applies.
         send_body = clamp_max_tokens(body, cur_model, settings.max_tokens_ceiling)
+        # C-6 (audit 2026-10-29): the wire body names the model serving THIS
+        # attempt — body["model"] is the CLIENT's name (a pin or an alias)
+        # and used to survive every fallback hop verbatim, so a strict
+        # upstream 400s the hop AFTER the chain entry was consumed (failover
+        # became a hard failure) and a permissive one silently served
+        # something other than what the ledger and X-PCAI-Served-Model claim.
+        if send_body.get("model") != cur_model:
+            send_body = {**send_body, "model": cur_model}
         try:
             resp = await model_router.client.post(cur_url, json=send_body, headers=cur_headers)
         except httpx2.HTTPError:
@@ -890,7 +992,23 @@ async def _proxy_json(
                 )
             if guarded_text != text and embedding_json:
                 try:
-                    embedding_json["choices"][0]["message"]["content"] = guarded_text
+                    # ZC-3 on the non-streaming surface (xv round 2, finding 3),
+                    # shaped EXACTLY like the stream's masked path: the answer
+                    # becomes the masked text; the OTHER model-text channels
+                    # (reasoning spellings, tool_calls) are DROPPED — on the
+                    # stream they are text-bearing chunks the masked path
+                    # suppresses, and re-masking fragments (or judging tool
+                    # data as assistant speech) is the leak/false-block trap
+                    # the stream rework just removed. A masked turn delivers a
+                    # clean answer, not executable calls.
+                    message0 = embedding_json["choices"][0]["message"]
+                    message0["content"] = guarded_text
+                    for _rk in toolrelay.REASONING_KEYS:
+                        message0.pop(_rk, None)
+                    message0.pop("tool_calls", None)
+                    choices0 = embedding_json["choices"][0]
+                    if choices0.get("finish_reason") == "tool_calls":
+                        choices0["finish_reason"] = "stop"
                 except (KeyError, IndexError, TypeError):
                     pass  # unusual shape: relay unmodified rather than corrupt
                 else:
@@ -1215,10 +1333,13 @@ class _StreamLedger:
 # 10 minutes are refused WITHOUT executing.
 _LOOP_GUARD_WINDOW_S = 600.0
 _LOOP_GUARD_MAX_HITS = 5
-# Distinct-fingerprint cap (audit finding 20): over the cap the OLDEST
-# fingerprint is evicted (insertion order), never a bulk clear.
+# Distinct-fingerprint cap (audit finding 20): over the cap eviction is by
+# STALENESS / least-recent-hit (see loop_guard_check) — never a bulk clear.
 _LOOP_GUARD_MAX_ENTRIES = 5000
 _loop_guard: dict[tuple[Any, str, str, str], list[float]] = {}
+# Amortization gate for the O(n) eviction walk (xv round 2, finding 11):
+# over-cap inserts pay the walk at most once per second, not per call.
+_evict_not_before = 0.0
 
 
 def loop_guard_check(key_id: Any, server: str, tool: str, arguments: dict) -> str | None:
@@ -1231,22 +1352,55 @@ def loop_guard_check(key_id: Any, server: str, tool: str, arguments: dict) -> st
     now = time.monotonic()
     hits = [t for t in _loop_guard.get(fp, []) if now - t < _LOOP_GUARD_WINDOW_S]
     if len(hits) >= _LOOP_GUARD_MAX_HITS:
-        _loop_guard[fp] = hits  # keep pruning without recording the blocked hit
+        # The blocked attempt is NOT recorded (xv round 2, finding 7): a
+        # tombstone keeps the fingerprint's window non-empty under steady
+        # retry, turning a 10-minute block into a process-lifetime ban (a
+        # legitimate identical call retried once a minute was 0/120 allowed).
+        # Pruned-only storage keeps the executed count truthful AND the
+        # per-fingerprint state bounded at MAX_HITS entries (finding 8) — so
+        # once the caller stops for one window the block lapses, exactly the
+        # pre-fix re-arm semantics.
+        _loop_guard[fp] = hits
         return (
-            f"loop guard: identical call {server}/{tool} made {len(hits) + 1}x in "
+            f"loop guard: identical call {server}/{tool} made {len(hits)}x in "
             f"{_LOOP_GUARD_WINDOW_S / 60:.0f}m — do not repeat it; use the result you already have or change approach"
         )
     hits.append(now)
     _loop_guard[fp] = hits
     # Hard cap (audit finding 20 — the bulk clear let ANY key wipe EVERY
-    # key's loop protection with 5000 distinct fingerprints): evict the
-    # OLDEST fingerprint instead. _loop_guard is plain-insertion-ordered
-    # (dict); the oldest entry is the first key — pop it until under the
-    # cap. Cross-tenant interference becomes bounded (one evicted entry per
-    # over-cap insert) instead of total.
-    while len(_loop_guard) > _LOOP_GUARD_MAX_ENTRIES:
-        oldest = next(iter(_loop_guard))
-        _loop_guard.pop(oldest, None)
+    # key's loop protection with 5000 distinct fingerprints): evict by
+    # STALENESS / least-recent-hit — never by insertion order. Under the old
+    # oldest-insertion eviction a tripped fingerprint was ALSO the map's
+    # oldest entry (its hits stop advancing while blocked), so 5000 distinct
+    # calls re-armed a blocked identical-call loop one eviction at a time
+    # (audit C-2). An AT/OVER-threshold fingerprint is an ACTIVE blocked
+    # loop and is never evicted while below-threshold ones exist; the
+    # below-threshold pool IS the flood (fresh fingerprints have 1 hit), so
+    # the flood evicts itself and the block survives (xv round 2 verified
+    # the tombstone variant of this; the threshold preference alone holds).
+    # Amortized (finding 11): the O(n) walk runs at most once per second,
+    # and one walk evicts a BATCH down to 90% of the cap.
+    global _evict_not_before
+    if len(_loop_guard) > _LOOP_GUARD_MAX_ENTRIES and now >= _evict_not_before:
+        _evict_not_before = now + 1.0
+        target = int(_LOOP_GUARD_MAX_ENTRIES * 0.9)
+        stale = [
+            f
+            for f, ts in _loop_guard.items()
+            if all(now - t >= _LOOP_GUARD_WINDOW_S for t in ts)
+        ]
+        for f in stale:
+            _loop_guard.pop(f, None)
+        if len(_loop_guard) > target:
+            live_below = [
+                (f, max((t for t in ts if now - t < _LOOP_GUARD_WINDOW_S), default=0.0))
+                for f, ts in _loop_guard.items()
+                if sum(1 for t in ts if now - t < _LOOP_GUARD_WINDOW_S) < _LOOP_GUARD_MAX_HITS
+            ]
+            live_below.sort(key=lambda kv: kv[1])
+            for f, _coldest in live_below[: len(_loop_guard) - target]:
+                _loop_guard.pop(f, None)
+    return None
     return None
 
 
@@ -1616,11 +1770,22 @@ async def _relay_sse(
         replay and the live loop — the cursor state is continuous across
         the two, so a line straddling the peek boundary still parses)."""
         buf.extend(data)
-        idx = buf.find(b"\n")
-        while idx != -1:
+        while True:
+            # LINE TERMINATORS (audit C-7). SSE (WHATWG) accepts CR, LF and
+            # CRLF. This cursor split on LF only, so a CR-only upstream — or
+            # an intermediary rewriting line endings — parsed as ONE giant
+            # line: json.loads failed on it in the ledger's usage scan, the
+            # settle fell back to the estimate, and [DONE] was never seen.
+            # Find whichever terminator comes first; CRLF stays one break
+            # (the trailing LF is consumed as the next, empty line — a shape
+            # the cursor already produced for blank lines, and skipped).
+            nl = buf.find(b"\n")
+            cr = buf.find(b"\r")
+            if nl == -1 and cr == -1:
+                break
+            idx = cr if (cr != -1 and (nl == -1 or cr < nl)) else nl
             ledger.feed(bytes(buf[:idx]))
             del buf[: idx + 1]
-            idx = buf.find(b"\n")
 
     def _observe_ttft() -> None:
         """TTFT: the first upstream byte batch reaching the client proxy
@@ -1740,9 +1905,16 @@ async def _guarded_sse(
     Pass   → the buffered bytes replay verbatim (byte-identical output;
              the cost is buffering latency, and only when the model has
              post_call guardrails attached).
-    Masked → content-carrying chunks are SUPPRESSED and one consolidated
-             chunk with the masked text is emitted (tool/`pcai` events and
-             non-content chunks replay verbatim — the mask must not leak).
+    Masked → every TEXT-CARRYING chunk is SUPPRESSED (audit ZC-3: content,
+             all three reasoning spellings, tool-call argument fragments and
+             the pcai thinking/tool events all carry the model's text — a
+             chunk the classifier calls text-bearing is dropped WHOLE, never
+             replayed unmasked, because a streaming fragment's guard verdict
+             can differ from the assembled one and a mask that misses a
+             fragment leaks exactly the text it exists to hide) and ONE
+             consolidated chunk carries the masked ASSISTANT ANSWER only.
+             Non-text frames (usage, finish, error envelopes, keepalives)
+             replay verbatim.
     Blocked→ the buffered output is discarded; the client receives a
              terminal SSE error envelope; the ledger records the outcome.
 
@@ -1758,7 +1930,22 @@ async def _guarded_sse(
     try:
         async for chunk in inner:
             chunks.append(chunk)
-            text_parts.extend(_sse_delta_texts(chunk))
+            # The guard judges what the ASSISTANT REPLIED: content deltas
+            # ONLY — see _sse_answer_texts_of_payload (reasoning is dropped
+            # wholesale on the masked path; tool args/results are caller or
+            # tool data and must not block or shape the answer).
+            for line in _sse_line_tokens(chunk):
+                stripped = line.strip()
+                if not stripped.startswith(b"data:"):
+                    continue
+                payload = stripped[len(b"data:") :].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                text_parts.extend(_sse_answer_texts_of_payload(obj))
     except BaseException:
         # Consumer walked away mid-buffer: the deferred ledger row and the
         # slot must still be handled (same discipline as _relay_sse's
@@ -1831,8 +2018,21 @@ async def _guarded_sse(
         for chunk in chunks:
             yield chunk
         return
-    # masked: suppress content-carrying chunks (and any original [DONE]),
-    # replay the rest verbatim, then the consolidated masked content.
+    # masked: suppress EVERY text-carrying chunk (and the original [DONE]),
+    # replay the rest verbatim, then the consolidated masked answer.
+    # ZC-3 (audit 2026-10-29 + xv round 2): the LEAK is fixed by widening the
+    # drop predicate, not by re-masking fragments. A streaming delta is a
+    # FRAGMENT — a guard rule that fires on the assembled text ("your key is
+    # ACME-SECRET-1") can miss both halves of a split secret, so any
+    # per-fragment re-masking either leaks (fragment unchanged) or blocks
+    # clean answers (tool data judged as assistant speech), and re-running
+    # the engine per fragment amplifies one verdict into hundreds of engine
+    # calls. The reviewer-mandated shape: drop text-bearing chunks WHOLE —
+    # a chunk the classifier calls text-bearing is never replayed unmasked,
+    # fail-closed on the channel the mask owns — and ship exactly one
+    # consolidated final carrying the MASKED ANSWER ONLY (not reasoning, not
+    # tool JSON, not pcai text: those are not the assistant's reply and the
+    # old per-channel rewrite glued them into delta.content).
     for chunk in chunks:
         if not _sse_delta_texts(chunk) and b"data: [DONE]" not in chunk:
             yield chunk
@@ -1903,13 +2103,19 @@ async def _peek_first_data_line(
                 return bytes(raw), chunks
             raw += chunk
             # Same line-cursor semantics as _relay_sse: a data line may
-            # straddle two network reads.
-            idx = raw.find(b"\n", scan)
-            while idx != -1:
+            # straddle two network reads — and (audit C-7) a terminator may
+            # be a bare CR, not only LF; a CR-only stream would otherwise
+            # never produce a "data line" here and every attempt would wait
+            # out the whole TTFT budget before failing over.
+            nl = raw.find(b"\n", scan)
+            cr = raw.find(b"\r", scan)
+            while nl != -1 or cr != -1:
+                idx = cr if (cr != -1 and (nl == -1 or cr < nl)) else nl
                 if bytes(raw[scan:idx]).strip().startswith(b"data:"):
                     return bytes(raw), chunks
                 scan = idx + 1
-                idx = raw.find(b"\n", scan)
+                nl = raw.find(b"\n", scan)
+                cr = raw.find(b"\r", scan)
     except BaseException:
         # The peek must never leak the upstream stream on an unexpected
         # failure (cancellation included) — the caller owns the close for
@@ -1995,6 +2201,10 @@ async def _stream_chat(
         # `cur_model` is this attempt's model (a failover hop gets ITS
         # ceiling). The client's `body` stays untouched for the settle.
         send_body = clamp_max_tokens(send_body, cur_model, settings.max_tokens_ceiling)
+        # C-6 (audit 2026-10-29): same rewrite as the non-streaming path —
+        # every attempt names ITS model (this loop IS the failover walk).
+        if send_body.get("model") != cur_model:
+            send_body = {**send_body, "model": cur_model}
         req = model_router.client.build_request("POST", cur_url, json=send_body, headers=cur_headers)
         try:
             resp = await model_router.client.send(req, stream=True)
@@ -2272,6 +2482,12 @@ async def _relay_catalog(
                 "server": server_name,
                 "tool": t["tool"],
                 "description": t.get("description", ""),
+                # The SERVER's own description rides on every entry so the
+                # hybrid surface can render a server directory without a
+                # second lookup (2026-10-28). Carried per-entry rather than
+                # as a third return value: _relay_catalog has two callers and
+                # a tuple change would ripple through both for a display string.
+                "server_description": target.get("description", "") or "",
                 **({"inputSchema": t["inputSchema"]} if isinstance(t.get("inputSchema"), dict) else {}),
             }
             for t in tools
@@ -2296,7 +2512,11 @@ async def _relay_catalog(
     return catalog, relay_grants
 
 
-def _persist_conversation_state(key: KeyRecord):
+def _persist_conversation_state(
+    key: KeyRecord,
+    canonical_input: list[dict[str, Any]] | None = None,
+    relay_projection: list[dict[str, Any]] | None = None,
+):
     """The relay's handback-terminal persistence hook. Returns an
     async callback that saves the AWAITING-CLIENT tail (the relay loop's
     appended messages: the assistant tool_calls + in-loop results) to the
@@ -2307,6 +2527,19 @@ def _persist_conversation_state(key: KeyRecord):
     and the substrate the X-PCAI-Continue
     result-only protocol stitches canonical + pending + client results
     from.
+
+    The input boundary is passed IN, not re-derived, because with the
+    context budget ON the list the relay loop saw is the TRIMMED projection,
+    not the stored canonical list (audit C-4): the old prefix check
+    (`final[:len(stored)] == stored`) compared across those two shapes —
+    once the budget dropped anything, the store was no longer a prefix of
+    what the loop appended to, the flush silently skipped, handback state
+    was never persisted and X-PCAI-Continue 400'd for the whole turn.
+      * `canonical_input` — the UNTRIMMED reconciled list, i.e. the same
+        content the canonical column was saved with; the stored-vs-adopted
+        comparison (a real race detector) still runs against it;
+      * `relay_projection` — the exact list the relay loop was handed and
+        appends to (trimmed or not); the tail slice starts at ITS length.
 
     The relay hands over its FULL final list (it doesn't know where the
     reconciled input ended); the pending column stores ONLY the tail beyond
@@ -2338,12 +2571,32 @@ def _persist_conversation_state(key: KeyRecord):
             # same posture: skip, never guess the boundary.
             log.info("canonical: pending-tail flush skipped (no stored canonical row thread=%s)", thread_id)
             return
-        n = len(stored)
-        if n > len(final_messages) or final_messages[:n] != stored:
+        if canonical_input is not None and stored != canonical_input:
             # The store moved under us (a racing request reconciled a
             # different shape): the slice would be a guess — skip loudly.
+            # (Compared against the UNTRIMMED list this request relayed and
+            # saved — see the docstring: the trimmed projection is a
+            # different shape, and comparing across them is what broke the
+            # flush entirely whenever the context budget dropped anything.)
             log.warning(
                 "canonical: pending-tail flush skipped (stored canonical is not a prefix of the final list, thread=%s)",
+                thread_id,
+            )
+            return
+        if relay_projection is not None:
+            # The relay loop appended to THIS list (its own copy): the tail
+            # starts at its length. The extend check guards a relay that
+            # shrank or rebuilt the list — not a shape the flush can slice.
+            n = len(relay_projection)
+            extends = len(final_messages) >= n and final_messages[:n] == relay_projection
+        else:
+            # Legacy default (no projection passed): the historical
+            # full-prefix check.
+            n = len(stored)
+            extends = not (n > len(final_messages) or final_messages[:n] != stored)
+        if not extends:
+            log.warning(
+                "canonical: pending-tail flush skipped (final list does not extend the relayed input, thread=%s)",
                 thread_id,
             )
             return
@@ -2368,9 +2621,17 @@ async def _reconcile_relay_messages(
     request: Request,
     key: KeyRecord,
     body: dict[str, Any],
-) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None, int]:
+    reserve_tokens: int = 0,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None, int, list[dict[str, Any]]]:
     """Canonical conversation reconciliation for the relay path (ROADMAP §7,
-    phase 1) — returns (messages_to_relay, mode, continuation, iterations_prior).
+    phase 1) — returns (messages_to_relay, mode, continuation, iterations_prior,
+    canonical_input).
+
+    The fifth value is the UNTRIMMED reconciled list — the same list the
+    store was (or would have been) written with. It is the input boundary
+    the handback-terminal flush slices at (audit C-4): deriving that
+    boundary from a prefix comparison against the TRIMMED projection broke
+    the flush whenever the context budget dropped anything.
 
     WHY: a relay HANDBACK ends the stream with finish_reason=tool_calls and
     the harness re-sends the ENTIRE accumulated conversation as a new
@@ -2474,7 +2735,12 @@ async def _reconcile_relay_messages(
                 relay_projection, dropped = canonical.trim_to_budget(
                     merged,
                     budget,
-                    lambda msgs: _estimate_tokens({**body, "messages": msgs}),
+                    # + reserve_tokens: gateway-authored text that rides the
+                    # model call but is NOT in this list (an agent profile's
+                    # system prompt, prepended by toolrelay). Without it the
+                    # context budget under-counts by exactly the prompt size —
+                    # the overflow class the budget exists to prevent.
+                    lambda msgs: _estimate_tokens({**body, "messages": msgs}) + reserve_tokens,
                 )
                 if dropped:
                     log.info(
@@ -2490,16 +2756,16 @@ async def _reconcile_relay_messages(
                 len(incoming),
                 cont_thread,
             )
-            return relay_projection, "continued", cont_shape, iterations_prior
+            return relay_projection, "continued", cont_shape, iterations_prior, merged
         except fastapi.HTTPException:
             raise
         except Exception as exc:
             log.warning("canonical: continuation merge failed (continuing on raw incoming): %s", exc)
-            return incoming, "raw", None, 0
+            return incoming, "raw", None, 0, incoming
 
     escape = (request.headers.get("x-pcai-conversation") or "").strip().lower()
     if escape == "raw" or not settings.canonical_conversations:
-        return incoming, "raw", None, 0
+        return incoming, "raw", None, 0, incoming
     # TITLE-REQUEST EXCLUSION (2026-10-17): a session-title call must never
     # become a canonical row. The relay is engaged for DSH title calls (its
     # provider config sends X-PCAI-Execute-Tools: 1), so this path captures
@@ -2510,11 +2776,11 @@ async def _reconcile_relay_messages(
         {"messages": incoming}, request.headers
     ):
         log.debug("canonical: skipped session-title request (relay path)")
-        return incoming, "raw", None, 0
+        return incoming, "raw", None, 0, incoming
     try:
         thread_id = canonical.thread_key(incoming, key.id)
         if thread_id is None:
-            return incoming, "raw", None, 0  # no first user message -> nothing to key the store on
+            return incoming, "raw", None, 0, incoming  # no first user message -> nothing to key the store on
         stored, iterations_prior = await canonical.load_row(db, key.id, thread_id)
         # ONE hash walk per turn (audit P2-3 follow-up): the prefix verdict is
         # computed here and consumed by BOTH reconcile (mode decision) and, on
@@ -2556,7 +2822,8 @@ async def _reconcile_relay_messages(
             relay_projection, dropped = canonical.trim_to_budget(
                 messages,
                 budget,
-                lambda msgs: _estimate_tokens({**body, "messages": msgs}),
+                # + reserve_tokens — see the twin call above (agent prompt).
+                lambda msgs: _estimate_tokens({**body, "messages": msgs}) + reserve_tokens,
             )
             if dropped:
                 log.info(
@@ -2579,10 +2846,10 @@ async def _reconcile_relay_messages(
             thread_id,
             " handback-continuation" if detected else "",
         )
-        return relay_projection, mode, continuation, iterations_for_guard
+        return relay_projection, mode, continuation, iterations_for_guard, messages
     except Exception as exc:
         log.warning("canonical: reconciliation failed (continuing on raw incoming messages): %s", exc)
-        return incoming, "raw", None, 0
+        return incoming, "raw", None, 0, incoming
 
 
 _capture_tasks: set[asyncio.Task] = set()
@@ -2704,6 +2971,24 @@ async def chat_completions(
         # special cases and the cascade reuse ONE lookup; resolve_cascade
         # re-fetches internally for its own walk (unchanged).
         order = await profile_order_for_key(key.id) if _routable else []
+        # CHAT-ONLY LADDER (2026-10-29): the ordering is an ACL as well as a
+        # ladder, so it can carry embedding/reranker pools. The router's ladder
+        # is a CHAT concept — order[0] is the CEILING and reversed(order) the
+        # cheap-first walk — so a non-chat head would pin every `routing`
+        # request to a pool the chat path then 400s. Filtered HERE (one place,
+        # both consumers) rather than inside core.model_routing, which is pure
+        # and takes the ladder as given.
+        if order:
+            order = [m for m in order if serves_chat(m)]
+        # GLOBAL LADDER (2026-10-28): the profile order is a CASCADE ordering;
+        # a profile that declares none used to make bare `routing` 404
+        # ("routing requires a profile model ordering"), i.e. the feature
+        # silently did not exist for that profile. Fall back to the fleet-level
+        # routing_config.model_order so routing is armed and usable once,
+        # globally. `order` is consumed ONLY by resolve_routed_model below, so
+        # the cascade walk and the relay fallback tail are untouched.
+        if _routable and not order:
+            order = await model_routing.global_ladder()
         # --- conversation incumbent -----------------------------------------
         # Read BEFORE the decision seam because the seam needs the
         # conversation's CURRENT model for two things:
@@ -2748,11 +3033,29 @@ async def chat_completions(
                         # the request carries them; bounded so a 40-image dump
                         # cannot blow the decision latency budget.
                         _imgs = _dr.extract_user_turn(_body)[1][: _dr.MAX_DECISION_IMAGES]
+                        # COST HINTS, automatic: the prompt tells the model to
+                        # break ties by cost, but nothing populated
+                        # candidates[].cost, so that step could never fire. The
+                        # rates are the ones the settle path already bills from
+                        # (model_costs), formatted once per decision.
+                        try:
+                            from ..core import costs as _costs
+
+                            # Bounded: the decision call itself is capped at
+                            # decision_timeout_ms, and a pricing table that
+                            # stalls must not extend that budget -- a timeout
+                            # costs a tie-break, never the decision.
+                            _prices = await asyncio.wait_for(
+                                _costs.price_hints(list(candidates)), timeout=0.5
+                            )
+                        except Exception:  # never let pricing cost a decision
+                            _prices = {}
                         state = _dr.build_state(
                             _body,
                             complexity=score,
                             candidates=candidates,
                             gpu=gpu,
+                            costs=_prices,
                             modalities=_p.get("modalities") or None,
                             # What this conversation is ALREADY served by, so
                             # the model can weigh the re-prefill a switch costs.
@@ -2799,6 +3102,25 @@ async def chat_completions(
                         )
 
 
+        # Budget capacity for THIS key, fetched ONCE per routing request
+        # (two aggregate queries — NOT one per model) and handed to the
+        # availability predicate so a model this key cannot afford right now
+        # is never offered to the router. This is what makes {{model_list}}
+        # honest: the decision model sees only models with token capacity at
+        # this moment. Fail-open by contract — a capacity fault leaves the
+        # map empty, which the predicate reads as "not evaluated" = available,
+        # so routing degrades to its previous behaviour instead of emptying
+        # the ladder (the admission gate still enforces the budget).
+        _capacity: dict[str, dict] = {}
+        if _routable:
+            try:
+                from ..core import budgets as _budgets
+
+                _capacity = await _budgets.model_capacity(key.id, sorted(registered))
+            except Exception as exc:
+                log.warning("routing: capacity lookup failed (fail-open): %s", exc)
+                _capacity = {}
+
         model, route_ctx = await model_routing.resolve_routed_model(
             key,
             body,
@@ -2806,7 +3128,7 @@ async def chat_completions(
             registered,
             key.allowed_models,
             order,
-            available=_routing_available(key) if _routable else None,
+            available=_routing_available(key, _capacity) if _routable else None,
             decide=decide_fn,
             sticky_floor=_sticky_floor,
             sticky_write=_sticky_write,
@@ -2848,11 +3170,54 @@ async def chat_completions(
     except Exception:
         log.warning("cascade: thread fingerprint failed — load-aware head disabled for this request", exc_info=True)
         _cascade_thread = None
-    # canonical capture for the plain chat path (fire-and-forget; the relay
-    # path captures its own): ANY agent using this key — relayed or not —
-    # converges into the canonical store and gets automatic memories.
+    # --- three-state relay resolution, EARLY (audit L-2): the plain-chat
+    # capture below must not run on a RELAYED request — the relay branch owns
+    # that turn's store rows (the reconcile save + the loop's own terminal
+    # persistence), and the capture was a second load+save against the same
+    # (key_id, thread_id) row on the hottest path (the commit that added the
+    # relay branch claimed "no capture on relay requests", but the only read
+    # of the relay header sat AFTER this scheduling). The verdict uses the
+    # SAME inputs the relay pre-flight consumes further down (header three-
+    # state + key default + the {type: mcp} body opt-in), so this guard and
+    # the resolution that actually routes the turn cannot drift.
     try:
-        if len(_capture_tasks) < _CAPTURE_TASKS_MAX:
+        _probe_mcp_reqs, _probe_fn_tools = _split_request_tools(body.get("tools"))
+    except ValueError:
+        # the strict parse below (with its 400) still owns validation; the
+        # probe only needs the not-a-mcp-tool answer
+        _probe_mcp_reqs = []
+    header_val = request.headers.get("x-pcai-execute-tools")
+    # MIRROR of the pre-flight's FINAL verdict (the block further down): the
+    # header's explicit "0" outranks the body opt-in and turns it into a
+    # loud 400 (relay_requested stays False there); require_approval:always
+    # is the client-execution path, never the relay; the global kill-switch
+    # off means the body opt-in is a 400, not a relay. Computing the same
+    # value here is what keeps the capture guard from drifting away from the
+    # resolution that actually routes the turn.
+    relay_requested = _relay_wants(header_val, key.relay_default, settings.tool_relay_enabled)
+    _probe_hdr0 = (header_val or "").strip() == "0"
+    _probe_approval_always = any(t.get("require_approval") == "always" for t in _probe_mcp_reqs)
+    if (
+        not relay_requested
+        and _probe_mcp_reqs
+        and not _probe_approval_always
+        and not _probe_hdr0
+        and settings.tool_relay_enabled
+    ):
+        relay_requested = True
+    if _probe_approval_always:
+        # require_approval:"always" is the CLIENT-execution path — the
+        # pre-flight below flips relay_requested to False for it even when
+        # the header or the key default armed the relay (xv round 2,
+        # finding 10: an approval-always request on a relay-default key is
+        # NOT relayed, so its plain-chat capture must run).
+        relay_requested = False
+    # canonical capture for the plain chat path (fire-and-forget; the relay
+    # path captures its own): a NON-relayed agent using this key converges
+    # into the canonical store and gets automatic memories. A relayed request
+    # is skipped above — relay_requested is the guard.
+    try:
+        if not relay_requested and len(_capture_tasks) < _CAPTURE_TASKS_MAX:
             # strong ref via the module set (a bare create_task can be GC'd
             # mid-flight - the classic fire-and-forget footgun); the done
             # callback discards AND logs (never a silent swallow)
@@ -2864,6 +3229,74 @@ async def chat_completions(
             _t.add_done_callback(_capture_tasks.discard)
     except Exception:
         log.warning("canonical: plain-chat capture could not be scheduled", exc_info=True)
+    # --- agent profiles (2026-10-29): a MODEL NAME that names an agent ------
+    # An agent is advertised in /v1/models as a model entry (pcai.type="agent"),
+    # so selecting one is just naming it. Resolution happens HERE — before the
+    # cascade — for two reasons:
+    #   1. the generic alias path would otherwise treat an unknown name as a
+    #      cascade request and serve it with the profile FULL tool surface: a
+    #      request that ASKED for a narrow agent would silently WIDEN. The 403
+    #      below is what keeps "not an agent" and "an agent you may not use"
+    #      distinguishable.
+    #   2. an agent may pin a model, which turns the rest of this block into an
+    #      ordinary pinned request (budgets, ACL, fallbacks all unchanged).
+    # SKIPPED for registered names (pinned), routing pseudo-models, and the two
+    # reserved aliases — so the dominant `auto` path pays nothing for this
+    # feature (no extra query).
+    agent: agents_mod.Agent | None = None
+    if _pseudo is None and requested_model not in registered and requested_model not in agents_mod.RESERVED_NAMES:
+        try:
+            _key_agents = await agents_mod.for_key(key.id)
+            agent = agents_mod.pick(_key_agents, requested_model)
+            if agent is None:
+                # NEAR MISS (case-only): a model id is exact, so this is a
+                # typo, not an alias request. Refuse it BY NAME — falling
+                # through would serve the profile FULL surface for a caller who
+                # asked for a narrow agent, and a silent cascade is
+                # indistinguishable from success.
+                _near = agents_mod.near_miss(_key_agents, requested_model)
+                if _near is not None:
+                    raise fastapi.HTTPException(
+                        404,
+                        detail={
+                            "type": "agent_name_case",
+                            "did_you_mean": _near.name,
+                            "message": (
+                                f"{requested_model!r} is not a model id; agents are matched exactly"
+                                f" — did you mean {_near.name!r}?"
+                            ),
+                        },
+                    )
+        except agents_mod.AgentRegistryUnavailable:
+            # FAIL OPEN, LOUDLY (core.agents docstring): an agent only ever
+            # HIDES tools the key already holds, so a registry fault degrades to
+            # "no narrowing" — the profile surface, which is what any
+            # unregistered name gets today — instead of making every alias
+            # request depend on this read. A fault is NEVER reported as a
+            # permission decision (the 403 below requires a successful read).
+            log.warning(
+                "agents: registry unavailable — serving %r without agent scoping (profile surface applies)",
+                requested_model,
+            )
+            agent = None
+        if agent is not None:
+            if not agent.offered:
+                raise fastapi.HTTPException(
+                    403,
+                    detail={
+                        "type": "agent_not_offered",
+                        "agent": agent.name,
+                        "message": (
+                            f"agent {agent.name!r} is not offered by this key's profile"
+                            " — ask the operator to add it, or name a registered model"
+                        ),
+                    },
+                )
+            # '' = cascade: the agent chooses tools + prompt, not the model, so
+            # it rides the SAME walk `auto` does (budget headroom, ACL, sticky
+            # head, admission failover — nothing special-cased).
+            model = agent.model or "auto"
+
     resolution = await resolve_cascade(
         key.id, model, registered, key.allowed_models, est_tokens, thread_key=_cascade_thread
     )
@@ -2875,6 +3308,16 @@ async def chat_completions(
             429 if resolution.attempts is not None else 403 if "not allowed" in resolution.reason else 404, detail
         )
     model = resolution.model  # the model that will actually serve
+    # Deferred stickiness commit (audit 2026-10-29 P3, XV-3): the router picks
+    # BEFORE admission, so the floor is written only now, with the model the
+    # gates actually settled on. Fail-open: a sticky fault must never fail a
+    # request that admission already approved (the writer is fail-open by
+    # contract; this catch is belt-and-braces for the finisher itself).
+    if route_ctx is not None and route_ctx.sticky_finish is not None:
+        try:
+            route_ctx.sticky_finish(model)
+        except Exception:
+            log.warning("routing: deferred sticky commit failed - floor not persisted", exc_info=True)
     # Per-request routing decision (observability, 2026-10-17): the gateway
     # logged cascade EVENTS only, so "which model actually served this
     # request, and why" was unanswerable in production — a pinned request
@@ -2942,7 +3385,12 @@ async def chat_completions(
     for _m in body["messages"]:
         if not isinstance(_m, dict):
             continue
-        for _rk in ("reasoning_content", "reasoning"):
+        # ALL THREE spellings the relay itself recognises (toolrelay.
+        # REASONING_KEYS). "reasoning_text" was missing here (audit ZC-5) —
+        # the pi-ai spelling for OpenRouter-style upstreams — so a client
+        # replaying reasoning under that key bypassed the cap entirely and
+        # the 2026-09-18 amplification hole reopened through it.
+        for _rk in toolrelay.REASONING_KEYS:
             _rv = _m.get(_rk)
             if _rv is None:
                 continue
@@ -3034,6 +3482,23 @@ async def chat_completions(
         else:
             body.pop("tools", None)
 
+    # --- agent scope vs an EXPLICIT server request (both tool paths) --------
+    # The client asked for specific servers AND named an agent. If the agent
+    # excludes one of them the request is self-contradictory: serving it either
+    # way lies to someone (the model gets a surface it was told it had, or the
+    # client gets a surface it asked not to have). FAIL LOUD, here, so the relay
+    # path and the approval-passthrough path cannot drift apart — the passthrough
+    # used to narrow silently and could ship an EMPTY tools array upstream
+    # (cross-validation 2026-10-29).
+    if agent is not None and requested_servers:
+        excluded = sorted(set(requested_servers) - set(agent.servers))
+        if excluded:
+            raise fastapi.HTTPException(
+                400,
+                f"agent {agent.name!r} does not include server(s) {excluded}"
+                f" (agent servers: {list(agent.servers)})",
+            )
+
     # --- relay pre-flight BEFORE the gates (slot-leak fix, security audit):
     # the "no MCP grants" 400 is deterministic from the key alone, so it runs
     # before _run_gates — the old order raised it AFTER the concurrency
@@ -3050,8 +3515,8 @@ async def chat_completions(
     # require_approval 'never' engages the relay; an explicit header '0'
     # still wins (with a loud 400 rather than silently ignoring the
     # execution request).
-    header_val = request.headers.get("x-pcai-execute-tools")
-    relay_requested = _relay_wants(header_val, key.relay_default, settings.tool_relay_enabled)
+    # relay_requested was resolved EARLY above (the L-2 capture guard shares
+    # the exact verdict); header_val rides along for the opt-out 400s below.
     # Per-request pcai-event override (RFC-PER-KEY-STREAM-EVENTS): '1' forces
     # telemetry events on, '0' strips them (strict clients), absent = the
     # key's stream_pcai_events default. Resolved ONCE here and passed into
@@ -3094,6 +3559,9 @@ async def chat_completions(
         catalog, _ = await _relay_catalog(key, relay_grants, requested_servers)
         if not catalog:
             raise fastapi.HTTPException(400, "approval passthrough requested but no MCP tools are granted to this key")
+        # An agent narrows the CLIENT-execution surface too: a model handed an
+        # agent must never see a tool the agent excludes, whichever side runs it.
+        catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None)
         fn_defs = [
             {
                 "type": "function",
@@ -3106,6 +3574,13 @@ async def chat_completions(
             for t in catalog
         ]
         body["tools"] = [*fn_tools, *fn_defs]
+        # An agent can narrow the surface to NOTHING (a chat-only agent) and the
+        # emptiness guard above ran BEFORE that narrowing. `tools: []` is not the
+        # same as having no tools key: strict upstreams (SGLang) 400 an empty
+        # array, and the model would see a tool channel with nothing in it
+        # (cross-validation 2026-10-29).
+        if not body["tools"]:
+            body.pop("tools", None)
         relay_requested = False
 
     # --- admission failover (rate/budget 429 -> next cascade candidate) ---
@@ -3228,6 +3703,14 @@ async def chat_completions(
 
         if relay_requested:
             catalog, relay_grants = await _relay_catalog(key, relay_grants, requested_servers)
+            # --- AGENT SCOPE (three-set rule, core.agents) ------------------
+            # The OFFERED surface and the DISPATCH gate narrow to the agent's
+            # servers; the EXECUTOR keeps the key's FULL set, so the read+egress
+            # gate still sees every tool this key could ever call (a per-request
+            # switchable selector must never become a way to split read and
+            # egress across two agents).
+            offered_grants = agents_mod.narrow_grants(relay_grants, agent.servers if agent else None)
+            catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None)
             # relay_grants rides along for the argument stage's read+egress
             # separation — already computed here, so no extra DB round-trip
             # on the hot path.
@@ -3309,8 +3792,13 @@ async def chat_completions(
             # client answering a handback (extend + tool-result-only tail),
             # the relay loop below is told so it can label the turn as a
             # continuation instead of a fresh conversation.
-            relay_messages, _recon_mode, continuation, iterations_prior = await _reconcile_relay_messages(
-                request, key, body
+            # The agent prompt rides every model call but is NOT in the client's
+            # message list, so the context budget must reserve its size (one
+            # rough token per 4 chars, the repo's estimator convention) or the
+            # trim would let the call overflow by exactly that much.
+            _agent_reserve = len(agent.system_prompt) // 4 if agent is not None and agent.system_prompt else 0
+            relay_messages, _recon_mode, continuation, iterations_prior, canonical_input = await _reconcile_relay_messages(
+                request, key, body, reserve_tokens=_agent_reserve
             )
 
             # Synthetic tool-call id counter for the WHOLE relay turn (audit
@@ -3321,6 +3809,10 @@ async def chat_completions(
             # counter has to reach stream_model_call, which is built here — so
             # it lives at this scope and every call closes over it.
             relay_id_counter: list[int] = [0]
+            # Model-call counter for THIS relay turn (audit ZC-7): stream_once
+            # downgrades the client's pinned tool_choice from the second call
+            # on — see the comment there.
+            call_index: list[int] = [0]
 
             def stream_once(msgs: list[dict], tools: list[dict] | None, pool_for: Any = None):
                 """One model call as an async GENERATOR of typed events.
@@ -3345,8 +3837,34 @@ async def chat_completions(
                 # via `pool_for`, so the clamp is re-evaluated per call with
                 # that call's model instead of the request's requested one.
                 b2 = clamp_max_tokens(b2, ep2.model_name, settings.max_tokens_ceiling)
+                # C-6 (audit 2026-10-29): the wire body names the model
+                # serving THIS call. b2 still carries the CLIENT's name (a
+                # pin, or an alias like auto/routing); the relay's per-hop
+                # ledger rows, X-PCAI-Served-Model and the mid-loop failover
+                # all speak in serving-model names, and a strict upstream
+                # 400s a body naming a model it does not serve — the failover
+                # would lose the hop it just gained.
+                b2["model"] = ep2.model_name
+                call_index[0] += 1
                 if tools:
                     b2["tools"] = tools
+                    # ZC-7 (audit 2026-10-29): the client's tool_choice used
+                    # to ride into EVERY loop call verbatim — "required" (or
+                    # a pinned function) forces each upstream call to return
+                    # tool calls, so the loop could only end at the guards:
+                    # the caller waited out the whole iteration/wall-clock
+                    # budget and got the max-iterations wrap-up instead of an
+                    # answer. The client's choice governs the FIRST call;
+                    # from the second on (tool results are in msgs) the model
+                    # must be free to answer in text.
+                    if call_index[0] > 1:
+                        b2["tool_choice"] = "auto"
+                else:
+                    # tool_choice without tools is an unconditional 400 on
+                    # strict upstreams: a body stripped of its mcp entries
+                    # (or a catalog-less turn) must not carry the client's
+                    # choice either.
+                    b2.pop("tool_choice", None)
 
                 async def gen():
                     try:
@@ -3438,10 +3956,15 @@ async def chat_completions(
 
             async def relay_gen():
                 iteration_depth = 0  # observed in finally — see below
+                relay_iterations: list[int] = []  # C-8 out-param (see below)
                 try:
                     async for chunk in toolrelay.relay_stream(
                         relay_messages,
-                        relay_grants,
+                        # OFFERED (agent-narrowed) grants, NOT the key's full
+                        # set: the surface and the dispatch gate must agree with
+                        # what the model was shown. The exfil gate above still
+                        # reads the full set.
+                        offered_grants,
                         catalog,
                         stream_once,
                         execute,
@@ -3477,6 +4000,10 @@ async def chat_completions(
                         # that opted in via X-PCAI-Relay-Deltas: 1.
                         render_deltas=render_deltas,
                         render_index_base=settings.tool_relay_render_index_base,
+                        # The agent profile's system prompt ('' = none). Applied
+                        # per CALL by toolrelay.with_system_prefix — never to
+                        # relay_msgs, whose length is the handback boundary.
+                        system_prefix=agent.system_prompt if agent is not None else "",
                         # Wave B2 client-tool dispatch: the executor (None
                         # when the flag is off, no offer, or wiring failed —
                         # handback behavior) and the shared wall-clock
@@ -3494,23 +4021,35 @@ async def chat_completions(
                         # conversation's thread fingerprint at loop end — the
                         # substrate a next-wave client's session-ref
                         # continuation reads instead of a full re-send.
-                        conversation_state=_persist_conversation_state(key),
+                        conversation_state=_persist_conversation_state(
+                            key, canonical_input=canonical_input, relay_projection=relay_messages
+                        ),
                         # RFC-PER-KEY-STREAM-EVENTS: key default + header
                         # override resolved above.
                         stream_pcai_events=stream_events,
+                        # C-8 (audit 2026-10-29): the relay's OWN iteration
+                        # count, published as it goes. The histogram used to be
+                        # derived by byte-matching the emitted pcai model_usage
+                        # event, which reads 0 for every X-PCAI-Stream-Events: 0
+                        # client (all strict OpenAI clients) and is the wrong
+                        # signal for a metric that means "how deep did the loop
+                        # go". This is the loop's accounting, not a re-derivation.
+                        iterations_out=relay_iterations,
                     ):
-                        # Count model iterations WITHOUT parsing protocol
-                        # internals: the relay emits exactly one
-                        # model_usage pcai-event per completed model call
-                        # (its ledger contract), so byte-matching the event
-                        # name gives the iteration depth cheaply and never
-                        # drifts from the settle contract.
-                        if b'"event": "model_usage"' in chunk or b'"event":"model_usage"' in chunk:
-                            iteration_depth += 1
+                        # C-8 (audit 2026-10-29): the depth now comes from the
+                        # relay's own counter (iterations_out, above), so this
+                        # loop is a pure pass-through — no byte-matching, which
+                        # read 0 for strict clients and could be perturbed by
+                        # model text. iteration_depth is refreshed after the
+                        # loop from the out-param.
                         yield chunk
                 finally:
                     # Every exit path (done, guard, disconnect) observes the
-                    # depth reached; histogram in [0..max_iterations].
+                    # depth reached; histogram in [0..max_iterations]. The
+                    # relay publishes after every completed call, so a closed
+                    # generator still carries the depth it reached.
+                    if relay_iterations:
+                        iteration_depth = relay_iterations[0]
                     _metrics.observe_relay_iterations(model, iteration_depth)
                     _release_in_flight(key.id)
 
@@ -3556,6 +4095,19 @@ async def chat_completions(
         _release_in_flight(key.id)
         raise
 
+    # --- agent system prompt on the PLAIN path (no relay) -------------------
+    # The relay path applies the prompt per CALL inside toolrelay (so it never
+    # enters the canonical store or the handback boundary). The plain path has no
+    # such seam, so the body is COPIED here with the prompt prepended — after the
+    # canonical capture was scheduled (it holds the original object) and after
+    # the guardrails ran (an operator's own prose is not what a PII guardrail
+    # should be scanning). Both plain dispatches below (_stream_chat and
+    # _proxy_json) read this body.
+    if agent is not None and agent.system_prompt:
+        body = {
+            **body,
+            "messages": toolrelay.with_system_prefix(list(body.get("messages") or []), agent.system_prompt),
+        }
     if bool(body.get("stream")):
         # Streaming: slot ownership TRANSFERS to the stream generator
         # (released in _relay_sse's finally, when the stream actually ends).
@@ -3795,11 +4347,36 @@ async def list_models(
     # UI change. Unprofiled keys: no primary (nothing to prefer).
     order = await profile_order_for_key(key.id)
     registered_set = set(registered)
-    primary = next((m for m in order if m in registered_set), "")
+    # CHAT-ONLY (2026-10-29): `primary` means "what `auto` would resolve to",
+    # and `auto` is chat-only now (core.cascade.serves_chat) — a non-chat head
+    # must not be marked primary, or the console preselects an embedding pool in
+    # the model dropdown and the first send 400s.
+    primary = next((m for m in order if m in registered_set and serves_chat(m)), "")
 
     def _pool_type(m: str) -> str:
         p = model_router.pool(m)
         return p.endpoints[0].model_type if p is not None and p.endpoints else "chat"
+
+    # CAPACITY (operator requirement, 2026-10-28): model_list should show, for
+    # a given api key, what models still have token capacity at that moment.
+    # ONE extra pair of aggregate queries for the whole listing -- model_capacity
+    # is not-N (it reuses budget_status two SUMs), so a 40-model listing costs
+    # the same as a 2-model one.
+    #
+    # ANNOTATE, do not filter. Dropping exhausted entries would make a drained
+    # budget indistinguishable from an ACL narrowing or a registry outage --
+    # exactly the confusion X-PCAI-Models-Denied was added to fix (see the
+    # truncation note above). pcai.capacity lets a client SEE the headroom and
+    # decide; the admission gate still enforces either way, and model_capacity
+    # fails open, so a budget-table fault degrades to the previous listing
+    # rather than an empty one.
+    try:
+        from ..core import budgets as _budgets
+
+        capacity = await _budgets.model_capacity(key.id, registered)
+    except Exception as exc:
+        log.warning("/v1/models: capacity lookup failed (fail-open): %s", exc)
+        capacity = {}
 
     data = [
         {
@@ -3807,7 +4384,11 @@ async def list_models(
             "object": "model",
             "created": int(time.time()),
             "owned_by": "pcai-llm-gateway",
-            "pcai": {"type": _pool_type(m), **({"primary": True} if m == primary else {})},
+            "pcai": {
+                "type": _pool_type(m),
+                **({"primary": True} if m == primary else {}),
+                **({"capacity": capacity[m]} if m in capacity else {}),
+            },
         }
         for m in registered
     ]
@@ -3876,7 +4457,47 @@ async def list_models(
                     "pcai": {"type": "routing"},
                 }
             )
+    # --- AGENT PROFILES (2026-10-29) ---------------------------------------
+    # An agent is selected by NAME, so it is advertised as a model entry: a
+    # client that pins provider+model (DSH's teammate spawn does exactly that)
+    # can name an agent with no other configuration. Filtered by the SAME
+    # function the request path uses (core.agents.for_key), so the listing
+    # cannot offer an agent the request would then 403.
+    try:
+        _agents = await agents_mod.for_key(key.id)
+    except agents_mod.AgentRegistryUnavailable:
+        # FAIL-SOFT HERE, unlike the request path: a listing that cannot read
+        # the registry shows no agents (the truth it can prove) instead of
+        # 400ing a call that needs no agent at all.
+        _agents = []
+    for _a in _agents:
+        if not _a.offered:
+            continue
+        # An agent PINNED to a model this key may not call would 403 at request
+        # time — never advertise it. Same for a pinned model that cannot serve
+        # CHAT (the admin API refuses that at save, but the registry can move
+        # under a stored row, and a listed entry that always 400s is a lie).
+        # Unpinned agents ride the profile cascade, which the ACL already
+        # governs; a pinned-but-unregistered name falls through to the cascade
+        # by design (core.cascade.classify_request), so it stays listed.
+        if _a.model and ((allowed is not None and _a.model not in allowed) or not serves_chat(_a.model)):
+            continue
+        data.append(
+            {
+                "id": _a.name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "pcai-llm-gateway",
+                "pcai": {
+                    "type": "agent",
+                    "description": _a.description,
+                    "servers": list(_a.servers),
+                    "model": _a.model or "auto",
+                },
+            }
+        )
     return {"object": "list", "data": data}
+
 
 
 @router.get("/usage")

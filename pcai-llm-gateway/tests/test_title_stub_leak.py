@@ -198,3 +198,60 @@ def test_stub_bytes_are_recognizable():
     body = stub[len(STUB_INDEX) :].strip()
     assert body == "Updating dsh package version"
     assert "## " not in stub, "a real summary always carries sections"
+
+
+# ---------------------------------------------------------------------------
+# AUDIT 2026-10-29 B-F1 (P1): decode the JSONB payload at the boundary
+# ---------------------------------------------------------------------------
+
+
+def test_f1_jsonb_string_payload_is_decoded_before_classification():
+    """asyncpg returns a jsonb column as a STRING (no JSONB codec is
+    registered on the pool). The title detector starts with
+    "if not isinstance(messages, list): return False", so on the REAL row
+    shape it returned False for every row and the exclusion was inert.
+
+    Pre-fix: is_title_messages(<the str>) -> False for the title row below.
+    """
+    import json
+
+    from pcai_llm.core.distill_schedule import decode_jsonb_messages
+
+    row = [
+        _gen_msg("investigate the routing bug"),
+        {"role": "assistant", "content": "Routing bug"},
+        _rev_msg("Routing bug"),
+        {"role": "assistant", "content": "Routing bug"},
+    ]
+    payload = json.dumps(row)
+    assert title_requests.is_title_messages(payload) is False  # the inert path
+    decoded = decode_jsonb_messages(payload)
+    assert isinstance(decoded, list)
+    assert title_requests.is_title_messages(decoded) is True
+
+
+def test_f1_decode_leaves_a_real_conversation_alone():
+    import json
+
+    from pcai_llm.core.distill_schedule import decode_jsonb_messages
+
+    row = [
+        {"role": "user", "content": "why is the distill sweep writing title stubs?"},
+        {"role": "assistant", "content": "Because the guard counts header chars."},
+        {"role": "user", "content": "fix it"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    assert decode_jsonb_messages(json.dumps(row)) == row
+    assert title_requests.is_title_messages(decode_jsonb_messages(json.dumps(row))) is False
+
+
+def test_f1_decode_is_tolerant_of_malformed_payloads():
+    """A payload that is not a JSON array is returned UNCHANGED: a malformed
+    row must never be silently replaced, and build_transcript has its own
+    recovery for the double-encoded shapes."""
+    from pcai_llm.core.distill_schedule import decode_jsonb_messages
+
+    assert decode_jsonb_messages("not json at all") == "not json at all"
+    assert decode_jsonb_messages('{"role": "user"}') == '{"role": "user"}'
+    assert decode_jsonb_messages([{"role": "user"}]) == [{"role": "user"}]
+    assert decode_jsonb_messages(None) is None

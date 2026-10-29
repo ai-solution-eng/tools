@@ -105,8 +105,14 @@ def _stream_relay(model_side_effects, exec_side_effects, **kwargs):
     calls = {"exec": 0}
     idx = {"n": 0}  # PER-RELAY model-call counter (a stream_once-local reset
     # would replay the first effect on every iteration)
+    # Optional capture of the tools array offered on EACH model call. The
+    # hybrid tool surface's whole contract is "what the model was offered",
+    # and that is only observable here (2026-10-28).
+    offered = kwargs.pop("offered", None)
 
     def stream_once(msgs, tools):
+        if offered is not None:
+            offered.append(tools)
         call_idx = idx["n"]
         idx["n"] += 1
         r = model_side_effects[min(call_idx, len(model_side_effects) - 1)]
@@ -2115,14 +2121,36 @@ def test_parallel_tool_calls_without_index_do_not_merge() -> None:
     """F-2: the OpenAI streaming contract does not require `index` on every
     fragment. Keying blindly on index 0 merged distinct parallel calls,
     concatenating name+arguments into one bogus call (e.g. "bashread")."""
-    calls = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"id": "c1", "type": "function",
-             "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"id": "c2", "type": "function",
-             "function": {"name": "read", "arguments": '{"p":"x"}'}}]}}]},
-    ])
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"id": "c2", "type": "function", "function": {"name": "read", "arguments": '{"p":"x"}'}}
+                            ]
+                        }
+                    }
+                ]
+            },
+        ]
+    )
     assert len(calls) == 2
     assert calls[0]["function"]["name"] == "bash"
     assert calls[1]["function"]["name"] == "read"
@@ -2133,12 +2161,26 @@ def test_parallel_tool_calls_without_index_do_not_merge() -> None:
 def test_repeated_tool_name_fragment_does_not_duplicate() -> None:
     """F-3: an upstream that repeats the name on every fragment produced
     "bashbash", which missed the ACL parse and became an unknown-tool error."""
-    calls = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": '{"cmd":'}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "function": {"name": "bash", "arguments": '"ls"}'}}]}}]},
-    ])
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": '{"cmd":'}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"name": "bash", "arguments": '"ls"}'}}]}}
+                ]
+            },
+        ]
+    )
     assert len(calls) == 1
     assert calls[0]["function"]["name"] == "bash"
     assert calls[0]["function"]["arguments"] == '{"cmd":"ls"}'
@@ -2148,12 +2190,12 @@ def test_tool_call_without_upstream_id_gets_a_synthetic_one() -> None:
     """F-4: an empty id made the DSH renderer join BOTH telemetry events to
     ONE card (relayById only registers non-empty ids, so both fell through to
     relayByName). The gateway must never put an empty id on the wire."""
-    calls = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "function": {"name": "bash", "arguments": "{}"}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 1, "function": {"name": "read", "arguments": "{}"}}]}}]},
-    ])
+    calls = _assemble(
+        [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "bash", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 1, "function": {"name": "read", "arguments": "{}"}}]}}]},
+        ]
+    )
     assert len(calls) == 2
     ids = [c["id"] for c in calls]
     assert all(i for i in ids), f"empty id on the wire: {ids}"
@@ -2163,12 +2205,32 @@ def test_tool_call_without_upstream_id_gets_a_synthetic_one() -> None:
 def test_parallel_calls_keep_upstream_order_not_index_order() -> None:
     """First-seen order is the model intent order; the old sorted(acc)
     reordered calls whenever an upstream numbered them out of arrival order."""
-    calls = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 1, "id": "c_second", "function": {"name": "second", "arguments": "{}"}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "c_first", "function": {"name": "first", "arguments": "{}"}}]}}]},
-    ])
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 1, "id": "c_second", "function": {"name": "second", "arguments": "{}"}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "c_first", "function": {"name": "first", "arguments": "{}"}}
+                            ]
+                        }
+                    }
+                ]
+            },
+        ]
+    )
     assert [c["function"]["name"] for c in calls] == ["second", "first"]
 
 
@@ -2260,14 +2322,50 @@ def test_render_delta_indexes_are_unique_across_iterations() -> None:
     # Distinct ids AND distinct arguments per iteration: identical repeats trip
     # the in-loop loop guard (separate, deliberate behaviour), which would end
     # the turn after iteration 1 and hide the index-space bug under test.
-    iter1 = [{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "a1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"1a"}'}},
-        {"index": 1, "id": "a2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"1b"}'}},
-    ]}}]}]
-    iter2 = [{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "b1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"2a"}'}},
-        {"index": 1, "id": "b2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"2b"}'}},
-    ]}}]}]
+    iter1 = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "a1",
+                                "function": {"name": "logsearch__search_logs", "arguments": '{"q":"1a"}'},
+                            },
+                            {
+                                "index": 1,
+                                "id": "a2",
+                                "function": {"name": "logsearch__search_logs", "arguments": '{"q":"1b"}'},
+                            },
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
+    iter2 = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "b1",
+                                "function": {"name": "logsearch__search_logs", "arguments": '{"q":"2a"}'},
+                            },
+                            {
+                                "index": 1,
+                                "id": "b2",
+                                "function": {"name": "logsearch__search_logs", "arguments": '{"q":"2b"}'},
+                            },
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
     final = [{"choices": [{"delta": {"content": "done"}}]}]
     text = _drive_relay([iter1, iter2, final], render_deltas=True)
     idxs = _render_indexes(text)
@@ -2279,14 +2377,26 @@ def test_handback_emits_usage_chunk_before_done() -> None:
     """F-7: both handback terminals closed with finish_reason + [DONE] and no
     usage chunk, despite include_usage=True being forced at the routes layer.
     DSH is a handback client, so every DSH turn reported zero usage."""
-    call = [{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}},
-    ]}}]}, {"usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}}]
+    call = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                        ]
+                    }
+                }
+            ]
+        },
+        {"usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}},
+    ]
     text = _drive_relay(
         [call],
         include_usage=True,
-        client_tools=[{"type": "function", "function": {
-            "name": "bash", "description": "d", "parameters": {"type": "object"}}}],
+        client_tools=[
+            {"type": "function", "function": {"name": "bash", "description": "d", "parameters": {"type": "object"}}}
+        ],
     )
     usages = _usage_chunks(text)
     assert usages, "handback terminal emitted no usage chunk"
@@ -2305,9 +2415,22 @@ def test_synthetic_ids_are_unique_across_iterations() -> None:
     import asyncio
 
     def one(q):
-        return [{"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "function": {"name": "logsearch__search_logs",
-                                       "arguments": json.dumps({"q": q})}}]}}]}]
+        return [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"name": "logsearch__search_logs", "arguments": json.dumps({"q": q})},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
 
     final = [{"choices": [{"delta": {"content": "done"}}]}]
     counter = [0]
@@ -2324,9 +2447,7 @@ def test_synthetic_ids_are_unique_across_iterations() -> None:
                     yield ("data: " + json.dumps(c) + "\n\n").encode()
 
         async def gen():
-            async for ev in toolrelay.stream_model_call(
-                R(), id_prefix="req-abc", id_counter=counter
-            ):
+            async for ev in toolrelay.stream_model_call(R(), id_prefix="req-abc", id_counter=counter):
                 yield ev
 
         return gen()
@@ -2357,8 +2478,7 @@ def test_synthetic_ids_are_unique_across_iterations() -> None:
             for line in text.splitlines()
             if line.startswith("data: ") and line[6:].strip() != "[DONE]"
         )
-        if isinstance(obj.get("pcai"), dict)
-        and obj["pcai"].get("event") in ("tool_call", "tool_error")
+        if isinstance(obj.get("pcai"), dict) and obj["pcai"].get("event") in ("tool_call", "tool_error")
     ]
     assert len(ids) == 2, ids
     assert len(set(ids)) == 2, f"synthetic ids collided across iterations: {ids}"
@@ -2371,22 +2491,40 @@ def test_tool_name_split_across_fragments_is_reassembled() -> None:
     """Review P2: setting the name once truncated a SPLIT name ("ba"+"sh" ->
     "ba"), which would execute the wrong tool. The repeat case (F-3) must still
     not duplicate, so both shapes are pinned here."""
-    split = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "x", "function": {"name": "ba", "arguments": "{}"}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "x", "function": {"name": "sh"}}]}}]},
-    ])
+    split = _assemble(
+        [
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "id": "x", "function": {"name": "ba", "arguments": "{}"}}]}}
+                ]
+            },
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "x", "function": {"name": "sh"}}]}}]},
+        ]
+    )
     assert split[0]["function"]["name"] == "bash"
 
 
 def test_synthetic_id_cannot_collide_with_a_real_upstream_id() -> None:
     """Review P1c: a fixed default prefix ("call_relay") could equal a REAL
     upstream id, fusing two different calls onto one join key."""
-    real = _assemble([{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "call_relay_1", "function": {"name": "real", "arguments": "{}"}}]}}]}])
-    synthetic = _assemble([{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "function": {"name": "synth", "arguments": "{}"}}]}}]}])
+    real = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "call_relay_1", "function": {"name": "real", "arguments": "{}"}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+    synthetic = _assemble(
+        [{"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "synth", "arguments": "{}"}}]}}]}]
+    )
     assert real[0]["id"] != synthetic[0]["id"]
 
 
@@ -2394,8 +2532,11 @@ def test_assembly_never_raises_on_malformed_fragments() -> None:
     """A malformed upstream must not kill the turn mid-stream."""
     shapes = [
         {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "z", "function": None}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": "0", "id": "z", "function": {"name": "n", "arguments": "{}"}}]}}]},
+        {
+            "choices": [
+                {"delta": {"tool_calls": [{"index": "0", "id": "z", "function": {"name": "n", "arguments": "{}"}}]}}
+            ]
+        },
         {"choices": [{"delta": {"tool_calls": [{"id": "z"}]}}]},
         {"choices": [{"delta": {"tool_calls": []}}]},
     ]
@@ -2405,8 +2546,19 @@ def test_assembly_never_raises_on_malformed_fragments() -> None:
 
 def test_non_string_arguments_are_coerced_not_fatal() -> None:
     """A pre-parsed (dict) arguments value used to raise TypeError on +=."""
-    calls = _assemble([{"choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "z", "function": {"name": "n", "arguments": {"a": 1}}}]}}]}])
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [{"index": 0, "id": "z", "function": {"name": "n", "arguments": {"a": 1}}}]
+                        }
+                    }
+                ]
+            }
+        ]
+    )
     assert calls[0]["function"]["arguments"] == '{"a": 1}'
 
 
@@ -2420,6 +2572,7 @@ def test_non_object_sse_payloads_do_not_kill_the_stream() -> None:
     import asyncio
 
     for payload in ("null", "[1,2]", "42", '"a string"', '{"choices":5}'):
+
         class R:
             async def aiter_bytes(self):
                 yield ("data: " + payload + "\n\n").encode()
@@ -2434,12 +2587,20 @@ def test_id_revealed_on_a_later_fragment_stays_one_call() -> None:
     """E-2: an upstream may reveal a call id only on a later fragment. Creating
     a fresh slot split one call into two — the second with an EMPTY name, which
     became an unknown-tool error."""
-    calls = _assemble([
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "function": {"name": "bash", "arguments": '{"cmd":'}}]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_real", "function": {"arguments": '"ls"}'}}]}}]},
-    ])
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"name": "bash", "arguments": '{"cmd":'}}]}}
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "id": "call_real", "function": {"arguments": '"ls"}'}}]}}
+                ]
+            },
+        ]
+    )
     assert len(calls) == 1
     assert calls[0]["id"] == "call_real"
     assert calls[0]["function"]["name"] == "bash"
@@ -2450,12 +2611,32 @@ def test_non_integer_indexes_do_not_merge_calls() -> None:
     """E-3: a string/float index was discarded as absent, then the fragment fell
     through to the most-recently-opened call and MERGED two distinct calls."""
     for idx0, idx1 in (("0", "1"), (0.0, 1.0)):
-        calls = _assemble([
-            {"choices": [{"delta": {"tool_calls": [
-                {"index": idx0, "id": "a", "function": {"name": "bash", "arguments": "{}"}}]}}]},
-            {"choices": [{"delta": {"tool_calls": [
-                {"index": idx1, "id": "b", "function": {"name": "read", "arguments": "{}"}}]}}]},
-        ])
+        calls = _assemble(
+            [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": idx0, "id": "a", "function": {"name": "bash", "arguments": "{}"}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": idx1, "id": "b", "function": {"name": "read", "arguments": "{}"}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
         assert len(calls) == 2, (idx0, idx1, calls)
         assert [c["function"]["name"] for c in calls] == ["bash", "read"]
 
@@ -2520,10 +2701,24 @@ def test_in_loop_reasoning_is_refed_and_capped(monkeypatch) -> None:
         async def raw():
             if n < 2:
                 yield {"choices": [{"delta": {"reasoning_content": big}}]}
-                yield {"choices": [{"delta": {"tool_calls": [{
-                    "index": 0, "id": f"c{n}", "function": {
-                        "name": "logsearch__search_logs",
-                        "arguments": json.dumps({"q": f"q{n}"})}}]}}]}
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"c{n}",
+                                        "function": {
+                                            "name": "logsearch__search_logs",
+                                            "arguments": json.dumps({"q": f"q{n}"}),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
             else:
                 yield {"choices": [{"delta": {"content": "done"}}]}
 
@@ -2542,11 +2737,18 @@ def test_in_loop_reasoning_is_refed_and_capped(monkeypatch) -> None:
         return (True, "ok")
 
     async def run():
-        return [c async for c in toolrelay.relay_stream(
-            [{"role": "user", "content": "go"}],
-            {("logsearch", "search_logs")},
-            [{"server": "logsearch", "tool": "search_logs", "description": "d"}],
-            stream_once, execute, "rid", "m1")]
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                [{"server": "logsearch", "tool": "search_logs", "description": "d"}],
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+            )
+        ]
 
     asyncio.run(run())
 
@@ -2578,10 +2780,24 @@ def test_in_loop_reasoning_off_restores_old_behaviour(monkeypatch) -> None:
         async def raw():
             if n < 2:
                 yield {"choices": [{"delta": {"reasoning_content": "thinking"}}]}
-                yield {"choices": [{"delta": {"tool_calls": [{
-                    "index": 0, "id": f"c{n}", "function": {
-                        "name": "logsearch__search_logs",
-                        "arguments": json.dumps({"q": f"q{n}"})}}]}}]}
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"c{n}",
+                                        "function": {
+                                            "name": "logsearch__search_logs",
+                                            "arguments": json.dumps({"q": f"q{n}"}),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
             else:
                 yield {"choices": [{"delta": {"content": "done"}}]}
 
@@ -2600,12 +2816,639 @@ def test_in_loop_reasoning_off_restores_old_behaviour(monkeypatch) -> None:
         return (True, "ok")
 
     async def run():
-        return [c async for c in toolrelay.relay_stream(
-            [{"role": "user", "content": "go"}],
-            {("logsearch", "search_logs")},
-            [{"server": "logsearch", "tool": "search_logs", "description": "d"}],
-            stream_once, execute, "rid", "m1")]
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                [{"server": "logsearch", "tool": "search_logs", "description": "d"}],
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+            )
+        ]
 
     asyncio.run(run())
     assistant_rows = [m for m in seen_msgs[1] if m.get("role") == "assistant"]
     assert all("reasoning_content" not in m for m in assistant_rows)
+
+
+# --- hybrid tool surface (2026-10-28) -------------------------------------
+#
+# The pure surface is covered in test_tool_surface.py. THESE tests pin the
+# WIRING, which is where a regression is silent: if promotion stopped working,
+# hybrid mode would offer only `pcai_tools` forever, the model would have no
+# callable tool, and every other test would still pass.
+
+
+def test_hybrid_promotes_server_and_offers_its_tools_next_call(monkeypatch) -> None:
+    from pcai_llm.config import settings
+    from pcai_llm.core import tool_surface as ts
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "hybrid", raising=False)
+    offered: list = []
+    model = [
+        {
+            "content": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "function": {
+                        "name": ts.META_TOOL,
+                        "arguments": '{"action":"describe","server":"logsearch"}',
+                    },
+                }
+            ],
+        },
+        {
+            "content": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "tool_calls": [{"id": "c2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"x"}'}}],
+        },
+        {"content": "done"},
+    ]
+    text, calls = _stream_relay(model, [(True, {"hits": 1})], grants={("logsearch", "search_logs")}, offered=offered)
+    # call 1: discovery only — nothing inlined yet
+    assert [t["function"]["name"] for t in offered[0]] == [ts.META_TOOL]
+    # call 2: the promoted server's tools are offered
+    assert "logsearch__search_logs" in [t["function"]["name"] for t in offered[1]]
+    # the meta call was handled LOCALLY: the executor ran only the real call
+    assert calls["exec"] == 1
+    assert "promoted=logsearch" in text
+
+
+def test_hybrid_meta_tool_never_reaches_the_executor(monkeypatch) -> None:
+    from pcai_llm.config import settings
+    from pcai_llm.core import tool_surface as ts
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "hybrid", raising=False)
+    model = [
+        {
+            "content": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "tool_calls": [{"id": "c1", "function": {"name": ts.META_TOOL, "arguments": '{"action":"list"}'}}],
+        },
+        {"content": "done"},
+    ]
+    _text, calls = _stream_relay(model, [(True, {})], grants={("logsearch", "search_logs")})
+    assert calls["exec"] == 0
+
+
+def test_full_mode_offers_exactly_tools_payload(monkeypatch) -> None:
+    """Rollback safety: mode=full must offer the pre-change array."""
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "full", raising=False)
+    offered: list = []
+    model = [{"content": "done"}]
+    _stream_relay(model, [(True, {})], grants={("logsearch", "search_logs")}, offered=offered)
+    assert [t["function"]["name"] for t in offered[0]] == [
+        t["function"]["name"] for t in toolrelay.tools_payload(CATALOG)
+    ]
+
+
+def test_full_mode_meta_tool_hallucination_is_a_clean_error(monkeypatch) -> None:
+    """In full mode `pcai_tools` is not offered; a call to it must not crash.
+
+    It must not reach the executor either — it is not a granted tool.
+    """
+    from pcai_llm.config import settings
+    from pcai_llm.core import tool_surface as ts
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "full", raising=False)
+    model = [
+        {
+            "content": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "tool_calls": [{"id": "c1", "function": {"name": ts.META_TOOL, "arguments": '{"action":"list"}'}}],
+        },
+        {"content": "done"},
+    ]
+    text, calls = _stream_relay(model, [(True, {})], grants={("logsearch", "search_logs")})
+    assert calls["exec"] == 0
+    # the refusal goes to the MODEL (so it can self-correct) and surfaces to the
+    # client as a tool_error event, not as a hard failure of the turn.
+    assert "tool_error" in text and "not an MCP tool name" in text
+
+
+def test_hybrid_meta_tool_is_not_rendered_as_a_client_tool_call(monkeypatch) -> None:
+    """The discovery tool must never look like a tool the CLIENT can call.
+
+    Measured live 2026-10-28: with render_deltas on, the relay re-emitted its
+    internal `pcai_tools` call as a native delta, so the harness believed it
+    owned that tool and tried `tools.pcai_tools(...)` -> "not a function",
+    burning turns. The call still HAPPENS (the pcai.tool event proves it); it
+    just must not be advertised on the wire.
+    """
+    from pcai_llm.config import settings
+    from pcai_llm.core import tool_surface as ts
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "hybrid", raising=False)
+    monkeypatch.setattr(settings, "tool_relay_render_deltas", True, raising=False)
+    model = [
+        {
+            "content": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "tool_calls": [{"id": "c1", "function": {"name": ts.META_TOOL, "arguments": '{"action":"list"}'}}],
+        },
+        {"content": "done"},
+    ]
+    text, _calls = _stream_relay(model, [(True, {})], grants={("logsearch", "search_logs")}, render_deltas=True)
+    # the discovery RAN (event present) ...
+    assert '"tool": "pcai_tools"' in text
+    # ... but was never advertised as a callable tool on the wire.
+    assert '"name": "pcai_tools"' not in text
+
+
+def test_discovery_budget_bounds_a_spinner_but_allows_real_discovery() -> None:
+    """Discovery is exempt from the identical-call abort, but NOT unbounded.
+
+    Repeated list/describe is legitimate (the loop guard used to abort it as a
+    "loop detected"); a spinner still has to be stopped. Both directions pinned.
+    """
+    from pcai_llm.core import tool_surface as ts
+
+    guard = toolrelay.RelayGuard(max_iterations=100, wall_clock_s=900)
+    call = [{"function": {"name": ts.META_TOOL, "arguments": '{"action":"list"}'}}]
+    # identical discovery calls do NOT trip the loop fingerprint
+    for i in range(toolrelay._META_CALL_MAX):
+        assert guard.check(i, call) == "", f"discovery call {i + 1} must be allowed"
+    # ... but the budget stops a spinner
+    assert "discovery budget exceeded" in guard.check(toolrelay._META_CALL_MAX, call)
+    # a repeated REAL call is still a loop
+    guard2 = toolrelay.RelayGuard(max_iterations=100, wall_clock_s=900)
+    real = [{"function": {"name": "logsearch__search_logs", "arguments": '{"q":"x"}'}}]
+    assert guard2.check(0, real) == ""
+    assert "loop detected" in guard2.check(1, real)
+
+
+def test_client_tool_named_pcai_tools_does_not_duplicate_the_offer(monkeypatch) -> None:
+    """A client tool colliding with the meta-tool name must not offer it twice.
+
+    Two same-named entries make the offer ambiguous, and the client wins the
+    partition anyway — so OURS is dropped (with a warning) rather than doubled.
+    """
+    from pcai_llm.config import settings
+    from pcai_llm.core import tool_surface as ts
+
+    monkeypatch.setattr(settings, "tool_relay_surface", "hybrid", raising=False)
+    offered: list = []
+    client_tools = [
+        {"type": "function", "function": {"name": ts.META_TOOL, "description": "client one", "parameters": {}}}
+    ]
+    _stream_relay(
+        [{"content": "done"}],
+        [(True, {})],
+        grants={("logsearch", "search_logs")},
+        client_tools=client_tools,
+        offered=offered,
+    )
+    names = [t["function"]["name"] for t in offered[0]]
+    assert names.count(ts.META_TOOL) == 1
+
+
+# ---------------------------------------------------------------------------
+# audit 2026-10-29 (zone 3a) — relay SSE / assembly regressions
+# ---------------------------------------------------------------------------
+
+
+def test_zc4_non_dict_tool_call_elements_do_not_kill_the_stream() -> None:
+    """ZC-4: the E-1 type guard validated the SSE object and choices[0] but
+    trusted every delta.tool_calls ELEMENT to be a dict. `{"delta":
+    {"tool_calls": [42]}}` raised AttributeError at tcd.get() — neither a
+    TimeoutError nor an httpx2.HTTPError — so it escaped relay_stream and killed
+    the client's SSE stream with no guard event, no error chunk, no [DONE] and
+    no settle: exactly the blast radius E-1 describes, one level lower."""
+    import asyncio
+
+    for frag in ([42], [None, "x"], ["str"], [42, None]):
+        payload = {"choices": [{"delta": {"tool_calls": frag}}]}
+
+        class R:
+            async def aiter_bytes(self):
+                yield ("data: " + json.dumps(payload) + "\n\n").encode()
+
+        async def run():
+            return [e async for e in toolrelay.stream_model_call(R())]
+
+        assert asyncio.run(run()) == [], frag  # must not raise
+
+    # a bare OBJECT where the fragment LIST belongs used to be iterated as its
+    # key strings — every element then blew up the same way
+    bare = {"choices": [{"delta": {"tool_calls": {"index": 0, "id": "z"}}}]}
+
+    class R2:
+        async def aiter_bytes(self):
+            yield ("data: " + json.dumps(bare) + "\n\n").encode()
+
+    async def run2():
+        return [e async for e in toolrelay.stream_model_call(R2())]
+
+    assert asyncio.run(run2()) == []
+
+    # a junk element must not swallow a GOOD one in the same delta (the good
+    # fragment opens a real call; the int is simply skipped)
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                42,
+                                {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "bash"
+
+
+def test_c7_cr_and_crlf_sse_framing_is_parsed() -> None:
+    """C-7: the line cursor split on b"\n" only. SSE (WHATWG) accepts CR, LF and
+    CRLF, so a CR-only upstream parsed as ONE unparseable line — json.loads
+    failed on the whole concatenation, every event was dropped, and the client
+    received a successful EMPTY completion instead of an answer."""
+    import asyncio
+
+    payload = {"choices": [{"delta": {"content": "hello"}}]}
+    body = json.dumps(payload).encode()
+
+    def make(chunks: list[bytes]):
+        async def raw():
+            for c in chunks:
+                yield c
+
+        return raw()
+
+    for sep in (b"\r", b"\r\n", b"\n"):
+        chunks = [b"data: " + body + sep, b"data: [DONE]" + sep]
+
+        async def run(c=chunks):
+            return [o async for o in toolrelay.parse_sse_payloads(make(c))]
+
+        assert asyncio.run(run()) == [payload], sep
+
+    # CRLF straddling a chunk boundary: the CR ends the line, the orphan LF is
+    # the next (empty, skipped) line
+    split = [b"data: " + body + b"\r", b"\ndata: [DONE]\r\n"]
+
+    async def run_split():
+        return [o async for o in toolrelay.parse_sse_payloads(make(split))]
+
+    assert asyncio.run(run_split()) == [payload]
+
+    # end-to-end: the answer survives assembly instead of vanishing
+    class R:
+        async def aiter_bytes(self):
+            yield b"data: " + body + b"\r"
+
+    async def run_stream():
+        return [e async for e in toolrelay.stream_model_call(R())]
+
+    assert asyncio.run(run_stream()) == [("content", "hello")]
+
+
+def test_c3_late_id_without_index_stays_one_call() -> None:
+    """C-3 shape A: the id is revealed on a LATER fragment that carries no
+    index. Pre-fix adoption was gated on `index is not None`, so the open
+    id-less call was unreachable and a second slot was minted."""
+    calls = _assemble(
+        [
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"name": "bash", "arguments": '{"cmd":'}}]}}
+                ]
+            },
+            {"choices": [{"delta": {"tool_calls": [{"id": "call_A", "function": {"arguments": '"ls"}'}}]}}]},
+        ]
+    )
+    assert len(calls) == 1, calls
+    assert calls[0]["id"] == "call_A"
+    assert calls[0]["function"]["name"] == "bash"
+    assert calls[0]["function"]["arguments"] == '{"cmd":"ls"}'
+
+
+def test_c3_id_first_without_index_does_not_fork_the_call() -> None:
+    """C-3 shape B — the shape the audit REPRODUCED. The id+name arrive first
+    with NO index (so no by_index entry exists), then the arguments arrive under
+    index 0. Pre-fix the arguments opened a SECOND call: call #1 kept the name
+    and executed with {} arguments (json.loads("" or "{}")), call #2 was a
+    nameless unknown-tool error."""
+    calls = _assemble(
+        [
+            {"choices": [{"delta": {"tool_calls": [{"id": "call_A", "function": {"name": "mm-rag__search"}}]}}]},
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q": "x"}'}}]}}
+                ]
+            },
+        ]
+    )
+    assert len(calls) == 1, calls
+    assert calls[0]["id"] == "call_A"
+    assert calls[0]["function"]["name"] == "mm-rag__search"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"q": "x"}
+
+
+def test_c3_adoption_never_fuses_a_genuine_second_call() -> None:
+    """Control for C-3: the new adoption must not fuse two real calls. A
+    fragment carrying a NAME at an unseen index opens a new call, and a nameless
+    fragment at an unseen index does not adopt a call that already has
+    arguments."""
+    named = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [{"id": "a", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [{"index": 1, "function": {"name": "read", "arguments": '{"p":"x"}'}}]
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    assert [c["function"]["name"] for c in named] == ["bash", "read"]
+
+    argumented = _assemble(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "a", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"delta": {"tool_calls": [{"index": 3, "function": {"arguments": '{"p":1}'}}]}}]},
+        ]
+    )
+    assert len(argumented) == 2, argumented
+
+
+def test_zc1_zero_completion_retry_transport_error_closes_cleanly(monkeypatch) -> None:
+    """ZC-1: the zero-completion RETRY attempt caught only TimeoutError. An
+    httpx2 transport error on the retry escaped relay_stream — the SSE died with
+    no [DONE] and no error envelope, and the retry never settled (the exact
+    ledger under-count the settle-in-finally discipline exists to prevent)."""
+    import asyncio
+    import uuid as _uuid
+
+    from pcai_llm.core.budgets import GateResult
+
+    monkeypatch.setattr(toolrelay.settings, "zero_completion_retry", True)
+
+    settled: list[tuple] = []
+
+    async def fake_settle(*a, **k):
+        settled.append(a)
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        calls["n"] += 1
+
+        async def gen():
+            if calls["n"] == 1:
+                # the empty answer that arms the zero-completion retry
+                yield ("usage", {"prompt_tokens": 7, "completion_tokens": 0})
+                return
+            raise httpx2.ConnectError("[Errno -2] Name or service not known")
+            yield  # pragma: no cover - makes this an async generator
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return (True, "ok")
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+            )
+        ]
+
+    text = b"".join(asyncio.run(run())).decode()
+    assert calls["n"] == 2, "the zero-completion retry must have run"
+    assert text.rstrip().endswith("data: [DONE]"), "the SSE must close cleanly, not die mid-flight"
+    assert "(model error: upstream call failed)" in text
+    # settle positional args: (0 key, 1 model, 2 endpoint, 3 prompt, 4
+    # completion, 5 status, ...). BOTH attempts are real spend: the empty one
+    # settled before the retry, the failed retry settles as an error row.
+    assert len(settled) == 2, settled
+    assert settled[-1][5] == "error"
+
+
+def _zc2_harness(monkeypatch, *, stream_thinking: bool):
+    """One attempt that streams reasoning and then dies on the wire, with a
+    budget-clean fallback armed; returns (sse text, fallback call count)."""
+    import asyncio
+    import uuid as _uuid
+
+    from pcai_llm.core.budgets import GateResult
+
+    async def fake_settle(*a, **k):
+        return None
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    fb_calls = {"n": 0}
+
+    def stream_once(msgs, tools, pool_for=None):
+        async def gen():
+            if pool_for is not None:
+                yield ("content", "recovered on the fallback model")
+                yield ("usage", {"prompt_tokens": 5, "completion_tokens": 3})
+                return
+            yield ("reasoning", "reasoning the client may not have seen")
+            raise httpx2.ConnectError("[Errno -2] Name or service not known")
+
+        return gen()
+
+    def fb_stream(msgs, tools):
+        fb_calls["n"] += 1
+        return stream_once(msgs, tools, pool_for=object())
+
+    async def execute(server, tool, args):
+        return (True, "ok")
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "GLM-5.3-Flash",
+                key_id=_uuid.uuid4(),
+                fallbacks=[("Deepseek-V4.1-Flash", fb_stream)],
+                stream_thinking=stream_thinking,
+            )
+        ]
+
+    return b"".join(asyncio.run(run())).decode(), fb_calls
+
+
+def test_zc2_transport_failover_ignores_client_suppressed_reasoning(monkeypatch) -> None:
+    """ZC-2: the transport-failover gate keyed on the RAW reasoning_acc while its
+    twin (the timeout gate) filters by CLIENT visibility. With
+    X-PCAI-Stream-Thinking: 0 — DSH's live posture — reasoning deltas are
+    suppressed, so an attempt that reasoned before the endpoint died reached the
+    client as NOTHING yet was never replaced: the 2026-10-06 outage protection
+    was silently disabled exactly where it is deployed."""
+    text, fb_calls = _zc2_harness(monkeypatch, stream_thinking=False)
+    assert fb_calls["n"] == 1, "a silent failed attempt must be replaced by the fallback"
+    assert "recovered on the fallback model" in text
+    # the handoff marker rides the reasoning channel, which is exactly the
+    # channel this client opted out of — the answer itself must still arrive
+    assert '"model": "Deepseek-V4.1-Flash"' in text
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+def test_zc2_transport_failover_declines_when_reasoning_reached_the_client(monkeypatch) -> None:
+    """Control for ZC-2: with thinking STREAMING the client already saw the
+    reasoning, so the attempt cannot be replayed on another model — the turn
+    closes with the clean error terminal instead (today's behaviour)."""
+    text, fb_calls = _zc2_harness(monkeypatch, stream_thinking=True)
+    assert fb_calls["n"] == 0, "an attempt the client SAW must never be replaced"
+    assert "(model error: upstream call failed)" in text
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+def test_zc6_guard_abort_wrap_up_emits_usage_chunk() -> None:
+    """ZC-6: the guard-abort wrap-up terminal was the THIRD terminal and the only
+    one without the OpenAI include_usage chunk (F-7 fixed the handback and
+    final-answer ones), so every aborted turn reported zero usage to
+    OpenAI-compatible clients (DSH's context meter)."""
+    model = [
+        {
+            "content": None,
+            "tool_calls": [{"id": "c1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"same"}'}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        },
+        {
+            "content": None,
+            "tool_calls": [{"id": "c2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"same"}'}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        },  # identical -> loop abort -> wrap-up pass
+        {
+            "content": "final wrap-up",
+            "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13},
+        },
+    ]
+    text, _ = _stream_relay(
+        model,
+        [(True, "r")],
+        grants={("logsearch", "search_logs")},
+        include_usage=True,
+    )
+    assert "loop detected" in text
+    usages = _usage_chunks(text)
+    assert usages, "the wrap-up terminal emitted no usage chunk"
+    assert usages[-1]["total_tokens"] == 13
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+def test_c8_relay_publishes_its_iteration_count() -> None:
+    """C-8 (audit 2026-10-29): the routes layer used to derive the relay
+    iteration histogram by byte-matching the emitted `pcai model_usage` event,
+    which reads 0 for every X-PCAI-Stream-Events: 0 client (i.e. every strict
+    OpenAI client). The loop now publishes its OWN completed-call count through
+    `iterations_out`, so the metric is the loop's accounting rather than a
+    re-derivation from the wire.
+    """
+    import asyncio
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        calls["n"] += 1
+        n = calls["n"]
+
+        async def gen():
+            class R:
+                async def aiter_bytes(self):
+                    if n == 1:
+                        yield (
+                            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+                            b'"function":{"name":"logsearch__search_logs","arguments":"{}"}}]}}]}\n\n'
+                        )
+                    else:
+                        yield b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+
+            async for ev in toolrelay.stream_model_call(R()):
+                yield ev
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return True, {"ok": 1}
+
+    published: list[int] = []
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m",
+                iterations_out=published,
+            )
+        ]
+
+    out = asyncio.run(run())
+    assert b"[DONE]" in b"".join(out)
+    assert published == [2], f"two completed model calls must publish 2, got {published}"

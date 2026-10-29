@@ -85,7 +85,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import db
-from .keys import KeyRecord, generate_key
+from .keys import KeyRecord, generate_key, key_record_from_row
 
 log = logging.getLogger(__name__)
 
@@ -727,12 +727,18 @@ _SHADOW_KEY_SQL = """
 SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
        k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
        k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-       p.offpeak_fraction
+       k.mcp_admin, p.offpeak_fraction
 FROM api_keys k
 JOIN users u ON u.id = k.user_id
 LEFT JOIN profiles p ON p.id = u.profile_id
 WHERE k.subject_id = (SELECT id FROM subjects WHERE idp = $1 AND subject = $2)
   AND k.bound_via = $3 AND k.revoked_at IS NULL
+  -- EXPIRY (audit C2, 2026-10-29): core.keys.authenticate refuses an expired
+  -- row; this door must too, or expiry is enforced on the API-key path and not
+  -- on the JWT/SSO path. Filtered HERE as well as in the mapper so an expired
+  -- newest key falls through to the next live candidate instead of resolving
+  -- to nothing.
+  AND (k.expires_at IS NULL OR k.expires_at > now())
 ORDER BY k.created_at DESC, k.id DESC
 LIMIT 1
 """
@@ -764,24 +770,17 @@ def _shadow_settings() -> dict[str, Any]:
     }
 
 
-def _row_to_key_record(row: Any) -> KeyRecord:
-    """The authenticate() SELECT shape → KeyRecord (the shadow-key lookup
-    mirrors authenticate's own row→record mapping exactly)."""
-    return KeyRecord(
-        id=row["id"],
-        user_id=row["user_id"],
-        name=row["name"],
-        key_prefix=row["key_prefix"],
-        scopes=list(row["scopes"]),
-        allowed_models=list(row["allowed_models"]),
-        rate_limit_rpm=row["rate_limit_rpm"],
-        rate_limit_tpm=row["rate_limit_tpm"],
-        max_concurrent=row["max_concurrent"],
-        expires_at=row["expires_at"],
-        relay_default=bool(row["relay_default"]),
-        stream_pcai_events=bool(row["stream_pcai_events"]),
-        offpeak_fraction=row["offpeak_fraction"],
-    )
+def _row_to_key_record(row: Any) -> KeyRecord | None:
+    """The shadow-key SELECT shape → KeyRecord | None.
+
+    DELEGATES to core.keys.key_record_from_row — ONE mapper for both doors
+    (audit C2, 2026-10-29). This used to be a second, hand-copied mapping that
+    never compared expires_at, so an expired token-shadow key kept authorizing
+    through the token rung while core.keys refused the identical row. The
+    shared mapper carries the revocation + expiry gate inside it, so the two
+    doors cannot drift again.
+    """
+    return key_record_from_row(row)
 
 
 async def _provision_shadow_key(subject: str, claims: TokenClaims | None) -> KeyRecord | None:
@@ -804,11 +803,28 @@ async def _provision_shadow_key(subject: str, claims: TokenClaims | None) -> Key
     try:
         display_name = (claims.email if claims and claims.email else subject)[:64] or subject[:64]
         groups = list(claims.groups) if claims else []
+        # USER ROW: REUSE BEFORE INSERT (audit F2, 2026-10-29). users carries
+        # UNIQUE (tenant_id, name) and a blind INSERT hit it on the SECOND
+        # provisioning of the same human — which is the DOCUMENTED off switch
+        # working as designed (console-revoke the shadow key, next token
+        # sighting re-provisions). The unique violation raised, the
+        # best-effort handler below swallowed it into None, and that subject
+        # 401'd FOREVER on valid tokens; two subjects sharing an email
+        # (display_name) collided the same way. The user row is the
+        # tenancy/policy holder, NOT an identity assertion — the subject row
+        # stays the identity anchor — so reusing it is correct, and it is what
+        # the enrollment mint does (there with a suffix-retry).
         user_row = await db.fetchrow(
-            "INSERT INTO users (tenant_id, name) VALUES ($1, $2) RETURNING id",
+            "SELECT id FROM users WHERE tenant_id = $1 AND name = $2",
             tenant_id,
             display_name,
         )
+        if user_row is None:
+            user_row = await db.fetchrow(
+                "INSERT INTO users (tenant_id, name) VALUES ($1, $2) RETURNING id",
+                tenant_id,
+                display_name,
+            )
         if user_row is None:  # pragma: no cover - RETURNING always yields a row
             return None
         user_id: uuid.UUID = user_row["id"]

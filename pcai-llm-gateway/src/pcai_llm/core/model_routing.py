@@ -317,8 +317,16 @@ def pick_serving_model(
     `available` (optional predicate: registered + key-allowed + healthy
     chat pool, built by the caller): when the mapped model can't serve,
     walk UP toward the ceiling — a request that needs tier-N capability
-    gets the cheapest AVAILABLE model that still fits; if none does, the
-    ceiling (the fail-safe answer).
+    gets the cheapest AVAILABLE model that still fits. When even the
+    ceiling is unavailable, walk DOWN the window to the cheapest available
+    model that fits the tier (the audit R-F1 defect: the ceiling used to be
+    returned unchecked, so an ACL that excluded the ladder head 403'd every
+    routed request). When NO window member can serve, return the
+    nothing-available sentinel (model='', reason='nothing_available') — the
+    CALLER turns that into the policy answer (active: RoutingRefused(503);
+    shadow: legacy degrade — shadow must never fail a request 'off' would
+    have served). Availability is a hard fact and always wins over the
+    floor; what happens when it is exhausted is policy.
     """
     t1, t2 = _cut_points()
     if ceiling not in cheap_first:
@@ -337,6 +345,9 @@ def pick_serving_model(
     if score < t1:
         pos, reason = floor_pos, "prompt_tokens<tier1"
     elif score < t2:
+        # XV-4 (cross-validation): a span==0 special case here was DEAD CODE —
+        # floor+(0+1)//2 == floor == ceil, byte-identical to the plain
+        # formula on the whole score grid (proved by A/B against 8a4a329).
         pos, reason = floor_pos + (span + 1) // 2, "prompt_tokens<tier2"
     else:
         pos, reason = ceil_pos, "prompt_tokens>=tier2"
@@ -348,7 +359,25 @@ def pick_serving_model(
                 chosen = cheap_first[p]
                 break
         else:
-            chosen = ceiling  # nothing in the window can serve → ceiling
+            # R-F1 (audit 2026-10-29): the ceiling was returned UNCHECKED. With
+            # no floor (floor_pos == ceil_pos) the pick IS the ceiling and this
+            # walk can never leave it, so a key whose ACL excludes the ladder
+            # head was served a model admission then 403'd on EVERY routed
+            # request — the feature was unusable, not degraded. Validate the
+            # final choice like any other: walk DOWN the window to the
+            # cheapest available model that still fits the tier (the floor is
+            # a downgrade policy, availability is a hard fact). When NOTHING
+            # in the window can serve, SIGNAL (model='', reason
+            # 'nothing_available') rather than raise: whether that becomes a
+            # refusal (active) or a legacy degrade (shadow, which must never
+            # fail a request 'off' would have served) is a POLICY answer only
+            # the caller can make.
+            for p in range(ceil_pos - 1, floor_pos - 1, -1):
+                if available(cheap_first[p]):
+                    chosen = cheap_first[p]
+                    break
+            else:
+                return RoutingChoice("", "nothing_available")
     return RoutingChoice(chosen, reason)
 
 
@@ -456,7 +485,9 @@ def apply_never_downgrade(
     can rescue a conversation whose difficulty rose.
 
     Position is CAPABILITY, not preference: candidates is the caller cheap-first
-    (floor..ceiling) window, so a HIGHER index is a more capable model.
+    (floor..ceiling) window, so a HIGHER index is a more capable model. The
+    caller availability-filters the window first (see resolve_routed_model): a
+    floor must be measured against what can actually serve.
 
     Total and fail-open, in the direction that cannot make an answer worse:
       * no head, empty candidates, or a head NOT in the current window (it left
@@ -488,6 +519,12 @@ def apply_never_downgrade(
 async def profile_routing_config(user_id: uuid.UUID) -> tuple[str, str]:
     """(routing_policy, routing_min_model) for the key's profile.
 
+    The second element is the EFFECTIVE floor: the profile's own
+    routing_min_model when set, else the GLOBAL routing_config floor
+    (routing_min_model — R3, audit 2026-10-29: the global-arming path had
+    no floor knob, so a fleet-armed router could never downgrade). The
+    profile value always wins when present.
+
     TTL-cached per user (the profile knobs change on operator action, not
     per request — same staleness trade as the costs/offpeak caches).
     Fail-safe: any lookup failure returns ('off', '') UNGACHED, so a DB
@@ -518,10 +555,97 @@ async def profile_routing_config(user_id: uuid.UUID) -> tuple[str, str]:
     if policy not in ("off", "shadow", "active"):
         log.warning("routing: unknown routing_policy %r treated as 'off'", policy)
         policy = "off"
+    # GLOBAL INHERITANCE (2026-10-28). Routing is a fleet-level feature: the
+    # operator arms it once in the routing panel (routing_config.routing_policy)
+    # instead of editing every profile. A profile that explicitly arms itself
+    # (shadow/active) still wins, so early opt-in per profile keeps working.
+    # This is what makes the panel honest: before, the panel could read
+    # decision_mode=active while every profile sat at the 'off' default, and
+    # nothing was served with no visible cause.
+    if policy == "off":
+        policy = await global_policy()
+    if not min_model:
+        # R3: inherit the GLOBAL floor when the profile declares none. Read
+        # OUTSIDE the policy-inheritance branch so a shadow/active profile
+        # without a floor still downgrades — and read through the SAME cached
+        # seam as global_policy, so a routing-config DB blip cannot turn into
+        # a per-request outage here.
+        min_model = await global_min_model()
     _policy_cache[user_id] = (now, policy, min_model)
     if len(_policy_cache) > _POLICY_CACHE_MAX:
         _policy_cache.clear()
     return policy, min_model
+
+
+async def global_policy() -> str:
+    """The fleet-level routing arming from routing_config. NEVER raises. PURE-ish (one cached read).
+
+    Fail-safe is 'off': an unreadable config must not arm routing by accident.
+    """
+    try:
+        from . import routing_config as _rc
+
+        cfg = await _rc.get_config()
+        val = str(cfg.get("routing_policy") or "off").strip().lower()
+        if val in ("off", "shadow", "active"):
+            return val
+        log.warning("routing: unknown global routing_policy %r treated as 'off'", val)
+    except Exception as exc:
+        log.warning("routing: global policy lookup failed (fail-safe 'off'): %s", exc)
+    return "off"
+
+
+def clear_policy_cache() -> None:
+    """Drop every cached profile routing policy (admin-write hook).
+
+    P3 (audit 2026-10-29): _policy_cache had NO invalidator, so a floor or
+    policy change made in the console lagged up to _POLICY_TTL_S (60s) per
+    user in the same process. routing_config.set_values() already invalidates
+    its own cache; this is the matching seam for the profile knobs. Bounded
+    dict, cleared wholesale on overflow — wholesale clear is the same
+    discipline the cache itself uses.
+    """
+    _policy_cache.clear()
+
+
+async def global_min_model() -> str:
+    """The fleet-level routing floor (weakest allowed model) from routing_config.
+
+    R3 (audit 2026-10-29): the 2026-10-28 global-arming path added a ladder
+    but no floor, so a fleet-armed heuristic router was pinned to the ceiling
+    and could never downgrade — the feature it enabled was inert. NEVER
+    raises; '' means no global floor (pinned to the ceiling, the shipped
+    behaviour).
+    """
+    try:
+        from . import routing_config as _rc
+
+        cfg = await _rc.get_config()
+        return str(cfg.get("routing_min_model") or "").strip()
+    except Exception as exc:
+        log.warning("routing: global min-model lookup failed (fail-safe: no floor): %s", exc)
+        return ""
+
+
+async def global_ladder() -> list[str]:
+    """The fleet-level capability ladder (MOST-CAPABLE FIRST) from routing_config.
+
+    Used when the calling profile declares no model_order. WHY this exists:
+    the router used to borrow profiles.model_order -- a CASCADE ordering -- as
+    its ladder, so a profile with an empty order made bare `routing` 404 and
+    the feature silently did not exist for that profile. NEVER raises; an
+    empty list means "no ladder", which preserves the old 404 exactly.
+    """
+    try:
+        from . import routing_config as _rc
+
+        cfg = await _rc.get_config()
+        raw = cfg.get("model_order")
+        if isinstance(raw, list):
+            return [str(m) for m in raw if str(m).strip()]
+    except Exception as exc:
+        log.warning("routing: global ladder lookup failed (fail-open: no ladder): %s", exc)
+    return []
 
 
 DecideFn = Callable[[list[str], dict[str, Any], int], Awaitable["DecisionOutcome"]]
@@ -581,6 +705,7 @@ class RouteDecision:
              row (pseudo-model requests under shadow/active only — direct
              requests never consulted the router, so there is nothing
              honest to stamp).
+    sticky_finish deferred stickiness commit: finisher(actual_model).
     """
 
     policy: str = ""
@@ -590,6 +715,13 @@ class RouteDecision:
     served: str = ""
     reason: str = ""
     stamp: bool = False
+    # Deferred stickiness commit (P3, audit 2026-10-29): when the caller's
+    # sticky_write supports deferral it returns a finisher here instead of
+    # persisting at pick time; the caller invokes it ONCE, with the model the
+    # budget gates actually settled on, so the sticky row can never name a
+    # model that never served. None = the write (if any) already happened
+    # (legacy eager writers keep working unchanged).
+    sticky_finish: Callable[[str], None] | None = None
     # option -> probability from the decision model, when one answered. Empty
     # when the heuristics served or the model abstained with no distribution.
     probabilities: dict[str, float] = field(default_factory=dict)
@@ -676,6 +808,14 @@ async def resolve_routed_model(
             # saying "routing__X" would make the response report a name
             # nobody served (ledger truth convention).
             body["model"] = pseudo.target
+            # XV-6 (cross-validation): an R4 floor-demotion here was
+            # UNREACHABLE — routes_proxy refills `order` from
+            # global_ladder() before calling this when the profile declares
+            # none, so an empty `order` implies an empty global ladder and
+            # the demotion could never fire. Deleted rather than kept as a
+            # dead branch with a test proving nothing; the pinned serve below
+            # IS the contract (pinned by test_unprofiled_named_serves_pinned
+            # and test_xv6_empty_order_named_ceiling_serves_pinned_under_active).
             return pseudo.target, RouteDecision()
 
         policy, min_model = await profile_routing_config(key.user_id)
@@ -703,7 +843,57 @@ async def resolve_routed_model(
         # available() is applied only to the ADDED models inside
         # expand_candidates -- the ladder keeps its own upstream walk semantics.
         cheap_first = expand_candidates(list(reversed(order)), routable_models, available)
-        ceiling = pseudo.target if pseudo.kind == "named" else order[0]
+        # R2 (audit 2026-10-29): BOTH ceiling forms go through the operator
+        # allowlist. The named form already checked allowed_models above, but
+        # the BARE form used to take order[0] raw — so bare `routing` under an
+        # 'active' policy served the ladder head the operator UNTICKED in the
+        # routing panel, and the shadow ledger trained on it. When the ladder
+        # head is unticked, the ceiling is the most capable TICKED model; an
+        # entirely stale allowlist falls back to the ladder head (a mis-ticked
+        # panel must not 404 the request — the same graceful degradation
+        # expand_candidates applies).
+        if pseudo.kind == "named":
+            ceiling = pseudo.target
+        else:
+            ceiling = order[0]
+            if routable_models and ceiling not in {str(m) for m in routable_models}:
+                for cand in order:
+                    if cand in {str(m) for m in routable_models}:
+                        ceiling = cand
+                        break
+
+        # R4 (audit 2026-10-29): a named ceiling the profile ladder cannot rank
+        # used to skip routing_min_model entirely (pick_serving_model's
+        # no_ladder branch pins to it). When BOTH the floor and the target sit
+        # on the GLOBAL routing ladder, a target demonstrably BELOW the floor
+        # is demoted to the floor: the floor is an operator spend control and
+        # naming a model must not step under it. At or above the floor (or
+        # unmeasurable — either name missing from the global ladder) keeps the
+        # shipped pin-to-ceiling semantics; 'off' never reaches here.
+        # The ASKED ceiling stays on RouteDecision.ceiling (the honest
+        # never-exceed for this request); only the router's working window is
+        # demoted.
+        eff_ceiling = ceiling
+        if (
+            pseudo.kind == "named"
+            and ceiling not in cheap_first
+            and min_model
+            # XV-1 (cross-validation): the demotion target must be LEGAL and
+            # SERVABLE for THIS request before it is adopted. cheap_first is
+            # expand_candidates' output — the operator's routing allowlist
+            # already bounded it — and available() is the key ACL + health +
+            # capacity closure. Skipping either check served an
+            # allowlist-excluded floor (spend-control bypass) or 503'd a
+            # pinned request the key was entitled to. An unusable floor keeps
+            # the ASKED ceiling: the pinned semantics the client asked for.
+            and min_model in cheap_first
+            and (available is None or available(min_model))
+            and (g_order := await global_ladder())
+            and min_model in g_order
+            and pseudo.target in g_order
+            and g_order.index(pseudo.target) > g_order.index(min_model)
+        ):
+            eff_ceiling = min_model
 
         floor_usable = bool(min_model) and min_model in cheap_first
         if not floor_usable and key.user_id not in _floor_warned:
@@ -723,7 +913,34 @@ async def resolve_routed_model(
                 _floor_warned.clear()
 
         score = complexity_score(body)
-        choice = pick_serving_model(cheap_first, ceiling, min_model, score, available=available)
+        choice = pick_serving_model(cheap_first, eff_ceiling, min_model, score, available=available)
+        if not choice.model:
+            # XV-2 (cross-validation): the sentinel fires on TRANSIENT
+            # unavailability too — `available` conflates policy (key ACL),
+            # health (breaker) and budget (model_capacity). Escalating it to a
+            # 503 preempted admission failover and the fallback chain, and
+            # turned a budget 429 into a 503. Degrade to legacy in BOTH
+            # policies: serve `requested` and let admission do its job — the
+            # baseline outcome for the all-unavailable window, and strictly
+            # better wherever the walk-down found a servable rung. Policy
+            # exclusions are refused where they are KNOWN (the named-ceiling
+            # ACL check above, a deliberate 4xx); the router itself never
+            # fails a request over availability.
+            # XV-5 (cross-validation): shadow must still HARVEST the decision —
+            # a blank RouteDecision dropped the X-PCAI-Route header and the
+            # ledger row precisely when an operator needs to see why nothing
+            # was picked. would='' is honest ("no pick"); the header falls
+            # back to the actually-served model.
+            if policy == "shadow":
+                return requested, RouteDecision(
+                    policy="shadow",
+                    engaged=True,
+                    ceiling=eff_ceiling,
+                    would="",
+                    reason="nothing_available",
+                    stamp=True,
+                )
+            return requested, RouteDecision()
 
         # --- decision-model seam (optional; heuristics stand by default) -----
         # The injected `decide` returns None when no decision model is
@@ -739,7 +956,7 @@ async def resolve_routed_model(
             # (floor..ceiling, in cheap-first order). Offering the model
             # anything outside that window would let it pick a model the
             # profile/ACL never offered.
-            candidates = _window(cheap_first, ceiling, min_model)
+            candidates = _window(cheap_first, eff_ceiling, min_model)
             if available is not None:
                 _avail = [m for m in candidates if available(m)]
                 if not _avail:
@@ -888,7 +1105,24 @@ async def resolve_routed_model(
         # model) it is rebuilt here so the floor still has a capability order
         # to measure against. Both are pure list operations -- no I/O.
         if sticky_floor:
-            floor_candidates = candidates if decide is not None else _window(cheap_first, ceiling, min_model)
+            floor_candidates = candidates if decide is not None else _window(cheap_first, eff_ceiling, min_model)
+            # P3 (audit 2026-10-29): the floor was measured in an
+            # AVAILABILITY-BLIND window, so a conversation could be pinned to
+            # a model that is cooling right now — the opposite of what
+            # cascade._reorder_head does for the pinned path (which steps the
+            # head to a servable model). Filter the SAME window by the
+            # caller's availability predicate: an unavailable sticky head
+            # drops OUT of the window, apply_never_downgrade then ignores it
+            # (its documented contract: "a stale preference must never
+            # resurrect a model the key may no longer use") and the choice
+            # stands. Fail-safe: when availability filtering would EMPTY the
+            # window, keep the unfiltered one — an all-unavailable fleet is a
+            # capacity problem for admission to report, not for the floor to
+            # fake.
+            if available is not None and floor_candidates:
+                _servable = [m for m in floor_candidates if available(m)]
+                if _servable:
+                    floor_candidates = _servable
             choice = apply_never_downgrade(choice, floor_candidates, sticky_floor)
 
         if policy == "shadow":
@@ -919,12 +1153,23 @@ async def resolve_routed_model(
         # conversation has no floor yet, and requiring one here meant the row
         # was never written, so the next turn again had no floor -- the feature
         # could never bootstrap (caught by cross-validation 2026-10-23).
+        # P3 (audit 2026-10-29): the floor was persisted HERE, at pick time —
+        # before admission/breaker promotion could move the request, so the
+        # sticky row could name a model that never actually served and the
+        # next turn's never-downgrade floor held the conversation there.
+        # The caller knows the real serving model only after the gates run,
+        # so the actual write is RE-DIRECTED through the deferred writer
+        # seam the caller supplies: sticky_write(model) returns either None
+        # (legacy eager writer — write now) or a zero-arg finisher that the
+        # caller invokes once admission settles. The ledger truth
+        # convention applies to stickiness too: record what billed.
+        _finish = None
         if sticky_write is not None:
             try:
-                sticky_write(choice.model)
+                _finish = sticky_write(choice.model)
             except Exception as exc:  # pragma: no cover - writer is fail-open
                 log.warning("routing: sticky write failed (%s) - floor not persisted", type(exc).__name__)
-        return choice.model, RouteDecision(
+        active_decision = RouteDecision(
             policy="active",
             engaged=True,
             ceiling=ceiling,
@@ -933,6 +1178,9 @@ async def resolve_routed_model(
             stamp=True,
             probabilities=probs,
         )
+        if _finish is not None:
+            active_decision.sticky_finish = _finish
+        return choice.model, active_decision
     except RoutingRefused:
         raise
     except Exception as exc:
