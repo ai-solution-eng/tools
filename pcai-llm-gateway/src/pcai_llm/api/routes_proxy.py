@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -46,15 +45,17 @@ from ..core import agents as agents_mod
 from ..core import (
     canonical,
     clientside,
+    context_window,
     embedcache,
     guardrails,
     model_fallbacks,
     model_routing,
     offpeak,
     registry,
-    secretbox,
     title_requests,
     toolrelay,
+    upstream_auth,
+    wire_compat,
 )
 
 # TTFT / budget-warning / concurrency metrics (settle-side counters live in
@@ -587,6 +588,19 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
             if "imeout" in type(exc).__name__:
                 raise TimeoutError(str(exc)) from exc
             raise
+        if resp.status_code >= 400:
+            # DIAGNOSTIC ONLY (2026-10-29). decision_routing collapses every
+            # failure to "call failed (HTTPStatusError)", which is the whole
+            # reason a decision endpoint returning 4xx/5xx was undiagnosable:
+            # the status and the endpoint's own message were both discarded.
+            # Seen live during the FP8 d3-turbo swap — 10 of them across two
+            # pods — with no way to tell 401 from 422 from 503.
+            log.warning(
+                "decision model: %s/systemone -> %s body=%s",
+                base,
+                resp.status_code,
+                resp.content[:400].decode("utf-8", "replace"),
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -605,29 +619,11 @@ def _upstream_headers(ep: Endpoint, request_id: str) -> dict[str, str]:
     Neither → unauthenticated call with a warning (the pool may still serve
     public models; the upstream 401 keeps misconfig visible).
     """
-    headers = {"X-Request-ID": request_id}
-    if ep.auth_token_enc:
-        token = secretbox.decrypt(ep.auth_token_enc)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-            return headers
-        log.error(
-            "endpoint %s has a stored credential but it is undecryptable "
-            "(master key missing/rotated) — calling unauthenticated",
-            ep.id,
-        )
-    if ep.api_key_secret:
-        env_name = "PCAI_LLM_UPSTREAM_KEY__" + ep.api_key_secret.upper().replace("-", "_")
-        secret = os.environ.get(env_name)
-        if secret:
-            headers["Authorization"] = f"Bearer {secret}"
-        else:
-            log.warning(
-                "upstream key secret %r not found as env var %s; forwarding without Authorization header",
-                ep.api_key_secret,
-                env_name,
-            )
-    return headers
+    # Resolution order lives in core.upstream_auth so context-window discovery
+    # (which reaches the same /v1/models card through the same credential)
+    # cannot drift from the forward path. This wrapper keeps the call sites and
+    # the header contract unchanged.
+    return upstream_auth.upstream_headers(ep, request_id)
 
 
 def _log_request(
@@ -652,6 +648,82 @@ def _log_request(
 
 def _is_2xx(status_code: int) -> bool:
     return 200 <= status_code < 300
+
+
+def _context_limit_for(ep: Endpoint | None) -> int | None:
+    """The context window learned for THIS upstream; None when not known yet.
+
+    READ-ONLY on purpose. Discovery happens in registry.refresh()
+    (core.context_window.refresh_windows), because the window is a property of
+    the endpoint set and because probing here made every request an extra
+    upstream call — which a transparent proxy must never do, and which silently
+    broke every test that counts upstream calls.
+
+    None means "no opinion": the static ceiling in settings.max_tokens_ceiling
+    still applies, exactly as before this feature existed.
+    """
+    if ep is None or not ep.base_url:
+        return None
+    return context_window.cached(ep.base_url)
+
+
+def _pool_context_limit(model_name: str) -> int | None:
+    """Smallest KNOWN window across a model's endpoints; None = all unknown.
+
+    Smallest, not first: a pool is a set of interchangeable servers, and sizing
+    a request for the biggest one sends it to whichever member has capacity —
+    including one that cannot hold it.
+    """
+    pool = model_router.pool(model_name)
+    if pool is None or not pool.endpoints:
+        return None
+    known = [w for ep in pool.endpoints if (w := context_window.cached(ep.base_url)) is not None]
+    return min(known) if known else None
+
+
+def _context_gated(base: Callable[[str], bool], body: dict[str, Any]) -> Callable[[str], bool]:
+    """Wrap a ladder predicate with "this model's window can hold the prompt".
+
+    WHY (2026-10-29): the ladder filtered candidates by ACL, health and budget
+    but never by TOKEN CAPACITY, so nothing stopped it offering a 262144-window
+    model a request whose PROMPT already exceeded that — the one overflow no
+    completion cap can rescue. Measured on the same ladder: the decision model
+    picked Qwen3.8-27B (confidence 0.68) for a 100461-token prompt, which fits
+    only after the cap is solved (see config.clamp_max_tokens); a session that
+    grows past 262144 does not fit at all, and there the model must leave the
+    ladder instead of absorbing the request and 400ing.
+
+    Fail-open by construction: an unknown window (fresh pod, endpoint that
+    advertises nothing) gates nothing, so this can only ever remove a model the
+    gateway can PROVE cannot serve the request.
+    """
+    estimate = context_window.estimate_context_tokens(body)
+
+    def predicate(model_name: str) -> bool:
+        if not base(model_name):
+            return False
+        return context_window.fits(context_limit=_pool_context_limit(model_name), est_prompt=estimate)
+
+    return predicate
+
+
+def _advertised_caps(models: list[str]) -> dict[str, int]:
+    """context_length / max_tokens for one /v1/models entry. Empty when unknown.
+
+    Advertised so a client does not have to hardcode what the upstream already
+    publishes (DSH's model discovery reads exactly these two field names):
+    `context_length` is the smallest KNOWN window across `models`, which for an
+    alias means the smallest window ANY model the alias may pick can hold —
+    advertising the biggest would be the same 1M lie that hid the Qwen 400.
+
+    Omitted entirely when nothing is known: absent is honest, a guess is not.
+    """
+    windows = [w for m in models if (w := _pool_context_limit(m)) is not None]
+    if not windows:
+        return {}
+    window = min(windows)
+    ceilings = [c for m in models if isinstance(c := settings.max_tokens_ceiling.get(m), int) and c > 0]
+    return {"context_length": window, "max_tokens": min(ceilings) if ceilings else window}
 
 
 @dataclass
@@ -853,7 +925,19 @@ async def _proxy_json(
         # actually serving THIS attempt (a failover hop gets ITS ceiling, not
         # the requested model's). `body` itself is untouched (settle/estimate
         # read it), and the helper is zero-copy when no clamp applies.
-        send_body = clamp_max_tokens(body, cur_model, settings.max_tokens_ceiling)
+        send_body = clamp_max_tokens(
+            # A role the upstream rejects must never reach the wire: SGLang's
+            # Qwen templates answer 400 "Unexpected message role" for OpenAI's
+            # `developer` role, and only the gateway knows the model it is
+            # about to call (see core.wire_compat).
+            wire_compat.normalize_system_messages(body),
+            cur_model,
+            settings.max_tokens_ceiling,
+            # The window THIS attempt's upstream publishes. None until registry
+            # discovery has learned it, which is why the static ceiling above is
+            # still honoured (and still the only guard on a cold pod).
+            context_limit=_context_limit_for(cur_ep),
+        )
         # C-6 (audit 2026-10-29): the wire body names the model serving THIS
         # attempt — body["model"] is the CLIENT's name (a pin or an alias)
         # and used to survive every fallback hop verbatim, so a strict
@@ -2200,7 +2284,12 @@ async def _stream_chat(
         # rebuilt each iteration, so this must sit AFTER the rebuild — and
         # `cur_model` is this attempt's model (a failover hop gets ITS
         # ceiling). The client's `body` stays untouched for the settle.
-        send_body = clamp_max_tokens(send_body, cur_model, settings.max_tokens_ceiling)
+        send_body = clamp_max_tokens(
+            wire_compat.normalize_system_messages(send_body),
+            cur_model,
+            settings.max_tokens_ceiling,
+            context_limit=_context_limit_for(cur_ep),
+        )
         # C-6 (audit 2026-10-29): same rewrite as the non-streaming path —
         # every attempt names ITS model (this loop IS the failover walk).
         if send_body.get("model") != cur_model:
@@ -3121,6 +3210,13 @@ async def chat_completions(
                 log.warning("routing: capacity lookup failed (fail-open): %s", exc)
                 _capacity = {}
 
+        # Candidate availability, extended with TOKEN CAPACITY: a model whose
+        # context window cannot hold this prompt must not be offered to the
+        # router at all (2026-10-29). Same seam, same fail-open posture as the
+        # budget predicate it wraps.
+        _available = _routing_available(key, _capacity) if _routable else None
+        if _available is not None:
+            _available = _context_gated(_available, body)
         model, route_ctx = await model_routing.resolve_routed_model(
             key,
             body,
@@ -3128,7 +3224,7 @@ async def chat_completions(
             registered,
             key.allowed_models,
             order,
-            available=_routing_available(key, _capacity) if _routable else None,
+            available=_available,
             decide=decide_fn,
             sticky_floor=_sticky_floor,
             sticky_write=_sticky_write,
@@ -3836,7 +3932,12 @@ async def chat_completions(
                 # mid-loop failover re-points iterations at a fallback pool
                 # via `pool_for`, so the clamp is re-evaluated per call with
                 # that call's model instead of the request's requested one.
-                b2 = clamp_max_tokens(b2, ep2.model_name, settings.max_tokens_ceiling)
+                b2 = clamp_max_tokens(
+                    wire_compat.normalize_system_messages(b2),
+                    ep2.model_name,
+                    settings.max_tokens_ceiling,
+                    context_limit=_context_limit_for(ep2),
+                )
                 # C-6 (audit 2026-10-29): the wire body names the model
                 # serving THIS call. b2 still carries the CLIENT's name (a
                 # pin, or an alias like auto/routing); the relay's per-hop
@@ -3897,6 +3998,23 @@ async def chat_completions(
                             )
                         if resp.status_code >= 400:
                             await resp.aread()
+                            # DIAGNOSTIC ONLY (2026-10-29). The relay renders an
+                            # upstream 4xx as assistant text "(model error 400)"
+                            # and used to DISCARD the body, which made a real
+                            # incident undiagnosable from outside: a Qwen 400 on
+                            # a 13163-token prompt with max_tokens 65536 — 79k
+                            # against a 262144 window, so no context overflow —
+                            # and the only surviving evidence was the status
+                            # code. The body is the upstream's own error text
+                            # (never our credentials), truncated because some
+                            # backends echo the request.
+                            log.warning(
+                                "relay: upstream %s from model=%s endpoint=%s body=%s",
+                                resp.status_code,
+                                ep2.model_name,
+                                ep2.id,
+                                resp.content[:600].decode("utf-8", "replace"),
+                            )
                             yield ("error", str(resp.status_code))
                             yield ("content", f"(model error {resp.status_code})")
                             return
@@ -4384,6 +4502,11 @@ async def list_models(
             "object": "model",
             "created": int(time.time()),
             "owned_by": "pcai-llm-gateway",
+            # Capacity the UPSTREAM publishes, so a client does not have to
+            # hardcode what the server already knows. DSH's model discovery
+            # reads exactly these two field names; absent means "not learned",
+            # never a guess.
+            **_advertised_caps([m]),
             "pcai": {
                 "type": _pool_type(m),
                 **({"primary": True} if m == primary else {}),
@@ -4412,6 +4535,10 @@ async def list_models(
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "pcai-llm-gateway",
+                # An alias is sized by its SMALLEST candidate: the walk may
+                # pick any of them, so advertising the biggest window would be
+                # the 1M lie that hid the Qwen 400.
+                **_advertised_caps([m for m in order if m in registered_set]),
                 "pcai": {"type": "cascade", "alias": True, "order": order},
             },
         )
@@ -4422,6 +4549,7 @@ async def list_models(
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "pcai-llm-gateway",
+                **_advertised_caps([m for m in order if m in registered_set]),
                 "pcai": {
                     "type": "cascade",
                     "alias": True,
@@ -4454,6 +4582,9 @@ async def list_models(
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "pcai-llm-gateway",
+                    # Sized by the whole chat ladder, not by the ceiling: a
+                    # routing request may be downgraded to ANY of them.
+                    **_advertised_caps(chat_registered),
                     "pcai": {"type": "routing"},
                 }
             )

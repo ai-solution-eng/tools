@@ -25,6 +25,7 @@ from typing import Any
 from ..db import db
 from ..routing.router import Endpoint
 from ..routing.router import router as model_router
+from . import context_window, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,23 @@ async def refresh() -> None:
         len(endpoint_rows),
         len(by_model),
     )
+
+    # --- learn each upstream's CONTEXT WINDOW (2026-10-29) ----------------
+    # Every vLLM/SGLang /v1/models card publishes max_model_len, and without it
+    # the gateway cannot solve the admission inequality
+    # (prompt + max_tokens <= window) — the Qwen 400 that produced
+    # "(model error 400)" as an assistant answer. Learned HERE rather than on
+    # the request path because the window is a property of the ENDPOINT set and
+    # because a transparent proxy must not add an upstream call per request.
+    # Concurrent, bounded, backoff-gated (context_window.PROBE_RETRY_SECONDS),
+    # and FAIL-OPEN: discovery can only ever add knowledge.
+    try:
+        entries = [
+            (ep.base_url, upstream_auth.upstream_headers(ep)) for endpoints in by_model.values() for ep in endpoints
+        ]
+        await context_window.refresh_windows(entries)
+    except Exception as exc:
+        log.warning("registry refresh: context-window discovery skipped (%s)", exc)
 
     # --- MCP servers -> federation cache --------------------------------
     # Order: (priority ASC, name ASC) — lower priority = preferred, the same

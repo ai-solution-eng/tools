@@ -49,7 +49,7 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits Chart.yaml appVersion.
-  tag: v3.4.4
+  tag: v3.5.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

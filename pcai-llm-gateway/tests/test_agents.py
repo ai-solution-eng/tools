@@ -489,7 +489,14 @@ def test_agent_prompt_follows_the_client_system_message(proxy_env) -> None:
     )
     assert r.status_code == 200, r.text
     sent = json.loads(_SEEN[-1])
-    assert [m["content"] for m in sent["messages"]][:2] == ["client framing", "agent role"]
+    # 2026-10-29: the agent prompt still FOLLOWS the client's framing, but the
+    # two system messages are merged into one before the body leaves the
+    # gateway (core.wire_compat). SGLang's Qwen templates reject a second
+    # system message with 400 "System message must be at the beginning", so an
+    # agent served by a Qwen-routed model would fail every turn otherwise.
+    assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+    assert sent["messages"][0]["content"] == "client framing\n\nagent role"
+    assert sent["messages"][1]["content"] == "x"
 
 
 # ---------------------------------------------------------------------------
