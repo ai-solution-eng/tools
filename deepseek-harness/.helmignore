@@ -8,3 +8,7 @@ apply/
 scripts/
 docker/
 docs/
+# NFS silly-rename temp files (nfs server rename artifacts)
+.nfs*
+__pycache__/
+*.pyc

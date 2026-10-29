@@ -2,7 +2,7 @@
 
 Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.com/deepseek-ai/deepseek-harness) coding-agent environments on **HPE Private Cloud AI**. Each user gets their own PVC-backed workspace, and a shared workspace enables team collaboration.
 
-Port of the `opencode` chart (`opencode-web-helm`): same router, warm pool, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
+Port of the `opencode` chart (`opencode-web-helm`): same router, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
 Chart: `dsh-web-helm` · current version **0.4.22** (dsh `0.2.1-rc.2`, Node 22.23.3 image).
 0.4.4 fixes the VAST quota-collision hang for long usernames: quota names are `csi:<ns>:<pvc>`
@@ -58,8 +58,7 @@ platform roots (unix permissions stay the real enforcement).
 
 **Provisioning semantics:** the unit is *born* in the project namespace (K8s objects cannot move
 between namespaces) when the user has **no existing unit** — sticky semantics preserved, so an
-upgrade never silently moves or resets existing units. A brand-new SSO user cold-starts once
-(the platform warm pool only warms classic/local units).
+upgrade never silently moves or resets existing units. A brand-new SSO user cold-starts once.
 
 **Requirements (the admin conversation):**
 1. **Cross-namespace RBAC** — enabling the flag renders a `ClusterRole` +
@@ -78,7 +77,7 @@ deleted. Unit ConfigMap mirrors (the pod template mounts them cross-namespace vi
 copies) are DSH-owned and cleaned with the unit.
 
 **PVC-survival contract (since 0.4.13, `storage.keepPvcOnDelete: true`):** user data PVCs —
-per-user `dsh-*-ws-*/-st-*` claims, warm-pool claims (`dsh-user-warm-N-*-pvc-<nameVersion>` — `v2` on every current install) and the
+per-user `dsh-*-ws-*/-st-*` claims and the
 per-namespace `dsh-web-helm-shared-pvc` mirror — are never deleted by the app: not via the
 anchor GC cascade (PVCs are no longer owner-referenced), not by the admin user-delete flow,
 not by uninstall (the hook lists them and keeps them). The release shared PVC carries
@@ -120,8 +119,6 @@ helm test dsh-web-helm -n dsh-web-helm
 # 5. Log in at https://<host>/ → create users at /__dsh_admin (admin creds in values)
 # 6. Replace CHANGEME keys: Data Manager → DSH Home → .env (hot-reloaded)
 ```
-
-**Warm-pool boot note:** a freshly claimed unit needs ~60–90s for the dsh web process to boot (init re-checks the toolchain in seconds; dsh itself is the slow part). v0.2.0's readiness probe gates on dsh actually answering, so the router never hands you a mid-boot unit — worst case the provisioning spinner runs longer, never a 502.
 
 ---
 
@@ -167,6 +164,8 @@ Ports map: **443→8080 router→8082 nginx→3080 dsh** (loopback), 7681 ttyd, 
 | `dshEnv` | Seed `.env` written into `$DSH_HOME` on first start — the credential layer (`apiKeyEnv` resolves from it; edit via Data Manager, hot-reloaded) |
 | `dsh.version` / `dsh.port` | dsh npm version / loopback port (3080) |
 | `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a `/api/session/prompt` body — the request never reaches dsh. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
+| `dataManager.clientMaxBodySize` | nginx body cap for the `/data-manager` locations only (default `2g`). The `http{}`-level `nginx.clientMaxBodySize` stays as the UI cap (pasted images); raise both if users need bigger single files. |
+| `dataManager.maxUploadMb` | server-side per-file guard (`DATA_MANAGER_MAX_UPLOAD_MB`, default `2048`). Keep it at or above `dataManager.clientMaxBodySize` so nginx stays the binding limit and an oversized file fails before it is streamed. |
 
 **Hot reload:** the supervisor watches `settings.yaml`, `.env`, `profiles/web/cordis.patch.yml` and `profiles/web/dsh.profile` as FILES and restarts dsh on change — every changed YAML file is validated (js-yaml from the dsh install, `!!js`-aware) before the restart, so a broken edit can never crash-loop dsh. dsh also re-reads settings per request, so most model edits apply without restart. Edit via the Data Manager's **DSH Home** root or the terminal; seeded on first start only, never overwritten.
 
@@ -186,13 +185,9 @@ Ports map: **443→8080 router→8082 nginx→3080 dsh** (loopback), 7681 ttyd, 
 | `/workspace/shared` | RWX PVC | Team area (seeded from `shared/` with toy demos + venv) |
 | `/var/dsh` (state PVC) | RWO PVC | `$DSH_HOME`, npm prefix, ttyd binary, boot state |
 
-Data Manager roots: **Personal**, **Shared**, **DSH Home** (`$DSH_HOME` — settings.yaml, skills, sessions), State (non-navigable). Monaco editor, upload/download/zip, storage panel — path-traversal clamped to the three navigable roots.
+Data Manager roots: **Personal**, **Shared**, **DSH Home** (`$DSH_HOME` — settings.yaml, skills, sessions), State (non-navigable); SSO units with `platformIntegration.enabled` also get **Platform Shared** (`/mnt/shared`) and **Platform Workspace** (`/mnt/user`). Monaco editor, upload/download/zip, storage panel — path-traversal clamped to the navigable roots.
 
----
-
-## Warm Pool
-
-Same semantics as the opencode chart (pre-provisioned Deployment+Service+PVCs per unit, warm-first assignment, Recreate strategy, stuck-unit recreation). Tradeoff: each unit idles up to 2 CPU / 2Gi. `warmPool.enabled/size` control it. Pre-delete hook cleans up all dynamic compute resources on `helm uninstall`; user data PVCs survive by default (`storage.keepPvcOnDelete: true`) and must be purged manually.
+**Uploads (0.4.30).** *Upload* takes plain files **and** compressed archives (.zip, .tar, .tar.gz/`.tgz`, .tar.xz, .tar.zst) — an archive is unpacked server-side unless you untick *Extract archives*, which is also the fastest way to land a big tree and the only path that preserves empty folders on every browser; *Upload folder* (`webkitdirectory`) keeps a directory tree as-is. Drag & drop accepts files **and** folders (entries API; empty folders preserved). Each file is one streamed request (temp file + `rename`, 3 in flight) with a progress dialog, per-file errors, cancel and retry. The pre-flight dialog sets the conflict policy (keep both / skip / overwrite), the permission policy (644/664/755/775) and hidden/temporary-entry skipping (`.git`, `.venv`, `~$…` Office lock files, `Thumbs.db` — on by default). Per-file ceiling: `dataManager.clientMaxBodySize` (default `2g`, per-location nginx override); `dataManager.maxUploadMb` is the server-side guard and must stay at or above it. The legacy whole-batch multipart endpoint is kept for browsers holding a cached SPA copy and is capped at 64 MiB.
 
 ---
 
@@ -204,7 +199,7 @@ Design contract (see `docker/user/Dockerfile`):
 
 - Baked artifacts live under **`/opt/dsh`** (`/opt/dsh/npm`, `/opt/dsh/bin`) — never under `/var/dsh`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/dsh/data/npm`, `/var/dsh/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `dsh-startup.sh` is unchanged.
 - **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `dsh.version` without rebuilding) and the old install-on-boot behavior resumes.
-- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated + warm pool) onto the new image automatically.
+- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated) onto the new image automatically.
 - User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
 
 Build & push (single source of truth: the script reads `dsh.version` + `provisioning.aptPackages` from the values file; the image tag defaults to `dsh.version` — a version bump and an image rebuild stay coupled):
@@ -259,7 +254,7 @@ dockerbuild -t ghcr.io/<org>/my-app:0.0.1 --push .   # build + push in one shot
 ### Caveats
 
 - **Bind mounts don't cross the DinD boundary**: `docker run -v /workspace/x:/x ...` resolves paths inside the *sidecar's* filesystem, not your PVC — the classic DinD limitation. Build contexts are fine (the CLI streams them to the daemon over the API).
-- Built images are ephemeral (node-local emptyDir, **disk-capped via values `docker.diskSize`, 50Gi by default** — rendered as both the volume `sizeLimit` and the daemon container's `ephemeral-storage` limit, since the pairing is what makes the cap enforceable; exceeding it evicts the daemon's pod and the build fails with `no space left on device`, never node DiskPressure; `docker.diskRequest` tunes the scheduler reservation). **The blast radius depends on where the daemon runs**: broker mode (SSO/platform units) — only the *broker* pod is evicted and its Deployment restarts it with a fresh store; the user's session stays up. In-pod sidecar mode (classic/warm units) — the eviction restarts the *user's* pod (the session dies with it). Either way, builds/pulls can never grow past the cap or put pressure on the node. Check usage with `docker system df`, reclaim with `docker system prune`; everything is re-pulled/re-built after a reschedule, and a `docker build` cache is likewise lost.
+- Built images are ephemeral (node-local emptyDir, **disk-capped via values `docker.diskSize`, 50Gi by default** — rendered as both the volume `sizeLimit` and the daemon container's `ephemeral-storage` limit, since the pairing is what makes the cap enforceable; exceeding it evicts the daemon's pod and the build fails with `no space left on device`, never node DiskPressure; `docker.diskRequest` tunes the scheduler reservation). **The blast radius depends on where the daemon runs**: broker mode (SSO/platform units) — only the *broker* pod is evicted and its Deployment restarts it with a fresh store; the user's session stays up. In-pod sidecar mode (classic units) — the eviction restarts the *user's* pod (the session dies with it). Either way, builds/pulls can never grow past the cap or put pressure on the node. Check usage with `docker system df`, reclaim with `docker system prune`; everything is re-pulled/re-built after a reschedule, and a `docker build` cache is likewise lost.
 - Each running build/container consumes the pod's resources — the sidecar requests 250m/512Mi with 4 CPU / 8Gi limits (values `docker.resources`).
 - **Platform units (`project-user-*`, SSO) get their daemon OUT-OF-POD (default).** The platform Kyverno policies deny privileged containers in user namespaces (observed on tr7: `ezprojects-restrict-privileged-pods` — an in-pod sidecar there makes the unit's Deployment POST fail with 400 and **breaks platform SSO entirely**). So the router deploys a **per-user broker** — one privileged `dsh-dind-<user>` Deployment + Service + NetworkPolicy (ingress restricted to the owning unit's pod) in the **release namespace**, where privileged is admitted — and the unit's terminal reaches it via `DOCKER_HOST=tcp://dsh-dind-<user>-svc.<release-ns>.svc.cluster.local:2375`. Same docker UX, no policy change needed. `docker.brokerForPlatformUnits: false` disables it (platform units then have no docker); `docker.onPlatformUnits: true` moves the daemon INTO the platform pod (loopback) — only after the platform team applies the Kyverno `PolicyException` (`dsh-user-managed=true`, kinds Deployment+Pod, policy `ezprojects-restrict-privileged-pods`).
 - **Broker lifecycle:** created on the unit's first SSO resolve and converged on image/values changes (the `dsh-web-helm/dind-template-version` annotation), deleted on user delete, swept by the helm-uninstall hook (`dsh-user-managed=true`). Sizing reuses `docker.resources` / `docker.diskSize`.
