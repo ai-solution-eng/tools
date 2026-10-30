@@ -1,6 +1,6 @@
 ---
 name: lessons-loop
-description: Use when building an agent that should learn from its own resolutions — a self-improvement / lesson-distillation loop, a "remember what worked" instruction store, or a domain-adaptive prompt layer. Domain-agnostic: applies to SQL, API calls, shell work, or any tool surface. NOT for session/memory curation (that is memory-curation), and not a substitute for a held-out eval set.
+description: 'Use when building an agent that should learn from its own resolutions — a self-improvement / lesson-distillation loop, a "remember what worked" instruction store, or a domain-adaptive prompt layer. Domain-agnostic: applies to SQL, API calls, shell work, or any tool surface. NOT for session/memory curation (that is memory-curation), and not a substitute for a held-out eval set.'
 ---
 
 # Lessons loop (self-improving agent, two-dataset guardrail)
