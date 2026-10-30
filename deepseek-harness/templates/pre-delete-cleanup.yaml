@@ -17,7 +17,7 @@
   PVC). Namespaces are never deleted by this hook.
 
   PVC SURVIVAL (storage.keepPvcOnDelete=true, the default): user data PVCs —
-  per-user ws/st claims, warm-pool claims and the per-namespace shared mirror
+  per-user ws/st claims and the per-namespace shared mirror
   — are NOT deleted on uninstall. They are listed and logged only, so the
   first re-login / re-install re-binds the exact same volumes. Deliberate
   purge = manual `kubectl delete pvc` (set storage.keepPvcOnDelete=false to
@@ -349,7 +349,7 @@ spec:
             }
             console.log('namespaces (final): ' + nsList.join(', '))
 
-            console.log('Phase 0: stop router (prevents warm-unit recreation during teardown)')
+            console.log('Phase 0: stop router (prevents unit recreation during teardown)')
             if (routerDeployment) {
               await deleteByName('/apis/apps/v1/namespaces/' + namespace + '/deployments', routerDeployment)
             }

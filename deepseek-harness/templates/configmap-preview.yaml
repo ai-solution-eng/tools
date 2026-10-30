@@ -86,6 +86,17 @@ data:
           proxy_buffering off;
         }
         location ^~ /data-manager {
+          # Folder / large-file uploads: the http{}-level 64m cap is sized for
+          # the UI (a pasted image), not for a model or dataset tree. This
+          # location gets its own, operator-tunable ceiling. Keep
+          # dataManager.maxUploadMb (the server-side guard) at or above it.
+          client_max_body_size {{ .Values.dataManager.clientMaxBodySize | default "2g" }};
+          # Stream the body straight to data_manager.mjs instead of spooling
+          # the whole request into /var/cache/nginx first — the node process
+          # writes it to disk itself (temp file + rename).
+          proxy_request_buffering off;
+          proxy_read_timeout 1800s;
+          proxy_send_timeout 1800s;
           proxy_pass http://127.0.0.1:7682;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
@@ -100,6 +111,10 @@ data:
         # from browser-cached SPA copies. data_manager.mjs aliases the
         # legacy prefix in-app instead.
         location ^~ /data_manager {
+          client_max_body_size {{ .Values.dataManager.clientMaxBodySize | default "2g" }};
+          proxy_request_buffering off;
+          proxy_read_timeout 1800s;
+          proxy_send_timeout 1800s;
           proxy_pass http://127.0.0.1:7682;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
@@ -1060,7 +1075,19 @@ data:
     const LEGACY_BASE = '/data_manager'
     const USER_SLUG = process.env.PREVIEW_USER_SLUG || ''
     const MAX_TEXT_SIZE = 5 * 1024 * 1024
-    const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '1024', 10) * 1024 * 1024
+    // Chart version, rendered by Helm. Surfaced by /api/healthz and in the
+    // header so "which build is this pod running?" is answerable from the
+    // browser — a re-stamp is otherwise invisible.
+    const BUILD = '{{ .Chart.Version }}'
+    // Default matches the chart's dataManager.maxUploadMb (2 GiB): a smaller
+    // default would silently become the binding limit under nginx's 2g cap.
+    const MAX_UPLOAD_SIZE = parseInt(process.env.DATA_MANAGER_MAX_UPLOAD_MB || '2048', 10) * 1024 * 1024
+    // The multipart endpoint below buffers the whole body in memory, so it
+    // keeps a hard, small ceiling of its own regardless of the streamed
+    // endpoint's limit: with the nginx /data-manager cap raised to 2g, a
+    // browser holding a cached SPA copy could otherwise hand that handler a
+    // body large enough to OOM the pod (2 Gi container limit).
+    const MAX_MULTIPART_SIZE = Math.min(MAX_UPLOAD_SIZE, 64 * 1024 * 1024)
     
     const BASE_ROOTS = [
       { key: 'personal', label: 'Personal', path: '/workspace/personal', navigable: true, shared: false },
@@ -1157,6 +1184,156 @@ data:
       }
     }
     
+    // ─── Upload path safety ─────────────────────────────
+    // Every write below starts from a base directory that already passed
+    // resolveSafe() and then walks the client-supplied relative path one
+    // segment at a time. The relative path is never used as a path until it
+    // has been split and validated, and mkdir({recursive:true}) is never
+    // called on untrusted input: a recursive mkdir would happily walk through
+    // a symlink that points outside the base.
+    const MAX_REL_PATH = 1024
+    const MAX_REL_DEPTH = 64
+    const MAX_REL_SEGMENT = 255
+    
+    function normalizeConflict(raw) {
+      return raw === 'skip' || raw === 'rename' ? raw : 'overwrite'
+    }
+    
+    // Normalized POSIX relative path, or null when the input is not something
+    // we are willing to write: absolute, containing "..", control characters,
+    // empty, too deep or with an over-long segment.
+    function sanitizeRelPath(raw) {
+      if (typeof raw !== 'string' || raw.length === 0) return null
+      const s = raw.normalize('NFC').replace(/\\/g, '/')
+      if (s.length > MAX_REL_PATH || s.startsWith('/')) return null
+      if (/[\u0000-\u001f\u007f]/.test(s)) return null
+      const segs = []
+      for (const seg of s.split('/')) {
+        if (!seg || seg === '.') continue
+        if (seg === '..') return null
+        if (seg.length > MAX_REL_SEGMENT) return null
+        segs.push(seg)
+      }
+      if (segs.length === 0 || segs.length > MAX_REL_DEPTH) return null
+      return segs.join('/')
+    }
+    
+    async function pathExists(p) {
+      try {
+        await fsp.lstat(p)
+        return true
+      } catch {
+        return false
+      }
+    }
+    
+    // Create relDir under baseReal and return its real path. Existing
+    // components are lstat()ed: a symlink is followed only when its target
+    // stays inside baseReal, and a non-directory component is an error.
+    async function mkdirInside(baseReal, relDir) {
+      let cur = baseReal
+      for (const seg of relDir ? relDir.split('/') : []) {
+        const next = path.join(cur, seg)
+        let st = null
+        try {
+          st = await fsp.lstat(next)
+        } catch (err) {
+          if (err.code !== 'ENOENT') throw err
+        }
+        if (!st) {
+          await fsp.mkdir(next)
+          cur = next
+          continue
+        }
+        if (st.isSymbolicLink()) {
+          const real = await fsp.realpath(next)
+          if (real !== baseReal && !real.startsWith(baseReal + path.sep)) {
+            const err = new Error('Refusing to follow a symlink that leaves the workspace')
+            err.code = 'EFORBIDDEN'
+            throw err
+          }
+          cur = real
+          continue
+        }
+        if (!st.isDirectory()) {
+          const err = new Error('Not a directory: ' + seg)
+          err.code = 'ENOTDIR'
+          throw err
+        }
+        cur = next
+      }
+      return cur
+    }
+    
+    // "report.txt" -> "report (1).txt"; a timestamp suffix if 999 attempts
+    // somehow all collide.
+    async function uniqueTarget(target) {
+      if (!(await pathExists(target))) return target
+      const dir = path.dirname(target)
+      const ext = path.extname(target)
+      const stem = path.basename(target, ext)
+      for (let i = 1; i < 1000; i += 1) {
+        const candidate = path.join(dir, stem + ' (' + i + ')' + ext)
+        if (!(await pathExists(candidate))) return candidate
+      }
+      return path.join(dir, stem + '-' + Date.now() + ext)
+    }
+    
+    // Map a filesystem error onto the HTTP shape the SPA understands.
+    function uploadError(res, err) {
+      const code = err && err.code
+      if (code === 'EFORBIDDEN') return sendError(res, 403, err.message)
+      if (code === 'ETOOLARGE') return sendError(res, 413, 'File too large')
+      if (code === 'ENOTDIR') return sendError(res, 409, err.message)
+      if (code === 'ENOSPC') return sendError(res, 507, 'No space left on device')
+      if (code === 'EDQUOT') return sendError(res, 507, 'Quota exceeded')
+      if (code === 'EROFS') return sendError(res, 403, 'Read-only file system')
+      if (code === 'EACCES' || code === 'EPERM') return sendError(res, 403, 'Permission denied')
+      if (code === 'ENAMETOOLONG') return sendError(res, 400, 'Path too long')
+      return sendError(res, 500, (err && err.message) || 'Upload failed')
+    }
+    
+    // Resolve one file destination under baseReal, applying the platform
+    // read-only policy per FILE (the opencode/openwork placement — checking
+    // only the base directory let a "../" filename land in a read-only
+    // platform root) and the requested conflict policy.
+    async function prepareUploadTarget(baseReal, rel, onConflict) {
+      const relDir = path.posix.dirname(rel) === '.' ? '' : path.posix.dirname(rel)
+      const dir = await mkdirInside(baseReal, relDir)
+      const blocked = platformWriteBlocked(dir) || platformWriteBlocked(path.join(dir, path.posix.basename(rel)))
+      if (blocked) {
+        const err = new Error(blocked)
+        err.code = 'EFORBIDDEN'
+        throw err
+      }
+      const relDirPosix = path.posix.dirname(rel) === '.' ? '' : path.posix.dirname(rel)
+      const joinRel = (name) => (relDirPosix ? relDirPosix + '/' + name : name)
+      let target = path.join(dir, path.posix.basename(rel))
+      if (onConflict === 'skip' && (await pathExists(target))) {
+        return { target, savedAs: rel, skipped: true }
+      }
+      if (onConflict === 'rename') target = await uniqueTarget(target)
+      return { target, savedAs: joinRel(path.basename(target)), skipped: false }
+    }
+    
+    // Split an absolute target into (deepest existing ancestor, remaining
+    // relative path) so mkdir can create several levels in one call — the old
+    // handler required the parent to exist and could only ever make one.
+    async function splitAtExistingAncestor(targetPath) {
+      let cur = path.resolve(String(targetPath || ''))
+      const segs = []
+      for (;;) {
+        if (await pathExists(cur)) {
+          const real = await resolveSafe(cur)
+          if (real) return { baseReal: real, rel: segs.slice().reverse().join('/') }
+        }
+        const parent = path.dirname(cur)
+        if (parent === cur) return null
+        segs.push(path.basename(cur))
+        cur = parent
+      }
+    }
+    
     function formatBytes(bytes) {
       if (bytes === 0) return '0 B'
       const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -1218,6 +1395,9 @@ data:
         path: r.path,
         shared: r.shared,
         platform: !!r.platform,
+        // Lets the SPA disable upload / new-folder on a read-only platform
+        // volume instead of failing one file at a time.
+        writable: !platformWriteBlocked(r.path),
       })))
     }
     
@@ -1444,41 +1624,402 @@ data:
     
       const boundary = boundaryMatch[1] || boundaryMatch[2]
       const contentLength = parseInt(req.headers['content-length'] || '0', 10)
-      if (contentLength > MAX_UPLOAD_SIZE) {
+      if (contentLength > MAX_MULTIPART_SIZE) {
         sendError(res, 413, 'Upload too large')
         return
       }
     
       const chunks = []
       let totalSize = 0
-      for await (const chunk of req) {
-        totalSize += chunk.length
-        if (totalSize > MAX_UPLOAD_SIZE) {
-          sendError(res, 413, 'Upload too large')
-          return
+      try {
+        for await (const chunk of req) {
+          totalSize += chunk.length
+          if (totalSize > MAX_MULTIPART_SIZE) {
+            sendError(res, 413, 'Upload too large')
+            return
+          }
+          chunks.push(chunk)
         }
-        chunks.push(chunk)
+      } catch (err) {
+        // The client hung up mid-upload: answer if we still can, never throw.
+        if (!res.headersSent) sendError(res, 400, 'Upload aborted')
+        return
       }
       const body = Buffer.concat(chunks)
       const parts = parseMultipart(body, boundary)
-      const uploaded = []
+    const uploaded = []
+    const onConflict = normalizeConflict(url.searchParams.get('onConflict'))
+    const modeRaw = url.searchParams.get('mode')
+    const mode = parseMode(modeRaw)
+    if (modeRaw && mode === null) {
+      sendError(res, 400, 'Invalid mode')
+      return
+    }
     
-      for (const part of parts) {
-        if (!part.filename) continue
-        const filePath = path.join(safePath, part.filename)
-        const safeFilePath = await resolveSafe(filePath)
-        if (!safeFilePath) {
-          uploaded.push({ name: part.filename, error: 'Forbidden path' })
+    for (const part of parts) {
+      if (!part.filename) continue
+      const rel = sanitizeRelPath(part.filename)
+      if (!rel) {
+        uploaded.push({ name: part.filename, error: 'Invalid path' })
+        continue
+      }
+      try {
+        const { target, savedAs, skipped } = await prepareUploadTarget(safePath, rel, onConflict)
+        if (skipped) {
+          uploaded.push({ name: rel, skipped: true })
           continue
         }
-        await fsp.mkdir(path.dirname(safeFilePath), { recursive: true })
-        await fsp.writeFile(safeFilePath, part.data)
-        uploaded.push({ name: part.filename, size: part.data.length })
+        // Temp file + rename, the same primitive the streamed endpoint uses:
+        // a direct writeFile() follows a symlink at the destination (only
+        // directory components go through mkdirInside), blocks forever on a
+        // FIFO, and leaves a truncated file when the disk fills mid-write.
+        const partTmp = path.join(path.dirname(target), '.dm-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.tmp')
+        try {
+          await fsp.writeFile(partTmp, part.data)
+          if (mode) await fsp.chmod(partTmp, mode)
+          await fsp.rename(partTmp, target)
+        } catch (err) {
+          await fsp.unlink(partTmp).catch(() => {})
+          throw err
+        }
+        uploaded.push({ name: rel, savedAs, size: part.data.length })
+      } catch (err) {
+        // One bad part must never take the process down: an async handler that
+        // throws is an unhandled rejection, node exits, and this server is not
+        // supervised (it is started with `node /opt/preview/data_manager.mjs &`).
+        uploaded.push({ name: rel, error: (err && err.message) || 'Upload failed' })
       }
+    }
     
       json(res, 200, { uploaded })
     }
     
+    // Streamed single-file upload — one request per file, body piped to a temp
+    // file beside the destination and renamed on success, so a partial transfer
+    // never shows up as a file and nothing is held in memory. The multipart
+    // /api/upload above stays for browsers running a cached SPA copy, but it
+    // buffers the whole body; folder uploads use this endpoint.
+    async function handleUploadFile(req, res, url) {
+      const baseReal = await resolveSafe(url.searchParams.get('path'))
+      if (!baseReal) {
+        sendError(res, 403, 'Forbidden path')
+        return
+      }
+      const blocked = platformWriteBlocked(baseReal)
+      if (blocked) {
+        sendError(res, 403, blocked)
+        return
+      }
+      const rel = sanitizeRelPath(url.searchParams.get('rel'))
+      if (!rel) {
+        sendError(res, 400, 'Invalid relative path')
+        return
+      }
+      const onConflict = normalizeConflict(url.searchParams.get('onConflict'))
+      const modeRaw = url.searchParams.get('mode')
+      const mode = parseMode(modeRaw)
+      if (modeRaw && mode === null) {
+        sendError(res, 400, 'Invalid mode')
+        return
+      }
+      const declared = parseInt(req.headers['content-length'] || '0', 10)
+      if (declared > MAX_UPLOAD_SIZE) {
+        sendError(res, 413, 'File too large')
+        return
+      }
+    
+      let tmpPath = null
+      try {
+        const { target, savedAs, skipped } = await prepareUploadTarget(baseReal, rel, onConflict)
+        if (skipped) {
+          // Discard the body we no longer need; swallow an abort so a dropped
+          // connection cannot surface as an unhandled stream error.
+          req.on('error', () => {})
+          req.resume()
+          json(res, 200, { ok: true, rel, skipped: true })
+          return
+        }
+        const existing = await fsp.lstat(target).catch(() => null)
+        if (existing && existing.isDirectory()) {
+          req.resume()
+          sendError(res, 409, 'A directory exists at ' + rel)
+          return
+        }
+        // Fixed-width temp name: deriving it from the destination basename
+        // overflows NAME_MAX for long (but legal) file names.
+        tmpPath = path.join(path.dirname(target), '.dm-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.tmp')
+        const handle = await fsp.open(tmpPath, 'wx')
+        // chmod after open: open()'s mode is masked by the process umask.
+        if (mode) await handle.chmod(mode)
+        let total = 0
+        try {
+          for await (const chunk of req) {
+            total += chunk.length
+            if (total > MAX_UPLOAD_SIZE) {
+              const err = new Error('File too large')
+              err.code = 'ETOOLARGE'
+              throw err
+            }
+            let off = 0
+            while (off < chunk.length) {
+              const { bytesWritten } = await handle.write(chunk, off, chunk.length - off)
+              if (!bytesWritten) throw new Error('Short write')
+              off += bytesWritten
+            }
+          }
+        } finally {
+          await handle.close()
+        }
+        await fsp.rename(tmpPath, target)
+        tmpPath = null
+        // savedAs is the name that actually landed on disk: onConflict=rename
+        // appends " (n)", and the SPA needs the real name to refresh the row.
+        json(res, 200, { ok: true, rel, savedAs, size: total })
+      } catch (err) {
+        if (tmpPath) await fsp.unlink(tmpPath).catch(() => {})
+        if (res.headersSent) {
+          res.destroy()
+          return
+        }
+        uploadError(res, err)
+        // A rejected body may still be streaming in; drop the connection so the
+        // client sees the error instead of pushing the rest of the file.
+        if (err && err.code === 'ETOOLARGE') req.destroy()
+      }
+    }
+    
+    // ─── Archive upload (zip / tar / tar.gz) ────────────
+    // A whole tree in one request: the browser sends an archive, the server
+    // detects the format, validates every entry name, extracts into an isolated
+    // temp dir inside the target, then installs the files with the same
+    // path-safety and conflict primitives as a normal upload. Links are never
+    // installed (both unzip and GNU tar refuse to write through a symlink
+    // member, and the installer drops them), and entries that escape the target
+    // reject the whole archive instead of extracting a partial tree.
+    const MAX_ARCHIVE_ENTRIES = 20000
+
+    // "644" / "775" -> octal number; rejects setuid/setgid/sticky.
+    function parseMode(raw) {
+      if (raw === null || raw === undefined || raw === '') return null
+      const s = String(raw)
+      if (!/^[0-7]{3,4}$/.test(s)) return null
+      const n = parseInt(s, 8)
+      return n > 0o777 ? null : n
+    }
+
+    function runTool(cmd, args) {
+      return new Promise((resolve) => {
+        let child
+        try {
+          child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+        } catch (err) {
+          resolve({ code: -1, stdout: '', stderr: String(err && err.message) })
+          return
+        }
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { if (stdout.length < 8 * 1024 * 1024) stdout += d.toString() })
+        child.stderr.on('data', (d) => { if (stderr.length < 64 * 1024) stderr += d.toString() })
+        child.on('error', (err) => resolve({ code: -1, stdout, stderr: String(err && err.message) }))
+        child.on('close', (code) => resolve({ code, stdout, stderr }))
+      })
+    }
+
+    // 'zip' | 'tar' (tar auto-detects gzip/bzip2/xz/zstd on read) | null.
+    function detectArchive(head) {
+      if (!head || head.length < 4) return null
+      if (head[0] === 0x50 && head[1] === 0x4b) return 'zip' // PK..
+      if (head[0] === 0x1f && head[1] === 0x8b) return 'tar' // gzip
+      if (head[0] === 0x42 && head[1] === 0x5a && head[2] === 0x68) return 'tar' // bzip2
+      if (head[0] === 0xfd && head[1] === 0x37 && head[2] === 0x7a && head[3] === 0x58) return 'tar' // xz
+      if (head[0] === 0x28 && head[1] === 0xb5 && head[2] === 0x2f && head[3] === 0xfd) return 'tar' // zstd
+      if (head.length >= 262 && head.subarray(257, 262).toString('latin1') === 'ustar') return 'tar'
+      return null
+    }
+
+    async function handleUploadArchive(req, res, url) {
+      const baseReal = await resolveSafe(url.searchParams.get('path'))
+      if (!baseReal) {
+        sendError(res, 403, 'Forbidden path')
+        return
+      }
+      const blocked = platformWriteBlocked(baseReal)
+      if (blocked) {
+        sendError(res, 403, blocked)
+        return
+      }
+      const onConflict = normalizeConflict(url.searchParams.get('onConflict'))
+      const modeRaw = url.searchParams.get('mode')
+      const mode = parseMode(modeRaw)
+      if (modeRaw && mode === null) {
+        sendError(res, 400, 'Invalid mode')
+        return
+      }
+      const baseStat = await fsp.stat(baseReal).catch(() => null)
+      if (!baseStat || !baseStat.isDirectory()) {
+        sendError(res, 404, 'Target directory not found')
+        return
+      }
+      // Hidden entries are skipped on install (the archive still extracts into
+      // the temp dir, which is removed afterwards).
+      const skipHidden = url.searchParams.get('skipHidden') === '1'
+      const declared = parseInt(req.headers['content-length'] || '0', 10)
+      if (declared > MAX_UPLOAD_SIZE) {
+        sendError(res, 413, 'Archive too large')
+        return
+      }
+
+      const stamp = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+      const zipPath = path.join(baseReal, '.dm-upload-' + stamp + '.bin')
+      const extractDir = path.join(baseReal, '.dm-extract-' + stamp)
+      let payload = null
+      try {
+        // 1. stream the archive to disk (never buffered in memory)
+        const handle = await fsp.open(zipPath, 'wx')
+        let total = 0
+        try {
+          for await (const chunk of req) {
+            total += chunk.length
+            if (total > MAX_UPLOAD_SIZE) {
+              const err = new Error('Archive too large')
+              err.code = 'ETOOLARGE'
+              throw err
+            }
+            let off = 0
+            while (off < chunk.length) {
+              const { bytesWritten } = await handle.write(chunk, off, chunk.length - off)
+              if (!bytesWritten) throw new Error('Short write')
+              off += bytesWritten
+            }
+          }
+        } finally {
+          await handle.close()
+        }
+
+        // 2. detect the format, then validate EVERY entry before extracting
+        const headHandle = await fsp.open(zipPath, 'r')
+        const head = Buffer.alloc(512)
+        let headLen = 0
+        try {
+          const read = await headHandle.read(head, 0, 512, 0)
+          headLen = read.bytesRead
+        } finally {
+          await headHandle.close()
+        }
+        const format = detectArchive(head.subarray(0, headLen))
+        if (!format) {
+          sendError(res, 400, 'Not a zip, tar or tar.gz archive')
+          return
+        }
+        const tool = format === 'zip' ? 'unzip' : 'tar'
+        const listing = await runTool(tool, format === 'zip' ? ['-Z1', zipPath] : ['-tf', zipPath])
+        if (listing.code === -1) {
+          sendError(res, 500, tool + ' is not available in this container')
+          return
+        }
+        const entries = String(listing.stdout || '').split('\n').map((s) => s.replace(/\r$/, '')).filter(Boolean)
+        if (entries.length === 0) {
+          const hint = String(listing.stderr || '').split('\n').filter(Boolean)[0] || ''
+          sendError(res, 400, hint ? 'Unreadable archive: ' + hint.slice(0, 160) : 'Empty or unreadable archive')
+          return
+        }
+        if (entries.length > MAX_ARCHIVE_ENTRIES) {
+          sendError(res, 400, 'Archive has more than ' + MAX_ARCHIVE_ENTRIES + ' entries')
+          return
+        }
+        for (const raw of entries) {
+          // tar (and some zips) prefix every member with "./"; the root
+          // member itself is a no-op.
+          const entry = raw.replace(/^\.\//, '').replace(/\/+$/, '')
+          if (!entry) continue
+          if (!sanitizeRelPath(entry)) {
+            sendError(res, 400, 'Archive entry not allowed: ' + raw.slice(0, 120))
+            return
+          }
+        }
+
+        // 3. extract into an isolated directory inside the target, then install.
+        await fsp.mkdir(extractDir)
+        const extract = format === 'zip'
+          ? await runTool('unzip', ['-o', '-qq', zipPath, '-d', extractDir])
+          : await runTool('tar', ['-xf', zipPath, '-C', extractDir, '--no-same-owner'])
+
+        const installed = []
+        const skipped = []
+        const failed = []
+        const installDir = async (dirRel) => {
+          const abs = dirRel ? path.join(extractDir, dirRel) : extractDir
+          const dirents = await fsp.readdir(abs, { withFileTypes: true })
+          for (const ent of dirents) {
+            const childRel = dirRel ? dirRel + '/' + ent.name : ent.name
+            const absChild = path.join(abs, ent.name)
+            const skippable = (seg) => {
+              if (seg === '.' || seg === '..') return false
+              if (seg.charAt(0) === '.') return true
+              if (seg.indexOf('~$') === 0) return true
+              if (/^~WRL/i.test(seg)) return true
+              return /^(thumbs\.db|ehthumbs\.db|desktop\.ini)$/i.test(seg)
+            }
+            if (skipHidden && childRel.split('/').some(skippable)) {
+              skipped.push(childRel)
+              continue
+            }
+            const rel = sanitizeRelPath(childRel)
+            if (!rel) { skipped.push(childRel); continue }
+            if (ent.isSymbolicLink()) { skipped.push(childRel); continue }
+            if (ent.isDirectory()) {
+              await installDir(childRel)
+              try {
+                const dir = await mkdirInside(baseReal, rel)
+                if (mode) await fsp.chmod(dir, mode | 0o111)
+              } catch (err) { failed.push({ rel, error: (err && err.message) || 'mkdir failed' }) }
+              continue
+            }
+            if (!ent.isFile()) { skipped.push(childRel); continue }
+            try {
+              const prep = await prepareUploadTarget(baseReal, rel, onConflict)
+              if (prep.skipped) { skipped.push(rel); continue }
+              await fsp.rename(absChild, prep.target)
+              if (mode) await fsp.chmod(prep.target, mode)
+              installed.push(prep.savedAs)
+            } catch (err) {
+              failed.push({ rel, error: (err && err.message) || 'install failed' })
+            }
+          }
+        }
+        await installDir('')
+
+        // Respond AFTER the finally below removed the temp archive and extract
+        // dir: the SPA refreshes the listing as soon as it sees this response and
+        // must not show .dm-* scratch entries.
+        payload = {
+          ok: true,
+          format,
+          entries: entries.length,
+          installed: installed.length,
+          skipped: skipped.length,
+          failed: failed.length,
+          bytes: total,
+          details: { skipped: skipped.slice(0, 20), failed: failed.slice(0, 20) },
+          stderr: extract.code === 0 ? '' : String(extract.stderr || '').slice(0, 500),
+        }
+      } catch (err) {
+        if (res.headersSent) {
+          res.destroy()
+          return
+        }
+        uploadError(res, err)
+        // A rejected body may still be streaming in; drop the connection so the
+        // client sees the error instead of pushing the rest of the file.
+        if (err && err.code === 'ETOOLARGE') req.destroy()
+        return
+      } finally {
+        await fsp.rm(extractDir, { recursive: true, force: true }).catch(() => {})
+        await fsp.unlink(zipPath).catch(() => {})
+      }
+      json(res, 200, payload)
+    }
+
     async function handleRead(req, res, url) {
       const filePath = url.searchParams.get('path')
       const safePath = await resolveSafe(filePath)
@@ -1536,22 +2077,55 @@ data:
     }
     
     async function handleMkdir(req, res, body) {
-      const dirPath = body.path
-      const safePath = await resolveSafe(dirPath)
-      if (!safePath) {
-        sendError(res, 403, 'Forbidden')
+      if (typeof body.path !== 'string' || !body.path) {
+        sendError(res, 400, 'Missing path')
         return
       }
-      const blocked = platformWriteBlocked(safePath)
+      // Two shapes: { path: <existing dir>, rel: "a/b" } (preferred, what the
+      // SPA sends) and the legacy { path: <full path> }. The legacy shape is
+      // split at its deepest existing ancestor, which is what finally makes a
+      // nested "New folder" possible: resolveSafe() alone requires the parent to
+      // exist, so the old handler could only ever create one level.
+      const wantsRel = typeof body.rel === 'string' && body.rel.length > 0
+      let baseReal = null
+      let rel = ''
+      if (wantsRel) {
+        baseReal = await resolveSafe(body.path)
+        rel = sanitizeRelPath(body.rel)
+        if (!baseReal || !rel) {
+          sendError(res, 403, 'Forbidden')
+          return
+        }
+      } else {
+        const split = await splitAtExistingAncestor(body.path)
+        if (!split) {
+          sendError(res, 403, 'Forbidden')
+          return
+        }
+        baseReal = split.baseReal
+        if (split.rel) {
+          rel = sanitizeRelPath(split.rel)
+          if (!rel) {
+            sendError(res, 403, 'Forbidden')
+            return
+          }
+        }
+      }
+      const blocked = platformWriteBlocked(baseReal)
       if (blocked) {
         sendError(res, 403, blocked)
         return
       }
       try {
-        await fsp.mkdir(safePath, { recursive: true })
-        json(res, 200, { ok: true, path: safePath })
+        if (!rel) {
+          // Already exists — recursive mkdir used to be a no-op here.
+          json(res, 200, { ok: true, path: baseReal, existed: true })
+          return
+        }
+        const created = await mkdirInside(baseReal, rel)
+        json(res, 200, { ok: true, path: created })
       } catch (err) {
-        sendError(res, 500, err.message)
+        uploadError(res, err)
       }
     }
     
@@ -1693,13 +2267,16 @@ data:
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
             .replace('__DSH_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        // Never cache the SPA: it is a subPath mount that only changes when the
+        // unit re-stamps, and a heuristically-cached copy makes a chart upgrade
+        // look like it did nothing.
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
         res.end(spaHtml)
         return
       }
     
       if (subPath === '/api/healthz') {
-        json(res, 200, { ok: true })
+        json(res, 200, { ok: true, build: BUILD })
         return
       }
     
@@ -1726,6 +2303,14 @@ data:
         return handleUpload(req, res, url)
       }
     
+      if (subPath === '/api/upload-archive' && req.method === 'POST') {
+        return handleUploadArchive(req, res, url)
+      }
+
+      if (subPath === '/api/upload-file' && req.method === 'POST') {
+        return handleUploadFile(req, res, url)
+      }
+
       if (subPath === '/api/read' && req.method === 'GET') {
         return handleRead(req, res, url)
       }
@@ -1765,7 +2350,26 @@ data:
       sendError(res, 404, 'Not found: ' + subPath)
     }
     
-    const server = http.createServer(handleRequest)
+    // A rejected handler must produce a response, not a hanging socket:
+    // requestTimeout is disabled for uploads, and a malformed JSON body
+    // used to reject before anything was written.
+    const server = http.createServer((req, res) => {
+      handleRequest(req, res).catch((err) => {
+        console.error('[data_manager] request failed:', err)
+        if (res.headersSent) res.destroy()
+        else sendError(res, 400, (err && err.message) || 'Bad request')
+      })
+    })
+    // Belt and braces: an async handler that throws must never take the
+    // process down — it is started unsupervised (node data_manager.mjs &),
+    // and a single bad upload used to exit it (unhandled rejection).
+    process.on('unhandledRejection', (err) => {
+      console.error('[data_manager] unhandled rejection:', err)
+    })
+    // Large uploads are legitimate: never let node's 300 s request timeout
+    // kill a body that is still arriving (the streamed upload endpoint writes
+    // straight to disk). headersTimeout still bounds slowloris headers.
+    server.requestTimeout = 0
     server.listen(PORT, HOST, () => {
       console.log('[data_manager] listening on ' + HOST + ':' + PORT)
     })
@@ -2098,6 +2702,18 @@ data:
 
     /* Editor dialog */
     #edit-dialog { width: 96vw; height: 94vh; max-width: none; max-height: none; }
+    /* Upload dialog: progress bar + per-file list */
+    .up-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+    .up-bar-fill { height: 100%; width: 0%; background: var(--accent); transition: width .15s linear; }
+    #up-list { max-height: 220px; overflow: auto; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+    #up-list .up-row { display: flex; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+    #up-list .up-row:last-child { border-bottom: 0; }
+    #up-list .up-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #up-list .up-status { color: var(--text-muted); white-space: nowrap; }
+    #up-list .up-row.ok .up-status { color: var(--green); }
+    #up-list .up-row.err .up-status { color: var(--red); }
+    #up-list .up-row.skip .up-status { color: var(--text-muted); }
+    
     #edit-dialog .dlg-body { padding: 0; flex: 1; overflow: hidden; display: flex; flex-direction: column; }
     #editor-container { flex: 1; overflow: hidden; min-height: 300px; }
     /* Media preview (image / PDF / audio / video) inside the edit dialog */
@@ -2139,7 +2755,7 @@ data:
         <div class="hpe-brand">
           <div class="hpe-brand-name">Hewlett Packard Enterprise</div>
           <div class="hpe-brand-title">Data Manager</div>
-          <div class="hpe-brand-sub">Browse, upload, and edit your workspace files</div>
+          <div class="hpe-brand-sub">Browse, upload, and edit your workspace files <span id="build-badge" style="opacity:.7"></span></div>
         </div>
       </div>
       <button class="btn" id="btn-toggle-storage">Storage</button>
@@ -2163,13 +2779,14 @@ data:
       <select id="root-selector"></select>
       <nav id="breadcrumb"></nav>
       <button class="btn" id="btn-upload">Upload</button>
+      <button class="btn" id="btn-upload-folder">Upload folder</button>
       <button class="btn" id="btn-new-folder">New Folder</button>
       <button class="btn" id="btn-new-file">New File</button>
       <button class="btn" id="btn-refresh">Refresh</button>
     </div>
     
     <div id="main">
-      <div id="drop-overlay">Drop files here to upload</div>
+      <div id="drop-overlay">Drop files or folders here to upload</div>
       <table>
         <thead>
           <tr>
@@ -2293,6 +2910,54 @@ data:
       </div>
     </dialog>
     
+    <!-- Upload dialog: pre-flight, then live progress -->
+    <dialog id="upload-dialog">
+      <div class="dlg-header">Upload</div>
+      <div class="dlg-body">
+        <div id="up-pre">
+          <p id="up-summary" style="font-size:13px;line-height:1.5;margin:0 0 12px;"></p>
+          <div class="dlg-field">
+            <label for="up-conflict">If a file already exists</label>
+            <select id="up-conflict">
+              <option value="rename">Keep both — rename the new file</option>
+              <option value="skip">Skip it</option>
+              <option value="overwrite">Overwrite it</option>
+            </select>
+          </div>
+          <div class="dlg-field">
+            <label for="up-mode">Permissions</label>
+            <select id="up-mode">
+              <option value="">Default (644 files, 755 folders)</option>
+              <option value="664">Group-writable (664 / 775)</option>
+              <option value="755">Executable (755 / 755)</option>
+              <option value="775">Group-writable and executable (775 / 775)</option>
+            </select>
+          </div>
+          <label id="up-extract-wrap" style="display:flex;gap:8px;align-items:center;font-size:13px;margin-top:2px;">
+            <input type="checkbox" id="up-extract" checked>
+            <span>Extract archives (.zip, .tar, .tar.gz, .tar.xz, .tar.zst)</span>
+          </label>
+          <label id="up-hidden-wrap" style="display:flex;gap:8px;align-items:center;font-size:13px;margin-top:6px;">
+            <input type="checkbox" id="up-skip-hidden" checked>
+            <span>Skip hidden and temporary files (.git, .venv, ~$…, Thumbs.db)</span>
+          </label>
+          <label id="up-keep-wrap" style="display:flex;gap:8px;align-items:center;font-size:13px;margin-top:6px;">
+            <input type="checkbox" id="up-keep-top" checked>
+            <span>Keep the top-level folder name</span>
+          </label>
+        </div>
+        <div id="up-progress" class="hidden">
+          <div class="up-bar" id="up-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="up-bar-fill" id="up-bar-fill"></div></div>
+          <div id="up-count" aria-live="polite" style="font-size:12px;color:var(--text-muted);margin:8px 0;"></div>
+          <div id="up-list"></div>
+        </div>
+      </div>
+      <div class="dlg-footer">
+        <button class="btn" id="up-cancel">Cancel</button>
+        <button class="btn btn-primary" id="up-start">Upload</button>
+      </div>
+    </dialog>
+    
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
     <script>
     const API = '/data-manager/api';
@@ -2338,6 +3003,18 @@ data:
       return data;
     }
     
+    // "Which build am I looking at?" — answered in the header, because a
+    // stale subPath mount otherwise looks exactly like a missing feature.
+    async function showBuild() {
+      try {
+        const r = await fetch(API + '/healthz');
+        const d = await r.json();
+        const el = document.getElementById('build-badge');
+        if (el && d && d.build) el.textContent = '· v' + d.build;
+      } catch (e) { /* cosmetic only */ }
+    }
+    showBuild();
+
     function iconFor(type, ext) {
       if (type === 'dir') return '\u{1F4C1}';
       const imgExts = ['png','jpg','jpeg','gif','webp','svg','bmp'];
@@ -2387,6 +3064,7 @@ data:
     
     // ─── Breadcrumb ─────────────────────────────────────
     function renderBreadcrumb() {
+      syncUploadButtons();
       const bc = document.getElementById('breadcrumb');
       bc.innerHTML = '';
       if (!currentRoot) return;
@@ -2632,45 +3310,497 @@ data:
       if (!panel.classList.contains('hidden')) loadStorage();
     };
     
-    // ─── Upload ─────────────────────────────────────────
-    document.getElementById('btn-upload').onclick = function() {
+    // ─── Upload (files, archives, folders) ──────────────
+    // One pipeline for every entry point. "Upload" takes files *and* compressed
+    // archives (a .zip/.tar/.tar.gz is extracted server-side unless the user
+    // unticks the box); "Upload folder" takes a directory tree. A drop can carry
+    // both files and folders. An item is { file, rel } for a file, or
+    // { rel, dir: true } for an empty directory — only the drop path can see
+    // those (a <input webkitdirectory> never reports them).
+    const UPLOAD_CONCURRENCY = 3;
+    const UPLOAD_MAX_ROWS = 300;
+    const ARCHIVE_NAME_RE = /\.(zip|tar|tar\.gz|tgz|tar\.xz|txz|tar\.zst)$/i;
+    const upState = { items: [], policy: 'rename', keepTop: true, skipHidden: true, extract: true, mode: '', folderMode: false, running: false, abort: null };
+
+    function uploadAllowed() {
+      return !currentRoot || currentRoot.writable !== false;
+    }
+
+    function syncUploadButtons() {
+      const ok = uploadAllowed();
+      ['btn-upload', 'btn-upload-folder'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.disabled = !ok;
+        el.title = ok ? '' : 'This location is read-only';
+      });
+    }
+
+    function isArchiveName(name) {
+      return ARCHIVE_NAME_RE.test(String(name || ''));
+    }
+
+    function pickUploadFiles() {
+      if (!uploadAllowed()) { toast('This location is read-only', 'error'); return; }
       const input = document.createElement('input');
       input.type = 'file';
       input.multiple = true;
-      input.onchange = async () => {
-        await uploadFiles(Array.from(input.files));
+      input.onchange = function () {
+        const items = Array.from(input.files).map(function (f) { return { file: f, rel: f.name }; });
+        if (items.length) openUploadDialog(items, false);
       };
       input.click();
-    };
-    
-    async function uploadFiles(files) {
-      if (files.length === 0) return;
-      const formData = new FormData();
-      files.forEach(f => formData.append('files', f, f.name));
-      toast('Uploading ' + files.length + ' file(s)...', 'info');
-      try {
-        const res = await fetch(API + '/upload?path=' + encodeURIComponent(currentPath), {
-          method: 'POST',
-          body: formData,
+    }
+
+    function pickUploadFolder() {
+      if (!uploadAllowed()) { toast('This location is read-only', 'error'); return; }
+      const probe = document.createElement('input');
+      if (!('webkitdirectory' in probe)) { toast('This browser cannot pick folders — use Upload', 'error'); return; }
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = true;
+      input.webkitdirectory = true;
+      input.onchange = function () {
+        const items = Array.from(input.files).map(function (f) {
+          return { file: f, rel: f.webkitRelativePath || f.name };
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Upload failed');
-        const ok = (data.uploaded || []).filter(f => !f.error).length;
-        const fail = (data.uploaded || []).filter(f => f.error).length;
-        if (fail > 0) toast(ok + ' uploaded, ' + fail + ' failed', 'warning');
-        else toast(ok + ' file(s) uploaded', 'success');
-        await loadDir(currentPath);
-        loadStorage();
-      } catch (e) {
-        toast('Upload failed: ' + e.message, 'error');
+        if (items.length) openUploadDialog(items, true);
+      };
+      input.click();
+    }
+
+    // Entries API walk for the drop path. readEntries() must be called until it
+    // returns an empty batch (Chromium caps one call at 100 entries). A single
+    // unreadable entry (locked file, broken link) must not abort the whole drop,
+    // so both callbacks resolve to a safe empty value on error.
+    async function walkEntry(entry, out) {
+      if (!entry) return;
+      const rel = String(entry.fullPath || '').replace(/^\/+/, '');
+      if (entry.isFile) {
+        const file = await new Promise(function (resolve) {
+          entry.file(resolve, function () { resolve(null); });
+        });
+        if (file && rel) out.push({ file: file, rel: rel });
+        return;
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const children = [];
+        for (;;) {
+          const batch = await new Promise(function (resolve) {
+            reader.readEntries(resolve, function () { resolve([]); });
+          });
+          if (!batch || batch.length === 0) break;
+          for (const child of batch) children.push(child);
+        }
+        if (children.length === 0 && rel) { out.push({ rel: rel, dir: true }); return; }
+        for (const child of children) await walkEntry(child, out);
       }
     }
-    
+
+    // Read the drag payload synchronously (webkitGetAsEntry must be called while
+    // the event is still live), then walk it.
+    function itemsFromDrop(dt) {
+      const entries = [];
+      const list = Array.from(dt.items || []);
+      for (const it of list) {
+        const get = it.webkitGetAsEntry || it.getAsEntry;
+        if (typeof get === 'function') {
+          const entry = get.call(it);
+          if (entry) entries.push(entry);
+        }
+      }
+      if (entries.length === 0) {
+        const files = Array.from(dt.files || []);
+        // Without the entries API a dropped directory arrives as ONE zero-length,
+        // type-less File named after the folder: refuse it instead of writing a
+        // 0-byte file. A single empty extensionless file is indistinguishable, so
+        // only treat a lone such item as a folder.
+        if (files.length === 1 && !files[0].type && files[0].size === 0) {
+          return Promise.resolve({ error: 'This browser cannot read dropped folders — use Upload folder' });
+        }
+        return Promise.resolve({ items: files.map(function (f) { return { file: f, rel: f.name }; }) });
+      }
+      return (async function () {
+        const out = [];
+        for (const entry of entries) await walkEntry(entry, out);
+        return { items: out };
+      })();
+    }
+
+    // "." and ".." are not "hidden entries" — a path containing them is a
+    // malformed one the server rejects with a visible error, which is better
+    // than silently dropping it here.
+    // Entries that never need to travel to the workspace when the skip box
+    // is on: hidden entries, Office owner/lock files (~$deck.pptx), Word
+    // temp files (~WRL*.tmp) and the usual Windows/macOS directory junk.
+    const JUNK_NAMES = { 'thumbs.db': 1, 'ehthumbs.db': 1, 'desktop.ini': 1 };
+    function isSkippableSeg(s) {
+      if (s === '.' || s === '..') return false;
+      if (s.charAt(0) === '.') return true;
+      if (s.indexOf('~$') === 0) return true;
+      if (/^~WRL/i.test(s)) return true;
+      return !!JUNK_NAMES[s.toLowerCase()];
+    }
+    function isHiddenRel(rel) {
+      return rel.split('/').some(isSkippableSeg);
+    }
+
+    // Pure: apply the "keep top-level folder" choice, drop hidden entries when
+    // asked to, and drop empty names. origRel is kept so a retry starts from the
+    // name the user actually chose.
+    function buildUploadPlan(items, folderMode, keepTop, skipHidden) {
+      const plan = [];
+      for (const it of items) {
+        let rel = it.rel;
+        if (skipHidden && isHiddenRel(rel)) continue;
+        if (folderMode && !keepTop) {
+          const slash = rel.indexOf('/');
+          rel = slash === -1 ? rel : rel.slice(slash + 1);
+        }
+        if (rel) plan.push({ file: it.file, dir: it.dir, rel: rel, origRel: it.rel });
+      }
+      return plan;
+    }
+
+    function countHidden(items) {
+      return items.filter(function (it) { return isHiddenRel(it.rel); }).length;
+    }
+
+    function openUploadDialog(items, folderMode) {
+      if (upState.running) { toast('An upload is already running', 'warning'); return; }
+      if (!uploadAllowed()) { toast('This location is read-only', 'error'); return; }
+      upState.items = items;
+      upState.folderMode = !!folderMode;
+      upState.policy = 'rename';
+      upState.keepTop = true;
+      upState.skipHidden = true;
+      upState.extract = true;
+      const files = items.filter(function (i) { return !!i.file; });
+      const dirs = items.filter(function (i) { return !!i.dir; });
+      const archives = files.filter(function (i) { return isArchiveName(i.file.name); });
+      let bytes = 0;
+      for (const f of files) bytes += f.file.size;
+      const hidden = countHidden(items);
+      document.getElementById('up-summary').textContent =
+        files.length + ' file' + (files.length === 1 ? '' : 's') +
+        (archives.length ? ' (' + archives.length + ' archive' + (archives.length === 1 ? '' : 's') + ')' : '') +
+        (dirs.length ? ' and ' + dirs.length + ' empty folder' + (dirs.length === 1 ? '' : 's') : '') +
+        ' · ' + fmt(bytes) + ' → ' + currentPath +
+        (hidden ? ' · ' + hidden + ' hidden/temp entr' + (hidden === 1 ? 'y' : 'ies') + ' skipped' : '');
+      document.getElementById('up-conflict').value = 'rename';
+      document.getElementById('up-mode').value = '';
+      document.getElementById('up-skip-hidden').checked = true;
+      document.getElementById('up-extract-wrap').style.display = archives.length ? 'flex' : 'none';
+      document.getElementById('up-extract').checked = true;
+      document.getElementById('up-keep-wrap').style.display = upState.folderMode ? 'flex' : 'none';
+      document.getElementById('up-keep-top').checked = true;
+      document.getElementById('up-pre').classList.remove('hidden');
+      document.getElementById('up-progress').classList.add('hidden');
+      document.getElementById('up-list').innerHTML = '';
+      const startBtn = document.getElementById('up-start');
+      startBtn.classList.remove('hidden');
+      startBtn.textContent = 'Upload';
+      startBtn.onclick = startUpload;
+      document.getElementById('up-cancel').textContent = 'Cancel';
+      document.getElementById('upload-dialog').showModal();
+    }
+
+    function uploadOne(item, onProgress) {
+      return new Promise(function (resolve, reject) {
+        let url = API + '/upload-file?path=' + encodeURIComponent(currentPath) +
+          '&rel=' + encodeURIComponent(item.rel) +
+          '&onConflict=' + encodeURIComponent(upState.policy);
+        if (upState.mode) url += '&mode=' + encodeURIComponent(upState.mode);
+        const xhr = new XMLHttpRequest();
+        // Capture the session: a late onload/onerror can fire after the run has
+        // finished and upState.abort has been cleared.
+        const session = upState.abort || { xhrs: new Set() };
+        session.xhrs.add(xhr);
+        xhr.open('POST', url, true);
+        xhr.timeout = 30 * 60 * 1000;
+        xhr.setRequestHeader('content-type', 'application/octet-stream');
+        xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded); };
+        xhr.onload = function () {
+          session.xhrs.delete(xhr);
+          let data = {};
+          try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
+          if (xhr.status >= 200 && xhr.status < 300) { resolve(data); return; }
+          let msg = data && data.error ? data.error : 'HTTP ' + xhr.status;
+          if (xhr.status === 413) msg = data && data.error ? data.error : 'File is larger than the server limit';
+          reject(new Error(msg));
+        };
+        xhr.onerror = function () { session.xhrs.delete(xhr); reject(new Error('Network error')); };
+        xhr.onabort = function () { session.xhrs.delete(xhr); reject(new Error('Cancelled')); };
+        xhr.ontimeout = function () { session.xhrs.delete(xhr); reject(new Error('Timed out')); };
+        xhr.send(item.file);
+      });
+    }
+
+    // One archive, extracted server-side. The same XHR session as a file upload,
+    // so Cancel aborts it too.
+    function uploadArchive(file, onProgress) {
+      return new Promise(function (resolve, reject) {
+        let url = API + '/upload-archive?path=' + encodeURIComponent(currentPath) +
+          '&onConflict=' + encodeURIComponent(upState.policy);
+        if (upState.mode) url += '&mode=' + encodeURIComponent(upState.mode);
+        if (upState.skipHidden) url += '&skipHidden=1';
+        const xhr = new XMLHttpRequest();
+        const session = upState.abort || { xhrs: new Set() };
+        session.xhrs.add(xhr);
+        xhr.open('POST', url, true);
+        xhr.timeout = 60 * 60 * 1000;
+        xhr.setRequestHeader('content-type', 'application/octet-stream');
+        xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+        xhr.onload = function () {
+          session.xhrs.delete(xhr);
+          let data = {};
+          try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
+          if (xhr.status >= 200 && xhr.status < 300 && data && data.ok) { resolve(data); return; }
+          reject(new Error((data && data.error) || ('HTTP ' + xhr.status)));
+        };
+        xhr.onerror = function () { session.xhrs.delete(xhr); reject(new Error('Network error')); };
+        xhr.onabort = function () { session.xhrs.delete(xhr); reject(new Error('Cancelled')); };
+        xhr.ontimeout = function () { session.xhrs.delete(xhr); reject(new Error('Timed out')); };
+        xhr.send(file);
+      });
+    }
+
+    // Wrapper so a throw can never leave the dialog stuck in the running state.
+    // The re-entrancy guard lives HERE as well: a second call must not fall
+    // through the finally and clear the state of the run that is still going.
+    async function startUpload() {
+      if (upState.running) return;
+      try {
+        await runUpload();
+      } finally {
+        upState.running = false;
+        upState.abort = null;
+      }
+    }
+
+    async function runUpload() {
+      if (upState.running) return;
+      upState.policy = document.getElementById('up-conflict').value;
+      upState.keepTop = document.getElementById('up-keep-top').checked;
+      upState.skipHidden = document.getElementById('up-skip-hidden').checked;
+      upState.extract = document.getElementById('up-extract').checked;
+      upState.mode = document.getElementById('up-mode').value;
+
+      const plan = buildUploadPlan(upState.items, upState.folderMode, upState.keepTop, upState.skipHidden)
+        .map(function (p, i) { return { file: p.file, dir: p.dir, rel: p.rel, origRel: p.origRel, key: i }; });
+      const planned = plan.filter(function (p) { return !!p.file; });
+      const dirs = plan.filter(function (p) { return !!p.dir; });
+      const archives = upState.extract ? planned.filter(function (p) { return isArchiveName(p.file.name); }) : [];
+      const files = planned.filter(function (p) { return archives.indexOf(p) === -1; });
+
+      const startBtn = document.getElementById('up-start');
+      const cancelBtn = document.getElementById('up-cancel');
+      const list = document.getElementById('up-list');
+      const bar = document.getElementById('up-bar-fill');
+      const barBox = document.getElementById('up-bar');
+      const count = document.getElementById('up-count');
+
+      upState.running = true;
+      upState.abort = { aborted: false, xhrs: new Set() };
+      startBtn.classList.add('hidden');
+      cancelBtn.textContent = 'Cancel';
+      document.getElementById('up-pre').classList.add('hidden');
+      document.getElementById('up-progress').classList.remove('hidden');
+      list.innerHTML = '';
+
+      const rows = new Map();
+      const addRow = function (rel, key) {
+        const row = document.createElement('div');
+        row.className = 'up-row';
+        const name = document.createElement('span');
+        name.className = 'up-name';
+        name.textContent = rel;
+        const status = document.createElement('span');
+        status.className = 'up-status';
+        status.textContent = '…';
+        row.appendChild(name);
+        row.appendChild(status);
+        // Reading scrollHeight forces a layout: only do it while the list is
+        // pinned to the bottom, and keep the DOM bounded on huge trees.
+        const pinned = list.scrollTop + list.clientHeight >= list.scrollHeight - 24;
+        list.appendChild(row);
+        if (pinned) list.scrollTop = list.scrollHeight;
+        if (list.children.length > UPLOAD_MAX_ROWS) {
+          const first = list.firstChild;
+          if (first) list.removeChild(first);
+        }
+        rows.set(key, { row: row, status: status });
+      };
+
+      let totalBytes = 0;
+      for (const f of planned) totalBytes += f.file.size;
+      let completedBytes = 0;
+      let done = 0;
+      const totalUnits = archives.length + files.length;
+      let okCount = 0;
+      let skipCount = 0;
+      let failCount = 0;
+      let extractedFiles = 0;
+      const failures = [];
+      const inflight = new Map();
+      const recompute = function () {
+        let live = 0;
+        inflight.forEach(function (v) { live += v; });
+        const pct = totalBytes > 0
+          ? Math.min(100, Math.round(((completedBytes + live) / totalBytes) * 100))
+          : (totalUnits ? Math.round((done / totalUnits) * 100) : 100);
+        bar.style.width = pct + '%';
+        if (barBox) barBox.setAttribute('aria-valuenow', String(pct));
+        count.textContent = done + ' of ' + totalUnits + ' item' + (totalUnits === 1 ? '' : 's') + ' · ' +
+          fmt(completedBytes + live) + ' of ' + fmt(totalBytes);
+      };
+      recompute();
+
+      // Empty directories first, so a tree with no files still appears.
+      for (const d of dirs) {
+        if (!upState.abort || upState.abort.aborted) break;
+        try {
+          await api('/mkdir', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: currentPath, rel: d.rel }),
+          });
+        } catch (e) { /* already exists is fine */ }
+      }
+
+      // Archives are extracted one at a time (one server-side unpack at a time),
+      // then the plain files stream through the usual worker pool.
+      for (const item of archives) {
+        if (upState.abort && upState.abort.aborted) break;
+        addRow(item.rel, item.key);
+        const row = rows.get(item.key);
+        inflight.set(item.key, 0);
+        row.status.textContent = 'extracting…';
+        try {
+          const data = await uploadArchive(item.file, function (loaded) {
+            inflight.set(item.key, loaded);
+            recompute();
+          });
+          inflight.delete(item.key);
+          completedBytes += item.file.size;
+          okCount += 1;
+          extractedFiles += data.installed || 0;
+          skipCount += data.skipped || 0;
+          row.row.classList.add('ok');
+          row.status.textContent = 'extracted ' + (data.installed || 0) +
+            (data.skipped ? ', ' + data.skipped + ' skipped' : '') +
+            (data.failed ? ', ' + data.failed + ' failed' : '');
+          if (data.failed) failCount += data.failed;
+        } catch (e) {
+          inflight.delete(item.key);
+          if (upState.abort && upState.abort.aborted) {
+            row.row.classList.add('skip');
+            row.status.textContent = 'cancelled';
+          } else {
+            failCount += 1;
+            row.row.classList.add('err');
+            row.status.textContent = e.message;
+            failures.push({ file: item.file, dir: item.dir, rel: item.origRel });
+          }
+        }
+        done += 1;
+        recompute();
+      }
+
+      const queue = files.slice();
+      const worker = async function () {
+        for (;;) {
+          if (!upState.abort || upState.abort.aborted) return;
+          const item = queue.shift();
+          if (!item) return;
+          addRow(item.rel, item.key);
+          const row = rows.get(item.key);
+          inflight.set(item.key, 0);
+          try {
+            const data = await uploadOne(item, function (loaded) {
+              inflight.set(item.key, loaded);
+              recompute();
+            });
+            inflight.delete(item.key);
+            completedBytes += item.file.size;
+            if (data && data.skipped) {
+              skipCount += 1;
+              row.row.classList.add('skip');
+              row.status.textContent = 'skipped';
+            } else {
+              okCount += 1;
+              row.row.classList.add('ok');
+              const saved = data && data.savedAs;
+              row.status.textContent = saved && saved !== item.rel ? 'ok → ' + saved : 'ok';
+            }
+          } catch (e) {
+            inflight.delete(item.key);
+            if (upState.abort && upState.abort.aborted) {
+              row.row.classList.add('skip');
+              row.status.textContent = 'cancelled';
+            } else {
+              failCount += 1;
+              row.row.classList.add('err');
+              row.status.textContent = e.message;
+              failures.push({ file: item.file, dir: item.dir, rel: item.origRel });
+            }
+          }
+          done += 1;
+          recompute();
+        }
+      };
+      const lanes = Math.min(UPLOAD_CONCURRENCY, files.length);
+      const running = [];
+      for (let i = 0; i < lanes; i += 1) running.push(worker());
+      await Promise.all(running);
+
+      cancelBtn.textContent = 'Close';
+      const aborted = !!(upState.abort && upState.abort.aborted);
+      const archiveNote = extractedFiles ? ', ' + extractedFiles + ' file(s) extracted' : '';
+      if (aborted) {
+        count.textContent = 'Cancelled — ' + okCount + ' uploaded' + (skipCount ? ', ' + skipCount + ' skipped' : '');
+        toast(count.textContent, 'info');
+      } else if (failCount > 0) {
+        count.textContent = okCount + ' uploaded' + archiveNote + ', ' + failCount + ' failed' + (skipCount ? ', ' + skipCount + ' skipped' : '');
+        startBtn.classList.remove('hidden');
+        startBtn.textContent = 'Retry failed';
+        startBtn.onclick = function () { openUploadDialog(failures.slice(), upState.folderMode); };
+        toast(failCount + ' item(s) failed', 'error');
+      } else {
+        count.textContent = okCount + ' uploaded' + archiveNote + (skipCount ? ', ' + skipCount + ' skipped' : '');
+        toast(count.textContent, okCount > 0 ? 'success' : 'info');
+      }
+      await loadDir(currentPath);
+      loadStorage();
+    }
+
+    document.getElementById('btn-upload').onclick = pickUploadFiles;
+    document.getElementById('btn-upload-folder').onclick = pickUploadFolder;
+
+    document.getElementById('up-cancel').onclick = function () {
+      if (upState.running && upState.abort) {
+        upState.abort.aborted = true;
+        upState.abort.xhrs.forEach(function (xhr) { try { xhr.abort(); } catch (e) {} });
+      } else {
+        upState.items = [];
+        document.getElementById('upload-dialog').close();
+      }
+    };
+    document.getElementById('upload-dialog').addEventListener('cancel', function (e) {
+      if (upState.running) {
+        e.preventDefault();
+        document.getElementById('up-cancel').click();
+      } else {
+        upState.items = [];
+      }
+    });
+
     // Drag & Drop
     let dragCounter = 0;
     const mainEl = document.getElementById('main');
     const dropOverlay = document.getElementById('drop-overlay');
-    
+
     mainEl.addEventListener('dragenter', (e) => {
       e.preventDefault();
       dragCounter++;
@@ -2689,10 +3819,20 @@ data:
       e.preventDefault();
       dragCounter = 0;
       dropOverlay.classList.remove('active');
-      const files = Array.from(e.dataTransfer.files);
-      if (files.length > 0) await uploadFiles(files);
+      if (!uploadAllowed()) { toast('This location is read-only', 'error'); return; }
+      try {
+        // Walking a big tree takes a moment and shows nothing yet: say so.
+        toast('Reading dropped items…', 'info');
+        const result = await itemsFromDrop(e.dataTransfer);
+        if (result.error) { toast(result.error, 'error'); return; }
+        const items = result.items || [];
+        if (items.length === 0) { toast('Nothing to upload', 'info'); return; }
+        const hasDir = items.some(function (i) { return !!i.dir || i.rel.indexOf('/') !== -1; });
+        openUploadDialog(items, hasDir);
+      } catch (err) {
+        toast('Could not read the dropped items: ' + err.message, 'error');
+      }
     });
-    
     // ─── Download ───────────────────────────────────────
     document.getElementById('btn-download-sel').onclick = function() {
       const paths = Array.from(selectedPaths);
@@ -3266,7 +4406,10 @@ data:
             .replaceAll('__PREVIEW_USER_SLUG__', USER_SLUG)
             .replace('__DSH_HOME__', USER_SLUG ? `/${USER_SLUG}/` : '/')
         }
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        // Never cache the SPA: it is a subPath mount that only changes when the
+        // unit re-stamps, and a heuristically-cached copy makes a chart upgrade
+        // look like it did nothing.
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
         res.end(spaHtml)
         return
       }

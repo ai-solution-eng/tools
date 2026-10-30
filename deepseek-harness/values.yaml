@@ -50,6 +50,18 @@ storage:
 nginx:
   clientMaxBodySize: 64m
 
+# Data Manager (in-pod file browser at /data-manager) uploads.
+dataManager:
+  # Per-request body cap for the /data-manager locations ONLY (nginx
+  # client_max_body_size override). The http{}-level nginx.clientMaxBodySize
+  # above stays as the UI cap (pasted images); this one is what a model or
+  # dataset tree needs. nginx becomes the binding limit, so keep
+  # maxUploadMb at or above this.
+  clientMaxBodySize: 2g
+  # Server-side per-file guard (DATA_MANAGER_MAX_UPLOAD_MB). Raise it together
+  # with clientMaxBodySize, never below it.
+  maxUploadMb: 2048
+
 # Pod-template convergence counter. Bump this to force EVERY user unit to
 # re-stamp onto the current chart-rendered pod template (nginx.conf, supervisor,
 # probes, env) on the next router reconcile — no chart/template edit required.
@@ -57,7 +69,7 @@ nginx:
 # changes, the router patches each Deployment and the unit rolls.
 # Historical values live as comments on the template constant (RUNTIME_REV in
 # templates/configmap-router.yaml); keep this in sync with the shipped default.
-RUNTIME_REV: 37
+RUNTIME_REV: 41
 
 images:
   # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
@@ -152,24 +164,6 @@ provisioning:
     enabled: true
     heading: "Setting up your account\u2026"
     subtext: "Usually ready in under a minute. Please wait."
-
-# ============================================================
-# Warm pool: pre-provisioned, always-ready per-user units.
-# Same semantics as the opencode chart: the router keeps `size`
-# fully-initialized user pods warm so a new user's first launch
-# proxies in ~seconds instead of waiting for the per-user install
-# (npm install of @deepseek-ai/dsh, uv, ttyd). A warm unit = its own
-# Deployment + Service + workspace PVC + state PVC (the state PVC
-# holds the installed toolchain, so claiming only restarts the pod).
-#
-# Tradeoff: each warm unit is an idle user pod consuming resources
-# (up to the per-user limits). Set size: 0 or enabled: false to keep
-# the on-demand cold spin-up behavior.
-# ============================================================
-warmPool:
-  enabled: false
-  size: 2
-  refreshIntervalSeconds: 15
 
 auth:
   username: dsh

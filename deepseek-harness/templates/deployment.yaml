@@ -137,12 +137,6 @@ spec:
               value: {{ .Values.dsh.port | quote }}
             - name: PREVIEW_DOMAIN_SUFFIX
               value: {{ .Values.previewDomain }}
-            - name: WARM_POOL_ENABLED
-              value: {{ .Values.warmPool.enabled | quote }}
-            - name: WARM_POOL_SIZE
-              value: {{ .Values.warmPool.size | default 0 | toString | quote }}
-            - name: WARM_REFRESH_INTERVAL_MS
-              value: {{ mul (.Values.warmPool.refreshIntervalSeconds | default 15) 1000 | quote }}
             - name: SETUP_UI_ENABLED
               value: {{ .Values.provisioning.loadingUI.enabled | default true | quote }}
             - name: SETUP_STATUS_PATH

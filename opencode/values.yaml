@@ -68,6 +68,18 @@ storage:
 nginx:
   clientMaxBodySize: 64m
 
+# Data Manager (in-pod file browser at /data-manager) uploads.
+dataManager:
+  # Per-request body cap for the /data-manager locations ONLY (nginx
+  # client_max_body_size override). The http{}-level nginx.clientMaxBodySize
+  # above stays as the UI cap (pasted images); this one is what a model or
+  # dataset tree needs. nginx becomes the binding limit, so keep
+  # maxUploadMb at or above this.
+  clientMaxBodySize: 2g
+  # Server-side per-file guard (DATA_MANAGER_MAX_UPLOAD_MB). Raise it together
+  # with clientMaxBodySize, never below it.
+  maxUploadMb: 2048
+
 # Pod-template convergence counter. Bump this to force EVERY user unit to
 # re-stamp onto the current chart-rendered pod template (nginx.conf, supervisor,
 # probes, env) on the next router reconcile — no chart/template edit required.
@@ -216,35 +228,6 @@ provisioning:
     heading: "Setting up your account\u2026"
     subtext: "This usually takes a few minutes on first launch. Please wait."
 
-# ============================================================
-# Warm pool: pre-provisioned, always-ready per-user units.
-# When enabled, the router keeps `size` fully-initialized user pods
-# warm so a new user's first launch proxies in ~seconds instead of
-# waiting 3-5 minutes for the per-user install. A warm unit = its own
-# Deployment + Service + workspace PVC + state PVC (the state PVC holds
-# the installed toolchain, so claiming only restarts the pod, it does
-# not reinstall opencode/uv/ttyd).
-#
-# Assignment is warm-first for NEW users: they claim a warm unit when one
-# is available (even one that is still starting - the loading screen waits
-# for it), and only get a dedicated pod when the pool is disabled or has
-# nothing claimable. Users who already have a dedicated environment stay
-# on it (their data is in the dedicated PVCs and is not migrated).
-#
-# Tradeoff: each warm unit is an idle user pod consuming resources
-# (up to user.resources.limits). Set size: 0 or enabled: false to keep
-# the original on-demand cold spin-up behavior (exact same as before).
-#
-# Versions are NOT baked into an image: tools are installed at runtime
-# into the pooled state PVCs, so opencode.version / openchamber.version
-# still upgrade via a values.yaml bump - pooled units re-init on the
-# existing template-version annotation check.
-# ============================================================
-warmPool:
-  enabled: false
-  size: 2
-  refreshIntervalSeconds: 15
-
 auth:
   username: opencode
   password: "7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N"
@@ -348,7 +331,7 @@ certificatesPolicy:
   enabled: false 
 
   # These env vars are applied to the router container AND to every dynamically
-  # created user pod (warm pool + per-user). NODE_EXTRA_CA_CERTS is set as a
+  # created user pod (per-user). NODE_EXTRA_CA_CERTS is set as a
   # container env var so it is re-applied automatically on every restart.
   env: []
 

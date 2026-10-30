@@ -59,7 +59,7 @@ data:
     // containers. tr7's ezprojects-restrict-privileged-pods denies them in
     // project-user-* namespaces (release-namespace units are unaffected), so
     // the sidecar is RUNTIME-GATED per unit:
-    //   - release-namespace units (classic + warm pool): sidecar when
+    //   - release-namespace units (classic): sidecar when
     //     docker.enabled.
     //   - platform units (project-user-*): sidecar only when
     //     docker.onPlatformUnits is ALSO true — which requires the platform
@@ -97,12 +97,28 @@ data:
     // nothing), and the edit dialog previews images / PDF / audio / video via
     // a new inline+Range mode on /api/download. Bumped so existing units
     // re-stamp onto the new data_manager.mjs + data_manager.html.
+    // v17: data-manager uploads — same feature set as opencode v19 (files
+    // and compressed archives behind one "Upload" button, folder picker,
+    // drop recursion with empty dirs, per-file streamed endpoint, archive
+    // extraction, conflict/permission/hidden-entry options, per-location
+    // nginx body cap). Bumped so existing units re-stamp onto the new
+    // data_manager.mjs/.html + nginx.conf.
+    // v18: re-stamp for the final data-manager UI. v17 shipped with both
+    // 0.1.21 and 0.1.22, so units stamped by 0.1.21 kept the old
+    // data_manager.html (subPath mounts never refresh). v18 changes the
+    // marker: one "Upload" button for files AND archives, no separate .zip
+    // button.
+    // v19: the skip box now also drops Office owner/lock files (~$deck.pptx),
+    // Word temp files (~WRL*.tmp) and Windows/macOS directory junk, in the
+    // picker/drop paths and inside archives alike.
+    // v20: the Data Manager shows its build in the header and /api/healthz
+    // reports it, so a stale unit is visible from the browser.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) and every user unit re-stamps on the next reconcile. The
     // default matches the value shipped in values.yaml, so an install that does
     // not set it keeps rendering the same marker.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 12 }}'
-    const userTemplateVersion = `terminal-tab-v16-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 16 }}'
+    const userTemplateVersion = `terminal-tab-v20-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -371,6 +387,12 @@ data:
     }
 
     const ttydVersion = '1.7.7'
+
+    // Data Manager upload guard (values.yaml dataManager.maxUploadMb). Keep
+    // it at or above nginx's per-location client_max_body_size, otherwise
+    // nginx rejects first and the SPA gets an HTML 413 instead of a JSON
+    // error from the Data Manager.
+    const dataManagerMaxUploadMb = parseInt('{{ .Values.dataManager.maxUploadMb | default 2048 }}', 10) || 2048
     const userPullSecret = process.env.USER_IMAGE_PULL_SECRET || ''
     const usernameHeader = 'x-auth-request-preferred-username'
     const fallbackUserHeader = 'x-auth-request-user'
@@ -387,14 +409,6 @@ data:
     const hostTokenHeader = process.env.OPENCODE_SERVER_PASSWORD || ''
     const activePtyUpgrades = new Map()
     let tunnelSeq = 0
-    const warmPoolEnabled = process.env.WARM_POOL_ENABLED === 'true'
-    const warmPoolSize = Number(process.env.WARM_POOL_SIZE || '0')
-    const warmRefreshIntervalMs = Number(process.env.WARM_REFRESH_INTERVAL_MS || '15000')
-    const warmStuckThresholdMs = Number(process.env.WARM_STUCK_THRESHOLD_MS || `${15 * 60 * 1000}`)
-    const ownerMap = new Map() // user slug -> warm poolId
-    let poolBusy = false
-    const poolLocks = new Map() // poolId -> promise chain (per-unit claim mutex)
-    const warmStuckSince = new Map() // warm deployment name -> first-seen-not-ready timestamp
     const setupUiEnabled = process.env.SETUP_UI_ENABLED === 'true'
     const setupStatusPath = process.env.SETUP_STATUS_PATH || '/__oc_setup_status'
     const setupHeading = process.env.SETUP_HEADING || 'Setting up your account\u2026'
@@ -654,8 +668,6 @@ data:
       for (const dep of deployments) {
         const labels = dep.metadata?.labels || {}
         if (labels['openwork-user-slug'] === slug) return dep
-        if (labels['openwork-user-warmpool'] === 'true'
-          && (labels['openwork-user-owner'] === slug || (legacySlug && labels['openwork-user-owner'] === legacySlug))) return dep
       }
       return null
     }
@@ -682,7 +694,7 @@ data:
       let fallback = null
       for (const pod of (result && result.items) || []) {
         const labels = pod.metadata?.labels || {}
-        const podSlug = labels['openwork-user-slug'] || (labels['openwork-user-warmpool'] === 'true' ? labels['openwork-user-owner'] : null)
+        const podSlug = labels['openwork-user-slug']
         if ((podSlug !== slug && (!legacySlug || podSlug !== legacySlug)) || !pod.spec?.nodeName) continue
         if (pod.status?.phase === 'Running') {
           return { phase: 'Running', nodeName: pod.spec.nodeName }
@@ -802,7 +814,7 @@ data:
         }
         for (const pod of (result && result.items) || []) {
           const labels = pod.metadata?.labels || {}
-          const podSlug = labels['openwork-user-slug'] || (labels['openwork-user-warmpool'] === 'true' ? labels['openwork-user-owner'] : null)
+          const podSlug = labels['openwork-user-slug']
           if (!podSlug || !pod.spec?.nodeName) continue
           const phase = pod.status?.phase || 'Unknown'
           const existing = podBySlug.get(podSlug)
@@ -1053,25 +1065,11 @@ data:
           // Namespace unreadable — skip it.
         }
       }
-      let warm = null
-      outer: for (const candidate of candidates) {
-        for (const dep of deployments) {
-          const labels = dep.metadata?.labels || {}
-          if (labels['openwork-user-warmpool'] === 'true' && labels['openwork-user-owner'] === candidate) {
-            warm = warmNamesForPoolId(Number(labels['openwork-user-pool-id']))
-            break outer
-          }
-        }
-      }
       // Prefer the environment that actually exists and derive its claim
       // names from the deployment spec: an adopted pre-readable-slug
       // environment mounts legacy-named claims that a name-derived lookup
       // would miss (leaking VAST quotas).
       let target = null
-      if (warm) {
-        // Warm units only exist in the release namespace.
-        target = { ...warm, ns: namespace }
-      } else {
         for (const candidate of candidates) {
           const candidateNames = namesForSlug(candidate)
           for (const ns of targetNamespaces) {
@@ -1098,7 +1096,6 @@ data:
           }
           if (target) break
         }
-      }
       if (!target && unitNsSet.size > 0) {
         const tns = [...unitNsSet][0]
         target = {
@@ -1481,38 +1478,6 @@ data:
       }
     }
 
-    function warmServiceManifest(poolId) {
-      const name = warmNamesForPoolId(poolId).service
-      const poolIdStr = String(poolId)
-      return {
-        apiVersion: 'v1',
-        kind: 'Service',
-        metadata: {
-          name,
-          namespace,
-          labels: {
-            app: 'openwork-user',
-            'openwork-user-managed': 'true',
-            'openwork-user-warmpool': 'true',
-            'openwork-user-pool-id': poolIdStr,
-          },
-        },
-        spec: {
-          type: 'ClusterIP',
-          selector: {
-            'openwork-user-pool-id': poolIdStr,
-          },
-          ports: [
-            { name: 'http', protocol: 'TCP', port: 8080, targetPort: userServerPort },
-            { name: 'http-preview', protocol: 'TCP', port: 8082, targetPort: 8082 },
-            { name: 'ttyd', protocol: 'TCP', port: 7681, targetPort: 7681 },
-            { name: 'data-manager', protocol: 'TCP', port: 7682, targetPort: 7682 },
-            { name: 'term-mgr', protocol: 'TCP', port: 7683, targetPort: 7683 },
-          ],
-        },
-      }
-    }
-
     function serviceSpec(appPort) {
       return {
         type: 'ClusterIP',
@@ -1560,42 +1525,22 @@ data:
       await upsertService(userServiceManifest(name, slug, ns, ownerRefs))
     }
 
-    function warmNamesForPoolId(poolId) {
-      const base = `openwork-user-warm-${poolId}`
-      return {
-        deployment: base,
-        service: `${base}-svc`,
-        workspaceClaim: `${base}-workspace-pvc-${pvcNameVersion}`,
-        stateClaim: `${base}-state-pvc-${pvcNameVersion}`,
-        slug: `warm-${poolId}`,
-      }
-    }
-
-    async function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform, ssoUnit }) {
-      slug = owner || (isWarmPool ? `warm-${poolId}` : slug)
+    async function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, unitNs, ownerRefs, platform, ssoUnit }) {
       const manifestNs = unitNs || namespace
       const platformVolumesMounted = !!(platform && platform.volumesMounted)
-      const matchLabels = isWarmPool
-        ? { 'openwork-user-pool-id': String(poolId) }
-        : { 'openwork-user-slug': slug }
+      const matchLabels = { 'openwork-user-slug': slug }
       const podLabels = {
         app: 'openwork-user',
         'openwork-user-managed': 'true',
         'openwork-role': 'preview',
         ...matchLabels,
-        ...(isWarmPool ? { 'openwork-user-warmpool': 'true' } : {}),
         ...(platformVolumesMounted ? { 'openwork-platform-unit': 'true' } : {}),
       }
       const deploymentLabels = {
         app: 'openwork-user',
         'openwork-user-managed': 'true',
         ...matchLabels,
-        ...(isWarmPool ? { 'openwork-user-warmpool': 'true' } : {}),
         ...(platformVolumesMounted ? { 'openwork-platform-unit': 'true' } : {}),
-      }
-      if (owner) {
-        podLabels['openwork-user-owner'] = owner
-        deploymentLabels['openwork-user-owner'] = owner
       }
       // Identity env (platform integration): the project's unix attributes
       // from the platform project-info ConfigMap. Consumed by the init
@@ -1665,14 +1610,11 @@ data:
         // Per-user folder in the shared workspace: every real unit creates
         // /workspace/shared/<slug> — named after the login username (SSO or
         // local) — as the project identity; mkdir -p is idempotent and never
-        // touches existing data. Warm-pool placeholder units (slug
-        // warm-<poolId>, no owner yet) are skipped: the folder appears when
-        // a user claims the unit, because the adoption re-stamp re-runs this
-        // init with the owner's slug. NOTE: for platform units
+        // touches existing data. NOTE: for platform units
         // /workspace/shared is the per-namespace mirror claim, so the folder
         // lands in the user's own project namespace; classic units share the
         // release-level PVC.
-        ...(isWarmPool && !owner ? [] : [`$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`]),
+        `$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`,
         'if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*; fi',
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
         '$RUN_AS_USER sh -c \'mkdir -p /var/openwork/home/.config/openwork && if [ ! -f /var/openwork/home/.config/openwork/server.json ] && [ -f /opt/openwork-defaults/openwork-server.json ]; then cp /opt/openwork-defaults/openwork-server.json /var/openwork/home/.config/openwork/server.json; fi\' || true',
@@ -1949,6 +1891,7 @@ data:
                     { name: 'OPENWORK_DISABLE_FREE_INFERENCE', value: '{{- if .Values.openwork.disableCloudModels }}1{{- else }}0{{- end }}' },
                     { name: 'OPENCODE_SERVER_PORT', value: String(userServerPort) },
                     { name: 'PREVIEW_USER_SLUG', value: slug },
+                    { name: 'DATA_MANAGER_MAX_UPLOAD_MB', value: String(dataManagerMaxUploadMb) },
                     { name: 'TTYD_DOMAIN', value: previewDomainSuffix },
                     { name: 'TTYD_SLUG', value: slug },
 
@@ -2122,207 +2065,13 @@ data:
     }
 
     async function ensureDeployment(name, workspaceClaim, stateClaim, slug, options = {}) {
-      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool: false, ...options })
+      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, ...options })
       await upsertUserDeployment(name, manifest)
-    }
-
-    async function ensureWarmDeployment(poolId, owner) {
-      const names = warmNamesForPoolId(poolId)
-      const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug: names.slug, isWarmPool: true, poolId, owner })
-      await upsertUserDeployment(names.deployment, manifest)
-    }
-
-    async function ensureWarmUnit(poolId) {
-      const names = warmNamesForPoolId(poolId)
-      await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
-      await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
-      await upsertService(warmServiceManifest(poolId))
-      await ensureWarmDeployment(poolId)
     }
 
     async function listUserDeployments(ns = namespace) {
       const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments?labelSelector=${encodeURIComponent('openwork-user-managed=true')}`)
       return (result && result.items) || []
-    }
-
-    async function recoverOwnerPool() {
-      ownerMap.clear()
-      if (!warmPoolEnabled || warmPoolSize <= 0) return
-      try {
-        const deployments = await listUserDeployments()
-        for (const dep of deployments) {
-          const labels = dep.metadata?.labels || {}
-          const owner = labels['openwork-user-owner']
-          if (!owner) continue
-          const poolId = Number(labels['openwork-user-pool-id'])
-          if (Number.isFinite(poolId) && poolId > 0) ownerMap.set(owner, poolId)
-        }
-        console.log(`[warmpool] recovered ${ownerMap.size} owned warm unit(s)`)
-      } catch (error) {
-        console.error('[warmpool] owner recovery failed', error)
-      }
-    }
-
-    function warmUnitState(dep) {
-      const labels = dep.metadata?.labels || {}
-      const poolId = Number(labels['openwork-user-pool-id'])
-      const ready = (dep.status?.availableReplicas || 0) >= 1 && (dep.status?.updatedReplicas || 0) >= 1
-      return {
-        labels,
-        isWarm: labels['openwork-user-warmpool'] === 'true',
-        poolId,
-        ready,
-        owned: !!labels['openwork-user-owner'],
-      }
-    }
-
-    async function reconcilePool() {
-      if (!warmPoolEnabled || warmPoolSize <= 0) return
-      if (poolBusy) return
-      poolBusy = true
-      try {
-        // Converge existing units FIRST (idempotent): heals deployments
-        // created by older chart versions (RollingUpdate strategy / old
-        // template), preserving the current owner so a claimed unit keeps
-        // its auth key and labels. Running this before counting/cleanup
-        // also guarantees we never re-create a unit the cleanup deletes.
-        const initial = await listUserDeployments()
-        const initialWarm = initial
-          .map((dep) => warmUnitState(dep))
-          .filter((state) => state.isWarm && Number.isFinite(state.poolId))
-        await Promise.all(initialWarm.map((state) => ensureWarmDeployment(state.poolId, state.owned ? state.labels['openwork-user-owner'] : undefined)))
-
-        const deployments = await listUserDeployments()
-        let maxPoolId = 0
-        let free = 0
-        let pending = 0
-        const now = Date.now()
-        for (const dep of deployments) {
-          const state = warmUnitState(dep)
-          if (Number.isFinite(state.poolId) && state.poolId > maxPoolId) maxPoolId = state.poolId
-          if (!state.isWarm) continue
-          if (state.owned) {
-            warmStuckSince.delete(dep.metadata.name)
-            continue
-          }
-          if (state.ready) {
-            warmStuckSince.delete(dep.metadata.name)
-            free += 1
-            continue
-          }
-          const stuckStart = warmStuckSince.get(dep.metadata.name)
-          if (stuckStart === undefined) {
-            warmStuckSince.set(dep.metadata.name, now)
-            pending += 1
-            continue
-          }
-          if (now - stuckStart >= warmStuckThresholdMs) {
-            // Stuck warm unit: its init container has not completed for a long
-            // time. Recreate the Deployment (PVCs and Service persist, so the
-            // toolchain state survives) so the pool refills instead of drying
-            // up on a permanently broken unit.
-            console.log(`[warmpool] warm unit ${dep.metadata.name} stuck not-ready for ${Math.round((now - stuckStart) / 60000)}m, recreating it`)
-            warmStuckSince.delete(dep.metadata.name)
-            await deleteK8s(`/apis/apps/v1/namespaces/${namespace}/deployments`, dep.metadata.name)
-            continue
-          }
-          pending += 1
-        }
-        const need = warmPoolSize - free - pending
-        if (need <= 0) return
-        const needPoolIds = []
-        for (let i = 0; i < need; i++) {
-          needPoolIds.push(maxPoolId + 1 + i)
-        }
-        // Build the needed warm units in parallel so a fresh pool fills
-        // quickly instead of one-at-a-time.
-        await Promise.all(needPoolIds.map(async (poolId) => {
-          console.log(`[warmpool] ensuring warm unit poolId=${poolId}`)
-          await ensureWarmUnit(poolId)
-          await waitForDeployment(warmNamesForPoolId(poolId).deployment)
-          console.log(`[warmpool] warm unit ready poolId=${poolId}`)
-        }))
-      } catch (error) {
-        console.error('[warmpool] reconcile failed', error)
-      } finally {
-        poolBusy = false
-      }
-    }
-
-    function acquirePoolLock(poolId) {
-      const prev = poolLocks.get(poolId) || Promise.resolve()
-      let release
-      const tail = new Promise((resolve) => { release = resolve })
-      poolLocks.set(poolId, prev.then(() => tail))
-      return prev.then(() => release)
-    }
-
-    async function claimWarmForUser(slug, legacySlug, isSsoUser = false) {
-      // Bounded retries: re-verify ownership inside the per-pool lock so two
-      // concurrent claims can never both PATCH the same warm unit (which would
-      // overwrite the owner and strand one user on a pod that authenticates the
-      // other). Different units are still claimed in parallel.
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const deployments = await listUserDeployments()
-        let mine = null
-        let bestReady = null
-        let bestPending = null
-        for (const dep of deployments) {
-          const state = warmUnitState(dep)
-          if (!state.isWarm) continue
-          if (state.owned && (state.labels['openwork-user-owner'] === slug
-            || (legacySlug && state.labels['openwork-user-owner'] === legacySlug))) {
-            // Owns it under the readable slug or the legacy hash (the claim
-            // below re-templates the unit with the readable slug, rolling the
-            // pod while its volumes — and the user's data — stay).
-            if (mine === null || state.poolId < mine) mine = state.poolId
-          } else if (!state.owned) {
-            // Ready units are preferred, but a unit that is still starting
-            // (init container installing the toolchain) is claimed too: the
-            // router's loading screen already waits for readiness, which beats
-            // falling back to a dedicated pod and locking the user there.
-            if (state.ready) {
-              if (bestReady === null || state.poolId < bestReady) bestReady = state.poolId
-            } else if (bestPending === null || state.poolId < bestPending) {
-              bestPending = state.poolId
-            }
-          }
-        }
-        if (mine !== null) {
-          const poolId = mine
-          const names = warmNamesForPoolId(poolId)
-          ownerMap.set(slug, poolId)
-          return { slug, names }
-        }
-        const poolId = bestReady !== null ? bestReady : bestPending
-        if (poolId === null) {
-          return null
-        }
-        const release = await acquirePoolLock(poolId)
-        try {
-          // Re-verify while holding the lock: someone else may have claimed
-          // this unit after our selection, or reconcile may have recreated it.
-          // If so, retry the selection.
-          const current = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${warmNamesForPoolId(poolId).deployment}`)
-          const state = warmUnitState(current)
-          if (!current || !state.isWarm || state.owned) {
-            continue
-          }
-          const names = warmNamesForPoolId(poolId)
-          const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug, isWarmPool: true, poolId, owner: slug, ssoUnit: isSsoUser })
-          await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`, {
-            metadata: { labels: manifest.metadata.labels },
-            spec: { template: manifest.spec.template },
-          })
-          ownerMap.set(slug, poolId)
-          console.log(`[warmpool] claimed poolId=${poolId} owner=${slug}${state.ready ? '' : ' (unit still starting)'}`)
-          reconcilePool()
-          return { slug, names }
-        } finally {
-          release()
-        }
-      }
-      return null
     }
 
     async function waitForDeployment(name, timeoutMs = 300000, ns = namespace) {
@@ -2738,10 +2487,8 @@ data:
       } catch {
         isSsoUser = false
       }
-      // Sticky: if the user already has a dedicated (non-warm) environment, keep
-      // serving them there. Prevents a user who fell back to a dedicated
-      // deployment during a pool shortage from being silently moved to a warm
-      // unit later when the pool recovers.
+      // Sticky: if the user already has an environment, keep serving them
+      // there rather than re-deriving one.
       const existingDedicated = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`)
       if (existingDedicated) {
         // Data-preserving adoption: mount the claims the deployment ALREADY
@@ -2801,29 +2548,6 @@ data:
         await ensureService(names.service, slug)
         await ensureDeployment(names.deployment, legacyWorkspaceClaim, legacyStateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names: { ...names, workspaceClaim: legacyWorkspaceClaim, stateClaim: legacyStateClaim } }
-      }
-      if (warmPoolEnabled && warmPoolSize > 0) {
-        let claimed = null
-        try {
-          // Units being created by a concurrent refill do not exist in the
-          // deployments list yet, so a single claim pass can come up empty
-          // while the pool is mid-refill. Retry briefly before falling back
-          // to a dedicated pod (bounded: worst case ~6s, vs minutes of cold
-          // provisioning).
-          for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
-            claimed = await claimWarmForUser(slug, legacySlug, isSsoUser)
-            if (!claimed && attempt < 2) {
-              await new Promise((resolve) => setTimeout(resolve, 2000))
-            }
-          }
-        } catch (error) {
-          // A transient claim failure must not break the user's request:
-          // fall through and provision the dedicated environment instead.
-          console.error('[warmpool] claim failed, falling back to dedicated environment', error)
-        }
-        if (claimed) {
-          return claimed
-        }
       }
       await ensureLease(`openwork-user-${slug}`)
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
@@ -3903,8 +3627,6 @@ data:
             dep = deployments.find((d) => {
               const labels = d.metadata?.labels || {}
               return labels['openwork-user-slug'] === slug
-                || (labels['openwork-user-warmpool'] === 'true'
-                  && (labels['openwork-user-owner'] === slug || labels['openwork-user-owner'] === legacy))
             }) || null
           }
           return {
@@ -3928,9 +3650,7 @@ data:
         for (const username of Object.keys(users)) knownSlugs.add(legacySlugForUser(username))
         for (const d of deployments) {
           const labels = d.metadata?.labels || {}
-          const slug = labels['openwork-user-warmpool'] === 'true'
-            ? labels['openwork-user-owner']
-            : labels['openwork-user-slug']
+          const slug = labels['openwork-user-slug']
           if (!slug || knownSlugs.has(slug)) continue
           knownSlugs.add(slug)
           list.push({
@@ -4278,13 +3998,12 @@ data:
       }
     })
 
+    // Data Manager folder uploads can carry a 2 GB body; node's 300 s
+    // default requestTimeout would cut a slow upload mid-flight. Bounded at
+    // 30 min, and headersTimeout (60 s) still guards the header phase.
+    server.requestTimeout = 30 * 60 * 1000
     server.listen(8080, '0.0.0.0', () => {
       console.log('opencode router listening on 0.0.0.0:8080')
     })
 
-    recoverOwnerPool()
-    reconcilePool()
     setInterval(sweepStaleClearJobs, 60000)
-    if (warmPoolEnabled && warmPoolSize > 0) {
-      setInterval(reconcilePool, warmRefreshIntervalMs)
-    }

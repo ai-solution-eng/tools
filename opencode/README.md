@@ -106,6 +106,8 @@ All configuration lives in `values.yaml`:
 | `sessionCookieTtlDays` | How long a login lasts, in **days** (default `180`; historically hardcoded to 7). It sets the signed `oc_sess` cookie's `Max-Age` and its `exp` claim, so it controls only **when a user must log in again** — it deletes nothing. Conversations (`opencode.db`), workspace files, `opencode.json`/agents/skills and `auth.json` all survive. Invalid values (`0`, negative, non-numeric) fall back to 7 so a typo cannot lock everyone out, and the result is clamped to [1 hour, 400 days] — 400 days is the hard cap browsers put on cookie lifetime (RFC 6265bis §5.5), so a larger number would just be truncated client-side. The expiry is baked in at issue time, so raising this does not retroactively extend cookies already in users' browsers — they pick it up at their next login. |
 | `RUNTIME_REV` | **Bump this to force every user unit to re-stamp** onto the current chart-rendered pod template (nginx.conf, supervisor, probes, env) on the next router reconcile — no chart or template edit needed. It is folded into the `opencode-web-helm/user-template-version` annotation; when the value changes the router patches each Deployment and the unit rolls. Leave it **unset** for normal operation: unset renders the historical marker unchanged (no surprise rollout on `helm upgrade`); any value you set becomes the `-r<value>` suffix. Also settable from an EzAppConfig values blob. |
 | `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a prompt body — the request never reaches the app. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
+| `dataManager.clientMaxBodySize` | nginx body cap for the `/data-manager` locations only (default `2g`). The `http{}`-level `nginx.clientMaxBodySize` stays as the UI cap (pasted images); raise both if users need bigger single files. |
+| `dataManager.maxUploadMb` | server-side per-file guard (`DATA_MANAGER_MAX_UPLOAD_MB`, default `2048`). Keep it at or above `dataManager.clientMaxBodySize` so nginx stays the binding limit and an oversized file fails before it is streamed. |
 
 To switch the version of either opencode or OpenChamber, change the number in `values.yaml` and repackage. The chart `version` (in `Chart.yaml`) is bumped manually per release; `appVersion` tracks the opencode major.minor family.
 
@@ -166,81 +168,18 @@ These are bundled into a ConfigMap and copied into each user's `~/.config/openco
 
 ---
 
-## Warm Pool (instant first launch)
+## Uninstall / `helm uninstall`
 
-By default, a brand-new user's first launch waits while the router provisions a
-per-user Deployment + PVCs and runs a heavy init (`npm install` of opencode,
-uv, ttyd, apt packages) — this can take 3–5 minutes.
-
-The router can instead keep a small pool of **already-provisioned, always-ready
-user units** so a first-time user's environment is usable in roughly seconds.
-
-```yaml
-warmPool:
-  enabled: false   # set to true to opt in
-  size: 2          # number of always-ready idle user units to maintain
-  refreshIntervalSeconds: 15
-```
-
-### How it works
-
-- A "warm unit" is the full per-user set — its own Deployment, Service, workspace
-  PVC, and **state PVC**. The toolchain (opencode/uv/ttyd/openchamber) is installed
-  into the state PVC, so it is built **once** when the unit enters the pool.
-- The router runs a background reconcile loop that keeps `size` warm, un-owned
-  units at all times (it builds replacements in parallel whenever one is claimed).
-  An un-owned unit that stays non-Ready for more than 15 minutes
-  (`WARM_STUCK_THRESHOLD_MS`) is recreated so the pool cannot dry up on a broken
-  unit.
-- **Assignment is warm-first for new users.** On a first launch the router claims
-  the lowest-free warm unit — preferring a Ready unit, but it will also claim a
-  unit that is still starting (the loading screen then waits for it, the same UX
-  as a cold start, without spawning a dedicated pod). Claiming patches the pod
-  template to set the user's slug (for preview/ttyd URLs) and records the user as
-  the unit's owner. Claims are serialized per-unit, so two concurrent logins can
-  never grab the same unit.
-- **Rollouts use `Recreate`, not RollingUpdate.** User pods mount RWO PVCs; a
-  RollingUpdate surge pod scheduled on a different node would deadlock on a
-  Multi-Attach error while the old pod holds the volumes (surfacing as an
-  endless loading page on multi-node clusters). Recreate terminates the old pod
-  first; the claim downtime is absorbed by the loading screen and the restart
-  is fast because the toolchain is already on the state PVC. Existing
-  deployments are converged to Recreate automatically by the reconcile loop
-  (owner labels preserved).
-- **Users who already have a dedicated environment stay on it** (sticky). Their
-  data lives in the dedicated PVCs and is not carried over to warm units, so the
-  router never moves them. Only users with no existing environment are assigned
-  warm units; a dedicated pod is provisioned only when the pool is disabled or
-  has nothing claimable (e.g. pool creation failing).
-- `size: 0` or `enabled: false` behaves **exactly like before** (on-demand cold
-  spin-up; zero idle pods).
-- Versions are **not** baked into an image. opencode/OpenChamber remain runtime-
-  parameterized, so bumping `opencode.version` / `openchamber.version` in
-  `values.yaml` and repackaging still works. Warm units adopt a new version the
-  next time they are claimed/re-initialized via the existing template-version
-  logic — no image rebuild.
-
-### Tradeoff
-
-Each warm unit is an idle user pod consuming up to the per-user pod limits
-(2 cores / 2 Gi, hardcoded in the user template). `warmPool.size` therefore
-adds a permanent overhead of `size × those limits`. This is the explicit cost
-of instant first launch; keep it `enabled: false` if idle capacity is a
-concern.
-
-### Uninstall / `helm uninstall`
-
-A `pre-delete` hook deletes the dynamically-created per-user/warm resources
+A `pre-delete` hook deletes the dynamically-created per-user resources
 (which Helm does not own) so the namespace does not hang in `Terminating`.
 The hook:
 
 1. **Stops the router first** (deletes the router `Deployment`) so it can no
-   longer reconcile/re-create warm units while teardown is running.
+   longer recreate units while teardown is running.
 2. Deletes the per-user **Deployments, Services, and Leases in parallel**.
 3. Waits for their **pods to terminate** (releasing the PVC mounts).
 4. **Keeps every user data PVC** (default `storage.keepPvcOnDelete: true`):
-   per-user `opencode-*-ws-*/-st-*` claims, warm-pool claims
-   (`opencode-user-warm-N-*-pvc-<nameVersion>` — `v2` on every current install) and the per-namespace shared mirror are
+   per-user `opencode-*-ws-*/-st-*` claims and the per-namespace shared mirror are
    listed and logged, never deleted — the first re-login / re-install re-binds
    the exact same volumes and the data is still there. Set
    `storage.keepPvcOnDelete: false` to restore the legacy
@@ -276,10 +215,6 @@ screen** immediately:
 - If provisioning fails or times out, the page swaps to an error state with a
   **Retry** button (the retry clears the failed provisioning attempt and
   starts over).
-
-With a [warm pool](#warm-pool-instant-first-launch) enabled the loading
-screen appears only briefly during the fast rolling restart of a claimed
-warm unit (no reinstall), so it is near-instant.
 
 ### Configuration
 
@@ -374,7 +309,7 @@ the UI read-only for the platform roots (unix permissions stay the real enforcem
 **Provisioning semantics:** the unit is *born* in the project namespace (K8s objects
 cannot move between namespaces) when the user has **no existing unit** — sticky
 semantics preserved, so an upgrade never silently moves or resets existing units. A
-brand-new SSO user cold-starts once (the warm pool only warms classic/local units).
+brand-new SSO user cold-starts once.
 
 **Requirements (platform admin sign-off needed):**
 
@@ -391,7 +326,7 @@ in the release namespace **and** each unit namespace from the registry — label
 (`opencode-anchor-<slug>`) in the project namespaces, with a skip-assert that refuses any
 PVC carrying an `ezprojects.hpe.com/*` label. **The platform PVCs are never deleted** —
 and by default (since 1.2.3, `storage.keepPvcOnDelete: true`) **neither are the user data
-PVCs** (ws/st, warm-pool claims, per-namespace shared mirror): the hook lists them, keeps
+PVCs** (ws/st, per-namespace shared mirror): the hook lists them, keeps
 them, and the anchor cascade no longer references them. Namespaces are never deleted.
 Unit ConfigMap mirrors (the pod template mounts them
 cross-namespace via mirrored copies) are chart-owned and cleaned with the unit.
@@ -455,13 +390,13 @@ https://opencode.{DOMAIN_NAME}/u-{slug}/data-manager
 It provides a full UI for navigating, uploading, downloading, and editing files across the **Personal**, **Shared**, and **Config** (`~/.config`) roots:
 
 - **Browse** — Folder tree with breadcrumb navigation across **Personal**, **Shared**, and **Config** (`~/.config`) roots. Hidden dotfiles (`.config`, `.git`, `.bashrc`, …) are shown in all roots.
-- **Upload** — Drag-and-drop or click-to-select file upload into any folder.
+- **Upload** — Drag-and-drop (files **and** folders) or click-to-select. *Upload* also accepts compressed archives (.zip, .tar, .tar.gz, .tar.xz, .tar.zst) and unpacks them server-side in one request unless *Extract archives* is unticked; *Upload folder* keeps the tree (`webkitdirectory`). Per-file streamed uploads with progress, cancel and retry; the dialog sets the conflict policy (keep both / skip / overwrite), the permission policy (644/664/755/775) and hidden/temporary-entry skipping (`.git`, `.venv`, `~$…` Office lock files, `Thumbs.db` — on by default). Per-file ceiling `dataManager.clientMaxBodySize` (default `2g`).
 - **Download** — Single files download directly (with optional rename); multiple files or folders are archived as ZIP or TAR.GZ with a custom filename.
 - **Edit** — Double-click any text file to open it in the Monaco editor (VS Code's editor engine) with syntax highlighting and save support. Binary or large files show metadata with a download option.
 - **CRUD** — Create folders, create files, rename/move, and delete (recursive for directories).
 - **Storage Status** — A collapsible panel shows real-time PVC usage (bytes + inodes) for Personal, Shared, and State volumes, with color-coded usage bars.
 
-The data manager runs as a zero-dependency Node.js process (`data_manager.mjs`) inside the user pod on port 7682, alongside ttyd and the opencode supervisor. All file operations are path-traversal-protected (clamped to `/workspace/personal`, `/workspace/shared`, and `/var/opencode/home/.config`).
+The data manager runs as a zero-dependency Node.js process (`data_manager.mjs`) inside the user pod on port 7682, alongside ttyd and the opencode supervisor. All file operations are path-traversal-protected (clamped to `/workspace/personal`, `/workspace/shared`, and `/var/opencode/home/.config`). Uploads stream to a temp file beside the destination and `rename()` into place, so a partial transfer never appears as a file; `.zip` extraction validates every entry before writing anything and never installs symlinks.
 
 ---
 
@@ -493,7 +428,7 @@ Design contract (see `docker/user/Dockerfile`):
 
 - Baked artifacts live under **`/opt/opencode`** (`/opt/opencode/npm`, `/opt/opencode/bin`) — never under `/var/opencode`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/opencode/data/npm`, `/var/opencode/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `opencode-startup.sh` is unchanged.
 - **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `opencode.version`/`openchamber.version` without rebuilding) and the old install-on-boot behavior resumes.
-- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated + warm pool) onto the new image automatically.
+- The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated) onto the new image automatically.
 - The **Helm CLI** is baked under `/opt/opencode/bin/helm` (version pinned via `provisioning.helmVersion` — latest Helm 3 release; Helm 4 exists but the chart and the platform-side install tooling are Helm 3), so `helm package` / `helm lint` / `helm template` run from any pod terminal — e.g. packaging this chart itself from inside the app.
 - User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
 
@@ -576,7 +511,7 @@ dockerbuild -t ghcr.io/<org>/my-app:0.0.1 --push .   # build + push in one shot
 ### Caveats
 
 - **Bind mounts don't cross the DinD boundary**: `docker run -v /workspace/x:/x ...` resolves paths inside the *sidecar's* filesystem, not your PVC — the classic DinD limitation. Build contexts are fine (the CLI streams them to the daemon over the API).
-- Built images are ephemeral (node-local emptyDir, **disk-capped via values `docker.diskSize`, 50Gi by default** — rendered as both the volume `sizeLimit` and the daemon container's `ephemeral-storage` limit, since the pairing is what makes the cap enforceable; exceeding it evicts the daemon's pod and the build fails with `no space left on device`, never node DiskPressure; `docker.diskRequest` tunes the scheduler reservation). **The blast radius depends on where the daemon runs**: broker mode (SSO/platform units) — only the *broker* pod is evicted and its Deployment restarts it with a fresh store; the user's session stays up. In-pod sidecar mode (classic/warm units) — the eviction restarts the *user's* pod (the session dies with it). Either way, builds/pulls can never grow past the cap or put pressure on the node. Check usage with `docker system df`, reclaim with `docker system prune`; everything is re-pulled/re-built after a reschedule, and a `docker build` cache is likewise lost.
+- Built images are ephemeral (node-local emptyDir, **disk-capped via values `docker.diskSize`, 50Gi by default** — rendered as both the volume `sizeLimit` and the daemon container's `ephemeral-storage` limit, since the pairing is what makes the cap enforceable; exceeding it evicts the daemon's pod and the build fails with `no space left on device`, never node DiskPressure; `docker.diskRequest` tunes the scheduler reservation). **The blast radius depends on where the daemon runs**: broker mode (SSO/platform units) — only the *broker* pod is evicted and its Deployment restarts it with a fresh store; the user's session stays up. In-pod sidecar mode (classic units) — the eviction restarts the *user's* pod (the session dies with it). Either way, builds/pulls can never grow past the cap or put pressure on the node. Check usage with `docker system df`, reclaim with `docker system prune`; everything is re-pulled/re-built after a reschedule, and a `docker build` cache is likewise lost.
 - Each running build/container consumes the pod's resources — the sidecar requests 250m/512Mi with 4 CPU / 8Gi limits (values `docker.resources`).
 - **Platform units (`project-user-*`, SSO) get their daemon OUT-OF-POD (default).** The platform Kyverno policies deny privileged containers in user namespaces (observed on tr7: `ezprojects-restrict-privileged-pods` — an in-pod sidecar there makes the unit's Deployment POST fail with 400 and **breaks platform SSO entirely**). So the router deploys a **per-user broker** — one privileged `opencode-dind-<user>` Deployment + Service + NetworkPolicy (ingress restricted to the owning unit's pod) in the **release namespace**, where privileged is admitted — and the unit's terminal reaches it via `DOCKER_HOST=tcp://opencode-dind-<user>-svc.<release-ns>.svc.cluster.local:2375`. Same docker UX, no policy change needed. `docker.brokerForPlatformUnits: false` disables it (platform units then have no docker); `docker.onPlatformUnits: true` moves the daemon INTO the platform pod (loopback) — only after the platform team applies the Kyverno `PolicyException` (`opencode-user-managed=true`, kinds Deployment+Pod, policy `ezprojects-restrict-privileged-pods`).
 - **Broker lifecycle:** created on the unit's first SSO resolve and converged on image/values changes (the `opencode-web-helm/dind-template-version` annotation), deleted on user delete, swept by the helm-uninstall hook (`opencode-user-managed=true`). Sizing reuses `docker.resources` / `docker.diskSize`.

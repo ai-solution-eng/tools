@@ -48,3 +48,22 @@ push to specific users; `TARGET_NAME=opencode.json` restores the old overwrite b
 - `helm lint` — clean
 - `helm template` — 19 docs render; zero stale `opencode-*` identifiers
 - VirtualService host: `openwork.${DOMAIN_NAME}`
+
+## Data Manager
+
+Every unit serves a web file manager at `https://openwork.{DOMAIN_NAME}/data-manager` (the legacy
+`/data_manager` spelling is aliased in-app), with **Personal**, **Shared** and **Config** roots — plus
+**Platform Shared** (`/mnt/shared`) and **Platform Workspace** (`/mnt/user`) on SSO units with
+`platformIntegration.enabled`.
+
+Uploads: **Upload** (files **and** compressed archives — .zip, .tar, .tar.gz, .tar.xz, .tar.zst, unpacked
+server-side unless *Extract archives* is unticked), **Upload folder** (`webkitdirectory`) and drag & drop of
+files *or* folders (empty folders preserved via the entries API).
+Per-file streamed requests with progress, cancel and retry; the pre-flight dialog sets the conflict
+policy (keep both / skip / overwrite), the permission policy (644/664/755/775) and hidden/temporary-entry
+skipping (`.git`, `.venv` — on by default). Per-file ceiling `dataManager.clientMaxBodySize`
+(default `2g`); `dataManager.maxUploadMb` (default `2048`) is the server-side guard.
+
+The server (`data_manager.mjs`, port 7682, zero dependencies) clamps every operation to the
+navigable roots, writes through a temp file + `rename()`, and refuses to follow symlinks out of a
+root.

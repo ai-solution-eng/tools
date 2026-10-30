@@ -110,11 +110,39 @@ data:
     // nothing), and the edit dialog previews images / PDF / audio / video via
     // a new inline+Range mode on /api/download. Bumped so existing units
     // re-stamp onto the new data_manager.mjs + data_manager.html.
+    // 38: data-manager uploads — "Upload" now takes plain files AND
+    // compressed archives (zip, tar, tar.gz, tar.xz, tar.zst; unpacked
+    // server-side unless unticked) and "Upload folder" keeps a tree
+    // (webkitdirectory); drop-zone entry recursion preserves empty dirs.
+    // Files stream one request each (/api/upload-file: temp file + rename,
+    // no whole-body buffering); archives go to /api/upload-archive. The
+    // dialog sets conflict policy, permissions (644/664/755/775) and
+    // hidden-entry skipping; nginx gets a per-location body cap
+    // (dataManager.*) with proxy_request_buffering off. The multipart path
+    // is hardened too: relative paths validated segment by segment,
+    // per-file platform read-only checks, and no unhandled rejection can
+    // exit the process. Bumped so existing units re-stamp onto the new
+    // data_manager.mjs/.html + nginx.conf.
+    // 39: re-stamp for the final data-manager UI. 0.4.30 and 0.4.31 both
+    // shipped RUNTIME_REV 38, so a unit stamped by 0.4.30 never picked up
+    // the 0.4.31 data_manager.html (the assets are subPath mounts and
+    // subPath never refreshes). 39 changes the marker, so the router
+    // re-stamps every unit onto: one "Upload" button that takes files AND
+    // archives (no separate .zip button), archive formats zip/tar/tar.gz/
+    // tar.xz/tar.zst, and the extract / hidden-entry / permissions options
+    // in the dialog.
+    // 40: the skip box now also drops Office owner/lock files (~$deck.pptx),
+    // Word temp files (~WRL*.tmp) and Windows/macOS directory junk
+    // (Thumbs.db, desktop.ini) — the files an open document leaves behind —
+    // in the file/folder paths and inside .zip/.tar archives alike.
+    // 41: the Data Manager shows its build in the header and /api/healthz
+    // reports it ("ok":true,"build":"0.4.34"), so a stale unit is visible
+    // from the browser instead of looking like a missing feature.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
-    // reconcile — no chart edit needed. Defaults to 37 so an install that
+    // reconcile — no chart edit needed. Defaults to 41 so an install that
     // does not set it keeps the historical value (no surprise rollout).
-    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 37 }}'
+    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 41 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -134,7 +162,7 @@ data:
     // containers. tr7's ezprojects-restrict-privileged-pods denies them in
     // project-user-* namespaces (release-namespace units are unaffected), so
     // the sidecar is RUNTIME-GATED per unit:
-    //   - release-namespace units (classic + warm pool): sidecar when
+    //   - release-namespace units (classic): sidecar when
     //     docker.enabled.
     //   - platform units (project-user-*): sidecar only when
     //     docker.onPlatformUnits is ALSO true — which requires the platform
@@ -428,6 +456,12 @@ data:
     }
 
     const ttydVersion = '1.7.7'
+
+    // Data Manager upload guard (values.yaml dataManager.maxUploadMb). Keep
+    // it at or above nginx's per-location client_max_body_size, otherwise
+    // nginx rejects first and the SPA gets an HTML 413 instead of a JSON
+    // error from the Data Manager.
+    const dataManagerMaxUploadMb = parseInt('{{ .Values.dataManager.maxUploadMb | default 2048 }}', 10) || 2048
     const userPullSecret = process.env.USER_IMAGE_PULL_SECRET || ''
     const usernameHeader = 'x-auth-request-preferred-username'
     const fallbackUserHeader = 'x-auth-request-user'
@@ -437,14 +471,6 @@ data:
     const serviceAccountCa = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt')
     const activePtyUpgrades = new Map()
     let tunnelSeq = 0
-    const warmPoolEnabled = process.env.WARM_POOL_ENABLED === 'true'
-    const warmPoolSize = Number(process.env.WARM_POOL_SIZE || '0')
-    const warmRefreshIntervalMs = Number(process.env.WARM_REFRESH_INTERVAL_MS || '15000')
-    const warmStuckThresholdMs = Number(process.env.WARM_STUCK_THRESHOLD_MS || `${15 * 60 * 1000}`)
-    const ownerMap = new Map() // user slug -> warm poolId
-    let poolBusy = false
-    const poolLocks = new Map() // poolId -> promise chain (per-unit claim mutex)
-    const warmStuckSince = new Map() // warm deployment name -> first-seen-not-ready timestamp
     const setupUiEnabled = process.env.SETUP_UI_ENABLED === 'true'
     const setupStatusPath = process.env.SETUP_STATUS_PATH || '/__dsh_setup_status'
     const setupHeading = process.env.SETUP_HEADING || 'Setting up your account\u2026'
@@ -687,8 +713,6 @@ data:
       for (const dep of deployments) {
         const labels = dep.metadata?.labels || {}
         if (labels['dsh-user-slug'] === slug) return dep
-        if (labels['dsh-user-warmpool'] === 'true'
-          && (labels['dsh-user-owner'] === slug || (legacySlug && labels['dsh-user-owner'] === legacySlug))) return dep
       }
       return null
     }
@@ -715,7 +739,7 @@ data:
       let fallback = null
       for (const pod of (result && result.items) || []) {
         const labels = pod.metadata?.labels || {}
-        const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
+        const podSlug = labels['dsh-user-slug']
         if ((podSlug !== slug && (!legacySlug || podSlug !== legacySlug)) || !pod.spec?.nodeName) continue
         if (pod.status?.phase === 'Running') {
           return { phase: 'Running', nodeName: pod.spec.nodeName }
@@ -834,7 +858,7 @@ data:
         }
         for (const pod of (result && result.items) || []) {
           const labels = pod.metadata?.labels || {}
-          const podSlug = labels['dsh-user-slug'] || (labels['dsh-user-warmpool'] === 'true' ? labels['dsh-user-owner'] : null)
+          const podSlug = labels['dsh-user-slug']
           if (!podSlug || !pod.spec?.nodeName) continue
           const phase = pod.status?.phase || 'Unknown'
           const existing = podBySlug.get(podSlug)
@@ -1092,25 +1116,11 @@ data:
           // Namespace unreadable — skip it.
         }
       }
-      let warm = null
-      outer: for (const candidate of candidates) {
-        for (const dep of deployments) {
-          const labels = dep.metadata?.labels || {}
-          if (labels['dsh-user-warmpool'] === 'true' && labels['dsh-user-owner'] === candidate) {
-            warm = warmNamesForPoolId(Number(labels['dsh-user-pool-id']))
-            break outer
-          }
-        }
-      }
       // Prefer the environment that actually exists and derive its claim
       // names from the deployment spec: an adopted pre-0.3.5 environment
       // mounts legacy-named claims that a name-derived lookup would miss
       // (leaking VAST quotas).
       let target = null
-      if (warm) {
-        // Warm units only exist in the release namespace.
-        target = { ...warm, ns: namespace }
-      } else {
         for (const candidate of candidates) {
           const candidateNames = namesForSlug(candidate)
           for (const ns of targetNamespaces) {
@@ -1137,7 +1147,6 @@ data:
           }
           if (target) break
         }
-      }
       if (!target && unitNsSet.size > 0) {
         const tns = [...unitNsSet][0]
         target = {
@@ -1525,38 +1534,6 @@ data:
       }
     }
 
-    function warmServiceManifest(poolId) {
-      const name = warmNamesForPoolId(poolId).service
-      const poolIdStr = String(poolId)
-      return {
-        apiVersion: 'v1',
-        kind: 'Service',
-        metadata: {
-          name,
-          namespace,
-          labels: {
-            app: 'dsh-user',
-            'dsh-user-managed': 'true',
-            'dsh-user-warmpool': 'true',
-            'dsh-user-pool-id': poolIdStr,
-          },
-        },
-        spec: {
-          type: 'ClusterIP',
-          selector: {
-            'dsh-user-pool-id': poolIdStr,
-          },
-          ports: [
-            { name: 'http', protocol: 'TCP', port: 8080, targetPort: 8082 },
-            { name: 'http-preview', protocol: 'TCP', port: 8082, targetPort: 8082 },
-            { name: 'ttyd', protocol: 'TCP', port: 7681, targetPort: 7681 },
-            { name: 'data-manager', protocol: 'TCP', port: 7682, targetPort: 7682 },
-            { name: 'term-mgr', protocol: 'TCP', port: 7683, targetPort: 7683 },
-          ],
-        },
-      }
-    }
-
     function serviceSpec(appPort) {
       return {
         type: 'ClusterIP',
@@ -1604,42 +1581,22 @@ data:
       await upsertService(userServiceManifest(name, slug, ns, ownerRefs))
     }
 
-    function warmNamesForPoolId(poolId) {
-      const base = `dsh-user-warm-${poolId}`
-      return {
-        deployment: base,
-        service: `${base}-svc`,
-        workspaceClaim: `${base}-workspace-pvc-${pvcNameVersion}`,
-        stateClaim: `${base}-state-pvc-${pvcNameVersion}`,
-        slug: `warm-${poolId}`,
-      }
-    }
-
-    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool, poolId, owner, unitNs, ownerRefs, platform, ssoUnit }) {
-      slug = owner || (isWarmPool ? `warm-${poolId}` : slug)
+    function userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, unitNs, ownerRefs, platform, ssoUnit }) {
       const manifestNs = unitNs || namespace
       const platformVolumesMounted = !!(platform && platform.volumesMounted)
-      const matchLabels = isWarmPool
-        ? { 'dsh-user-pool-id': String(poolId) }
-        : { 'dsh-user-slug': slug }
+      const matchLabels = { 'dsh-user-slug': slug }
       const podLabels = {
         app: 'dsh-user',
         'dsh-user-managed': 'true',
         'dsh-role': 'preview',
         ...matchLabels,
-        ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
         ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
       }
       const deploymentLabels = {
         app: 'dsh-user',
         'dsh-user-managed': 'true',
         ...matchLabels,
-        ...(isWarmPool ? { 'dsh-user-warmpool': 'true' } : {}),
         ...(platformVolumesMounted ? { 'dsh-platform-unit': 'true' } : {}),
-      }
-      if (owner) {
-        podLabels['dsh-user-owner'] = owner
-        deploymentLabels['dsh-user-owner'] = owner
       }
       // Identity env (Option B): the project's unix attributes from the
       // platform project-info ConfigMap. Consumed by the init container
@@ -1706,14 +1663,11 @@ data:
         // Per-user folder in the shared workspace: every real unit creates
         // /workspace/shared/<slug> — named after the login username (SSO or
         // local) — as the project identity; mkdir -p is idempotent and never
-        // touches existing data. Warm-pool placeholder units (slug
-        // warm-<poolId>, no owner yet) are skipped: the folder appears when
-        // a user claims the unit, because the adoption re-stamp re-runs this
-        // init with the owner's slug. NOTE: for platform units
+        // touches existing data. NOTE: for platform units
         // /workspace/shared is the per-namespace mirror claim, so the folder
         // lands in the user's own project namespace; classic units share the
         // release-level PVC.
-        ...(isWarmPool && !owner ? [] : [`$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`]),
+        `$RUN_AS_USER mkdir -p /workspace/shared/${slug} || true`,
         '$RUN_AS_USER sh -c \'if [ ! -d /workspace/personal/.git ]; then git init /workspace/personal >/dev/null; fi\' || true',
         // Seed $DSH_HOME/.env from chart values (dshEnv) — the same launch-
         // env layer a laptop .env provides. Seed-once semantics like
@@ -1987,6 +1941,7 @@ data:
                     { name: 'DSH_BOOT_STATE_FILE', value: '/var/dsh/state/dsh-boot-url' },
                     { name: 'DSH_TRUSTED_HOSTS', value: `${previewDomainSuffix.split('.').slice(-2).join('.')},dsh.${previewDomainSuffix},dsh-web.${previewDomainSuffix},deepseekharness.${previewDomainSuffix},deepseek-harness.${previewDomainSuffix}` },
                     { name: 'PREVIEW_USER_SLUG', value: slug },
+                    { name: 'DATA_MANAGER_MAX_UPLOAD_MB', value: String(dataManagerMaxUploadMb) },
                     { name: 'TTYD_DOMAIN', value: previewDomainSuffix },
                     { name: 'TTYD_SLUG', value: slug },
 
@@ -2177,207 +2132,13 @@ data:
     }
 
     async function ensureDeployment(name, workspaceClaim, stateClaim, slug, options = {}) {
-      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, isWarmPool: false, ...options })
+      const manifest = await userDeploymentManifest({ name, workspaceClaim, stateClaim, slug, ...options })
       await upsertUserDeployment(name, manifest)
-    }
-
-    async function ensureWarmDeployment(poolId, owner) {
-      const names = warmNamesForPoolId(poolId)
-      const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug: names.slug, isWarmPool: true, poolId, owner })
-      await upsertUserDeployment(names.deployment, manifest)
-    }
-
-    async function ensureWarmUnit(poolId) {
-      const names = warmNamesForPoolId(poolId)
-      await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
-      await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
-      await upsertService(warmServiceManifest(poolId))
-      await ensureWarmDeployment(poolId)
     }
 
     async function listUserDeployments(ns = namespace) {
       const result = await k8sRequest('GET', `/apis/apps/v1/namespaces/${ns}/deployments?labelSelector=${encodeURIComponent('dsh-user-managed=true')}`)
       return (result && result.items) || []
-    }
-
-    async function recoverOwnerPool() {
-      ownerMap.clear()
-      if (!warmPoolEnabled || warmPoolSize <= 0) return
-      try {
-        const deployments = await listUserDeployments()
-        for (const dep of deployments) {
-          const labels = dep.metadata?.labels || {}
-          const owner = labels['dsh-user-owner']
-          if (!owner) continue
-          const poolId = Number(labels['dsh-user-pool-id'])
-          if (Number.isFinite(poolId) && poolId > 0) ownerMap.set(owner, poolId)
-        }
-        console.log(`[warmpool] recovered ${ownerMap.size} owned warm unit(s)`)
-      } catch (error) {
-        console.error('[warmpool] owner recovery failed', error)
-      }
-    }
-
-    function warmUnitState(dep) {
-      const labels = dep.metadata?.labels || {}
-      const poolId = Number(labels['dsh-user-pool-id'])
-      const ready = (dep.status?.availableReplicas || 0) >= 1 && (dep.status?.updatedReplicas || 0) >= 1
-      return {
-        labels,
-        isWarm: labels['dsh-user-warmpool'] === 'true',
-        poolId,
-        ready,
-        owned: !!labels['dsh-user-owner'],
-      }
-    }
-
-    async function reconcilePool() {
-      if (!warmPoolEnabled || warmPoolSize <= 0) return
-      if (poolBusy) return
-      poolBusy = true
-      try {
-        // Converge existing units FIRST (idempotent): heals deployments
-        // created by older chart versions (RollingUpdate strategy / old
-        // template), preserving the current owner so a claimed unit keeps
-        // its auth key and labels. Running this before counting/cleanup
-        // also guarantees we never re-create a unit the cleanup deletes.
-        const initial = await listUserDeployments()
-        const initialWarm = initial
-          .map((dep) => warmUnitState(dep))
-          .filter((state) => state.isWarm && Number.isFinite(state.poolId))
-        await Promise.all(initialWarm.map((state) => ensureWarmDeployment(state.poolId, state.owned ? state.labels['dsh-user-owner'] : undefined)))
-
-        const deployments = await listUserDeployments()
-        let maxPoolId = 0
-        let free = 0
-        let pending = 0
-        const now = Date.now()
-        for (const dep of deployments) {
-          const state = warmUnitState(dep)
-          if (Number.isFinite(state.poolId) && state.poolId > maxPoolId) maxPoolId = state.poolId
-          if (!state.isWarm) continue
-          if (state.owned) {
-            warmStuckSince.delete(dep.metadata.name)
-            continue
-          }
-          if (state.ready) {
-            warmStuckSince.delete(dep.metadata.name)
-            free += 1
-            continue
-          }
-          const stuckStart = warmStuckSince.get(dep.metadata.name)
-          if (stuckStart === undefined) {
-            warmStuckSince.set(dep.metadata.name, now)
-            pending += 1
-            continue
-          }
-          if (now - stuckStart >= warmStuckThresholdMs) {
-            // Stuck warm unit: its init container has not completed for a long
-            // time. Recreate the Deployment (PVCs and Service persist, so the
-            // toolchain state survives) so the pool refills instead of drying
-            // up on a permanently broken unit.
-            console.log(`[warmpool] warm unit ${dep.metadata.name} stuck not-ready for ${Math.round((now - stuckStart) / 60000)}m, recreating it`)
-            warmStuckSince.delete(dep.metadata.name)
-            await deleteK8s(`/apis/apps/v1/namespaces/${namespace}/deployments`, dep.metadata.name)
-            continue
-          }
-          pending += 1
-        }
-        const need = warmPoolSize - free - pending
-        if (need <= 0) return
-        const needPoolIds = []
-        for (let i = 0; i < need; i++) {
-          needPoolIds.push(maxPoolId + 1 + i)
-        }
-        // Build the needed warm units in parallel so a fresh pool fills
-        // quickly instead of one-at-a-time.
-        await Promise.all(needPoolIds.map(async (poolId) => {
-          console.log(`[warmpool] ensuring warm unit poolId=${poolId}`)
-          await ensureWarmUnit(poolId)
-          await waitForDeployment(warmNamesForPoolId(poolId).deployment)
-          console.log(`[warmpool] warm unit ready poolId=${poolId}`)
-        }))
-      } catch (error) {
-        console.error('[warmpool] reconcile failed', error)
-      } finally {
-        poolBusy = false
-      }
-    }
-
-    function acquirePoolLock(poolId) {
-      const prev = poolLocks.get(poolId) || Promise.resolve()
-      let release
-      const tail = new Promise((resolve) => { release = resolve })
-      poolLocks.set(poolId, prev.then(() => tail))
-      return prev.then(() => release)
-    }
-
-    async function claimWarmForUser(slug, legacySlug, isSsoUser = false) {
-      // Bounded retries: re-verify ownership inside the per-pool lock so two
-      // concurrent claims can never both PATCH the same warm unit (which would
-      // overwrite the owner and strand one user on a pod that authenticates the
-      // other). Different units are still claimed in parallel.
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const deployments = await listUserDeployments()
-        let mine = null
-        let bestReady = null
-        let bestPending = null
-        for (const dep of deployments) {
-          const state = warmUnitState(dep)
-          if (!state.isWarm) continue
-          if (state.owned && (state.labels['dsh-user-owner'] === slug
-            || (legacySlug && state.labels['dsh-user-owner'] === legacySlug))) {
-            // Owns it under the readable slug or the pre-0.3.5 legacy hash
-            // (the claim below re-templates the unit with the readable slug,
-            // rolling the pod while its volumes — and the user's data — stay).
-            if (mine === null || state.poolId < mine) mine = state.poolId
-          } else if (!state.owned) {
-            // Ready units are preferred, but a unit that is still starting
-            // (init container installing the toolchain) is claimed too: the
-            // router's loading screen already waits for readiness, which beats
-            // falling back to a dedicated pod and locking the user there.
-            if (state.ready) {
-              if (bestReady === null || state.poolId < bestReady) bestReady = state.poolId
-            } else if (bestPending === null || state.poolId < bestPending) {
-              bestPending = state.poolId
-            }
-          }
-        }
-        if (mine !== null) {
-          const poolId = mine
-          const names = warmNamesForPoolId(poolId)
-          ownerMap.set(slug, poolId)
-          return { slug, names }
-        }
-        const poolId = bestReady !== null ? bestReady : bestPending
-        if (poolId === null) {
-          return null
-        }
-        const release = await acquirePoolLock(poolId)
-        try {
-          // Re-verify while holding the lock: someone else may have claimed
-          // this unit after our selection, or reconcile may have recreated it.
-          // If so, retry the selection.
-          const current = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${warmNamesForPoolId(poolId).deployment}`)
-          const state = warmUnitState(current)
-          if (!current || !state.isWarm || state.owned) {
-            continue
-          }
-          const names = warmNamesForPoolId(poolId)
-          const manifest = await userDeploymentManifest({ name: names.deployment, workspaceClaim: names.workspaceClaim, stateClaim: names.stateClaim, slug, isWarmPool: true, poolId, owner: slug, ssoUnit: isSsoUser })
-          await k8sRequest('PATCH', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`, {
-            metadata: { labels: manifest.metadata.labels },
-            spec: { template: manifest.spec.template },
-          })
-          ownerMap.set(slug, poolId)
-          console.log(`[warmpool] claimed poolId=${poolId} owner=${slug}${state.ready ? '' : ' (unit still starting)'}`)
-          reconcilePool()
-          return { slug, names }
-        } finally {
-          release()
-        }
-      }
-      return null
     }
 
     async function waitForDeployment(name, timeoutMs = 300000, ns = namespace) {
@@ -2656,10 +2417,8 @@ data:
       } catch {
         isSsoUser = false
       }
-      // Sticky: if the user already has a dedicated (non-warm) environment, keep
-      // serving them there. Prevents a user who fell back to a dedicated
-      // deployment during a pool shortage from being silently moved to a warm
-      // unit later when the pool recovers.
+      // Sticky: if the user already has an environment, keep serving them
+      // there rather than re-deriving one.
       const existingDedicated = await k8sRequest('GET', `/apis/apps/v1/namespaces/${namespace}/deployments/${names.deployment}`)
       if (existingDedicated) {
         await ensureLease(`dsh-user-${slug}`)
@@ -2699,29 +2458,6 @@ data:
         await ensureService(names.service, slug)
         await ensureDeployment(names.deployment, legacyNames.workspaceClaim, legacyNames.stateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names: { ...names, workspaceClaim: legacyNames.workspaceClaim, stateClaim: legacyNames.stateClaim } }
-      }
-      if (warmPoolEnabled && warmPoolSize > 0) {
-        let claimed = null
-        try {
-          // Units being created by a concurrent refill do not exist in the
-          // deployments list yet, so a single claim pass can come up empty
-          // while the pool is mid-refill. Retry briefly before falling back
-          // to a dedicated pod (bounded: worst case ~6s, vs minutes of cold
-          // provisioning).
-          for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
-            claimed = await claimWarmForUser(slug, legacySlug, isSsoUser)
-            if (!claimed && attempt < 2) {
-              await new Promise((resolve) => setTimeout(resolve, 2000))
-            }
-          }
-        } catch (error) {
-          // A transient claim failure must not break the user's request:
-          // fall through and provision the dedicated environment instead.
-          console.error('[warmpool] claim failed, falling back to dedicated environment', error)
-        }
-        if (claimed) {
-          return claimed
-        }
       }
       await ensureLease(`dsh-user-${slug}`)
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
@@ -3773,8 +3509,6 @@ data:
             dep = deployments.find((d) => {
               const labels = d.metadata?.labels || {}
               return labels['dsh-user-slug'] === slug
-                || (labels['dsh-user-warmpool'] === 'true'
-                  && (labels['dsh-user-owner'] === slug || labels['dsh-user-owner'] === legacy))
             }) || null
           }
           return {
@@ -3798,9 +3532,7 @@ data:
         for (const username of Object.keys(users)) knownSlugs.add(legacySlugForUser(username))
         for (const d of deployments) {
           const labels = d.metadata?.labels || {}
-          const slug = labels['dsh-user-warmpool'] === 'true'
-            ? labels['dsh-user-owner']
-            : labels['dsh-user-slug']
+          const slug = labels['dsh-user-slug']
           if (!slug || knownSlugs.has(slug)) continue
           knownSlugs.add(slug)
           list.push({
@@ -4147,13 +3879,12 @@ data:
       }
     })
 
+    // Data Manager folder uploads can carry a 2 GB body; node's 300 s
+    // default requestTimeout would cut a slow upload mid-flight. Bounded at
+    // 30 min, and headersTimeout (60 s) still guards the header phase.
+    server.requestTimeout = 30 * 60 * 1000
     server.listen(8080, '0.0.0.0', () => {
       console.log('dsh router listening on 0.0.0.0:8080')
     })
 
-    recoverOwnerPool()
-    reconcilePool()
     setInterval(sweepStaleClearJobs, 60000)
-    if (warmPoolEnabled && warmPoolSize > 0) {
-      setInterval(reconcilePool, warmRefreshIntervalMs)
-    }
