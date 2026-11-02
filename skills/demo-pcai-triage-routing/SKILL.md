@@ -1,6 +1,6 @@
 ---
 name: demo-pcai-triage-routing
-description: DEMO ONLY — not a team skill. Use when routing one PCAI support ticket to the owning layer: owner_tier (infrastructure / ezmeral / aisw / model_serving) from Prometheus metrics and pod logs, in gate order. Holds the gate chain, the namespace map, the 13-family probe and the two 5xx decompositions. Do NOT use outside the Nov 3 demo — for real triage use cluster-triage, for fix verification use release-verify.
+description: '"DEMO ONLY — not a team skill. Use when routing one PCAI support ticket to the owning layer: owner_tier (infrastructure / ezmeral / aisw / model_serving) from Prometheus metrics and pod logs, in gate order. Holds the gate chain, the namespace map, the 13-family probe and the two 5xx decompositions. Do NOT use outside the Nov 3 demo — for real triage use cluster-triage, for fix verification use release-verify."'
 ---
 
 # PCAI triage routing (demo)
