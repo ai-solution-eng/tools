@@ -1,6 +1,6 @@
 ---
 name: guard-uncommitted-work
-description: Use when about to spawn ANY agent or subagent that can write files, when integrating a stopped/killed/partial agent's work, or when a cleanup step is about to run a git state operation. Protects the user's uncommitted work from agent rollback.
+description: 'Use when about to spawn ANY agent or subagent that can write files, when integrating a stopped, killed, or partial agent work, or when a cleanup step is about to run a git state operation. Protects the user uncommitted work from agent rollback, and covers the twin/mirror recovery path when something was already lost. NOT for organizing scratch working directories (that is scratch-dirs) and NOT for shared-file propagation across repos (that is fleet-drift).'
 ---
 
 # guard-uncommitted-work
@@ -64,11 +64,11 @@ Recovery = **restore the file from the twin, then re-apply the agent's small, do
 
 Spawning writable agents at scale? Read `audit-wave` for zone partitioning and the stopped-agent integration rules. Doing the review itself? `cross-validate`. Link/drift state in question? `fleet-drift`.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One deployment's concrete values (2026-10-02) — re-derive locally, never hardcode:
 
-- Source repo `<repo>` = `/home/andrew/Code/HPE/MultimodalRAG/`; mirror `<twin>` = `/home/andrew/Code/HPE/pcai-solutions/foundational-workflows/multimodal-rag/`, per that repo's `hardlink_config.json` (`source` / `dest`, `on_conflict: overwrite`).
+- Source repo `<repo>` = `<your MultimodalRAG checkout>/`; mirror `<twin>` = `<your twin checkout>/`, per that repo's `hardlink_config.json` (`source` / `dest`, `on_conflict: overwrite`).
 - The twin is tracked inside the `foundational-workflows` repo (no nested `.git`); the twin subdir carries ~531 tracked files, and its HEAD is not the source repo's HEAD.
 - Hardlink state at the reference deployment (checked 2026-10-06): the twin files were **detached** from the source (different inodes, source nlink 1) — the twin was serving as an independent copy, not a live hardlink view.
 - Absent from the twin, present in the source repo: `automation.sh`, `bump_version.sh`, `prune_charts.py`. Absent from both trees at repo root: `pcai_models.py` — gitignored, present only as `src/multimodal_rag/utils/pcai_models.py` in the source working tree.

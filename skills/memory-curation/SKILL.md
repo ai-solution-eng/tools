@@ -92,21 +92,37 @@ The dataset is a **PROJECT MAP** — *what we worked on / how to access it / how
 
 ## Gotchas
 
-- Gateway tools are **four-part**: `mcp__<gateway>__<rag-server>__list_memories`. Flat two-part names are refused as unknown tools. The reference deployment's alias is in the fenced section.
+- Gateway tools are reached through the `pcai_tools` **relay** (see the reference section), not by
+  writing `mcp__<gateway>__<server>__<tool>` names — there are no `tools[...]` bindings for them and
+  no `mcp_catalog`/`mcp_call` client tools. Discover the surface with `{action:"list"}`.
 - `/tmp` does not persist between bash tool calls — make every verification one self-contained call.
 - Never run `git checkout` / `restore` / `clean` / `stash` anywhere (see `guard-uncommitted-work`).
 - `forget_session(session_id)` deletes ONLY that session's `session_history` docs — the tool for a session with sensitive material. It never touches curated memories.
 - The store is typically password-protected (`has_password: true`); dataset routes need `X-Dataset-Password`. In-store deletion is irreversible; the export is the only recovery, and it restores by re-embedding.
 - `lessons-loop` owns the **sql-lessons / sql-lessons-candidates** promotion gate — a different store and lifecycle; do not conflate it with memory-store curation. Before a destructive rebuild, apply `guard-uncommitted-work` to anything on disk and run `cross-validate` on the delete/keep plan when large.
 
-## Reference instantiation (one deployment's values — re-derive locally)
+## Deployment values to resolve locally
 
 Resolve your own equivalents (see PORTABILITY.md) before using any of these.
 
-- Memory dataset `andrew-memory` (★ binding; `RAG_MEMORY_DATASET` in the DSH env file) — discover, never hardcode it.
-- Gateway `pcai-llm-gateway`, RAG server `mm-rag` → `mcp__pcai-llm-gateway__mm-rag__list_memories`.
-- Profile `~/.dsh/profiles/web` (`$DSH_PROFILE_DIR`); the distiller resolves via `$DSH_PROFILE_DIR/node_modules/@deepseek-ai/dsh-session-memory-distiller` → `~/Projects/dsh-plugins/packages/session-memory-distiller`. The old `~/Projects/deepseek-harness/packages/memory/session-memory-distiller` path no longer exists.
-- Distiller config: `provider: pcai-model-endpoint-flow`, `model: Qwen3.8-27B`.
-- Memory-ops dirs: `~/Projects/.memory-sweep/` (sweep/analysis) and `~/Code/HPE/MultimodalRAG/.memory-rebuild/` (rebuild; also `install-mapreduce.fish` + `plugin-build/`).
+- Memory dataset: **discover it, never hardcode it.** `list_memories` with no `dataset_name` names the
+  resolved store on its first line; the name comes from your identity's ★ binding or
+  `RAG_MEMORY_DATASET` in the DSH env file.
+- Gateway MCP goes through the **relay**: call the `pcai_tools` tool DIRECTLY (a normal tool call,
+  not inside `run_code`) with `{action:"describe", server:"mm-rag"}` to promote that server; its
+  tools are then directly callable for the rest of the turn. `{action:"list"}` returns every server
+  and tool with a one-line summary. Memory tools on `mm-rag`: `list_memories`, `search_memory`,
+  `add_memory`, `delete_memory`, `forget_session`, `get_dataset_info`.
+- Profile: `$DSH_PROFILE_DIR` (`$DSH_HOME/profiles/<name>`). The distiller resolves via
+  `$DSH_PROFILE_DIR/node_modules/@deepseek-ai/dsh-session-memory-distiller`, which symlinks to the
+  plugin's real source — cite it by package name, never by an absolute path (the plugin moves).
+- Distiller config: `provider:` the Lead/main-agent route (`pcai-model-endpoint-flow`) — the route
+  that IS distilled — and `model:` any model that route offers. **Do NOT "fix" this to
+  `pcai-model-endpoint-subagent`.** That route sends `X-PCAI-Conversation: raw`, so nothing on it
+  is ever due for distill; pointing the distiller there silently disables memory capture instead of
+  cleaning it up. Provider and model ids rot — enumerate with `list_subagent_models({ provider })`
+  before changing either.
+- Memory-ops dirs: a sweep/analysis dir and a rebuild dir of your own (the rebuild dir also holds
+  `install-mapreduce.fish` and `plugin-build/`).
 - Rebuild key `PCAI_LLM_ADMIN_KEY`; `renormalize.py` also wants `RAG_API_KEY` + `RAG_MEMORY_PASSWORD`.
 - Parsed corpus (2026-10-04): `curated/` 570 md, `distilled/` 39 md, `dsh-gap/` 81 md, `fact-cards.json`. 2026-10-02 rebuild scored 7/7 probes at rrf 1.0.

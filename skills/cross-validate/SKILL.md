@@ -1,6 +1,6 @@
 ---
 name: cross-validate
-description: Use when doing coding, kube/cluster, or other consequential operational work with two (or more) models available, and when the user asks for cross-validation, a second opinion, or ensemble review. Implements a tiered, direction-matched model ensemble — the reviewer is chosen to target the primary's characteristic failure mode. See `model-roster-check` when a model is upgraded or the direction table looks stale.
+description: 'Use when doing coding, kube/cluster, or other consequential operational work with two or more models available, and when the user asks for cross-validation, a second opinion, or an ensemble review. Implements a tiered, direction-matched ensemble: the reviewer is chosen to target the primary characteristic failure mode. See model-roster-check when a cell is upgraded or the direction table looks stale. NOT for running a whole multi-agent audit or remediation wave (that is audit-wave), and NOT for spawning or collecting teammates (that is subagent-teams and team-collect-loop).'
 ---
 
 # Cross-validate (tiered model ensemble)
@@ -81,15 +81,22 @@ independent re-derivation by default.
   data whenever either cell is upgraded: hallucination/non-hallucination row = calibration posture;
   agentic-vs-knowledge spread = training concentration. Use `model-roster-check`.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One deployment's values — re-derive locally:
 
 - Cells: `pcai-ds` = DeepSeek V4.1-Flash (confident asserter; AA non-hallucination 4%), `pcai-glm` =
   GLM-5.3-Flash (calibrated abstainer; non-hallucination 72%). Direction: GLM reviews DS's facts; DS reviews
   GLM's execution depth. Both peers at kube RCA (ITBench 51% vs 47%).
-- Providers: `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`,
-  `auto`).
+- Providers — two routes, not interchangeable. Spawn the ensemble on
+  `pcai-model-endpoint-subagent` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`,
+  `routing`): it is the default spawn route and sends `X-PCAI-Conversation: raw`, so subagent
+  chatter never enters the canonical store and is never distilled into memory.
+  `pcai-model-endpoint-flow` is the Lead route (it IS distilled) — do not pin subagents to it.
+  Enumerate with `list_subagent_models({ provider })`. A provider reporting "not allowed for this
+  Session" means this session's recorded route list predates the setting — it is written at session
+  CREATION and never refreshed, so resuming does not update it and an empty session keeps the list
+  from its creation date. Not a dead id; only a genuinely new session sees the change.
 - Method doc + runnable implementation: `ModelDeploymentApproaches/MODEL_CROSS_VALIDATION.md` and
   `ensemble_flow.py` (update only its §6 when the roster changes).
 - Auth/TLS: endpoints in `ModelBenchmarker/src/model_benchmarker/utils/pcai_models.py`;

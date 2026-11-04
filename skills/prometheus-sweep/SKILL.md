@@ -65,6 +65,32 @@ on the same pods. Deploy as a `PrometheusRule` labelled to match the Prometheus 
 plateaued workloads produce ZERO firing at their known plateaus. **Replace, don't delete**: the
 generic alert is correct for every other container in the cluster.
 
+## Classify before you recommend — leak, plateau, or undersized
+
+A container-memory alert tells you the ratio crossed a line. It does NOT tell you which of three
+defects you have, and the remedy differs for each. **Always pull a 7-day range query before
+writing a remediation.**
+
+| Shape of the 7-day series | Diagnosis | Remedy |
+|---|---|---|
+| Monotonic climb, near-constant increment | **Leak** | Raise the limit AND compute the OOM ETA. State the days it buys. Report upstream; a bump alone moves the cliff. |
+| Flat band, limit close to the band | **Undersized limit** | Raise it once. Nothing else is wrong. |
+| Slow climb that plateaus | Growth to a budget | Usually healthy — the ladder handles it. |
+
+2026-10-29 G2: `csi-vast-plugin` read 842→989 MiB over 7 days (+21 MiB/day) against a 1 GiB
+limit — a leak with ~1.7 days to OOM, which "96.9%" alone did not convey. Same sweep,
+`ezlogcollector` read a flat 489 MiB against 512 MiB — undersized, not leaking. Two
+identical-looking criticals, two different answers. Range at a **6h step**: enough for a slope,
+cheap to read; 15s steps bury the shape and blow the output cap.
+
+## Ladder calibration — anchor critical to the measured plateau
+
+Critical must sit **above the measured plateau of the highest-sitting member — never at a round
+number.** 2026-10-29: the deployed ladder fired critical at `> 90%` while glm-53-flash's measured
+plateau was 90.5 → 92.3 → 92.0. It had been firing for 3 days and could never clear — exactly
+the permanent-critical failure the hygiene section exists to prevent. Verify a ladder by querying
+the real plateau of every workload class it covers, not by reading its thresholds.
+
 ## The fail-closed apply contract (same as cluster-triage)
 
 Plan first (`plan_apply` is always a dry-run), read the per-doc verdicts, then
@@ -96,13 +122,30 @@ number / resourceVersion tells you whether it drifted) before trusting it.
   10-day Job with thousands of pull attempts proves it.
 - DaemonSet log/telemetry agents restarting in pairs = shared defect (OOM or a rejected
   upstream), not two incidents.
+- **`scrape_samples_scraped == 0` with a fast `scrape_duration_seconds` (single-digit ms) is NOT
+  a network block.** The connection completed and the endpoint returned nothing parseable —
+  wrong `metricsPath`, or an app serving an empty `/metrics`. This is the OPPOSITE diagnosis to
+  the "duration pinned at the scrape timeout" case; check the duration first, because the two
+  are indistinguishable in `up==0` and share no remedy. Confirm it is not a NetworkPolicy by
+  checking sibling targets: `count by (namespace) (up{job="<job>"} == 0)`.
+- **A generic alert and a purpose-built ladder can both cover the same pods.** If the generic
+  "container memory > N%" fires on pods the ladder already owns, that is duplication, not
+  corroboration — 2 of 7 generic firings in the 2026-10-29 sweep were exact duplicates. Inhibit;
+  do not delete the generic rule.
+- **Do not patch a ClusterPolicy/alerting object you have not read.** `patched (no change)` means
+  the value was already there and your change achieved nothing. Read the live object, then work
+  out why it is not matching — the fix is usually in the object's *selectors*, not its values.
 
-## Reference instantiation (one deployment's values — re-derive locally)
+## Deployment values to resolve locally
 
-- Gateway connection prefix `pcai-llm-gateway` → `mcp__pcai-llm-gateway__<server>__<tool>`;
-  servers: `prometheus`, `logsearch`, `k8s-ops`, `applygate`, `workbench`.
+- Gateway MCP goes through the **`pcai_tools` relay** — call it DIRECTLY (not inside `run_code`)
+  with `{action:"describe", server:"<name>"}` to promote a server, then its tools are directly
+  callable for the rest of the turn. `{action:"list"}` returns every server and tool with a
+  one-line summary. Do not write `mcp__<gateway>__<server>__<tool>` names; there are no
+  `tools[...]` bindings for them. Servers: `prometheus`, `logsearch`, `k8s-ops`, `applygate`,
+  `workbench`.
 - HiCache predictors: `glm-53-flash` (~85% plateau) and `qwen-38-27b` (~81%), ns
-  `project-user-andrew-bydlon`, container `kserve-container`. Ladder deployed as
+  `project-user-<you>`, container `kserve-container`. Ladder deployed as
   PrometheusRule `mlis-predictor-memory-ladder` (90% warn growth / 95% crit, 10m dwell;
   ruleSelector label `release: prometheus`), with inhibit rule for the generic 80% alert.
 - DeepSeek-class deployments: engram KV table — same ladder treatment.

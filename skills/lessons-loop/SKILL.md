@@ -119,7 +119,7 @@ those existing rules cover are your eval set.
 - Deploying the loop is a release: verify the running version with `release-verify`. Model-pair assumptions
   behind the distill/review LLM are checked with `model-roster-check`.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One implementation (SQL domain) — re-derive locally:
 
