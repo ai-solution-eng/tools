@@ -505,6 +505,27 @@ def _apply(value: float) -> None:
     _apply_state(state, value)
 
 
+async def prometheus_target() -> tuple[str, dict[str, str]]:
+    """(url, headers) for the configured prometheus MCP server.
+
+    RAISES when the server is missing or its headers cannot be resolved; the
+    caller decides whether that fails one target or a whole snapshot.
+
+    Extracted (2026-10-30) so the off-peak evaluator and core.endpoint_metrics
+    resolve the SAME server: two copies of "look the server up in the registry
+    and resolve its server-level headers" is how a monitoring panel ends up
+    reporting a different cluster than the one the billing discount reads.
+    """
+    servers = {s["name"]: s for s in await registry.mcp_servers()}
+    target = servers.get(settings.offpeak_mcp_server)
+    if target is None:
+        raise LookupError(f"MCP server {settings.offpeak_mcp_server!r} is not in the enabled registry")
+    from ..api.routes_mcp import resolve_mcp_headers  # lazy: avoids import cycles
+
+    headers = await resolve_mcp_headers(target, key_id=None)  # server-level only
+    return target["url"], headers
+
+
 async def evaluate_once() -> None:
     """One evaluation tick. NEVER raises.
 
@@ -535,15 +556,7 @@ async def evaluate_once() -> None:
     await load_overrides()
 
     try:
-        servers = {s["name"]: s for s in await registry.mcp_servers()}
-        target = servers.get(settings.offpeak_mcp_server)
-        if target is None:
-            for _name, _promql, st in targets:
-                _fail_state(st, f"MCP server {settings.offpeak_mcp_server!r} is not in the enabled registry")
-            return
-        from ..api.routes_mcp import resolve_mcp_headers  # lazy: avoids import cycles
-
-        headers = await resolve_mcp_headers(target, key_id=None)  # server-level only
+        url, headers = await prometheus_target()
     except Exception as exc:
         for _name, _promql, st in targets:
             _fail_state(st, str(exc) or type(exc).__name__)
@@ -558,7 +571,7 @@ async def evaluate_once() -> None:
     # client per call (_upstream_session), so the concurrent calls share no
     # connection state — gather-safe by construction.
     results = await asyncio.gather(
-        *(_eval_one(name, promql, st, target["url"], headers) for name, promql, st in targets),
+        *(_eval_one(name, promql, st, url, headers) for name, promql, st in targets),
         return_exceptions=True,
     )
     # Belt-and-braces for a return_exceptions leak (a non-Exception BaseException

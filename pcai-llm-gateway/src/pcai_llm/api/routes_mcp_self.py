@@ -219,6 +219,13 @@ async def my_mcp_overview(key: KeyRecord = _mcp_key) -> dict[str, Any]:
     header names, and the per-pair entitlement bound (what a self-grant may
     still touch).
 
+    There is deliberately NO memory-dataset object: per-user memory identity
+    is an ordinary header override on the memory server (mm-rag: X-API-Key),
+    and the distiller's attachment gate probes the backend's own capability
+    (routes_distill.memory_attached) instead of reading a gateway-side stamp.
+    Specializing here would re-teach the gateway a dataset model it must not
+    know — the SSO-managed ★ binding lives entirely in the RAG app.
+
     TRUTHFULNESS (2026-10-09, user-reported): under scope grant mode the
     relay ADMITS the whole policy-admitted catalog at call time
     (routes_proxy scope merge: (held | catalog) - denies) — a pair the

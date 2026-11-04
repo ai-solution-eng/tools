@@ -14,6 +14,8 @@ from typing import Any
 import pytest
 
 from pcai_llm.core import budgets as budgets_mod
+from pcai_llm.core import costs as costs_mod
+from pcai_llm.core import teams as teams_mod
 from pcai_llm.core.budgets import _window_start
 
 
@@ -43,6 +45,8 @@ def test_all_windows_are_utc_and_naive_free() -> None:
     for period in ("day", "week", "month"):
         ws = _window_start(now, period)
         assert ws.tzinfo is UTC
+
+
 # ---------------------------------------------------------------------------
 # Audit 2026-10-29 — zone 4 (C1 / F1 / C3 / C6): budget-gate arithmetic,
 # non-finite limits, prediction-charge release, non-positive rate limits.
@@ -251,6 +255,12 @@ class SettleFakeDB:
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple]] = []
 
+    async def fetch(self, sql: str, *a: Any) -> list[Any]:
+        # model_costs lookup for costs.compute(). 'error' is a COSTED status
+        # (audit r5 #9), so settle prices it; this seam says "unpriced model",
+        # which is all these tests need — they pin the predicted charge.
+        return []
+
     async def execute(self, sql: str, *a: Any) -> str:
         self.executed.append((sql, a))
         return "INSERT 0 1"
@@ -272,17 +282,15 @@ def test_c3_zero_prompt_settle_releases_the_predicted_charge(monkeypatch: pytest
     ones) — unbounded growth on a throttled key, and a later request reusing
     that request_id reconciled against ANOTHER request's charge.
     """
-    monkeypatch.setattr(budgets_mod, "db", SettleFakeDB())
+    fake = SettleFakeDB()
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    monkeypatch.setattr(costs_mod, "db", fake)
     monkeypatch.setattr(budgets_mod.settings, "rate_limit_predict_cached", True)
     budgets_mod._predict_charges.clear()
     budgets_mod._remember_charge("req-refused", 500)
     assert "req-refused" in budgets_mod._predict_charges
 
-    asyncio.run(
-        budgets_mod.settle(
-            uuid.uuid4(), "m", "chat", 0, 0, "error", 1, "req-refused"
-        )
-    )
+    asyncio.run(budgets_mod.settle(uuid.uuid4(), "m", "chat", 0, 0, "error", 1, "req-refused"))
     assert "req-refused" not in budgets_mod._predict_charges, "a zero-prompt settle must release its charge"
     budgets_mod._predict_charges.clear()
 
@@ -291,6 +299,7 @@ def test_c3_reconcile_still_applies_a_real_delta(monkeypatch: pytest.MonkeyPatch
     """The release must not disarm reconciliation for a REAL settle."""
     fake = SettleFakeDB()
     monkeypatch.setattr(budgets_mod, "db", fake)
+    monkeypatch.setattr(costs_mod, "db", fake)
     monkeypatch.setattr(budgets_mod.settings, "rate_limit_predict_cached", True)
     budgets_mod._predict_charges.clear()
     budgets_mod._remember_charge("req-ok", 100)  # charged 100 at admission
@@ -300,3 +309,140 @@ def test_c3_reconcile_still_applies_a_real_delta(monkeypatch: pytest.MonkeyPatch
     ups = [a for sql, a in fake.executed if "rate_windows" in sql and "tokens = tokens +" in sql]
     assert ups and ups[-1][2] == 600, f"expected a +600 reconciliation, saw {ups}"
     budgets_mod._predict_charges.clear()
+
+
+# ---------------------------------------------------------------------------
+# audit r5 #9 — a post-call guardrail BLOCK is real GPU spend
+#
+# PRE-FIX: settle() priced a row only `elif status == "ok"`, and every budget
+# SUM (core.budgets x2, core.teams x2) hard-coded `status IN ('ok','error')`.
+# A post-call block settles status='guardrail_blocked' WITH the real
+# prompt/completion tokens the upstream burned, so that spend was recorded as
+# tokens, never priced, never counted against any budget, and never appeared in
+# chargeback — a tenant with a blocklist guardrail could burn unlimited prefill
+# for free. API.md/FEATURES.md promise "the ledger keeps the REAL upstream
+# spend".
+# ---------------------------------------------------------------------------
+
+
+class _PricedDB:
+    """db seam for settle(): keeps the ledger INSERT and prices one model.
+
+    Serves core.costs._load's row shape so costs.compute() returns a real
+    Decimal — these tests pin the PRICE BRANCH, not the arithmetic.
+    """
+
+    def __init__(self, priced: dict[str, tuple[float, float, float]]) -> None:
+        self.priced = priced
+        self.executed: list[tuple[str, tuple]] = []
+
+    async def fetch(self, sql: str, *a: Any) -> list[dict[str, Any]]:
+        if "FROM model_costs" in sql:
+            return [
+                {"model_name": m, "input_per_m": i, "output_per_m": o, "cached_per_m": c}
+                for m, (i, o, c) in self.priced.items()
+            ]
+        return []
+
+    async def fetchrow(self, sql: str, *a: Any) -> Any:
+        return None
+
+    async def fetchval(self, sql: str, *a: Any) -> Any:
+        return None
+
+    async def execute(self, sql: str, *a: Any) -> str:
+        self.executed.append((sql, a))
+        return "INSERT 0 1"
+
+    def ledger_row(self) -> tuple:
+        return next(a for sql, a in self.executed if "INSERT INTO usage_ledger" in sql)
+
+
+def _price_seam(monkeypatch: pytest.MonkeyPatch, fake: _PricedDB) -> None:
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    monkeypatch.setattr(costs_mod, "db", fake)
+    # The 60 s model_costs cache is process-global: a cached empty map from a
+    # sibling test would make every model "unpriced" and silently neuter this.
+    monkeypatch.setattr(costs_mod, "_loaded_at", float("-inf"))
+    monkeypatch.setattr(costs_mod, "_cache", {})
+
+
+def test_r5_9_guardrail_blocked_row_is_priced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blocked-but-served request must carry cost_usd, exactly like 'ok'."""
+    fake = _PricedDB({"blocked-model": (3.0, 6.0, 1.5)})
+    _price_seam(monkeypatch, fake)
+
+    asyncio.run(budgets_mod.settle(uuid.uuid4(), "blocked-model", "chat", 100, 50, "guardrail_blocked", 5, "rid-blk"))
+    row = fake.ledger_row()
+    assert (row[3], row[4]) == (100, 50), "the real upstream tokens stay on the row"
+    assert row[7] is not None, "a guardrail_blocked row was left UNPRICED (cost_usd NULL)"
+    assert row[7] > 0
+
+    fake.executed.clear()
+    asyncio.run(budgets_mod.settle(uuid.uuid4(), "blocked-model", "chat", 100, 50, "ok", 5, "rid-ok"))
+    assert fake.ledger_row()[7] == row[7], "the block must price identically to an ok row"
+
+
+def test_r5_9_refusals_and_cache_hits_stay_unpriced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The widened branch must NOT price rows that never reached an upstream."""
+    fake = _PricedDB({"blocked-model": (3.0, 6.0, 1.5)})
+    _price_seam(monkeypatch, fake)
+
+    asyncio.run(budgets_mod.settle(uuid.uuid4(), "blocked-model", "chat", 0, 0, "rate_limited", 5, "rid-rl"))
+    assert fake.ledger_row()[7] is None, "an admission refusal is not upstream spend"
+
+    fake.executed.clear()
+    asyncio.run(budgets_mod.settle(uuid.uuid4(), "blocked-model", "chat", 0, 0, "cache_hit", 5, "rid-ch"))
+    assert str(fake.ledger_row()[7]) == "0.000000", "a cache hit stays zero-priced"
+
+
+class _SqlCaptureDB:
+    """Records every statement so the SUM predicates can be asserted on."""
+
+    def __init__(self) -> None:
+        self.sqls: list[str] = []
+
+    async def fetch(self, sql: str, *a: Any) -> list[Any]:
+        self.sqls.append(sql)
+        return []
+
+    async def fetchrow(self, sql: str, *a: Any) -> Any:
+        self.sqls.append(sql)
+        return None
+
+    async def fetchval(self, sql: str, *a: Any) -> Any:
+        self.sqls.append(sql)
+        return None
+
+    async def execute(self, sql: str, *a: Any) -> str:
+        self.sqls.append(sql)
+        return "INSERT 0 1"
+
+
+def test_r5_9_one_shared_status_set_drives_every_sum(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ONE set, used by the price branch AND every budget SUM.
+
+    The four aggregates live in two modules (the per-key gate + console
+    rollup in core.budgets, the TEAM envelope in core.teams) and each spelled
+    the predicate out by hand — which is how they drifted from the price
+    branch in the first place.
+    """
+    fake = _SqlCaptureDB()
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    monkeypatch.setattr(teams_mod, "db", fake)
+    kid = uuid.uuid4()
+    asyncio.run(budgets_mod._budget_sums("budgets", "limit_tokens", "total_tokens", kid, "m"))
+    asyncio.run(budgets_mod._budget_sums("cost_budgets", "limit_usd", "cost_usd", kid, "m"))
+    asyncio.run(budgets_mod.budget_status_many([kid]))
+    asyncio.run(teams_mod.team_spend(uuid.uuid4(), "day"))
+    asyncio.run(teams_mod.team_allocation_state(uuid.uuid4(), "day"))
+
+    sums = [sql for sql in fake.sqls if "usage_ledger" in sql and "l.status" in sql]
+    assert len(sums) >= 5, f"expected all five aggregates, saw {len(sums)}"
+    for sql in sums:
+        assert "guardrail_blocked" in sql, f"a budget SUM still ignores the block: {sql}"
+        assert "l.status IN ('ok', 'error')" not in sql, f"a hand-spelled predicate survived: {sql}"
+
+    # ... and the set is the SINGLE source of truth for the SQL form.
+    assert "guardrail_blocked" in budgets_mod._COSTED_STATUSES
+    assert budgets_mod._COSTED_SQL == ", ".join(f"'{s}'" for s in budgets_mod._COSTED_STATUSES)

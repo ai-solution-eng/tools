@@ -162,6 +162,27 @@ DEFAULTS: dict[str, Any] = {
     # When set, the decision model is TOLD which candidates accept images, so
     # a VLM request is not routed to a text-only LLM.
     "model_modalities": {},
+    # --- per-model cards (the criteria channel) ---------------------------
+    # {model: {"description": "<what this model is for>"}} — one card per
+    # ROUTABLE model, rendered into the decision model's CRITERIA at call
+    # time. This is where a model's ROLE belongs: criteria is the only channel
+    # whose text is bound to an option label when the choice is scored, so the
+    # decision model reads "Deepseek: the default for agent work..." attached
+    # to the option it describes instead of cross-referencing a role list in
+    # the instructions against bare labels (the pre-2026-10-30 shape, which
+    # kept every role in one prose block keyed to hardcoded names).
+    #
+    # Deliberately DATA, not prose in the prompt: the candidate set is
+    # per-request (profile ladder, ACL, health, context fit), so a prompt that
+    # names three models is wrong on every site whose ladder differs. An empty
+    # map is valid — every option then renders as its bare name, which is the
+    # pre-existing behaviour — but the panel warns, because a decision model
+    # given labels with no descriptions has no basis to discriminate.
+    #
+    # Descriptions may carry live tokens ({{gpu_util}}, {{low_demand}},
+    # {{cost}}, {{modalities}}, {{model}}, {{gpu_line}}); see
+    # CRITERIA_PLACEHOLDERS. Tokens are resolved per-model, at call time.
+    "model_cards": {},
 }
 
 # The ONLY placeholder names render_prompt substitutes. Anything else in
@@ -169,6 +190,14 @@ DEFAULTS: dict[str, Any] = {
 # silently eaten) — the console renders this list as the placeholder legend,
 # so the legend and the renderer cannot drift.
 PLACEHOLDERS = ("models", "model_list", "gpu_load", "gpu_load_json", "decision_model")
+
+# The placeholders a per-model CARD description may use. Separate namespace
+# from PLACEHOLDERS on purpose: instruction placeholders describe the SET
+# (the model list, the whole load table), card placeholders describe ONE model
+# and are resolved against that model's own live row. Keeping them apart is
+# what lets a card say "{{gpu_util}} under load" and get its own number
+# instead of the fleet's.
+CRITERIA_PLACEHOLDERS = ("model", "gpu_util", "low_demand", "gpu_line", "cost", "modalities")
 
 # GPU-load source vocabulary. One value today; the constant exists so the
 # routes layer validates against a named set rather than a bare string
@@ -312,7 +341,12 @@ def defaults() -> dict[str, Any]:
     merged config so the console can render overrides distinctly). Copied
     because allowed_models is a list — a caller mutating the returned dict
     must not edit the module's DEFAULTS in place."""
-    return {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULTS.items()}
+    # Lists AND dicts are copied: model_modalities/model_cards are dict-typed,
+    # and returning them by reference let a caller mutate the module's defaults
+    # (the exact failure this helper exists to prevent for lists).
+    return {
+        k: (list(v) if isinstance(v, list) else (dict(v) if isinstance(v, dict) else v)) for k, v in DEFAULTS.items()
+    }
 
 
 async def get_config() -> dict[str, Any]:
@@ -398,6 +432,18 @@ async def decision_settings() -> dict[str, Any]:
         for name, mods in mods_raw.items():
             if isinstance(mods, (list, tuple)) and mods:
                 modalities[str(name)] = [str(m) for m in mods]
+    # Per-model cards, normalised to {name: {"description": str}} with blank
+    # entries DROPPED: a half-saved card must read as "no description" (the
+    # bare-label fallback), never as an empty description that suppresses it.
+    cards_raw = cfg.get("model_cards")
+    cards: dict[str, dict[str, str]] = {}
+    if isinstance(cards_raw, dict):
+        for name, card in cards_raw.items():
+            if not isinstance(card, dict):
+                continue
+            desc = card.get("description")
+            if isinstance(desc, str) and desc.strip():
+                cards[str(name)] = {"description": desc.strip()}
     return {
         "mode": mode,
         "model": str(cfg.get("decision_model") or ""),
@@ -406,6 +452,7 @@ async def decision_settings() -> dict[str, Any]:
         "timeout_ms": timeout_ms,
         "prompt": str(cfg.get("prompt") or ""),
         "modalities": modalities,
+        "cards": cards,
     }
 
 
@@ -498,21 +545,35 @@ async def gpu_load_snapshot() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _gpu_line(name: str, state: dict[str, Any]) -> str:
-    """One model's demand line: '- <name>: 42.1% util (low demand, 0.5x)'.
+def _gpu_summary(state: dict[str, Any]) -> str:
+    """One model's demand, without the name: '42.1% util (low demand, 0.5x)'.
 
-    The demand word and the fraction come from the evaluator's hysteresis
-    state, so a reader can see WHY the price is what it is. A model the
-    evaluator has never sampled renders 'no data' — a fabricated 0% would
-    read as "idle, send it traffic", the exact wrong inference.
+    Shared by the {{gpu_load}} block and the per-card {{gpu_line}} token so the
+    two can never phrase the same reading differently. A model the evaluator
+    has never sampled renders 'no data' — a fabricated 0% would read as
+    "idle, send it traffic", the exact wrong inference.
     """
     value = state.get("value_pct")
     if value is None:
-        return f"- {name}: no data"
-    demand = "low demand" if state.get("active") else "high demand"
+        return "no data"
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return "no data"
+    # active is None when the evaluator has a utilisation sample but no
+    # hysteresis state yet (or was never sampled). Rendering that as "high
+    # demand" invents a load claim the data does not support -- the same class
+    # of lie as a fabricated 0%.
+    active = state.get("active")
+    demand = "demand unknown" if active is None else ("low demand" if active else "high demand")
     fraction = state.get("fraction")
     suffix = f", {fraction}x" if isinstance(fraction, (int, float)) else ""
-    return f"- {name}: {float(value):.1f}% util ({demand}{suffix})"
+    return f"{float(value):.1f}% util ({demand}{suffix})"
+
+
+def _gpu_line(name: str, state: dict[str, Any]) -> str:
+    """One model's demand line: '- <name>: 42.1% util (low demand, 0.5x)'."""
+    return f"- {name}: {_gpu_summary(state)}"
 
 
 def render_prompt(
@@ -569,3 +630,147 @@ def render_prompt(
     for name in PLACEHOLDERS:
         text = text.replace("{{" + name + "}}", substitutions[name])
     return text
+
+
+# ---------------------------------------------------------------------------
+# per-model cards -> the decision model's CRITERIA
+# ---------------------------------------------------------------------------
+
+
+def _criteria_tokens(
+    name: str,
+    *,
+    gpu: dict[str, Any] | None,
+    costs: dict[str, Any] | None,
+    modalities: dict[str, list[str]] | None,
+) -> dict[str, str]:
+    """One model's live values, keyed by the token names a card may use. PURE.
+
+    Every token resolves against THIS model's own row, which is the whole
+    point of the criteria channel: "{{gpu_util}}" in Deepseek's card is
+    Deepseek's number, never the fleet's.
+
+    A model the evaluator has no reading for renders "no data" rather than a
+    zero, and injection-off renders the off-marker for the load tokens — an
+    operator who turned load injection OFF must not still get live numbers
+    through a card, which is the bug class the instructions path already fixed.
+    """
+    gpu_models = (gpu or {}).get("models") if isinstance(gpu, dict) else None
+    state = gpu_models.get(name) if isinstance(gpu_models, dict) else None
+    if not isinstance(state, dict):
+        state = {}
+    injecting = bool(gpu.get("inject", gpu.get("available"))) if isinstance(gpu, dict) else False
+    if not injecting:
+        gpu_util = low_demand = gpu_line = _GPU_INJECTION_OFF
+    else:
+        try:
+            gpu_util = "no data" if state.get("value_pct") is None else f"{float(state['value_pct']):.1f}%"
+        except (TypeError, ValueError):
+            # A hand-edited / half-populated snapshot must degrade to "no data"
+            # rather than 500 the preview route: this runs on a READ path too.
+            gpu_util = "no data"
+        # NO READING means no demand claim. A never-sampled evaluator's state is
+        # value_pct=None AND active=False (the dataclass default), so keying the
+        # demand word off "active" alone reported "high demand" for a model
+        # nobody measured -- the same lie as a fabricated 0%. value_pct is the
+        # presence test; "active" only means something once there is a sample.
+        if state.get("value_pct") is None or gpu_util == "no data":
+            low_demand = "no data"
+        elif state.get("active") is None:
+            low_demand = "demand unknown"
+        else:
+            low_demand = "low demand" if state.get("active") else "high demand"
+        gpu_line = _gpu_summary(state)
+    cost = (costs or {}).get(name) if isinstance(costs, dict) else None
+    mods = (modalities or {}).get(name) if isinstance(modalities, dict) else None
+    return {
+        "model": str(name),
+        "gpu_util": gpu_util,
+        "low_demand": low_demand,
+        "gpu_line": gpu_line,
+        "cost": str(cost) if cost else "no data",
+        # Only a real sequence is joinable: a hand-edited map can hold a
+        # scalar, and a bare string would be split into characters.
+        "modalities": (", ".join(str(m) for m in mods) if isinstance(mods, (list, tuple)) and mods else "not declared"),
+    }
+
+
+def render_criteria(
+    cards: dict[str, Any] | None,
+    models: list[str],
+    *,
+    gpu: dict[str, Any] | None = None,
+    costs: dict[str, Any] | None = None,
+    modalities: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
+    """Build the decision model's {option: description} map from the cards. PURE.
+
+    One description per ROUTABLE model, in the caller's order. A model with no
+    card description renders as its bare NAME — the pre-cards behaviour — so an
+    unconfigured site is byte-identical to what it served before this existed
+    and never inherits prose about models it does not run.
+
+    Tokens are substituted per model; an UNKNOWN {{...}} stays VERBATIM, the
+    same discipline as render_prompt, so a typo is visible in the panel
+    preview instead of being silently eaten.
+    """
+    safe_cards = cards if isinstance(cards, dict) else {}
+    out: dict[str, str] = {}
+    for name in models:
+        card = safe_cards.get(name)
+        raw_text = ""
+        if isinstance(card, dict):
+            raw = card.get("description")
+            if isinstance(raw, str):
+                raw_text = raw.strip()
+        text = raw_text
+        tokens = _criteria_tokens(name, gpu=gpu, costs=costs, modalities=modalities)
+        for token, value in tokens.items():
+            text = text.replace("{{" + token + "}}", value)
+        # The MACHINE FACTS are appended whether or not a card exists.
+        #
+        # This is the fix for the one real regression of the cards change: the
+        # request state stopped carrying modalities/gpu_util/cost (they belong
+        # to the criteria channel now), so a site that never wrote a card would
+        # have handed the decision model bare labels AND no capability, load or
+        # price -- strictly less than before -- while the prompt still told it
+        # to weigh those. Facts are appended here, exactly once, in the channel
+        # that is bound to the option; a card that already uses the token is
+        # left alone so nothing is stated twice.
+        facts: list[str] = []
+        uses_load = "{{gpu_util}}" in raw_text or "{{gpu_line}}" in raw_text
+        # Injection OFF appends nothing: the tokens render the off-marker
+        # sentence, and "gpu (gpu load injection is off) ((gpu load injection
+        # is off))" is noise. The operator's own switch is the message.
+        if not uses_load and tokens["gpu_util"] not in ("no data", _GPU_INJECTION_OFF):
+            facts.append(f"gpu {tokens['gpu_util']} ({tokens['low_demand']})")
+        if "{{cost}}" not in raw_text and tokens["cost"] != "no data":
+            facts.append(f"cost {tokens['cost']}")
+        if "{{modalities}}" not in raw_text and tokens["modalities"] != "not declared":
+            facts.append(f"modalities {tokens['modalities']}")
+        base = text or str(name)
+        out[name] = base + (" | " + " | ".join(facts) if facts else "")
+    return out
+
+
+def describe_coverage(cards: dict[str, Any] | None, models: list[str]) -> dict[str, Any]:
+    """How many routable models carry a description. PURE.
+
+    The panel and the stats endpoint both need the same answer to "is the
+    decision model being told anything?", and neither may compute it
+    differently — a router that has silently lost every description is the
+    failure this number exists to make visible.
+    """
+    safe_cards = cards if isinstance(cards, dict) else {}
+    described = [
+        name
+        for name in models
+        if isinstance(safe_cards.get(name), dict)
+        and isinstance(safe_cards[name].get("description"), str)
+        and safe_cards[name]["description"].strip()
+    ]
+    return {
+        "models": len(models),
+        "described": len(described),
+        "undescribed": [n for n in models if n not in described],
+    }

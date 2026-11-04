@@ -26,7 +26,7 @@ import time
 from ..config import settings
 from ..db import db
 from ..routing.router import router as model_router
-from . import context_window, upstream_auth
+from . import context_window, response_cache, toolcompress_store, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +55,23 @@ async def _sweep_once() -> None:
         await db.execute("DELETE FROM rate_windows WHERE window_start < now() - interval '2 minutes'")
     except Exception:
         log.debug("housekeeping: rate_windows prune skipped", exc_info=True)
+
+    # 1b) exact-match response cache: expired answers are dead weight (the
+    #     lookup already ignores them, so this is pure space reclamation).
+    #     Not an operator retention knob — the TTL is the policy.
+    await response_cache.purge_expired()
+
+    # 1c) compressed tool-result originals (X-PCAI-Compress-Tools): pure
+    #     retrieval data, TTL-bound. A pruned row only means a later
+    #     pcai__retrieve answers "expired" — the turn that compressed it
+    #     already used the text. Error-swallowed like every other sweep.
+    try:
+        if settings.tool_compress_store_ttl_s > 0:
+            reclaimed = await toolcompress_store.prune(settings.tool_compress_store_ttl_s)
+            if reclaimed:
+                log.info("housekeeping: pruned %d compressed tool results", reclaimed)
+    except Exception:
+        log.debug("housekeeping: tool_compress_store prune skipped", exc_info=True)
 
     # 2) operator-opted retention (0 = disabled — nothing is deleted until
     #    the policy exists, the roadmap contract).
@@ -202,10 +219,11 @@ async def _context_window_sweep() -> None:
     same requests fine. A window is a fact the upstream publishes continuously,
     so a pod that missed it has to keep asking.
 
-    Cost in the steady state is ZERO I/O: every upstream with a known window is
-    filtered out here, and context_window.probe additionally enforces
-    PROBE_RETRY_SECONDS so a permanently broken upstream is retried once a
-    minute at most. Error-swallowed like every other housekeeping step.
+    Cost in the steady state is near-ZERO I/O: every upstream with a known AND
+    FRESH window is filtered out here (a stale one is re-probed, audit w6 F1),
+    and context_window.probe additionally enforces PROBE_RETRY_SECONDS so a
+    permanently broken upstream is retried once a minute at most.
+    Error-swallowed like every other housekeeping step.
     """
     entries: list[tuple[str, dict[str, str]]] = []
     for name in model_router.models():
@@ -213,7 +231,10 @@ async def _context_window_sweep() -> None:
         if pool is None:
             continue
         for ep in pool.endpoints:
-            if context_window.cached(ep.base_url) is None:
+            # Unknown OR stale (audit w6 F1): a learned window older than
+            # WINDOW_TTL_S must be re-probed, or a shrunken upstream window is
+            # never re-read and the stale one over-sizes every request.
+            if context_window.cached(ep.base_url) is None or context_window.stale(ep.base_url):
                 entries.append((ep.base_url, upstream_auth.upstream_headers(ep)))
     if not entries:
         return

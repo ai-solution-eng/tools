@@ -683,7 +683,6 @@ def test_split_request_tools_invalid() -> None:
     assert rp._split_request_tools(None) == ([], [])
 
 
-
 # ---------------------------------------------------------------------------
 # audit wave 2026-10-29 (zone 3b): ZC-3 masked-replay leak, ZC-5 reasoning
 # strip spelling
@@ -699,9 +698,45 @@ def _zc3_chunks() -> list[bytes]:
         line({"choices": [{"delta": {"content": "the answer is ACME-Secret"}}]}),
         line({"choices": [{"delta": {"reasoning_content": "reasoning leaks ACME-Secret"}}]}),
         line({"choices": [{"delta": {"reasoning": "second spelling leaks ACME-Secret"}}]}),
-        line({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"cmd": "ACME-Secret"}'}}]}}]}),
+        line(
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"cmd": "ACME-Secret"}'}}]}}
+                ]
+            }
+        ),
         line({"pcai": {"event": "thinking", "iteration": 0, "text": "thinking leaks ACME-Secret too"}}),
-        line({"pcai": {"event": "tool_call", "id": "c1", "server": "s", "tool": "t", "ok": True, "ms": 1, "args": "{}", "result": "tool output ACME-Secret"}}),
+        line(
+            {
+                "pcai": {
+                    "event": "tool_call",
+                    "id": "c1",
+                    "server": "s",
+                    "tool": "t",
+                    "ok": True,
+                    "ms": 1,
+                    "args": "{}",
+                    "result": "tool output ACME-Secret",
+                }
+            }
+        ),
+        # The ACL-denied tool_error event in the shape toolrelay ACTUALLY
+        # emits (audit r5 #2a): the PARSED arguments as a dict, no result
+        # field, no other string channel. The old chunk pinned
+        # "args": "{}" — a shape no emitter produces — so the str-only
+        # classifier looked correct while this one was replayed verbatim.
+        line(
+            {
+                "pcai": {
+                    "event": "tool_error",
+                    "id": "c2",
+                    "server": "s",
+                    "tool": "t",
+                    "detail": "denied by ACL",
+                    "args": {"cmd": "cat ACME-Secret"},
+                }
+            }
+        ),
         b"data: [DONE]\n\n",
     ]
 
@@ -806,9 +841,7 @@ async def test_zc3_split_secret_is_not_recoverable_from_a_masked_stream(
         content = delta.get("content")
         if isinstance(content, str):
             client_text += content
-    assert "ACME-SECRET-KEY-12345" not in client_text, (
-        f"split secret recoverable by the client: {client_text!r}"
-    )
+    assert "ACME-SECRET-KEY-12345" not in client_text, f"split secret recoverable by the client: {client_text!r}"
     assert "[REDACTED] ok" in client_text, "the masked answer is delivered"
 
 
@@ -832,7 +865,10 @@ async def test_zc3_tool_data_does_not_block_a_clean_answer(monkeypatch: pytest.M
     monkeypatch.setattr(rp, "model_router", SimpleNamespace(client=None))
 
     async def inner():
-        yield b'data: {"pcai": {"event": "tool_call", "id": "c1", "server": "s", "tool": "t", "ok": true, "ms": 1, "args": "{\"pattern\": \"password\"}", "result": "the password file"}}\n\n'
+        # Valid JSON with the emitter's DICT args (audit r5 #2a): the old
+        # single-quote-inside-double-quote line was unparseable, so this test
+        # proved nothing about the classifier it names.
+        yield b'data: {"pcai": {"event": "tool_call", "id": "c1", "server": "s", "tool": "t", "ok": true, "ms": 1, "args": {"pattern": "password"}, "result": "the password file"}}\n\n'
         yield b'data: {"choices":[{"delta":{"content":"done, nothing found"}}]}\n\n'
         yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         yield b"data: [DONE]\n\n"
@@ -878,16 +914,19 @@ async def test_zc3_whole_answer_block_still_blocks(monkeypatch: pytest.MonkeyPat
         yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         yield b"data: [DONE]\n\n"
 
-    out = [chunk async for chunk in rp._guarded_sse(
-        inner(),
-        None,
-        [_spec("blk-guard", "post_call")],
-        key=_key(),
-        model=MODEL,
-        request_id="req-zc3b",
-        started=_time.monotonic(),
-        relay_mode=True,
-    )]
+    out = [
+        chunk
+        async for chunk in rp._guarded_sse(
+            inner(),
+            None,
+            [_spec("blk-guard", "post_call")],
+            key=_key(),
+            model=MODEL,
+            request_id="req-zc3b",
+            started=_time.monotonic(),
+            relay_mode=True,
+        )
+    ]
     assert any(b"guardrail_blocked" in c for c in out), "a blocked answer must surface the envelope"
     assert not any(b"ACME-Secret" in c for c in out)
 
@@ -897,9 +936,7 @@ async def test_zc3_whole_answer_block_still_blocks(monkeypatch: pytest.MonkeyPat
     [_fake_guardrails()],
     indirect=True,
 )
-def test_zc5_inbound_reasoning_cap_covers_the_reasoning_text_spelling(
-    env, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_zc5_inbound_reasoning_cap_covers_the_reasoning_text_spelling(env, monkeypatch: pytest.MonkeyPatch) -> None:
     """Audit ZC-5: the inbound cap/strip covered reasoning_content and
     reasoning but NOT reasoning_text (the third pi-ai spelling the relay
     itself recognises) — a client replaying reasoning under that key bypassed
@@ -1002,7 +1039,11 @@ def test_zc3_nonstreaming_mask_covers_every_model_text_channel(env, monkeypatch:
                     "content": "the answer is ACME-SECRET-KEY-12345",
                     "reasoning_content": "I looked up ACME-SECRET-KEY-12345",
                     "tool_calls": [
-                        {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{\"k\": \"ACME-SECRET-KEY-12345\"}"}}
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "t", "arguments": '{"k": "ACME-SECRET-KEY-12345"}'},
+                        }
                     ],
                 },
                 "finish_reason": "tool_calls",
@@ -1036,6 +1077,265 @@ def test_zc3_nonstreaming_mask_covers_every_model_text_channel(env, monkeypatch:
     msg = body["choices"][0]["message"]
     assert "ACME-SECRET-KEY-12345" not in json.dumps(body), "the secret survived the non-streaming mask"
     assert msg["content"] == "clean [REDACTED]"
-    assert "reasoning_content" not in msg and "tool_calls" not in msg, "non-content channels must be dropped, not relayed"
+    assert "reasoning_content" not in msg and "tool_calls" not in msg, (
+        "non-content channels must be dropped, not relayed"
+    )
     assert body["choices"][0]["finish_reason"] == "stop"
     assert r.headers.get("x-pcai-guardrail-modified") == "pii-guard"
+
+
+# ---------------------------------------------------------------------------
+# audit r5 #2b / #2c / #11 — the remaining masked-replay channels, the
+# per-model billing fraction, and the disconnect-during-guardrails slot leak
+# ---------------------------------------------------------------------------
+
+
+async def test_r5_2b_masked_stream_drops_a_multi_choice_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chunk that packs SEVERAL choices carries model text under a
+    non-zero index.
+
+    PRE-FIX (_sse_text_of_payload / _sse_answer_texts_of_payload read
+    obj["choices"][0] only): a chunk whose first choice carries no text and
+    whose second does classified as text-free — it was replayed VERBATIM on
+    the masked path AND the guard never judged that sample.
+    """
+    import time as _time
+
+    calls: list[str] = []
+
+    class _MaskingGuardrails:
+        async def run_post_call(self, guards, text, http):
+            calls.append(text)
+            return text.replace("ACME-SECRET-KEY-12345", "[REDACTED]"), [], False
+
+    monkeypatch.setattr(rp, "guardrails", _MaskingGuardrails())
+    monkeypatch.setattr(rp, "model_router", SimpleNamespace(client=None))
+
+    async def inner():
+        yield b'data: {"choices":[{"index":0,"delta":{"content":"the answer is ACME-SECRET-KEY-12345"}}]}\n\n'
+        # ONE chunk, TWO choices: choice 0 carries no text at all.
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{}},'
+            b'{"index":1,"delta":{"content":" sample two ACME-SECRET-KEY-12345"}}]}\n\n'
+        )
+        yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    out: list[bytes] = []
+    async for chunk in rp._guarded_sse(
+        inner(),
+        None,
+        [_spec("leak-guard", "post_call")],
+        key=_key(),
+        model=MODEL,
+        request_id="req-r5-2b",
+        started=_time.monotonic(),
+        relay_mode=True,
+    ):
+        out.append(chunk)
+    body = b"".join(out)
+    assert b"ACME-SECRET-KEY-12345" not in body, f"the non-zero-index choice leaked: {body!r}"
+    assert b"[REDACTED]" in body
+    assert "ACME-SECRET-KEY-12345" in calls[0], "the guard must judge EVERY choice, not just choices[0]"
+
+
+async def test_r5_2c_masked_stream_drops_an_event_split_across_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """httpx2 hands over whatever the socket returned, so an SSE event can
+    straddle two network reads.
+
+    PRE-FIX (one json.loads per read, no line cursor): both halves of a
+    straddled event classified as text-free — the guard never saw the text
+    (so no mask fired) and the masked replay shipped both halves verbatim,
+    which the client reassembles into the unmasked answer.
+    """
+    import time as _time
+
+    calls: list[str] = []
+
+    class _MaskingGuardrails:
+        async def run_post_call(self, guards, text, http):
+            calls.append(text)
+            return text.replace("ACME-SECRET-KEY-12345", "[REDACTED]"), [], False
+
+    monkeypatch.setattr(rp, "guardrails", _MaskingGuardrails())
+    monkeypatch.setattr(rp, "model_router", SimpleNamespace(client=None))
+
+    async def inner():
+        yield b'data: {"choices":[{"delta":{"content":"the answer is ACME-SECRET-KEY-12345"}}]}\n\n'
+        # ONE event, TWO reads: the boundary falls mid-JSON.
+        yield b'data: {"choices":[{"delta":{"content":"and again ACME-SECRET-KEY-'
+        yield b'12345"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    out: list[bytes] = []
+    async for chunk in rp._guarded_sse(
+        inner(),
+        None,
+        [_spec("leak-guard", "post_call")],
+        key=_key(),
+        model=MODEL,
+        request_id="req-r5-2c",
+        started=_time.monotonic(),
+        relay_mode=True,
+    ):
+        out.append(chunk)
+    body = b"".join(out)
+    assert b"ACME-SECRET-KEY-12345" not in body, f"a straddled event leaked: {body!r}"
+    assert b"ACME-SECRET-KEY-" not in body, "half of the straddled event was replayed"
+    assert "ACME-SECRET-KEY-12345" in calls[0], (
+        "the line cursor must reassemble the straddled event for the guard (pre-fix the guard "
+        "never saw it, so no mask could fire)"
+    )
+    assert body.count(b"data: [DONE]") == 1
+
+
+@pytest.mark.parametrize(
+    "env",
+    [_fake_guardrails()],
+    indirect=True,
+)
+def test_r5_2b_nonstreaming_mask_rewrites_every_choice(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A {"n": 2} request has TWO sampled answers; the masked path rewrote
+    only choices[0].
+
+    PRE-FIX (the JSON rewrite touched embedding_json["choices"][0] only): the
+    response carried the masked answer in choice 0 next to the UNMASKED
+    sample in choice 1 — well-formed JSON, no wire-splitting needed.
+    """
+    import pcai_llm.api.auth as auth_mod
+    import pcai_llm.core.budgets as budgets_mod
+    import pcai_llm.core.cascade as cascade_mod
+    import pcai_llm.core.costs as costs_mod
+    from pcai_llm.routing.router import Endpoint as _Ep
+    from pcai_llm.routing.router import Router as _Router
+
+    key = _key()
+
+    async def fake_auth(p: str) -> KeyRecord:
+        return key
+
+    class _MaskingGuardrails:
+        async def guardrails_for_model(self, model_name: str):
+            return [_spec("pii-guard", "post_call")]
+
+        async def run_pre_call(self, guards, messages, http):
+            return messages, []
+
+        async def run_post_call(self, guards, text, http):
+            return text.replace("ACME-SECRET-KEY-12345", "[REDACTED]"), [], False
+
+    n2 = {
+        "id": "cmpl-n2",
+        "object": "chat.completion",
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "sample one: ACME-SECRET-KEY-12345"},
+                "finish_reason": "stop",
+            },
+            {
+                "index": 1,
+                "message": {"role": "assistant", "content": "sample two: ACME-SECRET-KEY-12345"},
+                "finish_reason": "stop",
+            },
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+    }
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=n2)
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(auth_mod, "authenticate", fake_auth)
+    monkeypatch.setattr(budgets_mod, "db", fake_db)
+    monkeypatch.setattr(cascade_mod, "db", fake_db)
+    monkeypatch.setattr(costs_mod, "db", fake_db)
+    monkeypatch.setattr(rp, "guardrails", _MaskingGuardrails())
+    mock_router = _Router.with_mock(handler)
+    mock_router.set_endpoints(MODEL, [_Ep(id="ep1", model_name=MODEL, base_url="http://fake/v1")])
+    monkeypatch.setattr(rp, "model_router", mock_router)
+
+    app = FastAPI()
+    app.include_router(rp.router)
+    tc = TestClient(app, raise_server_exceptions=False)
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "n": 2, "messages": [{"role": "user", "content": "go"}]},
+        headers={"Authorization": "Bearer hllm-x"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["choices"]) == 2, "the masked turn must keep the requested choice count"
+    assert "ACME-SECRET-KEY-12345" not in json.dumps(body), "an unmasked sample survived in a non-zero choice"
+    # The guard judges ONE assembled answer — the join of every sampled text —
+    # so the masked turn delivers that one masked answer in EVERY choice. The
+    # alternative (one engine call per choice) multiplies webhook latency by
+    # n, the amplification the masked-path design explicitly rejects.
+    for choice in body["choices"]:
+        assert "[REDACTED]" in choice["message"]["content"]
+        assert choice["message"]["content"] == body["choices"][0]["message"]["content"]
+
+
+async def test_r5_11_cancel_during_post_call_still_settles_and_releases_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that walks away DURING a post_call guardrail must not leak the
+    concurrency slot or the ledger row.
+
+    PRE-FIX: the buffering loop was guarded by `except BaseException`, but the
+    `await guardrails.run_post_call(...)` that follows sat under only
+    `except Exception` — and CancelledError is a BaseException. A client
+    disconnecting during a 10 s webhook guardrail skipped BOTH
+    ledger.finish() (lost ledger row -> under-billing) and release_slot()
+    (the _in_flight counter never decrements -> the key is 429-bricked on its
+    concurrency cap until the pod restarts).
+    """
+    import asyncio as _asyncio
+
+    finished: list[bool] = []
+    released: list[bool] = []
+    entered = _asyncio.Event()
+
+    class _Ledger:
+        def __init__(self) -> None:
+            self.pre_events: list[Any] = []
+            self.extra_events: list[Any] = []
+            self.override_status: str | None = None
+
+        async def finish(self) -> None:
+            finished.append(True)
+
+    class _SlowGuardrails:
+        async def run_post_call(self, guards, text, http):
+            entered.set()
+            await _asyncio.sleep(10)  # the 10 s webhook guardrail, unbounded by the client
+            return text, [], False
+
+    monkeypatch.setattr(rp, "guardrails", _SlowGuardrails())
+    monkeypatch.setattr(rp, "model_router", SimpleNamespace(client=None))
+
+    async def inner():
+        yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def consume() -> None:
+        async for _chunk in rp._guarded_sse(
+            inner(),
+            _Ledger(),  # type: ignore[arg-type]
+            [_spec("hook-guard", "post_call", engine="webhook")],
+            key=_key(),
+            model=MODEL,
+            request_id="req-r5-11",
+            started=0.0,
+            release_slot=lambda: released.append(True),
+        ):
+            pass
+
+    task = _asyncio.create_task(consume())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+    assert finished == [True], "the ledger row was lost: finish() never ran for the cancelled request"
+    assert released == [True], "the concurrency slot leaked: release_slot() never ran"

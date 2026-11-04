@@ -402,6 +402,7 @@ def test_d2_explicit_conversation_distill_claims_the_row_when_suppressed(
     assert r.json()["ok"] is False
     assert marked == [(cid, 2)], "the suppressed row must be claimed so the sweep skips it"
 
+
 def test_conversation_distill_foreign_id_404(monkeypatch: pytest.MonkeyPatch, fake_conv_db: Any) -> None:
     client = _client(monkeypatch, _key())
     monkeypatch.setattr(conv_mod, "db", fake_conv_db)
@@ -2418,9 +2419,7 @@ async def test_d5_conversation_path_model_failure_with_raw_fallback_off_backs_of
     monkeypatch.setattr(settings, "distiller_raw_fallback", False)
 
     cid, kid = uuid.uuid4(), uuid.uuid4()
-    wrote = await rd.distill_due_conversation(
-        {"conversation_id": cid, "key_id": kid, "msg_count": 2, "title": "t"}
-    )
+    wrote = await rd.distill_due_conversation({"conversation_id": cid, "key_id": kid, "msg_count": 2, "title": "t"})
     assert wrote is False
     assert skipped == [cid]
 
@@ -2514,9 +2513,7 @@ async def test_d4_sweep_counts_only_real_writes(monkeypatch: pytest.MonkeyPatch)
     from pcai_llm.core import metrics as metrics_mod
 
     outcomes: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        metrics_mod, "observe_distill_write", lambda path, outcome: outcomes.append((path, outcome))
-    )
+    monkeypatch.setattr(metrics_mod, "observe_distill_write", lambda path, outcome: outcomes.append((path, outcome)))
 
     async def due() -> list[dict[str, Any]]:
         return [{"conversation_id": uuid.uuid4(), "key_id": uuid.uuid4(), "msg_count": 4}]
@@ -2808,3 +2805,26 @@ def test_d6_row_budget_is_generous_and_zero_budget_stays_unbounded(monkeypatch: 
     monkeypatch.setattr(settings, "distiller_sweep_budget_s", 0.0)
     assert ds.row_budget_seconds() == 0.0
 
+
+def test_due_conversations_resolves_the_group_live_key() -> None:
+    """REGRESSION (2026-11-03 cross-validation, both cells): the due sweep
+    joined api_keys ON k.id = c.key_id AND k.revoked_at IS NULL — the CREATING
+    credential. One rotation therefore removed the user's whole store from the
+    sweep. It must resolve a LIVE key in the conversation's key GROUP instead.
+
+    SQL-text assertion: every sweep test monkeypatches due_conversations, so
+    nothing else pins the join.
+    """
+    import inspect
+
+    from pcai_llm.core import distill_schedule as ds
+
+    src = inspect.getsource(ds.due_conversations)
+    assert "JOIN LATERAL" in src and "k2.key_group = c.key_group" in src
+    assert "JOIN api_keys k ON k.id = c.key_id" not in src, (
+        "the CREATING key must not gate the sweep — a rotated conversation would vanish"
+    )
+    # the live key is the one the scheduled path loads AND the creds gate joins
+    assert "cred.key_id = k.id" in src
+    # the pre-existing protections must survive the join rewrite
+    assert "lease_until" in src and "gate_failed_at" in src

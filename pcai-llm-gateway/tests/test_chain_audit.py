@@ -71,9 +71,7 @@ def test_args_digest_is_deterministic_and_never_echoes_payload():
     assert (d1, n1) == (d2, n2), "key order must not change the digest"
     assert "SECRETBLOB" not in d1
     assert n1 > 0
-    assert d1 == hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    assert d1 == hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def test_args_digest_survives_unserialisable_payloads():
@@ -108,9 +106,7 @@ async def test_write_mcp_call_records_digest_not_arguments(monkeypatch):
 @pytest.mark.asyncio
 async def test_write_mcp_call_is_never_fatal(monkeypatch):
     monkeypatch.setattr(chain_audit, "db", RowsFake(fail=True))
-    await write_mcp_call(
-        key_id=None, server="s", tool="t", arguments={}, outcome="ok"
-    )  # must not raise
+    await write_mcp_call(key_id=None, server="s", tool="t", arguments={}, outcome="ok")  # must not raise
 
 
 @pytest.mark.asyncio
@@ -203,7 +199,6 @@ async def test_verify_does_not_flag_an_empty_chain(monkeypatch):
     monkeypatch.setattr(chain_audit, "db", RowsFake([]))
     result = await chain_audit.verify_mcp_call_chain()
     assert result["ok"] is True and result["checked"] == 0
-
 
 
 @pytest.mark.asyncio
@@ -316,13 +311,18 @@ async def test_admin_audit_insert_carries_the_chain(monkeypatch):
     assert "should-be-redacted" not in str(args[6])
     assert args[9] == hashlib.sha256(str(args[6]).encode()).hexdigest()
     assert str(args[10]).startswith("|")
-    expected_fields = canonical(
-        [7, "svc", "admin-key", "key.create", "key", "abc", args[9], "req-9", "10.0.0.1"]
-    )
+    expected_fields = canonical([7, "svc", "admin-key", "key.create", "key", "abc", args[9], "req-9", "10.0.0.1"])
     assert args[10] == "|" + expected_fields
     assert ADMIN_AUDIT_CHAIN_FIELDS == [
-        "actor_key_id", "actor_subject", "actor_source", "action",
-        "resource_type", "resource_id", "details_sha256", "request_id", "source_ip",
+        "actor_key_id",
+        "actor_subject",
+        "actor_source",
+        "action",
+        "resource_type",
+        "resource_id",
+        "details_sha256",
+        "request_id",
+        "source_ip",
     ]
 
 

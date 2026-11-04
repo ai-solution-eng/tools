@@ -93,6 +93,25 @@ spec:
               number: {{ .Values.service.port }}
       timeout: {{ .Values.ezua.virtualService.timeout }}
     {{- end }}
+    {{- if .Values.ezua.virtualService.ssoProxy.enabled }}
+    # SAME-ORIGIN SSO SIGN-OUT (ezua.virtualService.ssoProxy). The consoles'
+    # "Sign out" goes to /oauth2/sign_out on THIS host; without this route it
+    # fell through to the catch-all below, hit the gateway and rendered
+    # {"detail":"Not Found"} while the domain-wide oauth2-proxy cookie survived
+    # — the "sign out does nothing" report. Routed to the proxy, the request
+    # clears the cookie (it lives on the parent domain, so this host may clear
+    # it) and 302s back to rd. MUST precede the catch-all "/" match: Istio
+    # evaluates http routes in order.
+    - match:
+        - uri:
+            prefix: /oauth2/
+      route:
+        - destination:
+            host: {{ .Values.ezua.virtualService.ssoProxy.host | required "Valid .Values.ezua.virtualService.ssoProxy.host is required when ssoProxy.enabled !" }}
+            port:
+              number: {{ .Values.ezua.virtualService.ssoProxy.port }}
+      timeout: 30s
+    {{- end }}
     # Chat UI (/ and /ui): a static page that talks to /v1 from the browser.
     # /v1 above already carries the routes this page calls; the page itself
     # is inert until a valid bearer key is pasted in. MUST sit behind real

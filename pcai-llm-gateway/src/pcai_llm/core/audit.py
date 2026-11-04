@@ -86,8 +86,16 @@ _METADATA_KEY_RE = re.compile(
 # them would blank every budget-set row. The quantity word binds to the
 # '_tokens' tail; a key that merely CONTAINS 'token' (auth_token) still
 # redacts.
+#
+# requested/applied/budget/allocated joined the list with the team leader tier
+# (2026-10-30): a top-up approval's whole substance is "how many tokens", and
+# budget_tokens is a budget amount on the enrollment and key mint rows. All
+# four are COUNTS. Without them the trail recorded WHO approved WHICH row but
+# not the amount — the one field a budget audit exists to keep. The '_tokens'
+# tail requirement is unchanged, so auth_token / bearer / api_key still redact.
 _TOKEN_COUNT_RE = re.compile(
-    r"(?:^|_)(?:limit|max|min|est|rate|num|remaining|total|prompt|completion|cached|seed)s?_tokens$",
+    r"(?:^|_)(?:limit|max|min|est|rate|num|remaining|total|prompt|completion|cached|seed|"
+    r"requested|applied|budget|allocated)s?_tokens$",
     re.IGNORECASE,
 )
 

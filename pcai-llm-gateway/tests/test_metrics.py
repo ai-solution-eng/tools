@@ -231,6 +231,9 @@ class TestNoopShims:
         mod.TTFT.labels(model="m").observe(0.25)
         mod.BREAKER_OPEN.labels(endpoint="e").set(1)
         mod.RELAY_ITERATIONS.labels(model="m").observe(3)
+        mod.DB_POOL_SIZE.set(1)
+        mod.DB_POOL_IDLE.set(0)
+        mod.DB_POOL_MAX.set(25)
         mod.observe_settle("m", "mcp:s:t", "error", 5)
         mod.observe_ttft("m", 0.5)
         mod.breaker_trip("e")
@@ -252,3 +255,81 @@ class TestStreamEventsResolution:
         assert _stream_events_wants(None, True) is True
         assert _stream_events_wants("", True) is True  # absent == key default
         assert _stream_events_wants(" 1 ", False) is True  # whitespace tolerated
+
+
+# ---------------------------------------------------------------------------
+# Postgres pool occupancy (2026-11-02)
+# ---------------------------------------------------------------------------
+
+
+def test_db_pool_gauges_report_the_live_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pool gauges read db.pool at SCRAPE time.
+
+    Sizing dbPoolMax needs the demand side — maxReplicas x dbPoolMax must fit
+    the server's max_connections, and before this the gateway exported
+    nothing about the pool. They are scrape-time functions rather than a
+    background updater because the pool handle is REPLACED on reconnect: a
+    value captured at import would go stale or point at a closed pool. So the
+    pin exercises the rendered exposition, not just the callback.
+    """
+    pytest.importorskip("prometheus_client")
+    from prometheus_client import generate_latest
+
+    from pcai_llm.db import db as real_db
+
+    class _Pool:
+        def get_size(self) -> int:
+            return 7
+
+        def get_idle_size(self) -> int:
+            return 3
+
+        def get_max_size(self) -> int:
+            return 25
+
+    monkeypatch.setattr(real_db, "pool", _Pool(), raising=False)
+    text = generate_latest().decode()
+    assert "gateway_db_pool_size 7.0" in text
+    assert "gateway_db_pool_idle 3.0" in text
+    assert "gateway_db_pool_max 25.0" in text
+
+
+def test_db_pool_gauges_report_zero_without_a_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No pool (unit tests, pre-boot scrape, closed pool) reports 0, never raises.
+
+    A scrape must not fail the request path — the same no-op-safe posture as
+    every other helper in core.metrics.
+    """
+    pytest.importorskip("prometheus_client")
+    from prometheus_client import generate_latest
+
+    from pcai_llm.db import db as real_db
+
+    monkeypatch.setattr(real_db, "pool", None, raising=False)
+    text = generate_latest().decode()
+    assert "gateway_db_pool_size 0.0" in text
+    assert "gateway_db_pool_idle 0.0" in text
+    assert "gateway_db_pool_max 0.0" in text
+
+
+def test_db_pool_gauge_survives_a_broken_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pool object whose stats RAISE still yields a number, not an exception.
+
+    The reader is called by prometheus_client during a scrape; an exception
+    there would break /metrics for every metric, not just these.
+    """
+    pytest.importorskip("prometheus_client")
+    from prometheus_client import generate_latest
+
+    from pcai_llm.db import db as real_db
+
+    class _Exploding:
+        def get_size(self) -> int:
+            raise RuntimeError("pool closed")
+
+        get_idle_size = get_size
+        get_max_size = get_size
+
+    monkeypatch.setattr(real_db, "pool", _Exploding(), raising=False)
+    text = generate_latest().decode()
+    assert "gateway_db_pool_size 0.0" in text

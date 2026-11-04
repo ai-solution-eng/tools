@@ -90,7 +90,9 @@ def args_digest(arguments: Any) -> tuple[str, int]:
 #     async def f(*, key_id, server: str) -> None: ...
 # So the "*," form is fine and the bare "*" form is not. Keep this signature
 # on one line - do not reformat it.
-async def write_mcp_call(*, key_id: Any,
+async def write_mcp_call(
+    *,
+    key_id: Any,
     server: str,
     tool: str,
     arguments: Any,
@@ -118,8 +120,20 @@ async def write_mcp_call(*, key_id: Any,
         (model or "")[:200],
         (request_id or "")[:200],
         (detail or "")[:200],
-        "|" + canonical([key_id, server[:200], tool[:200], digest, size, outcome,
-                         (model or "")[:200], (request_id or "")[:200], (detail or "")[:200]]),
+        "|"
+        + canonical(
+            [
+                key_id,
+                server[:200],
+                tool[:200],
+                digest,
+                size,
+                outcome,
+                (model or "")[:200],
+                (request_id or "")[:200],
+                (detail or "")[:200],
+            ]
+        ),
     )
     # FORK GUARD (wave-2 review P2-3): prev_hash is read INSIDE the inserting
     # statement, so two concurrent writers would both chain from the same prev
@@ -178,8 +192,11 @@ async def write_mcp_call(*, key_id: Any,
         except Exception:
             log.exception(
                 "mcp_call_audit WRITE FAILED (call %s/%s outcome=%s succeeded; audit row lost) - check database health",
-                server, tool, outcome,
+                server,
+                tool,
+                outcome,
             )
+
 
 async def _verify(table: str, fields: list[str]) -> dict[str, Any]:
     """Walk one chained table by id ASC and report the worst real break.
@@ -213,9 +230,7 @@ async def _verify(table: str, fields: list[str]) -> dict[str, Any]:
     one result set on the pool the data plane shares — an operational concern
     tracked separately from this correctness fix.
     """
-    rows = await db.fetch(
-        f"SELECT id, prev_hash, row_hash, {", ".join(fields)} FROM {table} ORDER BY id ASC"
-    )
+    rows = await db.fetch(f"SELECT id, prev_hash, row_hash, {', '.join(fields)} FROM {table} ORDER BY id ASC")
     prev = ""
     checked = 0
     unchained = 0

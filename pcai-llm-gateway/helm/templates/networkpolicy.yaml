@@ -79,12 +79,14 @@ spec:
     #       governed by rules (i)/(ii).
     {{- with .Values.networkPolicy.probeCidrs }}
     - from:
+        {{- range $cidr := . }}
         - ipBlock:
-            cidr: {{ . | first }}
+            cidr: {{ $cidr }}
             {{- with $.Values.networkPolicy.probeExceptCidrs }}
             except:
               {{- toYaml . | nindent 14 }}
             {{- end }}
+        {{- end }}
       ports:
         - port: {{ $.Values.service.targetPort }}
           protocol: TCP

@@ -13,7 +13,8 @@ routes_mcp.py).
 THE LADDER (per request, first hit wins):
 
 1. **Browser headers** (``X-Auth-Request-User`` / ``X-Email``, groups from
-   ``X-Forwarded-Groups``) — trusted ONLY when
+   ``X-Auth-Request-Groups``; ``X-Forwarded-Groups`` only behind
+   ``PCAI_LLM_TRUST_FORWARDED_GROUPS``) — trusted ONLY when
    ``PCAI_LLM_TRUST_PROXY_IDENTITY=true`` (settings.trust_proxy_identity).
    Exactly MultimodalRAG's ``RAG_TRUST_PROXY_IDENTITY`` rule (api_server.py
    ``_request_identity``) — the fleet convention this module mirrors,
@@ -109,8 +110,9 @@ IDP_ADMIN_ASSERTED = "admin-asserted"
 IDP_KEYCLOAK = "keycloak"
 
 # oauth2-proxy identity headers (the MultimodalRAG convention): the USER
-# claim first, email fallback; groups ride X-Forwarded-Groups (comma-
-# separated). Lookups are CASE-INSENSITIVE: Starlette's `Headers` is, but a
+# claim first, email fallback; groups ride X-Auth-Request-Groups (comma-
+# separated; X-Forwarded-Groups only behind PCAI_LLM_TRUST_FORWARDED_GROUPS
+# — see the GROUPS note below). Lookups are CASE-INSENSITIVE: Starlette's `Headers` is, but a
 # plain dict (tests, or `dict(request.headers)` which lowercases) is not —
 # the helper accepts both shapes.
 #
@@ -122,15 +124,39 @@ IDP_KEYCLOAK = "keycloak"
 #   X-Auth-Request-User and X-Email stay as fallbacks in order. All three
 #   assert the SAME person behind the proxy chain; the preferred form just
 #   matches the subject string the console/ledger already anchors on.
-# - GROUPS: X-Auth-Request-Groups is the FALLBACK after X-Forwarded-Groups
-#   (per-header precedence, additive) — behind the platform chain the
-#   browser/admin group path would otherwise silently see no groups.
+# - GROUPS: X-Auth-Request-Groups (the proxy-injected spelling) is the
+#   ONLY groups source by default; X-Forwarded-Groups joins ONLY behind
+#   PCAI_LLM_TRUST_FORWARDED_GROUPS (audit r5 #4 + the xv cross-
+#   validation follow-up, 2026-10-30). The platform proxy NEVER injects
+#   the forwarded spelling (verified live 2026-10-06; helm/ carries no
+#   strip/overwrite), so its arrival is client-supplied by definition —
+#   the original order let it out-prioritize the proxy's group assertion
+#   (any authenticated user → adminGroups), and even after the reorder a
+#   GROUPLESS proxy identity could still self-grant via the forwarded
+#   header alone. Default false = fail closed to the proxy spelling;
+#   flip the flag ONLY where the proxy injects and overwrites the
+#   forwarded header on every request. First NON-EMPTY wins (an empty
+#   header is no groups assertion).
 _BROWSER_USER_HEADERS = (
     "X-Auth-Request-Preferred-Username",
     "X-Auth-Request-User",
     "X-Email",
 )
-_BROWSER_GROUPS_HEADERS = ("X-Forwarded-Groups", "X-Auth-Request-Groups")
+_BROWSER_GROUPS_HEADERS = ("X-Auth-Request-Groups", "X-Forwarded-Groups")
+
+
+def _groups_headers() -> tuple[str, ...]:
+    """The groups headers to consult, in precedence order. X-Forwarded-Groups
+    joins ONLY behind ``PCAI_LLM_TRUST_FORWARDED_GROUPS`` (see the GROUPS
+    note above): without the flag its arrival is a client forgery — fail
+    closed to the proxy-injected spelling alone. Read per call (tests
+    flip settings without reloads)."""
+    from ..config import settings
+
+    if settings.trust_forwarded_groups:
+        return _BROWSER_GROUPS_HEADERS
+    return _BROWSER_GROUPS_HEADERS[:1]
+
 
 # X-MCP-Caller: attribution-never-authorization. The gateway stamps it on
 # every upstream fleet MCP call; upstreams may OPTIONALLY record it in their
@@ -190,10 +216,12 @@ def key_fingerprint(key: KeyRecord | None) -> str:
 def browser_identity_from_headers(headers: Mapping[str, str]) -> tuple[str, list[str]] | None:
     """(subject, groups) from oauth2-proxy identity headers, or None.
 
-    PURE header read — no trust decision here. Callers gate on
-    ``settings.trust_proxy_identity`` (and the deployment AuthorizationPolicy
-    requirement documented at module level) BEFORE consulting this; tests and
-    the enrollment redemption flow use it directly.
+    Header read — no trust_proxy decision here (callers gate on
+    ``settings.trust_proxy_identity`` and the deployment AuthorizationPolicy
+    requirement documented at module level BEFORE consulting this; tests and
+    the enrollment redemption flow use it directly). ONE settings-dependent
+    branch: X-Forwarded-Groups is consulted only behind
+    ``settings.trust_forwarded_groups`` (the GROUPS note at module top).
 
     Lookup is CASE-INSENSITIVE (lowercased keys first, exact-case fallback):
     `dict(request.headers)` lowercases every name (ASGI gives raw bytes
@@ -201,12 +229,13 @@ def browser_identity_from_headers(headers: Mapping[str, str]) -> tuple[str, list
     keep canonical case.
 
     Subject precedence (first present wins): X-Auth-Request-Preferred-
-    Username → X-Auth-Request-User → X-Email. Groups precedence (per-header
-    fallback, additive): X-Forwarded-Groups → X-Auth-Request-Groups — the
-    platform oauth2-proxy injects the latter, not the former, so the
-    fallback is what keeps the browser/admin group rung alive behind the
-    chain; when X-Forwarded-Groups IS present the behavior is byte-for-byte
-    unchanged.
+    Username → X-Auth-Request-User → X-Email. Groups: X-Auth-Request-Groups
+    (the proxy-injected spelling) is the only source by default —
+    X-Forwarded-Groups is consulted ONLY behind
+    PCAI_LLM_TRUST_FORWARDED_GROUPS (audit r5 #4 + the xv follow-up,
+    2026-10-30: the platform proxy never injects it, so a groupless proxy
+    identity could otherwise self-grant adminGroups by supplying it).
+    First non-empty wins; an empty header is no groups assertion.
     """
 
     def get(name: str) -> str:
@@ -224,7 +253,7 @@ def browser_identity_from_headers(headers: Mapping[str, str]) -> tuple[str, list
     if not subject:
         return None
     groups: list[str] = []
-    for header in _BROWSER_GROUPS_HEADERS:
+    for header in _groups_headers():
         raw_groups = get(header)
         if raw_groups.strip():
             groups = [g.strip() for g in raw_groups.split(",") if g.strip()]
@@ -724,10 +753,16 @@ async def bind_key_subject(
 # ---------------------------------------------------------------------------
 
 _SHADOW_KEY_SQL = """
+-- k.key_group is REQUIRED here (2026-11-03 cross-validation): this row feeds
+-- key_record_from_row, whose fallback is the key's own id. Without the column
+-- the token door would scope saved conversations by a DIFFERENT group than the
+-- bearer door (which selects it), so a rotated shadow key could never see the
+-- history the token door wrote. Column parity with keys.authenticate's SELECT
+-- is the contract; the mapper's fallbacks are silent.
 SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
        k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
        k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-       k.mcp_admin, p.offpeak_fraction
+       k.mcp_admin, k.key_group, p.offpeak_fraction
 FROM api_keys k
 JOIN users u ON u.id = k.user_id
 LEFT JOIN profiles p ON p.id = u.profile_id
@@ -746,6 +781,23 @@ LIMIT 1
 # UNIQUE (idp, subject) index; stream_pcai_events now selected so shadow keys
 # honor their stored column instead of the dataclass default (False since the
 # schema flip).
+
+# (audit r5 #5, 2026-10-30) The ABSENT/REFUSED discriminator for
+# resolve_shadow_key: the same newest-shadow-key probe as _SHADOW_KEY_SQL
+# WITHOUT the revocation/expiry gates. A row that answers here while
+# find_shadow_key refused it (expired or console-revoked) is TERMINAL —
+# console revocation is the off switch (resolve_shadow_key docstring), and
+# re-provisioning on refusal would self-heal a key whose INSERT carries no
+# expires_at and an allow-all allowed_models: a fresh, non-expiring,
+# unbudgeted key for a subject the operator just switched off.
+_SHADOW_KEY_ANY_SQL = """
+SELECT k.id
+FROM api_keys k
+WHERE k.subject_id = (SELECT id FROM subjects WHERE idp = $1 AND subject = $2)
+  AND k.bound_via = $3
+ORDER BY k.created_at DESC, k.id DESC
+LIMIT 1
+"""
 
 _SHADOW_TENANT_SQL = "SELECT id FROM tenants WHERE id = $1"
 
@@ -805,12 +857,13 @@ async def _provision_shadow_key(subject: str, claims: TokenClaims | None) -> Key
         groups = list(claims.groups) if claims else []
         # USER ROW: REUSE BEFORE INSERT (audit F2, 2026-10-29). users carries
         # UNIQUE (tenant_id, name) and a blind INSERT hit it on the SECOND
-        # provisioning of the same human — which is the DOCUMENTED off switch
-        # working as designed (console-revoke the shadow key, next token
-        # sighting re-provisions). The unique violation raised, the
-        # best-effort handler below swallowed it into None, and that subject
-        # 401'd FOREVER on valid tokens; two subjects sharing an email
-        # (display_name) collided the same way. The user row is the
+        # provisioning of the same human — at F2 time the post-revoke
+        # re-provision (audit r5 #5 has since made a refused row TERMINAL,
+        # so that trigger is gone) and still today two subjects sharing an
+        # email (display_name) or a retried provision after a partial
+        # failure. The unique violation raised, the best-effort handler
+        # below swallowed it into None, and that subject 401'd FOREVER on
+        # valid tokens. The user row is the
         # tenancy/policy holder, NOT an identity assertion — the subject row
         # stays the identity anchor — so reusing it is correct, and it is what
         # the enrollment mint does (there with a suffix-retry).
@@ -889,7 +942,9 @@ async def resolve_shadow_key(subject: str, claims: TokenClaims | None = None) ->
     The flag gates PROVISIONING, not RECOGNITION (review §1.3: "off =
     tokens validate but don't provision"): an already-provisioned shadow
     key keeps working when the operator flips the flag back off — console
-    revocation is the off switch for an existing shadow key. Flag off +
+    revocation is the off switch for an existing shadow key (audit r5 #5,
+    2026-10-30: an expired or revoked row is TERMINAL — the None it yields
+    is refused, not absent, so it never triggers a re-provision). Flag off +
     unknown subject ⇒ None WITHOUT provisioning (the anonymous-fp
     posture). DB failures PROPAGATE (fail-closed — the auth surfaces turn
     them into 401 exactly like a key-lookup failure)."""
@@ -897,5 +952,12 @@ async def resolve_shadow_key(subject: str, claims: TokenClaims | None = None) ->
     if existing is not None:
         return existing
     if not shadow_keys_enabled():
+        return None
+    # (audit r5 #5, 2026-10-30) None from find_shadow_key is AMBIGUOUS:
+    # ABSENT (a first sighting — provision) or REFUSED (a shadow row exists
+    # but is expired/revoked — the off switch above). Only ABSENT may
+    # provision; a refused row is terminal, never a re-provision trigger.
+    refused = await db.fetchrow(_SHADOW_KEY_ANY_SQL, IDP_KEYCLOAK, subject, VIA_TOKEN_SHADOW)
+    if refused is not None:
         return None
     return await _provision_shadow_key(subject, claims)

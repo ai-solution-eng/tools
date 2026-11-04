@@ -60,9 +60,7 @@ def test_decide_does_not_double_call_a_five_arg_caller_that_raises() -> None:
 
     from pcai_llm.core import decision_routing as dr
 
-    result = asyncio.run(
-        dr.decide(five_arg, state="s", instructions="i", candidates=["a", "b"])
-    )
+    result = asyncio.run(dr.decide(five_arg, state="s", instructions="i", candidates=["a", "b"]))
     assert len(calls) == 1, "a 5-arg caller must be invoked exactly once"
     assert result.ok is False and result.reason == "call_failed"
 
@@ -73,9 +71,7 @@ def test_decide_still_supports_a_legacy_four_arg_caller() -> None:
 
     from pcai_llm.core import decision_routing as dr
 
-    result = asyncio.run(
-        dr.decide(four_arg, state="s", instructions="i", candidates=["a", "b"])
-    )
+    result = asyncio.run(dr.decide(four_arg, state="s", instructions="i", candidates=["a", "b"]))
     assert result.ok and result.choice == "a"
 
 

@@ -23,7 +23,7 @@ index.
 | Admin key | operator Secret, comma-separated list | the admin plane only | `/admin/*` |
 | Enrollment code | `enroll-...` (minted via `/admin/enrollments`) | one redemption | `POST /v1/enroll` only |
 | IdP token (Phase B, optional) | `Authorization: Bearer eyJ...` (Keycloak JWT) | identity claims (sub/email/groups) | nothing BY ITSELF — validates for attribution; authorizes only through its subject's shadow key (`PCAI_LLM_TOKEN_SHADOW_KEYS`) |
-| Browser identity (Phase B, optional) | `X-Auth-Request-*` headers injected by the platform oauth2-proxy (subject: Preferred-Username → User → Email; groups: `X-Forwarded-Groups`, fallback `X-Auth-Request-Groups`) | a subject + groups — no credential material | nothing BY ITSELF — trusted only when `PCAI_LLM_TRUST_PROXY_IDENTITY=true`; identifies the caller on `GET /v1/identity` and `POST /v1/keys/for-me` (whose identity IS these headers) and never authorizes a request alone |
+| Browser identity (Phase B, optional) | `X-Auth-Request-*` headers injected by the platform oauth2-proxy (subject: Preferred-Username → User → Email; groups: `X-Auth-Request-Groups` (the proxy spelling); `X-Forwarded-Groups` only behind `PCAI_LLM_TRUST_FORWARDED_GROUPS` (default false — the platform proxy never sends the forwarded spelling, so an arriving value is client-supplied and must not outrank the proxy's group)) | a subject + groups — no credential material | nothing BY ITSELF — trusted only when `PCAI_LLM_TRUST_PROXY_IDENTITY=true`; identifies the caller on `GET /v1/identity` and `POST /v1/keys/for-me` (whose identity IS these headers) and never authorizes a request alone |
 
 The three credential tokens are stored/compared in SHA-256 hash space;
 plaintext is returned exactly once at mint time and never again. Fail
@@ -57,6 +57,7 @@ step 3).
 | `X-Cache: HIT` | Embeddings answered from the cache (zero upstream spend) |
 | `X-PCAI-Billing: offpeak-<fraction>` | Settled at a discounted billing fraction (absent = normal billing) |
 | `X-PCAI-Relay: streaming` | The tool relay answered this request (SSE with `pcai` events) |
+| `X-PCAI-Compress-Tools` | The tool-result compression mode in effect for this relayed turn (`on` / `shadow`); absent = off |
 | `X-PCAI-Route` | The complexity-routing decision in effect for THIS chat response — on every response of a profile whose `routing_policy` is `shadow`/`active`: `shadow ceiling=<m> would=<m> reason=<cut>`, `active ceiling=<m> served=<m> reason=<cut>`, `off` (profile opted in, fleet switch down), or `... reason=direct` for non-pseudo models. Absent when the profile policy is `off` |
 | `X-PCAI-Served-Model` | The model that ACTUALLY answered (post-cascade/post-routing/post-fallback truth) — on every chat response |
 | `X-PCAI-Endpoint` | The endpoint id (a `model_endpoints` row) that served this response — on every chat response |
@@ -69,6 +70,22 @@ stream (strict validating clients); `1` forces them on; absent → the key
 (NEW keys default FALSE since the 2026-09-24 consumer inventory — the
 console and enrollment surfaces opt their own keys in explicitly)
 default (see FEATURES.md § Key model).
+
+Request header `X-PCAI-Compress-Tools: 1|0|shadow` opts a RELAYED turn
+into deterministic tool-result compression: oversized results of recognised
+kinds (JSON arrays, NDJSON, logs, search output, diffs) are rewritten by
+selection — error records, boundary context, changed lines and first matches
+survive, redundancy is dropped — and the original is stored under a content
+digest so the model can expand it with the synthetic `pcai__retrieve` tool
+(offered only while the mode is `on`; `{"digest", "offset", "limit"}` pages
+the text). The header outranks the deployment default
+(`settings.tool_compress_default`); an unknown value is OFF, never an error.
+`shadow` computes and reports the saving — in-stream `pcai.compress` events
+carry kind/digest/before/after — and rewrites nothing. Compression is
+deterministic and model-free: the same bytes in produce the same bytes out,
+so a client that re-sends its history keeps the provider's prefix cache warm.
+A store failure passes the original through untouched (never a marker
+pointing at an unretrievable digest).
 
 Request header `X-PCAI-Metadata: 1` opts a NON-STREAMING chat response's
 body into the `"pcai": {"served_model", "endpoint", "cost_usd"?, "cached_tokens"?}`
@@ -221,6 +238,30 @@ land on the settled ledger rows (relay path: a 0-token `chat:guardrail`
 marker row). Every verdict — pass included — is recorded in
 `usage_ledger.guardrail_events`.
 
+**Session affinity** (`session_affinity_enabled`, default off). A chat request
+carrying `X-PCAI-Session: <id>` pins the conversation to the ENDPOINT that
+served it (not just the cascade head), so its prefix keeps hitting the same
+server's KV cache. The pin is routing state, never policy: it is validated
+against the live pool on every read, refreshed on a successful serve, and
+dropped on a breaker trip or transport error. Streaming responses read a pin
+but do not refresh it; relayed turns ignore it (the relay re-picks per
+iteration).
+
+**Exact-match response cache** (`response_cache_mode` = `off|shadow|active`,
+default off). Only **deterministic, non-streaming, non-relay** requests are
+eligible: `temperature` must be present and exactly `0`, the body must not
+set `stream`, and the turn must not be relayed. `shadow` computes the key
+and records would-be hits (`gateway_response_cache_total{mode="shadow"}`)
+without serving; `active` replays a stored answer with `X-Cache: HIT` and
+settles ONE free `cache_hit` ledger row (estimated prompt tokens, zero cost —
+the budget SUM excludes that status, exactly like the embeddings cache). The
+key is sha256 over the canonical request with transport-only fields excluded
+(`stream`, `stream_options`, `user`, `metadata`, `request_id`), scoped to
+`(key_id, model)` so one tenant's answer is never served to another. Entries
+expire after `response_cache_ttl_s` (default 1 h) and are purged by the
+housekeeping sweep. Every cache call is fail-open: a cache fault is a miss,
+never a failed request.
+
 ### 2.2 `POST /v1/embeddings`
 
 OpenAI-compatible passthrough; body must carry `model` + `input`. Identical
@@ -303,10 +344,12 @@ Errors are `{"error": ...}` bodies.
 
 Any valid virtual key. Turns a transcript into the calling key memory
 dataset (project-summary via the canonical prompt; errors `{"error": ...}`).
-**Inert contract**: a key whose memory feature is not attached (no enabled
-`mm-rag` registry row, or no stamped `{X-Memory-Dataset, X-Dataset-Password}`
-pair) gets `200 {"ok": false, "inert": true}` and nothing runs — harnesses
-call unconditionally. Feature flag `PCAI_LLM_DISTILLER_ENABLED` unmounts
+**Inert contract**: a key the backend reports as unattached (no enabled
+`mm-rag` registry row, or the backend's capability probe answering
+`memory_available=false`/`writable=false` for this key's credential merge)
+gets `200 {"ok": false, "inert": true}` and nothing runs — harnesses call
+unconditionally. The gateway does not inspect the backend's dataset model:
+per-user memory identity is whatever header override the key carries. Feature flag `PCAI_LLM_DISTILLER_ENABLED` unmounts
 both routes (404) when false.
 
 | Method | Path | Body | Response |
@@ -324,6 +367,20 @@ scheduling, quiet window, output cap, runtime enable).
 `PUT /admin/keys/{key_id}/mcp-creds` (admin) store per-key header overrides
 write-only; `GET` returns header NAMES only. Full walkthrough, including the
 mm-rag key/★-dataset side: [MEMORY.md](MEMORY.md).
+
+**The self-service dialog** (homepage → *MCP tools*): `GET /v1/mcp/selfservice`
+lists the entitled servers, their tools, and per server the stored
+credential-override header NAMES (`cred_header_names`; values never leave the
+DB). There is deliberately **no gateway-modelled memory object**: per-user
+memory identity is ONE header override on the memory server — for `mm-rag`,
+`X-API-Key` holding a key minted in the RAG app — over an SSO-managed ★
+dataset that the backend resolves server-side from that key. The dialog's
+generic header/value row is the attachment surface for every server,
+including the memory one; it is never superseded, and it shows the stored
+names so a legacy set stays replaceable/clearable. Enrollment provisioning
+(`/v1/enroll` `memory_opt_in`, below) remains an API/profile-level opt-in
+that stamps the LEGACY `{X-Memory-Dataset, X-Dataset-Password}` pair — it is
+no longer offered in the redeem dialog.
 
 ### 2.7 `POST /v1/enroll` — redeem an enrollment code
 
@@ -442,6 +499,41 @@ for attribution but authorizes nothing (401) unless token shadow-keys are
 enabled, in which case the subject's newest non-revoked `token-shadow` key
 (first sighting lazily provisions user + key) is the authorization anchor.
 
+### 2.8 `POST /v1/audio/speech` and `POST /v1/audio/transcriptions`
+
+Transparent audio passthrough over `voice`-typed pools. The request body
+**bytes** are forwarded unchanged (JSON for speech, multipart for
+transcriptions — the audio is never parsed or re-encoded) with the client's
+`Content-Type`, and the upstream status/content-type/bytes come back the same
+way. Model resolution: the JSON `model` field for speech; for transcriptions
+`?model=` first, then `X-PCAI-Model`, then the multipart `model` field — a
+request naming none is a **400**. The pool must be `voice`-typed (**400**
+otherwise) and the key's `allowed_models` still applies.
+
+Audio endpoints report no token usage, so each call settles ONE ledger row
+with an ESTIMATE (a zero-token row would be a budget bypass): TTS =
+`len(input) // audio_tts_chars_per_token`, ASR = audio duration at ~32 kB/s
+× `audio_asr_tokens_per_second`, floored at one second. The row carries
+`endpoint = audio.speech` / `audio.transcriptions`.
+
+### 2.9 `POST /v1/rerank` — rerankers behind the key
+
+Body: `{"model", "query", "documents"}` (`query`/`documents` may be strings or
+multimodal content dicts; vendor knobs such as `mm_processor_kwargs` pass
+through untouched). The route resolves the model's pool, requires a
+`reranker`-typed endpoint (**400** for any other type — a chat pool must never
+answer `/rerank`), runs the same budget/rate/concurrency gates as chat and
+embeddings, forwards the body **unchanged** to `{base_url}/rerank`, and
+settles ONE ledger row with `endpoint='rerank'`. Responses carry the usual
+`X-PCAI-Served-Model` / `X-PCAI-Endpoint` headers; the upstream's
+`usage.total_tokens` is used as the prompt count when it reports no
+`prompt_tokens` (vLLM's shape), falling back to the `len//4` estimate.
+No response cache: a score vector is tied to one (query, document-set) pair.
+The native vLLM spelling **`POST /rerank`** (no `/v1`) is also served, because
+clients that speak the native shape strip the trailing `/v1` from their
+base_url before posting — the RAG pipeline's `MultiModalReranker` does exactly
+that, and a 404 there would push it back to calling the upstream directly.
+
 ---
 
 ## 3. MCP surface (`/mcp`)
@@ -516,7 +608,7 @@ JSON discovery index.
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
 | POST | `/admin/keys` | `{user_id, name, scopes?, allowed_models?, rate_limit_rpm?, rate_limit_tpm?, expires_at?, relay_default?, stream_pcai_events?, profile_id?}` — `stream_pcai_events` defaults FALSE (spec-clean; console/enroll opt in). With `profile_id`: attaches the profile to the user AND stamps its preset budgets + MCP grants in one transaction | 201 `{id, key, key_prefix}` — **plaintext shown once** |
-| GET | `/admin/keys` | `?include_revoked=` | `[{...key fields, budget_status: [...]}]` — hashes never included |
+| GET | `/admin/keys` | `?include_revoked=`, `?enrollment_id=` (exact enrollment), `?enrollment=` (case-insensitive SUBSTRING match on the enrollment LABEL — "show me everything minted from the *station* codes"; trimmed, 100-char cap, blank = no filter). The two enrollment filters are AND-ed with everything else | `[{...key fields, enrollment_id, enrollment_label, budget_status: [...]}]` — hashes never included. `subject`/`subject_idp`/`bound_via` are the SSO identity that PICKED UP the key (unbound keys read `null` — that column is the honest "who redeemed this" answer) |
 | PATCH | `/admin/keys/{key_id}` | any of `{name, scopes, allowed_models, rate_limit_rpm, rate_limit_tpm, max_concurrent, expires_at, relay_default, stream_pcai_events}`; `expires_at: null` CLEARS expiry; omitted fields untouched; identity material absent | the updated row — live immediately (keys are read per request) |
 | DELETE | `/admin/keys/{key_id}` | — | `{"revoked": bool}` (idempotent revoke) |
 | POST | `/admin/keys/{key_id}/rotate` | — | 201 `{id, key, key_prefix, old_key_id, old_revoked, grants_copied, creds_copied, budgets_copied}` — mints a NEW key with the SAME name + attributes copied verbatim (scopes, allowed_models, RPM/TPM, max_concurrent, expires_at, relay_default), then revokes the old (create-first-then-revoke: a partial failure leaves both keys live, never none). **Plaintext shown once** — the DB keeps only the hash. The server CARRIES OVER the identity rows in one INSERT..SELECT each: `mcp_tool_acls` grants (allow AND deny; `grants_copied`), `mcp_server_creds` per-server credential overrides (`creds_copied` — the memory dataset/password identity survives rotation verbatim), and the `budgets`/`cost_budgets` LIMIT rows (`budgets_copied`, ON CONFLICT DO NOTHING). **Spend survives rotation**: the new key inherits `spend_ancestors` (+ the old id) and the budget gates sum the lineage's in-window ledger spend — rotating never resets a period budget (calendar windows still reset normally; RPM/TPM counters reset — 1-minute burst windows). 404 unknown key; 409 already-revoked (refused before any write) |
@@ -565,12 +657,13 @@ JSON discovery index.
 | DELETE | `/admin/profiles/{profile_id}` | `?force=true` detaches attached users | `{deleted, detached_users}` (409 while users are attached, without force) |
 | PUT | `/admin/users/{user_id}/profile` | `{profile_id: <uuid|null>}` (null clears) | the user row |
 | GET | `/admin/usage` | filters `key_id, user_id, model, status, since, until, limit (≤1000)`, `group_by=key|model|tenant|day`, `format=json|csv` | ledger rows with actor join (`key_name`, `key_prefix`, `user_name`, `tenant_name`), rollups, or `text/csv` attachment |
-| GET | `/admin/usage/summary` | — | `{totals: {requests, tokens in/out/cached, cache_hits, cost_usd}, by_model: [...]}` |
+| GET | `/admin/usage/summary` | `?since=&until=` | `{totals: {requests, tokens in/out/cached, cache_hits, cost_usd}, by_model: [...], window: {since, until}}` — both bounds ISO-8601 **with offset**; `until ≥ since`; span ≤ 366 days (400 otherwise). Omitted `since` = the 30-day default; omitted `until` = now. The chargeback explorer's Custom range sends both. |
 | GET | `/admin/traces` | `?user_id=&key_id=&since=ISO-8601&limit= (≤200, default 50)` | request-grouped timelines: `[{request_id, key_id, user_id, user_name, key_name, model, started_ts, last_ts, steps: [{iteration, phase, server, tool, ms, prompt_tokens, completion_tokens, status}], totals: {steps, tool_ms, chat_ms, tool_calls}}]` |
 | GET | `/admin/traces/{request_id}` | — | one request's timeline (404 when nothing traced) |
 | GET | `/admin/offpeak` | — | read-only evaluator snapshot: `{enabled, active, fraction, enter_pct, exit_pct, check_s, promql, mcp_server, tool, last_value_pct, last_check, last_error, state_since}` |
 | PUT | `/admin/offpeak/models/{model_name}/fraction` | `{fraction: <0–1>}` or `{fraction: null}` (clear — falls back to profile fraction, then the gateway default). Precedence while the model's governing evaluator is ACTIVE: override → profile → default; inactive bills 1.0. `{model_name:path}` carries slash-containing names | the updated row |
 | GET | `/admin/presented-models` | — | the admin-side "what does `/v1/models` advertise" view: `{aliases: [{id, type, order, demand_aware, present, reason}], models: [{id, type, primary, endpoints, healthy, max_tokens_ceiling, offpeak{value_pct,active,fraction}, demand_aware_excluded, routing_eligible}], routing: [{id, type, present, reason}], agents: [{id, type, description, servers, model, enabled, profiles, present, reason}], env{routing_enabled, load_aware_cascade}, counts{presented,registered}}`. Registry truth + config truth — an admin key holds no profile, so `order` is derived (the CHAT pools, name-sorted — non-chat pools are never cascade steps) and each alias `reason` says so. `agents` lists every enabled agent with the profiles that offer it |
+| GET | `/admin/endpoint-metrics` | `?window_s=300` | live per-ENDPOINT throughput and load, read from the inference servers' own Prometheus metrics (vLLM): `{available, source, window_s, endpoints: [{namespace, pod, instance, model_name, pool, prefill_tps, decode_tps, running, waiting, kv_cache_pct, prefill_share, idle}], error}`. `prefill_tps`/`decode_tps` are `rate()` over the window; `prefill_share` is prefill request-time / (prefill+decode) request-time — vLLM runs CHUNKED prefill, so a single iteration carries both phases and this is a mix, not a state. `pool` is a best-effort join (endpoint address, then normalised model name); a pod that matches neither is still returned with `pool=""` rather than dropped. `idle` means no traffic in the window (not a fault). Read-only; NEVER raises — an unreachable Prometheus answers `available=false` plus `error` |
 
 #### Agents — `/admin/agents`
 
@@ -580,16 +673,21 @@ An **agent** is a named tool surface a request selects by naming it as its
 choice; the hybrid surface removed the token cost, an agent removes the choice.
 
 An agent can only ever **hide** tools: the effective surface is the
-intersection of the key's grants and the agent's `servers`, so a server that
-gains a tool still grants that tool to nobody new. The profile is the envelope,
-the agent is the role inside it, and the key stays the hard boundary — which is
-also why the read+egress gate keeps evaluating the key's WHOLE grant set, not
-the agent-narrowed one.
+intersection of the key's grants and the agent's `servers` — optionally
+narrowed, per server, to specific `tools` (2026-11-04) — so a server that
+gains a tool still grants that tool to nobody new. A server ABSENT from
+`tools` is whole-server (every tool it exposes), which is also the
+pre-2026-11-04 meaning, so older agents keep working untouched. A tool name
+the server does not expose matches nothing (hiding, never adding), so the
+picker can be saved while a server is briefly down. The profile is the
+envelope, the agent is the role inside it, and the key stays the hard
+boundary — which is also why the read+egress gate keeps evaluating the key's
+WHOLE grant set, not the agent-narrowed one.
 
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
-| POST | `/admin/agents` | `{name, description?, servers? [names], model? ("" = profile cascade), system_prompt?, enabled? (default true)}` — upsert by name. Refused (400) when the name shadows a registered model, `auto`, `auto-demand-aware`, or the `routing*` namespace; when a server is not registered; or when a pinned `model` is not a registered CHAT model | the agent row |
-| GET | `/admin/agents` | — | every agent + `profiles` (the profiles that offer it) + `system_prompt_chars` (the prompt body is operator prose; the listing shows its length, not a token bill) |
+| POST | `/admin/agents` | `{name, description?, servers? [names], tools? {server: [tool, ...]}, model? ("" = profile cascade), system_prompt?, enabled? (default true)}` — upsert by name. `tools` narrows a listed server to those tools; a server omitted from it keeps ALL its tools, and a key that is not in `servers` is a 400 (dead config), as is an empty/blank tool list (remove the server instead) or more than 2000 narrowed names. Refused (400) when the name shadows a registered model, `auto`, `auto-demand-aware`, or the `routing*` namespace; when a server is not registered; or when a pinned `model` is not a registered CHAT model | the agent row (`tools` parsed) |
+| GET | `/admin/agents` | — | every agent + its `servers` and `tools` map + `profiles` (the profiles that offer it) + `system_prompt_chars` (the prompt body is operator prose; the listing shows its length, not a token bill) |
 | DELETE | `/admin/agents/{name}` | — | 204 (404 when it does not exist). `profile_agents` rows cascade; a key still naming the deleted agent falls back to the ordinary alias path |
 
 The profile side is `POST /admin/profiles` with `agents` (see §4.5); the
@@ -612,9 +710,22 @@ is what `/admin/routing/config` reports as `effective_enabled`.
 
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
-| GET | `/admin/routing/config` | — | `{config, defaults, overridden: [keys present in DB], registered, chat_models, env_enabled, effective_enabled, placeholders, gpu}` |
-| PUT | `/admin/routing/config` | any of `{enabled, decision_model, allowed_models, prompt, inject_gpu_load, gpu_load_source, max_prompt_chars}`; a field explicitly `null` CLEARS its row back to the default; an OMITTED field is untouched (the console sends `null` when the operator unticks every model); unknown keys 400. `decision_model` must be `""` or a registered **chat** pool; every `allowed_models` entry must be a registered **chat** pool (an embedding/reranker pool can never be a routing candidate, and an allowlist of them would intersect to empty — which reads as "every chat model", the opposite of the intent); `gpu_load_source` is `offpeak` only; `max_prompt_chars` 200–60000; `prompt` ≤ 20 000 chars. The audit row records the prompt's LENGTH, not its body (the trail is append-only and never pruned) | `{config}` (merged, effective) |
-| POST | `/admin/routing/prompt-preview` | `{prompt?, decision_model?, inject_gpu_load?}` — renders with the SAVED config plus these in-memory overrides. **Writes nothing**, no audit row | `{rendered, truncated, chars, gpu, models, used_placeholders}` |
+| GET | `/admin/routing/config` | — | `{config, defaults, overridden: [keys present in DB], registered, chat_models, env_enabled, effective_enabled, placeholders, criteria_placeholders, card_coverage, gpu}` |
+| PUT | `/admin/routing/config` | any of `{enabled, decision_model, allowed_models, prompt, model_cards, inject_gpu_load, gpu_load_source, max_prompt_chars}`; a field explicitly `null` CLEARS its row back to the default; an OMITTED field is untouched (the console sends `null` when the operator unticks every model); unknown keys 400. `decision_model` must be `""` or a registered **chat** pool; every `allowed_models` entry must be a registered **chat** pool (an embedding/reranker pool can never be a routing candidate, and an allowlist of them would intersect to empty — which reads as "every chat model", the opposite of the intent); `gpu_load_source` is `offpeak` only; `max_prompt_chars` 200–60000; `prompt` ≤ 20 000 chars. The audit row records the prompt's LENGTH, not its body (the trail is append-only and never pruned) | `{config}` (merged, effective) |
+| POST | `/admin/routing/prompt-preview` | `{prompt?, decision_model?, inject_gpu_load?, model_cards?}` — renders with the SAVED config plus these in-memory overrides. **Writes nothing**, no audit row | `{rendered, truncated, chars, gpu, models, used_placeholders, criteria, used_criteria_placeholders, card_coverage}` |
+
+`model_cards` is `{model: {description: str}}` — one card per routable
+model, rendered into the decision model's CRITERIA at call time (the option
+description it scores against), with per-model live tokens substituted
+(`{{gpu_util}}`, `{{low_demand}}`, `{{cost}}`, `{{modalities}}`, `{{model}}`, `{{gpu_line}}`).
+This is where a model's ROLE belongs: criteria is the only channel whose text
+is bound to an option label, and the candidate set is per-request (profile
+ladder, ACL, health, context fit), so a prompt that names models is wrong on
+every site whose ladder differs. A model with no card renders as its bare
+name; the GET reports `card_coverage` so a router that has lost every
+description is visible instead of silently classifying on labels alone.
+Descriptions are capped at 4000 chars each (they are inlined into every
+decision call), and an entry naming an unregistered chat pool is a 400.
 
 `allowed_models` is the set of models the router may ROUTE TO (empty = every
 registered chat model); it is deliberately separate from a key's
@@ -647,9 +758,15 @@ large GPU snapshot cannot blow the decision model's context.
 
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
-| POST | `/admin/enrollments` | `{label, tenant_id, profile_id?, max_uses? (0 = unlimited), expires_days?}` | 201 — includes `"code": "enroll-..."` **shown once** |
-| GET | `/admin/enrollments` | — | all codes with usage state (tenant/profile names, uses, expiry, revocation; hashes never leave the DB) |
+| POST | `/admin/enrollments` | `{label, tenant_id, profile_id?, max_uses? (0 = unlimited), expires_days?, budget_tokens?, budget_usd?, budget_period? (day\|week\|month, default month), overflow_enabled? (default true), with_team_leader? (default false)}` — the budget fields are the TEAM ENVELOPE (§4.11); `budget_period` is validated against the code-owned vocabulary (400). `with_team_leader` also mints the team leader key in the same call, minted AFTER the insert commits (a failure can only leave an enrollment without a leader key, never a leader key without an enrollment) | 201 — includes `"code": "enroll-..."` **shown once**, plus `team_leader_key`/`team_leader_key_prefix` **shown once** when requested |
+| GET | `/admin/enrollments` | — | all codes with usage state (tenant/profile names, uses, expiry, revocation; hashes never leave the DB). ADDITIVE team columns: `budget_tokens, budget_usd, budget_period, overflow_enabled, team_leader_key_prefix, team_leader_key_created_at, team_leader_key_revoked_at, team_leader_key_last_used_at, key_count, spend_tokens, allocated_tokens` — `last_used_at` is stamped (best-effort, throttled to ~1/hour) on every successful leader-console auth, so the admin can see whether the credential is actually in use; the console renders a stale/never-used/rotate-age nudge from it (spend/allocated use the gate's own helpers; a lookup fault degrades that row to 0 rather than 500ing the listing) |
+| PATCH | `/admin/enrollments/{enrollment_id}` | `{budget_tokens?, budget_usd?, budget_period?, overflow_enabled?, max_uses?, expires_days?}` — omitted fields untouched; audited as `enroll.envelope.patch`; the gate's enrollment cache is invalidated on write | the updated row |
 | POST | `/admin/enrollments/{enrollment_id}/revoke` | — | `{"revoked": true}` (idempotent) |
+| POST | `/admin/enrollments/{enrollment_id}/team-leader/rotate` | — | 201 `{team_leader_key, team_leader_key_prefix}` — mints a NEW leader key (also the way to create the first one), invalidating the old hash. **Plaintext shown once** |
+| POST | `/admin/enrollments/{enrollment_id}/team-leader/revoke` | — | `{"revoked": true}` (idempotent; the hash + prefix stay as the audit trail of the credential that existed) |
+| GET | `/admin/topup-requests` | `?status=pending\|approved\|denied`, `?limit` (≤200, default 100) | every ask, newest first, with `enrollment_label` + `tenant_name`: `[{id, enrollment_id, requested_tokens, requested_usd, note, status, created_at, resolved_at, resolved_by, enrollment_label, tenant_name}]` |
+| POST | `/admin/topup-requests/{id}/approve` | `{tokens?: int>0, usd?: float>0}` — OPTIONAL override (omitted = approve as requested). Raises the enrollment cap **additively in SQL** (`COALESCE(cap,0) + applied`), so concurrent approvals serialize on the row lock and both add; a NULL cap + an approved amount **establishes** the cap. One transaction for resolve + cap; the conditional `UPDATE … WHERE status='pending'` makes a double-click a 409 without ever double-adding. `teams.invalidate()` after commit; audited as `enroll.topup.approve` | `{…resolved row…, applied: {tokens, usd}, enrollment_caps: {budget_tokens, budget_usd, budget_period}}` — `requested_*` stay what was ASKED, `applied` is what was GRANTED |
+| POST | `/admin/topup-requests/{id}/deny` | `{note?: str≤500}` — caps are never touched; the note rides the audit details (`deny_note`), since the queue table deliberately has no deny-note column | `{…resolved row, status: "denied"}` |
 
 ### 4.8 Ops
 
@@ -659,7 +776,8 @@ large GPU snapshot cannot blow the decision model's context.
 | GET | `/health` | Liveness — process up; returns `{"status":"ok","version":...}` |
 | GET | `/ready` | Readiness — a real Postgres round-trip; 503 takes the pod out of the Service |
 | GET | `/metrics` | Prometheus exposition (when `metrics.enabled=true`) |
-| GET | `/`, `/ui` | Chat UI (key holders); `GET /admin` console (admin key via sessionStorage, Bearer on every fetch — never a cookie) |
+| GET | `/oauth2/sign_out` | **SSO sign-out** (public; `?rd=` = return path, relative only). Always a 302, never a 404: with `PCAI_LLM_SSO_SIGN_OUT_URL` set it redirects to the platform oauth2-proxy's sign-out (`rd` appended), which clears the domain-wide session cookie; unset it redirects to `/?signout=local` and the console says the platform session is still active. WHY the gateway owns the path: the SSO cookie is `HttpOnly` and domain-wide, so page JS cannot clear it, and the path used to fall through the VirtualService catch-all to a JSON 404 with the cookie alive. `ezua.virtualService.ssoProxy` (chart, off by default) supersedes this handler by routing `/oauth2/` on this host straight to the proxy — same-origin, no configuration. |
+| GET | `/`, `/ui` | Chat UI (key holders); `GET /admin` console (admin key via sessionStorage, Bearer on every fetch — never a cookie); `GET /team_leader` the enrollment-scoped team console (§4.11 — same sessionStorage discipline, distinct key). Both consoles carry a `← Chat` link back to `/` |
 
 ### 4.9 Guardrails (content policy)
 
@@ -705,3 +823,94 @@ Effective-prompt capture).
 |---|---|---|---|
 | GET | `/admin/audit` | filters AND-ed: `since`/`until` (ISO), `actor_key_id`, `action` (exact, e.g. `key.create`), `resource_type`; `limit` (default 100, cap 500), `offset`; `format=json\|csv` (csv = text/csv attachment, same projection) | newest-first rows `{id, ts, actor_key_id, actor_subject, actor_source, action, resource_type, resource_id, details, request_id, source_ip}` — details are secret-redacted at write time; rows immutable, never pruned |
 | GET | `/admin/effective-prompts` | filters: `key_id` (primary), `thread_id` (one conversation's per-call prompts in order), `limit` (default 50, cap 200) | newest-first captured effective prompts (post reasoning-strip, post canonical reconciliation, post trim) — the rows themselves are the bounded artifact; capture-off/faulted → `{"rows": []}` with 200 |
+
+### 4.11 Team leader plane (`/team_leader`) — enrollment-scoped mini admin
+
+An **enrollment code is a team invite**. Each enrollment may carry a **team
+leader key**: a control-plane credential (hash-only, the analog of an admin key
+for one enrollment) whose holder gets `/team_leader` — a console scoped to
+exactly that team. It is a SEPARATE credential space from both the admin keys
+(K8s Secret, never DB rows) and the data-plane `hllm-` keys: a leader key
+authorizes nothing on `/admin` and nothing on `/v1`.
+
+`GET /team_leader` serves the console page; every route below requires
+`Authorization: Bearer <team leader key>` (or `X-API-Key: <team leader key>` —
+the same two envelopes the data plane accepts) and answers **401** for a
+missing, unknown, revoked or expired credential (one message — no oracle). A
+**revoked or expired enrollment closes its console too**: the leader key stops
+resolving, so a closed team cannot keep managing its keys.
+
+Scope is the enrollment. Every id-taking route resolves its row with
+`WHERE id = $1 AND enrollment_id = $2`, so a key from another team is
+**indistinguishable from a missing one (404)** — never a 403 that would leak
+existence.
+
+| Method | Path | Body / notes | Response |
+|---|---|---|---|
+| GET | `/team_leader/overview` | — | `{enrollment: {id, label, tenant_name, profile_name}, budget: {period, tokens\|null, usd\|null, overflow_enabled}, spend: {tokens, usd}, allocated: {tokens, usd}, committed: {tokens, usd}, available: {tokens\|null, usd\|null}, unallocated: {tokens\|null, usd\|null}, keys: {total, active}, leader: {key_prefix, created_at}}` — spend/allocated come from the SAME helpers the budget gate uses, so the card cannot disagree with enforcement |
+| PATCH | `/team_leader/settings` | `{overflow_enabled: bool}` — the ONE policy knob a team leader owns (`extra="forbid"`: a typo is a loud 422, and there is no cap field to abuse — the enrollment TOTAL stays admin-only). Audited as `team.settings.set`; the gate's enrollment cache is invalidated | `{enrollment_id, overflow_enabled}` |
+| GET | `/team_leader/keys` | `?include_revoked=` | the `/admin/keys` row shape + `budget_status`, restricted to `api_keys.enrollment_id = <this enrollment>` |
+| POST | `/team_leader/keys` | `{name, subject?, rate_limit_rpm?, rate_limit_tpm?, expires_days?, budget_tokens?, budget_usd?}` — mints a teammate key in ONE transaction: user row in the enrollment's tenant, key stamped with `enrollment_id` + the enrollment profile's presets, optional allocation, optional subject binding (`idp=admin-asserted`, `bound_via=enrollment`). Scopes are FIXED (`proxy,mcp`) and there is no `mcp_admin` — a delegated console can never mint a credential-minting key. The envelope check runs BEFORE the transaction, so a 409 burns nothing | 201 `{id, key, key_prefix, message}` — **plaintext shown once** |
+| PATCH | `/team_leader/keys/{key_id}` | any of `{name, rate_limit_rpm, rate_limit_tpm, max_concurrent, expires_at}` (`expires_at: null` clears); scoped UPDATE — a concurrent re-scope can never patch across teams | the updated row |
+| DELETE | `/team_leader/keys/{key_id}` | — | `{"revoked": bool}` (idempotent) |
+| PUT | `/team_leader/keys/{key_id}/budgets` | `{"budgets": [{model, period, limit_tokens\|limit_usd}]}` — replace-all both kinds in one transaction, PLUS the **envelope check**: same-period allocations across the team (minus this key's own current rows) + the request must fit under the enrollment's cap for that kind. Only rows whose period equals the enrollment's `budget_period` are envelope-bound; an enrollment with no cap of that kind treats allocations as advisory | `{key_id, budgets: [...status]}`; **409** names the cap, the already-allocated amount and the request |
+| GET | `/team_leader/keys/{key_id}/usage` | — | `{budgets, recent: [50 ledger rows]}` (the `/admin` shape) |
+| GET | `/team_leader/usage` | `key_id, model, status, since, until, limit (≤1000)`, `group_by=key\|model\|tenant\|day\|subject`, `format=json\|csv` | scoped ledger rows / rollups / CSV — the enrollment scope is the FIRST predicate of every query; a `key_id` naming a foreign key is a 404 |
+| GET | `/team_leader/usage/summary` | `?since=` | scoped totals + `by_model` + `by_key` (30-day default window, 366 max) |
+| GET | `/team_leader/traces` | `?key_id=&since=&limit=` (≤200, default 50) | request-grouped agent timelines, scoped by `api_keys.enrollment_id` |
+| GET | `/team_leader/traces/{request_id}` | — | one request's timeline; **404** when it belongs to another team |
+| POST | `/team_leader/topup-requests` | `{tokens?: int>0, usd?: float>0, note?: str≤500}` — asks the admin for a bigger envelope. **One open ask at a time**: a second pending request for the same enrollment is a 409; neither amount is a 400. Audited as `team.topup.request` | 201 `{id, enrollment_id, requested_tokens, requested_usd, note, status:"pending", created_at, resolved_at}` |
+| GET | `/team_leader/topup-requests` | — | newest 50 for THIS enrollment: `[{id, requested_tokens, requested_usd, note, status, created_at, resolved_at}]` |
+| GET | `/team_leader/presented-models` | — | the **full** `/admin/presented-models` payload (byte-identical — the Advertised tab is not scoped) |
+
+#### Team budget envelope (enforced by the data plane, not the console)
+
+The envelope is a **hard cap on the whole team** and is enforced in
+`core.budgets.check_budgets` — the same single gate as every per-key budget, so
+"spent" means the same thing in the console and in the gate (same ledger rows,
+same `status IN ('ok','error')` predicate, same `billing_fraction` weighting,
+same cache-discount expression). Per-key `budgets`/`cost_budgets` rows are a
+teammate's **allocation** — a claim on that pool, not a separate budget.
+
+**Grant-time rule — spend consumes the pool too.** A seat allocated *later*
+gets less, because the team has already burned part of what it would be
+claiming. With `T` the cap for the period, `S` the team's spend in the window,
+and `aᵢ`/`sᵢ` each other key's allocation and spend:
+
+```
+committedᵢ = max(0, aᵢ - sᵢ)          # what key i can still consume under its own allocation
+available  = T - S - Σ committedᵢ      # what a leader may still grant (clamped at 0)
+```
+
+A grant (or a replace-all) larger than `available` is refused **409**, naming
+all of it: `team month token budget: cap 12000000, spent 9000000, committed to
+other keys 3000000, available 0, requested 1000000`. Nothing is written on a
+refusal. Worked example — 12 seats × 1M/month, six allocated, 9M already spent
+(so every one of the six is past its own allocation and reserves nothing more):
+`available = 12M − 9M − 0 = 3M`. Seats 7–9 get their 1M; seat 10 sees 0 and is
+refused. Had only 2M been spent, `available = 12M − 2M − 4M = 6M` — which is
+simply `T − Σ allocations`.
+
+**Run-time rule — overflow decides whether an allocation is a ceiling.**
+
+* `overflow_enabled = TRUE` (default): a key may **exceed its own allocation**
+  while the pool still has headroom (the envelope is what stops the call). The
+  unallocated remainder is a shared pool, first-come-first-served.
+* `overflow_enabled = FALSE`: a key is **hard-capped at its own allocation**,
+  and the envelope still caps the team. A key with NO allocation has no per-key
+  cap, so it draws on the pool.
+* An enrollment with **no cap** of a kind enforces nothing: its keys behave
+  exactly as they did before the tier existed (per-key budgets only).
+* The **team leader owns this switch** (`PATCH /team_leader/settings`); the
+  enrollment TOTAL is the admin's alone.
+
+The envelope test is **post-paid** (`spent >= limit`) and never charges the
+admission estimate: it is a pool several concurrent teammates draw from, and
+charging one request's estimate against a team-wide cap would refuse a teammate
+for tokens another may never use. A non-finite (NaN/Infinity) envelope refuses
+with a named reason rather than enforcing nothing.
+
+**Do not invert `available` to recover `committed`** (`T − S − available`): the
+helper clamps at 0, so the inversion reports a wrong commitment exactly when
+the pool is over-committed — the state an operator is most likely looking at.
+

@@ -270,6 +270,12 @@ def mint_env(monkeypatch: pytest.MonkeyPatch):
     create_key/authenticate, identity.db for bind_key_subject,
     core.audit.db for the best-effort audit writer)."""
     monkeypatch.setattr(settings, "trust_proxy_identity", True)
+    # The SURFACE flag must be ON here: these tests pin mint/rotate/GET
+    # behavior on an ENABLED deployment (audit w6 F1 made the mint enforce
+    # settings.sso_key_create_enabled — the config default False now refuses,
+    # so a fixture that leaves it unset pins the pre-fix bug). The flag-off
+    # refusal has its own test below.
+    monkeypatch.setattr(settings, "sso_key_create_enabled", True)
     monkeypatch.setattr(settings, "token_shadow_tenant_id", str(uuid.uuid4()))
     fake = SelfMintDB()
     import pcai_llm.core.keys as keys_mod
@@ -359,6 +365,26 @@ def test_for_me_get_trust_off_403(mint_env, monkeypatch: pytest.MonkeyPatch) -> 
     r = tc.get("/v1/keys/for-me", headers=BROWSER_H)
     assert r.status_code == 403
     assert r.json()["detail"] == "SSO key creation is not enabled on this deployment"
+
+
+def test_sso_flag_off_refuses_mint_and_get(mint_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OTHER posture switch (audit w6 F1): with
+    ``sso_key_create_enabled`` False BOTH for-me readers refuse with the
+    SAME 403 detail the trust-off refusal uses (one refusal vocabulary —
+    the probe's flags.self_mint is False here too, so the SPA hides the
+    card and the API agrees). The mint must refuse before ANY state
+    changes: no key row, no user row."""
+    tc, fake = mint_env
+    monkeypatch.setattr(settings, "sso_key_create_enabled", False)
+    r = tc.post("/v1/keys/for-me", json=None, headers=BROWSER_H)
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "SSO key creation is not enabled on this deployment"
+    r_get = tc.get("/v1/keys/for-me", headers=BROWSER_H)
+    assert r_get.status_code == 403
+    assert r_get.content == r.content  # byte-identical to the POST refusal
+    # the refusal is terminal: nothing was minted, nothing was written
+    assert fake.keys == []
+    assert fake.users == []
 
 
 def test_for_me_get_no_headers_401(mint_env) -> None:
@@ -1016,3 +1042,33 @@ def test_mint_with_usd_preset_tenant_profile_stamps_cost_budgets(mint_env) -> No
     assert r.status_code == 201, r.text
     assert any("INSERT INTO cost_budgets" in s for s in fake.statements), fake.statements
     assert not any("INSERT INTO budgets " in s for s in fake.statements), fake.statements
+
+
+def test_rotate_carries_grants_and_memory_credentials(mint_env) -> None:
+    """REGRESSION (2026-11-03 cross-validation, both cells): the SSO rotate
+    copied budgets but NOT mcp_tool_acls / mcp_server_creds, while the admin
+    rotate copies both. An SSO "Sign in with SSO" replacement therefore
+    dropped per-key grants — including DENY rows the admin path deliberately
+    preserves — and the memory attachment, which the distill sweep's
+    attachment gate joins (so the group's history silently stopped being
+    distilled).
+
+    The SHAPE is load-bearing: the profile stamp has already inserted rows for
+    the fresh key, so the acl copy must be ON CONFLICT DO UPDATE (the old
+    key's per-key reality, deny included, wins). A plain INSERT..SELECT 500s
+    on the PK, and DO NOTHING would resurrect a denied grant as allowed.
+    """
+    tc, fake = mint_env
+    _mint(tc)
+    r = tc.post("/v1/keys/for-me", json={"rotate": True}, headers=BROWSER_H)
+    assert r.status_code == 201, r.text
+    acl = [s for s in fake.statements if "INSERT INTO mcp_tool_acls" in s]
+    cred = [s for s in fake.statements if "INSERT INTO mcp_server_creds" in s]
+    assert acl, "the SSO rotate must carry the old key's per-key tool ACLs"
+    assert "SELECT $1, server, tool, allowed FROM mcp_tool_acls WHERE key_id = $2" in acl[-1]
+    assert "ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = EXCLUDED.allowed" in acl[-1], (
+        "the profile stamp already wrote rows for the new key: a plain INSERT 500s "
+        "and DO NOTHING would resurrect an operator's explicit DENY"
+    )
+    assert cred, "the SSO rotate must carry the memory attachment (mcp_server_creds)"
+    assert "SELECT $1, server_name, headers_enc FROM mcp_server_creds WHERE key_id = $2" in cred[-1]

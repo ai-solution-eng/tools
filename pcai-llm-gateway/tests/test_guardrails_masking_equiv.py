@@ -139,7 +139,13 @@ def test_known_divergence_is_avoided() -> None:
 def test_fuzz_equivalence() -> None:
     """Random text x random (often overlapping) keyword sets."""
     rng = random.Random(20261027)
-    alphabet = "abcABC +.\u00e9"
+    # '\u0130'/'\u0131'/'\u017f' exercise the span pass's fold in BOTH text
+    # and keyword position: U+0130 in a keyword is the AUDIT-r5 #3 round-2
+    # under-masking defect (867/20000 mismatches pre-fix); round 3 adds
+    # the sigma, micro/mu and theta pairs the interpreter table supplies;
+    # round 4 adds the UPPERCASE forms (Σ, Μ) whose split hid until the
+    # fold closed over upper. None may diverge from the loop oracle.
+    alphabet = "abcABC +.\u00e9\u0130\u0131\u017f\u03c2\u03c3\u00b5\u03bc\u03d1\u03b8\u03a3\u039c"
     for _ in range(600):
         text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
         kws = ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 3))) for _ in range(rng.randint(0, 5))]

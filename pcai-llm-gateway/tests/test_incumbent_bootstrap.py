@@ -92,9 +92,7 @@ def _real_thread() -> str:
     """The key the helper actually computes for _body()."""
     from pcai_llm.core import canonical
 
-    return st.scoped_thread_key(
-        canonical.thread_key(_body()["messages"], _Key.id), st.SCOPE_ROUTING
-    )
+    return st.scoped_thread_key(canonical.thread_key(_body()["messages"], _Key.id), st.SCOPE_ROUTING)
 
 
 def test_floor_stays_opt_in_but_writer_does_not(monkeypatch) -> None:
@@ -128,14 +126,24 @@ def test_turn_one_persists_the_model_turn_two_reads_it(monkeypatch) -> None:
     _inc, _floor, writer = asyncio.run(rp._routing_incumbent_state(_Key(), _body()))
 
     async def _decide1(_c, _b, _s):
-        return mr.DecisionOutcome(ok=True, choice="mid", confidence=0.90,
-                                  reason="decision", probabilities={"mid": 0.90, "small": 0.10})
+        return mr.DecisionOutcome(
+            ok=True, choice="mid", confidence=0.90, reason="decision", probabilities={"mid": 0.90, "small": 0.10}
+        )
 
     async def _turn1():
         return await mr.resolve_routed_model(
-            _Key(), _body(), "routing", set(order), [], order,
-            available=None, decide=_decide1, incumbent=None,
-            switch_margin=0.10, sticky_write=writer)
+            _Key(),
+            _body(),
+            "routing",
+            set(order),
+            [],
+            order,
+            available=None,
+            decide=_decide1,
+            incumbent=None,
+            switch_margin=0.10,
+            sticky_write=writer,
+        )
 
     served1, ctx1 = asyncio.run(_turn1())
     assert served1 == "mid"
@@ -153,14 +161,24 @@ def test_turn_one_persists_the_model_turn_two_reads_it(monkeypatch) -> None:
     assert incumbent == "mid", "turn 2 must read what turn 1 wrote"
 
     async def _decide2(_c, _b, _s):
-        return mr.DecisionOutcome(ok=True, choice="big", confidence=0.56,
-                                  reason="decision", probabilities={"big": 0.56, "mid": 0.55})
+        return mr.DecisionOutcome(
+            ok=True, choice="big", confidence=0.56, reason="decision", probabilities={"big": 0.56, "mid": 0.55}
+        )
 
     async def _turn2():
         return await mr.resolve_routed_model(
-            _Key(), _body(), "routing", set(order), [], order,
-            available=None, decide=_decide2, incumbent=incumbent,
-            switch_margin=0.10, sticky_write=writer)
+            _Key(),
+            _body(),
+            "routing",
+            set(order),
+            [],
+            order,
+            available=None,
+            decide=_decide2,
+            incumbent=incumbent,
+            switch_margin=0.10,
+            sticky_write=writer,
+        )
 
     served2, route2 = asyncio.run(_turn2())
     assert served2 == "mid", "a marginal challenger must be held"

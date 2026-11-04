@@ -98,6 +98,51 @@ def test_narrow_catalog_keeps_the_directory_honest() -> None:
     assert agents_mod.narrow_catalog(catalog, None) is catalog
 
 
+def test_narrow_grants_honours_per_server_tool_narrowing() -> None:
+    """Tool-level agents (2026-11-04): a server ABSENT from the tools map stays
+    whole-server, a present one keeps only the named tools, and narrowing can
+    only ever SUBTRACT from the key's grants."""
+    grants = {
+        ("k8s-ops", "get_pods"),
+        ("k8s-ops", "delete_pod"),
+        ("prometheus", "query"),
+    }
+    assert agents_mod.narrow_grants(grants, ("k8s-ops", "prometheus"), {"k8s-ops": ("get_pods",)}) == {
+        ("k8s-ops", "get_pods"),
+        ("prometheus", "query"),
+    }
+    # a tool the server does not expose simply matches nothing (hide, never add)
+    assert agents_mod.narrow_grants(grants, ("k8s-ops",), {"k8s-ops": ("ghost_tool",)}) == set()
+    # empty map = the pre-2026-11-04 whole-server shape
+    assert agents_mod.narrow_grants(grants, ("k8s-ops",), {}) == {
+        ("k8s-ops", "get_pods"),
+        ("k8s-ops", "delete_pod"),
+    }
+
+
+def test_narrow_catalog_honours_per_server_tool_narrowing() -> None:
+    catalog = [
+        {"server": "k8s-ops", "tool": "get_pods"},
+        {"server": "k8s-ops", "tool": "delete_pod"},
+        {"server": "searxng", "tool": "search"},
+    ]
+    out = agents_mod.narrow_catalog(catalog, ("k8s-ops", "searxng"), {"k8s-ops": ("get_pods",)})
+    assert [t["tool"] for t in out] == ["get_pods", "search"]
+
+
+def test_parse_tools_tolerates_every_stored_shape() -> None:
+    """The column is TEXT JSON; a hand-edited row must never widen an agent."""
+    assert agents_mod.parse_tools(None) == {}
+    assert agents_mod.parse_tools("") == {}
+    assert agents_mod.parse_tools("{not json") == {}
+    assert agents_mod.parse_tools('["k8s-ops"]') == {}
+    assert agents_mod.parse_tools('{"k8s-ops": ["get_pods", "get_pods", " "]}') == {"k8s-ops": ("get_pods",)}
+    # a dict (tests / a future JSONB column) reads the same way
+    assert agents_mod.parse_tools({"k8s-ops": ["get_pods"]}) == {"k8s-ops": ("get_pods",)}
+    # an empty list is not a narrowing — the server stays whole
+    assert agents_mod.parse_tools('{"k8s-ops": []}') == {}
+
+
 def test_row_mapping_reads_null_servers_as_chat_only() -> None:
     """A hand-edited row with servers NULL must HIDE tools, not reveal them."""
     a = agents_mod._row_to_agent(
@@ -142,8 +187,10 @@ class _AdminDB:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.agent_rows = rows or []
         self.executed: list[tuple[str, tuple]] = []
+        self.fetchrows: list[tuple[str, tuple]] = []
 
     async def fetchrow(self, sql: str, *args: Any):
+        self.fetchrows.append((sql, args))
         if "INSERT INTO profiles" in sql:
             return {
                 "id": uuid.uuid4(),
@@ -155,14 +202,17 @@ class _AdminDB:
                 "routing_min_model": args[5],
             }
         if "INSERT INTO agent_profiles" in sql:
+            # arg order mirrors the SQL: name, description, servers, tools,
+            # model, system_prompt, enabled
             return {
                 "id": uuid.uuid4(),
                 "name": args[0],
                 "description": args[1],
                 "servers": list(args[2]),
-                "model": args[3],
-                "system_prompt": args[4],
-                "enabled": args[5],
+                "tools": args[3],
+                "model": args[4],
+                "system_prompt": args[5],
+                "enabled": args[6],
             }
         if "DELETE FROM agent_profiles" in sql:
             return {"id": uuid.uuid4()} if args[0] == "Admin-Agent" else None
@@ -247,6 +297,47 @@ def test_agent_servers_must_exist(admin_env) -> None:
     assert r.status_code == 400 and "ghost-server" in r.text
 
 
+def test_agent_upsert_round_trips_per_server_tool_narrowing(admin_env) -> None:
+    """2026-11-04: an agent may name specific tools per server. The map is
+    stored as deterministic JSON TEXT and returned parsed; a server omitted
+    from it stays whole-server (the pre-tool-picker meaning)."""
+    tc, db = admin_env
+    r = tc.post(
+        "/admin/agents",
+        json=_body(servers=["k8s-ops", "prometheus"], tools={"k8s-ops": ["get_pods", "get_pods"]}),
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["tools"] == {"k8s-ops": ["get_pods"]}
+    upserts = [args for sql, args in db.fetchrows if "INSERT INTO agent_profiles" in sql]
+    assert upserts, "the upsert never reached the DB"
+    # arg order: name, description, servers, tools(JSON TEXT), model, prompt, enabled
+    assert json.loads(upserts[-1][3]) == {"k8s-ops": ["get_pods"]}
+
+
+def test_agent_tools_must_name_a_server_the_agent_lists(admin_env) -> None:
+    """A tools entry for an unlisted server is dead config — it would narrow
+    nothing while reading as if it did. Refuse it where the operator can see."""
+    tc, _ = admin_env
+    r = tc.post(
+        "/admin/agents",
+        json=_body(servers=["k8s-ops"], tools={"searxng": ["search"]}),
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 400
+    assert "not in servers" in r.json()["detail"]
+
+
+def test_agent_tools_empty_or_blank_refused(admin_env) -> None:
+    """An empty list is not "no narrowing" — it would read as an excluded
+    server. Remove the server from 'servers' instead."""
+    tc, _ = admin_env
+    empty = tc.post("/admin/agents", json=_body(tools={"k8s-ops": []}), headers=ADMIN_H)
+    assert empty.status_code == 400 and "empty" in empty.json()["detail"]
+    blank = tc.post("/admin/agents", json=_body(tools={"k8s-ops": ["  ", ""]}), headers=ADMIN_H)
+    assert blank.status_code == 400 and "empty" in blank.json()["detail"]
+
+
 def test_agent_model_must_serve_chat(admin_env) -> None:
     tc, _ = admin_env
     r = tc.post("/admin/agents", json=_body(model="emb"), headers=ADMIN_H)
@@ -327,6 +418,7 @@ def proxy_env(monkeypatch: pytest.MonkeyPatch):
                         "name": a_.name,
                         "description": a_.description,
                         "servers": list(a_.servers),
+                        "tools": a_.tools,
                         "model": a_.model,
                         "system_prompt": a_.system_prompt,
                         "enabled": a_.enabled,
@@ -358,7 +450,9 @@ def proxy_env(monkeypatch: pytest.MonkeyPatch):
         r.set_endpoints(MODEL, [Endpoint(id="ep1", model_name=MODEL, base_url="http://fake-upstream/v1")])
         # An EMBEDDING pool: the listing must not advertise an agent pinned to a
         # model that cannot serve chat (it would be a guaranteed 400).
-        r.set_endpoints("emb", [Endpoint(id="ep2", model_name="emb", base_url="http://fake-emb/v1", model_type="embedding")])
+        r.set_endpoints(
+            "emb", [Endpoint(id="ep2", model_name="emb", base_url="http://fake-emb/v1", model_type="embedding")]
+        )
         monkeypatch.setattr(routes_proxy, "model_router", r)
         # ONE router for both handles: production imports the SAME registry
         # singleton in routes_proxy and core.cascade, and core.cascade.serves_chat
@@ -434,6 +528,7 @@ def test_models_hides_an_agent_pinned_to_a_forbidden_model(proxy_env) -> None:
     ids = [m["id"] for m in tc.get("/v1/models", headers=KEY_H).json()["data"]]
     assert "Admin-Agent" not in ids
     assert MODEL in ids  # the real pools are still advertised
+
 
 # ---------------------------------------------------------------------------
 # system prompt: prepended per CALL, never into the conversation of record
@@ -596,3 +691,38 @@ def test_profile_save_without_agents_leaves_the_selection_alone(admin_env) -> No
     assert r.status_code == 201, r.text
     assert not any("profile_agents" in sql for sql, _ in db.executed)
 
+
+# ---------------------------------------------------------------------------
+# console: the per-server tool picker (2026-11-04)
+# ---------------------------------------------------------------------------
+
+
+def test_admin_agent_form_offers_a_per_server_tool_picker() -> None:
+    """The Agents tab must let an operator narrow a server to specific tools:
+    a per-server expander that loads the LIVE catalog from
+    GET /admin/mcp-servers/{name}/tools, and a save payload carrying 'tools'.
+    A whole-server tick must still be expressible (no tools entry)."""
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parents[1] / "src" / "pcai_llm" / "ui" / "admin.html").read_text(encoding="utf-8")
+    assert 'id="ag-servers" class="ag-servers"' in html, "the picker container must be the row list"
+    assert "ag-tools-btn" in html and "ag-tool-box" in html, "the expander and tool checkboxes must exist"
+    assert '"/mcp-servers/" + encodeURIComponent(server) + "/tools"' in html, (
+        "the picker must read the live catalog from the admin endpoint"
+    )
+    assert "function agSelection()" in html, "save must derive servers+tools from the picker"
+    assert "tools: sel.tools" in html, "the save payload must carry the narrowing"
+    assert "a.tools || {}" in html, "editing an agent must pre-load its stored narrowing"
+    # 2026-11-04 live report: the expander opened once and never retracted.
+    # The panel's author-level `display: flex` outranks the UA [hidden] rule,
+    # so retraction NEEDS this explicit selector.
+    assert ".ag-srvrow .ag-tools[hidden] { display: none; }" in html, (
+        "the expander must be able to retract (hidden must beat display:flex)"
+    )
+    # ...and a deselected server must not read as "all tools selected": the
+    # panel syncs disabled/unchecked state from the server's own checkbox.
+    assert "function agSyncToolPanel(" in html, "tool checkboxes must follow the server's include state"
+    assert "server not included — tick it to grant tools" in html, "the inert panel must say why"
+    assert "agSyncToolPanel(row);" in html, "expanding or re-ticking must re-sync the panel"
+    # the old whole-server-only selector is gone (it silently discarded tools)
+    assert 'input.ag-srv"' not in html

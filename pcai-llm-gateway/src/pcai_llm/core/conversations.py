@@ -1,10 +1,18 @@
-"""Key-scoped server-side saved conversations (data layer).
+"""Key-GROUP-scoped server-side saved conversations (data layer).
 
-Per API token ("per key") transcripts: every conversation row belongs to
-the key that created it and EVERY query in this module filters by
-``key_id`` — a foreign key id can neither read, mutate, nor even confirm
-the existence of another key's conversation (missing and foreign are the
+Per credential-GROUP transcripts: every conversation row belongs to the
+KEY GROUP that created it and EVERY query in this module filters by
+``key_group`` — a foreign group can neither read, mutate, nor even confirm
+the existence of another group's conversation (missing and foreign are the
 same ``None``/``False``, so no existence oracle).
+
+WHY the GROUP, not the raw key id (2026-11-03, operator report): rotation
+revokes the old key row and mints a NEW id, and this table used to scope by
+``key_id`` — so "Sign in with SSO" (which rotates) silently orphaned the
+user's transcripts. ``api_keys.key_group`` is the rotation-stable identity
+(every rotate copies it forward); independent keys of one user get their own
+group, so this does NOT widen visibility across them. ``key_id`` stays on
+the row as provenance (which credential created it) and keeps the cascade FK.
 
 Storage model: the client pushes the FULL transcript per turn (replace-all
 — idempotent, no partial state, matches the chat console's left panel) and
@@ -99,35 +107,46 @@ def auto_title(messages: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# data access — every query is key_id-scoped
+# data access — every query is key_group-scoped
 # ---------------------------------------------------------------------------
 
 
-async def create(key_id: uuid.UUID, user_id: uuid.UUID | None, title: str | None = None) -> ConvRow:
-    """Create an empty conversation owned by ``key_id``.
+async def create(
+    key_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    title: str | None = None,
+    group_id: uuid.UUID | None = None,
+) -> ConvRow:
+    """Create an empty conversation owned by the caller's KEY GROUP.
+
+    ``key_id`` is recorded as PROVENANCE (which credential created the row);
+    ``group_id`` is the scoping identity every read filters by. None =
+    fall back to key_id (a caller that predates groups, and the correct
+    "group of one" for a key whose row carries no group).
 
     The title is sanitized; None/empty → the default placeholder, which the
     first message save later replaces via auto-title (see replace_messages).
     """
     row = await db.fetchrow(
         """
-        INSERT INTO conversations (key_id, user_id, title)
-        VALUES ($1, $2, $3)
+        INSERT INTO conversations (key_id, user_id, key_group, title)
+        VALUES ($1, $2, $3, $4)
         RETURNING id, key_id, user_id, title, created_at, updated_at
         """,
         key_id,
         user_id,
+        group_id or key_id,
         DEFAULT_TITLE if title is None else sanitize_title(title),
     )
     assert row is not None  # INSERT ... RETURNING always yields a row
     return dict(row)
 
 
-async def list(key_id: uuid.UUID, limit: int = 200) -> ConvRows:
-    """The key's conversations, newest activity first, with message counts.
+async def list(group_id: uuid.UUID, limit: int = 200) -> ConvRows:
+    """The key GROUP's conversations, newest activity first, with counts.
 
     One round-trip: the count is a correlated subselect and the
-    (key_id, updated_at DESC) index drives the ordering. ``limit`` bounds
+    (key_group, updated_at DESC) index drives the ordering. ``limit`` bounds
     the page.
     """
     rows = await db.fetch(
@@ -136,36 +155,36 @@ async def list(key_id: uuid.UUID, limit: int = 200) -> ConvRows:
                (SELECT count(*) FROM conversation_messages m
                 WHERE m.conversation_id = c.id) AS message_count
         FROM conversations c
-        WHERE c.key_id = $1
+        WHERE c.key_group = $1
         ORDER BY c.updated_at DESC
         LIMIT $2
         """,
-        key_id,
+        group_id,
         limit,
     )
     return [dict(r) for r in rows]
 
 
-async def get_meta(key_id: uuid.UUID, conversation_id: uuid.UUID) -> ConvRow | None:
+async def get_meta(group_id: uuid.UUID, conversation_id: uuid.UUID) -> ConvRow | None:
     """Header only (no transcript) — {id, title, updated_at}.
 
-    None when the conversation is missing OR owned by a different key.
+    None when the conversation is missing OR owned by a different key group.
     """
     row = await db.fetchrow(
-        "SELECT id, title, updated_at FROM conversations WHERE id = $1 AND key_id = $2",
+        "SELECT id, title, updated_at FROM conversations WHERE id = $1 AND key_group = $2",
         conversation_id,
-        key_id,
+        group_id,
     )
     return dict(row) if row is not None else None
 
 
-async def get(key_id: uuid.UUID, conversation_id: uuid.UUID) -> ConvRow | None:
+async def get(group_id: uuid.UUID, conversation_id: uuid.UUID) -> ConvRow | None:
     """Full transcript for one conversation, seq-ordered.
 
     404-semantics: None when the conversation is missing OR foreign — the
     two are indistinguishable by design.
     """
-    head = await get_meta(key_id, conversation_id)
+    head = await get_meta(group_id, conversation_id)
     if head is None:
         return None
     msgs = await db.fetch(
@@ -212,7 +231,7 @@ def _validate_messages(messages: Any) -> builtins.list[ConvRow]:
     return checked
 
 
-async def replace_messages(key_id: uuid.UUID, conversation_id: uuid.UUID, messages: Any) -> int:
+async def replace_messages(group_id: uuid.UUID, conversation_id: uuid.UUID, messages: Any) -> int:
     """Replace the ENTIRE transcript of one owned conversation.
 
     Single transaction (repo pattern): row lock (FOR UPDATE) → ownership
@@ -243,9 +262,9 @@ async def replace_messages(key_id: uuid.UUID, conversation_id: uuid.UUID, messag
     acquire = getattr(db, "acquire_bounded", None) or db.acquire
     async with acquire() as conn, conn.transaction():
         head = await conn.fetchrow(
-            "SELECT title FROM conversations WHERE id = $1 AND key_id = $2 FOR UPDATE",
+            "SELECT title FROM conversations WHERE id = $1 AND key_group = $2 FOR UPDATE",
             conversation_id,
-            key_id,
+            group_id,
         )
         if head is None:
             raise ConversationNotFound(f"conversation {conversation_id} not found")
@@ -266,7 +285,7 @@ async def replace_messages(key_id: uuid.UUID, conversation_id: uuid.UUID, messag
     return len(checked)
 
 
-async def rename(key_id: uuid.UUID, conversation_id: uuid.UUID, title: str) -> ConvRow | None:
+async def rename(group_id: uuid.UUID, conversation_id: uuid.UUID, title: str) -> ConvRow | None:
     """Set one owned conversation's title (sanitized, capped).
 
     Bumps updated_at: the row changed and the newest-first listing should
@@ -275,22 +294,22 @@ async def rename(key_id: uuid.UUID, conversation_id: uuid.UUID, title: str) -> C
     row = await db.fetchrow(
         """
         UPDATE conversations SET title = $2, updated_at = now()
-        WHERE id = $1 AND key_id = $3
+        WHERE id = $1 AND key_group = $3
         RETURNING id, title, updated_at
         """,
         conversation_id,
         sanitize_title(title),
-        key_id,
+        group_id,
     )
     return dict(row) if row is not None else None
 
 
-async def delete(key_id: uuid.UUID, conversation_id: uuid.UUID) -> bool:
+async def delete(group_id: uuid.UUID, conversation_id: uuid.UUID) -> bool:
     """Delete one owned conversation (its messages cascade). False when the
-    id is missing or foreign."""
+    id is missing or foreign to this key GROUP."""
     tag = await db.execute(
-        "DELETE FROM conversations WHERE id = $1 AND key_id = $2",
+        "DELETE FROM conversations WHERE id = $1 AND key_group = $2",
         conversation_id,
-        key_id,
+        group_id,
     )
     return tag == "DELETE 1"

@@ -77,7 +77,8 @@ def test_zero_copy_for_already_valid_bodies() -> None:
 
 
 def test_never_raises_on_malformed_bodies() -> None:
-    for body in ({}, {"messages": None}, {"messages": []}, {"messages": "nope"}, {"messages": [None, 1, "x"]}):
+    bodies: list[dict] = [{}, {"messages": None}, {"messages": []}, {"messages": "nope"}, {"messages": [None, 1, "x"]}]
+    for body in bodies:
         assert normalize_system_messages(body) is body
 
 

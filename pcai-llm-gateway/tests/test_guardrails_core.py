@@ -145,7 +145,7 @@ class FakeDB:
 
 def test_public_constants() -> None:
     assert GUARDRAIL_MODES == ("pre_call", "post_call")
-    assert GUARDRAIL_ENGINES == ("blocklist", "regex_pii", "length", "webhook")
+    assert GUARDRAIL_ENGINES == ("blocklist", "regex_pii", "length", "webhook", "secrets")
     assert MASK == "[REDACTED]"
 
 

@@ -131,9 +131,9 @@ class FakeDB:
             return "delete-conv"
         return s[:50]
 
-    def _owned(self, cid: uuid.UUID, key_id: uuid.UUID) -> dict[str, Any] | None:
+    def _owned(self, cid: uuid.UUID, group_id: uuid.UUID) -> dict[str, Any] | None:
         row = self.convs.get(cid)
-        return row if row is not None and row["key_id"] == key_id else None
+        return row if row is not None and row["key_group"] == group_id else None
 
     async def fetchrow(self, sql: str, *args: Any) -> Any:
         self.log.append(self._tag(sql))
@@ -142,11 +142,14 @@ class FakeDB:
         # arms rebind it to _owned()'s possibly-None result
         row: dict[str, Any] | None
         if s.startswith("INSERT INTO conversations"):
+            # (key_id, user_id, key_group, title) — key_id is provenance,
+            # key_group is the scoping identity every read filters by.
             row = {
                 "id": uuid.uuid4(),
                 "key_id": args[0],
                 "user_id": args[1],
-                "title": args[2],
+                "key_group": args[2],
+                "title": args[3],
                 "created_at": self._now(),
                 "updated_at": self._now(),
             }
@@ -182,7 +185,7 @@ class FakeDB:
                     "message_count": len(self.msgs.get(c["id"], [])),
                 }
                 for c in self.convs.values()
-                if c["key_id"] == args[0]
+                if c["key_group"] == args[0]
             ]
             rows.sort(key=lambda r: r["updated_at"], reverse=True)
             return rows[: args[1]]
@@ -637,3 +640,72 @@ def test_routes_auto_title_flows_through_api(monkeypatch: pytest.MonkeyPatch) ->
     )
     rows = client.get("/v1/conversations", headers=HEADERS_A).json()["data"]
     assert rows[0]["title"] == "Explain budget cascades in one line"
+
+
+# ---------------------------------------------------------------------------
+# rotation continuity — the KEY GROUP (2026-11-03)
+# ---------------------------------------------------------------------------
+
+
+def _key_in_group(group: uuid.UUID) -> KeyRecord:
+    return KeyRecord(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        name="rotated",
+        key_prefix="hllm-RR",
+        scopes=["proxy"],
+        allowed_models=[],
+        rate_limit_rpm=1000,
+        rate_limit_tpm=1_000_000,
+        max_concurrent=0,
+        expires_at=None,
+        key_group=group,
+    )
+
+
+async def test_rotation_group_shares_conversations(fake: FakeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rotated key (NEW id, SAME key_group) sees the previous key's history.
+
+    The operator report: "Conversations aren't saved for the key after
+    rotation." Scoping is by key_group — the rotation-stable identity — so
+    the chain A -> B keeps ONE history while a different group sees nothing.
+    """
+    monkeypatch.setattr(conv_mod, "db", fake)
+    group = uuid.uuid4()
+    old_key = _key_in_group(group)
+    new_key = _key_in_group(group)  # the rotate: fresh id, inherited group
+
+    conv = await conv_mod.create(old_key.id, USER_A, group_id=group)
+    await conv_mod.replace_messages(group, conv["id"], [{"role": "user", "content": "before rotate"}])
+
+    assert [r["id"] for r in await conv_mod.list(new_key.key_group)] == [conv["id"]]
+    got = await conv_mod.get(new_key.key_group, conv["id"])
+    assert got is not None and got["messages"][0]["content"] == "before rotate"
+    # the new credential can keep writing to the same transcript
+    assert (
+        await conv_mod.replace_messages(new_key.key_group, conv["id"], [{"role": "user", "content": "after rotate"}])
+        == 1
+    )
+
+    # a key in a DIFFERENT group is still a 404/empty — groups do not widen
+    other = _key_in_group(uuid.uuid4())
+    assert await conv_mod.list(other.key_group) == []
+    assert await conv_mod.get(other.key_group, conv["id"]) is None
+
+
+def test_routes_rotation_keeps_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route-level twin: the rotated credential's API lists the old history."""
+    group = uuid.uuid4()
+    old_key = _key_in_group(group)
+    new_key = _key_in_group(group)
+    client = _client(monkeypatch, FakeDB(), old_key, new_key)
+    cid = client.post("/v1/conversations", json={"title": "kept"}, headers=HEADERS_A).json()["id"]
+    client.put(
+        f"/v1/conversations/{cid}/messages",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=HEADERS_A,
+    )
+    # tok-2 is the rotated key: same group -> the history is there
+    rows = client.get("/v1/conversations", headers=HEADERS_B).json()["data"]
+    assert [r["id"] for r in rows] == [cid]
+    assert client.get(f"/v1/conversations/{cid}", headers=HEADERS_B).json()["title"] == "kept"

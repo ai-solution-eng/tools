@@ -71,9 +71,16 @@ def test_alias_granted_gateway_name_never_guesses() -> None:
 
 
 def test_guard_max_iterations() -> None:
+    # The legacy max_iterations NAME is now a BUDGET in fractional units: one
+    # neutral call charges 1.0, so a 2.0 budget runs two calls and aborts on
+    # the third. Distinct arguments — the identical-call loop guard must not
+    # be what fires here.
     g = RelayGuard(max_iterations=2, wall_clock_s=60)
-    assert g.check(0, [{"function": {"name": "a__b", "arguments": "{}"}}]) == ""
-    assert g.check(2, [{"function": {"name": "a__b", "arguments": "{}"}}]) != ""
+    assert g.check(0, [{"function": {"name": "a__b", "arguments": '{"i": 0}'}}]) == ""
+    assert g.check(1, [{"function": {"name": "a__b", "arguments": '{"i": 1}'}}]) == ""
+    assert g.check(2, [{"function": {"name": "a__b", "arguments": '{"i": 2}'}}]) == (
+        "tool budget exhausted (3.00/2.00 units)"
+    )
 
 
 def test_guard_loop_detection() -> None:
@@ -2059,7 +2066,7 @@ def test_max_iterations_asks_user_to_continue(monkeypatch) -> None:
 
     text = b"".join(_asyncio.run(run())).decode()
     calls = {"exec": 0}
-    assert "max tool iterations (2) reached" in text
+    assert "tool budget exhausted (3.00/2.00 units)" in text
     assert calls["exec"] < 4, "no calls execute after the cap"
     assert text.rstrip().endswith("data: [DONE]")
     # the SSE shows the guard event, NOT the raw instruction (that is
@@ -2530,7 +2537,7 @@ def test_synthetic_id_cannot_collide_with_a_real_upstream_id() -> None:
 
 def test_assembly_never_raises_on_malformed_fragments() -> None:
     """A malformed upstream must not kill the turn mid-stream."""
-    shapes = [
+    shapes: list[dict] = [
         {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "z", "function": None}]}}]},
         {
             "choices": [
@@ -3144,11 +3151,7 @@ def test_c3_id_first_without_index_does_not_fork_the_call() -> None:
     calls = _assemble(
         [
             {"choices": [{"delta": {"tool_calls": [{"id": "call_A", "function": {"name": "mm-rag__search"}}]}}]},
-            {
-                "choices": [
-                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q": "x"}'}}]}}
-                ]
-            },
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q": "x"}'}}]}}]},
         ]
     )
     assert len(calls) == 1, calls
@@ -3166,20 +3169,12 @@ def test_c3_adoption_never_fuses_a_genuine_second_call() -> None:
         [
             {
                 "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [{"id": "a", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}]
-                        }
-                    }
+                    {"delta": {"tool_calls": [{"id": "a", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}]}}
                 ]
             },
             {
                 "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [{"index": 1, "function": {"name": "read", "arguments": '{"p":"x"}'}}]
-                        }
-                    }
+                    {"delta": {"tool_calls": [{"index": 1, "function": {"name": "read", "arguments": '{"p":"x"}'}}]}}
                 ]
             },
         ]
@@ -3452,3 +3447,492 @@ def test_c8_relay_publishes_its_iteration_count() -> None:
     out = asyncio.run(run())
     assert b"[DONE]" in b"".join(out)
     assert published == [2], f"two completed model calls must publish 2, got {published}"
+
+
+# ---------------------------------------------------------------------------
+# audit w6 (mcp-relay zone): the guard-abort WRAP-UP terminal
+# ---------------------------------------------------------------------------
+
+
+def test_w6_wrapup_transport_failure_closes_cleanly_and_settles(monkeypatch) -> None:
+    """W6 finding 1 (P2): the guard-abort wrap-up call handled only
+    TimeoutError — a mid-turn transport failure (ConnectError/DNS/reset, the
+    classes ZC-1/ZC-2 taught the other two attempt loops to expect) escaped
+    relay_stream: the client's SSE died with no error chunk and no [DONE],
+    and the wrap-up settle never ran (the turn's largest prefill went
+    unbilled). The wrap-up must get the zero-completion retry's treatment:
+    record the failure, settle it as an error row, close the SSE cleanly."""
+    import asyncio
+    import uuid as _uuid
+
+    from pcai_llm.core.budgets import GateResult
+
+    settled: list[tuple] = []
+
+    async def fake_settle(*a, **k):
+        settled.append(a)
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        calls["n"] += 1
+        n = calls["n"]
+
+        async def gen():
+            if n <= 2:
+                # two identical calls -> loop abort -> the wrap-up pass next
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            "id": f"c{n}",
+                            "type": "function",
+                            "function": {"name": "logsearch__search_logs", "arguments": '{"q":"same"}'},
+                        }
+                    ],
+                )
+                yield ("usage", {"prompt_tokens": 2, "completion_tokens": 1})
+                return
+            # the WRAP-UP model call: the upstream transport dies
+            raise httpx2.ConnectError("[Errno -2] Name or service not known")
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return True, "ok"
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+                include_usage=True,
+            )
+        ]
+
+    # pre-fix this line re-raised the ConnectError out of relay_stream
+    text = b"".join(asyncio.run(run())).decode()
+    assert calls["n"] == 3, "the wrap-up call must have been attempted"
+    assert "loop detected" in text
+    assert "wrap-up model call failed" in text, "the failed wrap-up must surface its guard event"
+    assert text.rstrip().endswith("data: [DONE]"), "the SSE must close cleanly, not die mid-flight"
+    # settle positional args: (0 key, 1 model, 2 endpoint, 3 prompt, 4
+    # completion, 5 status, ...): two loop iterations + the failed wrap-up
+    assert len(settled) == 3, settled
+    assert settled[-1][5] == "error", "the wrap-up transport failure must settle as an error row"
+
+
+def test_w6_wrapup_http_status_error_closes_cleanly_and_settles(monkeypatch) -> None:
+    """W6 xval (execution-completeness gap): HTTPStatusError is the ONE
+    httpx2.HTTPError subclass whose constructor is (message, *, request,
+    response). The arms used to rebuild the caught exception with
+    type(exc)(str(exc)) — dead code (nothing re-raises `exc`) that RAISED
+    TypeError inside this arm, where the sibling `except Exception` cannot
+    catch it: the stream died with no terminal chunk, no [DONE], and the
+    wrap-up settle never ran. The arm must survive the subclass intact."""
+    import asyncio
+    import uuid as _uuid
+
+    from pcai_llm.core.budgets import GateResult
+
+    settled: list[tuple] = []
+
+    async def fake_settle(*a, **k):
+        settled.append(a)
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        if tools is not None:
+            calls["n"] += 1
+            n = calls["n"]
+
+            async def gen():
+                # two identical calls -> loop abort -> the wrap-up pass next
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            "id": f"c{n}",
+                            "type": "function",
+                            "function": {"name": "logsearch__search_logs", "arguments": '{"q":"same"}'},
+                        }
+                    ],
+                )
+                yield ("usage", {"prompt_tokens": 2, "completion_tokens": 1})
+
+            return gen()
+
+        async def gen():
+            # the WRAP-UP model call dies with the status-error subclass.
+            # MUST be a real async GENERATOR failing on its FIRST anext (the
+            # shape of an upstream fault mid-call): a bare `async def` with
+            # only a raise is a COROUTINE — _bounded_call calls .__aiter__()
+            # on it and the AttributeError would exercise the generic arm
+            # instead of the httpx2 one (the bug this pin initially had).
+            if False:  # pragma: no cover - generator-marker yield only
+                yield ("content", "")
+            raise httpx2.HTTPStatusError(
+                "server error",
+                request=httpx2.Request("POST", "http://upstream/v1/chat/completions"),
+                response=httpx2.Response(502),
+            )
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return True, "ok"
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+            )
+        ]
+
+    # pre-fix the arm's rebuild raised TypeError OUT of relay_stream here
+    text = b"".join(asyncio.run(run())).decode()
+    assert calls["n"] == 2, "the wrap-up call must have been attempted"
+    assert "wrap-up model call failed" in text, "the failed wrap-up must surface its guard event"
+    assert "HTTPStatusError" in text, "the fault's class name must reach the wire detail"
+    # The DISCRIMINATING assertion: ONLY the HTTPError arm's detail names the
+    # upstream status (the generic arm renders the bare class name), so this
+    # fails if the fault were handled by the wrong arm (mutation-verified).
+    assert "(upstream status 502)" in text, (
+        "the httpx2 HTTPError arm must have handled the fault — only its detail names the status"
+    )
+    assert text.rstrip().endswith("data: [DONE]"), "the SSE must close cleanly, not die mid-flight"
+    assert len(settled) == 3, settled
+    assert settled[-1][5] == "error", "the wrap-up failure must settle as an error row"
+
+
+def test_w6_wrapup_generic_exception_closes_cleanly_and_settles(monkeypatch) -> None:
+    """W6 xval coverage pin: the wrap-up's GENERIC `except Exception` arm
+    (XV-2 wording: the relay must never die on an upstream fault) — a
+    non-httpx fault on the wrap-up call must take the same clean path:
+    guard event, [DONE], and an error settle row."""
+    import asyncio
+    import uuid as _uuid
+
+    from pcai_llm.core.budgets import GateResult
+
+    settled: list[tuple] = []
+
+    async def fake_settle(*a, **k):
+        settled.append(a)
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        if tools is not None:
+            calls["n"] += 1
+            n = calls["n"]
+
+            async def gen():
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            "id": f"c{n}",
+                            "type": "function",
+                            "function": {"name": "logsearch__search_logs", "arguments": '{"q":"same"}'},
+                        }
+                    ],
+                )
+                yield ("usage", {"prompt_tokens": 2, "completion_tokens": 1})
+
+            return gen()
+
+        async def gen():
+            # real async GENERATOR failing on its first anext (see the
+            # HTTPStatusError pin for why a bare raise would be a coroutine)
+            if False:  # pragma: no cover - generator-marker yield only
+                yield ("content", "")
+            raise RuntimeError("simulated non-httpx executor fault")
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return True, "ok"
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+            )
+        ]
+
+    text = b"".join(asyncio.run(run())).decode()
+    assert "wrap-up model call failed" in text
+    assert text.rstrip().endswith("data: [DONE]"), "the SSE must close cleanly, not die mid-flight"
+    assert len(settled) == 3, settled
+    assert settled[-1][5] == "error", "the wrap-up failure must settle as an error row"
+
+
+def test_w6_wrapup_never_extends_the_wall_clock(monkeypatch) -> None:
+    """W6 finding 2 (P3): the wrap-up budget was max(30.0, remaining) — a
+    fresh 30 s floor that re-armed AFTER the guard aborted for exceeding the
+    wall clock (defaults: deadline +570 s of a 600 s VS budget, +30 s = zero
+    margin). The wrap-up must spend min(30 s, REMAINING) — never new time: an
+    exhausted clock bottoms out at _bounded_call's 1 s attempt floor, so a
+    wedged wrap-up times out on the deadline's remainder instead of running
+    its full sleep."""
+    import asyncio
+    import time as _time
+    import uuid as _uuid
+
+    from pcai_llm.config import settings as _settings
+    from pcai_llm.core.budgets import GateResult
+
+    # Race-free shaping: the deadline (0.4 s) sits BETWEEN the instant first
+    # call (tripping it would need a >400 ms stall on a trivial generator)
+    # and the second call's 0.45 s sleep (sleeps never finish early, so the
+    # wall-clock abort at check(1) is certain). The wrap-up branch keys on
+    # tools is None — the abort path calls it TOOLLESS — so it can never be
+    # confused with a loop iteration whichever check trips.
+    monkeypatch.setattr(_settings, "tool_relay_wall_clock_s", 0.4)
+
+    async def fake_settle(*a, **k):
+        return None
+
+    async def fake_trace(*a, **k):
+        return None
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        # Branch on TOOLS, not a call counter: the abort path calls the
+        # wrap-up TOOLLESS (_bounded_call(relay_msgs, None, …)), so the
+        # wedged branch can never be taken by a loop iteration.
+        if tools is not None:
+            calls["n"] += 1
+            args_json = '{"q":"a"}' if calls["n"] == 1 else '{"q":"b"}'
+            call_id = "c1" if calls["n"] == 1 else "c2"
+
+            async def gen():
+                if calls["n"] == 1:
+                    # instant: check(0) cannot trip the 0.4 s deadline
+                    yield (
+                        "tool_calls",
+                        [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "logsearch__search_logs", "arguments": args_json},
+                            }
+                        ],
+                    )
+                else:
+                    # 0.45 s sleep > 0.4 s deadline: the wall-clock abort at
+                    # check(1) is certain (a sleep never finishes early)
+                    await asyncio.sleep(0.45)
+                    yield (
+                        "tool_calls",
+                        [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "logsearch__search_logs", "arguments": args_json},
+                            }
+                        ],
+                    )
+
+            return gen()
+
+        async def gen():
+            # the WRAP-UP call on an exhausted clock: a wedged upstream
+            await asyncio.sleep(3.0)
+            yield ("content", "wrap-up answer")
+
+        return gen()
+
+    async def execute(server, tool, args):
+        return True, "ok"
+
+    started = _time.monotonic()
+    out = asyncio.run(
+        _collect(
+            toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("logsearch", "search_logs")},
+                CATALOG,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+            )
+        )
+    )
+    elapsed = _time.monotonic() - started
+    text = b"".join(out).decode()
+    assert "wall-clock" in text, "the guard must abort on the wall clock for this pin"
+    # pre-fix the wrap-up ran its full 3 s sleep under a fresh 30 s budget
+    # (~3.5 s total); post-fix it bottoms out at _bounded_call's 1 s attempt
+    # floor (~1.5 s total) — the floor cannot extend past the deadline
+    assert elapsed < 2.5, f"the wrap-up extended the turn past the deadline: {elapsed:.2f}s"
+    assert "wrap-up model call timed out" in text, "the clamped wrap-up must time out, not complete"
+    assert "wrap-up answer" not in text, "a timed-out wrap-up must not ship its answer"
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+def test_w6_f2_in_loop_acl_denial_settles_metrics_and_audits(monkeypatch) -> None:
+    """F2 (audit w6 follow-up): an in-loop ACL-DENIED tool call used to
+    vanish — no ledger row, no metric, no mcp_call_audit row — while the
+    SAME denial via the executor and /mcp settles "denied". A relay turn
+    full of denials must be visible in the ledger and the audit trail with
+    the executor's exact status vocabulary (never a new status: the
+    usage_ledger CHECK constraint would reject it)."""
+    import asyncio
+    import uuid as _uuid
+    from types import SimpleNamespace
+
+    from pcai_llm.core import chain_audit
+    from pcai_llm.core.budgets import GateResult
+
+    settled: list[tuple] = []
+    traces_rows: list[dict] = []
+    audit_rows: list[dict] = []
+    metric_rows: list[tuple] = []
+
+    async def fake_settle(*a, **k):
+        settled.append(a)
+
+    async def fake_trace(*a, **k):
+        traces_rows.append(k)
+
+    async def fake_budgets(key_id, model, est):
+        return GateResult(True)
+
+    async def fake_audit(**k):
+        audit_rows.append(k)
+
+    monkeypatch.setattr(toolrelay, "settle", fake_settle)
+    monkeypatch.setattr(toolrelay.traces, "record", fake_trace)
+    monkeypatch.setattr(toolrelay, "check_budgets", fake_budgets)
+    monkeypatch.setattr(chain_audit, "write_mcp_call", fake_audit)
+    # raising=False: pre-fix the module has no _metrics import at all — the
+    # pin must fail on the BEHAVIORAL assertion (no settle row), not at setup
+    monkeypatch.setattr(
+        toolrelay,
+        "_metrics",
+        SimpleNamespace(observe_mcp_call=lambda *a: metric_rows.append(a)),
+        raising=False,
+    )
+
+    catalog = [
+        {"server": "s", "tool": "t", "description": "d", "inputSchema": {"type": "object", "properties": {}}},
+    ]
+    calls = {"n": 0}
+
+    def stream_once(msgs, tools):
+        calls["n"] += 1
+        n = calls["n"]
+
+        async def gen():
+            if n == 1:
+                # the model reaches for a tool the key is NOT granted
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "s__secret_tool", "arguments": '{"q":"x"}'},
+                        }
+                    ],
+                )
+                yield ("usage", {"prompt_tokens": 2, "completion_tokens": 1})
+            else:
+                yield ("content", "done without it")
+
+        return gen()
+
+    async def execute(server, tool, args):
+        raise AssertionError("an ungranted tool must never reach the executor")
+
+    async def run():
+        return [
+            c
+            async for c in toolrelay.relay_stream(
+                [{"role": "user", "content": "go"}],
+                {("s", "t")},
+                catalog,
+                stream_once,
+                execute,
+                "rid",
+                "m1",
+                key_id=_uuid.uuid4(),
+            )
+        ]
+
+    text = b"".join(asyncio.run(run())).decode()
+    assert '"detail": "denied by ACL"' in text
+    # the denial is a LEDGER row (executor vocabulary: endpoint mcp:s:t,
+    # status "denied"), a metric tick, and a hash-chain audit row
+    assert any(a[2] == "mcp:s:secret_tool" and a[5] == "denied" for a in settled), settled
+    assert any(k.get("status") == "denied" and k.get("server") == "s" for k in traces_rows), traces_rows
+    assert any(m[1] == "denied" for m in metric_rows), metric_rows
+    assert any(r["outcome"] == "denied" and r["tool"] == "secret_tool" for r in audit_rows), audit_rows
+    assert "done without it" in text, "the turn must continue after the denial"
+    assert text.rstrip().endswith("data: [DONE]")

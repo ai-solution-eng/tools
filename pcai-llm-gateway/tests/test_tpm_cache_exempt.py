@@ -448,7 +448,7 @@ async def test_flag_off_charges_the_full_estimate(predict_off, monkeypatch) -> N
     with a 97.5% cache ratio is still charged the FULL estimate."""
     fake = PredictionDB()
     monkeypatch.setattr(budgets_mod, "db", fake)
-    await budgets_mod.check_rate_limit(uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r")
+    await budgets_mod.check_rate_limit(uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r", model="m")
     assert fake.peak == 808_192, "flag off must charge the undiscounted estimate"
     assert budgets_mod._predict_charges == {}, "no charge recorded when prediction is off"
 
@@ -458,7 +458,9 @@ async def test_prediction_discounts_by_measured_ratio(predict_on, monkeypatch) -
     estimate at admission - the 800k-context case that used to 429 instantly."""
     fake = PredictionDB()
     monkeypatch.setattr(budgets_mod, "db", fake)
-    gate = await budgets_mod.check_rate_limit(uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r")
+    gate = await budgets_mod.check_rate_limit(
+        uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r", model="m"
+    )
     assert gate.ok, "a cache-served 800k context must be admitted at 100k TPM"
     assert fake.peak == 20_204, f"expected the measured-ratio charge, got {fake.peak}"
 
@@ -468,7 +470,7 @@ async def test_no_history_charges_full_estimate(predict_on, monkeypatch) -> None
     FULL estimate. Prediction must never hand an unknown key a discount."""
     fake = PredictionDB(cached=0.0, prompt=0.0)
     monkeypatch.setattr(budgets_mod, "db", fake)
-    await budgets_mod.check_rate_limit(uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r")
+    await budgets_mod.check_rate_limit(uuid.uuid4(), rpm=60, tpm=100_000, est_tokens=808_192, request_id="r", model="m")
     assert fake.peak == 808_192, "unknown key must not receive a cache discount"
 
 
@@ -478,7 +480,7 @@ async def test_reconciliation_charges_the_true_billable_total(predict_on, monkey
     fake = PredictionDB()
     monkeypatch.setattr(budgets_mod, "db", fake)
     kid = uuid.uuid4()
-    await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1")
+    await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1", model="m")
     await budgets_mod._reconcile_predicted_charge(kid, "r1", prompt_tokens=800_000, cached_tokens=780_000)
     assert fake.tokens == 20_000, f"expected the true billable 20k, got {fake.tokens}"
 
@@ -490,12 +492,12 @@ async def test_cache_busting_caller_pays_full_cost(predict_on, monkeypatch) -> N
     fake = PredictionDB()
     monkeypatch.setattr(budgets_mod, "db", fake)
     kid = uuid.uuid4()
-    gate = await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1")
+    gate = await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1", model="m")
     assert gate.ok, "admitted cheaply on the predicted ratio"
     await budgets_mod._reconcile_predicted_charge(kid, "r1", prompt_tokens=800_000, cached_tokens=0)
     assert fake.tokens == 800_000, f"the real cost must land, got {fake.tokens}"
     budgets_mod._predict_cache.clear()
-    again = await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r2")
+    again = await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r2", model="m")
     assert not again.ok, "the bypass must be bounded to ONE cheap admission per window"
 
 
@@ -507,7 +509,7 @@ async def test_predicted_request_does_not_also_take_the_cache_refund(predict_on,
     monkeypatch.setattr(budgets_mod.settings, "rate_limit_exclude_cached_tokens", True)
     monkeypatch.setattr(costs_mod, "db", _NoDB())
     kid = uuid.uuid4()
-    await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1")
+    await budgets_mod.check_rate_limit(kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="r1", model="m")
     await budgets_mod.settle(kid, "m", "chat", 800_000, 100, "ok", 5, "r1", cached_tokens=780_000)
     assert fake.tokens == 20_000, f"double-counting the cache would drift this; got {fake.tokens}"
 
@@ -520,3 +522,47 @@ async def test_reconcile_without_recorded_charge_is_a_noop(predict_on, monkeypat
     monkeypatch.setattr(budgets_mod, "db", fake)
     await budgets_mod._reconcile_predicted_charge(uuid.uuid4(), "unknown", 800_000, 780_000)
     assert fake.tokens == 5_000, "no recorded charge -> no adjustment"
+
+
+# ---------------------------------------------------------------------------
+# Per-model scoping (2026-11-02): the admission charge must follow the model
+# being called, not a key-wide blend of chat (~95% cached) and one-shot
+# embedding/rerank (~0% cached) traffic.
+# ---------------------------------------------------------------------------
+
+
+class ModelScopedDB(PredictionDB):
+    """Serves a DIFFERENT cache history per model name (arg 1 of the query)."""
+
+    def __init__(self, per_model: dict[str, tuple[float, float]]) -> None:
+        super().__init__()
+        self.per_model = per_model
+        self.models_seen: list[str] = []
+
+    async def fetchrow(self, sql: str, *a: Any):
+        if "usage_ledger" in sql and "cached_tokens" in sql:
+            self.models_seen.append(str(a[1]))
+            cached, prompt = self.per_model.get(str(a[1]), (0.0, 0.0))
+            return {"cached": cached, "prompt": prompt}
+        return await super().fetchrow(sql, *a)
+
+
+async def test_admission_charge_is_scoped_to_the_called_model(predict_on, monkeypatch) -> None:
+    """A key with 97.5% cached CHAT traffic must still be charged the full
+    estimate for an EMBEDDING call (and vice versa) - the blend was the bug."""
+    fake = ModelScopedDB({"cached-chat": (780_000.0, 800_000.0), "one-shot-embed": (0.0, 2_000.0)})
+    monkeypatch.setattr(budgets_mod, "db", fake)
+    kid = uuid.uuid4()
+
+    await budgets_mod.check_rate_limit(
+        kid, rpm=60, tpm=100_000, est_tokens=808_192, request_id="chat", model="cached-chat"
+    )
+    assert fake.peak < 30_000, f"chat must take its own measured discount, got {fake.peak}"
+
+    fake.tokens = 0
+    fake.peak = 0
+    await budgets_mod.check_rate_limit(
+        kid, rpm=60, tpm=100_000, est_tokens=2_000, request_id="embed", model="one-shot-embed"
+    )
+    assert fake.peak == 2_000, "a zero-cache model must be charged the FULL estimate"
+    assert fake.models_seen[:2] == ["cached-chat", "one-shot-embed"]

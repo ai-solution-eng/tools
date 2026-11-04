@@ -25,6 +25,8 @@ Contract under test:
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
 import pytest
@@ -523,6 +525,113 @@ async def test_a_failure_is_still_retried_after_the_short_backoff(monkeypatch: p
     await context_window.refresh_windows([("http://flaky/v1", {})])
     assert fake.urls == ["http://flaky/v1/models"]
     # Once the short backoff has elapsed, it is retried (unlike the no-window case).
-    context_window._LAST_ATTEMPT["http://flaky/v1"] = 0.0
+    # -inf, not 0.0: monotonic() is host uptime, so 0.0 is only "long ago" on a
+    # host that has been up for longer than PROBE_RETRY_SECONDS (audit w6).
+    context_window._LAST_ATTEMPT["http://flaky/v1"] = float("-inf")
     await context_window.refresh_windows([("http://flaky/v1", {})])
     assert fake.urls == ["http://flaky/v1/models", "http://flaky/v1/models"]
+
+
+# ---------------------------------------------------------------------------
+# audit w6 follow-up F1 — staleness: a learned window is re-probed after the
+# TTL. Without it a SHRUNKEN upstream window is never re-read: the stale
+# (larger) window over-sizes every request on that pool and 400s until the pod
+# restarts — the failure this module exists to remove.
+# ---------------------------------------------------------------------------
+
+
+def _age_window(base_url: str, seconds: float) -> None:
+    """Make a learned window look older than it is (the learned-at test seam)."""
+    context_window._WINDOWS_AT[base_url.rstrip("/")] = time.monotonic() - seconds
+
+
+async def test_a_learned_window_goes_stale_and_is_re_probed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh -> not due. Past the TTL -> due, and the NEW window replaces the old."""
+    fake = _FakeProbeClient(payload={"data": [{"max_model_len": 8192}]})
+    monkeypatch.setattr(context_window, "upstream_client", lambda **_kw: fake)
+    context_window.remember("http://shrunk/v1", QWEN_WINDOW)
+
+    assert context_window.stale("http://shrunk/v1") is False
+    assert await context_window.refresh_windows([("http://shrunk/v1", {})]) == 0
+    assert fake.urls == [], "a fresh window must not be re-probed"
+
+    _age_window("http://shrunk/v1", context_window.WINDOW_TTL_S + 1)
+    assert context_window.stale("http://shrunk/v1") is True
+    assert await context_window.refresh_windows([("http://shrunk/v1", {})]) == 1
+    assert fake.urls == ["http://shrunk/v1/models"], "a stale window must be re-probed"
+    assert context_window.cached("http://shrunk/v1") == 8192, "the SHRUNKEN window must win"
+
+
+async def test_a_failed_re_probe_keeps_the_last_known_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refresh failure must never regress a known window to 'unknown'."""
+    fake = _FakeProbeClient(status=503)
+    monkeypatch.setattr(context_window, "upstream_client", lambda **_kw: fake)
+    context_window.remember("http://flaky-refresh/v1", QWEN_WINDOW)
+    _age_window("http://flaky-refresh/v1", context_window.WINDOW_TTL_S + 1)
+
+    assert await context_window.refresh_windows([("http://flaky-refresh/v1", {})]) == 1
+    assert fake.urls == ["http://flaky-refresh/v1/models"]
+    assert context_window.cached("http://flaky-refresh/v1") == QWEN_WINDOW, "last known good window must survive"
+    # and it is NOT recorded as "publishes nothing" for the next hour
+    assert "http://flaky-refresh/v1" not in context_window._NO_WINDOW
+
+
+async def test_a_fresh_window_is_not_re_probed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeProbeClient()
+    monkeypatch.setattr(context_window, "upstream_client", lambda **_kw: fake)
+    context_window.remember("http://fresh/v1", QWEN_WINDOW)
+    assert await context_window.refresh_windows([("http://fresh/v1", {})]) == 0
+    assert fake.urls == []
+    assert context_window.cached("http://fresh/v1") == QWEN_WINDOW
+
+
+async def test_housekeeping_sweep_retries_a_stale_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The periodic sweep is the ONLY periodic prober — it must collect stale
+    endpoints, not just unknown ones (housekeeping prefilter, audit w6 F1)."""
+    from pcai_llm.core import housekeeping
+
+    pool = Pool(endpoints=[Endpoint(id="s", model_name="m", base_url="http://stale/v1")])
+    context_window.remember("http://stale/v1", QWEN_WINDOW)
+    _age_window("http://stale/v1", context_window.WINDOW_TTL_S + 1)
+    monkeypatch.setattr(housekeeping.model_router, "models", lambda: ["m"])
+    monkeypatch.setattr(housekeeping.model_router, "pool", lambda _m: pool)
+    monkeypatch.setattr(housekeeping.upstream_auth, "upstream_headers", lambda ep, _r="": {"X-Test": ep.id})
+
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    async def fake_refresh(entries: list[tuple[str, dict[str, str]]]) -> int:
+        seen.extend(entries)
+        return len(entries)
+
+    monkeypatch.setattr(housekeeping.context_window, "refresh_windows", fake_refresh)
+    await housekeeping._context_window_sweep()
+
+    assert [url for url, _ in seen] == ["http://stale/v1"], "a stale window must reach the prober"
+
+
+# ---------------------------------------------------------------------------
+# audit w6 follow-up F2 — the estimator must never UNDER-count. len//4
+# under-counts non-ASCII ~4x (a CJK character or an emoji cannot be encoded in
+# a quarter of a token), so fits() could admit a prompt that cannot fit.
+# ASCII-only text must stay byte-identical to the shipped formula.
+# ---------------------------------------------------------------------------
+
+
+def test_ascii_text_estimate_is_unchanged() -> None:
+    body = {"messages": [{"role": "user", "content": "a" * 400}], "tools": [{"t": "x" * 40}]}
+    expected = (400 // 4 + 4) + len(json.dumps(body["tools"], default=str)) // 4
+    assert context_window.estimate_context_tokens(body) == expected
+
+
+def test_non_ascii_text_estimates_higher_than_len_over_4() -> None:
+    for text in (
+        "这是一个用于测试上下文窗口估算的较长中文提示。" * 50,  # CJK
+        "🙂👍🏽🚀" * 200,  # emoji (incl. a ZWJ/skin-tone sequence)
+    ):
+        body = {"messages": [{"role": "user", "content": text}]}
+        naive = len(text) // 4 + 4
+        got = context_window.estimate_context_tokens(body)
+        assert got > naive, f"{len(text)} chars: {got} !> {naive} (len//4 under-count)"
+        # at least one token per non-ASCII character, plus the message overhead
+        non_ascii = sum(1 for ch in text if ord(ch) > 0x7F)
+        assert got >= non_ascii + 4, f"{got} < {non_ascii + 4} (a quarter-token character is impossible)"

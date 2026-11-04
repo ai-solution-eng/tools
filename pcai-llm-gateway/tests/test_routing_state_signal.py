@@ -77,9 +77,7 @@ def test_extract_user_task_returns_the_opening_ask_not_the_clock() -> None:
 
 def test_build_state_carries_the_real_message_and_the_task() -> None:
     body = _body("Port the chart to PCAI.", PREAMBLE + "\n\nNow add the ezua block.")
-    state = json.loads(
-        dr.build_state(body, complexity=1000, candidates=["GLM-5.3-Flash", "Qwen3.8-27B"])
-    )
+    state = json.loads(dr.build_state(body, complexity=1000, candidates=["GLM-5.3-Flash", "Qwen3.8-27B"]))
     request = state["request"]
     assert request["user_message"] == "Now add the ezua block."
     assert request["user_task"] == "Port the chart to PCAI."
@@ -108,17 +106,13 @@ def test_thread_key_is_stable_across_turns_that_only_differ_by_the_clock() -> No
         PREAMBLE.replace("turn 5", "turn 2"),
         PREAMBLE.replace("turn 5", "turn 3"),
     )
-    assert canonical.thread_key(first["messages"], "key-1") == canonical.thread_key(
-        second["messages"], "key-1"
-    )
+    assert canonical.thread_key(first["messages"], "key-1") == canonical.thread_key(second["messages"], "key-1")
 
 
 def test_thread_key_still_separates_different_conversations() -> None:
     a = _body("Port the chart to PCAI.", PREAMBLE)
     b = _body("Why is routing abstaining?", PREAMBLE)
-    assert canonical.thread_key(a["messages"], "key-1") != canonical.thread_key(
-        b["messages"], "key-1"
-    )
+    assert canonical.thread_key(a["messages"], "key-1") != canonical.thread_key(b["messages"], "key-1")
 
 
 def test_price_hints_formats_priced_models_and_skips_unpriced(monkeypatch) -> None:
@@ -133,6 +127,7 @@ def test_price_hints_formats_priced_models_and_skips_unpriced(monkeypatch) -> No
     assert hints["GLM-5.3-Flash"] == "in 0.3 / out 1.2 USD per 1M tokens"
     assert "Qwen3.8-27B" not in hints  # unpriced is unknown, not free
 
+
 def test_prom_samples_finds_a_counter_by_its_total_name() -> None:
     # The bug this pins: prometheus_client names a Counter's FAMILY without the
     # _total suffix, so matching the family alone reported zeros for every
@@ -144,10 +139,7 @@ def test_prom_samples_finds_a_counter_by_its_total_name() -> None:
     counter = Counter("zz_routing_stats_probe_total", "probe", ["outcome"])
     counter.labels(outcome="served").inc(2)
     samples = _prom_samples("zz_routing_stats_probe_total")
-    assert any(
-        s.name == "zz_routing_stats_probe_total" and s.labels.get("outcome") == "served"
-        for s in samples
-    )
+    assert any(s.name == "zz_routing_stats_probe_total" and s.labels.get("outcome") == "served" for s in samples)
     assert _prom_samples("zz_does_not_exist_total") == []
 
 
@@ -176,9 +168,7 @@ def test_thread_key_is_stable_for_preamble_only_conversations() -> None:
     # the fix at exactly the turn-1/turn-2 boundary.
     first = _body(PREAMBLE.replace("turn 5", "turn 1"))
     second = _body(PREAMBLE.replace("turn 5", "turn 2"))
-    assert canonical.thread_key(first["messages"], "key-1") == canonical.thread_key(
-        second["messages"], "key-1"
-    )
+    assert canonical.thread_key(first["messages"], "key-1") == canonical.thread_key(second["messages"], "key-1")
 
 
 def test_thread_key_is_stable_for_multimodal_list_content() -> None:
@@ -270,4 +260,3 @@ def test_price_hints_keeps_sub_cent_rates_significant(monkeypatch) -> None:
     hints = asyncio.run(costs.price_hints(["tiny"]))
     assert hints["tiny"] == "in 0.0005 / out 0.002 USD per 1M tokens"
     assert "0.00 " not in hints["tiny"]
-

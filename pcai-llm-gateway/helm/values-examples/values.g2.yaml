@@ -71,6 +71,11 @@ secretsMasterKey:
 database:
   existingSecret: pcai-llm-gateway-db           # your Postgres URL Secret name
   existingSecretKey: database-url
+  # EXTERNAL-DB connection budget for the render-time HPA × dbPoolMax check.
+  # Mirrors the live embedded PG's max_connections 200 (this sample renders
+  # external-DB): 4 × 25 = 100 <= 200, so the example is self-checking and
+  # does NOT warn.
+  maxConnectionsBudget: 200
   # Embedded Postgres (StatefulSet+Service+PVC; the chart derives the gateway URL). Password
   # seeds the data dir on FIRST init only. The LIVE G2 release runs embedded PG.
 
@@ -112,9 +117,12 @@ settings:
   # UPSTREAM TLS verification CA bundle. Empty = system trust store; a PRIVATE-CA site mounts the
   # bundle and sets the path. There is deliberately NO verify=False knob.
   upstreamCaBundle: ""
-  # Operational-table retention (traces / conversations). 0 = disabled — G2 KEEPS the
-  # default; the usage LEDGER is never pruned regardless.
-  retentionTraceDays: 0
+  # Operational-table retention (traces / conversations). The usage LEDGER is never
+  # pruned regardless. retentionTraceDays: agent_traces is OBSERVABILITY, not the
+  # audit artifact, so pruning is safe — G2 opts in at 30 (a full monthly budget
+  # window for troubleshooting; shorter risks losing traces before the monthly
+  # review, longer only grows the table).
+  retentionTraceDays: 30
   retentionConversationDays: 0
   # canonical_conversations (the distiller's INPUT store — the biggest table here and
   # pruned by nothing else). DISTILLED-ONLY: a row is deleted only when a marker
@@ -137,6 +145,34 @@ settings:
   # so it only moves WHEN tokens are charged, never HOW MANY.
   rateLimitPredictCached: true
   rateLimitPredictReconcile: true
+  # --- exact-match RESPONSE cache (3.7.3) ---------------------------------
+  # Deterministic (temperature: 0), non-streaming, non-relay requests only.
+  # shadow = compute the key and count WOULD-BE hits, serve nothing: read
+  # gateway_response_cache_total{mode="shadow"} for a week, then flip to
+  # 'active' only if the duplicate rate justifies replaying answers.
+  responseCacheMode: shadow
+  responseCacheTtlS: 3600
+  # --- session affinity (3.7.3) -------------------------------------------
+  # X-PCAI-Session pins a conversation to the ENDPOINT that served it (not
+  # just the cascade head) so its prefix keeps hitting the same server's KV
+  # cache. Harmless with one endpoint per model; it starts mattering the day
+  # a pool has two. Routing state, never policy: an unhealthy pin is dropped.
+  sessionAffinityEnabled: true
+  sessionAffinityTtlS: 3600
+  # --- audio passthrough billing (3.7.3) ----------------------------------
+  # TTS/ASR report no token usage; the gateway bills an estimate so a voice
+  # call cannot bypass a budget. Tune to your real rates if they differ.
+  audioTtsCharsPerToken: 4         # ~4 characters of spoken text per token
+  audioAsrTokensPerSecond: 3.0     # ~180 tokens/minute of audio (~150 words)
+  # --- OpenTelemetry tracing (3.7.3) --------------------------------------
+  # LEFT OFF: G2 has Prometheus but no OTLP collector in this values file.
+  # The exporter is fail-open (a DNS failure is swallowed), but a collector
+  # that does not exist produces nothing. Point otelEndpoint at a real
+  # collector and flip this to true; spans carry path-only attributes.
+  otelEnabled: false
+  otelEndpoint: http://otel-collector:4318
+  otelServiceName: pcai-llm-gateway
+  otelSampleRatio: 1.0
   toolRelayEnabled: true           # server-side model<->MCP loop (X-PCAI-Execute-Tools)
   toolRelayMaxIterations: 16
   # 'scope' (default) = every mcp-scoped key gets the policy-admitted tools of all enabled
@@ -155,6 +191,30 @@ settings:
   # One extra attempt per relay TURN when a bounded model call expires on timeout; the retry
   # budget comes out of the remaining wall clock. 0 = fail immediately.
   toolRelayCallRetries: 1
+  # --- Active endpoint health probe (2026-11-03) ---------------------------
+  # GETs {base_url}/models on every chat/embedding/reranker endpoint every
+  # intervalS, and excludes an endpoint that fails `failuresToTrip` CONSECUTIVE
+  # sweeps. WHY: availability used to be passive only (the breaker, fed by traffic
+  # that happens to arrive), so an idle-but-broken model read healthy forever and
+  # ranked as free/idle in the load-aware cascade — until a real request landed on
+  # it and died.
+  #
+  # ENABLED HERE after the 2026-11-03 incident, which four guards now prevent:
+  #   * the probe sends the endpoint's OWN credential (an auth-less probe read an
+  #     auth-gated /models as 401 and marked the whole fleet probe-failed);
+  #   * 401/403 count as ALIVE (availability is not authorization) and any other
+  #     4xx leaves the endpoint's state untouched (our probe was wrong, not it);
+  #   * Pool.healthy() IGNORES the probe when it alone would exclude every
+  #     endpoint (never-empty invariant: worst case is degraded routing, never a
+  #     503 "no healthy upstream");
+  #   * failuresToTrip=2 hysteresis, the same posture the breaker gives real traffic.
+  # Verify with GET /admin/endpoints after rollout: a pool that trips the
+  # never-empty invariant logs ONE ERROR naming the endpoints and the reasons.
+  healthProbe:
+    enabled: true
+    intervalS: 30
+    timeoutS: 5
+    failuresToTrip: 2
   # Reasoning continuity (2026-10-26): show the model its OWN prior reasoning — both
   # in-loop (between tool calls) and inbound (what the client replays). With this off,
   # a 32-iteration relay turn hands the model ~31 consecutive examples of itself calling
@@ -219,11 +279,11 @@ settings:
   # requires all three of issuer / jwksUrl / audience). Enable only with an enforcing proxy
   # in front: settings.trustProxyIdentity / ssoKeyCreateEnabled / adminGroups / tokenShadowKeys.
 
-  # Enrollment-time per-user memory datasets (2026-10: ACTIVE — the memory
-  # distiller's substrate). Requires a registered mm-rag MCP server row (the
-  # fleet bundle registers it) + secretsMasterKey. enrollMemoryDefault stays
-  # false: provisioning is opt-in at redemption, the human at the keyboard
-  # decides; profile presets can force it per profile.
+  # LEGACY enrollment-time per-user memory datasets. The supported path is the
+  # per-key X-API-Key header override (MCP tools → mm-rag) over an SSO-managed ★
+  # dataset; this dataset+password provisioning is only reachable via a redeem
+  # request's memory_opt_in field or a profile preset, and stays false here.
+  # Requires a registered mm-rag MCP server row + secretsMasterKey.
   enrollMemoryDefault: false
   enrollMemoryServer: "mm-rag"
   enrollMemoryNameRetries: 3
@@ -233,9 +293,9 @@ settings:
   # OWUI filter). Master switch only — the summarizer model (fleet Qwen),
   # off-peak-only scheduling, quiet window, and output cap are admin-editable
   # at runtime via the Memory Distiller panel (DB-backed; no redeploy to tune).
-  # Inert by construction for keys whose memory feature is not attached: no
-  # enabled mm-rag registry row or no stamped {X-Memory-Dataset,
-  # X-Dataset-Password} pair -> every call answers 200 inert no-op.
+  # Inert by construction for keys the backend reports unattached: no enabled
+  # mm-rag registry row, or the capability probe says not available/writable
+  # -> every call answers 200 inert no-op.
   distillerEnabled: true
   distillerMemoryServer: "mm-rag"
   distillerMemoryTool: "add_memory"
@@ -295,6 +355,15 @@ autoscaling:
   minReplicas: 2
   maxReplicas: 4
   targetCPUUtilizationPercentage: 70
+
+# Availability: with the HPA at 2-4, a node drain must not evict every
+# replica at once (in-process quota state + long-lived SSE streams).
+# minAvailable 1 — blocks draining the LAST replica while still allowing
+# a rolling update at the 2-replica floor (minAvailable 2 would deadlock
+# a 2-replica set: it could never replace one of two).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
 
 # ============================================================================
 # Security / Service Account
@@ -484,6 +553,12 @@ ezua:
     allowInClusterApi: true         # unmeshed in-cluster callers on the traffic port; the
                                     # identity paths stay edge-only
     ingressNamespace: istio-system
-    ingressGatewayPrincipals: []    # SPIFFE IDs tighten rule (i) beyond the namespace
+    ingressGatewayPrincipals: []    # SPIFFE IDs tighten rule (i) beyond the namespace.
+                                    # WITH trustProxyIdentity/ssoKeyCreateEnabled ON, EMPTY IS
+                                    # INSECURE — the whole istio-system namespace may then
+                                    # deliver spoofed X-Auth-Request-* headers (NOTES.txt
+                                    # warns at deploy time). Set the ezaf-gateway SA's
+                                    # SPIFFE ID, e.g.:
+                                    #   - cluster.local/ns/istio-system/sa/ezaf-gateway
     excludeInboundPorts: []         # KEEP EMPTY — an excluded port bypasses ALL policy rules
     rules: []                       # non-empty REPLACES the baseline ALLOW rules

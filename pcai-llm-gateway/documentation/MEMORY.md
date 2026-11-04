@@ -192,6 +192,11 @@ servers → find `mm-rag` → enter:
 
 → **Save cred**. `PUT /v1/mcp/creds/mm-rag` with `{"server":"mm-rag","headers":{"X-API-Key":"..."}}`.
 
+> That generic row is the ONLY memory surface in the dialog — there is no
+> separate dataset card (removed 2026-11-04: the gateway must not model a RAG
+> dataset, and the pair editor's "store both headers in one PUT" trick is
+> unnecessary when the whole credential is one header).
+
 > **Gotcha — the server must already be visible in that dialog.** Under the
 > default `explicit` grant mode the dialog lists only servers on which your key
 > holds **at least one granted tool**, and **omits a server entirely** when it
@@ -375,7 +380,14 @@ code comments claim otherwise:
 
 ---
 
-## 6. Let the gateway do it for you (enrollment provisioning)
+## 6. Let the gateway do it for you (LEGACY enrollment provisioning)
+
+> **Legacy — not the supported path (2026-11-04).** This stamps the
+> dataset/password pair, which *outranks* the ★ binding — so a provisioned key
+> cannot be retargeted by starring another dataset. Under the current
+> SSO-managed model §1–§3 is the way: one `X-API-Key` override. The redeem
+> dialog no longer offers this opt-in; the request field remains for API
+> callers and profile presets.
 
 If you would rather not mint, create, and paste by hand: an enrollment
 redemption can provision the whole chain.

@@ -126,7 +126,7 @@ def _header_matches(header: str, section: str) -> bool:
         return True
     if not header.startswith(section):
         return False
-    tail = header[len(section):].replace("*", "").strip()
+    tail = header[len(section) :].replace("*", "").strip()
     return tail == "" or tail.startswith(":")
 
 
@@ -539,9 +539,7 @@ def _check_deadline(deadline: float | None) -> None:
     import time as _time
 
     if _time.monotonic() > deadline:
-        raise DistillBudgetExceeded(
-            "distill sweep budget exhausted mid-row - deferring the rest of this transcript"
-        )
+        raise DistillBudgetExceeded("distill sweep budget exhausted mid-row - deferring the rest of this transcript")
 
 
 async def run_map_reduce(

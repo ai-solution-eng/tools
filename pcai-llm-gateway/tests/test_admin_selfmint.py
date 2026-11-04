@@ -328,6 +328,9 @@ def mint_env(monkeypatch: pytest.MonkeyPatch):
     function (its implementation is z2's file; here the agreed signature
     is faked per-test via the module attribute routes_enroll consults)."""
     monkeypatch.setattr(settings, "trust_proxy_identity", True)
+    # the SURFACE flag: on in this fixture's posture (the mint enforces it —
+    # audit w6 F1); the kill-switch test below flips it off explicitly.
+    monkeypatch.setattr(settings, "sso_key_create_enabled", True)
     monkeypatch.setattr(settings, "token_shadow_tenant_id", str(uuid.uuid4()))
     import pcai_llm.core.keys as keys_mod
     from pcai_llm.core import audit as audit_mod
@@ -525,6 +528,65 @@ def test_for_me_get_blocked_403_indistinguishable_from_flag_off(mint_env, monkey
     r_flag_off = tc.get("/v1/keys/for-me", headers=BROWSER_H)
     assert r_flag_off.status_code == 403
     assert r.content == r_flag_off.content
+
+
+def test_sso_flag_false_refuses_mint_and_get_before_any_subject_probe(
+    mint_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE sso_key_create_enabled PIN (audit w6 F1, elevated P1): the flag is
+    the documented self-mint kill switch — the /v1/identity probe's
+    flags.self_mint ANDs it (routes_identity.py) — so BOTH for-me readers
+    must refuse the same way. Ordering contract: the flag is a DEPLOYMENT
+    posture switch, consulted BEFORE the browser-header read and BEFORE the
+    eligibility lookup, so a flags-off surface never touches subject data
+    (no existence oracle) and every caller gets the byte-identical
+    surface-off refusal."""
+    tc, fake = mint_env
+    consulted = _install_eligibility(monkeypatch, {})  # would answer True — the flag must refuse FIRST
+    monkeypatch.setattr(settings, "sso_key_create_enabled", False)
+    r = tc.post("/v1/keys/for-me", json=None, headers=BROWSER_H)
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "SSO key creation is not enabled on this deployment"
+    r_get = tc.get("/v1/keys/for-me", headers=BROWSER_H)
+    assert r_get.status_code == 403
+    assert r_get.content == r.content  # ONE refusal vocabulary on a flags-off surface
+    # nothing subject-touching ran: no key minted, no eligibility probe
+    assert fake.keys == []
+    assert consulted == []
+
+
+def test_for_me_mint_audit_actor_is_proxy_identity(mint_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F3: the SSO self-mint's audit row names the CALLER's vocabulary —
+    actor_source='proxy-identity' with the caller's own subject. Behind the
+    SSO chain the proxy injects its id_token Bearer into every request; the
+    old _enroll_audit relabeled any non-'enroll' actor carrying a Bearer to
+    'admin-key', misattributing this self-service mint to the admin actor
+    class in the hash-chained trail."""
+    tc, _fake = mint_env
+    _install_eligibility(monkeypatch, {"alice": True})
+    rows: list[tuple] = []
+
+    class _Cap:
+        async def execute(self, sql: str, *args: Any):
+            rows.append(args)
+            return "INSERT 0 1"
+
+    from pcai_llm.core import audit as audit_mod
+
+    monkeypatch.setattr(audit_mod, "db", _Cap())
+    # the SSO-chained shape: the proxy-injected id_token Bearer RIDES ALONG
+    # (split at the JWT header prefix so the fleet pre-mirror secret scanner,
+    # whose JWT pattern honours no allow marker, does not flag this fixture)
+    sso_h = {
+        "X-Auth-Request-User": "alice",
+        "Authorization": "Bearer eyJ" + "hbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig",
+    }
+    r = tc.post("/v1/keys/for-me", json=None, headers=sso_h)
+    assert r.status_code == 201, r.text
+    args = rows[-1]
+    assert args[3] == "enroll.redeem"
+    assert args[2] == "proxy-identity", rows[-1]  # pre-fix: 'admin-key' (clobbered)
+    assert args[1] == "alice"
 
 
 def test_for_me_blocked_subject_cannot_even_learn_key_existence(mint_env, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3,7 +3,7 @@
 Two independent gates, both evaluated BEFORE an upstream call and settled
 AFTER it:
 
-1. Period budgets (day/week/month, per key and optionally per model) —
+1. Period budgets (day/week/month/quarter/year, per key and optionally per model) —
    ledger-derived: spent = SUM over usage_ledger in the window,
    FRACTION-WEIGHTED (each row's billing_fraction — off-peak billing keeps
    the ledger TRUE while budgets consume tokens*fraction / cost*fraction),
@@ -41,6 +41,11 @@ from ..db import db
 # out no-op shims and these calls are free.
 from . import metrics as _metrics
 
+# The team envelope lives in its own module (credential + envelope + console
+# queries); this import is safe in this direction because core.teams imports
+# the two pure helpers it needs FROM HERE lazily, at call time.
+from . import teams
+
 log = logging.getLogger(__name__)
 
 
@@ -57,7 +62,31 @@ class RateLimited(Exception):
         super().__init__(f"rate limit exceeded: {kind} limit={limit}")
 
 
-VALID_PERIODS = frozenset({"day", "week", "month"})
+VALID_PERIODS = frozenset({"day", "week", "month", "quarter", "year"})
+
+# The same periods in the fixed order the spend SUMs' CASE binds them in —
+# a frozenset has no order, and the numbered placeholders below depend on ONE
+# canonical sequence (day first, year last) shared by _budget_sums and
+# budget_status_many. Reordering this tuple renumbers the placeholders with it.
+_WINDOW_PERIODS: tuple[str, ...] = ("day", "week", "month", "quarter", "year")
+
+# Ledger statuses whose tokens and cost are REAL upstream spend (audit r5 #9).
+# Every row where the upstream actually ran must be PRICED and COUNTED:
+# 'guardrail_blocked' is a post-call POLICY refusal — the GPU time was already
+# spent (the proxy settles it with the real prompt/completion tokens), so
+# pricing only 'ok' stored those tokens with cost_usd NULL and the SUMs only
+# counting ('ok','error') let a tenant with a blocklist guardrail burn
+# unlimited prefill for free, with no budget gate and no chargeback line ever
+# seeing it (docs API.md §"real upstream spend" / FEATURES.md promise the
+# opposite). 'cache_hit' stays OUT deliberately: those rows are served from
+# our cache (no upstream spend) and the admission refusals never called an
+# upstream at all. ONE set, consumed by settle()'s price branch and by every
+# budget SUM (core.teams carries the same predicate for the team envelope).
+_COSTED_STATUSES: tuple[str, ...] = ("ok", "error", "guardrail_blocked")
+# The same set as a SQL IN list. Interpolated rather than parameterised
+# because a list cannot bind into IN (...); the values are this module
+# constant, never request data.
+_COSTED_SQL = ", ".join(f"'{s}'" for s in _COSTED_STATUSES)
 
 # Column bounds, mirrored from db/schema.py. These are NOT cosmetic: a
 # limit above them passes every shape check and then raises
@@ -139,6 +168,12 @@ def _window_start(now: datetime, period: str) -> datetime:
     if period == "week":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return start - timedelta(days=start.weekday())
+    if period == "quarter":
+        # First day of the calendar quarter, 00:00 UTC: months 1-3 -> Q1 starts
+        # Jan 1, 4-6 -> Apr 1, 7-9 -> Jul 1, 10-12 -> Oct 1.
+        return now.replace(month=(now.month - 1) // 3 * 3 + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period == "year":
+        return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)  # month
 
 
@@ -152,6 +187,15 @@ class GateResult:
     # budget-gate results (no window counter involved).
     remaining_requests: int | None = None
     remaining_tokens: int | None = None
+    # WHICH row refused (2026-10-30, per-model team pools): the period and
+    # family of the budget that produced the refusal. The team overlay needs
+    # them to answer "does the overflow pool for THIS limit have headroom?" —
+    # each N x profile preset is its own pool, so swallowing a day-limit
+    # refusal into month headroom (or a GLM refusal into Qwen headroom) would
+    # be exactly the incoherence the per-model caps exist to remove. None on
+    # admissions and on team-envelope refusals that are their own verdict.
+    refused_period: str | None = None
+    refused_kind: str | None = None  # 'tokens' | 'usd'
 
 
 async def _budget_rows_exist(key_id: uuid.UUID, model: str | None) -> bool:
@@ -222,7 +266,7 @@ async def _budget_sums(
     window boundaries stay UTC-exact regardless of the DB session timezone.
     """
     now = datetime.now(UTC)
-    starts = {p: _window_start(now, p) for p in ("day", "week", "month")}
+    starts = {p: _window_start(now, p) for p in _WINDOW_PERIODS}
     model_cond = "AND (b.model = '*' OR b.model = $2)" if model is not None else ""
     # Perf (audit P2-5): read spend_ancestors ONCE and pass it as a uuid[]
     # parameter. The old join built it via a correlated subselect INSIDE the
@@ -247,12 +291,14 @@ async def _budget_sums(
     args: list[Any] = [key_id]
     if model is not None:
         args.append(model)
-    args += [starts["day"], starts["week"], starts["month"]]
+    args += [starts[p] for p in _WINDOW_PERIODS]
     # Number the windows BEFORE appending the lineage (real-PG-verified fix:
     # the old order made the lineage the LAST param and the month window
     # reused its number — one placeholder cannot be both uuid[] and
     # timestamptz, so prepare() failed with CannotCoerceError and every
-    # budgeted chat call 500d). Windows sit at n_win-2 .. n_win.
+    # budgeted chat call 500d). Windows sit at n_win-4 .. n_win — five
+    # periods since quarter/year joined, bound in _WINDOW_PERIODS order by
+    # the CASE below (that SQL and this numbering must move together).
     n_win = len(args)
     args.append(ancestors + [key_id])
     lineage = "$" + str(len(args)) + "::uuid[]"
@@ -262,8 +308,8 @@ async def _budget_sums(
     # prepare(), which no fake seam can catch.
     # Unconditional (not `assert` — stripped under python -O; S101 class):
     _lineage_num = int(lineage[1:].split("::")[0])
-    _win_nums = (n_win - 2, n_win - 1, n_win)
-    if _lineage_num != len(args) or _lineage_num <= n_win or len(set(_win_nums)) != 3:
+    _win_nums = tuple(range(n_win - len(_WINDOW_PERIODS) + 1, n_win + 1))
+    if _lineage_num != len(args) or _lineage_num <= n_win or len(set(_win_nums)) != len(_WINDOW_PERIODS):
         raise RuntimeError(
             f"placeholder numbering drifted: lineage=${_lineage_num} (args={len(args)}), windows={_win_nums}"
         )
@@ -281,13 +327,17 @@ async def _budget_sums(
         FROM {table} b
         LEFT JOIN usage_ledger l
           ON l.key_id = ANY({lineage})
-         AND l.status IN ('ok', 'error')   -- cache_hit rows are FREE
+         AND l.status IN ({_COSTED_SQL})   -- cache_hit rows are FREE
          AND (l.model = b.model OR b.model = '*')
          AND l.ts >= CASE b.period
                      -- explicit casts: bare params inside a CASE fall back to
                      -- text in Postgres' type resolution → "timestamptz >= text"
-                     WHEN 'day' THEN ${n_win - 2}::timestamptz
-                     WHEN 'week' THEN ${n_win - 1}::timestamptz
+                     -- one WHEN per _WINDOW_PERIODS entry, ELSE = the last one
+                     -- (year); the numbering guard above cross-checks the args.
+                     WHEN 'day' THEN ${n_win - 4}::timestamptz
+                     WHEN 'week' THEN ${n_win - 3}::timestamptz
+                     WHEN 'month' THEN ${n_win - 2}::timestamptz
+                     WHEN 'quarter' THEN ${n_win - 1}::timestamptz
                      ELSE ${n_win}::timestamptz END
         WHERE b.key_id = $1 {model_cond}
         GROUP BY b.model, b.period, b.{limit_col}
@@ -295,6 +345,38 @@ async def _budget_sums(
         """,
         *args,
     )
+
+
+async def _team_for_key(key_id: uuid.UUID) -> teams.TeamEnrollment | None:
+    """The key's team envelope, or None — TOLERANT BY CONSTRUCTION.
+
+    WHY the blanket except: this runs on the admission path (every proxy call,
+    every cascade candidate, every relay iteration) and is exercised by db
+    seams that implement only a subset of the interface — the unit suite
+    monkeypatches the module-level handle with fakes that answer
+    fetchrow/fetch/fetchval/execute and may raise on a statement they do not
+    recognize. A team lookup that cannot be answered MUST degrade to "this key
+    has no team": the per-key budgets below still run, so the failure mode is
+    "the envelope was not enforced for this admission", never "the request
+    failed" and never "the per-key cap was skipped". Same posture as the
+    EXISTS-probe fallback (an unknown catalog must not break the gate).
+
+    A DB fault is NOT cached (core.teams only caches answers), so a recovered
+    database re-reads on the very next admission.
+
+    The log carries the exception's text but no traceback: on the test seams
+    this fires once per gate call, and a stack per call would drown the
+    operator's log for a condition that is already explained by the message.
+    """
+    try:
+        return await teams.enrollment_for_key(key_id)
+    except Exception as exc:
+        log.warning(
+            "team budget lookup failed for key %s — team envelope not enforced this call: %s",
+            key_id,
+            exc,
+        )
+        return None
 
 
 async def check_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> GateResult:
@@ -306,6 +388,164 @@ async def check_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> G
     earlier docstring were never implemented — doc drift A2). Pure
     visibility: NO behavior change (soft-threshold rerouting was
     deliberately rejected — see the cascade design decision).
+
+    TEAM ENVELOPE (team leader tier): a key minted from an enrollment is ALSO
+    capped by that enrollment's budget — a HARD cap on the SUM over every key
+    in the team. The per-key verdict is computed FIRST (it is unchanged code —
+    see _check_own_budgets), and the envelope only decides what to do with it:
+
+      * no team, or a team with NO cap configured -> the per-key verdict,
+        byte-identical to the pre-feature gate;
+      * overflow_enabled=FALSE -> the per-key refusal is TERMINAL (a key is
+        hard-capped at its own allocation; the envelope still caps the team);
+      * overflow_enabled=TRUE  -> a per-key refusal is SWALLOWED while the
+        envelope still has UNCOMMITTED headroom (T - S - SUM(alloc_k - spent_k)):
+        only the remainder nobody else is promised is a shared overflow pool
+        (2026-10-30: raw T - S let an over-budget key eat a teammate's
+        allocation). The envelope refusal is what stops the call.
+
+    The envelope's SHAPE depends on where it came from (2026-10-30): an
+    EXPLICIT cap is one pooled number per period (today's behavior, and what
+    an operator typed); a DERIVED envelope (profile presets x the mint
+    allowance) is PER-MODEL — every preset scaled by N becomes its own team
+    pool for its (model, period), and the overflow draws ONLY on the pool of
+    the limit that refused. See _apply_team_model_caps.
+
+    The envelope test is POST-PAID (spent >= limit) and deliberately does NOT
+    charge est_tokens: the estimate is a per-REQUEST projection, while the
+    envelope is a pool several concurrent teammates draw from — charging one
+    request's estimate against a team-wide cap would refuse a teammate for
+    tokens another teammate may never use. The per-key gate (which does charge
+    the estimate) is the surface that protects against one big call. Same
+    reasoning as the post-paid USD gate.
+    """
+    team = await _team_for_key(key_id)
+    own = await _check_own_budgets(key_id, model, est_tokens)
+    if team is None or not team.has_budget:
+        return own
+    return await _apply_team_envelope(team, own, model)
+
+
+def _eval_token_rows(rows: Iterable[Any], est_tokens: int) -> tuple[GateResult | None, int]:
+    """PURE: the token-family verdict (a refusal, or None) and its warn band.
+
+    ONE implementation of the per-key refusal/warn math, for BOTH consumers:
+    the admission gate (_check_own_budgets) and the visibility projection
+    (model_capacity). Visibility that disagrees with enforcement is worse than
+    no visibility — a listing that says "you have headroom" while admission
+    429s is the exact confusion this function exists to prevent.
+
+    The CALLER bumps the rejection metric, not this function: model_capacity
+    runs the same math on every /v1/models listing and every routing request,
+    and a counter that is supposed to describe refused TRAFFIC must not move
+    because somebody looked at the model picker.
+    """
+    # The admission estimate has no cached split (usage does not exist yet),
+    # so it is discounted by the SAME fraction the settle discounts the row
+    # with — assume the request may be as cache-served as the conversation
+    # it continues. The ledger settle brings the truth either way, so the
+    # residual budget overshoot is bounded by the CONCURRENT in-flight
+    # requests' undiscounted remainder (the same trade the post-paid USD
+    # gate accepts); frac=0 keeps the byte-identical legacy charge.
+    _frac = min(1.0, max(0.0, float(settings.budget_cached_exempt_fraction)))
+    est_billable = int(est_tokens * (1.0 - _frac))
+    warn = 0
+    for b in rows:
+        spent = int(b["spent"])
+        # HARD STOP AT THE CAP (audit C1, 2026-10-29): the projected test below
+        # charges only est*(1-frac) (est/10 at the deployed 0.9 fraction), so
+        # at spent == limit it ADMITTED every small request — and the two
+        # zero-estimate paths (the relay's per-iteration gate and /mcp) were
+        # admitted forever. The USD gate and model_capacity both treat
+        # spent >= limit as exhausted; the token gate must agree, or the three
+        # surfaces that describe one budget contradict each other.
+        if spent >= b["limit_tokens"] or spent + est_billable > b["limit_tokens"]:
+            return (
+                GateResult(
+                    False,
+                    f"{b['period']} budget {b['limit_tokens']} exceeded (spent {spent})",
+                    refused_period=b["period"],
+                    refused_kind="tokens",
+                ),
+                warn,
+            )
+        pct = spent * 100 // b["limit_tokens"]
+        if pct >= 95:
+            warn = max(warn, 95)
+        elif pct >= 80:
+            warn = max(warn, 80)
+    return None, warn
+
+
+def _eval_usd_rows(rows: Iterable[Any]) -> tuple[GateResult | None, int]:
+    """PURE: the USD-family verdict (a refusal, or None) and its warn band.
+
+    Same single-implementation contract as _eval_token_rows: the gate and
+    model_capacity must read one budget one way. Post-paid: the in-flight
+    request's true cost is known only after the response, so the test is
+    spent >= limit — the overshoot is bounded by one response's cost.
+    """
+    warn = 0
+    for cb in rows:
+        spent_usd = float(cb["spent"] or 0)
+        limit = float(cb["limit_usd"])
+        # NON-FINITE ROW (audit F1, 2026-10-29): split_preset_budgets now
+        # rejects NaN/Infinity at every write site, but a row persisted by a
+        # pre-fix build (or written straight into cost_budgets) must not be
+        # able to (a) admit forever — "spent >= nan" is always False — or
+        # (b) 500 on the percentage below. Fail CLOSED with a named refusal.
+        if not math.isfinite(limit) or not math.isfinite(spent_usd):
+            # NOT RESCUABLE (2026-10-30 review): an unreadable row is not a
+            # pool. refused_period=None makes every swallow rule miss it —
+            # the overflow must never admit a call on data it cannot
+            # evaluate (audit F1: "must not admit forever").
+            return (
+                GateResult(
+                    False,
+                    f"{cb['period']} cost budget has a non-finite limit or spend ({limit!r} / {spent_usd!r})",
+                    refused_period=None,
+                    refused_kind="usd",
+                ),
+                warn,
+            )
+        if spent_usd >= limit:
+            return (
+                GateResult(
+                    False,
+                    f"{cb['period']} cost budget ${limit:.2f} exceeded (spent ${spent_usd:.4f})",
+                    refused_period=cb["period"],
+                    refused_kind="usd",
+                ),
+                warn,
+            )
+        pct = int(spent_usd * 100 / limit) if limit else 0
+        if pct >= 95:
+            warn = max(warn, 95)
+        elif pct >= 80:
+            warn = max(warn, 80)
+    return None, warn
+
+
+def _token_headroom(rows: Iterable[Any]) -> int | None:
+    """The tightest token headroom across a model's matching rows (None = no
+    token budget at all, i.e. unlimited). Display-only: the refusal verdict
+    comes from _eval_token_rows, which also charges the request estimate."""
+    remaining: int | None = None
+    for r in rows:
+        left = max(0, int(r["limit_tokens"]) - int(r["spent"]))
+        remaining = left if remaining is None else min(remaining, left)
+    return remaining
+
+
+async def _check_own_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> GateResult:
+    """The PER-KEY gate: every budget row on THIS key, first refusal wins.
+
+    The pre-team body of check_budgets, moved here verbatim (comments and all)
+    so the team branch can reuse the exact same evaluation instead of growing
+    a second copy of the refusal/warn math that could drift from it. Returns
+    the FIRST refusal (that is the row that stopped the key) or the max warn
+    band when nothing refused — the envelope branch decides whether a refusal
+    is terminal, so "first refusal" is exactly what it needs.
     """
     # REMEDIATION P4 (budget-gate EXISTS short-circuit): the overwhelming
     # majority of keys carry NO budget rows at all, yet the gate used to pay
@@ -331,67 +571,371 @@ async def check_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0) -> G
     if any_rows is False:
         return GateResult(True, warn=0)
 
-    warn = 0
-    # The admission estimate has no cached split (usage does not exist yet),
-    # so it is discounted by the SAME fraction the settle discounts the row
-    # with — assume the request may be as cache-served as the conversation
-    # it continues. The ledger settle brings the truth either way, so the
-    # residual budget overshoot is bounded by the CONCURRENT in-flight
-    # requests' undiscounted remainder (the same trade the post-paid USD
-    # gate accepts); frac=0 keeps the byte-identical legacy charge.
-    _frac = min(1.0, max(0.0, float(settings.budget_cached_exempt_fraction)))
-    est_billable = int(est_tokens * (1.0 - _frac))
-    for b in await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, model):
-        spent = int(b["spent"])
-        # HARD STOP AT THE CAP (audit C1, 2026-10-29): the projected test below
-        # charges only est*(1-frac) (est/10 at the deployed 0.9 fraction), so
-        # at spent == limit it ADMITTED every small request — and the two
-        # zero-estimate paths (the relay's per-iteration gate and /mcp) were
-        # admitted forever. The USD gate and model_capacity both treat
-        # spent >= limit as exhausted; the token gate must agree, or the three
-        # surfaces that describe one budget contradict each other.
-        if spent >= b["limit_tokens"] or spent + est_billable > b["limit_tokens"]:
-            # WHICH budget family refused — the metric label (tokens|usd)
-            # lets an operator tell "tenant hit its token cap" from
-            # "tenant hit its dollar cap" without joining the ledger.
-            _metrics.BUDGET_REJECTIONS.labels(kind="tokens").inc()
-            return GateResult(False, f"{b['period']} budget {b['limit_tokens']} exceeded (spent {spent})")
-        pct = spent * 100 // b["limit_tokens"]
-        if pct >= 95:
-            warn = max(warn, 95)
-        elif pct >= 80:
-            warn = max(warn, 80)
+    token_refusal, token_warn = _eval_token_rows(
+        await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, model), est_tokens
+    )
+    if token_refusal is not None:
+        # WHICH budget family refused — the metric label (tokens|usd) lets an
+        # operator tell "tenant hit its token cap" from "tenant hit its dollar
+        # cap" without joining the ledger. Bumped HERE, not in the pure
+        # evaluator: model_capacity runs the same math for VISIBILITY and must
+        # never move a counter that describes refused traffic.
+        _metrics.BUDGET_REJECTIONS.labels(kind="tokens").inc()
+        return token_refusal
+    # SEQUENTIAL SEMANTICS (pinned by tests/test_budget_gate_cache.py): the
+    # cost-family aggregate is fetched ONLY when the token family did not
+    # refuse — a token refusal returns before the second SUM ever runs.
+    usd_refusal, usd_warn = _eval_usd_rows(await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, model))
+    if usd_refusal is not None:
+        _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
+        return usd_refusal
+    return GateResult(True, warn=max(token_warn, usd_warn))
 
-    # --- USD budgets (whichever limit hits first stops the key) ---
-    # Post-paid: the in-flight request's true cost is known only after the
-    # response, so the gate is spent >= limit — the overshoot is bounded by
-    # one response's cost.
-    for cb in await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, model):
-        spent_usd = float(cb["spent"] or 0)
-        limit = float(cb["limit_usd"])
-        # NON-FINITE ROW (audit F1, 2026-10-29): split_preset_budgets now
-        # rejects NaN/Infinity at every write site, but a row persisted by a
-        # pre-fix build (or written straight into cost_budgets) must not be
-        # able to (a) admit forever — "spent >= nan" is always False — or
-        # (b) 500 on the percentage below. Fail CLOSED with a named refusal.
-        if not math.isfinite(limit) or not math.isfinite(spent_usd):
-            _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
+
+async def _apply_team_envelope(team: teams.TeamEnrollment, own: GateResult, model: str) -> GateResult:
+    """Overlay the enrollment envelope on the per-key verdict.
+
+    Order matters and mirrors the contract:
+
+      1. own refusal + overflow OFF -> return the own refusal untouched (the
+         allocation is a hard cap; the envelope is never even read, so a hard
+         cap costs no extra query);
+      2. a DERIVED envelope (model_caps present) enforces PER-MODEL: every
+         N x preset is its own team pool for its (model, period) — see
+         _apply_team_model_caps;
+      3. an explicit envelope stays POOLED: one token cap + one USD cap for
+         the enrollment's period — see _apply_pooled_envelope;
+      4. otherwise admit, carrying the per-key warn band through (the console
+         still wants the "80% of your allocation" signal even when the call is
+         riding the team pool).
+
+    Refusals reuse the SAME metric the per-key gate bumps
+    (_metrics.BUDGET_REJECTIONS with kind=tokens|usd), so one dashboard row
+    answers "how much traffic did budgets refuse" without caring which tier
+    refused. Non-finite guards mirror the USD gate's: a NaN/Infinity envelope
+    (a pre-validation row, or a hand-written UPDATE) must REFUSE with a named
+    reason — "spent >= nan" is always False, so without this guard such a row
+    would enforce nothing while looking configured, and the percentage math
+    elsewhere in this module would raise on it.
+
+    A DB fault here propagates, exactly like _budget_sums: the gate's verdict
+    cannot be computed, and silently admitting would be the one failure mode
+    this whole module exists to prevent.
+    """
+    if not own.ok and not team.overflow_enabled:
+        return own
+    if team.model_caps:
+        return await _apply_team_model_caps(team, own, model)
+    return await _apply_pooled_envelope(team, own)
+
+
+def _cap_label(model: str) -> str:
+    """A cap's model in refusal strings: '*' is the any-model preset."""
+    return "any model" if model == "*" else model
+
+
+def _envelope_eval(
+    team: teams.TeamEnrollment,
+    caps: Iterable[teams.TeamModelCap],
+    spends: Mapping[tuple[str, str], tuple[int, float]],
+    pooled_scope: tuple[str, str] | None,
+) -> tuple[GateResult | None, int]:
+    """PURE: the team envelope's refusal (or None) and warn band for ONE model.
+
+    Mirrors _apply_team_model_caps' evaluation order exactly — every matching
+    cap in order, then the pooled outer bound — so the admission gate and the
+    visibility projection (model_capacity) cannot disagree about which pool
+    refused. `spends` carries every scope the caller fetched in ONE aggregate
+    (teams.team_cap_spend); a scope the envelope does not bound is simply
+    absent. The CALLER bumps the rejection metric, never this function (the
+    listing must not move a counter that describes refused traffic).
+    """
+    warn = 0
+    for cap in caps:
+        mtok, musd = spends[(cap.model, cap.period)]
+        if cap.limit_tokens is not None:
+            if mtok >= cap.limit_tokens:
+                return (
+                    GateResult(
+                        False,
+                        f"team {cap.period} budget for {_cap_label(cap.model)} {cap.limit_tokens} exceeded (spent {mtok})",
+                        refused_period=cap.period,
+                        refused_kind="tokens",
+                    ),
+                    warn,
+                )
+            pct = mtok * 100 // int(cap.limit_tokens) if cap.limit_tokens else 0
+            if pct >= 95:
+                warn = max(warn, 95)
+            elif pct >= 80:
+                warn = max(warn, 80)
+        if cap.limit_usd is not None:
+            if not math.isfinite(cap.limit_usd) or not math.isfinite(musd):
+                return (
+                    GateResult(
+                        False,
+                        f"team {cap.period} cost budget for {_cap_label(cap.model)} has a non-finite limit or spend ({cap.limit_usd!r} / {musd!r})",
+                        refused_period=cap.period,
+                        refused_kind="usd",
+                    ),
+                    warn,
+                )
+            if musd >= cap.limit_usd:
+                return (
+                    GateResult(
+                        False,
+                        f"team {cap.period} cost budget for {_cap_label(cap.model)} ${cap.limit_usd:.2f} exceeded (spent ${musd:.4f})",
+                        refused_period=cap.period,
+                        refused_kind="usd",
+                    ),
+                    warn,
+                )
+            pct = int(musd * 100 / cap.limit_usd) if cap.limit_usd else 0
+            if pct >= 95:
+                warn = max(warn, 95)
+            elif pct >= 80:
+                warn = max(warn, 80)
+    # THE POOLED TOTAL IS THE OUTER BOUND (audit W6 #1): a derived pooled number
+    # is the SUM of the per-model pools, so checking it unconditionally does NOT
+    # double-count — it is what makes the console's "budget.tokens" true.
+    if pooled_scope is not None and pooled_scope in spends:
+        ptok, pusd = spends[pooled_scope]
+        if team.budget_tokens is not None:
+            token_limit = int(team.budget_tokens)
+            if ptok >= token_limit:
+                return (
+                    GateResult(
+                        False,
+                        f"team {team.budget_period} budget {token_limit} exceeded (spent {ptok})",
+                        refused_period=team.budget_period,
+                        refused_kind="tokens",
+                    ),
+                    warn,
+                )
+            pct = ptok * 100 // token_limit if token_limit else 0
+            if pct >= 95:
+                warn = max(warn, 95)
+            elif pct >= 80:
+                warn = max(warn, 80)
+        if team.budget_usd is not None:
+            usd_limit = float(team.budget_usd)
+            if not math.isfinite(usd_limit) or not math.isfinite(pusd):
+                return (
+                    GateResult(
+                        False,
+                        f"team {team.budget_period} cost budget has a non-finite limit or spend ({usd_limit!r} / {pusd!r})",
+                        refused_period=team.budget_period,
+                        refused_kind="usd",
+                    ),
+                    warn,
+                )
+            if pusd >= usd_limit:
+                return (
+                    GateResult(
+                        False,
+                        f"team {team.budget_period} cost budget ${usd_limit:.2f} exceeded (spent ${pusd:.4f})",
+                        refused_period=team.budget_period,
+                        refused_kind="usd",
+                    ),
+                    warn,
+                )
+            pct = int(pusd * 100 / usd_limit) if usd_limit else 0
+            if pct >= 95:
+                warn = max(warn, 95)
+            elif pct >= 80:
+                warn = max(warn, 80)
+    return None, warn
+
+
+async def _cap_overflow_verdict(
+    team: teams.TeamEnrollment,
+    own: GateResult,
+    caps: Iterable[teams.TeamModelCap],
+    avail_cache: dict[tuple[str, str, int | None, float | None], tuple[int | None, float | None]] | None = None,
+) -> GateResult:
+    """The verdict that STANDS after the per-model overflow swallow.
+
+    Returns `own` when nothing rescues it (no pool of the same
+    (model, period, kind), overflow disabled, or the pool has no UNCOMMITTED
+    headroom), and an admitting GateResult when a pool can absorb the request.
+    `avail_cache` lets model_capacity evaluate many models from ONE round trip
+    per scope; the gate passes None (one model, one call).
+    """
+    if not team.overflow_enabled:
+        return own
+    pool = [
+        c
+        for c in caps
+        if c.period == own.refused_period
+        and (c.limit_tokens is not None if own.refused_kind == "tokens" else c.limit_usd is not None)
+    ]
+    if not pool:
+        return own
+    cache = {} if avail_cache is None else avail_cache
+    # SPEND-AWARE POOL per (model, period, kind): the pool's headroom must also
+    # clear the allocations still promised to the OTHER keys, or an
+    # over-allocation key would overflow into a teammate's promise.
+    for c in pool:
+        # The cache key carries the CAPS, not just the scope: two caps may name
+        # the same (model, period) with different limits (one token preset, one
+        # USD preset), and team_scope_available's answer depends on the caps it
+        # is asked about. Keying on the scope alone would let the USD cap's
+        # answer stand in for the token cap's — an optimistic verdict.
+        key = (c.model, c.period, c.limit_tokens, c.limit_usd)
+        if key not in cache:
+            cache[key] = await teams.team_scope_available(team.id, c.model, c.period, c.limit_tokens, c.limit_usd)
+        avail_t, avail_u = cache[key]
+        avail = avail_t if own.refused_kind == "tokens" else avail_u
+        if avail is not None and avail <= 0:
             return GateResult(
                 False,
-                f"{cb['period']} cost budget has a non-finite limit or spend ({limit!r} / {spent_usd!r})",
+                f"team {c.period} pool for {_cap_label(c.model)} fully committed — no overflow headroom left",
+                refused_period=c.period,
+                refused_kind=own.refused_kind,
             )
-        if spent_usd >= limit:
-            _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
-            return GateResult(False, f"{cb['period']} cost budget ${limit:.2f} exceeded (spent ${spent_usd:.4f})")
-        pct = int(spent_usd * 100 / limit) if limit else 0
-        if pct >= 95:
-            warn = max(warn, 95)
-        elif pct >= 80:
-            warn = max(warn, 80)
-    return GateResult(True, warn=warn)
+    return GateResult(True)
 
 
-async def check_rate_limit(key_id: uuid.UUID, rpm: int, tpm: int, est_tokens: int, request_id: str = "") -> GateResult:
+async def _pooled_overflow_verdict(
+    team: teams.TeamEnrollment,
+    own: GateResult,
+    avail_cache: dict[str, tuple[int | None, float | None]] | None = None,
+) -> GateResult:
+    """The verdict that STANDS after the POOLED overflow swallow.
+
+    A per-key refusal is rescued ONLY by a pool of the same KIND for the
+    envelope's own period — the envelope IS the only pool an explicit cap has.
+    A token refusal with a USD-only envelope (or a day refusal against a month
+    envelope) has no pool to draw on, so the refusal stands.
+    """
+    if not team.overflow_enabled:
+        return own
+    if own.refused_kind == "tokens":
+        kind_capped = team.budget_tokens is not None
+    elif own.refused_kind == "usd":
+        kind_capped = team.budget_usd is not None
+    else:
+        kind_capped = False
+    if not kind_capped or own.refused_period != team.budget_period:
+        return own
+    cache = {} if avail_cache is None else avail_cache
+    # SPEND-AWARE POOL (2026-10-30): headroom means UNCOMMITTED headroom —
+    # T - S - SUM(max(0, alloc_k - spent_k)), the exact number the leader
+    # console grants from (teams.team_available). Raw T - S is not enough:
+    # an over-allocation key would otherwise eat the allocations still
+    # promised to under-budget teammates.
+    if "avail" not in cache:
+        cache["avail"] = await teams.team_available(team.id, team.budget_period)
+    avail_tokens, avail_usd = cache["avail"]
+    avail = avail_tokens if own.refused_kind == "tokens" else avail_usd
+    if avail is not None and avail <= 0:
+        return GateResult(
+            False,
+            f"team {team.budget_period} budget fully committed — no overflow headroom left",
+            refused_period=team.budget_period,
+            refused_kind=own.refused_kind,
+        )
+    return GateResult(True)
+
+
+async def _apply_team_model_caps(team: teams.TeamEnrollment, own: GateResult, model: str) -> GateResult:
+    """The PER-MODEL team overlay (derived envelopes, 2026-10-30).
+
+    Every N x profile preset is its own team pool, scoped to (model, period):
+
+    * a model-specific preset pools THAT model's team spend only;
+    * a '*' preset pools the team's total across models for its period;
+    * the request's model is checked against every cap that names it (or a
+      '*') — one team_cap_spend round trip, the same single aggregate the
+      pooled path paid;
+    * the POOLED number is checked AFTER the caps and binds ALWAYS, whatever
+      derived it (audit W6 #1, 2026-11-02): a derived pooled number is the SUM
+      of the per-model pools, so it is the team's TOTAL bound — the per-model
+      caps are sub-bounds of it, never a substitute. Without this a named-model
+      request rode its own pool on top of a team total already at the envelope
+      (~2x the stated cap);
+    * OVERFLOW SWALLOW RULE (the operator's reading, now the code's): a
+      per-key refusal is swallowed ONLY into the pool of the same
+      (model, period, kind) limit that refused. A day-limit refusal cannot
+      draw on month headroom, and a GLM refusal cannot draw on Qwen headroom.
+      A refusal whose (model, period, kind) has no pool at all stands —
+      nothing was derived for it to overflow into.
+
+    The caps are POST-PAID (spent >= limit) like every team cap: the pool is
+    shared by concurrent teammates and the in-flight request's true size is
+    known only after the response.
+    """
+    caps = [c for c in team.model_caps if c.model == model or c.model == "*"]
+    if not caps:
+        # A model no preset names: the pooled envelope remains the outer
+        # bound — the same accidental bound such models always had.
+        return await _apply_pooled_envelope(team, own)
+    # ONE AGGREGATE (audit W6 #1 follow-up): the pooled total is the '*' scope —
+    # no model filter, i.e. the whole team's spend for the enrollment's period —
+    # so it rides the SAME statement as the per-model caps instead of paying a
+    # second team_spend round trip on the admission hot path. A '*' model_cap for
+    # the same period IS that same quantity (team_cap_spend dedupes the scope), so
+    # folding it in cannot conflate two different numbers.
+    pooled_scope = ("*", team.budget_period)
+    scopes = [(c.model, c.period) for c in caps]
+    if team.budget_tokens is not None or team.budget_usd is not None:
+        scopes.append(pooled_scope)
+    spends = await teams.team_cap_spend(team.id, scopes)
+    refusal, team_warn = _envelope_eval(team, caps, spends, pooled_scope)
+    if refusal is not None:
+        _metrics.BUDGET_REJECTIONS.labels(kind=refusal.refused_kind or "tokens").inc()
+        return refusal
+    if not own.ok:
+        standing = await _cap_overflow_verdict(team, own, caps)
+        if standing is own:
+            return own
+        if not standing.ok:
+            _metrics.BUDGET_REJECTIONS.labels(kind=standing.refused_kind or "tokens").inc()
+            return standing
+        # RESCUED: the per-key band still describes this call's headroom (the
+        # pre-refactor path returned GateResult(True, warn=own.warn) here), and
+        # the team band joins it — the header must carry the tighter one.
+        return GateResult(True, warn=max(own.warn, team_warn))
+    # The per-key warn band rides through AND the team band joins it: "80% of
+    # your allocation" and "95% of the team pool" are both true statements
+    # about the call's headroom, and the header must carry the tighter one.
+    return GateResult(True, warn=max(own.warn, team_warn))
+
+
+async def _apply_pooled_envelope(team: teams.TeamEnrollment, own: GateResult) -> GateResult:
+    """The POOLED overlay: one token cap + one USD cap for the enrollment's
+    period — the explicit-envelope shape, and the fallback bound for a model
+    that no preset names on a derived team."""
+    period = team.budget_period
+    tokens_spent, usd_spent = await teams.team_spend(team.id, period)
+    pooled_scope = ("*", period)
+    refusal, team_warn = _envelope_eval(team, (), {pooled_scope: (tokens_spent, usd_spent)}, pooled_scope)
+    if refusal is not None:
+        _metrics.BUDGET_REJECTIONS.labels(kind=refusal.refused_kind or "tokens").inc()
+        return refusal
+    if not own.ok:
+        # OVERFLOW SWALLOW (pooled path, 2026-10-30 review): a per-key refusal
+        # is rescued ONLY by a pool of the same KIND for the envelope's own
+        # period — the envelope IS the only pool an explicit cap has.
+        standing = await _pooled_overflow_verdict(team, own)
+        if standing is own:
+            return own
+        if not standing.ok:
+            _metrics.BUDGET_REJECTIONS.labels(kind=standing.refused_kind or "tokens").inc()
+            return standing
+        # RESCUED: carry the per-key band through (pre-refactor behaviour).
+        return GateResult(True, warn=max(own.warn, team_warn))
+    return GateResult(True, warn=max(own.warn, team_warn))
+
+
+async def check_rate_limit(
+    key_id: uuid.UUID,
+    rpm: int,
+    tpm: int,
+    est_tokens: int,
+    request_id: str = "",
+    model: str = "",
+) -> GateResult:
     """Atomic fixed-window counter; creates the window row if absent.
 
     request_id (optional): when the caller supplies it, the charge actually
@@ -403,10 +947,12 @@ async def check_rate_limit(key_id: uuid.UUID, rpm: int, tpm: int, est_tokens: in
     now = datetime.now(UTC)
     start = _window_start(now, "day").replace(hour=now.hour, minute=now.minute)  # 1-minute windows
     # ADMISSION CHARGE (rate_limit_predict_cached): discount the estimate by
-    # the key's OWN measured cache ratio, so a cache-heavy conversation is
-    # not refused for tokens the upstream will serve from prefix cache.
-    # Without the flag this is exactly est_tokens (byte-identical legacy).
-    charge = await predicted_charge(key_id, est_tokens)
+    # THIS KEY's measured cache ratio FOR THIS MODEL, so a cache-heavy
+    # conversation is not refused for tokens the upstream will serve from
+    # prefix cache - and a one-shot embedding/rerank call is not discounted
+    # by the key's chat traffic. Without the flag (or without a model) this
+    # is exactly est_tokens (byte-identical legacy).
+    charge = await predicted_charge(key_id, model, est_tokens)
     if charge != est_tokens:
         _remember_charge(request_id, charge)
     row = await db.fetchrow(
@@ -460,7 +1006,7 @@ async def check_rate_limit(key_id: uuid.UUID, rpm: int, tpm: int, est_tokens: in
 # The key's measured cache ratio, cached in-process for _PREDICT_TTL_S.
 # Module-level (not per-request) so the admission path costs one indexed
 # ledger aggregate per key per TTL window, not one per request.
-_predict_cache: dict[uuid.UUID, tuple[float, float]] = {}  # key -> (ratio, expires_at)
+_predict_cache: dict[tuple[uuid.UUID, str], tuple[float, float]] = {}  # (key, model) -> (ratio, expires_at)
 
 
 def _predict_ttl() -> float:
@@ -471,8 +1017,8 @@ def _predict_enabled() -> bool:
     return bool(getattr(settings, "rate_limit_predict_cached", False))
 
 
-async def measured_cache_ratio(key_id: uuid.UUID) -> float:
-    """This key's token-weighted cache ratio over its recent ledger rows.
+async def measured_cache_ratio(key_id: uuid.UUID, model: str) -> float:
+    """This key's token-weighted cache ratio for ONE model, over its recent rows.
 
     WHY a MEASURED ratio rather than a blind discount: the admission gate has
     no upstream usage to consult (the call has not run yet), so the only
@@ -482,12 +1028,29 @@ async def measured_cache_ratio(key_id: uuid.UUID) -> float:
     bypass. A measured ratio is self-limiting: to raise it you must actually
     be cache-served.
 
-    Returns 0.0 when there is no history (a new key pays the FULL estimate)
+    WHY PER MODEL (2026-11-02): cache hit rate is a property of the WORKLOAD,
+    not of the key. On this fleet the chat pools run 94-99.7% prefix-cache
+    hits while embedding/reranker/voice pools sit near zero (one forward pass
+    per unique input - there is no repeated prefix to serve). A key-scoped
+    ratio blended those into one number: a chat-heavy key's ~95% discounted
+    its embedding/rerank calls to ~5% of the estimate, and a key whose recent
+    rows were embedding-heavy charged its first big chat call the FULL
+    estimate - still 429ing on tokens the upstream would have served from
+    cache. Scoping the lookup to (key, model) makes each model's admission
+    charge reflect that model's own measured behaviour.
+
+    Returns 0.0 when there is no model in hand, no history for THIS model (a
+    new key, or a model the key has not called yet, pays the FULL estimate),
     or when the feature/ledger is unavailable - fail-safe to the legacy
     charge, never to a discount.
     """
+    if not model:
+        # No model in hand (a caller that has not resolved one yet): charge
+        # the full estimate. Prediction is an optimisation, never a right.
+        return 0.0
     now = time.monotonic()
-    hit = _predict_cache.get(key_id)
+    cache_key = (key_id, model)
+    hit = _predict_cache.get(cache_key)
     if hit is not None and hit[1] > now:
         return hit[0]
     rows = int(getattr(settings, "rate_limit_predict_rows", 50) or 50)
@@ -499,12 +1062,14 @@ async def measured_cache_ratio(key_id: uuid.UUID) -> float:
             FROM (
                 SELECT cached_tokens, prompt_tokens
                 FROM usage_ledger
-                WHERE key_id = $1 AND status = 'ok' AND prompt_tokens > 0
+                WHERE key_id = $1 AND model = $2
+                  AND status = 'ok' AND prompt_tokens > 0
                 ORDER BY ts DESC
-                LIMIT $2
+                LIMIT $3
             ) recent
             """,
             key_id,
+            model,
             rows,
         )
     except Exception:
@@ -515,7 +1080,7 @@ async def measured_cache_ratio(key_id: uuid.UUID) -> float:
         ratio = float(row["cached"] or 0) / float(row["prompt"])
         # Clamp: a poisoned/odd upstream row must never imply a discount > 1.
         ratio = min(1.0, max(0.0, ratio))
-    _predict_cache[key_id] = (ratio, now + _predict_ttl())
+    _predict_cache[cache_key] = (ratio, now + _predict_ttl())
     # Bound the cache: a gateway with many keys must not grow this unboundedly.
     if len(_predict_cache) > 4096:
         for k in [k for k, v in _predict_cache.items() if v[1] <= now]:
@@ -523,7 +1088,7 @@ async def measured_cache_ratio(key_id: uuid.UUID) -> float:
     return ratio
 
 
-async def predicted_charge(key_id: uuid.UUID, est_tokens: int) -> int:
+async def predicted_charge(key_id: uuid.UUID, model: str, est_tokens: int) -> int:
     """The admission charge: the estimate discounted by the MEASURED ratio.
 
     Returns est_tokens unchanged when prediction is off (byte-identical
@@ -531,7 +1096,7 @@ async def predicted_charge(key_id: uuid.UUID, est_tokens: int) -> int:
     """
     if not _predict_enabled() or est_tokens <= 0:
         return est_tokens
-    ratio = await measured_cache_ratio(key_id)
+    ratio = await measured_cache_ratio(key_id, model)
     return int(est_tokens * (1.0 - ratio))
 
 
@@ -734,13 +1299,26 @@ def _budget_token_expr(alias: str) -> str:
     via GREATEST/LEAST guards that keep a poisoned row (cached > total)
     from going negative. The USD branch is UNCHANGED - costs.compute
     already prices cached tokens at cached_per_m."""
+    return f"SUM({_budget_token_value(alias)})"
+
+
+def _budget_token_value(alias: str) -> str:
+    """The PER-ROW billable-token VALUE (no aggregate) for `alias`.
+
+    2026-10-30: split out of _budget_token_expr because a caller that needs
+    its own aggregate — team_cap_spend's SUM(...) FILTER per scope — cannot
+    nest the SUM the expr already carries (Postgres: "aggregate function
+    calls cannot be nested"; a live 500 the fake DB could never catch).
+    This is the single source of the cache-discount arithmetic: the SUM form,
+    the per-scope FILTER form and the console rollups all build on it.
+    """
     frac = min(1.0, max(0.0, float(settings.budget_cached_exempt_fraction)))
     t = f"{alias}.total_tokens"
     f = f"{alias}.billing_fraction"
     if frac <= 0.0:
-        return f"SUM({t} * {f})"
+        return f"{t} * {f}"
     c = f"{alias}.cached_tokens"
-    return f"SUM(GREATEST({t} - LEAST({c}, {t}) * {frac}, 0) * {f})"
+    return f"GREATEST({t} - LEAST({c}, {t}) * {frac}, 0) * {f}"
 
 
 async def settle(
@@ -769,7 +1347,10 @@ async def settle(
     those rows cost ZERO budget — the budget SUM excludes them — but stay
     visible for the cache-hits reporting). Cost: computed from model_costs
     AT REQUEST TIME and stored on the row (repricing never rewrites
-    history); NULL when unpriced.
+    history); NULL only when the row was never real upstream spend — an
+    unpriced model, or a status outside _COSTED_STATUSES (a request that
+    never reached an upstream). A post-call 'guardrail_blocked' row IS
+    priced: the GPU time was spent (audit r5 #9).
 
     billing_fraction: the off-peak evaluator's CURRENT fraction at the
     settle moment (core.offpeak.fraction(); 1.0 when the feature is off or
@@ -799,7 +1380,12 @@ async def settle(
         from decimal import Decimal
 
         cost = Decimal("0.000000")
-    elif status == "ok":
+    elif status in _COSTED_STATUSES:
+        # Real upstream spend is priced whatever the OUTCOME was: a post-call
+        # guardrail block ('guardrail_blocked') burned the same prefill, and
+        # leaving it unpriced stored the tokens with cost_usd NULL (audit r5
+        # #9 — the ledger then claimed "real upstream spend" for tokens it
+        # never priced).
         from . import costs as _costs
 
         cost = await _costs.compute(model, prompt_tokens, completion_tokens, cached_tokens)
@@ -906,99 +1492,172 @@ async def budget_status(key_id: uuid.UUID) -> list[dict]:
     return out
 
 
-async def model_capacity(key_id: uuid.UUID, models: list[str]) -> dict[str, dict]:
-    """Per-model budget capacity for ONE key, right now.
+async def model_capacity(key_id: uuid.UUID, models: list[str], est_tokens: int = 0) -> dict[str, dict]:
+    """Per-model budget capacity for ONE key, right now — TEAM ENVELOPE INCLUDED.
 
-    Returns {model: {"ok": bool, "remaining_tokens": int | None, "blocked_by": str}}.
+    Returns {model: {"ok": bool, "remaining_tokens": int | None, "blocked_by": str,
+                     "warn": int, "team": {...}?}}.
     remaining_tokens is None when the key carries no token budget for that model
-    (unlimited). blocked_by is "" when ok, else a short human reason.
+    (unlimited). blocked_by is "" when ok, else a short human reason. warn is
+    the highest crossed warning band (80/95) — the SAME number check_budgets
+    puts in X-Budget-Warning. `team` appears only when the key's enrollment
+    carries an envelope, and reports that envelope's own verdict.
+    ON A REFUSED MODEL the band is what was accumulated BEFORE the refusing
+    row (the gate's own GateResult carries 0 there) — the gate's
+    X-Budget-Warning only rides ADMITTED calls, so there is no header to
+    disagree with, and the extra information is what a picker wants: "this
+    rung is spent, the next one is at 85%".
 
-    READ "ok" AS "HAS HEADROOM", NOT "WILL ADMIT THIS REQUEST". This is a
-    visibility filter, not the gate: check_budgets also charges an ADMISSION
-    ESTIMATE (est_tokens discounted by budget_cached_exempt_fraction, 0.9 on
-    this deployment), so a model with 5k tokens left reports ok=True here and
-    is still refused for a 100k-token request. The divergence is deliberate —
-    the alternative is guessing the caller's next prompt size — and it is why
-    the admission gate remains the only enforcement point.
+    READ "ok" AS "THE ADMISSION GATE WOULD ADMIT THIS", not merely "spent <
+    limit". The per-key verdict is the SAME pure evaluator the gate runs
+    (_eval_token_rows / _eval_usd_rows), including the admission estimate, and
+    the team overlay mirrors _apply_team_envelope exactly: per-model caps, the
+    pooled outer bound, and the overflow swallow with its UNCOMMITTED-headroom
+    test. That parity is the whole point — the router offers only models
+    admission would serve, so it cannot pick one the gate then 429s, and a
+    listing cannot say "Unavailable to you" about a model overflow admits.
+
+    `est_tokens` is the request's estimated size. The default 0 keeps the
+    listing's historical "has headroom" reading; the routing path passes the
+    real estimate so a model with 5k left is not offered for a 100k request.
+    The team envelope stays POST-PAID (never charged an estimate), exactly like
+    the gate.
+
+    FAIL-OPEN is deliberate and is the routing contract: a budget lookup fault
+    must never make models disappear from model_list (an empty or all-blocked
+    answer would reroute/refuse traffic on a DB blip). The gate itself still
+    enforces on admission, so the worst case is a model shown as available
+    that the gate then refuses — never the reverse.
     """
-    # FAST PATH (perf): the overwhelming majority of keys carry NO budget rows
-    # at all, and budget_status would pay BOTH lineage fetchrows plus BOTH
-    # ledger aggregates to discover that. Probe the tiny indexed catalog first
-    # — the same short-circuit check_budgets uses (see its REMEDIATION P4
-    # note) — so the common case costs ONE cheap probe instead of four
-    # round-trips on the pool the data plane shares.
+    if not models:
+        return {}
+    unlimited = {m: {"ok": True, "remaining_tokens": None, "blocked_by": "", "warn": 0} for m in models}
+    # TEAM ENVELOPE (2026-11-03): the gate's verdict is the per-key verdict
+    # OVERLAID by the enrollment's envelope (check_budgets -> _apply_team_envelope).
+    # A capacity that stopped at the per-key rows advertised models the TEAM
+    # pool then refused — the "routed to a model I have no budget for"
+    # complaint this projection exists to prevent. The lookup is TTL-cached in
+    # core.teams (30 s, negative answers included), so it is ~free per call.
     try:
-        if await _budget_rows_exist(key_id, None) is False:
-            return {m: {"ok": True, "remaining_tokens": None, "blocked_by": ""} for m in models}
+        team = await _team_for_key(key_id)
+    except Exception:  # _team_for_key is tolerant already; belt and braces
+        log.warning("model_capacity: team lookup failed; per-key verdict only", exc_info=True)
+        team = None
+    team_budget = team is not None and team.has_budget
+
+    # FAST PATH (perf): the overwhelming majority of keys carry NO budget rows
+    # at all, and the aggregates below would pay BOTH lineage fetchrows plus
+    # BOTH ledger SUMs to discover that. Probe the tiny indexed catalog first —
+    # the same short-circuit check_budgets uses (see its REMEDIATION P4 note) —
+    # so the common case costs one cheap probe instead of four round-trips on
+    # the pool the data plane shares. The probe covers the OWN rows only; a
+    # team-capped key still takes the aggregate path even with no own rows.
+    try:
+        any_rows = await _budget_rows_exist(key_id, None)
     except Exception:
         # An unknown catalog must never skip the real check below.
+        any_rows = None
         log.warning("model_capacity: budget-row probe failed; falling back to the aggregates", exc_info=True)
-    # WHY this delegates to budget_status instead of issuing its own SQL:
-    # budget_status already runs EXACTLY the two aggregate queries the gate
-    # runs (one per budget family, lineage-scoped, cache-weighted — see
-    # _budget_sums), and the operator's question ("which models still have
-    # token capacity at that moment?") is answered entirely from those rows.
-    # A third hand-rolled aggregate here would be a second copy of the
-    # spend math that can silently drift from what check_budgets ENFORCES —
-    # visibility that disagrees with the gate is worse than no visibility.
-    # It also keeps the cost at TWO queries for the whole model list: the
-    # naive shape (check_budgets per model) would be 2*len(models) ledger
-    # SUMs on the connection pool the data plane shares, from a UI endpoint.
-    #
-    # FAIL-OPEN is deliberate and is the routing contract: a budget lookup
-    # fault must never make models disappear from model_list (an empty or
-    # all-blocked answer would reroute/refuse traffic on a DB blip). The
-    # gate itself still enforces on admission, so the worst case is a model
-    # shown as available that the gate then refuses — never the reverse.
-    try:
-        rows = await budget_status(key_id)
-    except Exception:
-        log.warning("model_capacity: budget lookup failed; reporting all models as unlimited", exc_info=True)
-        return {m: {"ok": True, "remaining_tokens": None, "blocked_by": ""} for m in models}
+    if any_rows is False and not team_budget:
+        return unlimited
 
-    # Matching semantics MIRROR check_budgets byte-for-byte:
-    # * a row applies to model m when row["model"] == m or row["model"] == "*"
-    #   (the same predicate the ledger JOIN uses: l.model = b.model OR
-    #   b.model = '*');
-    # * token exhaustion is spent >= limit — the gate's admission test is
-    #   spent + est > limit, so a row with even ONE token of headroom
-    #   (spent + 1 <= limit) admits and is therefore NOT exhausted. Reporting
-    #   "0 remaining" for a row that still admits would be a false block;
-    # * USD exhaustion is spent_usd >= limit_usd (post-paid: the gate cannot
-    #   know in-flight cost, so the equality case is already exhausted);
-    # * NO matching row anywhere -> UNLIMITED. This mirrors check_budgets'
-    #   any_rows-is-False short-circuit: a key without budget rows is not
-    #   "exhausted", it is uncapped. This is the overwhelmingly common case
-    #   and must never render as blocked.
+    token_rows: list[Any] = []
+    usd_rows: list[Any] = []
+    if any_rows is not False:
+        # WHY the SAME _budget_sums the gate runs (not budget_status): this is
+        # ONE implementation of the spend math, and visibility that disagrees
+        # with the gate is worse than no visibility. Two aggregates for the
+        # whole model list — the naive shape (check_budgets per model) would be
+        # 2*len(models) ledger SUMs on the pool the data plane shares.
+        try:
+            token_rows = list(await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, None))
+            usd_rows = list(await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, None))
+        except Exception:
+            log.warning("model_capacity: budget lookup failed; reporting all models as unlimited", exc_info=True)
+            return unlimited
+
+    # TEAM SPEND — ONE aggregate for the whole listing. A derived envelope is
+    # per-model, so every cap's scope is fetched together (team_cap_spend
+    # dedupes and runs one statement, with the pooled '*' scope folded in); an
+    # explicit envelope is one pooled number (team_spend).
+    caps: tuple[teams.TeamModelCap, ...] = tuple(team.model_caps) if team_budget and team is not None else ()
+    spends: dict[tuple[str, str], tuple[int, float]] = {}
+    pooled_scope = ("*", team.budget_period) if team_budget and team is not None else None
+    if team_budget and team is not None and pooled_scope is not None:
+        try:
+            if caps:
+                scopes = [(c.model, c.period) for c in caps]
+                if team.budget_tokens is not None or team.budget_usd is not None:
+                    scopes.append(pooled_scope)
+                spends = await teams.team_cap_spend(team.id, scopes)
+            else:
+                tokens_spent, usd_spent = await teams.team_spend(team.id, team.budget_period)
+                spends = {pooled_scope: (tokens_spent, usd_spent)}
+        except Exception:
+            # FAIL-OPEN, same contract as the per-key lookup above: a team
+            # aggregate fault degrades to the per-key verdict, never to an
+            # empty listing. The gate still enforces on admission.
+            log.warning("model_capacity: team spend lookup failed; team overlay skipped", exc_info=True)
+            team_budget = False
+        # A PARTIAL aggregate is not an envelope: _envelope_eval indexes the
+        # scopes it needs, and a missing one would raise out of the listing.
+        # Degrade to the per-key verdict instead (fail-open, same contract as
+        # the faults above; the gate still enforces on admission).
+        if team_budget and not {(c.model, c.period) for c in caps}.issubset(spends):
+            log.warning("model_capacity: team spend aggregate is missing scopes; team overlay skipped")
+            team_budget = False
+
     out: dict[str, dict] = {}
+    # Per-SCOPE caches for the overflow swallow: a listing evaluates many
+    # models, but the number of DISTINCT scopes is the number of configured
+    # caps (or one pooled scope), NOT the number of models — so the whole
+    # listing still costs at most one round trip per scope.
+    scope_cache: dict[tuple[str, str, int | None, float | None], tuple[int | None, float | None]] = {}
+    pooled_cache: dict[str, tuple[int | None, float | None]] = {}
     for m in models:
-        matched = [r for r in rows if r["model"] == m or r["model"] == "*"]
-        if not matched:
-            out[m] = {"ok": True, "remaining_tokens": None, "blocked_by": ""}
-            continue
-
-        # Several rows can match one model (e.g. a '*' month cap plus an
-        # exact-model day cap, or the same model capped in two periods): the
-        # key is blocked if ANY of them is exhausted, and the reported
-        # headroom is the MINIMUM across the token rows — the tightest cap is
-        # what actually runs out first.
-        blocked_by = ""
-        remaining: int | None = None
-        for r in matched:
-            if r["kind"] == "tokens":
-                limit = int(r["limit"])
-                spent = int(r["spent"])
-                left = max(0, limit - spent)
-                remaining = left if remaining is None else min(remaining, left)
-                if spent >= limit and not blocked_by:
-                    blocked_by = f"{r['period']} token budget {limit} exhausted (spent {spent})"
-            elif r["kind"] == "usd":
-                limit_usd = float(r["limit_usd"])
-                spent_usd = float(r["spent_usd"] or 0)
-                if spent_usd >= limit_usd and not blocked_by:
-                    blocked_by = f"{r['period']} cost budget ${limit_usd:.2f} exhausted (spent ${spent_usd:.4f})"
-
-        out[m] = {"ok": not blocked_by, "remaining_tokens": remaining, "blocked_by": blocked_by}
+        # Matching semantics MIRROR the gate byte-for-byte: a row applies when
+        # row["model"] == m or row["model"] == "*" (the same predicate the
+        # ledger JOIN uses), and NO matching row means UNCAPPED, never blocked.
+        matched_t = [r for r in token_rows if r["model"] == m or r["model"] == "*"]
+        matched_u = [r for r in usd_rows if r["model"] == m or r["model"] == "*"]
+        token_refusal, token_warn = _eval_token_rows(matched_t, est_tokens)
+        usd_refusal, usd_warn = _eval_usd_rows(matched_u)
+        own = token_refusal or usd_refusal or GateResult(True)
+        entry: dict[str, Any] = {
+            "ok": own.ok,
+            "remaining_tokens": _token_headroom(matched_t),
+            "blocked_by": "" if own.ok else own.reason,
+            "warn": max(token_warn, usd_warn),
+        }
+        if team_budget and team is not None and pooled_scope is not None:
+            caps_for_model = [c for c in caps if c.model == m or c.model == "*"]
+            team_refusal, team_warn = _envelope_eval(team, caps_for_model, spends, pooled_scope)
+            entry["team"] = {
+                "period": team.budget_period,
+                "ok": team_refusal is None,
+                "warn": team_warn,
+            }
+            entry["warn"] = max(entry["warn"], team_warn)
+            if team_refusal is not None:
+                entry["ok"] = False
+                entry["team"]["blocked_by"] = team_refusal.reason
+                # REASON PARITY: when a per-key refusal cannot be swallowed
+                # (overflow off) the gate SHORT-CIRCUITS the envelope and
+                # reports the per-key reason; report the same one, or the
+                # listing would name a pool the caller never hit first.
+                if own.ok or team.overflow_enabled:
+                    entry["blocked_by"] = team_refusal.reason
+            elif not own.ok:
+                # The per-key refusal may be SWALLOWED into the team pool
+                # (overflow_enabled) — mirror the gate or the listing would
+                # hide a model admission would have served.
+                if caps_for_model:
+                    standing = await _cap_overflow_verdict(team, own, caps_for_model, scope_cache)
+                else:
+                    standing = await _pooled_overflow_verdict(team, own, pooled_cache)
+                entry["ok"] = standing.ok
+                entry["blocked_by"] = "" if standing.ok else standing.reason
+        out[m] = entry
     return out
 
 
@@ -1018,7 +1677,7 @@ async def budget_status_many(key_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[d
     if not key_ids:
         return out
     now = datetime.now(UTC)
-    starts = {p: _window_start(now, p) for p in ("day", "week", "month")}
+    starts = {p: _window_start(now, p) for p in _WINDOW_PERIODS}
     # Lineage note (audit P2-5 + review round 3): spend_ancestors arrays are
     # VARIABLE-LENGTH per key, so they cannot bind as a flat uuid[] alongside
     # their keys (asyncpg rejects non-homogeneous nested arrays), and unnest
@@ -1044,19 +1703,20 @@ async def budget_status_many(key_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[d
             LEFT JOIN usage_ledger l
               ON l.key_id = ANY(
                    (SELECT a.spend_ancestors FROM api_keys a WHERE a.id = b.key_id) || b.key_id)
-             AND l.status IN ('ok', 'error')
+             AND l.status IN ({_COSTED_SQL})
              AND (l.model = b.model OR b.model = '*')
              AND l.ts >= CASE b.period
+                         -- _WINDOW_PERIODS order, ELSE = the last one (year)
                          WHEN 'day' THEN ${n + 1}::timestamptz
                          WHEN 'week' THEN ${n + 2}::timestamptz
-                         ELSE ${n + 3}::timestamptz END
+                         WHEN 'month' THEN ${n + 3}::timestamptz
+                         WHEN 'quarter' THEN ${n + 4}::timestamptz
+                         ELSE ${n + 5}::timestamptz END
             WHERE b.key_id IN ({placeholders})
             GROUP BY b.key_id, b.model, b.period, b.{limit_col}
             """,
             *key_ids,
-            starts["day"],
-            starts["week"],
-            starts["month"],
+            *(starts[p] for p in _WINDOW_PERIODS),
         )
         for r in rows:
             if table == "budgets":

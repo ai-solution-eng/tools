@@ -302,6 +302,7 @@ def test_payload_telemetry_never_refuses(monkeypatch: pytest.MonkeyPatch) -> Non
     assert '"ok": true' in out
     assert ("workbench", "write_file", "base64-blob") in env.metrics
 
+
 def test_failover_candidate_runs_the_argument_stage_for_its_own_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -363,3 +364,102 @@ def test_failover_candidate_runs_the_argument_stage_for_its_own_server(
     assert touched == [primary["url"]], "the refused candidate must never be contacted"
     assert "cluster-host" in out, "the refusal must be reported in attempts"
     assert ("mcp:searxng:run", "policy_blocked") in settles
+
+
+# ---------------------------------------------------------------------------
+# F1 (audit w6): the DISCOVERY surfaces are metered and the fan-out bounded
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_rate_gate_refuses_tools_list_and_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F1: tools/list and mcp_catalog ran NO rate gate — with a cold TTL one
+    request opened N concurrent upstream listing sessions. Both discovery
+    surfaces now use the SAME check_rate_limit the gate chain uses, with the
+    SAME refusal shape: settle "rate_limited" + a ToolError result."""
+    key = _key()
+    env = _Env(key, {("searxng", "fetch")}, [_server("searxng")]).install(monkeypatch)
+
+    async def refused_rate(key_id: uuid.UUID, rpm: int, tpm: int, est: int):
+        return GateResult(False, reason="RPM limit 60 exceeded (61 this minute)")
+
+    monkeypatch.setattr(routes_mcp, "check_rate_limit", refused_rate)
+    server = routes_mcp._new_gateway_server()
+
+    token = routes_mcp._caller.set(key)
+    try:
+        with pytest.raises(ToolError) as list_exc:
+            asyncio.run(server.list_tools())
+        with pytest.raises(ToolError) as cat_exc:
+            asyncio.run(routes_mcp._mcp_catalog())
+    finally:
+        routes_mcp._caller.reset(token)
+
+    assert "rate limited" in str(list_exc.value), "tools/list must refuse with the standard shape"
+    assert "rate limited" in str(cat_exc.value), "mcp_catalog must refuse with the standard shape"
+    assert ("mcp:_discovery:tools_list", "rate_limited") in env.settles, env.settles
+    assert ("mcp:_discovery:mcp_catalog", "rate_limited") in env.settles, env.settles
+
+
+def test_catalog_fan_out_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F1: a cold-cache mcp_catalog used to open ONE upstream listing session
+    per registered server, all at once (N-parallel gather). The per-request
+    semaphore caps the amplification at _CATALOG_FETCH_CONCURRENCY."""
+    key = _key()
+    env = _Env(key, {("searxng", "fetch")}, [_server(f"s{i}") for i in range(6)]).install(monkeypatch)
+    routes_mcp.listing_cache_clear()
+    state = {"cur": 0, "max": 0}
+
+    async def tracked(server: dict[str, Any]) -> list[dict[str, Any]]:
+        state["cur"] += 1
+        state["max"] = max(state["max"], state["cur"])
+        await asyncio.sleep(0.02)
+        state["cur"] -= 1
+        return []
+
+    monkeypatch.setattr(routes_mcp, "_cached_upstream_tools", tracked)
+
+    token = routes_mcp._caller.set(key)
+    try:
+        out = asyncio.run(routes_mcp._mcp_catalog())
+    finally:
+        routes_mcp._caller.reset(token)
+
+    assert env.upstream_calls == 0, "the tracker replaced the fetch — no real sessions"
+    # getattr default: pre-fix the module has no cap constant — the pin must
+    # fail on the MEASURED concurrency (6-parallel), not at setup
+    cap = getattr(routes_mcp, "_CATALOG_FETCH_CONCURRENCY", 4)
+    assert state["max"] <= cap, (f"cold fan-out opened {state['max']} concurrent sessions; cap is {cap}",)
+    assert "servers" in out
+
+
+def test_discovery_gate_fails_open_on_limiter_infrastructure_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F1 follow-up: the gate distinguishes "the limiter could not be
+    evaluated" (a DB blip inside check_rate_limit) from "the limit was
+    exceeded". A limiter outage must not become a discovery outage: an
+    INFRASTRUCTURE error is logged at WARNING and the listing proceeds —
+    still bounded by the TTL caches, the 15 s metadata bound and the
+    fan-out cap. The OVER-LIMIT path never fails open (the refusal pin
+    above keeps proving that)."""
+    import logging
+
+    key = _key()
+    env = _Env(key, {("searxng", "fetch")}, [_server("searxng")]).install(monkeypatch)
+
+    async def broken_limiter(key_id: uuid.UUID, rpm: int, tpm: int, est: int):
+        raise RuntimeError("database not connected")
+
+    monkeypatch.setattr(routes_mcp, "check_rate_limit", broken_limiter)
+
+    token = routes_mcp._caller.set(key)
+    try:
+        with caplog.at_level(logging.WARNING, logger="pcai_llm.api.routes_mcp"):
+            out = asyncio.run(routes_mcp._mcp_catalog())
+    finally:
+        routes_mcp._caller.reset(token)
+
+    assert "servers" in out, "a limiter outage must not refuse discovery"
+    assert any("rate gate unavailable" in r.getMessage() for r in caplog.records), caplog.text
+    assert env.settles == [], "nothing was refused, so no refusal row exists"

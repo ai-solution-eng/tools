@@ -17,7 +17,10 @@
 # ### OPTIONAL ###
 # Major tuning setups (copy the shape from the pointer):
 #   SSO self-mint rollout, ORDERED: settings.trustProxyIdentity + ssoKeyCreateEnabled +
-#     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) —
+#     ezua.authorizationPolicy (+ relief knobs allowMetricsScrape / allowInClusterApi) +
+#     ezua.authorizationPolicy.ingressGatewayPrincipals — EMPTY while the trust flags
+#     are on leaves the WHOLE ingressNamespace able to deliver spoofed identity
+#     headers (the render warns loudly — see the NOTES.txt spoofing-risk block) —
 #     documentation/DEPLOYMENT.md § SSO self-mint rollout | documentation/changelogs/SSO-ROLLOUT-G2.md (the G2 runbook)
 #   Chart-generated Secrets (trial-friendly): adminApiKey.create / secretsMasterKey.create /
 #     database.embedded.auth.create — DEPLOYMENT.md § Required Secrets
@@ -49,7 +52,14 @@ deployment:
 image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits Chart.yaml appVersion.
-  tag: v3.5.1
+  # MUTABLE-TAG CAVEAT (W6 H5): the tag is mutable and the default
+  # pullPolicy IfNotPresent never re-pulls a re-pushed same-tag image on
+  # nodes that cached the old one. For a digest-pinned supply chain, set
+  # tag to the tag@digest form, e.g.
+  #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
+  # (the reference renders as repository:tag@sha256:...); for tag-only
+  # sites the alternative is pullPolicy: Always (re-checks every pull).
+  tag: v3.9.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -72,6 +82,14 @@ adminApiKey:
 database:
   existingSecret: pcai-llm-gateway-db
   existingSecretKey: database-url
+  # EXTERNAL-DB connection budget (used only when embedded.enabled=false): the
+  # database's max_connections, as far as the chart knows. 0/unset = unknown —
+  # with autoscaling on, NOTES.txt then prints the maxReplicas × dbPoolMax
+  # arithmetic as an informational NOTE instead of a warning; set it to the
+  # real limit to make an oversubscription a WARNING. Embedded mode uses
+  # database.embedded.maxConnections as the budget instead (image default 100
+  # when 0). See the autoscaling.maxReplicas × settings.dbPoolMax invariant.
+  maxConnectionsBudget: 0
 
   # Embedded Postgres 16 (StatefulSet + Service + PVC) in the release namespace;
   # the password arrives BY REFERENCE via discrete PCAI_LLM_DB_* env vars.
@@ -143,6 +161,12 @@ settings:
   # disable the writer entirely.
   effectivePromptCapture: true
   effectivePromptRetainDays: 7
+  # agent_traces retention (retentionTraceDays) — OBSERVABILITY, not the audit
+  # artifact: the usage LEDGER (never pruned, above) is what budgets and usage
+  # disputes rely on, so pruning traces is safe. 0 = never prune (the code
+  # default — the base chart keeps it; a site decides). Sites that want bounded
+  # growth opt in explicitly: the g2 example ships 30 (a full monthly budget
+  # window for troubleshooting).
   retentionTraceDays: 0
   retentionConversationDays: 0
   # canonical_conversations — the distiller's INPUT store (full message history as
@@ -159,6 +183,11 @@ settings:
   # Postgres pool bounds + bounded acquire: under saturation a request fails fast
   # (503 "database busy") instead of queueing forever.
   dbPoolMin: 5
+  # INvariant with autoscaling.maxReplicas: every pod pools its own dbPoolMax
+  # connections, so worst-case aggregate demand is maxReplicas × dbPoolMax —
+  # keep that product within the database's max_connections or pods fail to
+  # ACQUIRE at the spike that caused the scale-up (the render warns; see
+  # autoscaling.maxReplicas + database.maxConnectionsBudget).
   dbPoolMax: 25
   dbAcquireTimeoutS: 2
   embeddingCacheEnabled: true
@@ -184,6 +213,15 @@ settings:
   # with no history pays the full estimate (no bypass for new keys).
   # DEFAULT OFF: it changes admission behaviour; enable per site.
   rateLimitPredictCached: false
+  # Exact-match response cache for NON-STREAMING chat (2026-11-02).
+  # off = legacy path; shadow = measure would-be hits only (nothing served);
+  # active = serve a stored answer on a hit (free: a cache_hit ledger row,
+  # no budget, no rate-window token). Only deterministic requests qualify
+  # (temperature: 0, not streamed, not relayed).
+  # Start in shadow, read gateway_response_cache_total{mode="shadow"}, then
+  # switch to active only if the duplicate rate justifies it.
+  responseCacheMode: "off"
+  responseCacheTtlS: 3600
   # Settle the predicted-vs-actual difference. Leave ON when prediction is
   # on: it is what bounds a cache-busting caller to one cheap admission.
   rateLimitPredictReconcile: true
@@ -206,6 +244,22 @@ settings:
   # Bounded model-call retries PER RELAY TURN; spends only the REMAINING wall clock
   # and fires when >=10s of it is left. 0 = fail fast.
   toolRelayCallRetries: 1
+  # Active endpoint health probe (2026-11-03). GETs {base_url}/models on every
+  # chat/embedding/reranker endpoint and excludes an endpoint that fails N
+  # consecutive sweeps. DEFAULT OFF, deliberately: the first cut shipped on and
+  # took the fleet down (auth-less probe -> 401 from an upstream that gates
+  # /models -> every pool empty -> "503 no healthy upstream" on every request).
+  # Turn it on after GET /admin/endpoints shows the fleet probed OK. Two
+  # structural guards now exist: the probe sends the endpoint's own credential,
+  # and Pool.healthy() ignores the probe entirely when it would empty a pool —
+  # so the blast radius is degraded routing, never an outage.
+  healthProbe:
+    enabled: false
+    intervalS: 30
+    timeoutS: 5
+    # CONSECUTIVE failed sweeps before an endpoint is excluded (hysteresis,
+    # the same posture the breaker gives real traffic). 1 = exclude on a blip.
+    failuresToTrip: 2
   # Reasoning continuity (2026-10-26): show the model its OWN prior reasoning —
   # both in-loop (between tool calls) and inbound (what the client replays).
   # With this off, a long relay turn hands the model dozens of consecutive
@@ -231,6 +285,18 @@ settings:
   # requires header X-PCAI-Relay-Deltas: 1 — the stamp blocks execution.
   toolRelayRenderDeltas: false
   toolRelayRenderIndexBase: 1000
+  # Deterministic, model-free compression of oversized tool results
+  # (request header X-PCAI-Compress-Tools: 0|1|shadow). Default off; "shadow"
+  # measures the saving on real traffic without rewriting anything. Compressed
+  # results carry a digest marker; the synthetic pcai__retrieve tool expands
+  # them from the TTL-bound original store. No LLM, no extra request.
+  toolCompressDefault: "off"
+  toolCompressMinChars: 4096
+  toolCompressRatioFloor: 0.15
+  toolCompressStoreTtlS: 86400
+  # Largest original retained for retrieval (chars). Above this the result
+  # passes through uncompressed instead of pinning multi-MB text for the TTL.
+  toolCompressMaxStoreChars: 1000000
   # A key registers its local tools and answers relay dispatches over long-poll, so the
   # model calls `client__<tool>` in the live loop. Routes 404 while off.
   clientToolDispatch: false
@@ -258,6 +324,16 @@ settings:
   # `{server}__{tool}` tools; false = legacy two-tool surface.
   mcpFlatTools: true
   mcpCatalogCacheS: 60.0
+  # Cross-replica registry convergence (2026-10-30). The gateway caches
+  # mcp_servers + model_endpoints in PROCESS memory; with the HPA at 2+ pods a
+  # server registered on one replica was invisible to its sibling until that pod
+  # restarted (console "test" 404s on ~half the clicks; relay "unknown server"
+  # on the stale pod). Each replica now polls a DB watermark and refreshes when
+  # it moves. 5s bounds the data plane's staleness; 0 disables the poll (only
+  # safe on a single replica). The console additionally re-checks on read,
+  # rate-limited by registryAdminFreshS.
+  registryWatchS: 5.0
+  registryAdminFreshS: 1.0
   mcpFailoverAttempts: 2
   # Argument-level destination policy (hardening P0-1): runs on BOTH MCP paths
   # (/mcp and the relay, i.e. the tool calls a model makes during a chat turn).
@@ -284,6 +360,10 @@ settings:
   # Trust the oauth2-proxy identity headers on the browser rung. Client-spoofable at
   # the pod — set ONLY behind an enforcing proxy + AuthorizationPolicy.
   trustProxyIdentity: false
+  # Groups from X-Forwarded-Groups on the browser rung. The platform oauth2-proxy
+  # does NOT inject that header (an arriving value is client-supplied) — enable
+  # ONLY for chains whose proxy injects and overwrites it. DEFAULT OFF (fail closed).
+  trustForwardedGroups: false
   # Stamp X-MCP-Caller: <subject or key-fp>@gateway on every upstream fleet MCP call.
   # The name is RESERVED — tenants cannot supply it via per-key overrides.
   mcpCallerAttribution: true
@@ -305,11 +385,25 @@ settings:
   # POST /v1/keys/for-me: a trusted browser identity mints a key bound to its OWN subject.
   # ONE PER IDENTITY — a second mint is 409 unless {"rotate": true}.
   ssoKeyCreateEnabled: false
+  # Absolute URL of the platform oauth2-proxy's sign-out endpoint, e.g.
+  #   https://oauth2-proxy.<your-domain>/oauth2/sign_out
+  # Both consoles' "Sign out" navigates to /oauth2/sign_out on THIS host; the
+  # gateway answers that path with a redirect (never a JSON 404 — that was the
+  # "sign out does nothing" bug: the page died on {"detail":"Not Found"} while
+  # the domain-wide SSO cookie survived). Empty = local-only sign-out, and the
+  # UI says so honestly ("your platform session is still active").
+  # PREFER ezua.virtualService.ssoProxy below when the proxy is in-cluster: it
+  # routes /oauth2/ on this host straight to the proxy, so the same-origin
+  # sign-out really terminates the session and nothing needs configuring here.
+  ssoSignOutUrl: ""
   # A trusted browser identity in ANY of these groups (comma-separated) may call the
   # admin API. Empty = off. Same precondition as trustProxyIdentity.
   adminGroups: ""
-  # Opt-in at redemption: provisions a private RAG dataset on the REGISTERED memory MCP
-  # server and stamps X-Memory-Dataset + X-Dataset-Password onto the key. Requires secretsMasterKey.
+  # LEGACY opt-in (no longer offered in the redeem dialog; a redeem request's
+  # memory_opt_in field or a profile preset can still request it): provisions a private
+  # RAG dataset on the REGISTERED memory MCP server and stamps X-Memory-Dataset +
+  # X-Dataset-Password onto the key. Requires secretsMasterKey. The supported path is a
+  # per-key X-API-Key header override over an SSO-managed dataset.
   enrollMemoryDefault: false
   enrollMemoryServer: "mm-rag"
   enrollMemoryNameRetries: 3
@@ -318,7 +412,7 @@ settings:
   # Master env switch; the per-knob runtime config (summarizer model,
   # off-peak-only scheduling, quiet window, output cap) is admin-editable at
   # runtime via the Memory Distiller panel (DB-backed, no redeploy needed).
-  # Inert by construction for keys without the memory pair attached.
+  # Inert by construction for keys the backend reports unattached.
   distillerEnabled: false
   # Distill OUTPUT cap in tokens (NOT the RAG chunk size — that 8192 lives in
   # mm-rag). An overrun is rejected whole by document_is_complete(), so the
@@ -416,6 +510,29 @@ settings:
   demandAwareExcludedModels: []
   #   - Qwen3.8-27B
 
+  # OpenTelemetry tracing: one server span per HTTP request, exported as OTLP/HTTP
+  # JSON to {otelEndpoint}/v1/traces. Off = no span object, no task, no client.
+  otelEnabled: false
+  otelEndpoint: http://otel-collector:4318
+  otelServiceName: pcai-llm-gateway
+  # Deterministic per-trace hash ratio: 0 = none, 1 = all.
+  otelSampleRatio: 1.0
+
+  # Session affinity: a chat conversation that sends X-PCAI-Session pins the
+  # ENDPOINT (not just the cascade head) so its prefix keeps hitting the same
+  # server's KV cache. Routing STATE, never policy: a pin that no longer
+  # qualifies is discarded on read. Off by default (it changes endpoint
+  # selection, so it is opted into per site).
+  sessionAffinityEnabled: false
+  sessionAffinityTtlS: 3600
+
+  # Audio passthrough billing heuristics. TTS/ASR report no token usage, and
+  # a zero-token row would be a budget bypass, so the gateway bills an
+  # ESTIMATE: TTS by characters (4 chars ~ 1 token), ASR by audio duration
+  # (~3 tokens/second ~ 180/minute, roughly 150 spoken words).
+  audioTtsCharsPerToken: 4
+  audioAsrTokensPerSecond: 3.0
+
 # ============================================================================
 # Kyverno / Metrics
 # ============================================================================
@@ -480,6 +597,10 @@ podDisruptionBudget:
 autoscaling:
   enabled: false
   minReplicas: 2
+  # INvariant with settings.dbPoolMax: worst-case aggregate Postgres demand is
+  # maxReplicas × dbPoolMax (each pod pools its own connections) — keep that
+  # product within the database's max_connections (the render warns when it
+  # exceeds a known budget; see settings.dbPoolMax + database.maxConnectionsBudget).
   maxReplicas: 6
   targetCPUUtilizationPercentage: 70
 
@@ -563,6 +684,19 @@ ezua:
     istioGateway: istio-system/ezaf-gateway
     # >= settings.upstreamTimeoutS (900s) or Istio 504s long streams
     timeout: 960s
+    # SAME-ORIGIN SSO SIGN-OUT (optional). Routes /oauth2/ on THIS host to the
+    # platform's oauth2-proxy, so the consoles' "Sign out" -> /oauth2/sign_out
+    # reaches the proxy directly: it clears the domain-wide session cookie and
+    # bounces back. Without it the path falls to the gateway (which answers a
+    # redirect, so nothing breaks — the session just is not ended) or to the
+    # catch-all "/" route (the old JSON-404 behaviour).
+    # The cookie lives on the PARENT domain (--cookie-domain=.<domain>), so a
+    # Set-Cookie from this host clears it — that is why same-origin works.
+    # Find the service with: kubectl -n oauth2-proxy get svc
+    ssoProxy:
+      enabled: false
+      host: ""            # e.g. oauth2-proxy.oauth2-proxy.svc.cluster.local
+      port: 80
 
   # Route /admin on the PUBLIC VirtualService. /admin mutates the control plane — flip
   # true ONLY where real gateway auth sits in front.
@@ -585,7 +719,8 @@ ezua:
     allowMetricsScrape: false
     metricsNamespace: prometheus
     # ANY source on the traffic port EXCEPT the identity-bearing paths (/v1/identity,
-    # /v1/keys/for-me) — for apps calling the gateway SERVICE directly.
+    # /v1/keys/for-me, /v1/enroll, /admin) — for apps calling the gateway SERVICE
+    # directly. Rule (ii)'s same-namespace leg carries the same notPaths set.
     allowInClusterApi: false
     # EXTRA rules — when NON-EMPTY these REPLACE the baseline above. E.g. a principal+GET allow:
     #   rules: [{from: [{source: {principals: ["cluster.local/ns/istio-system/sa/httpbin"]}}], to: [{operation: {methods: ["GET"]}}]}]

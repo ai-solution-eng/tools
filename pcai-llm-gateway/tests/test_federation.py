@@ -49,6 +49,7 @@ def test_is_allowed_exact_pair_only() -> None:
 def test_unknown_server_never_allowed() -> None:
     assert not is_allowed({("x", "y")}, "unknown", "tool")
 
+
 # ---------------------------------------------------------------------------
 # Server-class taxonomy + presets + admin hard stop (P0-3, hardening wave)
 # ---------------------------------------------------------------------------
@@ -176,10 +177,16 @@ def test_preset_pairs_resolution() -> None:
     assert egress == {("searxng", "search"), ("searxng", "fetch_content")}
 
     mutate = set(preset_pairs("mutate", FLEET_PAIRS))
-    assert {("applygate", "apply_manifest"), ("applygate", "plan_apply"),
-            ("applygate", "delete_resource"), ("applygate", "plan_delete"),
-            ("ezapp-deploy", "apply_ezappconfig"), ("workbench", "write_file"),
-            ("mm-rag", "dataset_delete_documents"), ("mm-rag", "add_memory")} <= mutate
+    assert {
+        ("applygate", "apply_manifest"),
+        ("applygate", "plan_apply"),
+        ("applygate", "delete_resource"),
+        ("applygate", "plan_delete"),
+        ("ezapp-deploy", "apply_ezappconfig"),
+        ("workbench", "write_file"),
+        ("mm-rag", "dataset_delete_documents"),
+        ("mm-rag", "add_memory"),
+    } <= mutate
     # sqlhandler carries no mutate CLASS, so its write verbs ride no preset:
     # they are reachable only through explicit per-key/per-profile grants
     assert ("sqlhandler", "run_sql") not in mutate
@@ -218,18 +225,33 @@ def test_write_verb_rule_pins_the_reviewed_catalog() -> None:
     of these shapes, this test is the tripwire to review the constant."""
     for t in (
         # mm-rag (the wave-1 review list, verbatim)
-        "dataset_delete_documents", "end_short_term_memory", "dataset_add_documents",
-        "dataset_replace_document", "add_memory", "delete_memory", "forget_session",
-        "set_memory_dataset", "deselect_dataset", "unlock_dataset",
+        "dataset_delete_documents",
+        "end_short_term_memory",
+        "dataset_add_documents",
+        "dataset_replace_document",
+        "add_memory",
+        "delete_memory",
+        "forget_session",
+        "set_memory_dataset",
+        "deselect_dataset",
+        "unlock_dataset",
         "create_short_term_memory",
         # sqlhandler persistence verbs
-        "query_save", "query_delete", "query_cancel",
+        "query_save",
+        "query_delete",
+        "query_cancel",
         # k8s-ops execution
-        "exec_in_pod", "run_kubectl",
+        "exec_in_pod",
+        "run_kubectl",
         # applygate / ezapp-deploy destructive verbs
-        "plan_delete", "delete_chart", "apply_manifest", "apply_ezappconfig",
+        "plan_delete",
+        "delete_chart",
+        "apply_manifest",
+        "apply_ezappconfig",
         # workbench writes
-        "write_file", "delete_file", "sandbox_run",
+        "write_file",
+        "delete_file",
+        "sandbox_run",
     ):
         assert is_write_tool(t), t
     # wave-2: the two read-only run tools are write-SHAPED but read-only BY
@@ -242,11 +264,26 @@ def test_write_verb_rule_pins_the_reviewed_catalog() -> None:
     assert READ_ONLY_RUN_TOOLS == {("sqlhandler", "run_sql"), ("k8s-ops", "run_kubectl")}
     assert is_write_tool("run_sql") and is_write_tool("run_kubectl")  # shape, unchanged
     for t in (
-        "search_dataset", "get_dataset_files", "search_logs", "get_pod_logs",
-        "prom_query", "triage", "cluster_health", "check_rbac",
-        "verify_audit_chain", "sample_rows", "query_result", "query_status",
-        "column_stats", "describe_media", "transcribe_audio", "whoami",
-        "search", "fetch_content", "describe_table", "profile_table",
+        "search_dataset",
+        "get_dataset_files",
+        "search_logs",
+        "get_pod_logs",
+        "prom_query",
+        "triage",
+        "cluster_health",
+        "check_rbac",
+        "verify_audit_chain",
+        "sample_rows",
+        "query_result",
+        "query_status",
+        "column_stats",
+        "describe_media",
+        "transcribe_audio",
+        "whoami",
+        "search",
+        "fetch_content",
+        "describe_table",
+        "profile_table",
         "get_resource",
     ):
         assert not is_write_tool(t), t
@@ -268,6 +305,7 @@ def test_admin_only_tool_case_insensitive() -> None:
 
 def test_preset_pairs_unknown_preset_raises() -> None:
     import pytest as _pytest
+
     with _pytest.raises(ValueError):
         preset_pairs("everything", FLEET_PAIRS)  # a typo must be loud
 
@@ -279,6 +317,7 @@ def test_preset_catalog_pairs_shape() -> None:
 
 def test_separate_read_egress_mode_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     from pcai_llm.config import settings
+
     assert separate_read_egress_mode() == "warn"  # the DEFAULT (spec §3 D3.3)
     assert separate_read_egress_mode("enforce") == "enforce"
     assert separate_read_egress_mode("off") == "off"

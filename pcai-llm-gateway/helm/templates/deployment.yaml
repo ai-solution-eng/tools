@@ -190,6 +190,14 @@ spec:
               value: {{ .Values.settings.rateLimitPredictCached | quote }}
             - name: PCAI_LLM_RATE_LIMIT_PREDICT_RECONCILE
               value: {{ .Values.settings.rateLimitPredictReconcile | quote }}
+            # --- exact-match response cache (2026-11-02): off | shadow | active.
+            # Shadow measures would-be hits without serving; active replays a
+            # stored answer for a deterministic, non-streaming, non-relay
+            # request (a free cache_hit ledger row).
+            - name: PCAI_LLM_RESPONSE_CACHE_MODE
+              value: {{ .Values.settings.responseCacheMode | quote }}
+            - name: PCAI_LLM_RESPONSE_CACHE_TTL_S
+              value: {{ .Values.settings.responseCacheTtlS | quote }}
             # --- tool-use relay (server-side model<->MCP loop) ---
             - name: PCAI_LLM_TOOL_RELAY_ENABLED
               value: {{ .Values.settings.toolRelayEnabled | quote }}
@@ -206,6 +214,16 @@ spec:
             # remaining wall clock (>=10s left to attempt). 0 = fail fast.
             - name: PCAI_LLM_TOOL_RELAY_CALL_RETRIES
               value: {{ .Values.settings.toolRelayCallRetries | int | quote }}
+            # Active endpoint health probe. DEFAULT OFF — see values.yaml for
+            # the 2026-11-03 incident that made it opt-in.
+            - name: PCAI_LLM_HEALTH_PROBE_ENABLED
+              value: {{ .Values.settings.healthProbe.enabled | default false | quote }}
+            - name: PCAI_LLM_HEALTH_PROBE_INTERVAL_S
+              value: {{ .Values.settings.healthProbe.intervalS | default 30 | quote }}
+            - name: PCAI_LLM_HEALTH_PROBE_TIMEOUT_S
+              value: {{ .Values.settings.healthProbe.timeoutS | default 5 | quote }}
+            - name: PCAI_LLM_HEALTH_PROBE_FAILURES_TO_TRIP
+              value: {{ .Values.settings.healthProbe.failuresToTrip | default 2 | int | quote }}
             # Reasoning continuity (2026-10-26): re-feed the model its own prior
             # reasoning, CAPPED. The cap is what keeps the 2026-09-18 unbounded
             # re-append storm structurally impossible.
@@ -240,12 +258,25 @@ spec:
               value: {{ if hasKey .Values.settings "toolRelayRenderDeltas" }}{{ .Values.settings.toolRelayRenderDeltas | quote }}{{ else }}"false"{{ end }}
             - name: PCAI_LLM_TOOL_RELAY_RENDER_INDEX_BASE
               value: {{ .Values.settings.toolRelayRenderIndexBase | default 1000 | int | quote }}
+            # --- deterministic tool-result compression (X-PCAI-Compress-Tools) ---
+            # Default OFF; the request header is the per-request switch. "shadow"
+            # measures the saving on real traffic without rewriting.
+            - name: PCAI_LLM_TOOL_COMPRESS_DEFAULT
+              value: {{ .Values.settings.toolCompressDefault | default "off" | quote }}
+            - name: PCAI_LLM_TOOL_COMPRESS_MIN_CHARS
+              value: {{ .Values.settings.toolCompressMinChars | default 4096 | int | quote }}
+            - name: PCAI_LLM_TOOL_COMPRESS_RATIO_FLOOR
+              value: {{ .Values.settings.toolCompressRatioFloor | default 0.15 | quote }}
+            - name: PCAI_LLM_TOOL_COMPRESS_STORE_TTL_S
+              value: {{ .Values.settings.toolCompressStoreTtlS | default 86400 | int | quote }}
+            - name: PCAI_LLM_TOOL_COMPRESS_MAX_STORE_CHARS
+              value: {{ .Values.settings.toolCompressMaxStoreChars | default 1000000 | int | quote }}
             # --- client tool-server dispatch (wave B2; routes 404 while off,
             # inert for keys without a registered offer) ---
             - name: PCAI_LLM_CLIENT_TOOL_DISPATCH
               value: {{ if hasKey .Values.settings "clientToolDispatch" }}{{ .Values.settings.clientToolDispatch | quote }}{{ else }}"false"{{ end }}
             - name: PCAI_LLM_CLIENT_TOOL_DISPATCH_TIMEOUT_S
-              value: {{ .Values.settings.clientToolDispatchTimeoutS | default 120.0 | quote }}
+              value: {{ if hasKey .Values.settings "clientToolDispatchTimeoutS" }}{{ .Values.settings.clientToolDispatchTimeoutS | quote }}{{ else }}"120"{{ end }}
             # --- complexity routing (pseudo-models; per-profile policy gates) ---
             - name: PCAI_LLM_ROUTING_ENABLED
               value: {{ .Values.settings.routingEnabled | quote }}
@@ -262,7 +293,7 @@ spec:
             - name: PCAI_LLM_STICKY_ROUTING
               value: {{ .Values.settings.stickyRouting | default false | quote }}
             - name: PCAI_LLM_STICKY_ROUTING_IDLE_RESET_S
-              value: {{ .Values.settings.stickyRoutingIdleResetS | default 1800 | int | quote }}
+              value: {{ if hasKey .Values.settings "stickyRoutingIdleResetS" }}{{ .Values.settings.stickyRoutingIdleResetS | int | quote }}{{ else }}"1800"{{ end }}
             - name: PCAI_LLM_ROUTE_DEFAULT_MODEL
               value: {{ .Values.settings.routeDefaultModel | default false | quote }}
             # --- MCP federation surface (flat per-tool exposure; kill switch) ---
@@ -270,6 +301,14 @@ spec:
               value: {{ .Values.settings.mcpFlatTools | quote }}
             - name: PCAI_LLM_MCP_CATALOG_CACHE_S
               value: {{ .Values.settings.mcpCatalogCacheS | quote }}
+            # Cross-replica registry convergence (2026-10-30): the in-memory
+            # registry snapshot is refreshed by a watermark poll, so a server
+            # registered on one replica reaches its siblings in seconds instead
+            # of "whenever that pod restarts".
+            - name: PCAI_LLM_REGISTRY_WATCH_S
+              value: {{ if hasKey .Values.settings "registryWatchS" }}{{ .Values.settings.registryWatchS | quote }}{{ else }}"5"{{ end }}
+            - name: PCAI_LLM_REGISTRY_ADMIN_FRESH_S
+              value: {{ if hasKey .Values.settings "registryAdminFreshS" }}{{ .Values.settings.registryAdminFreshS | quote }}{{ else }}"1"{{ end }}
             - name: PCAI_LLM_MCP_FAILOVER_ATTEMPTS
               value: {{ .Values.settings.mcpFailoverAttempts | int | quote }}
             # --- argument-level policy stage (hardening P0-1) ---
@@ -320,6 +359,20 @@ spec:
             # --- identity (Phase A: trust-gated browser headers + MCP caller attribution) ---
             - name: PCAI_LLM_TRUST_PROXY_IDENTITY
               value: {{ .Values.settings.trustProxyIdentity | quote }}
+            # Groups from X-Forwarded-Groups — ONLY for chains whose proxy
+            # INJECTS that header. The platform oauth2-proxy does NOT (an
+            # arriving value is client-supplied); default false = fail closed
+            # to X-Auth-Request-Groups (audit r5 #4 + xv follow-up).
+            - name: PCAI_LLM_TRUST_FORWARDED_GROUPS
+              value: {{ .Values.settings.trustForwardedGroups | quote }}
+            # Absolute URL of the platform oauth2-proxy sign-out (e.g.
+            # https://oauth2-proxy.<domain>/oauth2/sign_out). Empty = the
+            # gateway's /oauth2/sign_out answers "/?signout=local" (an honest
+            # local-only sign-out) instead of a JSON 404 that left the SSO
+            # cookie alive. Only needed where the proxy is NOT routed on this
+            # host — see ezua.virtualService.ssoProxy for the same-origin form.
+            - name: PCAI_LLM_SSO_SIGN_OUT_URL
+              value: {{ .Values.settings.ssoSignOutUrl | default "" | quote }}
             - name: PCAI_LLM_MCP_CALLER_ATTRIBUTION
               value: {{ .Values.settings.mcpCallerAttribution | quote }}
             # --- identity Phase B (token validation + SSO surfaces; all default-off = inert) ---
@@ -360,9 +413,9 @@ spec:
             # transcript -> memory pipeline. Master switch only — per-knob
             # runtime config (model / offpeak-only / debounce / cap) is
             # DB-backed and admin-editable at /admin (Memory Distiller panel).
-            # The surface is additionally INERT for any key whose memory
-            # feature is not attached (no enabled mm-rag registry row or no
-            # stamped dataset pair).
+            # The surface is additionally INERT for any key the backend
+            # reports unattached (no enabled mm-rag registry row, or the
+            # backend's capability probe says not available/writable).
             - name: PCAI_LLM_DISTILLER_ENABLED
               value: {{ if hasKey .Values.settings "distillerEnabled" }}{{ .Values.settings.distillerEnabled | quote }}{{ else }}"false"{{ end }}
             - name: PCAI_LLM_DISTILLER_MEMORY_SERVER
@@ -452,7 +505,7 @@ spec:
             # a 2xx-then-stalled upstream is failed over; 0 disables the
             # gate — legacy commit-to-2xx behavior) ---
             - name: PCAI_LLM_FAILOVER_TTFT_S
-              value: {{ .Values.settings.failoverTtftS | default 45 | quote }}
+              value: {{ if hasKey .Values.settings "failoverTtftS" }}{{ .Values.settings.failoverTtftS | quote }}{{ else }}"45"{{ end }}
             {{- with .Values.settings.demandAwareExcludedModels }}
             # Demand-aware head exclusion list (JSON array of model names):
             # models the load-aware head must never pick as conversation
@@ -476,6 +529,27 @@ spec:
             # stays additive/conditional on the same key.
             - name: PCAI_LLM_METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
+            # OpenTelemetry tracing (OTLP/HTTP JSON, no SDK dependency): one
+            # server span per request, path-only attributes. Rendered ALWAYS so
+            # chart-off means app-off. The ratio is a per-trace hash, not a
+            # coin flip per span.
+            - name: PCAI_LLM_OTEL_ENABLED
+              value: {{ .Values.settings.otelEnabled | quote }}
+            - name: PCAI_LLM_OTEL_ENDPOINT
+              value: {{ .Values.settings.otelEndpoint | quote }}
+            - name: PCAI_LLM_OTEL_SERVICE_NAME
+              value: {{ .Values.settings.otelServiceName | quote }}
+            - name: PCAI_LLM_OTEL_SAMPLE_RATIO
+              value: {{ .Values.settings.otelSampleRatio | quote }}
+            # Session affinity (endpoint pin) and audio billing heuristics.
+            - name: PCAI_LLM_SESSION_AFFINITY_ENABLED
+              value: {{ .Values.settings.sessionAffinityEnabled | quote }}
+            - name: PCAI_LLM_SESSION_AFFINITY_TTL_S
+              value: {{ .Values.settings.sessionAffinityTtlS | quote }}
+            - name: PCAI_LLM_AUDIO_TTS_CHARS_PER_TOKEN
+              value: {{ .Values.settings.audioTtsCharsPerToken | quote }}
+            - name: PCAI_LLM_AUDIO_ASR_TOKENS_PER_SECOND
+              value: {{ .Values.settings.audioAsrTokensPerSecond | quote }}
             # Upstream endpoint keys: one env entry per listed Secret — the
             # env NAME is the by-reference handle the app resolves from
             # model_endpoints.api_key_secret (suffix normalized the same way).

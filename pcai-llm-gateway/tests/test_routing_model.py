@@ -130,11 +130,11 @@ def test_score_images_add_flat_charge() -> None:
     Scoring base64 length was a real bug: a 1.5MB PNG contributed ~500K
     "tokens" and force-routed every vision request to the ceiling.
     """
+
     def img_body(n: int) -> dict:
         parts: list[dict] = [{"type": "text", "text": "what is this?"}]
         parts += [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 100_000}}
-            for _ in range(n)
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 100_000}} for _ in range(n)
         ]
         return {"messages": [{"role": "user", "content": parts}]}
 
@@ -597,6 +597,30 @@ def test_direct_request_no_header_when_policy_off(env) -> None:
     assert "x-pcai-route" not in {k.lower() for k in r.headers}
 
 
+def test_routing_capacity_is_asked_with_the_request_estimate(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-11-03: capacity is consulted with the REQUEST's estimate.
+
+    The availability predicate must answer the same question admission will
+    answer — "would a request THIS size be admitted?" — not merely "is any
+    headroom left". Without the estimate a model with 5k tokens left was
+    offered to the router for a 100k-token request, admission 429'd it, and
+    the request walked the ordering for nothing.
+    """
+    seen: list[tuple[list[str], int]] = []
+
+    async def spy(key_id, models, est_tokens: int = 0):
+        seen.append((list(models), est_tokens))
+        return {m: {"ok": True, "remaining_tokens": None, "blocked_by": "", "warn": 0} for m in models}
+
+    monkeypatch.setattr(budgets_mod, "model_capacity", spy)
+    tc, _db, _upstream = env(policy="active")
+    r = _chat(tc, "routing", content="x" * 4000)  # chars/4 ~= 1000 est tokens
+    assert r.status_code == 200, r.text
+    assert seen, "the routing path must consult budget capacity"
+    _models, est = seen[-1]
+    assert est > 0, "the estimate must reach model_capacity (0 would mean the default was used)"
+
+
 # --- policy 'shadow': serve as off, stamp would-serve -----------------------
 
 
@@ -793,9 +817,20 @@ def test_models_lists_routing_entries_when_opted_in(env) -> None:
     for m in ORDER:
         assert f"routing__{m}" in ids
     entry = next(m for m in data if m["id"] == "routing")
-    assert entry["pcai"] == {"type": "routing"}
+    # 2026-11-03: routing entries carry WINDOWED capacity (ok / warn /
+    # candidate counts) so a picker can render "Unavailable to you" and
+    # "You are about to run out" without guessing. No DB here -> fail-open:
+    # every rung reads available and the band is 0.
+    assert entry["pcai"]["type"] == "routing"
+    assert entry["pcai"]["capacity"] == {
+        "ok": True,
+        "warn": 0,
+        "candidates": {"ok": 3, "blocked": 0},
+    }
     named = next(m for m in data if m["id"] == "routing__llm-1")
-    assert named["pcai"] == {"type": "routing"}
+    assert named["pcai"]["type"] == "routing"
+    # floor llm-2 .. ceiling llm-1 -> a TWO-rung window.
+    assert named["pcai"]["capacity"]["candidates"] == {"ok": 2, "blocked": 0}
 
 
 def test_models_lists_nothing_new_when_policy_off(env) -> None:

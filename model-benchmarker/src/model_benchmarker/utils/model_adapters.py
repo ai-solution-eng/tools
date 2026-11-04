@@ -10,12 +10,24 @@ from math import ceil
 from typing import Any, overload
 
 import httpx2
-from openai.types.create_embedding_response import CreateEmbeddingResponse
 
 from .general_tools import list_chunker, sync_wrapper_safe
 from .logging_utils import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _embedding_response_type() -> Any:
+    """The OpenAI SDK response type, imported on first use.
+
+    Importing openai costs ~0.5s and pulls in its whole generated types tree.
+    Keeping it out of this module import means a caller that only builds a
+    DecisionModel (which never speaks the OpenAI SDK) never pays for it.
+    """
+    from openai.types.create_embedding_response import CreateEmbeddingResponse
+
+    return CreateEmbeddingResponse
+
 
 __all__ = ["InputConversion", "MultiModalEmbeddings", "MultiModalReranker"]
 
@@ -1353,7 +1365,7 @@ class MultiModalEmbeddings:
     async def _embed_single_message_unbounded(self, input_dict: list[dict[str, Any]]) -> list[float]:
         response = await self.emb.async_client.post(
             "/embeddings",
-            cast_to=CreateEmbeddingResponse,  # Ensure this type is imported in your script
+            cast_to=_embedding_response_type(),  # Ensure this type is imported in your script
             body={
                 "model": self.emb.model_name,
                 "messages": input_dict,  # Assuming the endpoint accepts the string input_dict here
@@ -1421,7 +1433,7 @@ class MultiModalEmbeddings:
         formatted = [self._fmt_chat_template(t) for t in texts]
         response = await self.emb.async_client.post(
             "/embeddings",
-            cast_to=CreateEmbeddingResponse,
+            cast_to=_embedding_response_type(),
             body={
                 "model": self.emb.model_name,
                 "input": formatted,

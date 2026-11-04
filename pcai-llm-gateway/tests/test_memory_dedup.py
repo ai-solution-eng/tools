@@ -53,7 +53,7 @@ SIBLING_0A = (
     "apply), mcp-fleet-apikeys.\n"
     "- PVC size: user explicitly rejected 20 Gi, requested 5 Gi.\n"
     "- Hit a FailedMount on the policy-seed volume: configmap "
-    "\"sqlhandler-policy\" not found.\n"
+    '"sqlhandler-policy" not found.\n'
     "- Resolved SSO self-mint failure: a hidden X-API-KEY header was "
     "intercepting auth.\n"
     "- User invoked GLM + DeepSeek subagents for a cross-verification "
@@ -92,7 +92,7 @@ SIBLING_B9 = (
     "namespace, which also destroyed the PVC.\n"
     "- Recreated s3-credentials and mcp-fleet-apikeys secrets afterwards.\n"
     "- PVC sized 5 Gi per explicit user request (20 Gi rejected).\n"
-    "- FailedMount on policy-seed: configmap \"sqlhandler-policy\" not found.\n"
+    '- FailedMount on policy-seed: configmap "sqlhandler-policy" not found.\n'
     "- SSO self-mint blocked by a hidden X-API-KEY header in the PCAI LLM "
     "gateway.\n"
     "- GLM + DeepSeek subagent bug-hunt on semantic view RW, admin policy, "
@@ -133,11 +133,12 @@ DOC_OTHER = (
 )
 
 
-def _search_stub(hits: list[dict]) -> callable:
+def _search_stub(hits: list[dict]) -> object:
     async def mcp_search(arguments: dict) -> tuple[bool, str]:
         import json
 
         return True, json.dumps({"results": hits})
+
     return mcp_search
 
 
@@ -161,7 +162,10 @@ async def test_cross_session_near_duplicate_is_suppressed():
         return True, "stored"
 
     ok, detail = await write_memory(
-        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
         mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
     )
     assert ok is False
@@ -179,7 +183,10 @@ async def test_same_session_near_duplicate_is_allowed():
         return True, "stored"
 
     ok, _detail = await write_memory(
-        UUID, mcp_add, SIBLING_B9, session_id="session-old",
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-old",
         mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
     )
     assert ok is True and calls, "same-session re-distill must write"
@@ -194,7 +201,10 @@ async def test_different_topic_same_project_writes():
         return True, "stored"
 
     ok, _detail = await write_memory(
-        UUID, mcp_add, DOC_OTHER, session_id="session-audit",
+        UUID,
+        mcp_add,
+        DOC_OTHER,
+        session_id="session-audit",
         mcp_search=_search_stub([_hit("session-deploy", SIBLING_0A)]),
     )
     assert ok is True and calls
@@ -213,7 +223,10 @@ async def test_probe_failure_writes_through():
         raise RuntimeError("rag search down")
 
     ok, _detail = await write_memory(
-        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
         mcp_search=broken_search,
     )
     assert ok is True and calls
@@ -247,10 +260,71 @@ async def test_session_history_kind_never_probed():
         return True, "[]"
 
     ok, _ = await write_memory(
-        UUID, mcp_add, "raw transcript", session_id="s", kind="session_history",
+        UUID,
+        mcp_add,
+        "raw transcript",
+        session_id="s",
+        kind="session_history",
         mcp_search=probe,
     )
     assert ok is True and calls and probed == []
+
+
+# ---------------------------------------------------------------------------
+# the operator kill switch (settings.distiller_dedup_superseded, 2026-11-02)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flag_off_writes_the_superseded_memory(monkeypatch: pytest.MonkeyPatch):
+    """settings.distiller_dedup_superseded is the operator's OFF switch for
+    near-duplicate suppression. It was declared (config.py) and never read, so
+    an operator could not stop a legitimately NEW memory from being dropped as
+    a near-copy of an older session."""
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(settings, "distiller_dedup_superseded", False)
+    calls: list[dict] = []
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        calls.append(args)
+        return True, "stored"
+
+    ok, detail = await write_memory(
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
+        mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
+    )
+    assert ok is True, f"flag OFF must write through, got detail={detail!r}"
+    assert calls, "flag OFF: the write must reach add_memory"
+    assert "near-duplicate" not in detail
+
+
+@pytest.mark.asyncio
+async def test_flag_on_suppresses_as_before(monkeypatch: pytest.MonkeyPatch):
+    """The default stays ON: the suppression that the 2026-10-23 fix added is
+    unchanged when the flag is at its shipped value."""
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(settings, "distiller_dedup_superseded", True)
+    calls: list[dict] = []
+
+    async def mcp_add(args: dict) -> tuple[bool, str]:
+        calls.append(args)
+        return True, "stored"
+
+    ok, detail = await write_memory(
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
+        mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
+    )
+    assert ok is False
+    assert "near-duplicate" in detail
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +386,10 @@ async def test_d2_suppression_reports_the_suppressed_verdict():
 
     verdict: list[str] = []
     ok, _detail = await write_memory(
-        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
         mcp_search=_search_stub([_hit("session-old", SIBLING_0A)]),
         verdict_out=verdict,
     )
@@ -329,7 +406,10 @@ async def test_d2_a_landed_write_reports_the_written_verdict():
 
     verdict: list[str] = []
     ok, _ = await write_memory(
-        UUID, mcp_add, SIBLING_B9, session_id="session-new",
+        UUID,
+        mcp_add,
+        SIBLING_B9,
+        session_id="session-new",
         mcp_search=_search_stub([_hit("session-old", DOC_OTHER)]),
         verdict_out=verdict,
     )

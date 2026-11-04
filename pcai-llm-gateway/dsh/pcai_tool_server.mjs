@@ -95,7 +95,10 @@
  *   ttl_s      (default 900)  offer TTL seconds
  *   pollWaitS  (default 25)   long-poll wait seconds (0..60)
  *   registerRetryS (default 10) base sleep between failed registrations
- *   pollDelayS (default 1)     sleep after a claim/error before re-polling
+ *   pollDelayS (default 1)     sleep before re-polling after a recoverable
+ *                              poll error (a claimed job re-polls IMMEDIATELY:
+ *                              the gateway pops one job per poll, so waiting
+ *                              only adds dead time to the next call)
  *   logger     (default console) { log, warn, error }
  *
  * ENV
@@ -131,7 +134,18 @@ const DEFAULT_TOOLS = [
   },
 ];
 
-const MAX_ANSWERED_CACHE = 512;
+const MAX_ANSWERED_CACHE = 4096;
+/** Per-request ceilings: a hung socket must never stall the poll loop. */
+const REGISTER_TIMEOUT_MS = 15_000;
+const RESULT_TIMEOUT_MS = 30_000;
+const POLL_TIMEOUT_GRACE_MS = 15_000;
+/** Idle-path floor. A 204 normally means the long poll consumed its wait, but
+ *  wait_s=0 (legal) or a proxy that short-circuits the poll would otherwise
+ *  turn this loop into a hot spin. */
+const EMPTY_POLL_FLOOR_MS = 50;
+/** A refused registration (bad key, bad offer) does not improve by hammering:
+ *  retry at operator pace, not at network pace. */
+const AUTH_RETRY_S = 60;
 
 /** Jittered exponential backoff: base * 2^attempt capped at 60s, +-25%. */
 function backoff(baseS, attempt) {
@@ -144,11 +158,18 @@ function backoff(baseS, attempt) {
 function sleep(ms, signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    // The listener is removed when the TIMER wins, not only when the signal
+    // aborts: a long-lived stop signal would otherwise accumulate one abort
+    // listener per sleep for the life of the process.
+    const onAbort = () => {
       clearTimeout(t);
       resolve();
-    }, { once: true });
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -204,6 +225,13 @@ export class PcaiToolServer {
     return `${this.baseUrl}${path}`;
   }
 
+  /** Fuse the stop signal with a per-request ceiling (a hung socket must not
+   *  stall the loop forever). */
+  _timed(signal, ms) {
+    const ceiling = AbortSignal.timeout(ms);
+    return signal === undefined ? ceiling : AbortSignal.any([signal, ceiling]);
+  }
+
   /**
    * One registration attempt. Returns {ok, clientId, expiresAtMs, retryable}.
    * 401/403/400 are NOT retried by the loop's caller until the next TTL
@@ -216,7 +244,7 @@ export class PcaiToolServer {
         method: "POST",
         headers: this._headers({ "Content-Type": "application/json" }),
         body: JSON.stringify({ tools: this.tools, ttl_s: this.ttlS }),
-        signal,
+        signal: this._timed(signal, REGISTER_TIMEOUT_MS),
       });
       if (resp.ok) {
         const body = await resp.json().catch(() => ({}));
@@ -240,7 +268,9 @@ export class PcaiToolServer {
         this.logger.error(
           `[pcai_tool_server] registration refused (${resp.status}): ${text.slice(0, 200)}`,
         );
-        return { ok: false, retryable: resp.status === 401 || resp.status === 403, status: resp.status };
+        // A refused offer is an operator problem, not a transient one: report it
+        // as non-retryable so the caller waits at operator pace (AUTH_RETRY_S).
+        return { ok: false, retryable: false, status: resp.status };
       }
       return { ok: false, retryable: true, status: resp.status };
     } catch (err) {
@@ -263,9 +293,11 @@ export class PcaiToolServer {
       if (out.ok) return true;
       if (out.aborted) return false;
       if (!out.retryable) {
-        // Auth/validation refused: do NOT hot-loop; wait a full base period
-        // (the operator may fix the key / the offer mid-flight).
+        // Auth/validation refused: the operator may fix the key or the offer
+        // mid-flight, so keep trying — but at operator pace, not network pace.
         attempt = 0;
+        await sleep(AUTH_RETRY_S * 1000, signal);
+        continue;
       }
       await sleep(backoff(this.registerRetryS, attempt++), signal);
     }
@@ -281,7 +313,11 @@ export class PcaiToolServer {
     try {
       resp = await fetch(
         this._url(`/v1/dispatch/poll?wait_s=${encodeURIComponent(this.pollWaitS)}`),
-        { method: "GET", headers: this._headers(), signal },
+        {
+          method: "GET",
+          headers: this._headers(),
+          signal: this._timed(signal, this.pollWaitS * 1000 + POLL_TIMEOUT_GRACE_MS),
+        },
       );
     } catch (err) {
       if (signal?.aborted) return { done: true };
@@ -336,29 +372,41 @@ export class PcaiToolServer {
       ok = false;
       payload = err?.message || String(err);
     }
-    try {
-      const resp = await fetch(this._url("/v1/dispatch/result"), {
-        method: "POST",
-        headers: this._headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify(
-          ok
-            ? { dispatch_id: job.dispatch_id, ok: true, content: payload }
-            : { dispatch_id: job.dispatch_id, ok: false, error: payload },
-        ),
-        signal,
-      });
-      if (resp.status === 409) {
-        // First answer already won (or the relay timed out) — replay denial
-        // is working as designed; drop our payload.
-        this.logger.warn(`[pcai_tool_server] result for ${job.dispatch_id} settled elsewhere (409)`);
-      } else if (!resp.ok) {
-        this.logger.error(`[pcai_tool_server] result POST failed (${resp.status}) — job dropped (dispatch-once)`);
+    const body = JSON.stringify(
+      ok
+        ? { dispatch_id: job.dispatch_id, ok: true, content: payload }
+        : { dispatch_id: job.dispatch_id, ok: false, error: payload },
+    );
+    // One retry is safe under replay denial: if the first POST actually landed,
+    // the retry answers 409 and is dropped; if it did not, the retry settles it.
+    // Only transport failures and 5xx are retried — a 4xx IS the server's answer.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const resp = await fetch(this._url("/v1/dispatch/result"), {
+          method: "POST",
+          headers: this._headers({ "Content-Type": "application/json" }),
+          body,
+          signal: this._timed(signal, RESULT_TIMEOUT_MS),
+        });
+        if (resp.status === 409) {
+          // First answer already won (or the relay timed out) — replay denial
+          // is working as designed; drop our payload.
+          this.logger.warn(`[pcai_tool_server] result for ${job.dispatch_id} settled elsewhere (409)`);
+          return;
+        }
+        if (resp.ok) return;
+        if (resp.status < 500) {
+          this.logger.error(`[pcai_tool_server] result POST failed (${resp.status}) — job dropped (dispatch-once)`);
+          return;
+        }
+        this.logger.warn(`[pcai_tool_server] result POST failed (${resp.status}) — retrying once`);
+      } catch (err) {
+        if (signal?.aborted) return;
+        this.logger.warn(`[pcai_tool_server] result POST failed: ${err?.message || err} — retrying once`);
       }
-    } catch (err) {
-      if (!signal?.aborted) {
-        this.logger.error(`[pcai_tool_server] result POST failed: ${err?.message || err} — job dropped (dispatch-once)`);
-      }
+      if (attempt === 0) await sleep(250, signal);
     }
+    this.logger.error(`[pcai_tool_server] result for ${job.dispatch_id} dropped after retry (dispatch-once)`);
   }
 
   /**
@@ -375,9 +423,10 @@ export class PcaiToolServer {
       if (out.job) {
         backoffAttempt = 0;
         // Await the job fully before polling again: one in-flight dispatch
-        // at a time keeps local approval prompts ordered.
+        // at a time keeps local approval prompts ordered. Re-poll IMMEDIATELY:
+        // the gateway pops one job per poll, so a sleep here only adds dead
+        // time to the next call of a multi-call turn.
         await this._runJob(out.job, signal);
-        await sleep(this.pollDelayS * 1000, signal);
         continue;
       }
       if (out.backoff) {
@@ -385,7 +434,14 @@ export class PcaiToolServer {
         continue;
       }
       backoffAttempt = 0;
-      if (!out.empty && !out.reregister) {
+      if (out.empty) {
+        // A 204 normally means the long poll consumed its wait; a server that
+        // answers immediately (wait_s=0, or a proxy that short-circuits the
+        // long poll) must not turn this loop into a hot spin.
+        await sleep(EMPTY_POLL_FLOOR_MS, signal);
+        continue;
+      }
+      if (!out.reregister) {
         await sleep(this.pollDelayS * 1000, signal);
       }
     }

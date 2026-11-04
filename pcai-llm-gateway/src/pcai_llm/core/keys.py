@@ -56,6 +56,21 @@ class KeyRecord:
     # a test fake that omits the field reads as False (getattr/get-safe), so
     # no un-flagged key can ever authenticate into admin capability.
     mcp_admin: bool = False
+    # Per-profile tool-relay BUDGET, in fractional UNITS (2026-11-03). Read
+    # via the SAME profile JOIN as offpeak_fraction, so a console edit is live
+    # on the next request without a restart. None = the profile declares none
+    # => INHERIT settings.tool_relay_max_iterations (read as a unit budget);
+    # the relay applies that fallback, not this mapper, so the record stays a
+    # faithful projection of the row.
+    tool_relay_budget: int | None = None
+    # The rotation-stable KEY GROUP (2026-11-03): every rotate copies the old
+    # key's group onto the new row, so a credential chain A -> B -> C is ONE
+    # group. Saved conversations are scoped by it (rotation must not orphan a
+    # user's transcripts), NOT by user_id — independent keys of one user get
+    # their own group, so this never widens visibility across them.
+    # None only for a fake/legacy row that predates the column; the mapper
+    # falls back to the key's own id, which is the correct "group of one".
+    key_group: uuid.UUID | None = None
 
 
 def generate_key() -> tuple[str, str]:
@@ -110,6 +125,14 @@ def key_record_from_row(row: Any) -> KeyRecord | None:
         # both implement .get — a SELECT or a fake row missing the column
         # degrades to False (the control default), never to a KeyError.
         mcp_admin=bool(row.get("mcp_admin", False)),
+        # Same idiom (the mcp_admin comment above): a fake/legacy row that
+        # does not carry the column degrades to None = "inherit the site
+        # default", which is the pre-feature behaviour, never a KeyError.
+        tool_relay_budget=row.get("tool_relay_budget"),
+        # Same .get idiom: a pre-column row/fake reads as "its own group",
+        # which keeps conversation scoping correct (the id is always a valid
+        # group of one) and never raises.
+        key_group=row.get("key_group") or row["id"],
     )
 
 
@@ -142,6 +165,25 @@ async def create_key(
     # must never reset a period budget (the SSO rotation budget-reset bypass).
     # Default [] = a fresh mint (spend starts at zero, which is correct).
     spend_ancestors: list[uuid.UUID] | None = None,
+    # Team membership (team leader tier): the enrollment this key was minted
+    # from. It groups the key under that enrollment's budget ENVELOPE
+    # (core.budgets.check_budgets) and under its team console's scope. Default
+    # None = a key outside any team, i.e. every pre-feature row and every
+    # admin/CLI mint — nothing about those changes. Keyword-only like every
+    # other post-hoc column so no positional CALL SITE moves, and appended
+    # LAST in the INSERT so every existing parameter keeps its index (only a
+    # trailing slot is added — an assertion that counts from the END of the
+    # arg tuple must account for it).
+    enrollment_id: uuid.UUID | None = None,
+    # Rotation-stable KEY GROUP (2026-11-03): the rotate paths pass the OLD
+    # key's key_group so conversations survive the rotation. None = a
+    # brand-new credential gets a fresh group of its own (generated HERE, not
+    # by the column default: an explicit NULL in VALUES would override that
+    # default, and a COALESCE() expression inside VALUES trips the release
+    # gate's arity check — scripts/check_sql_schema.py splits VALUES on
+    # commas, so a nested call counts as two expressions. The DB default
+    # still covers any direct SQL insert.)
+    key_group: uuid.UUID | None = None,
 ) -> tuple[str, uuid.UUID]:
     plaintext, key_hash = generate_key()
     row = await (conn if conn is not None else db).fetchrow(
@@ -149,8 +191,8 @@ async def create_key(
         INSERT INTO api_keys
             (user_id, name, key_hash, key_prefix, scopes, allowed_models,
              rate_limit_rpm, rate_limit_tpm, expires_at, relay_default,
-             stream_pcai_events, spend_ancestors)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             stream_pcai_events, spend_ancestors, enrollment_id, key_group)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING id
         """,
         user_id,
@@ -165,6 +207,11 @@ async def create_key(
         relay_default,
         stream_pcai_events,
         spend_ancestors or [],
+        enrollment_id,
+        # Always a concrete uuid: a fresh mint starts its own group, a rotate
+        # inherits the old key's. (See the parameter comment for why this is
+        # generated here rather than left to the column default.)
+        key_group or uuid.uuid4(),
     )
     assert row is not None  # INSERT ... RETURNING always yields a row
     return plaintext, row["id"]
@@ -181,7 +228,7 @@ async def authenticate(plaintext: str) -> KeyRecord | None:
         SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
                k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
                k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-               k.mcp_admin, p.offpeak_fraction
+               k.mcp_admin, k.key_group, p.offpeak_fraction, p.tool_relay_budget
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
         LEFT JOIN profiles p ON p.id = u.profile_id
@@ -197,13 +244,23 @@ async def load_key_record(key_id: uuid.UUID) -> KeyRecord | None:
     """Resolve a key BY ID to its record (the scheduled-distill path: a sweep
     row is a key id, not a bearer token). Same SELECT shape and the SAME
     fail-closed contract as authenticate - revoked/expired keys are None,
-    never a record (a revoked key's conversation must not mint spend)."""
+    never a record (a revoked key's conversation must not mint spend).
+
+    COLUMN PARITY IS LOAD-BEARING (2026-11-03 cross-validation): this SELECT
+    feeds the SAME key_record_from_row as authenticate, and the mapper's
+    fallbacks are SILENT. Omitting k.key_group made every scheduled distill
+    read the key's OWN id as its group — so a conversation written after a
+    rotation (row key_group = the chain root) was looked up under the new id,
+    missed, and its marker dropped as "gone/purged" on every sweep. Omitting
+    k.mcp_admin would silently demote the record to the fail-closed default.
+    Any column the mapper reads MUST be named here; tests with fakes that
+    pre-populate the column cannot catch the omission."""
     row = await db.fetchrow(
         """
         SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
                k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
                k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-               p.offpeak_fraction
+               k.mcp_admin, k.key_group, p.offpeak_fraction, p.tool_relay_budget
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
         LEFT JOIN profiles p ON p.id = u.profile_id
@@ -223,7 +280,12 @@ async def revoke_key(key_id: uuid.UUID) -> bool:
     return tag == "UPDATE 1"
 
 
-async def list_keys(user_id: uuid.UUID | None = None, include_revoked: bool = False) -> list[dict[str, Any]]:
+async def list_keys(
+    user_id: uuid.UUID | None = None,
+    include_revoked: bool = False,
+    enrollment_id: uuid.UUID | None = None,
+    enrollment_search: str | None = None,
+) -> list[dict[str, Any]]:
     """Active keys by default, alphabetical by key name (the console's
     scan order); same-name ties (a rotation reissues under the SAME name)
     keep newest-first. Revoked rows stay in the DB (the ledger
@@ -254,7 +316,16 @@ async def list_keys(user_id: uuid.UUID | None = None, include_revoked: bool = Fa
     affects NEW SSO mints. LEFT JOIN because a user may carry no profile
     (NULL profile_id = no cascade ordering; the console renders the dash).
     Repeated per-key like self_mint_enabled — a per-USER constant across the
-    user's rows is safe, and every row re-converges on the next loadKeys()."""
+    user's rows is safe, and every row re-converges on the next loadKeys().
+
+    Enrollment projection + filters (team leader tier): every row carries
+    k.enrollment_id and the enrollment's LABEL (LEFT JOIN enrollments — a key
+    outside any team must survive the join as NULL, never be dropped), so the
+    admin console can render the Enrollment column from the same payload as
+    every other column. `enrollment_id` scopes the list to ONE team (the team
+    console's key tab) and `enrollment_search` is the console's case-insensitive
+    label filter — trimmed and length-capped, and an EMPTY search is treated as
+    "no filter" (a console that clears the box must not hide every row)."""
     sql = """
         SELECT k.id, k.user_id, u.name AS user_name, k.name, k.key_prefix,
                k.scopes, k.allowed_models, k.rate_limit_rpm, k.rate_limit_tpm,
@@ -262,16 +333,30 @@ async def list_keys(user_id: uuid.UUID | None = None, include_revoked: bool = Fa
                k.stream_pcai_events, k.mcp_admin,
                k.bound_via, k.bound_at, s.subject AS subject, s.idp AS subject_idp,
                u.self_mint_enabled AS self_mint_enabled,
-               u.profile_id AS user_profile_id, p.name AS user_profile_name
+               u.profile_id AS user_profile_id, p.name AS user_profile_name,
+               k.enrollment_id, e.label AS enrollment_label
         FROM api_keys k JOIN users u ON u.id = k.user_id
         LEFT JOIN subjects s ON s.id = k.subject_id
         LEFT JOIN profiles p ON p.id = u.profile_id
+        LEFT JOIN enrollments e ON e.id = k.enrollment_id
     """
     args: list[Any] = []
     conds = []
     if user_id is not None:
         args.append(user_id)
         conds.append(f"k.user_id = ${len(args)}")
+    if enrollment_id is not None:
+        args.append(enrollment_id)
+        conds.append(f"k.enrollment_id = ${len(args)}")
+    # The search term is a PARAMETER, never concatenated into the SQL; the
+    # literal '%' || $n || '%' shape keeps the wildcard on the SQL side so a
+    # caller cannot smuggle a pattern boundary. Trim + 100-char cap: a console
+    # search box has no business sending more, and an all-spaces value must
+    # not become a filter that matches nothing.
+    search = (enrollment_search or "").strip()[:100]
+    if search:
+        args.append(search)
+        conds.append(f"e.label ILIKE '%' || ${len(args)} || '%'")
     if not include_revoked:
         conds.append("k.revoked_at IS NULL")
     if conds:

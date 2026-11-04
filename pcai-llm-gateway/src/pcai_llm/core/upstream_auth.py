@@ -22,7 +22,7 @@ from . import secretbox
 log = logging.getLogger(__name__)
 
 
-def upstream_headers(ep: Endpoint, request_id: str = "") -> dict[str, str]:
+def upstream_headers(ep: Endpoint, request_id: str = "", quiet: bool = False) -> dict[str, str]:
     """Build upstream headers: request id (when given) + bearer key if resolvable.
 
     Credential resolution ORDER (first hit wins):
@@ -33,6 +33,12 @@ def upstream_headers(ep: Endpoint, request_id: str = "") -> dict[str, str]:
        chart injects as env PCAI_LLM_UPSTREAM_KEY__<NAME_NORMALIZED>.
     Neither → unauthenticated call with a warning (the pool may still serve
     public models; the upstream 401 keeps misconfig visible).
+
+    `quiet=True` suppresses those two diagnostics for a BACKGROUND caller that
+    repeats on a timer (core.health_probe sweeps every 30 s): the same missing
+    credential would otherwise log N lines per sweep, for the life of the
+    deployment. The forward path never passes it — a real request must keep
+    shouting about an unauthenticated call.
     """
     headers: dict[str, str] = {"X-Request-ID": request_id} if request_id else {}
     if ep.auth_token_enc:
@@ -40,17 +46,18 @@ def upstream_headers(ep: Endpoint, request_id: str = "") -> dict[str, str]:
         if token:
             headers["Authorization"] = f"Bearer {token}"
             return headers
-        log.error(
-            "endpoint %s has a stored credential but it is undecryptable "
-            "(master key missing/rotated) — calling unauthenticated",
-            ep.id,
-        )
+        if not quiet:
+            log.error(
+                "endpoint %s has a stored credential but it is undecryptable "
+                "(master key missing/rotated) — calling unauthenticated",
+                ep.id,
+            )
     if ep.api_key_secret:
         env_name = "PCAI_LLM_UPSTREAM_KEY__" + ep.api_key_secret.upper().replace("-", "_")
         secret = os.environ.get(env_name)
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
-        else:
+        elif not quiet:
             log.warning(
                 "upstream key secret %r not found as env var %s; forwarding without Authorization header",
                 ep.api_key_secret,

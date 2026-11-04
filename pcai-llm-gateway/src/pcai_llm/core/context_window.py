@@ -65,6 +65,11 @@ IMAGE_TOKEN_EQUIVALENT = 1600
 # endpoints pointing at one server share a window, and a re-registered
 # endpoint (new id, same server) must not lose what we already learned.
 _WINDOWS: dict[str, int] = {}
+# base_url -> monotonic time the window was LEARNED (audit w6 F1). Distinct
+# from _LAST_ATTEMPT ("when we last TRIED"): a learned window older than
+# WINDOW_TTL_S is due again, while a failed attempt is throttled. Different
+# questions, so the two ages are kept apart.
+_WINDOWS_AT: dict[str, float] = {}
 # base_urls with a probe in flight, so a burst of requests schedules ONE probe.
 _INFLIGHT: set[str] = set()
 # base_url -> monotonic time of the last attempt. A FAILED probe (401, no card,
@@ -87,6 +92,15 @@ PROBE_RETRY_SECONDS = 60.0
 # again hourly, so an upstream that later starts publishing is still picked up.
 NO_WINDOW_RETRY_SECONDS = 3600.0
 
+# How long a LEARNED window is trusted before it is re-probed (audit w6 F1).
+# An upstream that changes its max_model_len (a re-deployed model, a window
+# shrunk to leave KV room) publishes the new value on the next /v1/models. With
+# no TTL the pod kept the OLD window until it restarted, so a stale LARGER
+# window over-sized every request on that pool and 400'd — the exact failure
+# this module exists to remove. One metadata GET per endpoint per hour is cheap
+# and makes an operator change land without a restart.
+WINDOW_TTL_S = 3600.0
+
 
 def _norm(base_url: str) -> str:
     return base_url.rstrip("/")
@@ -107,13 +121,35 @@ def remember(base_url: str, limit: Any) -> int | None:
     """
     if not base_url or isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         return None
-    _WINDOWS[_norm(base_url)] = limit
+    key = _norm(base_url)
+    _WINDOWS[key] = limit
+    _WINDOWS_AT[key] = time.monotonic()
     return limit
 
 
+def stale(base_url: str | None) -> bool:
+    """Is this upstream's LEARNED window older than WINDOW_TTL_S? PURE.
+
+    False for an upstream with no window: "unknown" is a DIFFERENT state (the
+    callers read it as "no opinion") and the sweep collects it separately. A
+    window whose learned-at is missing reads STALE — an unmeasurable age must
+    not be trusted forever. The -inf default is the repo's documented sentinel
+    idiom (core/costs.py:22-27, core/housekeeping.py:41-46): 0.0 would compare
+    against host uptime and report a fresh window as ancient on a fresh pod.
+    """
+    if not base_url:
+        return False
+    key = _norm(base_url)
+    if key not in _WINDOWS:
+        return False
+    return time.monotonic() - _WINDOWS_AT.get(key, float("-inf")) >= WINDOW_TTL_S
+
+
 def forget_all() -> None:
-    """Drop the cache. Tests only -- production learns and keeps."""
+    """Drop the cache. Tests only -- production learns and keeps (the TTL is
+    what refreshes a learned window in production)."""
     _WINDOWS.clear()
+    _WINDOWS_AT.clear()
     _INFLIGHT.clear()
     _LAST_ATTEMPT.clear()
     _NO_WINDOW.clear()
@@ -163,18 +199,30 @@ async def probe(client: Any, base_url: str, headers: dict[str, str]) -> int | No
         return None
     key = _norm(base_url)
     known = _WINDOWS.get(key)
-    if known is not None:
+    # A FRESH learned window is final; a STALE one is due again (audit w6 F1).
+    # The known value stays the fallback for every path below: a failed REFRESH
+    # must never regress a known window to "unknown" (that would un-clamp the
+    # pool until the next successful probe — the very 400s this module removes).
+    if known is not None and not stale(key):
         return known
     if key in _INFLIGHT:
-        return None
+        return known
     # Backoff, applied to EVERY outcome: a 401, a card with no max_model_len
     # and a timeout are all "we do not know", and retrying them on every
     # refresh would turn a misconfiguration into a polling loop.
+    #
+    # SENTINEL = -inf, NEVER 0.0 (audit w6, P1). time.monotonic() is HOST
+    # UPTIME, not wall time, so "now - 0.0 < interval" is TRUE for the first
+    # interval of uptime: a 0.0 default silently SKIPPED every probe for the
+    # first hour after a pod start, which is the window this module exists to
+    # learn. core/costs.py:22-27 documents the same defect and fix ("NEGATIVE
+    # INFINITY, not 0.0"); core/housekeeping.py:41-46 uses the None variant.
+    # Same idiom here — do not reintroduce a 0.0 default.
     now = time.monotonic()
-    if now - _NO_WINDOW.get(key, 0.0) < NO_WINDOW_RETRY_SECONDS:
-        return None
-    if now - _LAST_ATTEMPT.get(key, 0.0) < PROBE_RETRY_SECONDS:
-        return None
+    if now - _NO_WINDOW.get(key, float("-inf")) < NO_WINDOW_RETRY_SECONDS:
+        return known
+    if now - _LAST_ATTEMPT.get(key, float("-inf")) < PROBE_RETRY_SECONDS:
+        return known
     _LAST_ATTEMPT[key] = now
     _INFLIGHT.add(key)
     try:
@@ -191,7 +239,7 @@ async def probe(client: Any, base_url: str, headers: dict[str, str]) -> int | No
                 key,
                 getattr(resp, "status_code", "?"),
             )
-            return None
+            return known
         limit = read_card(resp.json())
         if limit is None:
             # A fact, not a failure: remember it so the retry sweep stops
@@ -202,34 +250,65 @@ async def probe(client: Any, base_url: str, headers: dict[str, str]) -> int | No
                 key,
                 NO_WINDOW_RETRY_SECONDS,
             )
-            return None
+            return known
         _WINDOWS[key] = limit
+        _WINDOWS_AT[key] = time.monotonic()
         log.info("context window: learned max_model_len=%d for %s", limit, key)
         return limit
     except Exception as exc:
-        log.warning("context window: probe of %s failed (%s) - window unknown", key, type(exc).__name__)
-        return None
+        log.warning("context window: probe of %s failed (%s) - keeping the last known window", key, type(exc).__name__)
+        return known
     finally:
         _INFLIGHT.discard(key)
 
 
-def _message_text_chars(content: Any) -> int:
-    """Characters of TEXT in one message's content. PURE, never raises.
+def _text_tokens(text: str) -> int:
+    """Token charge for one text blob. PURE, never raises.
 
-    Image parts contribute through the flat IMAGE_TOKEN_EQUIVALENT charge in
-    the caller, never through their base64 length.
+    ASCII at len//4 -- byte-identical to the shipped estimator, so ASCII-only
+    traffic does not shift. Every NON-ASCII character costs at least ONE token
+    (audit w6 F2): no tokenizer can encode a CJK character or an emoji in a
+    quarter of a token, so len//4 under-counted those ~4x and an UNDER-count is
+    what 400s (the module docstring's invariant is the opposite direction).
     """
+    if text.isascii():
+        return len(text) // 4
+    ascii_chars = 0
+    for ch in text:
+        if ch < "\x80":
+            ascii_chars += 1
+    return ascii_chars // 4 + (len(text) - ascii_chars)
+
+
+def _message_text_tokens(content: Any) -> int:
+    """Token charge for one message's TEXT content. PURE, never raises.
+
+    Aggregated per MESSAGE, not per part, so a pure-ASCII message keeps the
+    shipped sum-of-lengths // 4 exactly. Non-text parts (image_url, audio,
+    file) contribute nothing here: images ride the flat
+    IMAGE_TOKEN_EQUIVALENT charge in the caller, never their base64 length.
+    """
+    texts: list[str] = []
     if isinstance(content, str):
-        return len(content)
-    if not isinstance(content, list):
-        return 0
-    total = 0
-    for part in content:
-        if isinstance(part, str):
-            total += len(part)
-        elif isinstance(part, dict) and isinstance(part.get("text"), str):
-            total += len(part["text"])
-    return total
+        texts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    ascii_chars = 0
+    non_ascii = 0
+    for text in texts:
+        if text.isascii():
+            ascii_chars += len(text)
+            continue
+        for ch in text:
+            if ch < "\x80":
+                ascii_chars += 1
+            else:
+                non_ascii += 1
+    return ascii_chars // 4 + non_ascii
 
 
 def count_images(body: dict[str, Any]) -> int:
@@ -260,8 +339,10 @@ def estimate_context_tokens(body: dict[str, Any]) -> int:
     bulk of the prompt (a 28-tool MCP surface is tens of thousands of tokens),
     and excluding it is precisely how a 65536-token headroom assumption died.
 
-    Charges: text at len//4, tool schemas at their serialized len//4, a flat
-    per-image charge, and a small per-message overhead for role/framing tokens.
+    Charges: ASCII text at len//4, NON-ASCII characters at >= 1 token each (an
+    under-count is what 400s — see _text_tokens), tool schemas at the same
+    serialized charge, a flat per-image charge, and a small per-message
+    overhead for role/framing tokens.
     """
     total = 0
     messages = body.get("messages")
@@ -269,18 +350,18 @@ def estimate_context_tokens(body: dict[str, Any]) -> int:
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            total += _message_text_chars(msg.get("content")) // 4 + 4
-            # Tool-call arguments ride outside `content` on assistant turns.
+            total += _message_text_tokens(msg.get("content")) + 4
+            # Tool-call arguments ride outside content on assistant turns.
             calls = msg.get("tool_calls")
             if isinstance(calls, list) and calls:
                 try:
-                    total += len(json.dumps(calls, default=str)) // 4
+                    total += _text_tokens(json.dumps(calls, default=str))
                 except (TypeError, ValueError):
                     total += 64 * len(calls)
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
         try:
-            total += len(json.dumps(tools, default=str)) // 4
+            total += _text_tokens(json.dumps(tools, default=str))
         except (TypeError, ValueError):
             total += 256 * len(tools)
     total += count_images(body) * IMAGE_TOKEN_EQUIVALENT
@@ -334,7 +415,7 @@ def fits(*, context_limit: int | None, est_prompt: int, min_completion: int = MI
 
 
 async def refresh_windows(entries: list[tuple[str, dict[str, str]]]) -> int:
-    """Learn every UNKNOWN window in one bounded pass. NEVER raises.
+    """Learn every UNKNOWN or STALE window in one bounded pass. NEVER raises.
 
     Called by registry.refresh() -- at boot and after any committed admin
     mutation -- NOT from the request path. That placement is deliberate on two
@@ -358,12 +439,18 @@ async def refresh_windows(entries: list[tuple[str, dict[str, str]]]) -> int:
         if not base_url:
             continue
         key = _norm(base_url)
-        if key in _WINDOWS or key in _INFLIGHT:
+        if key in _INFLIGHT:
+            continue
+        # A FRESH learned window is settled; a STALE one is due again (audit
+        # w6 F1). This pass is the only thing that ever re-probes a KNOWN
+        # upstream, so without this the TTL could never take effect.
+        if key in _WINDOWS and not stale(key):
             continue
         # An upstream that answered "no max_model_len" is settled for an hour:
         # filtering it here (not only inside probe) also avoids building and
         # tearing down a client for a pass that can do no work.
-        if now - _NO_WINDOW.get(key, 0.0) < NO_WINDOW_RETRY_SECONDS:
+        # -inf default, never 0.0 — see probe()'s SENTINEL note (audit w6).
+        if now - _NO_WINDOW.get(key, float("-inf")) < NO_WINDOW_RETRY_SECONDS:
             continue
         todo.append((key, headers))
     if not todo:

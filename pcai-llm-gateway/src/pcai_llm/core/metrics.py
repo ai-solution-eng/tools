@@ -75,6 +75,35 @@ class _NoopMetric:
         return None
 
 
+def _pool_stat(method: str) -> Any:
+    """A SCRAPE-TIME reader for one asyncpg Pool stat. NEVER raises.
+
+    Why a function and not a background updater: the pool handle is created
+    at boot and replaced on reconnect, so a value captured at import time
+    would go stale (or point at a closed pool). Reading `db.pool` inside the
+    callback also keeps this module importable without db/ — the import is
+    lazy precisely because core.metrics is imported BY modules that db/
+    imports, so a module-level import would cycle.
+
+    A missing pool (unit tests, pre-boot scrape, closed pool) reports 0.0
+    rather than raising: a metrics scrape must never fail a request path or
+    the scrape itself.
+    """
+
+    def _read() -> float:
+        try:
+            from ..db import db as _db
+
+            pool = getattr(_db, "pool", None)
+            if pool is None:
+                return 0.0
+            return float(getattr(pool, method)())
+        except Exception:
+            return 0.0
+
+    return _read
+
+
 if _REAL:
     REQUESTS = Counter(
         "gateway_requests_total",
@@ -102,8 +131,7 @@ if _REAL:
         # It was documented as "calls refused". Counting requests instead needs
         # the refusing family plumbed through GateResult to each terminal raise
         # site — a follow-up, not a silent re-meaning of an existing series.
-        "Budget-gate candidate refusals (one per refusing candidate; a "
-        "cascading request may contribute several).",
+        "Budget-gate candidate refusals (one per refusing candidate; a cascading request may contribute several).",
         ["kind"],  # tokens | usd (which budget family refused)
     )
     RATE_LIMITED = Counter(
@@ -282,10 +310,52 @@ if _REAL:
         ["outcome"],
     )
 
+    # --- Postgres pool occupancy (2026-11-02) ------------------------------
+    # Without these the pool is sized BLIND: the operator has to reason that
+    # maxReplicas x dbPoolMax must fit the server's max_connections, with no
+    # measurement of the demand side. Reported per process — the aggregate is
+    # sum() across pods, which is exactly the number that must stay under the
+    # server limit.
+    #
+    # size = connections currently open; idle = open but unused; max = the
+    # configured ceiling (settings.db_pool_max). Sustained size == max with
+    # idle near 0 is the signal that the pool is the constraint; size well
+    # under max means raising it would buy nothing.
+    DB_POOL_SIZE = Gauge(
+        "gateway_db_pool_size",
+        "Connections currently open in this process's Postgres pool.",
+    )
+    DB_POOL_IDLE = Gauge(
+        "gateway_db_pool_idle",
+        "Idle connections held by this process's Postgres pool.",
+    )
+    DB_POOL_MAX = Gauge(
+        "gateway_db_pool_max",
+        "Configured ceiling (dbPoolMax) for this process's Postgres pool.",
+    )
+    RESPONSE_CACHE = Counter(
+        "gateway_response_cache_total",
+        "Exact-match response-cache events. mode=shadow counts WOULD-BE hits "
+        "(nothing is served); mode=active counts served hits and misses. A "
+        "shadow hit rate is the only honest way to decide whether enabling "
+        "the cache is worth it on this workload.",
+        ["mode", "result"],  # shadow|active x hit|miss
+    )
+    # set_function, not a periodic set(): prometheus_client calls these at
+    # scrape time, so the reading is always current and the steady-state cost
+    # is one attribute read per scrape rather than a background task.
+    DB_POOL_SIZE.set_function(_pool_stat("get_size"))
+    DB_POOL_IDLE.set_function(_pool_stat("get_idle_size"))
+    DB_POOL_MAX.set_function(_pool_stat("get_max_size"))
+
 else:
     # Deliberate conditional re-definition (import guard) — the mypy-sanctioned
     # pattern; the shims share the real metrics' method surface by construction.
     REQUESTS: Any = _NoopMetric()  # type: ignore[no-redef]
+    DB_POOL_SIZE: Any = _NoopMetric()  # type: ignore[no-redef]
+    DB_POOL_IDLE: Any = _NoopMetric()  # type: ignore[no-redef]
+    DB_POOL_MAX: Any = _NoopMetric()  # type: ignore[no-redef]
+    RESPONSE_CACHE: Any = _NoopMetric()  # type: ignore[no-redef]
     LATENCY: Any = _NoopMetric()  # type: ignore[no-redef]
     TTFT: Any = _NoopMetric()  # type: ignore[no-redef]
     BUDGET_REJECTIONS: Any = _NoopMetric()  # type: ignore[no-redef]

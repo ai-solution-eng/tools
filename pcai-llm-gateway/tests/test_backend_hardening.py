@@ -1421,6 +1421,7 @@ def test_retention_prunes_when_configured(monkeypatch: pytest.MonkeyPatch) -> No
     # ledger untouched
     assert not any("DELETE FROM usage_ledger" in s for s in sqls)
 
+
 # ---------------------------------------------------------------------------
 # F6 (audit 2026-10-29): /mcp rate-limit refusals settle "rate_limited"
 # ---------------------------------------------------------------------------

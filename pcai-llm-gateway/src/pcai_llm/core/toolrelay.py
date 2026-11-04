@@ -35,7 +35,8 @@ import anyio
 import httpx2
 
 from ..config import clamp_max_tokens, settings
-from . import clientside, effective, offpeak, tool_surface, traces
+from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces
+from . import metrics as _metrics
 from .budgets import check_budgets, settle
 from .canonical import thread_key
 
@@ -141,19 +142,84 @@ def _preview(content: Any, cap: int = 4000) -> str:
 RELAY_TOOL_RESULT_CAP_CHARS = 32_000
 
 
-def _relay_content(content: Any) -> str:
-    """The role=tool content string for relay_msgs: serialized + CAPPED.
+def _serialize_tool_content(content: Any) -> str:
+    """The role=tool text for relay_msgs, before any bound is applied."""
+    return content if isinstance(content, str) else json.dumps(content, default=str)
 
-    Truncation is explicit (the model sees the marker and can re-request
-    narrower output), matching _preview's discipline but at a model-facing
-    bound rather than a display bound."""
-    text = content if isinstance(content, str) else json.dumps(content, default=str)
+
+def _cap_tool_content(text: str) -> str:
+    """The hard model-facing bound: explicit, and the model can re-request.
+
+    Kept as the OUTER bound even when compression ran: compression is a
+    best-effort reduction, the cap is the guarantee."""
     if len(text) <= RELAY_TOOL_RESULT_CAP_CHARS:
         return text
     return (
         text[:RELAY_TOOL_RESULT_CAP_CHARS]
         + f" …[truncated by the gateway: tool result was {len(text)} chars; request narrower output]"
     )
+
+
+def _relay_content(content: Any) -> str:
+    """The role=tool content string for relay_msgs: serialized + CAPPED."""
+    return _cap_tool_content(_serialize_tool_content(content))
+
+
+async def _prepare_tool_content(
+    content: Any,
+    *,
+    mode: str,
+    key_id: uuid.UUID | None,
+    server: str,
+    tool: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Serialize, optionally compress, then cap one tool result.
+
+    Order is load-bearing:
+      1. serialize (the compressors are pure text functions);
+      2. compress + STORE THE ORIGINAL — the store write must succeed BEFORE
+         the rewrite is used, or the model would receive a marker pointing at
+         a digest that was never persisted (lossy compression with extra
+         steps). A failed write therefore fails the COMPRESSION, not the
+         turn: the original passes through untouched;
+      3. cap — the hard bound, independent of whether compression ran.
+
+    Returns (text_for_the_model, stats_or_None). `shadow` reports stats and
+    rewrites nothing, which is how a site measures the ratio before enabling.
+    """
+    text = _serialize_tool_content(content)
+    stats: dict[str, Any] | None = None
+    if mode in ("on", "shadow") and text:
+        result = toolcompress.compress_tool_text(
+            text,
+            min_chars=settings.tool_compress_min_chars,
+            ratio_floor=settings.tool_compress_ratio_floor,
+        )
+        if result is not None:
+            stats = {**result.stats.as_dict(), "server": server, "tool": tool, "mode": mode}
+            if mode == "on":
+                stored = False
+                if key_id is not None and len(text) <= settings.tool_compress_max_store_chars:
+                    try:
+                        from . import toolcompress_store
+
+                        await toolcompress_store.save(key_id, result.stats.digest, text)
+                        stored = True
+                    except Exception:
+                        log.exception(
+                            "relay: tool_compress_store save failed (%s/%s) — passing the original through",
+                            server,
+                            tool,
+                        )
+                if stored:
+                    text = result.text
+                else:
+                    # Two causes, one signal: the write failed, or the
+                    # original is too large to retain. Either way the model
+                    # gets the original — a marker must never point at a
+                    # digest the store does not hold.
+                    stats["stored"] = False
+    return _cap_tool_content(text), stats
 
 
 @dataclass
@@ -220,6 +286,7 @@ def with_system_prefix(msgs: list[dict], prefix: str) -> list[dict]:
     if msgs and isinstance(msgs[0], dict) and str(msgs[0].get("role") or "") in ("system", "developer"):
         lead = 1
     return [*msgs[:lead], head, *msgs[lead:]]
+
 
 def tools_payload(catalog: list[dict]) -> list[dict]:
     """OpenAI tools array from the granted (server, tool) catalog.
@@ -425,10 +492,47 @@ def wall_clock_deadline(started: float | None = None, wall_clock_s: float | None
 
 
 class RelayGuard:
-    """Iteration/wall-clock/loop guards — the AgentBuilder lessons, ported."""
+    """Iteration/wall-clock/loop guards — the AgentBuilder lessons, ported.
 
-    def __init__(self, max_iterations: int, wall_clock_s: float) -> None:
+    BUDGET IN UNITS, NOT ROUNDS (2026-11-03). The per-turn bound used to be a
+    COUNT of model iterations. A count cannot price a server: one call to a
+    heavyweight server can cost far more upstream work than ten cheap ones,
+    and the count charged both exactly the same. The bound is therefore a
+    BUDGET of fractional UNITS, and each tool call in a batch charges its
+    SERVER weight (core.mcp_weights; an unweighted/unknown server is the
+    neutral 1.0, so units == CALLS). That is NOT the old round count: the
+    removed check charged one unit per MODEL ROUND, this charges one per tool
+    CALL, so a round emitting k parallel calls costs k here and 1 there —
+    identical for single-call rounds, STRICTER for parallel batches (the new
+    bound can only fire EARLIER than the old one, never later).
+
+    The constructor parameter keeps its old NAME (max_iterations) because many
+    call sites and tests construct the guard positionally — it is READ as a
+    unit budget, never as a round count.
+    """
+
+    def __init__(
+        self,
+        max_iterations: float,
+        wall_clock_s: float,
+        *,
+        # server name -> unit weight (core.mcp_weights.weights()). {} = every
+        # call charges the neutral 1.0, i.e. units degenerate to a call count.
+        weights: dict[str, float] | None = None,
+        # The GRANTED catalog ({"server","tool"} dicts) used for server
+        # attribution through the EXISTING name algebra — a harness-prefixed
+        # spelling must be priced as the server it actually reaches, not as
+        # its first name segment ("mcp"). None = plain server__tool split.
+        catalog: list[dict] | None = None,
+        # Units this TURN already spent before this request. A handback
+        # CONTINUATION resumes the turn budget (iterations_prior); the
+        # persisted counter is a legacy ROUND count, so it is charged at the
+        # neutral weight — the same translation the pre-weight cap made.
+        spent_prior: float = 0.0,
+    ) -> None:
         self.max_iterations = max_iterations
+        self.weights = weights or {}
+        self.catalog = catalog or []
         # Ingress clamp (the "avoid actual failures" guardrail): the relay's
         # whole response must close INSIDE the Istio virtualService timeout
         # (600s) — a wall clock at/above it means a burned budget races the
@@ -446,11 +550,66 @@ class RelayGuard:
         # fired on legitimate discovery and killed the turn. A spinner still
         # needs bounding, so a per-turn budget replaces the fingerprint.
         self.meta_calls = 0
+        # Fractional UNITS charged so far this turn (see check()). A handback
+        # continuation resumes the turn's budget through spent_prior, so the
+        # cap cannot be reset by replaying the request.
+        self.spent = 0.0
+        if spent_prior > 0:
+            self.spent = float(spent_prior)
 
-    def check(self, iteration: int, tool_calls: list[dict]) -> str:
-        """Return an abort reason, or '' to continue."""
-        if iteration >= self.max_iterations:
-            return f"max tool iterations ({self.max_iterations}) reached"
+    def _weight_of(self, tc: dict) -> float:
+        """Units ONE tool call charges: its server weight (neutral 1.0).
+
+        Server attribution goes through the SAME name algebra the dispatch
+        loop uses (alias_granted_gateway_name -> _suffix_matches_gateway), so
+        a harness-prefixed spelling ("mcp__pcai-llm-gateway__mm-rag__search_memory")
+        is priced as the server it actually reaches instead of as "mcp". The
+        plain server__tool split is the FALLBACK: an ungranted or unknown name
+        has no catalog twin and charges the neutral default.
+        """
+        name = str((tc.get("function") or {}).get("name") or "")
+        server = ""
+        if self.catalog:
+            twin = alias_granted_gateway_name(name, self.catalog)
+            if twin is not None:
+                server = twin[0]
+        if not server:
+            server = name.split(TOOLSEP, 1)[0]
+        try:
+            return max(0.0, float(self.weights.get(server, 1.0)))
+        except (TypeError, ValueError):
+            return 1.0  # a hand-written weight dict cannot break the bound
+
+    def check(self, iteration: int, tool_calls: list[dict], charge_calls: list[dict] | None = None) -> str:
+        """Return an abort reason, or '' to continue.
+
+        The turn is bounded by the unit BUDGET below, not by `iteration` (kept
+        in the signature because every call site passes it and the wall-clock /
+        loop checks are independent of it).
+
+        `charge_calls` is the subset of the batch the GATEWAY will execute
+        (the relay loop passes its in-cluster partition). A handback call is
+        run by the CLIENT's own loop, so the gateway spends no relay work on
+        it and it must not be charged to the gateway's budget — charging it
+        would end a mixed batch (one cloud call + one client call) with a
+        budget abort instead of the handback that batch exists to perform.
+        None = charge the whole batch (pure-function callers/tests).
+        """
+        # --- BUDGET (fractional units, not rounds) ------------------------
+        # Charge the WHOLE chargeable batch before deciding: the abort halts
+        # the batch before dispatch, so the reported spend is what the turn
+        # actually ASKED for — a batch that overshoots the budget is not
+        # silently discounted just because it never ran.
+        budget = float(self.max_iterations)
+        self.spent += sum(self._weight_of(tc) for tc in (tool_calls if charge_calls is None else charge_calls))
+        # TOLERANCE, not an exact compare (cross-review 2026-11-03): fractional
+        # weights accumulate in float, so ten 0.7-unit calls sum to
+        # 7.000000000000001 and an exact `> budget` aborts a batch whose true
+        # cost IS the budget — printing the self-contradicting
+        # "tool budget exhausted (7.00/7.00 units)". 1e-9 is far below the
+        # 0.01 weight floor, so no real overspend is ever forgiven.
+        if self.spent > budget + 1e-9:
+            return f"tool budget exhausted ({self.spent:.2f}/{budget:.2f} units)"
         if time.monotonic() > self.deadline:
             return "tool relay wall-clock budget exceeded"
         for tc in tool_calls:
@@ -915,6 +1074,15 @@ async def relay_stream(
     # nothing accumulates, nothing amplifies; steps stay fully traced and
     # the console's chips still render.
     stream_thinking: bool = True,
+    # --- tool-result compression (X-PCAI-Compress-Tools, 2026-11-04) ------
+    # "off" (default) = byte-for-byte the pre-feature behavior. "on" rewrites
+    # oversized results with the deterministic selectors in core.toolcompress
+    # and offers the synthetic pcai__retrieve tool. "shadow" computes and
+    # reports the saving without rewriting — the rollout mode.
+    compress_mode: str = "off",
+    # OUT-PARAM: per-result stats the routes layer logs after the turn. The
+    # in-stream `pcai.compress` event is the live signal; this is post-hoc.
+    compress_stats_out: list[dict[str, Any]] | None = None,
     # OpenAI stream_options.include_usage: when the client asked (or the
     # routes layer decides), the standard empty-choices usage chunk rides
     # before [DONE] with the LAST upstream usage verbatim (details intact).
@@ -1017,6 +1185,19 @@ async def relay_stream(
     # capture (the admin's "what the model actually saw" view) and into the
     # settle-time token estimate, so neither under-reports by its size.
     system_prefix: str = "",
+    # Per-turn tool-relay BUDGET, in fractional UNITS (2026-11-03) — NOT a
+    # count of model rounds. Every tool call charges its server's weight, so
+    # a 0.1-weight server costs a tenth of a neutral call. None (default) =
+    # settings.tool_relay_max_iterations read as a unit budget — the same
+    # NUMBER as the pre-weight bound but a different UNIT (calls, not rounds:
+    # a k-call batch costs k), so a parallel-heavy turn is bounded tighter
+    # than before; a profile's tool_relay_budget (core.keys) overrides it at
+    # the routes layer.
+    max_iterations: float | None = None,
+    # server name -> unit weight. None (default) = core.mcp_weights.weights()
+    # (TTL-cached, never raises; {} degrades every call to the neutral 1.0).
+    # An explicit dict is what unit tests and per-request experiments pass.
+    tool_weights: dict[str, float] | None = None,
 ):
     """The streaming relay loop — yields SSE bytes for the client.
 
@@ -1106,11 +1287,32 @@ async def relay_stream(
     # see the wall_clock_deadline param comment), convert it back to the
     # remaining wall clock the guard applies verbatim (the internal clamp
     # re-adds the same constants, so the instant is reproduced exactly).
+    #
+    # BUDGET + WEIGHTS (2026-11-03): the bound is UNITS. An explicit
+    # max_iterations (the key's profile budget) wins; otherwise the site
+    # default is read as the same unit budget, which is the pre-weight
+    # behaviour. Weights come from core.mcp_weights (TTL-cached, never
+    # raises) unless the caller pinned a dict.
+    # FLOOR (cross-review 2026-11-03): the admin API validates 1..4096, but a
+    # 0/negative row written by any future path that skips the Pydantic model
+    # would make the budget 0 and abort the FIRST in-cluster batch of every
+    # relayed turn ("tool budget exhausted (1.00/0.00 units)") — a silent
+    # relay-off for that profile. A non-positive value means "no opinion", so
+    # it inherits the site default instead, which is the same fail-safe shape
+    # mcp_weights uses on a DB fault.
+    _budget = max_iterations if max_iterations is not None and max_iterations > 0 else None
     guard = RelayGuard(
-        settings.tool_relay_max_iterations,
+        settings.tool_relay_max_iterations if _budget is None else _budget,
         settings.tool_relay_wall_clock_s
         if wall_clock_deadline is None
         else max(0.0, wall_clock_deadline - time.monotonic()),
+        weights=tool_weights if tool_weights is not None else await mcp_weights.weights(),
+        # Server attribution needs the GRANTED catalog: a harness-prefixed
+        # call must be priced as the server it reaches, not as "mcp".
+        catalog=catalog,
+        # A handback CONTINUATION resumes the turn budget: iterations_prior
+        # is a legacy ROUND count, charged at the neutral weight.
+        spent_prior=float(max(0, int(iterations_prior or 0))),
     )
     # --- TOOL SURFACE (2026-10-28) ---------------------------------------
     # Inlining every granted tool cost 34,459 prompt tokens for a 111-tool /
@@ -1142,6 +1344,15 @@ async def relay_stream(
         # the warning below already tells the operator to rename.
         if any(t.get("function", {}).get("name") == tool_surface.META_TOOL for t in offered_client):
             gw = [t for t in gw if t.get("function", {}).get("name") != tool_surface.META_TOOL]
+        if compress_mode == "on" and key_id is not None:
+            # Offered on EVERY iteration of an ON turn — not only after the
+            # first compression. A tools array that changes mid-turn would
+            # invalidate the provider's cached prefix on the next call, and
+            # the marker is useless to a model that cannot see the tool.
+            # Keyless turns are excluded: retrieval needs a key to scope the
+            # lookup, so offering the tool there would advertise a call that
+            # can never succeed (and keyless turns never rewrite anyway).
+            gw = [*gw, *tools_payload([toolcompress.retrieve_catalog_entry()])]
         return gw + offered_client
 
     # mixed-mode: the caller's OWN tools ride along under the MCP catalog —
@@ -1220,6 +1431,7 @@ async def relay_stream(
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         status: str = "ok",
+        cached_tokens: int = 0,
     ) -> None:
         """Best-effort agent-trace write for ONE relay step.
 
@@ -1243,6 +1455,7 @@ async def relay_stream(
             completion_tokens=completion_tokens,
             status=status,
             thread_id=thread_id,
+            cached_tokens=cached_tokens,
         )
 
     async def _capture_prompt(
@@ -1343,6 +1556,7 @@ async def relay_stream(
                 prompt_tokens=prompt,
                 completion_tokens=completion,
                 status=status,
+                cached_tokens=_cached_tokens(usage),
             )
             # effective-prompt capture (additive, best-effort, strictly AFTER
             # the upstream call completed — observation never blocks the wire)
@@ -1799,17 +2013,15 @@ async def relay_stream(
                 call_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
                 model_error = True
                 # The failure surfaced through _bounded_call's pending
-                # __anext__ task: retrieving it here marks the task retrieved,
-                # but `_bounded_call`'s finally does a bare `await pending` to
-                # reap it — a task whose exception was ALREADY fetched raises
-                # that exception AGAIN on every await (CPython semantics), and
-                # that reaper only suppresses what it catches for the
-                # CancelledError/Exception pair it wraps — a second retrieval
-                # from OUR re-raise would escape. Prevent the re-raise at the
-                # source: consume the exception out of the task so every
-                # future await on it is clean, then raise a FRESH instance we
-                # own.
-                exc = type(exc)(str(exc))
+                # __anext__ task. Double retrieval is already safe WITHOUT any
+                # re-raise here: the task is re-awaited only by _bounded_call's
+                # finally, whose reaper suppresses every Exception it surfaces,
+                # so this arm sees the failure exactly once. (An earlier
+                # revision "consumed and re-raised a fresh instance" via
+                # type(exc)(str(exc)) — that was DEAD CODE: nothing below
+                # re-raises `exc`, and for HTTPStatusError the rebuild itself
+                # raised TypeError INSIDE this arm, where the sibling excepts
+                # cannot catch it. Deleted, audit w6 xval.)
             finally:
                 # Settle in finally (the _relay_sse discipline, audit fix):
                 # the happy path settles here too — the code after the
@@ -2059,10 +2271,12 @@ async def relay_stream(
                     # close the stream cleanly.
                     retry_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
                     model_error = True
-                    # Same task-reap hazard the main loop documents: re-raise a
-                    # FRESH instance so _bounded_call's finally cannot surface
-                    # the already-retrieved exception a second time.
-                    exc = type(exc)(str(exc))
+                    # Double retrieval is already safe: the failed task is
+                    # re-awaited only by _bounded_call's finally, whose reaper
+                    # suppresses every Exception — nothing re-raises `exc`
+                    # here. (The old type(exc)(str(exc)) rebuild was dead code
+                    # and raised TypeError for HTTPStatusError inside this arm
+                    # — deleted, audit w6 xval.)
                 except Exception as exc:  # the relay must never die on an upstream fault
                     # ANYTHING ELSE ON THE RETRY (cross-validation XV-2). The
                     # two clauses above cover the expected transport shapes, but
@@ -2391,7 +2605,7 @@ async def relay_stream(
             yield b"data: [DONE]\n\n"
             return
 
-        abort = guard.check(iteration, tool_calls)
+        abort = guard.check(iteration, tool_calls, charge_calls=mcp_calls)
         if abort:
             yield _pcai({"pcai": {"event": "guard", "detail": abort}})
             yield _reasoning_delta(f"\n[relay] {abort}\n")
@@ -2404,17 +2618,20 @@ async def relay_stream(
             # answered "halted" (the model never gets to act on them
             # anyway — the loop is over).
             #
-            # MAX-ITERATIONS HANDOFF (2026-10 operator request): for the
-            # iterations cap specifically, the wrap-up instruction tells
-            # the model to report progress and ASK THE USER whether to
+            # BUDGET-EXHAUSTION HANDOFF (2026-10 operator request): for the
+            # unit budget specifically, the wrap-up instruction tells the
+            # model to report progress and ASK THE USER whether to
             # continue with more tool calls — the user's next message is a
             # FRESH TURN (routes_proxy zeroes iterations_prior on any
             # non-continuation shape), so their "yes" restarts the budget
-            # legitimately instead of the cap silently growing. The other
+            # legitimately instead of the budget silently growing. The other
             # abort reasons (wall clock, loop detection) keep the original
             # "answer from what you have" instruction — a repeated identical
             # call must not be laundered into a permission request, and a
             # wall-clock stop is not the model's decision to resume.
+            # The prefix below is RelayGuard.check's budget message
+            # ("tool budget exhausted (x/y units)"); it replaced the old
+            # "max tool iterations" prefix when the count became a budget.
             _halt_instruction = (
                 (
                     f"Tool use paused: {abort}. Do NOT attempt further tool calls now. "
@@ -2422,7 +2639,7 @@ async def relay_stream(
                     "whether to continue with more tool calls (their next message starts a fresh "
                     "tool budget)."
                 )
-                if abort.startswith("max tool iterations")
+                if abort.startswith("tool budget exhausted")
                 else f"Tool use halted: {abort}. Answer from what you have."
             )
             _all_ids = [tc.get("id", "") for tc in tool_calls if tc.get("id")]
@@ -2445,11 +2662,19 @@ async def relay_stream(
             wrap_usage = None
             wrap_error = False
             wrap_timed_out = False
+            wrap_failed = ""
             _wrap_chunks: list[str] = []
+            # W6 audit (finding 2): the budget used to be max(30.0, remaining),
+            # which RE-ARMED a fresh 30 s floor after a wall-clock abort — with
+            # defaults (deadline +570 s, VS 600 s) a slow wrap-up landed exactly
+            # on the ingress timeout the headroom exists to stay under. The
+            # wrap-up spends min(30 s, REMAINING) — never new time: a
+            # max-iterations/loop abort with a healthy clock keeps today's 30 s,
+            # an exhausted clock bottoms out at _bounded_call's 1 s attempt
+            # floor (one bounded try, then the clean timeout close).
+            _wrap_budget = min(30.0, max(0.0, guard.deadline - time.monotonic()))
             try:
-                async for kind, payload in _bounded_call(
-                    relay_msgs, None, max(30.0, guard.deadline - time.monotonic())
-                ):
+                async for kind, payload in _bounded_call(relay_msgs, None, _wrap_budget):
                     if kind == "heartbeat":
                         yield b": keepalive\n\n"
                     elif kind == "reasoning":
@@ -2469,6 +2694,35 @@ async def relay_stream(
                         wrap_error = True
             except TimeoutError:
                 wrap_timed_out = True
+            except httpx2.HTTPError as exc:
+                # W6 audit (finding 1, the ZC-1/XV-2 sibling): the wrap-up is the
+                # THIRD real model call of the turn and had NO transport handler —
+                # a ConnectError/DNS/reset here escaped relay_stream, killing the
+                # client's SSE with no error chunk and no [DONE] while the settle
+                # below never ran (the turn's largest prefill went unbilled).
+                # Same treatment as the zero-completion retry: record the
+                # failure, settle it as an error row, close the stream cleanly.
+                wrap_error = True
+                # The upstream status, when the fault carries one, rides the
+                # detail: an operator sees "died on an HTTP status" vs a
+                # transport fault, and the w6 pin can prove THIS arm (not the
+                # generic one) handled the fault — the generic arm cannot name
+                # a status. getattr chain: formatting the refusal must never
+                # itself raise (a raise here escapes the sibling excepts).
+                _status = getattr(getattr(exc, "response", None), "status_code", None)
+                wrap_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
+                if _status is not None:
+                    wrap_failed += f" (upstream status {_status})"
+                # Double retrieval is already safe: the failed task is
+                # re-awaited only by _bounded_call's finally, whose reaper
+                # suppresses every Exception — nothing re-raises `exc` here.
+                # (The old type(exc)(str(exc)) rebuild was dead code AND the
+                # defect this arm shipped with: for HTTPStatusError it raised
+                # TypeError inside this arm, escaping relay_stream before the
+                # settle — deleted, audit w6 xval.)
+            except Exception as exc:  # the relay must never die on an upstream fault (XV-2)
+                wrap_error = True
+                wrap_failed = f"{type(exc).__name__}: {exc}".strip() or "upstream call failed"
             if _wrap_chunks:
                 _wrap_text = "".join(_wrap_chunks)
                 relay_msgs.append({"role": "assistant", "content": _wrap_text})
@@ -2488,6 +2742,12 @@ async def relay_stream(
             if wrap_timed_out:
                 yield _pcai({"pcai": {"event": "guard", "detail": "wrap-up model call timed out"}})
                 yield _reasoning_delta("\n[relay] wrap-up model call timed out\n")
+            elif wrap_failed:
+                # the transport/generic failure arm (W6 finding 1): the same
+                # clean-close shape the timeout arm gives — guard event +
+                # reasoning tombstone; the usage chunk and [DONE] below are shared.
+                yield _pcai({"pcai": {"event": "guard", "detail": "wrap-up model call failed: " + wrap_failed}})
+                yield _reasoning_delta("\n[relay] wrap-up model call failed: " + wrap_failed + "\n")
             # OpenAI-standard final usage chunk (audit 2026-10-29, ZC-6). The
             # F-7 fix covered the handback and final-answer terminals and
             # MISSED this third one: a guard-aborted turn settled the wrap-up
@@ -2552,12 +2812,19 @@ async def relay_stream(
             # definitions only where it needs them.
             if fn_name == tool_surface.META_TOOL and _surface_mode == tool_surface.MODE_HYBRID:
                 _meta_text, _promoted = tool_surface.handle_meta_call(fn.get("arguments"), catalog, _promoted)
+                _meta_out, _meta_stats = await _prepare_tool_content(
+                    _meta_text, mode=compress_mode, key_id=key_id, server="pcai", tool="tools"
+                )
                 relay_msgs.append(
                     # Cap like every other tool result: a describe payload is
                     # re-prefilled on every later iteration, so an uncapped one
                     # is exactly the "big result" hazard this cap exists for.
-                    {"role": "tool", "tool_call_id": tc.get("id", ""), "content": _relay_content(_meta_text)}
+                    {"role": "tool", "tool_call_id": tc.get("id", ""), "content": _meta_out}
                 )
+                if _meta_stats is not None:
+                    if compress_stats_out is not None:
+                        compress_stats_out.append(_meta_stats)
+                    yield _pcai({"pcai": {"event": "compress", **_meta_stats}})
                 yield _pcai(
                     {
                         "pcai": {
@@ -2657,6 +2924,68 @@ async def relay_stream(
                 )
                 mcp_summaries.append(f"[tool result] {server}__{tool} → invalid arguments JSON\n")
                 continue
+            # --- compressed-result retrieval (X-PCAI-Compress-Tools) -------
+            # Handled LOCALLY: `pcai__retrieve` is a synthetic tool, never a
+            # granted MCP tool, so the ACL path below would deny it. It is
+            # offered only on an ON turn, but a HISTORY that still names it
+            # from an earlier ON turn resolves too — the alternative is a
+            # model that followed the marker's instruction and got "denied".
+            if server == toolcompress.RETRIEVE_SERVER and tool == toolcompress.RETRIEVE_TOOL:
+                _digest = str(args.get("digest") or "").strip()
+                _stored: str | None = None
+                if _digest and key_id is not None:
+                    try:
+                        from . import toolcompress_store
+
+                        _stored = await toolcompress_store.load(key_id, _digest)
+                    except Exception:
+                        log.exception("relay: tool_compress_store load failed")
+                if not _digest:
+                    _retrieve_text = (
+                        "error: pcai__retrieve requires a digest — copy it from the compression marker "
+                        'on the result you are trying to expand, e.g. {"digest": "ab12cd34ef56"}'
+                    )
+                elif _stored is None:
+                    _retrieve_text = toolcompress.retrieve_unknown_digest(_digest)
+                else:
+                    _retrieve_text = toolcompress.retrieve_slice(
+                        _stored,
+                        offset=args.get("offset", 0),
+                        limit=args.get("limit", toolcompress.RETRIEVE_MAX_CHARS),
+                    )
+                relay_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": _relay_content(_retrieve_text),
+                    }
+                )
+                yield _pcai(
+                    {
+                        "pcai": {
+                            "event": "tool_call",
+                            "id": tc.get("id", ""),
+                            "server": server,
+                            "tool": tool,
+                            "ok": _stored is not None,
+                            "ms": 0,
+                            "args": args,
+                            "result": _preview(_retrieve_text),
+                        }
+                    }
+                )
+                await _trace_step(
+                    iteration,
+                    "tool",
+                    server=server,
+                    tool=tool,
+                    ms=0,
+                    status="ok" if _stored is not None else "error",
+                )
+                mcp_summaries.append(
+                    f"[tool result] {server}__{tool} → " + ("ok" if _stored is not None else "no stored result") + "\n"
+                )
+                continue
             # Wave B dispatch branch (flag-gated by the executor's presence):
             # the "client" pseudo-server is NOT an entry in `grants` — its
             # calls route to the client-tool dispatch executor, which carries
@@ -2670,13 +2999,20 @@ async def relay_stream(
                 except TimeoutError:
                     exec_ok, content = False, "error: client tool exceeded the relay wall-clock budget"
                 ms = int((time.monotonic() - started) * 1000)
+                _client_text, _client_stats = await _prepare_tool_content(
+                    content, mode=compress_mode, key_id=key_id, server=server, tool=tool
+                )
                 relay_msgs.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "content": _relay_content(content),
+                        "content": _client_text,
                     }
                 )
+                if _client_stats is not None:
+                    if compress_stats_out is not None:
+                        compress_stats_out.append(_client_stats)
+                    yield _pcai({"pcai": {"event": "compress", **_client_stats}})
                 yield _pcai(
                     {
                         "pcai": {
@@ -2727,6 +3063,32 @@ async def relay_stream(
                     }
                 )
                 yield _reasoning_trace(server, tool, args, "denied")
+                # F2 (audit w6 follow-up): an in-loop ACL denial used to
+                # vanish — no ledger row, no metric, no mcp_call_audit row —
+                # while the SAME denial via the executor and /mcp settles
+                # "denied". Mirror the executor's record() exactly (same
+                # status vocabulary, model "*" like every relay tool row,
+                # 0 tokens, best-effort: a broken ledger must not kill the
+                # turn). The trace row above already recorded the step.
+                if key_id is not None:
+                    try:
+                        await settle(key_id, "*", f"mcp:{server}:{tool}", 0, 0, "denied", 0, request_id)
+                    except Exception:
+                        log.exception("relay: settle failed (denied %s/%s)", server, tool)
+                    _metrics.observe_mcp_call(server, "denied", "")
+                    try:
+                        from .chain_audit import write_mcp_call
+
+                        await write_mcp_call(
+                            key_id=key_id,
+                            server=server,
+                            tool=tool,
+                            arguments=args,
+                            outcome="denied",
+                            request_id=request_id,
+                        )
+                    except Exception:
+                        log.exception("relay: mcp_call_audit write failed (denied %s/%s)", server, tool)
                 await _trace_step(
                     iteration,
                     "tool",
@@ -2758,13 +3120,20 @@ async def relay_stream(
                 log.warning("relay: executor %s/%s failed: %s", server, tool, type(exc).__name__)
                 ok, content = False, f"error: tool execution failed ({type(exc).__name__})"
             ms = int((time.monotonic() - started) * 1000)
+            _tool_text, _tool_stats = await _prepare_tool_content(
+                content, mode=compress_mode, key_id=key_id, server=server, tool=tool
+            )
             relay_msgs.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
-                    "content": _relay_content(content),
+                    "content": _tool_text,
                 }
             )
+            if _tool_stats is not None:
+                if compress_stats_out is not None:
+                    compress_stats_out.append(_tool_stats)
+                yield _pcai({"pcai": {"event": "compress", **_tool_stats}})
             yield _pcai(
                 {
                     "pcai": {

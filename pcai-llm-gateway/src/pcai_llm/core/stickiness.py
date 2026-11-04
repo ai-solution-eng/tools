@@ -23,7 +23,7 @@ Contract (the fail-open discipline of mcpf.federation.load_grants):
 * Retention: housekeeping prunes rows older than
   settings.retention_stickiness_days (default 14; 0 = keep forever).
 
-NAMESPACING (defect fix, 2026-10-23): the table is shared by TWO independent
+NAMESPACING (defect fix, 2026-10-23): the table is shared by independent
 features -- the cascade's load-aware HEAD (auto-demand-aware) and the routing
 never-downgrade FLOOR. Both key on (key_id, thread_key), and the thread
 fingerprint is identical for a given conversation, so without a namespace the
@@ -32,6 +32,12 @@ auto-demand-aware at GLM would have every later ROUTED turn held at GLM
 regardless of the request. Rows are therefore namespaced by SCOPE at the
 thread-key level (no schema change; thread_key is TEXT). The cascade path keeps
 its historical un-prefixed key so its stored rows and behaviour are unchanged.
+A THIRD scope, ep: (session affinity), pins a conversation to a physical
+ENDPOINT id — under that scope the model column holds an endpoint id, not a
+model name. Same discipline: the raw fingerprint is identical across features,
+so the prefix is the ONLY thing keeping the three from reading each other's
+rows; every ep: writer/reader goes through the endpoint helpers below, which
+apply the scope internally so callers can never mix it up with a model row.
 """
 
 from __future__ import annotations
@@ -56,9 +62,10 @@ _PENDING: set[asyncio.Task] = set()
 _PENDING_MAX = 1024
 
 # Row namespaces. The cascade path uses NO prefix (its rows predate this and
-# must keep working); routing prefixes so the two features can never read each
-# other's rows. See the module docstring's NAMESPACING note.
+# must keep working); routing and session-affinity prefix so the features can
+# never read each other's rows. See the module docstring's NAMESPACING note.
 SCOPE_ROUTING = "routing:"
+SCOPE_ENDPOINT = "ep:"
 
 
 def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
@@ -170,9 +177,66 @@ async def get_sticky_row(key_id: uuid.UUID, thread_key: str | None) -> tuple[str
     return str(model), age
 
 
-def make_writer(
-    key_id: uuid.UUID, thread_key: str | None, defer: bool = False
-) -> Callable[[str], Any] | None:
+# ---------------------------------------------------------------------------
+# Endpoint pins (session affinity) — the ep: scope
+# ---------------------------------------------------------------------------
+#
+# The pin is ROUTING state, never policy: the caller (routes_proxy chat path)
+# validates the stored endpoint against the LIVE pool on every read (inside
+# Pool.pick) and drops it when the endpoint cooled down or vanished. The
+# ep: scope keeps it out of the cascade head's and routing floor's rows
+# (NAMESPACING note above).
+
+
+async def get_endpoint_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
+    """The conversation's pinned ENDPOINT id, or None.
+
+    `session` is the RAW X-PCAI-Session value; the ep: scope is applied HERE
+    (callers never see or write the namespaced key, so the three scopes can
+    never collide at the call site). TTL rides the row's own updated_at: a
+    pin older than ttl_s is expired — dropped, so it cannot outlive its
+    lease — and reported as absent. ttl_s <= 0 disables the expiry (the
+    housekeeping retention sweep still applies).
+
+    NEVER raises (module contract): any fault reads as "no pin", and the
+    pick falls back to normal rotation — a stickiness outage must never
+    change the response shape.
+    """
+    tk = scoped_thread_key(session, SCOPE_ENDPOINT)
+    if not tk:
+        return None
+    row = await get_sticky_row(key_id, tk)
+    if row is None:
+        return None
+    pin, age = row
+    if ttl_s > 0 and age > ttl_s:
+        await drop_sticky(key_id, tk)
+        return None
+    return pin
+
+
+async def set_endpoint_pin(key_id: uuid.UUID, session: str | None, endpoint_id: str) -> None:
+    """Persist (or refresh) the conversation's endpoint pin.
+
+    Best-effort, never raises (set_sticky's contract): the call that
+    produced the pin already resolved, so a lost write costs one re-decision
+    on the next turn. A re-serve refreshes updated_at, which is also the
+    TTL clock — an idle conversation's pin expires on its own.
+    """
+    await set_sticky(key_id, scoped_thread_key(session, SCOPE_ENDPOINT), endpoint_id)
+
+
+async def drop_endpoint_pin(key_id: uuid.UUID, session: str | None) -> None:
+    """Forget the pin (breaker trip / transport error / upstream refusal).
+
+    Best-effort, never raises: the pin just proved stale, and leaving it in
+    place would only cost one ignored read before the live-pool validation
+    rejects it anyway.
+    """
+    await drop_sticky(key_id, scoped_thread_key(session, SCOPE_ENDPOINT))
+
+
+def make_writer(key_id: uuid.UUID, thread_key: str | None, defer: bool = False) -> Callable[[str], Any] | None:
     """A fire-and-forget writer bound to one conversation, or None.
 
     Returned to the router as its sticky_write callable. The router is

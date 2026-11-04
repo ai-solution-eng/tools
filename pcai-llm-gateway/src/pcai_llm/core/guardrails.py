@@ -20,7 +20,9 @@ Contract:
   output of the previous one (mask-then-scan semantics).
 * Engines (config shapes on the engine helpers): blocklist (keyword
   deny/mask), regex_pii (email / phone / Luhn-valid credit cards), length
-  (character caps), webhook (external moderator).
+  (character caps), webhook (external moderator), secrets (credential-shaped
+  strings: AWS keys, PEM private keys, JWTs, gateway/provider API keys,
+  bearer tokens — MASK-ONLY, no reversible mapping).
 * Bug fixes vs the reference pipeline this module ports: mask replaces
   EVERY occurrence of EVERY keyword (the reference stopped at the first
   hit); the PHONE pattern refuses to match inside a longer digit run
@@ -52,14 +54,75 @@ from ..db import db
 log = logging.getLogger(__name__)
 
 GUARDRAIL_MODES = ("pre_call", "post_call")
-GUARDRAIL_ENGINES = ("blocklist", "regex_pii", "length", "webhook")
+GUARDRAIL_ENGINES = ("blocklist", "regex_pii", "length", "webhook", "secrets")
 MASK = "[REDACTED]"
+
+# --- secrets engine patterns (2026-11-02) ----------------------------------
+# Credential-shaped strings that must never leave the gateway or be echoed
+# back by a model. Deliberately CONSERVATIVE: each pattern is anchored on a
+# vendor prefix or a key header, so ordinary prose is not redacted. The
+# engine is MASK-ONLY: no token->original mapping is stored, so a masked
+# secret cannot be re-inflated (reversibility needs its own at-rest secret
+# store and is a separate decision).
+_SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
+    "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "aws_secret_key": re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{40}"),
+    "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
+    "jwt": re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    "gateway_key": re.compile(r"\bhllm-[A-Za-z0-9]{16,}\b"),
+    "openai_key": re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    "github_token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    "bearer": re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}=*"),
+}
+SECRET_KINDS = tuple(_SECRET_PATTERNS)
+
+
+def _secret_kinds_of(cfg: dict[str, Any]) -> tuple[str, ...]:
+    """Which kinds this guardrail watches. Unknown names are ignored; an
+    empty/absent list means ALL kinds (the safe default)."""
+    raw = cfg.get("kinds")
+    if isinstance(raw, list) and raw:
+        picked = tuple(str(k) for k in raw if str(k) in _SECRET_PATTERNS)
+        return picked or SECRET_KINDS
+    return SECRET_KINDS
+
+
+def _first_secret_hit(texts: list[str], kinds: tuple[str, ...]) -> str | None:
+    """The FIRST kind found in any text (for block/flag verdicts), else None."""
+    for text in texts:
+        for kind in kinds:
+            if _SECRET_PATTERNS[kind].search(text):
+                return kind
+    return None
+
+
+def _mask_secrets(text: str, kinds: tuple[str, ...]) -> tuple[str, dict[str, int]]:
+    """Replace every credential-shaped match with [REDACTED:<kind>]."""
+    counts: dict[str, int] = {}
+    for kind in kinds:
+        pattern = _SECRET_PATTERNS[kind]
+
+        def _sub(match: re.Match[str], _kind: str = kind) -> str:
+            counts[_kind] = counts.get(_kind, 0) + 1
+            return f"[REDACTED:{_kind}]"
+
+        text = pattern.sub(_sub, text)
+    return text, counts
+
 
 # Audit cap for one run's event list (the ledger's guardrail_events JSONB).
 # Enforcement is NEVER capped — only the recorded verdicts are.
 _MAX_EVENTS = 50
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# AUDIT-r5 #7 (P1 PERF): unbounded '+' on both sides of the @ made any
+# no-match text drive quadratic backtracking — every start position
+# re-scans the whole run (a 100k-char 'a' prompt, inside the pre_call
+# cap, stalled the event loop for ~8.4 s). {1,64}/{1,255} are the RFC
+# 5321 local-part and RFC 1035 domain bounds, so real addresses match
+# unchanged ('user@localhost' still fails: no dot) while the per-start
+# scan is capped and the sweep stays linear.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,}")
 # (?<!\d) / (?!\d) anchors: a phone must not sit inside a longer digit run
 # (the reference pattern flagged suffixes of IDs and dates).
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}(?!\d)")
@@ -312,18 +375,158 @@ def _keywords_of(cfg: dict) -> list[str]:
 def _first_keyword_hit(keywords: list[str], texts: list[str]) -> str | None:
     """First keyword (CONFIG order) matching any text case-insensitively —
     config order keeps deny verdicts deterministic for the audit log."""
-    lowered = [t.lower() for t in texts]
+    # AUDIT-r5 #3 (round 3): the deny decision must fold exactly like the
+    # mask engine — a 'ς' keyword policy must hit 'σ' text, which plain
+    # .lower() misses and would PASS what the mask would have redacted.
+    lowered = [_fold(t) for t in texts]
     for kw in keywords:
-        kw_low = kw.lower()
+        kw_low = _fold(kw)
         if any(kw_low in t for t in lowered):
             return kw
     return None
 
 
+# The span pass (str.find) must search the SAME folded form the loop's
+# re.IGNORECASE subn matches against — and the fold must not change any
+# length, or the spans would point off the original text. str.lower()
+# misses the literal-equivalence pairs re adds on top of it (CPython's
+# re._casefix table: final/regular sigma, micro/mu, theta variants, the
+# Cyrillic te-tail set, ...);
+#   * U+0130's lower is TWO chars ('i' + combining dot), so sre equates
+#     it to 'i' through its expansion handling instead of the table; and
+#   * str.lower() applies the CONTEXTUAL Greek final-sigma rule: a 'Σ'
+#     before a non-cased char lowers to 'ς', not 'σ' — the fold image of
+#     'Σ' would depend on its NEIGHBOURS, while re.IGNORECASE matches
+#     case per character (round 5: a keyword 'σ' missed a word-final
+#     'Σ' that str.lower() had turned into 'ς').
+# The table therefore folds every character to a FIXED class member:
+# one bulk-guarded scan collects every 1:1 lowercase pair (the cased
+# 'A' after each char keeps the final-sigma rule from firing while
+# scanning; the one 2-char lower U+0130 is excluded and unioned
+# explicitly), the interpreter's _casefix classes are unioned in on
+# top, and every class collapses onto its smallest member that is its
+# own lowercase. Because sigma-form characters all map AWAY from 'Σ',
+# no 'Σ' survives the translate step and the trailing .lower() in
+# _fold can never fire the contextual rule — it only serves as the
+# plain-case folder should the table build degrade (no interpreter
+# table), where the len guards at both call sites then decline
+# anything that lengthens to the exact sequential loop.
+def _build_fold_trans() -> list[str | None]:
+    # getattr, not "from re import _casefix": the module attribute is private
+    # and absent from typeshed, so a direct import fails type-checking while
+    # getattr degrades cleanly on an interpreter that does not carry it.
+    import re as _re
+
+    _casefix = getattr(_re, "_casefix", None)
+    extra: dict[int, tuple[int, ...]] = {}
+    if _casefix is not None:
+        raw = getattr(_casefix, "_EXTRA_CASES", None) or {}
+        for k, v in raw.items():
+            try:
+                extra[int(k)] = tuple(int(x) for x in (v if isinstance(v, (tuple, list)) else (v,)))
+            except (TypeError, ValueError):
+                continue
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.get(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        # setdefault BOTH endpoints: a case partner (upper form, say 'S')
+        # may be otherwise unmentioned, and find's path-halving needs
+        # every stored value to be a key.
+        parent.setdefault(a, a)
+        parent.setdefault(b, b)
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    def mention(cp: int) -> None:
+        parent.setdefault(cp, cp)
+        lo = chr(cp).lower()
+        if len(lo) == 1:  # U+0130's 2-char lower must not poison the union
+            union(cp, ord(lo))
+        # AUDIT-r5 #3 (round 4): upper forms must land in the class too —
+        # re matches a char against its upper trivially, so a class that
+        # excludes the upper form splits.
+        up = chr(cp).upper()
+        if len(up) == 1:
+            union(cp, ord(up))
+
+    mention(0x130)
+    union(0x130, 0x69)  # sre's expansion equivalence: 'İ' matches 'i'
+    for k, members in extra.items():
+        mention(k)
+        for cp in members:
+            mention(cp)
+        for cp in members:
+            union(k, cp)
+    # Every 1:1 lowercase pair is likewise re-equivalent. Collect them in
+    # ONE bulk pass so import stays cheap: the cased guard letter after
+    # each char keeps the contextual final-sigma rule from firing (a
+    # word-final capital sigma must still map to 'σ' here, not 'ς'), and
+    # U+0130 — the one 2-char lower, which would desynchronise the
+    # pairing — is excluded and already unioned above. If a FUTURE char
+    # grows a 2-char lower, the length check skips this pass and only
+    # the class table plus plain .lower() remain (conceded degradation,
+    # see _fold).
+    chars = "".join(chr(cp) + "A" for cp in range(0x11000) if not 0xD800 <= cp <= 0xDFFF and cp != 0x130)
+    lowered = chars.lower()
+    if len(lowered) == len(chars):
+        for i in range(0, len(chars), 2):
+            if chars[i] != lowered[i]:
+                union(ord(chars[i]), ord(lowered[i]))
+    classes: dict[int, list[int]] = {}
+    for cp in parent:
+        classes.setdefault(find(cp), []).append(cp)
+    trans: dict[int, str] = {}
+    for group in classes.values():
+        # canonical = smallest member that is its OWN lowercase, so no
+        # class image can be re-contextualised by the trailing .lower()
+        own_lower = [m for m in group if chr(m) == chr(m).lower()]
+        canon = min(own_lower) if own_lower else min(group)
+        for cp in group:
+            if cp != canon:
+                trans[cp] = chr(canon)
+    # list, not dict: str.translate indexes a sequence in C, and the
+    # fold sits on the per-request masking path. Identity-filled — a
+    # None entry would DELETE the character, not leave it unchanged.
+    table: list[str | None] = [chr(i) for i in range(0x11000)]
+    for cp, ch in trans.items():
+        table[cp] = ch
+    return table
+
+
+_FOLD_TRANS = _build_fold_trans()
+
+
+def _fold(s: str) -> str:
+    """Length-preserving, CONTEXT-FREE fold reproducing re.IGNORECASE's
+    literal equivalence for THIS interpreter.
+
+    str.lower() is unusable directly: it misses re's extra
+    literal-equivalence pairs (re._casefix: sigma variants, micro/mu,
+    ...), it LENGTHENS U+0130 (-> 'i' + combining dot) — shifting find()
+    spans off the original text — and its contextual Greek final-sigma
+    rule makes the image of 'Σ' depend on the NEXT character, while
+    re.IGNORECASE matches case per character. The translate table maps
+    every character to a fixed member of its re-equivalence class (see
+    _build_fold_trans), which keeps len(_fold(s)) == len(s) — offsets
+    stay valid — removes every 'Σ' so the trailing .lower() can never
+    fire the contextual rule, and degrades to plain .lower() if the
+    table build found no interpreter table; the len guards at both call
+    sites then decline any lengthening codepoint to the exact
+    sequential loop."""
+    return s.translate(_FOLD_TRANS).lower()
+
+
 @lru_cache(maxsize=64)
 def _simple_keywords(keywords: tuple[str, ...]) -> tuple[str, ...] | None:
-    """Deduped, lowercased set when a single span pass is provably
-    equivalent to the sequential loop; None when it is not.
+    """Deduped, re-folded (IGNORECASE-exact) set when a single span pass
+    is provably equivalent to the sequential loop; None when it is not.
 
     The loop masks keyword 1 everywhere, then keyword 2 over the ALREADY
     masked text, so the two diverge whenever one keyword can interact with
@@ -336,17 +539,25 @@ def _simple_keywords(keywords: tuple[str, ...]) -> tuple[str, ...] | None:
       inside a token an earlier one just inserted);
     * an empty keyword (the loop's behaviour there is degenerate).
 
+    The returned keywords are the FOLDED forms — the span pass searches
+    text folded the same way (_fold), so find() sees what the loop's
+    re.subn sees.
+
     Cached per keyword tuple, so a set is validated once, not per request.
     Exact duplicates collapse (masking a keyword twice is idempotent, and
     the loop's second pass counts zero hits)."""
-    mask_low = MASK.lower()
+    mask_low = _fold(MASK)
     seen: list[str] = []
     for kw in keywords:
-        kw_low = kw.lower()
+        kw_low = _fold(kw)
+        if len(kw_low) != len(kw):
+            # AUDIT-r5 #3 (round 2): a keyword the fold cannot keep
+            # length-preserving cannot drive span search — take the loop.
+            return None
         if not kw_low or kw_low in mask_low:
             return None
         for other in keywords:
-            other_low = other.lower()
+            other_low = _fold(other)
             if other_low != kw_low and kw_low in other_low:
                 return None
         if kw_low not in seen:
@@ -355,14 +566,23 @@ def _simple_keywords(keywords: tuple[str, ...]) -> tuple[str, ...] | None:
 
 
 def _mask_by_spans(text: str, lowered_keywords: tuple[str, ...]) -> tuple[str, int] | None:
-    """One pass over the lowered text; None when occurrences OVERLAP.
+    """One pass over the folded text; None when occurrences OVERLAP or
+    the fold fails to preserve the text's length (see the guard below).
 
     Overlap is the remaining way one pass could differ from the loop:
     masking "abc" then "bcd" on "abcd" leaves "[REDACTED]d", while a single
     combined pass would swallow the "bcd" too. It is detected and the caller
     falls back. str.find is the C memchr loop, so the cost is one lowercase
     pass plus one scan per keyword instead of one regex pass per keyword."""
-    lowered = text.lower()
+    lowered = _fold(text)
+    if len(lowered) != len(text):
+        # AUDIT-r5 #3 safety net: a codepoint the fold does not already
+        # map that .lower() would LENGTHEN shifts every span off the
+        # original text — 20 of them before a secret shipped it verbatim
+        # while redacting an unrelated tail. Decline; the caller's
+        # sequential re.subn loop is exact under any case expansion.
+        # (Today no such codepoint exists — see _fold.)
+        return None
     spans: list[tuple[int, int]] = []
     for kw in lowered_keywords:
         start = lowered.find(kw)
@@ -397,8 +617,9 @@ def _mask_keywords(text: str, keywords: list[str]) -> tuple[str, int]:
     prompt is 50 full regex passes, measured at 340-600 ms of synchronous
     event-loop stall, the worst latency cliff in the gateway. When the set
     is provably order-insensitive (_simple_keywords) and its occurrences do
-    not overlap, one span pass produces byte-identical output for roughly
-    17x less time. Every other case runs the original loop unchanged, so
+    not overlap (and the fold preserves the text's length), one span pass
+    produces byte-identical output for roughly 17x less time. Every other
+    case runs the original loop unchanged, so
     behaviour is identical for all inputs."""
     if not keywords:
         return text, 0
@@ -680,6 +901,33 @@ async def run_pre_call(
                     events.append(_event(guard, "webhook", "pass", detail))
             else:
                 events.append(_event(guard, "webhook", "pass", payload))
+        elif guard.engine == "secrets":
+            kinds = _secret_kinds_of(cfg)
+            action = str(cfg.get("action", "mask")).lower()
+            if action == "block":
+                found = _first_secret_hit(_user_texts(current), kinds)
+                if found is not None:
+                    detail = f"blocked {found} credential"
+                    events.append(_event(guard, "secrets", "blocked", detail))
+                    raise GuardrailBlocked(
+                        guard.name, "pre_call", detail, engine="secrets", reply_text=_reply_text_of(cfg)
+                    )
+                events.append(_event(guard, "secrets", "pass"))
+            elif action == "flag":
+                found = _first_secret_hit(_user_texts(current), kinds)
+                events.append(_event(guard, "secrets", "pass", f"flagged {found}" if found else ""))
+            else:
+                secret_totals: dict[str, int] = {}
+
+                def mask_secrets_part(text: str) -> str:
+                    new_text, counts = _mask_secrets(text, kinds)
+                    for kind, count in counts.items():
+                        secret_totals[kind] = secret_totals.get(kind, 0) + count
+                    return new_text
+
+                current = rewrite_user_texts(current, mask_secrets_part)
+                action_name = "masked" if secret_totals else "pass"
+                events.append(_event(guard, "secrets", action_name, _detail_of(secret_totals)))
         else:
             # Unreachable via the DDL CHECK constraint; a hand-built spec
             # must not silently pass or block — skip loudly, yield nothing.
@@ -736,6 +984,23 @@ async def run_post_call(
                 events.append(_event(guard, "webhook", "masked", detail))
             else:
                 events.append(_event(guard, "webhook", "pass", payload))
+        elif guard.engine == "secrets":
+            kinds = _secret_kinds_of(cfg)
+            action = str(cfg.get("action", "mask")).lower()
+            if action == "block":
+                found = _first_secret_hit([text], kinds)
+                if found is not None:
+                    detail = f"blocked {found} credential in the answer"
+                    events.append(_event(guard, "secrets", "blocked", detail))
+                    return text, _cap(events), True
+                events.append(_event(guard, "secrets", "pass"))
+            elif action == "flag":
+                found = _first_secret_hit([text], kinds)
+                events.append(_event(guard, "secrets", "pass", f"flagged {found}" if found else ""))
+            else:
+                text, counts = _mask_secrets(text, kinds)
+                action_name = "masked" if counts else "pass"
+                events.append(_event(guard, "secrets", action_name, _detail_of(counts)))
         else:
             log.warning("guardrails: skipping %r — unknown engine %r", guard.name, guard.engine)
     return text, _cap(events), False

@@ -126,9 +126,7 @@ async def price_hints(models: list[str]) -> dict[str, str]:
         if not isinstance(row, dict):
             continue
         try:
-            hints[name] = (
-                f"in {float(row['input_per_m']):g} / out {float(row['output_per_m']):g} USD per 1M tokens"
-            )
+            hints[name] = f"in {float(row['input_per_m']):g} / out {float(row['output_per_m']):g} USD per 1M tokens"
         except (TypeError, ValueError, KeyError):
             continue
     return hints

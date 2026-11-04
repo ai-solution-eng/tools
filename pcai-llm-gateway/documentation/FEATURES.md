@@ -14,7 +14,7 @@ is no "remaining" column — no read-modify-write, no check-then-act race.
 
 - **Two kinds**: token budgets (`budgets.limit_tokens`) and USD cost budgets
   (`cost_budgets.limit_usd`), both (key, model-or-`'*'`, period ∈
-  `day|week|month`, UNIQUE per triple). A key may carry several; every
+  `day|week|month|quarter|year`, UNIQUE per triple). A key may carry several; every
   matching budget must have headroom or the call is refused — whichever
   limit hits first stops the key. USD budgets are gate-checked post-paid
   (`spent >= limit`): an in-flight request's true cost is known only after
@@ -37,7 +37,21 @@ is no "remaining" column — no read-modify-write, no check-then-act race.
   mean serializing every call on a lock.
 - **Visibility**: `X-Budget-Warning: <80|95>% of a period budget consumed`
   on responses (including the relay stream) when a matching budget crosses
-  80%/95% — pure visibility, never a refusal.
+  80%/95% — pure visibility, never a refusal. The band is the TIGHTER of the
+  key's own allocation and the enrollment's TEAM envelope: a team pool at 95%
+  is "about to run out" even when the key's own allocation has room.
+- **`GET /v1/models` capacity projection**: every registered entry carries
+  `pcai.capacity = {ok, remaining_tokens, blocked_by, warn}` for the CALLING
+  key. `ok` means "the ADMISSION GATE would admit this", not merely "spent <
+  limit": the per-key verdict (charged with the admission estimate) and the
+  team envelope (per-model caps, pooled outer bound, overflow swallow) are the
+  SAME evaluators `check_budgets` runs, so visibility cannot drift from
+  enforcement. Routing pseudo-model entries carry the WINDOWED form —
+  `{ok, warn, candidates: {ok, blocked}, blocked_by?}` over their
+  floor..ceiling ladder — so a picker can render "Unavailable to you" and "You
+  are about to run out" without guessing. Fail-open: a budget-table fault
+  degrades to `ok: true` / `warn: 0` (the previous listing), never to an
+  empty one.
 
 ## Rate limits
 
@@ -198,6 +212,21 @@ only — TPM is blind to them.
   carrying `X-PCAI-Stream-Events: 0`) gets the same turn WITHOUT the
   `{"pcai": …}` events — a byte-clean OpenAI-spec stream for strict
   validating clients (see Key model).
+- **Tool-result compression** (`X-PCAI-Compress-Tools: 1|0|shadow`,
+  default OFF): deterministic, model-free selection over oversized tool
+  results. A recognised kind (JSON array, NDJSON, logs, search output, diff)
+  keeps its signal — error records, statistical outliers, boundary context,
+  ERROR/stack-trace/summary lines, first matches per file, changed lines —
+  and drops the redundancy; unknown shapes, small results (< 4,096 chars) and
+  marginal savings (< 15%) pass through untouched. The original is stored
+  under its content digest and the marker tells the model to call the
+  synthetic `pcai__retrieve` tool (offered on every iteration of an ON turn,
+  so the tool list is stable and the cached prefix survives). No LLM, no
+  network, no second request: the transform is a pure function of the text,
+  which is what makes it cache-safe and cheap enough for the request path.
+  `shadow` reports the saving via `pcai.compress` events without rewriting.
+  A store failure fails the COMPRESSION, not the turn (the original passes
+  through). Retention is `toolCompressStoreTtlS` (0 disables reclamation).
 - **Request semantics**: the relay pre-flight (grants check) runs BEFORE
   the gates — a grantless relay request cannot leak its concurrency slot —
   and a catalog fetch per granted server happens before the first token
@@ -311,12 +340,17 @@ each hop take".
   and the relay turn proceeds untouched. Debugging aid, not a second
   transcript store.
 
-## Saved conversations (per API key)
+## Saved conversations (per key group)
 
-- **Key-scoped server-side transcripts**: every conversation belongs to the
-  creating key; every query filters by `key_id`, so a foreign id is a plain
-  404 with no existence oracle. Routes behind the SAME bearer auth as the
-  proxy (any valid key — no extra scope).
+- **Key-GROUP-scoped server-side transcripts**: every conversation belongs to
+  the credential's `key_group` — the rotation-stable identity every rotate
+  copies forward — and every query filters by it, so a foreign group is a
+  plain 404 with no existence oracle. `key_id` stays on the row as
+  provenance (which credential created it). A rotation (the admin rotate, or
+  the SSO "Sign in with SSO" replacement) therefore keeps the user's history;
+  independent keys of one user get their own group and stay isolated.
+  Routes behind the SAME bearer auth as the proxy (any valid key — no extra
+  scope).
 - **Replace-all storage model**: the client pushes the FULL transcript per
   turn (`PUT /v1/conversations/{id}/messages`); the delete+insert swap is
   one transaction, so a concurrent reader sees the old or the new
@@ -383,9 +417,25 @@ each hop take".
   for a subject that already holds a live `sso-create` key is refused with
   409 unless the body is `{"rotate": true}` — rotate REVOKES the old key
   in the SAME transaction that mints the new one (never two live keys,
-  never zero; a failed mint leaves the old key live). Admin-governed
+  never zero; a failed mint leaves the old key live) and the new key
+  INHERITS the old key's `key_group`, so saved conversations survive the
+  replacement. Admin-governed
   eligibility: `users.self_mint_enabled` (a first mint is default-eligible)
   via `GET/PUT /admin/keys/self-mint-eligibility`.
+- **The chat page keeps the association (2026-11-03)**: the minted key is
+  stored with SSO PROVENANCE, so the chip keeps rendering "Signed in as
+  <subject> · oidc" after sign-in and across reloads — boot auto-connects
+  the stored key in the SSO flavor (`connectKey({sso:true})`) instead of
+  flipping to "API-key user" the moment the mint lands. The mint card is a
+  FIRST-mint affordance only: it hides as soon as the browser holds a
+  working key, so the old loop ("clicking the SSO button ALWAYS gets me a
+  new rotated key") cannot happen. An SSO key is auto-remembered in
+  localStorage — it is this browser's device credential, unlike a pasted
+  secret — while the remember box stays visible and un-checkable. A browser
+  WITHOUT the key (new tab/device, cleared storage) sees the chip admit
+  "no key on this browser yet", and the 409 dialog NAMES the existing key
+  (prefix + created-at from `GET /v1/keys/for-me`) before offering the
+  destructive replace, stating that conversations follow the key group.
 - **The `X-API-Key` envelope** — behind a chained host the proxy injects
   `Authorization: Bearer <id_token>` into every forwarded request, so the
   browser SPA cannot deliver a minted virtual key via the Authorization
@@ -409,9 +459,10 @@ each hop take".
 ## Per-key MCP credential overrides
 
 - **The multi-tenant memory problem**: some MCP servers key tenant identity
-  on request headers (the memory-MCP pattern: `X-Memory-Dataset` /
-  `X-Dataset-Password`). Server-level auth is one fleet-wide identity —
-  per-USER identity needs per-key headers.
+  on request headers (the memory-MCP pattern: `X-API-Key` holding a
+  user-minted RAG key; the legacy `X-Memory-Dataset` / `X-Dataset-Password`
+  pair addresses a dataset directly). Server-level auth is one fleet-wide
+  identity — per-USER identity needs per-key headers.
 - **Storage**: Fernet-encrypted JSON `{header: value}` per
   (key_id, server_name) in `mcp_server_creds`, keyed off the same master
   key as every panel credential. **Write-only**: PUT replaces (upsert),
@@ -427,17 +478,23 @@ each hop take".
 - **Separation of concerns**: credentials are not grants — a key can carry
   memory headers for a server whose tools it has not been granted.
 
-## Enrollment-time memory datasets (opt-in at redemption)
+## Enrollment-time memory datasets (LEGACY opt-in at redemption)
+
+> **Legacy path (2026-11-04).** The current RAG model is SSO-managed: a user
+> mints a key in the RAG app (`/access`), ★-binds a dataset there, and the
+> backend resolves dataset+password from that key — the gateway then needs
+> only the `X-API-Key` override. The provisioning below remains for explicit
+> API/profile callers; the redeem dialog no longer offers it and the console
+> no longer models a dataset.
 
 - **The admin-burden loop, closed**: the per-key credential override above
   still needed an admin to hand-create each user's dataset and paste the
-  header pair into the creds dialog. Now the REDEEM itself can do it: the
+  header pair into the creds dialog. The REDEEM itself can do it: the
   redeem request gains `memory_opt_in` (`bool | null`) — `null`/omitted
   falls back to the deployment default (`PCAI_LLM_ENROLL_MEMORY_DEFAULT`,
   chart `settings.enrollMemoryDefault`, **false**), and a profile bound to
   the code can preset the cohort with `"memory": {"provision": true}` in
-  its `defaults_json` (request > profile > deployment default). The
-  redeem-page checkbox ("Give me a private memory dataset") sends it.
+  its `defaults_json` (request > profile > deployment default).
 - **Provisioning**: the gateway resolves the RAG server by REGISTRY NAME
   (`PCAI_LLM_ENROLL_MEMORY_SERVER`, default `mm-rag`) from the same
   `mcp_servers` snapshot the federation layer serves, derives the REST
@@ -600,6 +657,16 @@ stateless streamable-http).
   freshness); without an entry the server is skipped-with-error as
   before. Cold start pays a bounded fan-out once (15 s/server metadata
   timeout).
+- **Cross-replica convergence**: the registry snapshot is per-process, so a
+  mutation served by one replica used to leave its siblings stale until they
+  restarted (console "test" 404s, relay `unknown server`). The registry now
+  polls a DB watermark (`count(*)` + `max(updated_at)` over `mcp_servers` and
+  `model_endpoints`, the stamps maintained by a trigger so out-of-band SQL
+  edits count) every `PCAI_LLM_REGISTRY_WATCH_S` (5 s) and refreshes only when
+  it moved; the console's two registry reads additionally re-check on read
+  (`PCAI_LLM_REGISTRY_ADMIN_FRESH_S`, 1 s, fail-open). The local refresh after
+  a committed mutation stays — that is what makes the SERVING replica
+  immediately correct.
 - **Kill switch**: `PCAI_LLM_MCP_FLAT_TOOLS=0` reverts `tools/list` to
   exactly the two gateway tools and flattened names to unknown-tool
   errors — the pre-flat surface, bit-for-bit.
@@ -686,7 +753,10 @@ stateless streamable-http).
   6000 estimated tokens) map the score to a ladder position: below tier 1
   serves the floor, below tier 2 the middle of the floor..ceiling window,
   at/above tier 2 the ceiling. Unavailable models walk UP within the
-  window (the request gets the cheapest AVAILABLE model that fits); a
+  window (the request gets the cheapest AVAILABLE model that fits — where
+  available means the ADMISSION GATE would admit it: key ACL, healthy chat
+  pool, and budget headroom for THIS request's estimate, per-key AND team
+  envelope); a
   router error or any doubt serves the ceiling — routing can only
   DOWNGRADE when the heuristics positively say the cheap model fits,
   never as a side effect of a failure, and the choice is made before the
@@ -708,7 +778,10 @@ stateless streamable-http).
 - **`GET /v1/models` routing entries**: when the CALLING key's profile
   policy is shadow/active and the master switch is on, the listing
   appends `routing` + `routing__{X}` for each registered chat model the
-  key may use, each with `"pcai": {"type": "routing"}`. Off-policy keys
+  key may use, each with `"pcai": {"type": "routing"}` and — when capacity is
+  known — `pcai.capacity` aggregated over that entry's floor..ceiling window
+  (`ok` = at least one rung can serve, `warn` = the tightest rung's band,
+  `candidates` = {ok, blocked} counts). Off-policy keys
   see nothing new — for them the names behave as plain aliases, and
   listing them would suggest semantics the profile never signed up for.
 
@@ -1066,9 +1139,9 @@ prior release), existing tables untouched.
 | Table | Purpose |
 |---|---|
 | `tenants`, `users` | Tenancy roots (tenant → users → keys; `users.profile_id`). |
-| `profiles` | Named cascade orderings (`model_order`) + key-creation presets (`defaults_json`: budgets, mcp_grants) + per-profile `offpeak_fraction` + complexity-routing knobs (`routing_policy` `off\|shadow\|active`, `routing_min_model` floor). A preset budget is a token budget (`limit_tokens`) or a dollar budget (`limit_usd`), exactly one kind per entry (period `day\|week\|month`, positive); keys minted from the profile get BOTH kinds stamped — token presets into `budgets`, dollar presets into `cost_budgets`. |
+| `profiles` | Named cascade orderings (`model_order`) + key-creation presets (`defaults_json`: budgets, mcp_grants) + per-profile `offpeak_fraction` + complexity-routing knobs (`routing_policy` `off\|shadow\|active`, `routing_min_model` floor). A preset budget is a token budget (`limit_tokens`) or a dollar budget (`limit_usd`), exactly one kind per entry (period `day\|week\|month\|quarter\|year`, positive); keys minted from the profile get BOTH kinds stamped — token presets into `budgets`, dollar presets into `cost_budgets`. |
 | `api_keys` | Hashed keys: `key_hash`, `key_prefix`, `scopes`, `allowed_models`, `rate_limit_rpm/tpm`, `max_concurrent`, `expires_at`, `revoked_at`, `relay_default`. |
-| `budgets` | Token budgets: (key, model-or-`'*'`, period ∈ day/week/month, `limit_tokens`) — UNIQUE per triple. |
+| `budgets` | Token budgets: (key, model-or-`'*'`, period ∈ day/week/month/quarter/year, `limit_tokens`) — UNIQUE per triple. |
 | `cost_budgets` | USD cost budgets, parallel shape (`limit_usd`); gate-checked POST-PAID alongside the token budgets (`spent >= limit` — the in-flight request's cost is only known after the response, so overshoot is bounded by one response), and INERT for an unpriced model (`cost_usd` NULL contributes nothing to the SUM). |
 | `model_costs` | Per-model USD prices (input/output/cached per 1M tokens) that price `usage_ledger.cost_usd` at request time; absent row = unpriced (cost NULL). |
 | `usage_ledger` | One immutable row per request outcome: key, model, `endpoint` (`chat|embeddings|mcp:<server>:<tool>|chat:guardrail`), prompt/completion/total/cached tokens, `cost_usd`, `status` (`ok|error|cache_hit|budget_exceeded|rate_limited|guardrail_blocked`), latency, request id, `billing_fraction`, `guardrail_events` JSONB, complexity-routing audit columns (`routing_policy/ceiling/served/reason`, stamped on pseudo-model requests under shadow/active only). Indexed `(key_id, ts DESC)` and `(key_id, model, ts DESC)`. |

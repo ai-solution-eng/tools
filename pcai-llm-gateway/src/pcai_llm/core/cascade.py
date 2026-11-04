@@ -63,6 +63,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..config import settings
 from ..db import db
@@ -234,6 +235,43 @@ def _pool_servable(model: str) -> bool:
     return pool is not None and bool(pool.healthy())
 
 
+def pool_serves_chat(pool: Any) -> bool:
+    """Does this POOL OBJECT serve chat? Pure — takes the pool, not a name.
+
+    WHY THIS EXISTS SEPARATELY FROM serves_chat (2026-11-03, caught by the full
+    suite): serves_chat resolves the name through cascade's OWN module-level
+    router singleton. A caller that holds a pool from a DIFFERENT router
+    reference — the admin plane, a test double, any monkeypatched routes
+    module — would then get the fail-open "unknown is kept" answer instead of
+    the real one, silently reclassifying every model as chat. Callers that
+    already have the pool MUST use this function; serves_chat stays the
+    name-resolving wrapper for the walk.
+
+    Unknown (None / no endpoints) is KEPT, for the same documented reason as
+    serves_chat: the caller's own pool checks handle that case, and
+    reclassifying it here would change error semantics this predicate is not
+    about.
+    """
+    if pool is None or not pool.endpoints:
+        return True
+    return any(e.model_type == "chat" for e in pool.endpoints)
+
+
+def pool_has_type(pool: Any, *types: str) -> bool:
+    """Does this pool serve ANY of these model types? (any(), not endpoints[0])
+
+    The non-chat twin of pool_serves_chat: /v1/rerank, /v1/embeddings and the
+    voice routes each used ``endpoints[0].model_type``, so a pool whose
+    first-registered endpoint was another type 400'd a legitimate request even
+    when a member could serve it. Registration order is not a policy.
+
+    Unknown (None / no endpoints) is KEPT — same fail-open rule.
+    """
+    if pool is None or not pool.endpoints:
+        return True
+    return any(e.model_type in types for e in pool.endpoints)
+
+
 def serves_chat(model: str) -> bool:
     """Can this model's pool serve a CHAT request? (pure-ish: reads the router)
 
@@ -263,10 +301,7 @@ def serves_chat(model: str) -> bool:
     stays correct if a pool ever mixes types — and it matches
     routes_proxy._routing_available, the other availability gate.
     """
-    pool = model_router.pool(model)
-    if pool is None or not pool.endpoints:
-        return True
-    return any(e.model_type == "chat" for e in pool.endpoints)
+    return pool_serves_chat(model_router.pool(model))
 
 
 def _head_first(head: str, candidates: list[str], unhealthy: list[str]) -> list[str]:

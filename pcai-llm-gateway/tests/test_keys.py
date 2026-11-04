@@ -134,8 +134,17 @@ async def test_stream_pcai_events_roundtrip(patched_db) -> None:
     await keys.create_key(uuid.uuid4(), "k", ["proxy"], stream_pcai_events=False)
     insert_sql, insert_args = fake2.queries[0]
     assert "stream_pcai_events" in insert_sql
-    assert insert_args[-2] is False  # 11th INSERT value = the flag
-    assert insert_args[-1] == []  # 12th = spend_ancestors (default: a fresh mint has no lineage)
+    # Positional tail of the INSERT (columns are appended, never reordered):
+    # stream flag, spend_ancestors, enrollment_id (team leader tier — a plain
+    # mint belongs to no team), then key_group (None = let the DB mint a new
+    # group of one; rotation is what passes an inherited group).
+    assert insert_args[-4] is False  # stream_pcai_events
+    assert insert_args[-3] == []  # spend_ancestors (a fresh mint has no lineage)
+    assert insert_args[-2] is None  # enrollment_id (no team)
+    # a fresh mint starts its own group — generated HERE so the INSERT keeps
+    # one expression per column (the release gate's arity check splits VALUES
+    # on commas, so a COALESCE(...) call would count as two).
+    assert isinstance(insert_args[-1], uuid.UUID)
     # authenticate's SELECT must read the column
     fake3 = patched_db(_row())
     await keys.authenticate("x")
@@ -159,3 +168,20 @@ def test_stream_pcai_events_default_true() -> None:
     )
     assert rec.stream_pcai_events is True
     assert rec.relay_default is False
+
+
+async def test_load_key_record_selects_the_rotation_stable_group(patched_db) -> None:
+    """REGRESSION (2026-11-03 cross-validation, both cells): the by-id door
+    (scheduled distill) omitted k.key_group, so the shared mapper fell back to
+    the key's OWN id. The sweep then looked a rotated conversation up under the
+    new id, missed, and dropped its marker as "gone/purged" on every pass.
+
+    Fakes that PRE-POPULATE the column cannot catch this — assert the SQL.
+    The mapper's fallbacks are silent, so column parity with authenticate is
+    the contract.
+    """
+    fake = patched_db(_row())
+    await keys.load_key_record(uuid.uuid4())
+    sql, _ = fake.queries[0]
+    assert "k.key_group" in sql, "load_key_record must select the group the mapper scopes by"
+    assert "k.mcp_admin" in sql, "column parity with authenticate: mcp_admin must be named too"

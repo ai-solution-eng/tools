@@ -222,7 +222,12 @@ async def resolve_bearer_key(
         # consulted FIRST (attribution only, audit C4) so a proxy-identified
         # user is not attributed as key-anon on the SSO envelope path.
         caller = await _browser_caller(headers)
-        if caller is None and plaintext and identity._JWT_SHAPE_RE.match(plaintext) and identity.token_validation_configured():
+        if (
+            caller is None
+            and plaintext
+            and identity._JWT_SHAPE_RE.match(plaintext)
+            and identity.token_validation_configured()
+        ):
             try:
                 caller = await identity.resolve_caller(None, token=plaintext)
             except Exception:

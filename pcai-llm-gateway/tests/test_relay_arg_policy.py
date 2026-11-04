@@ -130,9 +130,7 @@ class _Relay:
 
 def test_relay_refuses_metadata_url_without_opening_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
     relay = _Relay().install(monkeypatch)
-    ok, payload = relay.run(
-        _key(), "searxng", "fetch_content", {"url": "http://169.254.169.254/latest/meta-data/"}
-    )
+    ok, payload = relay.run(_key(), "searxng", "fetch_content", {"url": "http://169.254.169.254/latest/meta-data/"})
     assert ok is False
     assert "MCP argument policy" in str(payload) and "169.254.169.254" not in str(payload)
     assert relay.upstream_calls == 0, "the refusal must not open an upstream session"

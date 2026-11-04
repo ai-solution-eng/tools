@@ -29,7 +29,12 @@ is treated as a DESTINATION only when it is a destination in its ENTIRETY:
    all do. This single rule is what keeps
    `SELECT ... WHERE host='127.0.0.1'», a multi-line manifest containing a
    URL, and `kubectl get pods -n prod» out of the deny path - pinned by
-   tests/test_arg_policy.py::test_false_positive_*.
+   tests/test_arg_policy.py::test_false_positive_*. The ONE exception is a
+   hierarchical URL ("scheme://"): a client percent-encodes a raw space, so
+   its wire bytes are the refused whitespace-free request's and a raw space
+   must not be the cheaper spelling of "%20" (AUDIT-r5 #1). A drive path
+   ("C:\\Program Files"), a command line and prose carry no "//", so they
+   keep the exemption.
 2. The WHOLE string is an IP literal in some encoding (127.0.0.1, 2130706433,
    0x7f000001, 127.1, 0177.0.0.1) -> range check. An address argument is a
    destination; an address inside a larger string is not classified at all.
@@ -38,13 +43,23 @@ is treated as a DESTINATION only when it is a destination in its ENTIRETY:
    FAILS to parse is REFUSED, never waved through: "could not parse" is not
    evidence of safety (the posture url_guard design rule 3 demands).
 4. Otherwise, only when the ARGUMENT KEY names a destination (url, endpoint,
-   host, target, ...) do we additionally accept a bare `host[:port][/path]»
-   form, so `fetch_content("169.254.169.254/latest/meta-data")» is caught
-   while a `namespace» / `pattern» / `path» argument is not.
+   host, target, path, ...) do we additionally accept a bare
+   `host[:port][/path]» form, so `fetch_content("169.254.169.254/latest/meta-data")»
+   is caught while a `namespace» / `pattern» / `sql» argument is not ('paths'
+   is a destination key because mm-rag DOWNLOADS it). The same gate covers the
+   protocol-relative `//host/path» form, which a client that urljoin()s the
+   argument against a base URL resolves to the same host (AUDIT-r5 #1,
+   cross-review xv-glm-a); a single leading "/" stays a path reference, a
+   host run holding ".." is a parent-relative path and not a host, and a
+   bracketed IPv6 literal is decoded with url_guard's IP machinery.
 
 Percent-encoding is decoded once before classification (`%31%32%37.0.0.1» is
 127.0.0.1 to a web server); a decode that introduces whitespace drops the
-string from destination classification, same rule as above.
+string from destination classification, same rule as above - EXCEPT for a
+string that starts with a scheme, where that whitespace can only sit in the
+path/query and the host is still the destination. A URL FRAGMENT is never
+transmitted, so it is stripped before both tests; otherwise "#%20" decoded to
+a trailing space and waved the whole URL through (AUDIT-r5 #1).
 
 WHAT THIS DOES **NOT** DO (state it plainly, do not oversell it)
 ---------------------------------------------------------------
@@ -291,15 +306,25 @@ _ARG_RESOLVE_TIMEOUT_S = 2.0
 
 # Schemed strings: a scheme is <alpha><alnum+.-*> followed by ':'.
 _SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+# The same, but only the AUTHORITY forms: "scheme://host" and the RFC 3986
+# network-path reference "//host" (scheme inherited from a base URL). RULE 1
+# must not exempt a whitespace-carrying string when that string is a URL whose
+# host the tool will contact: the client percent-encodes the space, so the
+# bytes on the wire are the refused request's (AUDIT-r5 #1, xv-glm-a).
+# Requiring "//" is what keeps "C:\Program Files\x" (drive letter, no
+# authority) and prose that merely starts "note: foo bar" in the allowed set.
+_URL_WITH_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//")
 # Whitespace/control: the "not a destination" signal (see module docstring).
 _NOT_A_TOKEN_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 # Bare host[:port][/path?query#frag] - only consulted for destination-ish keys.
 _BARE_HOST_RE = re.compile(r"^(?P<host>[A-Za-z0-9._\-]+)(?::(?P<port>\d{1,5}))?(?:[/?#].*)?$", re.DOTALL)
 # Argument KEYS that name a destination. Deliberately narrow: 'sql', 'yaml',
-# 'manifest', 'content', 'pattern', 'namespace', 'path', 'query' are absent on
-# purpose - those arguments are payloads, not destinations.
+# 'manifest', 'content', 'pattern', 'namespace', 'query' are absent on purpose
+# - those arguments are payloads, not destinations. 'path'/'paths' ARE keys
+# here: a local path never starts with a scheme, so RULE 4 costs nothing, while
+# mm-rag's 'paths' is a DOWNLOAD vector (AUDIT-r5 #1 family, xv-glm-a).
 _DEST_KEY_RE = re.compile(
-    r"(url|uri|endpoint|host|hostname|address|addr|target|base|webhook|callback|link|proxy|peer|dest|origin|referer|site|domain)",
+    r"(url|uri|endpoint|host|hostname|address|addr|target|base|webhook|callback|link|proxy|peer|dest|origin|referer|site|domain|paths?)",
     re.IGNORECASE,
 )
 # PAYLOAD argument keys: a scheme-prefixed single token under one of these
@@ -552,6 +577,16 @@ def _url_reason(server: str, tool: str, text: str, scheme: str) -> str:
             parsed = urlparse(text)
         except ValueError:
             return REASON_DESTINATION
+        # AUDIT w6 F3 (the WHATWG parse differential): this parser takes the
+        # host after the LAST "@" while a WHATWG-grade client ends the
+        # authority at the first "/" or backslash — "http://127.0.0.1\@evil.com/"
+        # parsed here as host "evil.com" (allowed, DNS-checked) while such a
+        # client connects to 127.0.0.1. Conservative rule, stated once: an
+        # authority carrying USERINFO at all, or a BACKSLASH anywhere, is
+        # refused — legitimate MCP destinations never carry credentials in
+        # the URL.
+        if "@" in parsed.netloc or "\\" in parsed.netloc:
+            return REASON_DESTINATION
         return _host_reason(server, parsed.hostname or "")
     if scheme == "file":
         # file: is denied unless the tool is explicitly known file-taking AND
@@ -575,24 +610,83 @@ def _key_base(key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (key or "").strip().lower()).strip("_")
 
 
+def _parent_relative(host_run: str) -> bool:
+    """True when a _BARE_HOST_RE host run is really a PARENT-RELATIVE path.
+
+    The regex stops the host at the first "/", so "../up/x.txt" yields the
+    host run ".."; _host_reason's trailing-dot branch (written for the FQDN
+    "example.com." case) then strips one dot and refuses the residual ".".
+    A DNS name never contains an empty label, so a run holding ".." is not a
+    host and the caller must fall through to allowed: wave 1 accepted these
+    paths and an enforce-mode refusal of "../x" is a false positive the model
+    cannot spell its way out of (wave-2 review of the "paths?" delta)."""
+    return ".." in host_run
+
+
 def check_string(server: str, tool: str, key: str, value: str) -> str:
     """Deny reason for ONE argument string, else '' (the classification rule
     from the module docstring, executable)."""
     if not isinstance(value, str) or not value:
         return ""
     text = value.strip()[:MAX_SCAN_CHARS]
+    # A URL fragment is NEVER transmitted, so it cannot change where the tool
+    # sends the request - drop it BEFORE classification. Otherwise a fragment
+    # is a free bypass of every rule below: "#%20" (or a raw space inside the
+    # fragment) makes RULE 1 see whitespace and return ALLOWED for the exact
+    # request whose fragment-less twin is refused (AUDIT-r5 #1).
+    text = text.split("#", 1)[0]
     if not text:
         return ""
     # RULE 1: a destination is a single token. Whitespace/control characters
     # mean SQL / YAML / prose / a command line / a multi-line regex - not a
-    # destination. This is the primary false-positive guard.
-    if _NOT_A_TOKEN_RE.search(text):
+    # destination. This is the primary false-positive guard. The ONE exception
+    # is a hierarchical URL: the client percent-encodes a raw space, so
+    # "http://denied/a b" puts the same bytes on the wire as the refused
+    # ".../a%20b" (AUDIT-r5 #1).
+    if _NOT_A_TOKEN_RE.search(text) and not _URL_WITH_AUTHORITY_RE.match(text):
         return ""
+    # RULE 1b: a protocol-relative reference ("//host/path", the RFC 3986
+    # network-path form) IS a destination for any tool that urljoin()s the
+    # argument against a base URL: urljoin("https://ok/", "//169.254.169.254/x")
+    # keeps the scheme and takes the DENIED host. A single leading "/" is a
+    # path reference and stays allowed, and the bare-host key gate is RULE 4's,
+    # so a payload key is untouched (AUDIT-r5 #1, cross-review xv-glm-a).
+    if text.startswith("//") and _DEST_KEY_RE.search(key or ""):
+        rest = text[2:]
+        # AUDIT w6 F3: the SAME authority rule as the scheme branch — the
+        # authority of a network-path reference ends at the first "/" and a
+        # WHATWG client also ends it at a backslash, so userinfo or a
+        # backslash here is the same parse differential.
+        authority = rest.split("/", 1)[0]
+        if "@" in authority or "\\" in authority:
+            return REASON_DESTINATION
+        if rest.startswith("["):
+            # A bracketed IPv6 literal: _BARE_HOST_RE's host class has no
+            # brackets, so the address goes through the same url_guard decode
+            # RULE 2 uses. An unterminated "[" is not a host and falls through.
+            end = rest.find("]")
+            literal = rest[1:end] if end > 0 else ""
+            if literal and url_guard.denied_ip_reason(literal, extra_cidrs=settings.url_deny_cidrs):
+                return REASON_DESTINATION
+        else:
+            bare = _BARE_HOST_RE.match(rest)
+            if bare and not _parent_relative(bare.group("host")):
+                return _host_reason(server, bare.group("host"))
     # Percent-encoding is decoded ONCE before classification (a web server
-    # decodes it too). A decode that introduces whitespace means the payload
-    # was not a destination token after all.
+    # decodes it too). A percent-encoded '#' is the same fragment delimiter,
+    # so the fragment is dropped after the decode as well (AUDIT-r5 #1).
     decoded = unquote(text) if "%" in text else text
-    if not decoded or _NOT_A_TOKEN_RE.search(decoded):
+    decoded = decoded.split("#", 1)[0]
+    if not decoded:
+        return ""
+    # A decode that introduces whitespace means the payload was not a
+    # destination token after all - UNLESS the caller's string STARTS with a
+    # scheme, i.e. it IS a URL: the fragment is gone and RULE 1 already proved
+    # the raw text carries no whitespace, so that whitespace can only sit in
+    # the path/query while the host stays the destination. Exempting
+    # URL-shaped strings was the AUDIT-r5 #1 bypass ("?q=%20", "/a%20b",
+    # "gopher://127.0.0.1:6379/_x%20").
+    if _NOT_A_TOKEN_RE.search(decoded) and not _SCHEME_RE.match(text):
         return ""
     # RULE 2: the WHOLE string is an IP literal in ANY encoding.
     if url_guard.looks_like_ip_literal(decoded) or url_guard.decode_ip_literal(decoded) is not None:
@@ -612,7 +706,7 @@ def check_string(server: str, tool: str, key: str, value: str) -> str:
     # RULE 4: bare host[:port][/path] - only for destination-named keys.
     if _DEST_KEY_RE.search(key or ""):
         bare = _BARE_HOST_RE.match(decoded)
-        if bare:
+        if bare and not _parent_relative(bare.group("host")):
             return _host_reason(server, bare.group("host"))
     return ""
 
@@ -718,9 +812,11 @@ def scan_payload_signals(server: str, tool: str, arguments: dict[str, Any]) -> l
             signals.append("long-path")
     return signals
 
+
 # ---------------------------------------------------------------------------
 # the gate-chain entry point (ONE call per path, both paths)
 # ---------------------------------------------------------------------------
+
 
 class PolicyDecision:
     """The gate chain's verdict for one call. Truthy refusal via .refused.
@@ -787,9 +883,7 @@ def gate_call(
         # decision: an operator alerting on them sees a broken control, not a
         # caller doing something wrong.
         reason = (
-            ADMIN_REFUSAL_UNAVAILABLE
-            if refusal == _UNAVAILABLE_TEXT[ADMIN_REFUSAL_UNAVAILABLE]
-            else ADMIN_TOOL_REASON
+            ADMIN_REFUSAL_UNAVAILABLE if refusal == _UNAVAILABLE_TEXT[ADMIN_REFUSAL_UNAVAILABLE] else ADMIN_TOOL_REASON
         )
         _count_block(server, tool, reason)
         return PolicyDecision(reason=reason, message=refusal)

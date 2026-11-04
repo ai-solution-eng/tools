@@ -124,11 +124,8 @@ def thread_key(msgs: list[dict], key_id: Any) -> str | None:
         # line-anchored pattern can never match -- which silently re-split every
         # multimodal conversation even after the string case was fixed.
         if isinstance(content, list):
-            text = "\n".join(
-                p.get("text")
-                for p in content
-                if isinstance(p, dict) and isinstance(p.get("text"), str)
-            )
+            parts: list[str] = [p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
+            text = "\n".join(parts)
         elif isinstance(content, str):
             text = content
         elif content is None:
