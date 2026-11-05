@@ -59,7 +59,7 @@ image:
   #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
   # (the reference renders as repository:tag@sha256:...); for tag-only
   # sites the alternative is pullPolicy: Always (re-checks every pull).
-  tag: v3.9.0
+  tag: v3.9.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

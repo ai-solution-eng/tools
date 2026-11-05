@@ -182,6 +182,8 @@ spec:
           value: {{ .Values.aioli.dbPasswordSecret.namespace | quote }}
         - name: AIOLI_DB_SECRET_KEY
           value: {{ .Values.aioli.dbPasswordSecret.key | quote }}
+        - name: CATALOG_DEFAULT_PROJECT
+          value: {{ .Values.catalog.defaultProject | default "" | quote }}
         livenessProbe:
           httpGet:
             path: /api/healthz

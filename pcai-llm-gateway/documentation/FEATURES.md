@@ -986,8 +986,10 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   memory-attached keys (debounce window, default 5 min). Admin-configurable
   (Admin UI → Memory Distiller): summarizer model (default: the caller's own
   routing), off-peak-only scheduling (scheduled distills run only while the
-  off-peak evaluator reports low demand), quiet window, output cap, runtime
-  enable. DB-backed overrides over the env defaults, audited.
+  SUMMARIZER MODEL's per-model off-peak evaluator reports low demand; the
+  global evaluator is the fallback when no model is pinned or no per-model
+  query is configured), quiet window, output cap, runtime enable. DB-backed
+  overrides over the env defaults, audited.
 * **Cost**: every distill LLM call settles ONE ledger row against the owning
   key and writes a `phase=distill` agent trace — the spend is attributed
   where the work happened, never free.
@@ -1036,9 +1038,16 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   row (metadata call). MCP servers have the equivalent live check in
   `GET /admin/mcp-servers/{name}/tools` (a real `list_tools`, 15 s bound).
 - Console: status dots + a `test` button per row in the Models and MCP
-  tabs. The MCP Tools dialog renders upstream tool descriptions as
-  whitelisted markdown (links, bold, `code` spans, leading-dash list
-  items) — escape-first on semi-trusted upstream content: the text is
+  tabs. A row's `edit` button loads the whole registration into the top
+  form (MCP servers and model pools alike): model-pool edit reads
+  `GET /admin/models/{name}/pool`, which returns the by-ref Secret NAME
+  and an `auth_configured` boolean — never a credential value. Both tables
+  share one action block: equal ghost buttons with the test result on its
+  own line underneath, so a wide `ok · 122ms` or a fail message wraps
+  inside the cell instead of re-flowing the row. The MCP Tools dialog renders
+  upstream tool descriptions as whitelisted markdown (links, bold, `code`
+  spans, leading-dash list items) — escape-first on semi-trusted upstream
+  content: the text is
   entity-escaped BEFORE any transform and link URLs are charset-restricted
   (https? only, no quotes/whitespace), so upstream markup can never reach
   `innerHTML` as tags. No raw-HTML passthrough, no images/headings/tables.

@@ -158,8 +158,28 @@ def create_app(work_dir: str | None = None) -> Any:
 
     @app.get("/api/results")
     async def results_index() -> JSONResponse:
-        """Public-safe index of every run on the PVC (no params, no logs)."""
-        return JSONResponse({"runs": manager.public_index()})
+        """Public-safe index of every run on the PVC (no params, no logs),
+        plus the ids hidden from the LIST (page management, not deletion --
+        hidden runs remain comparable and downloadable by id)."""
+        return JSONResponse({"runs": manager.public_index(), "hidden": manager.hidden_ids()})
+
+    @app.post("/api/results/hidden")
+    async def results_hidden(request: Request) -> JSONResponse:
+        """Hide/unhide entries in the results list (reversible page
+        management: artifacts stay on the PVC). Gated by the API key -- it
+        changes what every viewer of the shared page sees. Body:
+        {"ids": ["<run id>" | "lib:<model>/<stem>", ...], "hidden": true}."""
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail='JSON body required: {"ids": [...], "hidden": true}') from None
+        ids = body.get("ids") if isinstance(body, dict) else None
+        hidden = body.get("hidden", True) if isinstance(body, dict) else True
+        if not isinstance(ids, list) or not ids:
+            raise HTTPException(status_code=400, detail="ids: a non-empty list of run/library ids is required")
+        if not isinstance(hidden, bool):
+            raise HTTPException(status_code=400, detail="hidden must be true or false")
+        return JSONResponse({"hidden": manager.set_hidden(ids, hidden)})
 
     @app.get("/api/target-aliases")
     async def target_aliases_route(request: Request) -> JSONResponse:
@@ -182,9 +202,13 @@ def create_app(work_dir: str | None = None) -> Any:
         rest of the /results surface). ids: comma-separated run ids, read
         from request.query_params so the route behaves identically through
         real HTTP and the ASGI test helper (which routes on the full URI);
-        unknown ids are skipped and reported under "missing"."""
+        unknown ids are skipped and reported under "missing". ref: optional
+        run id to use as the reference/baseline (deltas are signed against
+        it and it is listed first); unknown or absent -> first selected run
+        of each kind."""
         ids = request.query_params.get("ids") or request.url.query
         requested = [rid.strip() for rid in str(ids or "").split(",") if rid.strip()]
+        reference = (request.query_params.get("ref") or "").strip() or None
         if not requested:
             raise HTTPException(status_code=400, detail="ids: at least one run id is required")
         if len(requested) > MAX_COMPARE_RUNS:
@@ -217,7 +241,7 @@ def create_app(work_dir: str | None = None) -> Any:
                 status_code=400,
                 detail="need at least 2 comparable runs" if not missing else f"no such run(s): {', '.join(missing)}",
             )
-        return JSONResponse(finalize_comparison(runs_data, requested))
+        return JSONResponse(finalize_comparison(runs_data, requested, reference))
 
     @app.get("/api/results/atoms")
     async def results_atoms(request: Request) -> JSONResponse:
@@ -454,6 +478,9 @@ def create_app(work_dir: str | None = None) -> Any:
             return True  # launcher pages
         if path == "/api/targets":
             return True  # launch-advice catalog
+        # hiding entries changes the shared results page for every viewer
+        if path == "/api/results/hidden":
+            return True
         # the launch surface is POST /api/runs and POST .../cancel; everything
         # else under /api/runs (status, log tail, artifact list/download) is a
         # PUBLIC read-only result

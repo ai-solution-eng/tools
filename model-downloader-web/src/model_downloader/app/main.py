@@ -32,6 +32,7 @@ from .preflight import (
 )
 from .queue import JobQueue
 from .storage import DownloadedModelsCache
+from .versioning import config_fingerprint, normalize_project
 
 APP_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
 DEFAULT_NAMESPACE = os.environ.get("DEFAULT_NAMESPACE", "project-user-andrew-bydlon")
@@ -66,6 +67,13 @@ PVC_SCAN_ENABLED = os.environ.get("PVC_SCAN_ENABLED", "false").strip().lower() =
 PVC_REFRESH_INTERVAL = int(os.environ.get("PVC_REFRESH_INTERVAL", "60"))
 
 CATALOG_PATH = os.environ.get("CATALOG_PATH", "/mnt/catalog/catalog.json")
+# Project recorded on a pushed packaged model that names none (chart:
+# catalog.defaultProject).  Empty = leave it blank, the historical behaviour.
+# The target is MLIS's "project" filter: rows with an empty project only show
+# under "All projects".  PCAI projects are namespaces, so this is normally a
+# project-user-* namespace -- verify the exact string MLIS filters on with one
+# push before rolling it out.
+CATALOG_DEFAULT_PROJECT = os.environ.get("CATALOG_DEFAULT_PROJECT", "").strip()
 # "Refresh from GitHub" button: raw URL of the catalog JSON on GitHub
 # (e.g. https://raw.githubusercontent.com/<org>/<repo>/<branch>/seed_catalog.json).
 CATALOG_GITHUB_URL = os.environ.get("CATALOG_GITHUB_URL", "")
@@ -163,6 +171,7 @@ aioli_db = AioliDB(
     secret_name=AIOLI_DB_SECRET_NAME,  # secret-scan:allow (k8s Secret NAME constant, not a credential)
     secret_ns=AIOLI_DB_SECRET_NS,
     secret_key=AIOLI_DB_SECRET_KEY,
+    default_project=CATALOG_DEFAULT_PROJECT,
 )
 downloaded_cache = DownloadedModelsCache(pvc_refresh_interval=PVC_REFRESH_INTERVAL)
 
@@ -788,18 +797,24 @@ async def add_catalog_entry(req: Request):
 async def add_catalog_entries(req: Request):
     """Add one entry (JSON object) or many (JSON array) from the direct-JSON textarea.
 
-    Each entry needs name and image.  Entries are deduplicated: a catalog_id
-    already present (or a name+version pair already in the catalog) is skipped,
-    so re-pasting the same JSON doesn't create duplicates.  Returns per-entry
-    results for the UI.
+    Each entry needs name and image.  Entries are deduplicated by catalog_id and
+    by name + deployment configuration (versioning.config_fingerprint), so
+    re-pasting the same JSON does not create duplicates while a different
+    configuration of the same model still can.  Returns per-entry results for
+    the UI.
     """
     entries = await req.json()
     if isinstance(entries, dict):
         entries = [entries]  # single {MODEL_CONFIGURATION}
     if not isinstance(entries, list):
         raise HTTPException(400, "expected a JSON object or a JSON array of entries")
+    # Identity is name + deployment configuration, not name + version: the
+    # catalog stores version 1 for every entry (MLIS assigns the real version at
+    # push time), so keying on (name, version) would let the same configuration
+    # in twice under two versions while refusing a genuinely different
+    # configuration of the same model (vLLM vs SGLang on one GPU class).
     present_ids = {e.get("catalog_id") for e in catalog.all()}
-    present_pairs = {(e.get("name"), e.get("version")) for e in catalog.all()}
+    present_configs = {(e.get("name"), config_fingerprint(e)) for e in catalog.all()}
     added = skipped = 0
     results = []
     for entry in entries:
@@ -810,14 +825,16 @@ async def add_catalog_entries(req: Request):
             continue
         if (entry.get("catalog_id") and entry["catalog_id"] in present_ids) or (
             name,
-            entry.get("version"),
-        ) in present_pairs:
+            config_fingerprint(entry),
+        ) in present_configs:
             skipped += 1
-            results.append({"status": "skipped", "name": name, "detail": "already in catalog"})
+            results.append(
+                {"status": "skipped", "name": name, "detail": "already in catalog (same name and configuration)"}
+            )
             continue
         e = catalog.add(entry)
         added += 1
-        present_pairs.add((e["name"], e.get("version")))
+        present_configs.add((e["name"], config_fingerprint(e)))
         results.append({"status": "added", "name": e["name"], "catalog_id": e["catalog_id"]})
     return {"added": added, "skipped": skipped, "results": results}
 
@@ -874,17 +891,31 @@ async def refresh_catalog_from_github():
 
 
 @app.post("/api/push")
-async def push_models(req: Request):
+async def push_models(req: Request, project: str = ""):
     """Push a JSON object or a JSON array of model configs into the AIOLI packaged_models table.
 
-    Duplicate (name, version) entries are skipped.  Returns per-config results.
+    MLIS assigns the version: v1 for a name it has never seen, max(version)+1
+    when the name exists with a different configuration, and a skip (not a new
+    version) when the configuration is identical.  Any version in the posted
+    JSON is ignored.  Returns per-config results, each carrying the version it
+    landed as and whether that version was bumped.
+
+    The optional "project" query parameter files the pushed models under that
+    project (the UI sends the namespace picked next to the push button).  It
+    only fills in configs that name no project of their own; a config's own
+    project always wins, and the chart default (catalog.defaultProject) applies
+    when neither is set.
     """
+    try:
+        project = normalize_project(project)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     configs = await req.json()
     if isinstance(configs, dict):
         configs = [configs]  # single {MODEL_CONFIGURATION} — same as a 1-element array
     if not isinstance(configs, list):
         raise HTTPException(400, "expected a JSON object or a JSON array of model configs")
-    results = await aioli_db.push_batch(configs)
+    results = await aioli_db.push_batch(configs, project=project)
     pushed = sum(1 for r in results if r["status"] == "pushed")
     skipped = sum(1 for r in results if r["status"] == "skipped")
     errors = sum(1 for r in results if r["status"] == "error")

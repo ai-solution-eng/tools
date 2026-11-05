@@ -14,10 +14,12 @@ import pytest
 
 from pcai_llm.core import guardrails as g
 
-# Credential-shaped fixtures are split at the vendor/header prefix: the fleet
-# pre-mirror secret scanner's hard patterns (JWT/sk-/hllm-) honour no allow
-# marker, so the literal shape is what keeps this test file out of the mirror
-# gate. The concatenated runtime value is byte-identical to the real shape.
+# Credential-shaped fixtures are split at the vendor/header prefix so no secret
+# scanner reads them as credentials: the fleet pre-mirror gate
+# (pcai_utils/secret_scan.sh) flags every JWT-shaped literal and honours no
+# allow marker for it, and scripts/secret_scan.py additionally flags the
+# sk-/hllm- forms. The concatenated runtime value is byte-identical to the
+# unsplit literal, so the fixtures still exercise the detector.
 OPENAI = "sk-" + "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
 GATEWAY = "hllm-" + "0123456789abcdef0123456789abcdef"
 JWT = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"

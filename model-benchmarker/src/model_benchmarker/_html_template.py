@@ -178,6 +178,9 @@ function rowMatches(r){
 function badges(m){
   const b=[];
   if (m.gpu) b.push('<span class="badge">'+esc(m.gpu)+(m.gpu_count>1?' ×'+m.gpu_count:'')+'</span>');
+  // Fabric topology: the same GPU count on a 2-way vs 8-way NVLink box is a
+  // different setup, so it is a first-class badge, not a footnote.
+  if (m.nvlink) b.push('<span class="badge">'+esc(m.nvlink)+'-way NVLink</span>');
   if (m.engine) b.push('<span class="badge">'+esc(m.engine)+'</span>');
   if (m.mtp) b.push('<span class="badge badge-mtp">MTP: '+esc(m.mtp)+'</span>');
   if (m.hicache!==null && m.hicache!==undefined) b.push('<span class="badge badge-hicache">HiCache: '+esc(m.hicache)+'</span>');
@@ -266,6 +269,7 @@ function setupTitle(s){
   const m=s.meta||{};
   const parts=[];
   if (m.gpu) parts.push(m.gpu+(m.gpu_count>1?' ×'+m.gpu_count:''));
+  if (m.nvlink) parts.push(m.nvlink+'-way NVLink');
   if (m.engine) parts.push(m.engine);
   if (m.mtp) parts.push('MTP: '+m.mtp);
   if (m.hicache!==null&&m.hicache!==undefined) parts.push('HiCache: '+m.hicache);

@@ -1674,6 +1674,83 @@ def test_no_distiller_failure_is_swallowed_at_debug() -> None:
     assert "log.warning(" in inspect.getsource(hk._distill_sweep)
 
 
+@pytest.mark.asyncio
+async def test_distill_sweep_offpeak_gate_uses_the_summarizer_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off-peak-only must follow the model the sweep will actually call.
+
+    The gate used the GLOBAL evaluator, so a busy fleet average kept the
+    distiller paused even when its own summarizer model was idle (live
+    2026-11-05: Qwen3.8-27B ~1.6% off-peak, fleet ~24% -> no sweep for
+    hours). A per-model signal now wins; the global state is only the
+    fallback when no model is pinned or no per-model evaluator exists.
+    """
+    from pcai_llm.core import distill_schedule as ds
+    from pcai_llm.core import distiller_config as dc
+    from pcai_llm.core import housekeeping as hk
+    from pcai_llm.core import offpeak
+
+    calls: list[str] = []
+
+    async def fake_sweep() -> None:
+        calls.append("sweep")
+
+    async def enabled() -> bool:
+        return True
+
+    async def offpeak_only() -> bool:
+        return True
+
+    async def model() -> str:
+        return "Qwen3.8-27B"
+
+    monkeypatch.setattr(ds, "sweep", fake_sweep)
+    monkeypatch.setattr(dc, "is_enabled", enabled)
+    monkeypatch.setattr(dc, "offpeak_only", offpeak_only)
+    monkeypatch.setattr(dc, "get_model", model)
+    monkeypatch.setattr(offpeak.state, "enabled", True)
+    monkeypatch.setattr(offpeak.state, "active", True)
+
+    # The model's own evaluator is BUSY -> stay paused, even though the
+    # global state says off-peak.
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: False)
+    await hk._distill_sweep()
+    assert calls == [], "a busy summarizer model must keep the sweep paused"
+
+    # The model's own evaluator says off-peak -> sweep, even if the global
+    # state is idle.
+    monkeypatch.setattr(offpeak.state, "active", False)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: True)
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "the summarizer model's own off-peak state must open the gate"
+
+    # No per-model evaluator -> fall back to the global state.
+    calls.clear()
+    monkeypatch.setattr(offpeak.state, "active", True)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: None)
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "no per-model signal must fall back to the global evaluator"
+
+    calls.clear()
+    monkeypatch.setattr(offpeak.state, "active", False)
+    await hk._distill_sweep()
+    assert calls == [], "no per-model signal + idle global must stay paused"
+
+    # No model pinned (caller routing) -> the per-model lookup is skipped and
+    # the global state decides.
+    calls.clear()
+
+    async def no_model() -> str:
+        return ""
+
+    monkeypatch.setattr(dc, "get_model", no_model)
+    monkeypatch.setattr(offpeak.state, "active", True)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: False)  # must not be consulted
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "an unpinned model must use the global evaluator"
+
+
 def test_conversation_path_is_leased_against_hpa_duplicates() -> None:
     """BOTH distill paths must carry the cross-replica lease.
 

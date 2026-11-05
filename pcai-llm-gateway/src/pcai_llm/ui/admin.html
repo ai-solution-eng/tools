@@ -75,17 +75,30 @@
   nav button { background: none; border: none; color: var(--dim); padding: 8px 14px;
                cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
   nav button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
-  /* Key-row action grid (2026-10-23): eight stacked ghost buttons made every
-     row ~150px tall and read as a scattered pile. A fixed 2-column grid of
-     EQUAL cells gives one compact block whose height is predictable (3 rows),
-     so row height no longer depends on how many buttons a key happens to
-     show (a revoked key renders fewer). `grid-auto-rows: 1fr` keeps the two
-     columns the same height even when one label wraps. */
+  /* Row action grid (2026-10-23; table rows 2026-11-05): eight stacked ghost
+     buttons made every key row ~150px tall and read as a scattered pile. A
+     fixed 2-column grid of EQUAL cells gives one compact block whose height
+     is predictable, so row height no longer depends on how many buttons a
+     row happens to show. `grid-auto-rows: 1fr` keeps the two columns the
+     same height even when one label wraps. The MCP and Live pools tables use
+     the SAME grid, so their action blocks are identical boxes. */
   .rowacts { display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
              width: 168px; align-items: stretch; }
   .rowacts button { width: 100%; padding: 4px 6px; font-size: 12px;
                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rowacts .wide { grid-column: 1 / -1; }
+  /* Test result line (2026-11-05 operator request): ALWAYS its own line under
+     the action grid, never inline beside the buttons. An inline result made
+     the cell's width depend on the pill text, so a wider "ok · 122ms" or a
+     fail message wrapped on some rows and not others — row heights changed
+     and the table stretched past the card. The result block is pinned to the
+     grid's width, and long text wraps INSIDE it (overflow-wrap:anywhere so a
+     single long token cannot widen the column). min-height reserves the line,
+     so a row does not jump when a test result appears. */
+  .rowres { width: 168px; margin-top: 5px; min-height: 18px; }
+  .rowres .pill { display: inline-block; max-width: 100%; margin: 0;
+                  white-space: normal; overflow-wrap: anywhere; text-align: left; }
+  .rowres button.pill { cursor: pointer; }
   main { padding: 18px 16px 60px; max-width: 1200px; margin: 0 auto; }
   section { display: none; } section.active { display: block; }
   h2 { font-size: 16px; margin: 6px 0 12px; }
@@ -194,6 +207,9 @@
   input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 9px; font: inherit; font-size: 13px; }
   input:focus, select:focus, textarea:focus { outline: 2px solid var(--focus); }
+  /* Edit mode pins the model name (it is the pool key) — dim it so the field
+     reads as fixed rather than broken. */
+  input[readonly] { color: var(--dim); cursor: default; }
   button.btn { background: var(--accent); color: var(--accent-contrast); border: 0; border-radius: 7px;
     padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }
   /* Dialog submit buttons use .primary (edit-key did since the key-UX wave)
@@ -601,7 +617,7 @@
   <!-- ============ MODELS ============ -->
   <section id="tab-models">
     <div class="card">
-      <h2>Register a model endpoint pool</h2>
+      <h2 id="mo-form-title">Register a model endpoint pool</h2>
       <div class="row">
         <label>Virtual model name <input id="mo-name" placeholder="llama-8b"></label>
         <label>Type
@@ -628,9 +644,11 @@
       <div class="row" style="margin-top:10px">
         <button class="ghost mini" onclick="moAddRow()">+ add endpoint</button>
         <button class="btn" id="mo-save">Save pool</button>
+        <button class="ghost" id="mo-cancel" hidden>Cancel</button>
       </div>
       <div class="form-hint"><ul>
         <li><b>Saving replaces the whole pool</b> — endpoints not listed are removed.</li>
+        <li><b>Editing</b> — a row's <i>edit</i> button loads the whole pool into this form; the model name is fixed (it is the pool key — remove and re-register to rename), and a blank API key keeps the stored one.</li>
         <li><b>API key</b> — required even in-cluster. Stored encrypted; blank on re-save keeps the stored one. Rotation = paste + Save, no restart.</li>
         <li><b>Secret name</b> — by-reference path for ops-managed tokens (<code>upstreamKeySecrets</code> in chart values).</li>
         <li><b>Priority</b> — lower is preferred. The next tier serves only when every endpoint in it is failing.</li>
@@ -638,7 +656,7 @@
       </ul></div>
     </div>
     <h2>Live pools</h2>
-    <table id="models-table"><thead><tr><th>Model</th><th title="The pool's model_type — what this endpoint actually SERVES. One pool, one type: a decision model cannot serve chat, and an embedding pool cannot serve chat completions.">Type</th><th>Endpoints</th><th></th></tr></thead><tbody></tbody></table>
+    <table id="models-table"><thead><tr><th>Model</th><th title="The pool's model_type — what this endpoint actually SERVES. One pool, one type: a decision model cannot serve chat, and an embedding pool cannot serve chat completions.">Type</th><th>Endpoints</th><th>Test</th></tr></thead><tbody></tbody></table>
   </section>
 
   <!-- ============ ADVERTISED (registry view) ============ -->
@@ -961,7 +979,7 @@
         <tr><th>Scheduling</th>
           <td>
             <label class="chk"><input type="checkbox" id="di-offpeak"> off-peak only</label>
-            <div class="hint">Scheduled distills run only while the off-peak evaluator reports low demand.</div>
+            <div class="hint">Scheduled distills run only while the summarizer model's off-peak evaluator reports low demand (global evaluator when the model has none).</div>
           </td></tr>
         <tr><th>Runtime enabled</th>
           <td>
@@ -1431,15 +1449,23 @@ async function loadModels() {
     const cls = t === 'chat' ? '' : ' off';
     return `<span class="pill${cls}" title="model_type ${esc(t)}">${esc(t)}</span>`;
   };
+  // Action cell (2026-11-05): the SAME .rowacts grid + .rowres result line
+  // the MCP table uses. test/edit sit on the first row, fallbacks/remove on
+  // the second, and the probe result always renders BELOW the grid — never
+  // inline, where a wider pill used to re-flow some rows and stretch the
+  // table. editModel loads the whole pool into the form above.
   $('models-table').querySelector('tbody').innerHTML = state.models.map(m =>
     `<tr><td class="mono"><b>${esc(m)}</b></td>
      <td>${typeCell(m)}</td>
      <td>${(byModel[m] || []).map(epLine).join('')
        || (state.endpoints ? '<span class="muted">no endpoints</span>' : '<span class="muted">—</span>')}</td>
-     <td><button class="ghost mini" data-model="${esc(m)}" onclick="probeModel(this)">test</button>
-         <button class="ghost mini" data-model="${esc(m)}" onclick="editFallbacks(this)">fallbacks</button>
-         <span class="probe-out" data-probe="${esc(m)}"></span><br>
-         <button class="ghost mini danger" data-model="${esc(m)}" onclick="deleteModel(this)">remove</button></td></tr>`).join('')
+     <td><div class="rowacts">
+           <button class="ghost mini" data-model="${esc(m)}" onclick="probeModel(this)">test</button>
+           <button class="ghost mini" data-model="${esc(m)}" onclick="editModel(this)">edit</button>
+           <button class="ghost mini" data-model="${esc(m)}" onclick="editFallbacks(this)">fallbacks</button>
+           <button class="ghost mini danger" data-model="${esc(m)}" onclick="deleteModel(this)">remove</button>
+         </div>
+         <div class="rowres"><span class="probe-out" data-probe="${esc(m)}"></span></div></td></tr>`).join('')
     || '<tr><td colspan="4" class="muted">none registered</td></tr>';
 }
 
@@ -1896,6 +1922,18 @@ window.toggleSelfMint = (btn, userId, allowed) => withBtn(btn, async () => {
 });
 
 function dlg(html) { $('dlg-body').innerHTML = html; $('dlg').showModal(); armPasswordToggles($('dlg-body')); layoutFormRowsNow(); }
+
+// Scroll a form title into view BELOW the sticky header + nav (2026-11-05).
+// Plain scrollIntoView({block:'start'}) parks the title UNDER both sticky
+// bars, so an edit lands on a form whose title (and the "editing X" banner)
+// the operator cannot see. Measured at call time: both bars wrap on narrow
+// screens, so a hard-coded offset would be wrong there.
+function scrollFormTitleIntoView(el) {
+  if (!el || !el.getBoundingClientRect) return;
+  const h = (document.querySelector('header') || {}).offsetHeight || 0;
+  const n = (document.querySelector('nav') || {}).offsetHeight || 0;
+  window.scrollTo({ top: Math.max(0, el.getBoundingClientRect().top + window.scrollY - h - n - 12) });
+}
 
 // w7 (owner 2026-11-02): the single-control budget/caps lifecycle shared by
 // the KEYS table (ALLOCATION column) and the ENROLLMENTS table (caps cell).
@@ -2814,9 +2852,11 @@ async function loadMcpServers() {
         </select></td>
      <td><input type="number" class="m-priority-in" data-server="${esc(sv.name)}" value="${Number(sv.priority) || 0}" title="lower = preferred: catalog/listing order + flat-call failover order" style="width:64px;font-size:12px;padding:3px 6px"></td>
      <td><input type="checkbox" class="m-enable-chk" data-server="${esc(sv.name)}" ${sv.enabled ? 'checked' : ''}></td>
-     <td><button class="ghost mini" data-name="${esc(sv.name)}" onclick="testMcp(this)">test</button>
-         <button class="ghost mini" data-name="${esc(sv.name)}" onclick="editMcp(this)">edit</button>
-         <span class="mcp-test" data-server="${esc(sv.name)}"></span></td></tr>`).join('')
+     <td><div class="rowacts">
+           <button class="ghost mini" data-name="${esc(sv.name)}" onclick="testMcp(this)">test</button>
+           <button class="ghost mini" data-name="${esc(sv.name)}" onclick="editMcp(this)">edit</button>
+         </div>
+         <div class="rowres"><span class="mcp-test" data-server="${esc(sv.name)}"></span></div></td></tr>`).join('')
     || '<tr><td colspan="7" class="muted">none registered</td></tr>';
   // instant-apply: toggles + policy dropdown PATCH the server inline
   document.querySelectorAll('#mcp-table .m-enable-chk').forEach(c =>
@@ -2852,7 +2892,10 @@ async function loadMcpServers() {
 window.testMcp = async btn => {
   const name = btn && btn.dataset ? btn.dataset.name : '';
   if (!name || btn.disabled) return;
-  const out = btn.parentElement.querySelector('.mcp-test');
+  // The result line is OUTSIDE the .rowacts button grid (shared table action
+  // block), so look it up from the cell — parentElement is now the grid.
+  const cell = btn.closest ? btn.closest('td') : null;
+  const out = cell ? cell.querySelector('.mcp-test') : null;
   if (out) out.innerHTML = '<span class="muted">testing…</span>';
   btn.disabled = true;
   try {
@@ -2914,8 +2957,7 @@ function editMcp(btn) {
   $('m-save').textContent = 'Save changes';
   $('m-cancel').hidden = false;
   banner(`editing <b>${esc(sv.name)}</b> — change and Save changes`, '', 3000, true);
-  const title = $('m-form-title');
-  if (title.scrollIntoView) title.scrollIntoView({ block: 'start' });
+  scrollFormTitleIntoView($('m-form-title'));
 }
 $('m-cancel').onclick = () => mcpFormReset('edit cancelled — form cleared');
 
@@ -3000,41 +3042,121 @@ window.deleteModel = async el => {
   if (!confirm(`Remove model "${name}"?\n\nIts endpoint pool is deleted and it disappears from routing.\nProfiles whose cascade lists it will simply skip it; keys keep working.`)) return;
   try {
     const j = await api(`/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    // a removed pool must not leave its dead registration in the edit form
+    if (editingModel === name) modelFormReset();
     banner(`model <b>${esc(j.model)}</b> removed (${j.endpoints_removed} endpoint(s))`, '', 4000, true);
     await loadModels();
   } catch (e) { banner(e.message, 'error', 6000); }
 };
 
-window.moAddRow = () => {
+// ---- Edit flow (2026-11-05 operator request): a row's edit button loads the
+// FULL pool registration into the top form — one edit surface for register +
+// edit, the same contract the MCP table uses. The read is a dedicated admin
+// call: GET /admin/models returns NAMES only, and the health surface carries
+// no credential state. Credential VALUES never cross this path either — the
+// form receives the by-ref Secret NAME and the boolean auth_configured (used
+// only to render "(unchanged)"), never the stored token.
+let editingModel = null;
+
+function modelFormReset(msg) {
+  editingModel = null;
+  $('mo-form-title').textContent = 'Register a model endpoint pool';
+  $('mo-save').textContent = 'Save pool';
+  $('mo-cancel').hidden = true;
+  const name = $('mo-name');
+  name.value = ''; name.readOnly = false; name.removeAttribute('title');
+  $('mo-type').value = '';
+  $('mo-eps').innerHTML = '';
+  moAddRow();                       // one blank endpoint row, as on a fresh page
+  if (msg) banner(msg, '', 2500);
+}
+
+window.editModel = async btn => {
+  const name = btn && btn.dataset ? btn.dataset.model : '';
+  if (!name || btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const j = await api(`/models/${encodeURIComponent(name)}/pool`);
+    const eps = (j && j.endpoints) || [];
+    if (!eps.length) {
+      banner(`model <b>${esc(name)}</b> has no registered endpoints — refresh and retry`, 'error', 5000, true);
+      return;
+    }
+    editingModel = name;
+    $('mo-form-title').textContent = `Edit model endpoint pool: ${name}`;
+    $('mo-save').textContent = 'Save changes';
+    $('mo-cancel').hidden = false;
+    const nameInput = $('mo-name');
+    nameInput.value = name;
+    // The model name is the pool key: a POST under a new name would CREATE a
+    // second pool and leave this one behind, so edit mode pins it.
+    nameInput.readOnly = true;
+    nameInput.title = 'The model name is the pool key — remove and re-register to rename.';
+    // Pin the pool's current type: Save must not re-probe (detection is
+    // best-effort and an unreachable endpoint silently falls back to chat).
+    // A mixed/unknown pool has no single selectable type; leave auto-detect
+    // and say so rather than guessing.
+    const types = [...new Set(eps.map(e => e.model_type).filter(Boolean))];
+    const knownType = types.length === 1 && [...$('mo-type').options].some(o => o.value === types[0]);
+    $('mo-type').value = knownType ? types[0] : '';
+    $('mo-eps').innerHTML = '';
+    eps.forEach(ep => moAddRow(ep));
+    banner(`editing <b>${esc(name)}</b>${knownType ? '' : ' — <b>mixed/unknown model type</b>: Save will probe endpoint 1'} — change and Save changes`, '', 4500, true);
+    scrollFormTitleIntoView($('mo-form-title'));
+  } catch (e) {
+    banner(e.message, 'error', 6000);
+  } finally {
+    btn.disabled = false;
+  }
+};
+$('mo-cancel').onclick = () => modelFormReset('edit cancelled — form cleared');
+
+// ep = one endpoint from GET /admin/models/{name}/pool (edit mode) or omitted
+// (a fresh row). Blank API key means KEEP the stored credential (the server's
+// tri-state: null = keep), so an edited row with a stored key says
+// "(unchanged)" instead of inviting a re-paste. weight 0 is a REAL value
+// (standby: failover only) and must never be coerced to 1.
+window.moAddRow = ep => {
+  const e = ep || {};
   const div = document.createElement('div');
   div.className = 'ep-row';
-  div.innerHTML = `<label>Base URL <input class="mo-url" placeholder="http://vllm-svc.ns.svc.cluster.local/v1"></label>
-    <label>API key <input class="mo-key" type="password" placeholder="(unchanged)"></label>
-    <label>or Secret name <input class="mo-secret" placeholder="(by-ref)"></label>
-    <label>Priority <input class="mo-pri" type="number" value="0"></label>
-    <label>Weight <input class="mo-w" type="number" value="1"></label>
+  div.innerHTML = `<label>Base URL <input class="mo-url" placeholder="http://vllm-svc.ns.svc.cluster.local/v1" value="${esc(e.base_url || '')}"></label>
+    <label>API key <input class="mo-key" type="password" placeholder="${e.auth_configured ? '(unchanged)' : 'paste — stored encrypted'}"${e.auth_configured ? ' title="a panel credential is stored — leave blank to keep it, paste to replace"' : ''}></label>
+    <label>or Secret name <input class="mo-secret" placeholder="(by-ref, advanced)" value="${esc(e.api_key_secret || '')}"></label>
+    <label>Priority <input class="mo-pri" type="number" value="${esc(e.priority != null ? e.priority : 0)}"></label>
+    <label>Weight <input class="mo-w" type="number" value="${esc(e.weight != null ? e.weight : 1)}"></label>
     <button class="ghost mini danger ep-remove" title="Remove this endpoint from the form (takes effect on Save)" onclick="this.closest('.ep-row').remove()">×</button>`;
   $('mo-eps').appendChild(div);
   armPasswordToggles(div);
   layoutFormRowsNow();
 };
 $('mo-save').onclick = guarded('mo-save', async () => {
-  const endpoints = [...document.querySelectorAll('.ep-row')].map(r => ({
-    base_url: r.querySelector('.mo-url').value.trim(),
-    priority: +r.querySelector('.mo-pri').value || 0,
-    weight: +r.querySelector('.mo-w').value || 1,
-    api_key_secret: r.querySelector('.mo-secret').value.trim() || null,
-    // "" would CLEAR the stored key — normalize blank to null (keep)
-    api_key: r.querySelector('.mo-key').value || null,
-  })).filter(e => e.base_url);
+  const endpoints = [...document.querySelectorAll('#mo-eps .ep-row')].map(r => {
+    const wRaw = r.querySelector('.mo-w').value;
+    const w = wRaw === '' ? 1 : +wRaw;
+    return {
+      base_url: r.querySelector('.mo-url').value.trim(),
+      priority: +r.querySelector('.mo-pri').value || 0,
+      // 0 is standby — a fallback of 1 here would silently promote it
+      weight: Number.isFinite(w) ? w : 1,
+      api_key_secret: r.querySelector('.mo-secret').value.trim() || null,
+      // "" would CLEAR the stored key — normalize blank to null (keep)
+      api_key: r.querySelector('.mo-key').value || null,
+    };
+  }).filter(e => e.base_url);
   try {
     const chosenType = ($('mo-type') && $('mo-type').value) || '';
-    const payload = { model_name: $('mo-name').value, endpoints };
+    // editingModel is the source of truth: the name field is readonly in edit
+    // mode, and a rename would create a second pool instead of updating this one.
+    const payload = { model_name: editingModel || $('mo-name').value, endpoints };
     // Only pin the type when the operator chose one; '' = let the gateway
     // detect. Omitting the field entirely is what makes detection run.
     if (chosenType) payload.model_type = chosenType;
     await api('/models', { method: 'POST', body: payload });
-    banner('model pool saved', '', 3000); await loadModels();
+    const wasEditing = !!editingModel;
+    if (wasEditing) modelFormReset();
+    banner(wasEditing ? 'model pool updated' : 'model pool saved', '', 3000);
+    await loadModels();
   } catch (e) { banner(e.message, 'error', 6000); }
 });
 

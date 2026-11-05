@@ -101,6 +101,23 @@ WEIGHT_LABELS = {
     "fp16": "FP16",
 }
 
+# NVLink topology tokens: nvlink2 / nvlinkx2 / 2waynvlink -> GPUs per NVLink
+# group.  Topology moves PERFORMANCE (all-reduce bandwidth across TP), never
+# capacity -- an 8-way and a 2-way 4-GPU box pool the same HBM (see
+# memory_model/gpus.py).  The token is how a run records which box it ran on.
+_NVLINK_RE = (re.compile(r"nvlinkx?(\d+)"), re.compile(r"(\d+)waynvlink"))
+
+
+def nvlink_ways(tok: str) -> int | None:
+    """GPUs per NVLink group from a filename token ('nvlink2', 'nvlinkx2',
+    '2waynvlink' -> 2), or None when the token is not a topology token."""
+    for rx in _NVLINK_RE:
+        m = rx.fullmatch(tok)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 # Tokens to ignore when building the "extra info" notes
 _IGNORED_TOKENS = {"old", "hicache", "fp8", "fp8_e4m3", "bf16", "fp16"}
 
@@ -482,6 +499,7 @@ def parse_setup(stem: str) -> dict:
         "mtp": None,
         "weights": None,
         "hicache": None,
+        "nvlink": None,
         "replicas": 1,
         "obsolete": False,
         "arrival": "closed",  # closed-loop (unmarked) | open-loop (_ol token)
@@ -524,6 +542,10 @@ def parse_setup(stem: str) -> dict:
         m = re.fullmatch(r"replicasx(\d+)", low)
         if m:
             meta["replicas"] = int(m.group(1))
+            continue
+        nvlink = nvlink_ways(low)
+        if nvlink is not None:
+            meta["nvlink"] = nvlink
             continue
         if low in WEIGHT_LABELS:
             meta["weights"] = WEIGHT_LABELS[low]

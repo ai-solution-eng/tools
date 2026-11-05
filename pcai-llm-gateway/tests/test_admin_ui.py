@@ -1288,6 +1288,72 @@ def test_live_pools_show_model_type() -> None:
     assert "mixed" in s
 
 
+def test_console_live_pools_edit_loads_the_whole_registration() -> None:
+    """2026-11-05 operator request: Live pools had test/fallbacks/remove but no
+    edit, so changing a pool meant re-typing every endpoint. The row's edit
+    button now loads the FULL registration into the top form — the same
+    register+edit surface the MCP tab uses.
+
+    The read is a dedicated admin call (GET /admin/models returns NAMES only,
+    and the health surface carries no credential state). Credential VALUES
+    never cross it: the form receives the by-ref Secret NAME and the boolean
+    auth_configured (for the "(unchanged)" placeholder), never the token."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # the action + its inline-onclick export
+    assert 'onclick="editModel(this)"' in s
+    assert re.search(r"window\.editModel = async btn =>", s), "editModel must be a window global"
+    # the form grew an edit identity and a cancel path
+    assert 'id="mo-form-title"' in s and 'id="mo-cancel"' in s
+    assert "function modelFormReset(" in s
+    assert "$('mo-cancel').onclick" in s
+    # the pool read, path-encoded (pool names may contain "/")
+    assert "encodeURIComponent(name)}/pool`" in s
+    # the edit lands BELOW the sticky header + nav, not under them
+    assert "function scrollFormTitleIntoView(" in s
+    assert "scrollFormTitleIntoView($('mo-form-title'))" in s
+    # the model name is the pool key: editing must not silently rename/create
+    assert "nameInput.readOnly = true" in s and "name.readOnly = false" in s
+    assert "model_name: editingModel || $('mo-name').value" in s
+    # blank key = keep stored credential; the form knows which rows have one
+    assert "e.auth_configured ? '(unchanged)'" in s
+    # weight 0 is standby — the edit paint and the save must both preserve it
+    assert "e.weight != null ? e.weight : 1" in s
+    assert "Number.isFinite(w) ? w : 1" in s
+    # removing the pool that is open in the form clears the dead editor
+    assert "editingModel === name" in s
+
+
+def test_console_table_action_cells_share_one_block() -> None:
+    """2026-11-05 operator request: the MCP and Live pools rows must lay out
+    their actions identically. Both render the same .rowacts grid of equal
+    ghost buttons and put the test result on its OWN .rowres line underneath.
+    Inline results made the cell width depend on the pill text, so a wider
+    "ok · 122ms" or a fail message wrapped on some rows and not others — row
+    heights changed and the table stretched past the card."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # both tables render the shared grid + result line
+    assert s.count('<div class="rowacts">') >= 3  # keys + profiles + MCP + models
+    assert '<div class="rowres"><span class="mcp-test"' in s
+    assert '<div class="rowres"><span class="probe-out"' in s
+    # the result is OUTSIDE the button grid: testMcp must look it up from the cell
+    assert "btn.closest('td')" in s
+    assert "btn.parentElement.querySelector('.mcp-test')" not in s
+    # the result line is pinned to the grid width and long text wraps inside it
+    rule = re.search(r"\.rowres \{[^}]*\}", s)
+    assert rule and "width: 168px" in rule.group(0)
+    pill = re.search(r"\.rowres \.pill \{[^}]*\}", s)
+    assert pill, "the result pill needs its own rule"
+    assert "max-width: 100%" in pill.group(0)
+    assert "white-space: normal" in pill.group(0)
+    assert "overflow-wrap: anywhere" in pill.group(0)
+    # the models table carries the new edit action in the same block
+    assert 'onclick="editModel(this)"' in s
+
+
 def test_nav_is_sticky_below_the_header() -> None:
     """The tab strip scrolled away on a long page, forcing a scroll back to
     the top to change section. It must stick, and it must stick BELOW the

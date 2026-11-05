@@ -3,7 +3,8 @@
 compare.py holds the PURE logic: normalized run summaries (produced by
 ``RunManager.compare_data`` in runner.py, which owns the path safety) are
 merged here into sections of merged rows with per-run cells and delta
-columns against the first selected run (the reference).
+columns against the reference run (the first selected run of each kind, or
+the caller's explicit ``reference`` pick).
 
 The response shape:
 
@@ -183,18 +184,31 @@ def _columns_for(rows: list[dict]) -> list[str]:
     return known + unknown
 
 
-def _reference_id(runs_data: list[dict]) -> str | None:
-    return runs_data[0]["run_id"] if runs_data else None
+def _reference_id(runs_data: list[dict], reference: str | None = None) -> str | None:
+    """The section's reference run: the caller's explicit pick when it is one
+    of the section's runs, else the first selected run of that kind."""
+    if not runs_data:
+        return None
+    ids = [r["run_id"] for r in runs_data]
+    if reference and reference in ids:
+        return reference
+    return ids[0]
 
 
-def build_comparison(runs_data: list[dict]) -> dict:
+def build_comparison(runs_data: list[dict], reference: str | None = None) -> dict:
     """Merge normalized per-run dicts into the comparison payload.
 
     Rows with the same label are aligned across runs; the union of labels is
     ordered by first appearance (reference run first, then each later run's
     new labels in its own file order). Same-label same-kind runs of DIFFERENT
     kinds never mix — sections are grouped per kind, each with its own
-    reference (the first selected run OF that kind) and its own columns.
+    reference and its own columns.
+
+    ``reference`` (optional) names the run the deltas are computed against.
+    It must be one of the compared runs; an unknown id falls back to the
+    historical default (the first selected run of that kind). The reference
+    is placed FIRST in its section's ``runs`` so "the first column is the
+    baseline" stays true in the UI.
     """
     present = [r for r in runs_data if r.get("run_id")]
     sections: list[dict] = []
@@ -202,19 +216,22 @@ def build_comparison(runs_data: list[dict]) -> dict:
         kind_runs = [r for r in present if r.get("kind") == kind and r.get("rows")]
         if not kind_runs:
             continue
-        ref_id = _reference_id(kind_runs)
+        ref_id = _reference_id(kind_runs, reference)
         if ref_id is None:  # unreachable: kind_runs is non-empty here
             continue
-        run_ids = [r["run_id"] for r in kind_runs]
-        # union of labels, first appearance across the runs in selection order
+        # reference first, then the rest in selection order
+        run_ids = [ref_id] + [r["run_id"] for r in kind_runs if r["run_id"] != ref_id]
+        by_id = {r["run_id"]: r for r in kind_runs}
+        ordered = [by_id[rid] for rid in run_ids]
+        # union of labels, first appearance across the runs in section order
         labels: list[str] = []
-        for r in kind_runs:
+        for r in ordered:
             for row in r["rows"]:
                 lab = row["label"]
                 if lab not in labels:
                     labels.append(lab)
         by_label: dict[str, dict[str, dict]] = {}
-        for r in kind_runs:
+        for r in ordered:
             for row in r["rows"]:
                 by_label.setdefault(row["label"], {}).setdefault(r["run_id"], row["metrics"])
         all_rows = []
@@ -242,7 +259,7 @@ def build_comparison(runs_data: list[dict]) -> dict:
                     if d is not None:
                         deltas.setdefault(metric, {})[rid] = d
             all_rows.append({"label": lab, "cells": cells, "delta_vs_reference": deltas})
-        columns = _columns_for([row for r in kind_runs for row in r["rows"]])
+        columns = _columns_for([row for r in ordered for row in r["rows"]])
         sections.append(
             {
                 "kind": kind,
@@ -261,15 +278,17 @@ def missing_ids(requested: list[str], runs_data: list[dict]) -> list[str]:
     return [rid for rid in requested if rid not in found]
 
 
-def finalize_comparison(runs_data: list[dict], requested: list[str]) -> dict:
+def finalize_comparison(runs_data: list[dict], requested: list[str], reference: str | None = None) -> dict:
     """build_comparison + the missing-id list (the route's single entry
-    point). Duplicate requested ids collapse to their first position."""
+    point). Duplicate requested ids collapse to their first position;
+    ``reference`` is the caller's optional baseline pick (see
+    :func:`build_comparison`)."""
     seen: set[str] = set()
     unique: list[str] = []
     for rid in requested:
         if rid not in seen:
             seen.add(rid)
             unique.append(rid)
-    out = build_comparison(runs_data)
+    out = build_comparison(runs_data, reference)
     out["missing"] = missing_ids(unique, runs_data)
     return out

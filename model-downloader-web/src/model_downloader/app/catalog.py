@@ -281,9 +281,27 @@ class Catalog:
             self.entries = json.loads(self.path.read_text())
         else:
             self.entries = []
-        changed = self._merge_seed()
+        changed = self._normalize_versions()
+        changed = self._merge_seed() or changed
         if changed or not self.path.exists():
             self._save()
+
+    def _normalize_versions(self) -> bool:
+        """Force every entry's version to 1 (MLIS assigns the real one at push).
+
+        Entries pulled from a local MLIS arrive carrying that instance's
+        version (v9 for DeepSeek, v8 for GLM), which made the same model a
+        different version on every unit.  The version is an MLIS-side sequence
+        now (versioning.plan_push), so the catalog stores 1 and the push result
+        reports what was actually assigned.  Returns True when anything
+        changed, so the caller saves the normalised catalog.
+        """
+        changed = False
+        for entry in self.entries:
+            if entry.get("version") != 1:
+                entry["version"] = 1
+                changed = True
+        return changed
 
     def _read_removed_seeds(self) -> set[str]:
         if self.removed_path.exists():
@@ -330,6 +348,10 @@ class Catalog:
             elif cid in self._removed_seed_ids:
                 removed += 1
             else:
+                # Same normalisation as the on-load pass: a seed file or a
+                # GitHub refresh may carry an inherited MLIS version.
+                entry = dict(entry)
+                entry["version"] = 1
                 self.entries.append(entry)
                 present.add(cid)
                 added += 1
@@ -427,8 +449,10 @@ class Catalog:
         entry["catalog_id"] = uuid.uuid4().hex[:12]
         if entry.get("tier") not in TIERS:
             entry["tier"] = TIERS[0]
-        if entry.get("version") is None:
-            entry["version"] = 1
+        # MLIS assigns the real version at push time (versioning.plan_push);
+        # storing an authored one here is what made one model v9 on one unit
+        # and v1 on another.
+        entry["version"] = 1
         if entry.get("metadata") is None:
             entry["metadata"] = {"tags": "", "modelCategory": "other"}
         if entry.get("environment") is None:

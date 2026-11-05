@@ -848,6 +848,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "POST   /admin/tenants/{tenant_id}/users",
             "POST   /admin/models",
             "GET    /admin/models",
+            "GET    /admin/models/{model_name}/pool",
             "DELETE /admin/models/{model_name}",
             "POST   /admin/models/{model_name}/probe",
             "POST   /admin/models/{model_name}/detect-type",
@@ -2245,6 +2246,51 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
 async def list_models(_: AdminDep) -> list[str]:
     """Current live router pool names (post-refresh state, not raw DB rows)."""
     return model_router.models()
+
+
+@router.get("/models/{model_name:path}/pool")
+async def get_model_pool(model_name: str, _: AdminDep) -> dict[str, Any]:
+    """Full registration for ONE pool — the console's edit surface.
+
+    GET /admin/models returns live NAMES only, and the endpoint-health surface
+    carries no credential state, so the register form's edit mode needs this
+    read. Credential VALUES are never here: `api_key_secret` is the
+    by-reference K8s Secret NAME (the same pointer GET /admin/mcp-servers
+    exposes as `auth_secret`), and `auth_configured` is the boolean "a
+    panel-managed token is stored" — the console uses it only to render
+    "(unchanged)" and can never receive the token itself.
+
+    `{model_name:path}` because pool names legitimately contain "/"
+    ("Qwen/Qwen3.8-27B-FP8"); a plain path param 404s those.
+    """
+    rows = await db.fetch(
+        "SELECT base_url, priority, weight, api_key_secret, "
+        "(auth_token_enc IS NOT NULL) AS auth_configured, model_type "
+        "FROM model_endpoints WHERE model_name = $1 "
+        "ORDER BY priority, base_url",
+        model_name,
+    )
+    if not rows:
+        raise HTTPException(404, f"model {model_name!r} has no registered endpoints")
+    types = {r["model_type"] for r in rows if r["model_type"]}
+    return {
+        "model_name": model_name,
+        # One pool, one type. None = the rows disagree (legacy/hand-edited
+        # data) or carry no type; the console then leaves auto-detect on and
+        # says so rather than silently pinning one endpoint's type.
+        "model_type": next(iter(types)) if len(types) == 1 else None,
+        "endpoints": [
+            {
+                "base_url": r["base_url"],
+                "priority": r["priority"],
+                "weight": r["weight"],
+                "api_key_secret": r["api_key_secret"],
+                "auth_configured": bool(r["auth_configured"]),
+                "model_type": r["model_type"],
+            }
+            for r in rows
+        ],
+    }
 
 
 def _iso_epoch(ts: float) -> str | None:

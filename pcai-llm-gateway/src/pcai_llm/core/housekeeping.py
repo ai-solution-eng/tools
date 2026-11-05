@@ -193,11 +193,22 @@ async def _distill_sweep() -> None:
 
         if not await distiller_config.is_enabled():
             return
-        # Off-peak-only gate (single combined condition per SIM102): the
-        # global evaluator hysteresis state — fail-safe: a disabled evaluator
-        # is never "low demand", so the sweep just waits.
-        if await distiller_config.offpeak_only() and not (offpeak.state.enabled and offpeak.state.active):
-            return
+        # Off-peak-only gate. Prefer the DISTILLER MODEL's own evaluator when
+        # one is configured: the sweep spends GPU on that model, so the fleet
+        # average is the wrong signal (live 2026-11-05: Qwen3.8-27B sat at
+        # ~1.6% — off-peak — while the fleet average was ~24%, and the sweep
+        # stayed paused for hours). None = no model pinned (caller routing)
+        # or no per-model evaluator: fall back to the global hysteresis. A
+        # per-model False is a BUSY signal and must never be overridden by an
+        # active global state.
+        if await distiller_config.offpeak_only():
+            model = await distiller_config.get_model()
+            per_model = offpeak.model_active(model) if model else None
+            if per_model is None:
+                if not (offpeak.state.enabled and offpeak.state.active):
+                    return
+            elif not per_model:
+                return
         await distill_schedule.sweep()
     except Exception:
         # WARNING, not DEBUG (2026-10-14): the outermost distiller catch. At

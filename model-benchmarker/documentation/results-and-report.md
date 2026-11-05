@@ -100,11 +100,13 @@ The filename is the only place the serving setup is recorded, so it follows
 a fixed grammar that the report parses:
 
 ```
-<GPU>[x<count>][_sglang|_vllm][_dflash|_dflash2|_dspark|_dsp|_eagle|_eagle3|_mtp|_mtp2|_disabled]
+<GPU>[x<count>][_nvlink<N>|_<N>waynvlink][_sglang|_vllm]
+    [_dflash|_dflash2|_dspark|_dsp|_eagle|_eagle3|_mtp|_mtp2|_disabled]
     [_nvfp4|_fp8|_fp8_e4m3|_bf16|_fp16][_hicache[xN]][_replicasxN][_ol].md
 ```
 
 e.g. `H200_sglang_dflash2_hicachex3_replicasx3.md`, `RTXPRO6000x2_hicachex16.md`,
+`H200x4_NVLink2_hicachex6.md` (4× H200 on a G2 medium — 2-way NVLink pairs),
 `H200_ol.md` (open-loop arrivals), `H200.md`, `OLD_RTXPRO6000x1.md` (the
 `OLD_` prefix flags the file obsolete in the report).
 
@@ -115,6 +117,7 @@ Model-Downloader catalog, then to `Disabled`/inference):
 |---|---|
 | **Model** | results sub-directory |
 | **GPU type + count** | filename (e.g. `H200Sx4` → 4× NVIDIA H200 PCIe — the trailing `S` is a legacy filename marker, not SXM) |
+| **NVLink topology** | `nvlinkN` / `nvlinkxN` / `Nwaynvlink` token → N GPUs per NVLink group (e.g. `NVLink2` → 2-way; absent = unrecorded). Topology changes *performance* (all-reduce bandwidth across TP), not capacity — a 2-way 4× box and an 8-way 4× box pool the same HBM, so the label calls it out before two such runs are compared |
 | **MTP / speculative decoding** | `dflash2`, `dspark`, `eagle`, `dsp`, `mtp` token or catalog; else `Disabled` |
 | **Weights** | `nvfp4` / `fp8` / `bf16` / `fp16` token |
 | **Engine** | `sglang` / `vllm` token, or catalog image |

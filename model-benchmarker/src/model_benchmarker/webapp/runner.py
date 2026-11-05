@@ -56,6 +56,14 @@ MAX_NOTES = 5
 DEFAULT_RUN_TIMEOUT_S = 7200.0
 DEFAULT_MAX_CONCURRENT = 2
 
+# Results-page page management: ids hidden from the run list. This is NOT
+# deletion -- the artifacts stay on the PVC and stay comparable by id; it only
+# keeps the shared list readable. Persisted beside the runs so every viewer
+# sees the same page.
+HIDDEN_FILE = "hidden.json"
+MAX_HIDDEN = 5000
+HIDDEN_ID_MAX = 200
+
 _INT_RE = re.compile(r"^[0-9]+$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _ARG_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -1085,6 +1093,52 @@ class RunManager:
             raise BenchError(f"run {run_id} is not running (status: {rec.status})")
         rec.cancel = True
         return rec
+
+    # -- results-page page management (hide, never delete) -------------------
+
+    def _hidden_path(self) -> Path:
+        return self.work_dir / HIDDEN_FILE
+
+    def hidden_ids(self) -> list[str]:
+        """Ids hidden from the results list (run ids and ``lib:`` baseline
+        ids). A missing or corrupt file reads as "nothing hidden": page
+        management must never break the public results surface."""
+        try:
+            raw = json.loads(self._hidden_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        ids = raw.get("ids") if isinstance(raw, dict) else None
+        if not isinstance(ids, list):
+            return []
+        return [i for i in ids if isinstance(i, str) and i][:MAX_HIDDEN]
+
+    def set_hidden(self, ids: list[str], hidden: bool) -> list[str]:
+        """Hide (or unhide) entries from the results list; returns the new
+        hidden set. Ids are opaque strings -- a run id or a ``lib:`` baseline
+        id -- so an unknown id is harmless and simply never matches. The
+        write is atomic (tmp + os.replace) and locked: every /api/results
+        request reads this file."""
+        clean: list[str] = []
+        for i in ids:
+            if not isinstance(i, str):
+                continue
+            i = i.strip()
+            if i and len(i) <= HIDDEN_ID_MAX and i not in clean:
+                clean.append(i)
+        with self._lock:
+            current = self.hidden_ids()
+            if hidden:
+                seen = set(current)
+                current.extend(i for i in clean if i not in seen)
+            else:
+                drop = set(clean)
+                current = [i for i in current if i not in drop]
+            current = current[-MAX_HIDDEN:]
+            path = self._hidden_path()
+            tmp = path.with_name(path.name + ".partial")
+            tmp.write_text(json.dumps({"ids": current}, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        return current
 
     # -- reads --------------------------------------------------------------
 

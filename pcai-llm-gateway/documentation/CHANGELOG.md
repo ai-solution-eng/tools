@@ -7,6 +7,49 @@ feature is listed under the LATER version.
 
 ## Unreleased
 
+- **Distiller off-peak scheduling follows the summarizer model, not the
+  fleet average (2026-11-05 operator report).** The Memory Distiller's
+  `offpeak_only` gate read the GLOBAL evaluator, so a busy fleet average kept
+  the sweep paused even when the distiller's own model was idle — live:
+  Qwen3.8-27B at ~1.6% (off-peak) while the fleet average sat at ~24%, and
+  the automatic feed wrote nothing for hours. The gate now reads
+  `offpeak.model_active(<summarizer model>)` first: the model's own
+  per-model PromQL (the Off-peak panel's per-model rows) decides. A busy
+  per-model state blocks the sweep even if the global state is active; an
+  off-peak per-model state opens it even if the global state is idle. When
+  no model is pinned (empty = caller routing) or no per-model query is
+  configured, it falls back to the global hysteresis exactly as before. The
+  admin panel hint, the config docstring and FEATURES.md state which
+  evaluator governs. Explicit `/v1/distill` calls are unchanged (they always
+  run). Tests: busy-model blocks, idle-model opens, global fallback in both
+  directions, and unpinned-model fallback.
+
+- **Live pools get an edit surface, and both registry tables share one action
+  block (2026-11-05 operator request).** The Models tab could register a pool
+  but never edit one, so changing a priority or a weight meant re-typing
+  every endpoint. Each Live pools row now carries an `edit` button that loads
+  the FULL registration into the top form — the same register+edit surface
+  the MCP tab uses: base URLs, priorities, weights, by-ref Secret names and
+  the pool's model type. The model name is fixed while editing (it is the
+  pool key; a POST under a new name would create a second pool and leave the
+  old one behind — remove and re-register to rename), `Cancel` returns to
+  register mode, and a blank API key keeps the stored credential. The read is
+  a new admin-only `GET /admin/models/{model_name}/pool`: `GET /admin/models`
+  returns names only and the health surface carries no credential state, so
+  the form needs its own read. Credential VALUES never cross it —
+  `api_key_secret` is the by-reference Secret NAME (the same pointer the MCP
+  registry exposes) and `auth_configured` is the boolean "a panel token is
+  stored", used only to render `(unchanged)`. The Live pools and Registered
+  servers action cells now render the SAME block: equal ghost buttons in the
+  `.rowacts` grid, with the test result on its own line underneath. Inline
+  results used to sit beside the buttons, so a wider `ok · 122ms` or a fail
+  message wrapped on some rows and not others — row heights changed and the
+  table stretched past the card. The result line is pinned to the block width
+  and long text wraps inside it; weight `0` (standby) is preserved through
+  the edit paint AND the save. Tests: the pool read (round-trip, mixed type,
+  404, slash-named pools, no credential values), plus source-shape pins on
+  the edit flow and the shared action cell.
+
 - **Deterministic tool-result compression for relayed turns
   (2026-11-04, opt-in).** Oversized tool results were re-prefilled on every
   later iteration of a turn, and the only bound was a blunt 32,000-char head

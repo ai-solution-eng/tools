@@ -95,6 +95,11 @@ def _setup_label(meta: dict[str, Any]) -> str:
     parts: list[str] = []
     if meta.get("gpu"):
         parts.append(str(meta["gpu"]) + (f" x{meta['gpu_count']}" if (meta.get("gpu_count") or 1) > 1 else ""))
+    if meta.get("nvlink"):
+        # Fabric topology is the differentiator between otherwise-identical
+        # GPU counts (a 2-way 4x box is not an 8-way 4x box): show it in the
+        # label so a cross-box comparison never reads as apples-to-apples.
+        parts.append(f"{meta['nvlink']}-way NVLink")
     if meta.get("engine"):
         parts.append(str(meta["engine"]))
     if meta.get("mtp"):
@@ -172,6 +177,7 @@ def scan_library(root: Path | None = None) -> dict:
                     "mtp": meta.get("mtp"),
                     "weights": meta.get("weights"),
                     "hicache": meta.get("hicache"),
+                    "nvlink": meta.get("nvlink"),
                     "replicas": meta.get("replicas") or 1,
                     "status": "complete" if "Status: complete" in text else "partial",
                     "rows": chat_rows,
