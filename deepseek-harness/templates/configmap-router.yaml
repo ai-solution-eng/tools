@@ -138,11 +138,16 @@ data:
     // 41: the Data Manager shows its build in the header and /api/healthz
     // reports it ("ok":true,"build":"0.4.34"), so a stale unit is visible
     // from the browser instead of looking like a missing feature.
+    // 42: a failed upload now reports the proxy's own error text instead of a
+    // bare "HTTP 500" — an nginx/gateway error page is stripped to its first
+    // words, so the row says which hop failed.
+    // 43: drops the unused personal/logo.png — the personal ConfigMap never
+    // rendered it and the init loop logged "cp: cannot stat" on every start.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
-    // reconcile — no chart edit needed. Defaults to 41 so an install that
+    // reconcile — no chart edit needed. Defaults to 42 so an install that
     // does not set it keeps the historical value (no surprise rollout).
-    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 41 }}'
+    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 43 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,
@@ -538,7 +543,7 @@ data:
     // routes (nginx serves /terminal, /term, /data-manager — the legacy
     // /data_manager spelling stays aliased in-app) keep the legacy
     // hash slug instead.
-    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u'])
+    const slugReservedNames = new Set(['healthz', 'terminal', 'term', 'u', 'data-manager'])
     function slugifyUsername(userId) {
       const cleaned = (userId || '')
         .toLowerCase()
@@ -2885,12 +2890,25 @@ data:
     function authPageHtml(identity) {
       const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
       const adminConfigured = !!(adminUsername && adminPassword)
+      // Signed-in launcher. The two sibling apps (ttyd terminal on 7683,
+      // data manager on 7682) are same-origin and reachable root-relative
+      // through the session passthrough, so a plain <a> is the whole
+      // integration — no JS, no CSP to satisfy (the page sets none). They
+      // open in a new tab so the launcher and its session survive, matching
+      // how the in-pod pages already cross-link (data_manager.html /
+      // terminal_manager.html use target="_blank" too). Root-relative hrefs
+      // are deliberately NOT slug-prefixed: /terminal and /data-manager are
+      // in slugReservedNames, so they always reach the app, never a user pod.
       const strip = identity
-        ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-            <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
-            <div style="display:flex;gap:14px;">
-              <a href="/__dsh_start" style="color:var(--accent);">Open your environment</a>
-              <a href="/__dsh_logout" style="color:var(--text-muted);">Log out</a>
+        ? `<div class="card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+              <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
+              <a href="/__dsh_logout" style="color:var(--text-muted);font-size:13px;">Log out</a>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <a class="btn btn-primary" href="/__dsh_start" style="text-decoration:none;">Open your environment</a>
+              <a class="btn btn-outline" href="/terminal" target="_blank" rel="noopener" style="text-decoration:none;">Terminal</a>
+              <a class="btn btn-outline" href="/data-manager" target="_blank" rel="noopener" style="text-decoration:none;">Data Manager</a>
             </div>
           </div>`
         : ''

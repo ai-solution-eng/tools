@@ -316,7 +316,7 @@ The first login after logout used to strand the user on the login menu ("Signed 
 | Units **stuck NotReady** after 0.1.5 | Readiness probed dsh's nonexistent `/healthz` route | chart ≥0.1.7 (probe hits dsh root — 302 counts as ready); immediate unblock: revert readinessProbe to `tcpSocket 8082` |
 | PVCs hang Pending / VAST quota collisions | VAST CSI 64-char quota-name truncation | `scripts/cleanup-dsh-web-helm-stale-quotas.sh` (dry-run by default) |
 
-**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. **`RUNTIME_REV` is operator-tunable** (`values.yaml` / EzAppConfig values blob): bump it to force every unit to re-stamp onto the current template without editing the chart. Defaults to the shipped value (36), so leaving it unset changes nothing. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
+**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. **`RUNTIME_REV` is operator-tunable** (`values.yaml` / EzAppConfig values blob): bump it to force every unit to re-stamp onto the current template without editing the chart. Defaults to the shipped value (43), so leaving it unset changes nothing. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
 
 ---
 
