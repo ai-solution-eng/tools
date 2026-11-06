@@ -139,13 +139,23 @@ data:
     // v22: the Data Manager shows its build in the header and /api/healthz
     // reports it, so a stale unit is visible from the browser.
     //
-    // RUNTIME_REV is operator-tunable: set it in values.yaml (or an EzAppConfig
-    // values blob) and every user unit re-stamps on the next reconcile — no
-    // chart edit needed. The suffix is only appended when the value is SET, so
-    // an install that never sets it renders the historical marker EXACTLY and
-    // gets no surprise rollout on upgrade.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default "" }}'
-    const userTemplateVersion = `terminal-tab-v22-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}${userRuntimeRev ? `-r${userRuntimeRev}` : ''}`
+    // v23: a failed upload reports the proxy's error text instead of a bare
+    // "HTTP 500".
+    //
+    // v24: unit-start fixes from the 1.2.25 field report — apply-defaults
+    // writes valid JSON again (a literal backslash-n corrupted every profile
+    // it touched; a repair pass heals files 1.2.25 already broke) and the
+    // supervisor resolves the configured opencode/openchamber from the state
+    // PVC instead of the image's baked copies (the /usr/local/bin relink needs
+    // root and silently fails on forced-uid clusters). Also drops the unused
+    // personal/logo.png, which the personal ConfigMap never rendered and the
+    // init loop logged a cp error for on every start.
+    // RUNTIME_REV is part of the marker, same contract as the dsh and openwork
+    // charts: the shipped default is 22 and it is ALWAYS appended, so bumping
+    // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
+    // the next reconcile — no chart edit needed.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 22 }}'
+    const userTemplateVersion = `terminal-tab-v24-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------

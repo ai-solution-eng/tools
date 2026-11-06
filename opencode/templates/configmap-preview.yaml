@@ -365,6 +365,26 @@ data:
     const webHost = process.env.OPENCODE_WEB_HOST || '0.0.0.0'
     const portCheckHost = process.env.OPENCODE_WEB_CHECK_HOST || '127.0.0.1'
     const chamberPort = Number(process.env.OPENCHAMBER_PORT || '3000')
+
+    // The chart installs the configured opencode/openchamber versions into the
+    // state PVC; the image also carries baked copies under /usr/local/bin.
+    // opencode-startup.sh relinks /usr/local/bin to the PVC copies, but that
+    // needs root — on forced-uid platform units the relink silently fails and
+    // the baked versions would win. Resolve the PVC copy (what the chart asked
+    // for) and fall back to the image only when it is missing.
+    function resolveBinary(name) {
+      const statePath = `/var/opencode/data/npm/bin/${name}`
+      try {
+        if (fs.statSync(statePath).isFile()) {
+          fs.accessSync(statePath, fs.constants.X_OK)
+          return statePath
+        }
+      } catch {}
+      return `/usr/local/bin/${name}`
+    }
+    const opencodeBinary = resolveBinary('opencode')
+    const openchamberBinary = resolveBinary('openchamber')
+    console.log(`[opencode] binaries: opencode=${opencodeBinary} openchamber=${openchamberBinary}`)
     const opencodeArgs = isChamber
       ? ['--print-logs', 'serve', '--port', String(webPort), '--hostname', '127.0.0.1']
       : ['--print-logs', 'web', '--port', String(webPort), '--hostname', webHost]
@@ -628,7 +648,7 @@ data:
         OPENCODE_HOST: `http://127.0.0.1:${webPort}`,
         OPENCODE_SKIP_START: 'true',
       }
-      const proc = spawn('/usr/local/bin/openchamber', args, {
+      const proc = spawn(openchamberBinary, args, {
         detached: true,
         stdio: 'inherit',
         env: chamberEnv,
@@ -699,7 +719,7 @@ data:
       if (stopping || child) return
 
       console.log('[opencode] starting web process')
-      const proc = spawn('/usr/local/bin/opencode', opencodeArgs, {
+      const proc = spawn(opencodeBinary, opencodeArgs, {
         detached: true,
         stdio: 'inherit',
         env: opencodeServerEnv(),
@@ -3238,6 +3258,14 @@ data:
       document.getElementById('upload-dialog').showModal();
     }
 
+    // A proxy in front of the app answers with an HTML error page, which the
+    // SPA used to collapse into a bare "HTTP 500". Keep the first words of
+    // the body so the row says who failed and why.
+    function httpErrorText(status, text) {
+      const stripped = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      return 'HTTP ' + status + (stripped ? ' — ' + stripped.slice(0, 140) : '');
+    }
+
     function uploadOne(item, onProgress) {
       return new Promise(function (resolve, reject) {
         let url = API + '/upload-file?path=' + encodeURIComponent(currentPath) +
@@ -3258,7 +3286,7 @@ data:
           let data = {};
           try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
           if (xhr.status >= 200 && xhr.status < 300) { resolve(data); return; }
-          let msg = data && data.error ? data.error : 'HTTP ' + xhr.status;
+          let msg = data && data.error ? data.error : httpErrorText(xhr.status, xhr.responseText);
           if (xhr.status === 413) msg = data && data.error ? data.error : 'File is larger than the server limit';
           reject(new Error(msg));
         };
@@ -3289,7 +3317,7 @@ data:
           let data = {};
           try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
           if (xhr.status >= 200 && xhr.status < 300 && data && data.ok) { resolve(data); return; }
-          reject(new Error((data && data.error) || ('HTTP ' + xhr.status)));
+          reject(new Error((data && data.error) || httpErrorText(xhr.status, xhr.responseText)));
         };
         xhr.onerror = function () { session.xhrs.delete(xhr); reject(new Error('Network error')); };
         xhr.onabort = function () { session.xhrs.delete(xhr); reject(new Error('Cancelled')); };
