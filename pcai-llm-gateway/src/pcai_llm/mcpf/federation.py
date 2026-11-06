@@ -186,7 +186,6 @@ def server_allows(target: dict, tool: str) -> bool:
     return tool in (target.get("allowed_tools") or [])
 
 
-
 # ---------------------------------------------------------------------------
 # Server-class taxonomy + grant-profile presets (P0-3, hardening 2026-10-26)
 # ---------------------------------------------------------------------------
@@ -255,9 +254,26 @@ MCP_ADMIN_ONLY_TOOL_PREFIXES = ("admin_",)
 # prefix cannot express. ONE constant — presets derive their safety from
 # it and the tests pin real registered tool names against it.
 MCP_WRITE_TOOL_PREFIXES = (
-    "add_", "create_", "delete_", "replace_", "set_", "save_", "forget_",
-    "end_", "unlock_", "deselect_", "exec_", "run_", "apply_", "write_",
-    "remove_", "upload_", "cancel_", "revoke_", "restore_", "patch_",
+    "add_",
+    "create_",
+    "delete_",
+    "replace_",
+    "set_",
+    "save_",
+    "forget_",
+    "end_",
+    "unlock_",
+    "deselect_",
+    "exec_",
+    "run_",
+    "apply_",
+    "write_",
+    "remove_",
+    "upload_",
+    "cancel_",
+    "revoke_",
+    "restore_",
+    "patch_",
 )
 # Verb SEGMENTS (wave-1 review P1-2 follow-up): several registered tools
 # carry the write verb in the MIDDLE of the name — mm-rag
@@ -272,10 +288,12 @@ MCP_WRITE_TOOL_PREFIXES = (
 # Full-name exact entries (case-insensitive): verbs the prefix/segment rules
 # cannot express. plan_delete is the applygate destructive verb; delete_chart
 # is ALSO caught by "delete_" and pinned for legibility.
-MCP_WRITE_TOOL_NAMES = frozenset({
-    "plan_delete",
-    "delete_chart",
-})
+MCP_WRITE_TOOL_NAMES = frozenset(
+    {
+        "plan_delete",
+        "delete_chart",
+    }
+)
 
 # READ-ONLY exceptions to the WRITE-VERB rule (wave-2 review): these (server,
 # tool) pairs are named with a write-shaped verb but are read-only BY
@@ -286,16 +304,37 @@ MCP_WRITE_TOOL_NAMES = frozenset({
 # guarantees for THAT tool, and a same-named tool elsewhere gets no benefit
 # of the doubt. If either server ever widens the verb's behavior, remove the
 # pair here — the tests pin observe CONTAINS these two.
-READ_ONLY_RUN_TOOLS = frozenset({
-    ("sqlhandler", "run_sql"),
-    ("k8s-ops", "run_kubectl"),
-})
+READ_ONLY_RUN_TOOLS = frozenset(
+    {
+        ("sqlhandler", "run_sql"),
+        ("k8s-ops", "run_kubectl"),
+    }
+)
 
-MCP_WRITE_TOOL_SEGMENTS = frozenset({
-    "add", "create", "delete", "replace", "set", "save", "forget", "end",
-    "unlock", "deselect", "exec", "run", "apply", "write", "remove",
-    "upload", "cancel", "revoke", "restore", "patch",
-})
+MCP_WRITE_TOOL_SEGMENTS = frozenset(
+    {
+        "add",
+        "create",
+        "delete",
+        "replace",
+        "set",
+        "save",
+        "forget",
+        "end",
+        "unlock",
+        "deselect",
+        "exec",
+        "run",
+        "apply",
+        "write",
+        "remove",
+        "upload",
+        "cancel",
+        "revoke",
+        "restore",
+        "patch",
+    }
+)
 
 # The (only) server whose admin_* verbs mint/revoke credentials and edit
 # authorization policy. Pinned as a named constant so the predicate, the
@@ -337,10 +376,7 @@ def is_admin_only_tool(server: str, tool: str) -> bool:
     or "Admin_Grants" must not slip the gate. Not exploitable today — the
     pair ACL grants exact strings and sqlhandler's dispatch is exact-match —
     but the predicate must not depend on that."""
-    return (
-        server.lower() == ADMIN_ONLY_SERVER
-        and tool.lower().startswith(MCP_ADMIN_ONLY_TOOL_PREFIXES)
-    )
+    return server.lower() == ADMIN_ONLY_SERVER and tool.lower().startswith(MCP_ADMIN_ONLY_TOOL_PREFIXES)
 
 
 def is_write_tool(tool: str) -> bool:
@@ -464,9 +500,7 @@ def preset_pairs(
     try:
         classes = MCP_PROFILE_PRESETS[preset]
     except KeyError:
-        raise ValueError(
-            f"unknown mcp grant preset {preset!r}; known: {sorted(MCP_PROFILE_PRESETS)}"
-        ) from None
+        raise ValueError(f"unknown mcp grant preset {preset!r}; known: {sorted(MCP_PROFILE_PRESETS)}") from None
     out: set[tuple[str, str]] = set()
     for server, tool in catalog:
         if MCP_SERVER_CLASSES.get(server, frozenset()) & classes:
@@ -474,11 +508,7 @@ def preset_pairs(
                 continue  # rule 1: admin verbs stay out of every non-admin stamp
             if "admin" in classes and not tool.startswith(MCP_ADMIN_ONLY_TOOL_PREFIXES):
                 continue  # rule 2: the admin stamp is admin verbs ONLY
-            if (
-                "mutate" not in classes
-                and is_write_tool(tool)
-                and (server, tool) not in READ_ONLY_RUN_TOOLS
-            ):
+            if "mutate" not in classes and is_write_tool(tool) and (server, tool) not in READ_ONLY_RUN_TOOLS:
                 # rule 3: a non-mutate stamp never carries a write verb —
                 # EXCEPT the documented read-only run tools above (wave-2:
                 # rule 3 as shipped had cut sqlhandler.run_sql and

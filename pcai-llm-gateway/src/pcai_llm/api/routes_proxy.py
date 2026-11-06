@@ -48,11 +48,14 @@ from ..core import (
     context_window,
     embedcache,
     guardrails,
+    mcp_weights,
     model_fallbacks,
     model_routing,
     offpeak,
     registry,
+    response_cache,
     title_requests,
+    toolcompress,
     toolrelay,
     upstream_auth,
     wire_compat,
@@ -66,6 +69,8 @@ from ..core.budgets import budget_status, check_budgets, check_rate_limit, settl
 from ..core.cascade import (
     DEMAND_AWARE_ALIAS,
     classify_request,
+    pool_has_type,
+    pool_serves_chat,
     profile_order_for_key,
     resolve_cascade,
     serves_chat,
@@ -81,7 +86,6 @@ log = logging.getLogger(__name__)
 router = fastapi.APIRouter(prefix="/v1", tags=["proxy"])
 
 _RETRY_AFTER_RATE_LIMITED = "5"  # seconds; client should back off briefly
-
 
 
 # --------------------------------------------------------------------------
@@ -165,21 +169,45 @@ def _split_request_tools(raw_tools: Any) -> tuple[list[dict[str, Any]], list[Any
     return mcp_reqs, fn_tools
 
 
-def _assistant_message_text(payload: dict[str, Any]) -> str:
-    """The assistant text of a non-streaming chat response ("" when absent).
+def _assistant_message_texts(payload: dict[str, Any]) -> list[str]:
+    """The assistant text of EVERY choice of a non-streaming response.
 
     Handles both the plain string content shape and the multimodal
     content-parts shape (only text parts carry policy-relevant content).
+    Absent/empty choices contribute nothing. Never raises.
+
+    WHY every choice (audit r5 #2b): a {"n": 2} request carries two SAMPLED
+    answers. Reading only choices[0] meant the post_call guard judged one of
+    them, and the masked rewrite then replaced that one — leaving the second
+    sample's text verbatim in a perfectly well-formed JSON body.
     """
-    try:
-        content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
-    return ""
+    out: list[str] = []
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    for choice in choices if isinstance(choices, list) else ():
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                out.append(content)
+        elif isinstance(content, list):
+            joined = "\n".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
+            )
+            if joined:
+                out.append(joined)
+    return out
+
+
+def _assistant_message_text(payload: dict[str, Any]) -> str:
+    """The assistant text of a non-streaming chat response ("" when absent).
+
+    EVERY choice, joined with a newline (audit r5 #2b) — the post_call guard
+    must judge all sampled answers, not just the first. For the ordinary
+    single-choice response this is byte-identical to the old read.
+    """
+    return "\n".join(_assistant_message_texts(payload))
 
 
 def _sse_line_tokens(chunk: bytes) -> list[bytes]:
@@ -206,11 +234,16 @@ def _sse_text_of_payload(obj: Any) -> list[str]:
     envelopes carry no model text and are skipped.
     """
     texts: list[str] = []
-    try:
-        delta = obj["choices"][0].get("delta") or {}
-    except (KeyError, IndexError, TypeError, AttributeError):
-        delta = None
-    if isinstance(delta, dict):
+    # EVERY choice, not choices[0] (audit r5 #2b): an upstream that packs
+    # several sampled choices into ONE chunk (choices: [{index:0,...},
+    # {index:1,...}]) carries model text under a non-zero index — reading
+    # only choices[0] classified such a chunk text-free and replayed it
+    # VERBATIM on the masked path, shipping the unmasked sample.
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    for choice in choices if isinstance(choices, list) else ():
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            continue
         content = delta.get("content")
         if isinstance(content, str) and content:
             texts.append(content)
@@ -229,6 +262,21 @@ def _sse_text_of_payload(obj: Any) -> list[str]:
             v = payload.get(field)
             if isinstance(v, str) and v:
                 texts.append(v)
+            elif isinstance(v, (dict, list)):
+                # TYPE-BLIND, not str-only (audit r5 #2a): toolrelay emits
+                # pcai.args as the PARSED dict (toolrelay.py:2625 does
+                # args = json.loads(...), stamped at :2690/:2726), so an
+                # ACL-denied tool_error event carries a dict and NO string
+                # field at all — the str-only test called it text-free and
+                # replayed the model's tool arguments verbatim on the masked
+                # path. Serialize whatever the field holds: a container is
+                # text the moment its bytes reach the wire.
+                try:
+                    rendered = json.dumps(v, default=str)
+                except (TypeError, ValueError):
+                    rendered = str(v)
+                if rendered and rendered not in ("{}", "[]"):
+                    texts.append(rendered)
     return texts
 
 
@@ -245,39 +293,27 @@ def _sse_answer_texts_of_payload(obj: Any) -> list[str]:
     drops every reasoning chunk wholesale: it can neither leak nor steer the
     verdict, exactly like pre-fix — the widened drop predicate is the fix.
     """
-    try:
-        delta = obj["choices"][0].get("delta") or {}
-    except (KeyError, IndexError, TypeError, AttributeError):
-        return []
-    content = delta.get("content")
-    return [content] if isinstance(content, str) and content else []
+    # EVERY choice (audit r5 #2b): the guard must judge each sampled answer,
+    # not just the first — otherwise a multi-choice chunk's non-zero-index
+    # content is neither judged nor (see _sse_text_of_payload) classified.
+    texts: list[str] = []
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    for choice in choices if isinstance(choices, list) else ():
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            continue
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            texts.append(content)
+    return texts
 
-def _sse_delta_texts(chunk: bytes) -> list[str]:
-    """Assistant text deltas carried in one raw SSE byte chunk.
 
-    Byte chunks may straddle SSE line boundaries — a delta JSON split
-    across two chunks simply fails json.loads and is skipped; the FINAL
-    assembled text is a best-effort guard input, not a transcript (the
-    upstream re-parse in _proxy_json is the exact one). pcai thinking/tool
-    events DO carry model text and are read (audit ZC-3) — error envelopes
-    and usage-only chunks are skipped.
-    """
-    out: list[str] = []
-    for line in _sse_line_tokens(chunk):
-        line = line.strip()
-        if not line.startswith(b"data:"):
-            continue
-        payload = line[len(b"data:") :].strip()
-        if not payload or payload == b"[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict) or "error" in obj:
-            continue
-        out.extend(_sse_text_of_payload(obj))
-    return out
+# NOTE (audit r5 #2c): the per-CHUNK classifier that used to live here is
+# gone on purpose. httpx2 hands over whatever the socket returned, so an SSE
+# event can straddle two reads — a per-chunk view classifies both halves as
+# text-free and the masked replay then ships them verbatim. The masked path
+# and the guard input are both driven by the LINE CURSOR in _guarded_sse
+# instead; do not reintroduce a per-read parser for either.
 
 
 def _guard_body_size(request: Request) -> None:
@@ -323,6 +359,27 @@ async def _json_body(request: Request) -> Any:
         return json.loads(bytes(buf))
     except (ValueError, UnicodeDecodeError):
         raise fastapi.HTTPException(400, "request body is not valid JSON") from None
+
+
+async def _raw_body(request: Request) -> bytes:
+    """Read the request body as BYTES with the same hard cap as _json_body.
+
+    The audio passthrough routes must forward whatever bytes arrived, audio
+    included — a JSON round-trip would re-encode them (and base64 in a
+    multipart `file` field would be impossible to reconstruct by parsing).
+    Same framing-agnostic bound as _json_body: a declared oversize body
+    413s pre-read, a chunked body is bounded as it accumulates.
+    """
+    _guard_body_size(request)
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > settings.max_body_bytes:
+            raise fastapi.HTTPException(
+                413,
+                f"request body too large: exceeds limit {settings.max_body_bytes}",
+            )
+    return bytes(buf)
 
 
 def _check_model_allowed(key: KeyRecord, model: str) -> None:
@@ -393,15 +450,40 @@ def _estimate_embedding_tokens(body: dict[str, Any]) -> int:
     return len(str(body.get("input") or "")) // 4
 
 
+def _estimate_rerank_tokens(body: dict[str, Any]) -> int:
+    """Estimate tokens for a rerank call: query + every document, len//4.
+
+    Rerank bodies carry text (strings) or multimodal content dicts; the
+    estimator only needs a rough SIZE, and str() of a content dict still
+    scales with the text/base64 it holds. Never raises, never negative -
+    same fail-safe contract as _estimate_tokens.
+    """
+    query = body.get("query")
+    total = len(query) if isinstance(query, str) else len(str(query or ""))
+    documents = body.get("documents")
+    if isinstance(documents, (list, tuple)):
+        for doc in documents:
+            total += len(doc) if isinstance(doc, str) else len(str(doc or ""))
+    elif isinstance(documents, str):
+        total += len(documents)
+    return max(0, total // 4)
+
+
 def _routing_available(key: KeyRecord, capacity: dict[str, dict] | None = None) -> Callable[[str], bool]:
     """Availability predicate for the complexity-router's ladder walk.
 
     A ladder model is servable for THIS key when it is registered (a pool
     exists), inside the key's allowed_models (the ACL is a hard boundary —
     a routing pseudo-name must never become an ACL bypass), has a healthy
-    chat-typed endpoint, and — when `capacity` is supplied — still has
-    budget headroom for this key RIGHT NOW. Built per request because it
-    closes over the key; core.model_routing stays a pure decision module.
+    chat-typed endpoint, and — when `capacity` is supplied — would be
+    ADMITTED by the budget gate for this request RIGHT NOW. `capacity` is
+    budgets.model_capacity, which since 2026-11-03 mirrors check_budgets:
+    per-key rows AND the team envelope (per-model caps, pooled outer bound,
+    overflow swallow), charged with the request estimate. The router therefore
+    never offers a model the admission gate would then 429 — including one the
+    key's TEAM pool has no room for, which the per-key-only projection used to
+    advertise. Built per request because it closes over the key;
+    core.model_routing stays a pure decision module.
 
     WHY capacity belongs here and not only in the admission gate: the
     decision model is offered exactly this predicate's survivors as
@@ -434,9 +516,7 @@ def _routing_available(key: KeyRecord, capacity: dict[str, dict] | None = None) 
     return _ok
 
 
-async def _routing_incumbent_state(
-    key: Any, body: dict[str, Any]
-) -> tuple[str | None, str | None, Any]:
+async def _routing_incumbent_state(key: Any, body: dict[str, Any]) -> tuple[str | None, str | None, Any]:
     """(incumbent, sticky_floor, sticky_writer) for one routed request.
 
     Extracted from the request path so the bootstrap chain is TESTABLE.
@@ -497,10 +577,16 @@ async def _routing_incumbent_state(
         # finisher(serving_model) once admission settles, so the never-
         # downgrade floor can never name a model that did not bill.
         writer = _sticky.make_writer(key.id, thread, defer=True)
-    except Exception:
-        log.warning("routing: incumbent/sticky lookup failed - plain routing", exc_info=True)
+    except Exception as exc:
+        # WARNING without a traceback (audit w6, P2): this sits on the request
+        # path, so a stickiness/DB blip printed a FULL TRACEBACK PER REQUEST --
+        # a log flood at exactly the moment the DB is already unhappy. The
+        # exception type keeps the fault identifiable; the request still
+        # degrades to plain routing.
+        log.warning("routing: incumbent/sticky lookup failed - plain routing (%s)", type(exc).__name__)
         return None, None, None
     return incumbent, floor, writer
+
 
 def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..., Any] | None:
     """Build the System One caller for the configured decision model.
@@ -521,7 +607,19 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
     pool = model_router.pool(decision_model)
     if pool is None or not pool.endpoints:
         return None
-    ep = pool.pick() or pool.endpoints[0]
+    # BREAKER (audit w6, P2): a cooling pool means "no usable decision
+    # endpoint", and None is exactly this function's contract for that -- the
+    # router then keeps its heuristics. The old `or pool.endpoints[0]` fallback
+    # re-picked a COOLING endpoint on every request, so the breaker wired below
+    # could never actually relieve a hung decision model.
+    ep = pool.pick()
+    if ep is None:
+        # INFO, not WARNING: this fires once per routed request while the
+        # breaker is open, and the trip itself is already visible (the
+        # breaker_trip metric + Pool.report's last_error on /admin/endpoints).
+        # A per-request WARNING here would be the log flood this wave removed.
+        log.info("decision model %r has no healthy endpoint (breaker open) - heuristics stand", decision_model)
+        return None
     base = (ep.base_url or "").rstrip("/")
     if not base:
         return None
@@ -541,6 +639,12 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
         # model receives.
         from ..core import routing_config
 
+        # ONE live snapshot feeds both channels: the instructions block (only
+        # when the operator prompt still carries {{...}}) and the per-model
+        # cards, which become the criteria descriptions. Reading it once is
+        # also what keeps the two channels from disagreeing about the load.
+        cfg = await routing_config.get_config()
+        gpu = {**await routing_config.gpu_load_snapshot(), "inject": bool(cfg.get("inject_gpu_load"))}
         text = instructions
         if "{{" in text:
             # Honour the operator's inject_gpu_load flag, exactly as the panel
@@ -548,11 +652,38 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
             # inject=True here made the live call disagree with the preview: a
             # site with injection OFF still sent real GPU numbers, so the text
             # the operator approved was not the text the model received.
-            cfg = await routing_config.get_config()
-            gpu = {**await routing_config.gpu_load_snapshot(), "inject": bool(cfg.get("inject_gpu_load"))}
-            text = routing_config.render_prompt(
-                text, gpu=gpu, models=candidates, decision_model=decision_model
-            )
+            text = routing_config.render_prompt(text, gpu=gpu, models=candidates, decision_model=decision_model)
+        # The operator's max_prompt_chars is a COST bound on every decision
+        # call, and it used to be enforced only in the preview -- so the panel
+        # could show a truncated prompt while the live call shipped the whole
+        # thing. Same cap, same truncation, one rule.
+        try:
+            _cap = max(200, int(cfg.get("max_prompt_chars") or 8000))
+        except (TypeError, ValueError):
+            _cap = 8000
+        if len(text) > _cap:
+            text = text[:_cap]
+        # The CRITERIA channel: one description per candidate, built from that
+        # model's card plus its own live row. This is the only channel whose
+        # text is bound to an option label when the choice is scored, so it is
+        # where a model's ROLE belongs -- a role list in the instructions made
+        # the model map prose onto bare labels across channels. A model with no
+        # card renders as its bare name (the pre-cards behaviour).
+        # Bounded like the state path: a pricing fault costs a tie-break hint,
+        # never the decision.
+        try:
+            from ..core import costs as _costs
+
+            prices = await asyncio.wait_for(_costs.price_hints(list(candidates)), timeout=0.5)
+        except Exception:  # never let pricing cost a decision
+            prices = {}
+        criteria = routing_config.render_criteria(
+            policy.get("cards") or {},
+            list(candidates),
+            gpu=gpu,
+            costs=prices,
+            modalities=policy.get("modalities") or None,
+        )
         payload = {
             "model": decision_model,
             "state": state,
@@ -562,7 +693,7 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
                     "instructions": text,
                     # criteria is {option: description}; a choice question
                     # needs >= 2 options, which the caller guarantees.
-                    "criteria": {c: c for c in candidates},
+                    "criteria": criteria,
                 }
             },
         }
@@ -575,10 +706,14 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
         headers = dict(_upstream_headers(ep, uuid.uuid4().hex[:12]))
         headers["Content-Type"] = "application/json"
         try:
-            resp = await model_router.client.post(
-                url, json=payload, headers=headers, timeout=timeout_ms / 1000.0
-            )
+            resp = await model_router.client.post(url, json=payload, headers=headers, timeout=timeout_ms / 1000.0)
         except Exception as exc:
+            # BREAKER (audit w6, P2): every other upstream call in this file
+            # reports to its pool, so a dead endpoint cools and stops being
+            # picked. The decision endpoint had NO report at all, so a hung
+            # decision model cost decision_timeout_ms on EVERY routed request,
+            # forever. Timeout and transport failure both count.
+            await pool.report(ep, False, error=type(exc).__name__)
             # httpx2's TimeoutException does NOT inherit builtin TimeoutError
             # (it is TransportError -> HTTPError), so decision_routing's
             # `except TimeoutError` would classify a real timeout as
@@ -601,7 +736,9 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
                 resp.status_code,
                 resp.content[:400].decode("utf-8", "replace"),
             )
+            await pool.report(ep, False, error=f"upstream status {resp.status_code}")
         resp.raise_for_status()
+        await pool.report(ep, True)
         return resp.json()
 
     return _call
@@ -648,6 +785,56 @@ def _log_request(
 
 def _is_2xx(status_code: int) -> bool:
     return 200 <= status_code < 300
+
+
+# Explicit (lowercased) body markers that make a 400 attributable to the
+# MODEL the upstream was asked for — not to the caller's request shape.
+_MODEL_400_MARKERS = (
+    "model not found",
+    "does not exist",
+    "unknown model",
+    "context length",
+    "maximum context",
+    "message role",
+    "unsupported role",
+)
+
+
+def _is_model_attributable_4xx(status: int, body: bytes, model: str) -> bool:
+    """Could a DIFFERENT model from the fallback chain serve this request?
+
+    The gateway's default is "4xx = the caller's/request's fault — never
+    re-rolled". That is right for client-shape errors (a malformed payload
+    400s on EVERY endpoint, so re-rolling only spends a second GPU call to
+    reproduce the same error) — and wrong when the UPSTREAM is rejecting the
+    MODEL itself: a 404 model-not-found, or a 400 whose body names the model
+    / context length / message role, where another model can legitimately
+    succeed. This helper is the ONE predicate both failover sites
+    (_proxy_json and the streaming path) use to decide that.
+
+    NARROW BY DESIGN:
+      * 404 -> eligible. The call path is fixed (/chat/completions, built by
+        the gateway), so a 404 there is the upstream's "no such model", not
+        a route miss.
+      * 400 -> eligible ONLY when the lowercased body matches an explicit
+        marker (model not found / does not exist / unknown model / context
+        length / maximum context / message role / unsupported role), or when
+        it QUOTES the model name the gateway sent (a strict upstream's
+        rejection message names the model even when its phrasing misses
+        every marker). A generic validation 400 never matches.
+      * 401/403/429 and every other status -> NOT eligible: credentials,
+        authorization and rate limits are identical on every endpoint of the
+        same deployment, so a second attempt reproduces the same refusal.
+    Pure by contract (no router/DB/IO) — table-testable, zero hot-path cost.
+    """
+    if status == 404:
+        return True
+    if status != 400:
+        return False
+    text = body.decode("utf-8", errors="replace").lower()
+    if any(marker in text for marker in _MODEL_400_MARKERS):
+        return True
+    return bool(model) and model.lower() in text
 
 
 def _context_limit_for(ep: Endpoint | None) -> int | None:
@@ -774,7 +961,7 @@ async def _run_gates(
             request_id,
         )
         raise fastapi.HTTPException(429, budget.reason)
-    rate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, est_tokens, request_id)
+    rate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, est_tokens, request_id, model)
     if not rate.ok:
         await settle(
             key.id,
@@ -881,6 +1068,7 @@ async def _proxy_json(
     fallback_from: str = "",
     want_metadata: bool = False,
     _is_zero_retry: bool = False,
+    cache_hash: str | None = None,
 ) -> Response:
     """Forward one non-streaming call, settle the ledger, relay bytes as-is.
 
@@ -969,9 +1157,13 @@ async def _proxy_json(
         if not _is_2xx(resp.status_code):
             # Transparent proxy: relay the upstream error body and status code
             # untouched so client SDKs can react to the real upstream error —
-            # except on a failover-eligible 5xx with chain left: the breaker
-            # report + error settle happen exactly as before, then the walk
-            # continues. 4xx is the caller's/request's fault — never re-rolled.
+            # except on a failover-eligible status with chain left: the
+            # breaker report + error settle happen exactly as before (this
+            # attempt settled under ITS actual model), then the walk
+            # continues. Eligible = a 5xx (upstream fault), OR a 4xx the
+            # helper attributes to the MODEL itself (a different model can
+            # legitimately serve it — _is_model_attributable_4xx). Every
+            # other 4xx is the caller's/request's fault — never re-rolled.
             await cur_pool.report(cur_ep, False, error=f"upstream status {resp.status_code}")
             await settle(key.id, cur_model, endpoint, 0, 0, "error", latency, request_id)
             _log_request(key.key_prefix, cur_model, cur_ep, "error", latency, request_id)
@@ -989,7 +1181,13 @@ async def _proxy_json(
                     fallback_from=hdr_from,
                 ),
             )
-            if not (500 <= resp.status_code < 600 and chain):
+            if (
+                not (
+                    (500 <= resp.status_code < 600)
+                    or _is_model_attributable_4xx(resp.status_code, resp.content, cur_model)
+                )
+                and chain
+            ):
                 return err_resp
             nxt, chain = await _next_fallback_candidate(
                 chain, cur_model, key, endpoint, est_tokens, request_id, started
@@ -1008,7 +1206,15 @@ async def _proxy_json(
         except ValueError:
             pass  # non-JSON 2xx body: settle on the estimate
         usage = embedding_json.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0) or est_tokens
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        if not prompt_tokens and endpoint != "chat":
+            # Embeddings/rerank servers (vLLM) report total_tokens only, and
+            # on those surfaces the total IS the prompt count - there is no
+            # generated completion to subtract. Chat is excluded: a chat
+            # server that omitted prompt_tokens would otherwise bill the
+            # completion as prompt, so it keeps the estimate fallback.
+            prompt_tokens = int(usage.get("total_tokens") or 0)
+        prompt_tokens = prompt_tokens or est_tokens
         completion_tokens = int(usage.get("completion_tokens") or 0)
         # Usage-detail passthrough (the plain-path twin of toolrelay._cached_tokens):
         # vLLM/SGLang report upstream prompt-cache hits as
@@ -1085,15 +1291,21 @@ async def _proxy_json(
                     # data as assistant speech) is the leak/false-block trap
                     # the stream rework just removed. A masked turn delivers a
                     # clean answer, not executable calls.
-                    message0 = embedding_json["choices"][0]["message"]
-                    message0["content"] = guarded_text
-                    for _rk in toolrelay.REASONING_KEYS:
-                        message0.pop(_rk, None)
-                    message0.pop("tool_calls", None)
-                    choices0 = embedding_json["choices"][0]
-                    if choices0.get("finish_reason") == "tool_calls":
-                        choices0["finish_reason"] = "stop"
-                except (KeyError, IndexError, TypeError):
+                    # EVERY choice (audit r5 #2b): the guard input is the join
+                    # of all sampled answers, so a mask that fired must land on
+                    # all of them — rewriting only choices[0] shipped the masked
+                    # answer in choice 0 next to the UNMASKED sample in choice 1.
+                    for choice in embedding_json["choices"]:
+                        message = choice.get("message")
+                        if not isinstance(message, dict):
+                            continue
+                        message["content"] = guarded_text
+                        for _rk in toolrelay.REASONING_KEYS:
+                            message.pop(_rk, None)
+                        message.pop("tool_calls", None)
+                        if choice.get("finish_reason") == "tool_calls":
+                            choice["finish_reason"] = "stop"
+                except (KeyError, IndexError, TypeError, AttributeError):
                     pass  # unusual shape: relay unmodified rather than corrupt
                 else:
                     masked_by = sorted({d["guardrail"] for d in post_dicts if d.get("action") == "masked"})
@@ -1192,12 +1404,110 @@ async def _proxy_json(
             )
             if mutated is not None:
                 out_content = json.dumps(mutated).encode()
+        # Exact-match response cache: store the FINAL bytes (post-guardrail,
+        # post-metadata) under the model that actually served. Best-effort -
+        # a store fault never affects the caller (core.response_cache).
+        if cache_hash is not None and resp.status_code == 200:
+            await response_cache.store(key.id, cur_model, cache_hash, out_content)
         return Response(
             content=out_content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
             headers=out_headers,
         )
+
+
+# The multipart model-field scanner for /v1/audio/transcriptions (OpenAI SDKs
+# send `model` INSIDE the multipart body, where the gateway's usual JSON-body
+# resolution cannot see it). Part header line, blank line, value: the value
+# runs to the next CRLF — values never contain newlines (form fields are
+# line-oriented), so a non-greedy line match is the whole parse we need.
+_MULTIPART_MODEL_RE = re.compile(rb'name="model"[^\r\n]*\r\n\r\n([^\r\n]+)')
+
+
+def _asr_model_from_multipart(body: bytes) -> str:
+    """The `model` field of a multipart transcription body, '' when absent.
+
+    Pure byte scanning — the audio payload is NEVER decoded or validated
+    (the upstream owns that contract; the gateway only needs the model
+    name to gate and bill). decode-with-replace: a model name is ASCII in
+    practice, and a garbage value must 404/403 loudly, not crash the route.
+    """
+    m = _MULTIPART_MODEL_RE.search(body)
+    if m is None:
+        return ""
+    return m.group(1).decode("utf-8", "replace").strip()
+
+
+async def _proxy_audio_raw(
+    pool: Pool,
+    ep: Endpoint,
+    url: str,
+    body: bytes,
+    content_type: str,
+    key: KeyRecord,
+    model: str,
+    label: str,
+    est_tokens: int,
+    request_id: str,
+    started: float,
+    gate: _GateOutcome,
+) -> Response:
+    """Forward one audio call BYTES-UNCHANGED, relay status/type/bytes.
+
+    `label` is the ledger endpoint label (audio.speech / audio.transcriptions
+    — the audio surface is not an endpoint id, so the label doubles as the
+    row's endpoint column, exactly like the "chat"/"embeddings" labels the
+    other routes settle under). Audio endpoints report no token usage, so
+    the ADMISSION estimate IS the billing fact: the 2xx row settles the
+    estimate with completion 0; a transport failure or a relayed non-2xx
+    settles an "error" row with zero tokens (the relayed error body goes
+    back to the client untouched, same transparent-proxy stance as
+    _proxy_json). The client's Content-Type rides upstream — a multipart
+    transcription must arrive as multipart, a JSON speech body as JSON.
+    """
+    headers = dict(_upstream_headers(ep, request_id))
+    headers["Content-Type"] = content_type
+    headers.update(gate.rate_headers)
+    if gate.warn_level:
+        headers["X-Budget-Warning"] = f"{gate.warn_level}% of a period budget consumed"
+    try:
+        resp = await model_router.client.post(url, content=body, headers=headers)
+    except httpx2.HTTPError:
+        # Connection refused / timeout / TLS: a breaker-worthy endpoint
+        # failure, not a client error (same classification as _proxy_json).
+        latency = _latency_ms(started)
+        await pool.report(ep, False, error="HTTPError")
+        await settle(key.id, model, label, 0, 0, "error", latency, request_id)
+        _log_request(key.key_prefix, model, ep, "error", latency, request_id)
+        raise fastapi.HTTPException(502, "upstream request failed") from None
+    latency = _latency_ms(started)
+    out_headers = _relay_headers(
+        headers,
+        request_id,
+        offpeak.effective_for(model, offpeak.key_fraction(key)),
+        served_model=model,
+        endpoint_id=ep.id,
+    )
+    if not _is_2xx(resp.status_code):
+        await pool.report(ep, False, error=f"upstream status {resp.status_code}")
+        await settle(key.id, model, label, 0, 0, "error", latency, request_id)
+        _log_request(key.key_prefix, model, ep, "error", latency, request_id)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type"),
+            headers=out_headers,
+        )
+    await pool.report(ep, True)
+    await settle(key.id, model, label, est_tokens, 0, "ok", latency, request_id)
+    _log_request(key.key_prefix, model, ep, "ok", latency, request_id)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type"),
+        headers=out_headers,
+    )
 
 
 def _finish_reason_of(payload: dict[str, Any]) -> str:
@@ -1225,7 +1535,10 @@ async def _next_fallback_candidate(
     list, never a policy/budget bypass:
       * registered in the live router snapshot;
       * inside the key's allowed_models (ACL is a hard boundary);
-      * a HEALTHY chat pool (embedding/reranker pools never serve chat);
+      * a HEALTHY chat pool (embedding/reranker pools never serve chat —
+        serves_chat's any() predicate, NOT endpoints[0]: a redeploy that
+        re-registers endpoints in a different order must not 400 a pool that
+        still has a chat member);
       * fresh `check_budgets` headroom — an exhausted candidate settles its
         own 'budget_exceeded' row (visible, budget-source-of-truth) and is
         skipped, exactly like the admission cascade treats it;
@@ -1248,7 +1561,7 @@ async def _next_fallback_candidate(
         cand_pool = model_router.pool(cand)
         if cand_pool is None or not cand_pool.healthy():
             continue
-        if cand_pool.endpoints and cand_pool.endpoints[0].model_type != "chat":
+        if not serves_chat(cand):
             continue
         try:
             budget = await check_budgets(key.id, cand, est_tokens)
@@ -1394,7 +1707,15 @@ class _StreamLedger:
             latency,
             self._request_id,
             cached_tokens=self._cached(),
-            billing_fraction=offpeak.effective(self._off_base),
+            # PER-MODEL (audit r5 #8): this was the last global effective()
+            # call in the tree while all eleven sibling settle sites use
+            # effective_for(model, base) — and the X-PCAI-Billing header for
+            # THIS response is already computed with the per-model form. The
+            # global state averages every model together, so a busy model's
+            # stream booked a discount the operator never granted (or lost
+            # one they did), and the ledger number is what the budget gates
+            # consume. _model is the model this stream was SERVED by.
+            billing_fraction=offpeak.effective_for(self._model, self._off_base),
             guardrail_events=events,
             **model_routing.ledger_stamp(self._route, self._model),
         )
@@ -1468,11 +1789,7 @@ def loop_guard_check(key_id: Any, server: str, tool: str, arguments: dict) -> st
     if len(_loop_guard) > _LOOP_GUARD_MAX_ENTRIES and now >= _evict_not_before:
         _evict_not_before = now + 1.0
         target = int(_LOOP_GUARD_MAX_ENTRIES * 0.9)
-        stale = [
-            f
-            for f, ts in _loop_guard.items()
-            if all(now - t >= _LOOP_GUARD_WINDOW_S for t in ts)
-        ]
+        stale = [f for f, ts in _loop_guard.items() if all(now - t >= _LOOP_GUARD_WINDOW_S for t in ts)]
         for f in stale:
             _loop_guard.pop(f, None)
         if len(_loop_guard) > target:
@@ -1617,9 +1934,7 @@ async def _relay_executor(
 
     _ctor_model = served_model
 
-    async def record(
-        server: str, tool: str, arguments: dict, status: str, model: str = ""
-    ) -> None:
+    async def record(server: str, tool: str, arguments: dict, status: str, model: str = "") -> None:
         served_model = model or _ctor_model
         # ONE terminal outcome for a relay tool call: ledger row + P2-1 metric
         # + P2-2 chained audit row.
@@ -1643,9 +1958,7 @@ async def _relay_executor(
         # policy_blocked is counted by mcpf.arg_policy._count_block, so the
         # metric is ticked here only for ok/error (no double count).
         try:
-            await settle(
-                key.id, served_model or "*", f"mcp:{server}:{tool}", 0, 0, status, 0, request_id
-            )
+            await settle(key.id, served_model or "*", f"mcp:{server}:{tool}", 0, 0, status, 0, request_id)
         except Exception:
             log.exception("relay: settle failed (%s %s/%s)", status, server, tool)
         if status in ("ok", "error", "denied"):
@@ -1970,6 +2283,72 @@ def _guardrail_reply_json(model: str, request_id: str, reply_text: str) -> dict[
     }
 
 
+def _sse_carries_tool_call_delta(obj: Any) -> bool:
+    """Does ONE parsed SSE chat chunk carry a tool-call DELTA? PURE.
+
+    The mask classifies tool-call argument fragments as text (they ARE model
+    output), so the chunk is dropped — and a client that never receives the
+    delta can never execute the call.
+    """
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    for choice in choices if isinstance(choices, list) else ():
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if isinstance(delta, dict) and delta.get("tool_calls"):
+            return True
+    return False
+
+
+def _sse_is_handback_event(obj: Any) -> bool:
+    """Is this chunk the relay's {"pcai": {"event": "handback", ...}} frame? PURE.
+
+    Its payload carries the tool NAMES, not the arguments, so the mask leaves it
+    alone — which is exactly why a masked turn could still ask the client to
+    hand back calls whose deltas were suppressed (audit w6 protocol break).
+    """
+    payload = obj.get("pcai") if isinstance(obj, dict) else None
+    return isinstance(payload, dict) and payload.get("event") == "handback"
+
+
+def _sse_finishes_with_tool_calls(obj: Any) -> bool:
+    """Does this chunk terminate the turn with finish_reason "tool_calls"? PURE."""
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    return any(
+        isinstance(choice, dict) and choice.get("finish_reason") == "tool_calls"
+        for choice in (choices if isinstance(choices, list) else ())
+    )
+
+
+def _downgrade_tool_calls_terminal(chunk: bytes) -> bytes | None:
+    """Rewrite ONE buffered SSE chunk's tool_calls finish_reason to "stop".
+
+    Returns the rewritten chunk, or None when the chunk is not a single
+    parseable data event (a straddled event: the caller drops it and the
+    synthetic masked final supplies the terminal). Only the finish_reason is
+    touched — every other field (usage included) survives verbatim.
+    """
+    text = chunk.strip()
+    if not text.startswith(b"data:"):
+        return None
+    payload = text[len(b"data:") :].strip()
+    try:
+        obj = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return None
+    changed = False
+    for choice in choices:
+        if isinstance(choice, dict) and choice.get("finish_reason") == "tool_calls":
+            choice["finish_reason"] = "stop"
+            changed = True
+    if not changed:
+        return None
+    return b"data: " + json.dumps(obj).encode() + b"\n\n"
+
+
 async def _guarded_sse(
     inner: AsyncIterator[bytes],
     ledger: _StreamLedger | None,
@@ -1997,8 +2376,11 @@ async def _guarded_sse(
              can differ from the assembled one and a mask that misses a
              fragment leaks exactly the text it exists to hide) and ONE
              consolidated chunk carries the masked ASSISTANT ANSWER only.
-             Non-text frames (usage, finish, error envelopes, keepalives)
-             replay verbatim.
+             Non-text frames (usage, error envelopes, keepalives) replay
+             verbatim. A turn whose TOOL-CALL deltas were suppressed is
+             DOWNGRADED (audit w6): its handback event is dropped and its
+             tool_calls terminal is rewritten to "stop", so the client is
+             never asked to execute calls it did not receive.
     Blocked→ the buffered output is discarded; the client receives a
              terminal SSE error envelope; the ledger records the outcome.
 
@@ -2011,25 +2393,82 @@ async def _guarded_sse(
     """
     chunks: list[bytes] = []
     text_parts: list[str] = []
+    # LINE CURSOR, not one parse per network read (audit r5 #2c): httpx2's
+    # aiter_bytes() hands over whatever the socket returned, so an SSE event
+    # routinely straddles two reads. Parsing each read on its own made a
+    # straddled event INVISIBLE — the guard never saw its text (so no mask
+    # ever fired) and the masked replay, classifying both halves text-free,
+    # replayed them VERBATIM. `tail` carries the unterminated remainder into
+    # the next read, `tail_from` is the index of the FIRST chunk it came from,
+    # and `dirty` records every chunk that contributed bytes to a
+    # text-bearing line so the masked replay drops those chunks WHOLE.
+    # (This is why the old per-chunk classifier is gone: a per-chunk view
+    # cannot see a straddled event, which was the defect.)
+    tail = b""
+    tail_from = -1
+    dirty: set[int] = set()
+    # The handback protocol break (audit w6): the mask drops every chunk that
+    # carries a tool-call ARGUMENT fragment, but the handback pcai event (tool
+    # NAMES only) and the finish_reason "tool_calls" terminal carry no
+    # classified field — so they used to replay while the deltas the client
+    # must answer were suppressed. These spans let the masked replay detect
+    # that and downgrade the turn to a plain masked completion.
+    tool_span: set[int] = set()
+    handback_span: set[int] = set()
+    finish_span: set[int] = set()
+
+    def _classify(line: bytes, first: int, last: int) -> None:
+        """Fold ONE complete SSE line into the guard input + the drop set.
+
+        The guard judges what the ASSISTANT REPLIED: content deltas ONLY —
+        see _sse_answer_texts_of_payload (reasoning is dropped wholesale on
+        the masked path; tool args/results are caller or tool data and must
+        not block or shape the answer). The DROP set is deliberately wider
+        than the guard input: every model-text channel makes its chunk
+        undeliverable on the masked path.
+        """
+        stripped = line.strip()
+        if not stripped.startswith(b"data:"):
+            return
+        payload = stripped[len(b"data:") :].strip()
+        if not payload or payload == b"[DONE]":
+            return
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(obj, dict):
+            return  # a non-object data line carries no chat text (never crash a stream)
+        text_parts.extend(_sse_answer_texts_of_payload(obj))
+        if _sse_text_of_payload(obj):
+            dirty.update(range(first, last + 1))
+        if _sse_carries_tool_call_delta(obj):
+            tool_span.update(range(first, last + 1))
+        if _sse_is_handback_event(obj):
+            handback_span.update(range(first, last + 1))
+        if _sse_finishes_with_tool_calls(obj):
+            finish_span.update(range(first, last + 1))
+
     try:
         async for chunk in inner:
+            idx = len(chunks)
             chunks.append(chunk)
-            # The guard judges what the ASSISTANT REPLIED: content deltas
-            # ONLY — see _sse_answer_texts_of_payload (reasoning is dropped
-            # wholesale on the masked path; tool args/results are caller or
-            # tool data and must not block or shape the answer).
-            for line in _sse_line_tokens(chunk):
-                stripped = line.strip()
-                if not stripped.startswith(b"data:"):
-                    continue
-                payload = stripped[len(b"data:") :].strip()
-                if not payload or payload == b"[DONE]":
-                    continue
-                try:
-                    obj = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                text_parts.extend(_sse_answer_texts_of_payload(obj))
+            # _sse_line_tokens is CR/LF/CRLF-aware (audit C-7); its LAST
+            # element is the unterminated remainder, everything before it is
+            # a complete line.
+            *complete, tail = _sse_line_tokens(tail + chunk)
+            # NOT named `first`: the blocked branch below reuses that name for
+            # the first GuardrailEvent and mypy infers one type per function.
+            span_first = tail_from if tail_from >= 0 else idx
+            for line in complete:
+                _classify(line, span_first, idx)
+            tail_from = span_first if tail else -1
+        if tail:
+            # A stream may end WITHOUT a final terminator: classify the
+            # remainder like a line (it is a whole event in every real
+            # upstream, and the per-read parser used to parse it).
+            _classify(tail, max(tail_from, 0), len(chunks) - 1)
+            tail = b""
     except BaseException:
         # Consumer walked away mid-buffer: the deferred ledger row and the
         # slot must still be handled (same discipline as _relay_sse's
@@ -2047,6 +2486,23 @@ async def _guarded_sse(
     except Exception as exc:  # fail-open, visible: policy engine errors must not eat the answer
         log.warning("guardrails: post_call evaluation failed: %s", exc)
         guarded_text, post_events, blocked = text, [], False
+    except BaseException:
+        # Client disconnect / task cancellation DURING the guardrail
+        # evaluation (audit r5 #11): the buffering loop above is guarded, but
+        # this await sits AFTER it — and CancelledError is a BaseException, so
+        # a client that walks away while a webhook guardrail is evaluating
+        # (10 s default, unbounded by the client) used to skip BOTH
+        # ledger.finish() (lost ledger row -> under-billing) and
+        # release_slot() (the _in_flight counter never decrements -> the key
+        # is 429-bricked on its concurrency cap until the pod restarts).
+        # Same discipline as the buffering loop: settle and release shielded,
+        # then re-raise the cancellation.
+        if ledger is not None:
+            with anyio.CancelScope(shield=True):
+                await ledger.finish()
+        if release_slot is not None and not relay_mode:
+            release_slot()
+        raise
     post_dicts = [e.as_dict() for e in post_events]
     all_events = [*([*ledger.pre_events] if ledger is not None else [*(pre_events or [])]), *post_dicts]
 
@@ -2117,9 +2573,29 @@ async def _guarded_sse(
     # consolidated final carrying the MASKED ANSWER ONLY (not reasoning, not
     # tool JSON, not pcai text: those are not the assistant's reply and the
     # old per-channel rewrite glued them into delta.content).
-    for chunk in chunks:
-        if not _sse_delta_texts(chunk) and b"data: [DONE]" not in chunk:
-            yield chunk
+    # The drop set comes from the LINE CURSOR above (audit r5 #2c), not from a
+    # per-chunk parse: a chunk that merely CARRIES HALF of a text-bearing
+    # event is in `dirty` too, so a straddled event can never be reassembled
+    # by the client from two "text-free" halves.
+    # HANDBACK DOWNGRADE (audit w6, owner decision): a turn whose tool-call
+    # deltas the mask dropped can no longer be a handback — the client would be
+    # told to execute calls it never received. Drop the handback event and force
+    # the terminal to finish_reason "stop", so the masked stream is a clean,
+    # self-consistent completion. The arguments stay MASKED: never replay them.
+    downgrade_handback = bool(tool_span & dirty)
+    for i, chunk in enumerate(chunks):
+        if i in dirty or b"data: [DONE]" in chunk:
+            continue
+        if downgrade_handback and i in handback_span:
+            continue
+        if downgrade_handback and i in finish_span:
+            rewritten = _downgrade_tool_calls_terminal(chunk)
+            if rewritten is not None:
+                yield rewritten
+            # an unparseable (straddled) terminal is dropped: the synthetic
+            # masked final below supplies the one and only stop.
+            continue
+        yield chunk
     yield _sse_masked_final(model, request_id, guarded_text)
 
 
@@ -2393,16 +2869,20 @@ async def _stream_chat(
     if not _is_2xx(resp.status_code):
         # Read the error body fully, close the stream context, and relay it
         # as an ordinary (non-SSE) response with the upstream status code.
-        # A failover-eligible 5xx with chain left walks pre-first-byte
+        # A failover-eligible status with chain left walks pre-first-byte
         # (review §4a): the error body never reached the client, so the
         # switch is invisible today and survivable with the chain.
+        # Eligible = a 5xx, or a 4xx the helper attributes to the MODEL
+        # itself (same policy as _proxy_json — one predicate, both sites).
         payload = await resp.aread()
         await resp.aclose()
         latency = _latency_ms(started)
         await cur_pool.report(cur_ep, False, error=f"upstream status {resp.status_code}")
         await settle(key.id, cur_model, "chat", 0, 0, "error", latency, request_id)
         _log_request(key.key_prefix, cur_model, cur_ep, "error", latency, request_id)
-        if 500 <= resp.status_code < 600 and chain:
+        if (
+            500 <= resp.status_code < 600 or _is_model_attributable_4xx(resp.status_code, payload, cur_model)
+        ) and chain:
             nxt, chain = await _next_fallback_candidate(chain, cur_model, key, "chat", est_tokens, request_id, started)
             if nxt is not None:
                 cur_pool, cur_ep, cur_url, _ = nxt
@@ -3084,9 +3564,9 @@ async def chat_completions(
         #   1. switch_cost/current_model in the decision state, so the model can
         #      weigh the re-prefill a switch would cost; and
         #   2. hysteresis, so a challenger must beat the incumbent by a margin.
-        # Read UNCONDITIONALLY -- hysteresis must work even when
-        # never-downgrade (sticky_routing) is off, and that is the default.
-        # Fail-open: a stickiness fault means "no incumbent" (plain routing).
+        # Read UNCONDITIONALLY WITHIN THE ROUTING PATH -- hysteresis must work
+        # even when never-downgrade (sticky_routing) is off, and that is the
+        # default. Fail-open: a stickiness fault means "no incumbent".
         # The incumbent AND the never-downgrade floor are read here, ONCE, and
         # the sticky WRITER is built unconditionally. That last part is load-
         # bearing: this block is the only writer of a `routing:`-scoped row, so
@@ -3094,8 +3574,17 @@ async def chat_completions(
         # permanently None and made the whole hysteresis feature inert in the
         # shipped default (dual review 2026-10-26, HIGH). Hysteresis is a COST
         # guard -- it must work without opting into never-downgrade.
-        _incumbent, _sticky_floor, _sticky_write = await _routing_incumbent_state(key, body)
-
+        # The gate is the router's own _routable flag, NOT sticky_routing
+        # (audit w6, P2): a DIRECT request never consults the router at all, so
+        # its incumbent/floor/writer can never be read -- yet this ran on every
+        # chat request and put one model_stickiness SELECT on the pre-upstream
+        # (TTFT) path for nothing. A routing pseudo-model still reads it BEFORE
+        # resolution, which is what the dual-review fix above requires.
+        _incumbent: str | None = None
+        _sticky_floor: str | None = None
+        _sticky_write: Any = None
+        if _routable:
+            _incumbent, _sticky_floor, _sticky_write = await _routing_incumbent_state(key, body)
 
         # --- decision-model seam -------------------------------------------
         # Built only for a pseudo-model request on an opted-in profile: a
@@ -3115,40 +3604,24 @@ async def chat_completions(
                     from ..core import decision_routing as _dr
 
                     async def decide_fn(candidates, _body, score, _c=_caller, _p=_policy, _inc=_incumbent):
-                        from ..core import routing_config as _rc2
-
-                        gpu = await _rc2.gpu_load_snapshot()
                         # Images the decision model may READ. Only offered when
                         # the request carries them; bounded so a 40-image dump
                         # cannot blow the decision latency budget.
                         _imgs = _dr.extract_user_turn(_body)[1][: _dr.MAX_DECISION_IMAGES]
-                        # COST HINTS, automatic: the prompt tells the model to
-                        # break ties by cost, but nothing populated
-                        # candidates[].cost, so that step could never fire. The
-                        # rates are the ones the settle path already bills from
-                        # (model_costs), formatted once per decision.
-                        try:
-                            from ..core import costs as _costs
-
-                            # Bounded: the decision call itself is capped at
-                            # decision_timeout_ms, and a pricing table that
-                            # stalls must not extend that budget -- a timeout
-                            # costs a tie-break, never the decision.
-                            _prices = await asyncio.wait_for(
-                                _costs.price_hints(list(candidates)), timeout=0.5
-                            )
-                        except Exception:  # never let pricing cost a decision
-                            _prices = {}
+                        # REQUEST-ONLY state (2026-10-30): the per-model facts
+                        # (role, live load, cost, modalities) now ride in the
+                        # CRITERIA channel, built by _decision_caller from the
+                        # same cards and the same live snapshot. Emitting them
+                        # here too would put one number in two channels, and the
+                        # candidate SET is already the criteria keys.
                         state = _dr.build_state(
                             _body,
                             complexity=score,
                             candidates=candidates,
-                            gpu=gpu,
-                            costs=_prices,
-                            modalities=_p.get("modalities") or None,
                             # What this conversation is ALREADY served by, so
                             # the model can weigh the re-prefill a switch costs.
                             current_model=_inc,
+                            include_candidates=False,
                         )
                         # The decision is otherwise unobservable after the
                         # fact: nothing logs what the model was shown, so a
@@ -3190,7 +3663,6 @@ async def chat_completions(
                             latency_ms=result.latency_ms or None,
                         )
 
-
         # Budget capacity for THIS key, fetched ONCE per routing request
         # (two aggregate queries — NOT one per model) and handed to the
         # availability predicate so a model this key cannot afford right now
@@ -3205,7 +3677,14 @@ async def chat_completions(
             try:
                 from ..core import budgets as _budgets
 
-                _capacity = await _budgets.model_capacity(key.id, sorted(registered))
+                # est_tokens (2026-11-03): capacity is asked the SAME
+                # question admission will ask — "would a request THIS size be
+                # admitted?" — not merely "is any headroom left". A model with
+                # 5k tokens left used to read available and get picked for a
+                # 100k-token request, which admission then 429'd: a needless
+                # routing hop, a 'budget_exceeded' ledger row and a walk the
+                # user never asked for.
+                _capacity = await _budgets.model_capacity(key.id, sorted(registered), est_tokens)
             except Exception as exc:
                 log.warning("routing: capacity lookup failed (fail-open): %s", exc)
                 _capacity = {}
@@ -3439,7 +3918,12 @@ async def chat_completions(
     pool = model_router.pool(model)
     if pool is None:
         raise fastapi.HTTPException(404, f"model {model!r} is not registered")
-    if pool.endpoints and pool.endpoints[0].model_type != "chat":
+    # Type gate: serves_chat's any() predicate (imported from core.cascade —
+    # the SAME rule the cascade walk uses, not duplicated). The old
+    # endpoints[0] check 400'd a pool whose FIRST endpoint happened to be
+    # non-chat even when another member could serve — a redeploy that
+    # re-registers endpoints in a different order produced exactly that.
+    if not serves_chat(model):
         raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not chat")
 
     # X-PCAI-Metadata: 1 — opt-in body metadata (review §4b). Headers ride
@@ -3591,8 +4075,7 @@ async def chat_completions(
         if excluded:
             raise fastapi.HTTPException(
                 400,
-                f"agent {agent.name!r} does not include server(s) {excluded}"
-                f" (agent servers: {list(agent.servers)})",
+                f"agent {agent.name!r} does not include server(s) {excluded} (agent servers: {list(agent.servers)})",
             )
 
     # --- relay pre-flight BEFORE the gates (slot-leak fix, security audit):
@@ -3657,7 +4140,7 @@ async def chat_completions(
             raise fastapi.HTTPException(400, "approval passthrough requested but no MCP tools are granted to this key")
         # An agent narrows the CLIENT-execution surface too: a model handed an
         # agent must never see a tool the agent excludes, whichever side runs it.
-        catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None)
+        catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None, agent.tools if agent else None)
         fn_defs = [
             {
                 "type": "function",
@@ -3699,7 +4182,61 @@ async def chat_completions(
                 continue
             if key.allowed_models and cand not in key.allowed_models:
                 continue
+            # CHAT-ONLY (audit w6, P1): resolution.order is the profile ACL as
+            # well as the ladder, so it legitimately carries embedding /
+            # reranker pools (the seeder ships them). This walk has no type
+            # check of its own -- _next_fallback_candidate does -- so an
+            # unfiltered candidate here promotes a CHAT request onto an
+            # embedding pool, which every upstream 400s.
+            if not serves_chat(cand):
+                continue
             candidates.append(cand)
+
+    # --- exact-match response cache (off | shadow | active) ----------------
+    # Placed BEFORE admission so a hit costs no budget and no rate-window
+    # token: the whole point is that a repeated deterministic request skips
+    # the model. Eligibility is deliberately narrow (see core.response_cache):
+    # temperature == 0, non-streaming, non-relay, and no routing/cascade
+    # rewrite (model must still be the name that arrived). Shadow mode only
+    # RECORDS would-be hits; it still stores, because a would-be hit needs an
+    # entry to be measured against.
+    _cache_hash: str | None = None
+    _cache_mode = response_cache.mode()
+    if (
+        _cache_mode != "off"
+        and not relay_requested
+        and model == requested_model
+        and model not in ("auto",)
+        and model_routing.detect_pseudo_model(model) is None
+        and response_cache.eligible(body)
+        and model_router.pool(model) is not None
+    ):
+        _cache_hash = response_cache.request_hash(body)
+        _cached = await response_cache.lookup(key.id, model, _cache_hash)
+        _metrics.RESPONSE_CACHE.labels(mode=_cache_mode, result="hit" if _cached is not None else "miss").inc()
+        if _cache_mode == "active" and _cached is not None:
+            _cache_latency = _latency_ms(started)
+            await settle(
+                key.id,
+                model,
+                "chat",
+                est_tokens,
+                0,
+                "cache_hit",
+                _cache_latency,
+                request_id,
+                cached_tokens=est_tokens,
+            )
+            _log_request(key.key_prefix, model, None, "cache_hit", _cache_latency, request_id)
+            return fastapi.responses.Response(
+                content=_cached,
+                media_type="application/json",
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Cache": "HIT",
+                    "X-PCAI-Served-Model": model,
+                },
+            )
 
     model, gate, admission_fallback_from = await _admit_with_failover(
         key, candidates, est_tokens, request_id, started, resolution.gate
@@ -3735,8 +4272,48 @@ async def chat_completions(
     fallback_from = admission_fallback_from
 
     try:
-        ep = pool.pick()
+        # P1 (audit w6): the admission walk above may have PROMOTED the request
+        # to a DIFFERENT model (a rate/budget 429 walks the ordering by
+        # design), while `pool` was resolved for the model that ARRIVED.
+        # Serving the promoted model through the old pool sends the request to
+        # the endpoint that just refused it -- a strict upstream answers 400/404
+        # (so the failover turns a 429 into a hard failure) and a permissive one
+        # serves the budget-refused model while the ledger books another (a
+        # per-model budget bypass). Re-resolve for the model that will serve.
+        # Inside the try: the gates have already taken the in-flight slot, so
+        # every raise here must go through the release path below.
+        pool = model_router.pool(model)
+        if pool is None:
+            raise fastapi.HTTPException(404, f"model {model!r} is not registered")
+        # Same any()-based type gate as the first admission (serves_chat —
+        # see its docstring for the endpoints[0] order-dependence defect).
+        if not serves_chat(model):
+            raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not chat")
+        # --- session affinity (X-PCAI-Session) -------------------------------
+        # Pin the conversation to an ENDPOINT so its prefix keeps hitting the
+        # same server's KV cache. Three gates before a pin is even read:
+        # the fleet flag, a non-relay request (the relay re-picks per
+        # iteration and would fight the pin), and a session id in the
+        # header. Routing STATE, never policy: the pin is validated against
+        # the LIVE pool by pick() itself, and the store is refreshed on a
+        # successful serve and dropped the moment the endpoint proves it
+        # cannot serve (breaker trip / transport error / upstream error).
+        affinity_session: str | None = None
+        preferred_ep: str | None = None
+        if settings.session_affinity_enabled and not relay_requested:
+            affinity_session = (request.headers.get("x-pcai-session") or "").strip() or None
+            if affinity_session:
+                from ..core import stickiness as _stick
+
+                preferred_ep = await _stick.get_endpoint_pin(key.id, affinity_session, settings.session_affinity_ttl_s)
+        ep = pool.pick(preferred_ep)
         if ep is None:
+            # No healthy endpoint at all: the pinned one (if any) is dead
+            # with the rest — drop the pin so the next turn re-picks fresh.
+            if affinity_session:
+                from ..core import stickiness as _stick
+
+                await _stick.drop_endpoint_pin(key.id, affinity_session)
             # Ledger-worthy error outcome: the request was admitted but served
             # by nobody, so budgets should still see that it happened.
             await settle(
@@ -3805,8 +4382,12 @@ async def chat_completions(
             # gate still sees every tool this key could ever call (a per-request
             # switchable selector must never become a way to split read and
             # egress across two agents).
-            offered_grants = agents_mod.narrow_grants(relay_grants, agent.servers if agent else None)
-            catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None)
+            offered_grants = agents_mod.narrow_grants(
+                relay_grants, agent.servers if agent else None, agent.tools if agent else None
+            )
+            catalog = agents_mod.narrow_catalog(
+                catalog, agent.servers if agent else None, agent.tools if agent else None
+            )
             # relay_grants rides along for the argument stage's read+egress
             # separation — already computed here, so no extra DB round-trip
             # on the hot path.
@@ -3893,9 +4474,13 @@ async def chat_completions(
             # rough token per 4 chars, the repo's estimator convention) or the
             # trim would let the call overflow by exactly that much.
             _agent_reserve = len(agent.system_prompt) // 4 if agent is not None and agent.system_prompt else 0
-            relay_messages, _recon_mode, continuation, iterations_prior, canonical_input = await _reconcile_relay_messages(
-                request, key, body, reserve_tokens=_agent_reserve
-            )
+            (
+                relay_messages,
+                _recon_mode,
+                continuation,
+                iterations_prior,
+                canonical_input,
+            ) = await _reconcile_relay_messages(request, key, body, reserve_tokens=_agent_reserve)
 
             # Synthetic tool-call id counter for the WHOLE relay turn (audit
             # 2026-10-26, F-4). stream_model_call mints an id when an upstream
@@ -4056,7 +4641,12 @@ async def chat_completions(
                     fp = model_router.pool(cand)
                     if fp is None or not fp.healthy():
                         continue
-                    if fp.endpoints and fp.endpoints[0].model_type != "chat":
+                    # serves_chat's any() predicate — the ONE chat-type rule,
+                    # shared with the admission gates and the cascade walk. The
+                    # old endpoints[0] test dropped a servable fallback from the
+                    # relay tail whenever a pool's FIRST endpoint happened to be
+                    # non-chat (endpoint re-registration order is not a policy).
+                    if not serves_chat(cand):
                         continue
 
                     def _fb(p=fp):
@@ -4071,6 +4661,17 @@ async def chat_completions(
                 if fallback_from
                 else ""
             )
+
+            # Tool-result compression (X-PCAI-Compress-Tools): resolved ONCE
+            # per request from the header, falling back to the deployment
+            # default. "off" is byte-for-byte the pre-feature behavior. The
+            # MODE is announced on the response headers before the stream
+            # starts; the saving itself rides in-stream pcai.compress events,
+            # because headers are sent before any result exists.
+            compress_mode = toolcompress.resolve_mode(
+                request.headers.get("x-pcai-compress-tools"), settings.tool_compress_default
+            )
+            compress_stats: list[dict] = []
 
             async def relay_gen():
                 iteration_depth = 0  # observed in finally — see below
@@ -4091,6 +4692,16 @@ async def chat_completions(
                         key_id=key.id,
                         user_id=key.user_id,
                         key_fraction=off_base,
+                        # GOVERNED PER PROFILE (2026-11-03): the relay cap is a
+                        # BUDGET IN UNITS, not a round count. The profile's
+                        # tool_relay_budget overrides the site default (NULL =
+                        # inherit settings.tool_relay_max_iterations), and each
+                        # call charges its SERVER's weight (mcp_servers.tool_weight
+                        # — 0.1 = a cheap call, 3 = an expensive one). Weights are
+                        # TTL-cached and degrade to {} (= every server at 1.0) on
+                        # a DB fault, so governance can never fail a request.
+                        max_iterations=key.tool_relay_budget,
+                        tool_weights=await mcp_weights.weights(),
                         started=started,
                         estimate=lambda msgs: _estimate_tokens({**body, "messages": msgs}),
                         # Per-model max_tokens ceiling for the relay path: the
@@ -4110,6 +4721,10 @@ async def chat_completions(
                         # steps while plain turns reported fine).
                         include_usage=True,
                         stream_thinking=stream_thinking,
+                        # Deterministic tool-result compression + the
+                        # synthetic pcai__retrieve tool (both resolved above).
+                        compress_mode=compress_mode,
+                        compress_stats_out=compress_stats,
                         fallbacks=fallbacks,
                         failover_note=failover_note,
                         continuation=continuation,
@@ -4169,6 +4784,28 @@ async def chat_completions(
                     if relay_iterations:
                         iteration_depth = relay_iterations[0]
                     _metrics.observe_relay_iterations(model, iteration_depth)
+                    if compress_stats:
+                        # Honest accounting: only entries that actually
+                        # REWROTE the text count as savings. A store failure
+                        # ("stored": false) and every shadow entry kept the
+                        # original, so their before/after delta is
+                        # hypothetical — report those separately.
+                        rewritten = [s for s in compress_stats if s.get("mode") == "on" and s.get("stored", True)]
+                        shadowed = [s for s in compress_stats if s.get("mode") == "shadow"]
+                        if rewritten:
+                            log.info(
+                                "relay: compressed %d tool result(s), %d chars saved (request_id=%s)",
+                                len(rewritten),
+                                sum(int(s.get("before", 0)) - int(s.get("after", 0)) for s in rewritten),
+                                request_id,
+                            )
+                        if shadowed:
+                            log.info(
+                                "relay: compression shadow would save %d chars across %d result(s) (request_id=%s)",
+                                sum(int(s.get("before", 0)) - int(s.get("after", 0)) for s in shadowed),
+                                len(shadowed),
+                                request_id,
+                            )
                     _release_in_flight(key.id)
 
             stream_headers = _relay_headers(
@@ -4182,6 +4819,8 @@ async def chat_completions(
             )
             stream_headers["Cache-Control"] = "no-cache"
             stream_headers["X-PCAI-Relay"] = "streaming"
+            if compress_mode != "off":
+                stream_headers["X-PCAI-Compress-Tools"] = compress_mode
             if guardrail_post:
                 # Post-call guardrails on the relayed stream: buffer, judge
                 # the FINAL answer, replay (verbatim / masked / blocked).
@@ -4251,7 +4890,7 @@ async def chat_completions(
             fallback_chain=fb_chain,
         )
     try:
-        return await _proxy_json(
+        resp = await _proxy_json(
             pool,
             ep,
             url,
@@ -4269,9 +4908,42 @@ async def chat_completions(
             fallback_chain=fb_chain,
             fallback_from=fallback_from,
             want_metadata=want_metadata,
+            cache_hash=_cache_hash,
         )
+    except BaseException:
+        # Transport failure / chain exhausted: the pinned endpoint just
+        # proved dead — drop the pin so the next turn re-picks fresh, then
+        # re-raise untouched (the slot-leak release below still runs).
+        if affinity_session:
+            from ..core import stickiness as _stick
+
+            await _stick.drop_endpoint_pin(key.id, affinity_session)
+        raise
     finally:
         _release_in_flight(key.id)
+    # --- session affinity commit (non-streaming surface only) ---------------
+    # The stream path cannot know success at response-construction time, so
+    # it benefits from READING a pin (pick above) without refreshing one —
+    # a deliberate best-effort gap, not a correctness one.
+    if affinity_session:
+        from ..core import stickiness as _stick
+
+        if (
+            _is_2xx(resp.status_code)
+            and resp.headers.get("X-PCAI-Endpoint") == ep.id
+            and resp.headers.get("X-PCAI-Fallback") is None
+        ):
+            # The pinned endpoint served THIS turn: refresh the pin (and
+            # its TTL clock) with what actually answered. Best-effort by
+            # contract — a store fault never fails the request.
+            await _stick.set_endpoint_pin(key.id, affinity_session, ep.id)
+        else:
+            # Upstream error, or a fallback hop served instead of the pin:
+            # the pin no longer names the endpoint that kept this
+            # conversation's cache warm — drop it (same trigger that drops
+            # it on a breaker trip: the endpoint proved it cannot serve).
+            await _stick.drop_endpoint_pin(key.id, affinity_session)
+    return resp
 
 
 @router.post("/embeddings")
@@ -4298,7 +4970,7 @@ async def embeddings(
     pool = model_router.pool(model)
     if pool is None:
         raise fastapi.HTTPException(404, f"model {model!r} is not registered")
-    if pool.endpoints and pool.endpoints[0].model_type not in ("embedding",):
+    if not pool_has_type(pool, "embedding"):
         raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not embedding")
 
     # --- cache hit path: serve without gates or ledger write ---
@@ -4364,6 +5036,275 @@ async def embeddings(
             request_id,
             started,
             cache_input=input_str,
+        )
+    finally:
+        _release_in_flight(key.id)
+
+
+@router.post("/rerank")
+async def rerank(
+    request: Request,
+    key: KeyRecord = fastapi.Depends(require_scope("proxy")),
+) -> Response:
+    """OpenAI-style rerank proxy (vLLM's `/rerank`), gated and ledgered.
+
+    The fleet already runs rerankers (Qwen3-VL-Reranker) that the RAG
+    pipeline calls DIRECTLY at the upstream; this route puts them behind the
+    same key, budget/rate gates, ledger rows and served-model headers as
+    chat and embeddings, so a retrieval hop becomes attributable and
+    metered like every other call.
+
+    The body is forwarded UNCHANGED: `query` and `documents` may be
+    strings or multimodal content dicts, and vendor knobs such as
+    `mm_processor_kwargs` pass straight through. The upstream's own
+    contract is the contract - the gateway is a governor here, not a
+    translator.
+
+    NO response cache: a rerank answer is a score vector tied to one
+    (query, document-set) pair, and this fleet's rerank traffic is one-shot
+    (same reasoning that keeps semantic caching out of scope). Token
+    estimate is the len//4 heuristic over query + documents; settle prefers
+    the upstream's own usage when it reports one, and falls back to the
+    estimate when it does not (vLLM reports total_tokens, not
+    prompt_tokens).
+    """
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+
+    body = await _json_body(request)  # bounded read (413) + JSON parse (400)
+    if not isinstance(body, dict) or "model" not in body or "query" not in body or "documents" not in body:
+        raise fastapi.HTTPException(
+            400,
+            "rerank request must be a JSON object with 'model', 'query' and 'documents'",
+        )
+    model = str(body["model"])
+    _check_model_allowed(key, model)
+    pool = model_router.pool(model)
+    if pool is None:
+        raise fastapi.HTTPException(404, f"model {model!r} is not registered")
+    if not pool_has_type(pool, "reranker"):
+        raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not reranker")
+
+    est_tokens = _estimate_rerank_tokens(body)
+    gate = await _run_gates(key, model, est_tokens, "rerank", request_id, started)
+    warn_level = gate.warn_level
+
+    ep = pool.pick()
+    if ep is None:
+        await settle(
+            key.id,
+            model,
+            "rerank",
+            0,
+            0,
+            "error",
+            _latency_ms(started),
+            request_id,
+        )
+        _log_request(key.key_prefix, model, None, "error", _latency_ms(started), request_id)
+        # Same release-before-raise reasoning as the chat/embeddings paths.
+        _release_in_flight(key.id)
+        raise fastapi.HTTPException(503, "no healthy upstream")
+
+    url = f"{ep.base_url}/rerank"
+    headers = dict(_upstream_headers(ep, request_id))
+    headers.update(gate.rate_headers)
+    if warn_level:
+        headers["X-Budget-Warning"] = f"{warn_level}% of a period budget consumed"
+    try:
+        return await _proxy_json(
+            pool,
+            ep,
+            url,
+            body,
+            headers,
+            key,
+            model,
+            "rerank",
+            est_tokens,
+            request_id,
+            started,
+        )
+    finally:
+        _release_in_flight(key.id)
+
+
+# Native-path alias. vLLM serves rerank at BOTH /rerank and /v1/rerank, and
+# clients that speak the native shape strip the trailing "/v1" from their
+# base_url before posting (the RAG pipeline's MultiModalReranker does exactly
+# that: `base_url[:-3]` then POST "/rerank"). Without this alias such a client
+# pointed at the gateway would 404 - and the tempting fix is to point it back
+# at the upstream, which is the governance bypass the route exists to close.
+# Same handler, both spellings.
+rerank_alias_router = fastapi.APIRouter(tags=["proxy"])
+
+
+@rerank_alias_router.post("/rerank")
+async def rerank_native_path(
+    request: Request,
+    key: KeyRecord = fastapi.Depends(require_scope("proxy")),
+) -> Response:
+    """POST /rerank (no /v1) - the native vLLM spelling of /v1/rerank."""
+    return await rerank(request, key)
+
+
+# --------------------------------------------------------------------------
+# audio passthrough: /v1/audio/speech (TTS) and /v1/audio/transcriptions (ASR)
+# --------------------------------------------------------------------------
+#
+# Transparent proxy over the fleet's voice endpoints (pool model_type
+# "voice"): the request body BYTES leave exactly as they arrived (JSON for
+# speech, multipart for transcriptions — the audio payload is never parsed,
+# decoded or re-encoded) and the upstream's status, content-type and body
+# bytes come back the same way. Added value is the control plane: key auth,
+# allowed-model enforcement, the pool's voice-type gate, budgets/rate gates,
+# the circuit breaker, and ONE ledger row per request settling an ESTIMATE
+# (audio endpoints report no token usage; a zero-token row would be a
+# budget bypass — see settings.audio_tts_chars_per_token /
+# audio_asr_tokens_per_second).
+
+
+@router.post("/audio/speech")
+async def audio_speech(
+    request: Request,
+    key: KeyRecord = fastapi.Depends(require_scope("proxy")),
+) -> Response:
+    """OpenAI-compatible TTS passthrough: JSON in, audio bytes out.
+
+    Model resolution is the JSON body's `model` field (the OpenAI speech
+    shape); the body's BYTES are forwarded unchanged (the client's
+    Content-Type rides upstream, not a re-serialization). Token estimate:
+    len(input) // audio_tts_chars_per_token — the same len//4-family
+    heuristic the text path uses, so a TTS call bills proportionally to
+    the text it speaks.
+    """
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+
+    body = await _raw_body(request)
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise fastapi.HTTPException(400, "speech request must be a JSON body") from None
+    if not isinstance(payload, dict) or not payload.get("model"):
+        raise fastapi.HTTPException(400, "speech request must be a JSON object with a 'model' field")
+    model = str(payload["model"])
+    _check_model_allowed(key, model)
+    pool = model_router.pool(model)
+    if pool is None:
+        raise fastapi.HTTPException(404, f"model {model!r} is not registered")
+    if not pool_has_type(pool, "voice"):
+        raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not voice")
+
+    # TTS estimate: characters of the spoken text (4 chars ~ 1 token). A
+    # non-string input (list of strings) is summed the same way; anything
+    # else estimates 0 — the gates still run on the request axis.
+    text = payload.get("input")
+    if isinstance(text, str):
+        chars = len(text)
+    elif isinstance(text, list):
+        chars = sum(len(t) for t in text if isinstance(t, str))
+    else:
+        chars = 0
+    est_tokens = max(0, chars // settings.audio_tts_chars_per_token)
+
+    gate = await _run_gates(key, model, est_tokens, "audio.speech", request_id, started)
+
+    ep = pool.pick()
+    if ep is None:
+        await settle(key.id, model, "audio.speech", 0, 0, "error", _latency_ms(started), request_id)
+        _log_request(key.key_prefix, model, None, "error", _latency_ms(started), request_id)
+        _release_in_flight(key.id)
+        raise fastapi.HTTPException(503, "no healthy upstream")
+
+    url = f"{ep.base_url}/audio/speech"
+    try:
+        return await _proxy_audio_raw(
+            pool,
+            ep,
+            url,
+            body,
+            request.headers.get("content-type") or "application/json",
+            key,
+            model,
+            "audio.speech",
+            est_tokens,
+            request_id,
+            started,
+            gate,
+        )
+    finally:
+        _release_in_flight(key.id)
+
+
+@router.post("/audio/transcriptions")
+async def audio_transcriptions(
+    request: Request,
+    key: KeyRecord = fastapi.Depends(require_scope("proxy")),
+) -> Response:
+    """OpenAI-compatible ASR passthrough: audio bytes in, JSON out.
+
+    Model resolution: OpenAI SDKs send `model` INSIDE the multipart body,
+    where the gateway's usual JSON-body resolution cannot see it, so the
+    order is (1) ?model= query, (2) X-PCAI-Model header, (3) the multipart
+    model field scanned out of the raw body — and a loud 400 when none
+    yields a name. The body BYTES are forwarded unchanged (multipart stays
+    multipart; the audio is never parsed). Token estimate: audio duration
+    at the fleet's assumed 16 kHz 16-bit mono rate (~32 kB/s) times
+    audio_asr_tokens_per_second (~3/s ≈ 150 spoken words/min), floored at
+    one second so a tiny upload still bills the request it carried.
+    """
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+
+    body = await _raw_body(request)
+    # Query first, header second, multipart scan last: explicit beats
+    # ambient beats embedded. All three are stripped before the ACL so a
+    # padded value cannot sneak past the allowed-models list.
+    model = request.query_params.get("model") or request.headers.get("x-pcai-model") or _asr_model_from_multipart(body)
+    model = (model or "").strip()
+    if not model:
+        raise fastapi.HTTPException(
+            400,
+            "transcription request must name a model: pass ?model=, the X-PCAI-Model "
+            "header, or a 'model' field in the multipart body",
+        )
+    _check_model_allowed(key, model)
+    pool = model_router.pool(model)
+    if pool is None:
+        raise fastapi.HTTPException(404, f"model {model!r} is not registered")
+    if not pool_has_type(pool, "voice"):
+        raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not voice")
+
+    # ASR estimate: raw body bytes / 32000 (16 kHz 16-bit mono ≈ 32 kB/s),
+    # floored at 1 second — a multipart envelope around a tiny clip still
+    # carried a real transcription request.
+    est_tokens = max(1, int(max(1, len(body) / 32000) * settings.audio_asr_tokens_per_second))
+
+    gate = await _run_gates(key, model, est_tokens, "audio.transcriptions", request_id, started)
+
+    ep = pool.pick()
+    if ep is None:
+        await settle(key.id, model, "audio.transcriptions", 0, 0, "error", _latency_ms(started), request_id)
+        _log_request(key.key_prefix, model, None, "error", _latency_ms(started), request_id)
+        _release_in_flight(key.id)
+        raise fastapi.HTTPException(503, "no healthy upstream")
+
+    url = f"{ep.base_url}/audio/transcriptions"
+    try:
+        return await _proxy_audio_raw(
+            pool,
+            ep,
+            url,
+            body,
+            request.headers.get("content-type") or "multipart/form-data",
+            key,
+            model,
+            "audio.transcriptions",
+            est_tokens,
+            request_id,
+            started,
+            gate,
         )
     finally:
         _release_in_flight(key.id)
@@ -4477,9 +5418,11 @@ async def list_models(
 
     # CAPACITY (operator requirement, 2026-10-28): model_list should show, for
     # a given api key, what models still have token capacity at that moment.
-    # ONE extra pair of aggregate queries for the whole listing -- model_capacity
-    # is not-N (it reuses budget_status two SUMs), so a 40-model listing costs
-    # the same as a 2-model one.
+    # model_capacity is NOT-N: a FIXED set of round trips for the whole listing
+    # (2 catalog probes + 2 aggregates + 2 lineage lookups, plus — only for a
+    # key with a capped enrollment — one team aggregate and at most one overflow
+    # probe per configured cap scope), so a 40-model listing costs the same as a
+    # 2-model one.
     #
     # ANNOTATE, do not filter. Dropping exhausted entries would make a drained
     # budget indistinguishable from an ACL narrowing or a registry outage --
@@ -4569,25 +5512,80 @@ async def list_models(
         policy, _min_model = await model_routing.profile_routing_config(key.user_id)
     except Exception:
         policy = ""  # fail-safe: a lookup blip must not break the listing
-    if settings.routing_enabled and policy in ("shadow", "active"):
+        _min_model = ""  # defined on every path: the window math below reads it
+    # AND the fleet-level kill switch (audit r5 #10 residual): the panel's
+    # 'enabled' toggle is a runtime pause, and the request path now honours it
+    # (core.model_routing.decide gates on global_enabled()). Advertising the
+    # pseudo-models while the switch is OFF offered names that then behave as
+    # plain aliases — a listing that contradicts the behaviour.
+    if settings.routing_enabled and policy in ("shadow", "active") and await model_routing.global_enabled():
         chat_registered = [
-            m
-            for m in registered
-            if (p := model_router.pool(m)) is not None and p.endpoints and p.endpoints[0].model_type == "chat"
+            m for m in registered if (p := model_router.pool(m)) is not None and p.endpoints and pool_serves_chat(p)
         ]
+        # WINDOWED CAPACITY (2026-11-03): a routing pseudo-model is usable only
+        # while SOME rung of its floor..ceiling window has budget headroom, and
+        # "about to run out" is the tightest rung's band. The window is built
+        # the SAME way the request path builds its candidate ladder — the
+        # routing panel's allowlist BOUNDS the ladder and adds ticked off-ladder
+        # models at the cheap end (expand_candidates), and bare "routing"
+        # demotes an unticked ladder head to the most capable ticked model (R2)
+        # — so the listing cannot promise a rung the router will never pick, nor
+        # hide one it could.
+        try:
+            from ..core import routing_config as _rc_list
+
+            _cfg = await _rc_list.get_config()
+            _allow = _cfg.get("allowed_models")
+            _routable = [str(m) for m in _allow] if isinstance(_allow, list) and _allow else None
+        except Exception:
+            _routable = None  # fail-open: the plain profile ladder, as before
+        cheap_first = model_routing.expand_candidates(list(reversed(order)), _routable, None)
         for rid in ("routing", *(f"routing__{m}" for m in chat_registered)):
-            data.append(
-                {
-                    "id": rid,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "pcai-llm-gateway",
-                    # Sized by the whole chat ladder, not by the ceiling: a
-                    # routing request may be downgraded to ANY of them.
-                    **_advertised_caps(chat_registered),
-                    "pcai": {"type": "routing"},
-                }
+            # Bare "routing" ceilings at the head of the profile ordering; a
+            # "routing__X" at X. An EMPTY ordering (no ladder to walk) leaves
+            # the bare entry without a window: it 404s at request time anyway,
+            # and inventing a window would advertise a ladder that does not
+            # exist.
+            if rid == "routing":
+                ceiling = order[0] if order else ""
+                if ceiling and _routable and ceiling not in {str(m) for m in _routable}:
+                    for cand in order:
+                        if cand in {str(m) for m in _routable}:
+                            ceiling = cand
+                            break
+            else:
+                ceiling = rid.split("__", 1)[1]
+            window = (
+                [m for m in model_routing._window(cheap_first, ceiling, _min_model) if m in registered_set]
+                if ceiling
+                else []
             )
+            entry: dict[str, Any] = {
+                "id": rid,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "pcai-llm-gateway",
+                # Sized by the whole chat ladder, not by the ceiling: a
+                # routing request may be downgraded to ANY of them.
+                **_advertised_caps(chat_registered),
+                "pcai": {"type": "routing"},
+            }
+            if capacity and window:
+                blocked = [m for m in window if capacity.get(m, {}).get("ok") is False]
+                cap: dict[str, Any] = {
+                    # ok = at least one rung can serve: the router walks the
+                    # window, so one healthy rung is a usable selection.
+                    "ok": len(blocked) < len(window),
+                    # The band is the TIGHTEST rung's: a rung about to run out
+                    # is exactly the ladder losing a step, which is what the
+                    # "about to run out" signal must say.
+                    "warn": max((capacity.get(m, {}).get("warn", 0) for m in window), default=0),
+                    "candidates": {"ok": len(window) - len(blocked), "blocked": len(blocked)},
+                }
+                if blocked and len(blocked) == len(window):
+                    cap["blocked_by"] = "every model in this routing window is out of budget"
+                entry["pcai"]["capacity"] = cap
+            data.append(entry)
     # --- AGENT PROFILES (2026-10-29) ---------------------------------------
     # An agent is selected by NAME, so it is advertised as a model entry: a
     # client that pins provider+model (DSH's teammate spawn does exactly that)
@@ -4628,7 +5626,6 @@ async def list_models(
             }
         )
     return {"object": "list", "data": data}
-
 
 
 @router.get("/usage")

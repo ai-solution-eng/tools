@@ -194,10 +194,18 @@ class _KeyWriteDB(FakeDB):
     async def fetchrow(self, sql: str, *args: Any):
         if "UPDATE api_keys" in sql:
             return {
-                "id": uuid.uuid4(), "user_id": uuid.uuid4(), "name": "k",
-                "scopes": ["proxy"], "allowed_models": [], "rate_limit_rpm": 60,
-                "rate_limit_tpm": 1000, "max_concurrent": 0, "expires_at": None,
-                "relay_default": False, "stream_pcai_events": True, "mcp_admin": True,
+                "id": uuid.uuid4(),
+                "user_id": uuid.uuid4(),
+                "name": "k",
+                "scopes": ["proxy"],
+                "allowed_models": [],
+                "rate_limit_rpm": 60,
+                "rate_limit_tpm": 1000,
+                "max_concurrent": 0,
+                "expires_at": None,
+                "relay_default": False,
+                "stream_pcai_events": True,
+                "mcp_admin": True,
             }
         return await super().fetchrow(sql, *args)
 
@@ -327,8 +335,13 @@ class _FakeRegistry:
 
     async def mcp_servers(self) -> list[dict[str, Any]]:
         return [
-            {"name": name, "url": "http://" + name + ".svc:9000/mcp", "headers": {},
-             "auth_secret": None, "auth_token_enc": None}
+            {
+                "name": name,
+                "url": "http://" + name + ".svc:9000/mcp",
+                "headers": {},
+                "auth_secret": None,
+                "auth_token_enc": None,
+            }
             for name in sorted(federation.MCP_SERVER_CLASSES)
         ]
 
@@ -388,10 +401,17 @@ def test_stamping_observe_preset_writes_merged_grants(stamp_client) -> None:
     # run_kubectl: read-by-contract exception, RIDES observe (wave-2)
     assert ("k8s-ops", "run_kubectl") in grants
     for verb in (
-        "dataset_add_documents", "dataset_delete_documents",
-        "dataset_replace_document", "add_memory", "delete_memory",
-        "forget_session", "set_memory_dataset", "deselect_dataset",
-        "unlock_dataset", "create_short_term_memory", "end_short_term_memory",
+        "dataset_add_documents",
+        "dataset_delete_documents",
+        "dataset_replace_document",
+        "add_memory",
+        "delete_memory",
+        "forget_session",
+        "set_memory_dataset",
+        "deselect_dataset",
+        "unlock_dataset",
+        "create_short_term_memory",
+        "end_short_term_memory",
     ):
         assert ("mm-rag", verb) not in grants, verb
     assert ("searxng", "fetch_content") not in grants
@@ -483,11 +503,7 @@ def test_stamp_changes_what_a_profile_key_sees(stamp_client) -> None:
     defaults = parse_profile_defaults(json.dumps(stored))
     assert defaults.get("live_grants") is None  # stamping alone does NOT flip live mode
     pairs = {(str(g[0]), str(g[1])) for g in defaults["mcp_grants"]}
-    catalog = [
-        {"server": s, "tool": t}
-        for s, tools in FLEET_CATALOGS.items()
-        for t in [x["tool"] for x in tools]
-    ]
+    catalog = [{"server": s, "tool": t} for s, tools in FLEET_CATALOGS.items() for t in [x["tool"] for x in tools]]
     seen = federation.visible_tools(catalog, pairs)
     seen_pairs = {(t["server"], t["tool"]) for t in seen}
     assert seen_pairs == pairs

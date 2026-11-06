@@ -52,9 +52,11 @@ spec:
       containers:
         - name: postgres
           # TAG-PIN NOTE: `postgres:16` floats on the minor tag. The gateway
-          # image is digest-pinned; a site that wants the same guarantee here
-          # sets database.embedded.image to a digest reference (the
-          # wait-for-pg initContainer renders the SAME value — one edit).
+          # image is digest-pinned ONLY in site values that supply a digest — the
+          # base chart ships a MUTABLE tag + IfNotPresent (see values.yaml image.tag
+          # caveat); a site that wants the same guarantee here sets
+          # database.embedded.image to a digest reference (the wait-for-pg
+          # initContainer renders the SAME value — one edit).
           image: {{ .Values.database.embedded.image }}
           imagePullPolicy: IfNotPresent
           # Container-level hardening (audit: the gateway pod had this, PG
@@ -176,14 +178,18 @@ spec:
     {{- with .Values.networkPolicy.probeCidrs }}
     # (ii) Node-originated kubelet probes (same caveat: an ipBlock rule
     #      cannot distinguish node sources from pods inside the CIDR —
-    #      probeExceptCidrs carves the pod CIDR back out).
+    #      probeExceptCidrs carves the pod CIDR back out). EVERY entry
+    #      renders — a multi-node site loses the probe allowance (and
+    #      liveness) for any CIDR dropped here (W6 H3).
     - from:
+        {{- range $cidr := . }}
         - ipBlock:
-            cidr: {{ . | first }}
+            cidr: {{ $cidr }}
             {{- with $.Values.networkPolicy.probeExceptCidrs }}
             except:
               {{- toYaml . | nindent 14 }}
             {{- end }}
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP

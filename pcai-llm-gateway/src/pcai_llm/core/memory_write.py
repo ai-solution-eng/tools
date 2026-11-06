@@ -170,13 +170,23 @@ async def write_memory(
     # against each hit. Cross-session near-dup -> suppressed; same-session
     # near-dup -> allowed (the designed re-distill update). Every failure
     # mode writes through: a broken dedupe probe must never block a memory.
-    if mcp_search is not None and kind == KIND_SUMMARY and session_id:
+    #
+    # THE FLAG GATES IT (2026-11-02, audit A-2). settings.distiller_dedup_superseded
+    # was declared and never read, so the documented kill switch was inert: an
+    # operator whose two genuinely distinct conversations legitimately share
+    # most of their vocabulary had no way to stop a NEW memory being dropped as
+    # a near-copy — and, because a suppression is a PERMANENT verdict, the
+    # distill row then re-spent its whole map-reduce forever (audit A-1).
+    # Off -> write through, exactly like a missing probe.
+    if mcp_search is not None and settings.distiller_dedup_superseded and kind == KIND_SUMMARY and session_id:
         try:
             verdict = await _near_duplicate_verdict(mcp_search, doc, session_id)
         except Exception as exc:
             log.warning(
                 "memory dedup probe failed (key=%s, session=%s): %s - writing anyway",
-                key_id, session_id[:16], type(exc).__name__,
+                key_id,
+                session_id[:16],
+                type(exc).__name__,
             )
             verdict = None
         if verdict is not None:
@@ -185,7 +195,9 @@ async def write_memory(
                 log.info(
                     "memory dedup: suppressed near-duplicate write "
                     "(session=%s matches prior session=%s, containment=%.2f)",
-                    session_id[:16], hit_session[:16], score,
+                    session_id[:16],
+                    hit_session[:16],
+                    score,
                 )
                 _verdict(VERDICT_SUPPRESSED)
                 return False, (
@@ -222,7 +234,6 @@ async def write_memory(
             detail = detail + "; fallback failed: " + type(exc).__name__
     _verdict(VERDICT_WRITTEN if ok else VERDICT_FAILED)
     return ok, detail
-
 
 
 async def _near_duplicate_verdict(
@@ -301,7 +312,7 @@ def _token_containment(new_doc: str, hit_text: str) -> float:
         text = s.lstrip()
         if text.startswith("[MEMORY INDEX"):
             close = text.find("]")
-            text = text[close + 1:] if close != -1 else text
+            text = text[close + 1 :] if close != -1 else text
         return set(re.findall(r"[a-z0-9_.:/-]+", text.lower()))
 
     a, b = toks(new_doc), toks(hit_text)

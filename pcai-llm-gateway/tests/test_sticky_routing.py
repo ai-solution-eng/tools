@@ -118,6 +118,8 @@ def test_demand_aware_alias_is_not_hijacked() -> None:
 
 
 class _Key:
+    id: uuid.UUID  # assigned by the caller that needs it (the incumbent writer)
+
     def __init__(self) -> None:
         self.user_id = KEY
         self.allowed_models: list[str] = []
@@ -745,15 +747,27 @@ def test_schema_has_the_probabilities_column() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_with(monkeypatch, *, policy_pair, routable=None, order=None, registered=None,
-                        body_model="routing", body=None, available=None, sticky_floor=None,
-                        sticky_write=None, routing_enabled=True):
+async def _resolve_with(
+    monkeypatch,
+    *,
+    policy_pair,
+    routable=None,
+    order=None,
+    registered=None,
+    body_model="routing",
+    body=None,
+    available=None,
+    sticky_floor=None,
+    sticky_write=None,
+    routing_enabled=True,
+):
     """Drive resolve_routed_model with the profile policy pinned to policy_pair.
 
     policy_pair=None keeps the REAL profile_routing_config (the test must
     then monkeypatch model_routing.db and clear the policy cache itself).
     """
     if policy_pair is not None:
+
         async def _fake_policy(_user_id):
             return policy_pair
 
@@ -782,7 +796,10 @@ async def test_r2_bare_routing_never_serves_an_unticked_head(monkeypatch) -> Non
     ledger stamped it as training truth.
     """
     model, ctx = await _resolve_with(
-        monkeypatch, policy_pair=("active", ""), routable=[GLM], body={"model": "routing", "messages": [{"role": "user", "content": "x" * 40000}]}
+        monkeypatch,
+        policy_pair=("active", ""),
+        routable=[GLM],
+        body={"model": "routing", "messages": [{"role": "user", "content": "x" * 40000}]},
     )
     assert model != DS, "the operator unticked DS; routing must never serve it"
     assert model == GLM
@@ -792,7 +809,10 @@ async def test_r2_bare_routing_never_serves_an_unticked_head(monkeypatch) -> Non
 async def test_r2_shadow_also_respects_the_allowlist_ceiling(monkeypatch) -> None:
     """Shadow must not stamp the excluded head as would-serve training data."""
     _model, ctx = await _resolve_with(
-        monkeypatch, policy_pair=("shadow", ""), routable=[GLM], body={"model": "routing", "messages": [{"role": "user", "content": "x" * 40000}]}
+        monkeypatch,
+        policy_pair=("shadow", ""),
+        routable=[GLM],
+        body={"model": "routing", "messages": [{"role": "user", "content": "x" * 40000}]},
     )
     assert ctx.ceiling == GLM
     assert ctx.would != DS
@@ -842,6 +862,7 @@ async def test_r3_profile_floor_wins_over_global_floor(monkeypatch) -> None:
 
 async def test_r3_global_floor_read_failure_fails_safe_to_ceiling(monkeypatch) -> None:
     """A routing-config blip must not invent a floor (fail-safe: no downgrade)."""
+
     async def _boom():
         raise RuntimeError("config db down")
 
@@ -856,6 +877,7 @@ async def test_r4_named_ceiling_off_ladder_honours_profile_floor(monkeypatch) ->
     Pre-fix the no_ladder branch served X pinned even when the profile floor
     sat ABOVE it on the global ladder.
     """
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]  # most-capable first
 
@@ -888,6 +910,7 @@ async def test_r4_named_ceiling_at_or_above_floor_stays_pinned(monkeypatch) -> N
 
 async def test_r4_unmeasurable_floor_keeps_pinned_ceiling(monkeypatch) -> None:
     """Floor not on the global ladder -> cannot compare -> fail-safe: stay pinned."""
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]
 
@@ -903,12 +926,15 @@ async def test_r4_unmeasurable_floor_keeps_pinned_ceiling(monkeypatch) -> None:
 
 async def test_r4_no_ladder_profile_shadow_stays_byte_identical(monkeypatch) -> None:
     """Shadow serves exactly as 'off' would: the pseudo name rides the alias path."""
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]
 
     monkeypatch.setattr(mr, "global_ladder", _fake_ladder)
     body = {"model": f"routing__{QWEN}", "messages": [{"role": "user", "content": "hi"}]}
-    model, ctx = await _resolve_with(monkeypatch, policy_pair=("shadow", GLM), order=[], body_model=f"routing__{QWEN}", body=body)
+    model, ctx = await _resolve_with(
+        monkeypatch, policy_pair=("shadow", GLM), order=[], body_model=f"routing__{QWEN}", body=body
+    )
     assert model == QWEN, "shadow must not serve a floor it did not serve under 'off'"
     assert ctx.stamp is False
 
@@ -935,8 +961,8 @@ def test_p3_admin_profile_put_calls_the_invalidator() -> None:
     assert "clear_policy_cache()" in src, "profile writes must drop the router policy cache"
     # the GLOBAL routing-config write is the kill-switch path: it must drop the
     # cache too, or a panel save lags per user for up to the 60s TTL
-    put_start = src.index('async def put_routing_config')
-    put_end = src.index('@router.get', put_start)
+    put_start = src.index("async def put_routing_config")
+    put_end = src.index("@router.get", put_start)
     assert "clear_policy_cache()" in src[put_start:put_end], (
         "PUT /admin/routing/config must drop the router policy cache (kill-switch lag)"
     )
@@ -954,9 +980,7 @@ async def test_p3_sticky_write_deferral_protocol(monkeypatch) -> None:
         picks.append(model)
         return lambda actual: picks.append(f"commit:{actual}")
 
-    model, ctx = await _resolve_with(
-        monkeypatch, policy_pair=("active", QWEN), sticky_write=_deferring_writer
-    )
+    model, ctx = await _resolve_with(monkeypatch, policy_pair=("active", QWEN), sticky_write=_deferring_writer)
     assert picks == [model], "the pick is recorded, but NOT yet committed"
     assert ctx.sticky_finish is not None, "the finisher must ride out on the decision"
     ctx.sticky_finish(GLM)
@@ -1076,6 +1100,7 @@ async def test_xv1_floor_demotion_requires_a_servable_floor(monkeypatch) -> None
     no_ladder branch returned it unchecked: a SERVABLE pinned request 503'd
     (baseline served Qwen).
     """
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]
 
@@ -1097,6 +1122,7 @@ async def test_xv1_demotion_never_serves_an_allowlist_excluded_floor(monkeypatch
     Pre-XV1-fix the router SERVED the excluded GLM (spend-control bypass:
     expand_candidates' 'a bound that only ever widened would be a lie').
     """
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]
 
@@ -1117,6 +1143,7 @@ async def test_xv1_legal_servable_floor_still_demotes(monkeypatch) -> None:
     """The XV-1 guard must not break the R4 fix: a legal, servable floor still
     holds against a below-floor named ceiling.
     """
+
     async def _fake_ladder():
         return [DS, GLM, QWEN]
 

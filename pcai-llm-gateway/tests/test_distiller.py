@@ -402,6 +402,7 @@ def test_d2_explicit_conversation_distill_claims_the_row_when_suppressed(
     assert r.json()["ok"] is False
     assert marked == [(cid, 2)], "the suppressed row must be claimed so the sweep skips it"
 
+
 def test_conversation_distill_foreign_id_404(monkeypatch: pytest.MonkeyPatch, fake_conv_db: Any) -> None:
     client = _client(monkeypatch, _key())
     monkeypatch.setattr(conv_mod, "db", fake_conv_db)
@@ -1673,6 +1674,83 @@ def test_no_distiller_failure_is_swallowed_at_debug() -> None:
     assert "log.warning(" in inspect.getsource(hk._distill_sweep)
 
 
+@pytest.mark.asyncio
+async def test_distill_sweep_offpeak_gate_uses_the_summarizer_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off-peak-only must follow the model the sweep will actually call.
+
+    The gate used the GLOBAL evaluator, so a busy fleet average kept the
+    distiller paused even when its own summarizer model was idle (live
+    2026-11-05: Qwen3.8-27B ~1.6% off-peak, fleet ~24% -> no sweep for
+    hours). A per-model signal now wins; the global state is only the
+    fallback when no model is pinned or no per-model evaluator exists.
+    """
+    from pcai_llm.core import distill_schedule as ds
+    from pcai_llm.core import distiller_config as dc
+    from pcai_llm.core import housekeeping as hk
+    from pcai_llm.core import offpeak
+
+    calls: list[str] = []
+
+    async def fake_sweep() -> None:
+        calls.append("sweep")
+
+    async def enabled() -> bool:
+        return True
+
+    async def offpeak_only() -> bool:
+        return True
+
+    async def model() -> str:
+        return "Qwen3.8-27B"
+
+    monkeypatch.setattr(ds, "sweep", fake_sweep)
+    monkeypatch.setattr(dc, "is_enabled", enabled)
+    monkeypatch.setattr(dc, "offpeak_only", offpeak_only)
+    monkeypatch.setattr(dc, "get_model", model)
+    monkeypatch.setattr(offpeak.state, "enabled", True)
+    monkeypatch.setattr(offpeak.state, "active", True)
+
+    # The model's own evaluator is BUSY -> stay paused, even though the
+    # global state says off-peak.
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: False)
+    await hk._distill_sweep()
+    assert calls == [], "a busy summarizer model must keep the sweep paused"
+
+    # The model's own evaluator says off-peak -> sweep, even if the global
+    # state is idle.
+    monkeypatch.setattr(offpeak.state, "active", False)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: True)
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "the summarizer model's own off-peak state must open the gate"
+
+    # No per-model evaluator -> fall back to the global state.
+    calls.clear()
+    monkeypatch.setattr(offpeak.state, "active", True)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: None)
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "no per-model signal must fall back to the global evaluator"
+
+    calls.clear()
+    monkeypatch.setattr(offpeak.state, "active", False)
+    await hk._distill_sweep()
+    assert calls == [], "no per-model signal + idle global must stay paused"
+
+    # No model pinned (caller routing) -> the per-model lookup is skipped and
+    # the global state decides.
+    calls.clear()
+
+    async def no_model() -> str:
+        return ""
+
+    monkeypatch.setattr(dc, "get_model", no_model)
+    monkeypatch.setattr(offpeak.state, "active", True)
+    monkeypatch.setattr(offpeak, "model_active", lambda _name: False)  # must not be consulted
+    await hk._distill_sweep()
+    assert calls == ["sweep"], "an unpinned model must use the global evaluator"
+
+
 def test_conversation_path_is_leased_against_hpa_duplicates() -> None:
     """BOTH distill paths must carry the cross-replica lease.
 
@@ -2418,9 +2496,7 @@ async def test_d5_conversation_path_model_failure_with_raw_fallback_off_backs_of
     monkeypatch.setattr(settings, "distiller_raw_fallback", False)
 
     cid, kid = uuid.uuid4(), uuid.uuid4()
-    wrote = await rd.distill_due_conversation(
-        {"conversation_id": cid, "key_id": kid, "msg_count": 2, "title": "t"}
-    )
+    wrote = await rd.distill_due_conversation({"conversation_id": cid, "key_id": kid, "msg_count": 2, "title": "t"})
     assert wrote is False
     assert skipped == [cid]
 
@@ -2514,9 +2590,7 @@ async def test_d4_sweep_counts_only_real_writes(monkeypatch: pytest.MonkeyPatch)
     from pcai_llm.core import metrics as metrics_mod
 
     outcomes: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        metrics_mod, "observe_distill_write", lambda path, outcome: outcomes.append((path, outcome))
-    )
+    monkeypatch.setattr(metrics_mod, "observe_distill_write", lambda path, outcome: outcomes.append((path, outcome)))
 
     async def due() -> list[dict[str, Any]]:
         return [{"conversation_id": uuid.uuid4(), "key_id": uuid.uuid4(), "msg_count": 4}]
@@ -2808,3 +2882,26 @@ def test_d6_row_budget_is_generous_and_zero_budget_stays_unbounded(monkeypatch: 
     monkeypatch.setattr(settings, "distiller_sweep_budget_s", 0.0)
     assert ds.row_budget_seconds() == 0.0
 
+
+def test_due_conversations_resolves_the_group_live_key() -> None:
+    """REGRESSION (2026-11-03 cross-validation, both cells): the due sweep
+    joined api_keys ON k.id = c.key_id AND k.revoked_at IS NULL — the CREATING
+    credential. One rotation therefore removed the user's whole store from the
+    sweep. It must resolve a LIVE key in the conversation's key GROUP instead.
+
+    SQL-text assertion: every sweep test monkeypatches due_conversations, so
+    nothing else pins the join.
+    """
+    import inspect
+
+    from pcai_llm.core import distill_schedule as ds
+
+    src = inspect.getsource(ds.due_conversations)
+    assert "JOIN LATERAL" in src and "k2.key_group = c.key_group" in src
+    assert "JOIN api_keys k ON k.id = c.key_id" not in src, (
+        "the CREATING key must not gate the sweep — a rotated conversation would vanish"
+    )
+    # the live key is the one the scheduled path loads AND the creds gate joins
+    assert "cred.key_id = k.id" in src
+    # the pre-existing protections must survive the join rewrite
+    assert "lease_until" in src and "gate_failed_at" in src

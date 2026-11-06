@@ -392,6 +392,14 @@ def _window(cheap_first: list[str], ceiling: str, min_model: str) -> list[str]:
     consider. That is the invariant this helper protects; it does NOT claim the
     window matches the heuristic's pick (see the floor note below).
     """
+    # No configured floor -> position 0, i.e. the WHOLE ladder. This is the
+    # decision seam's long-standing behaviour and it is deliberately NOT the
+    # heuristic's rule: pick_serving_model pins to the ceiling when no floor is
+    # set ("no downgrade"), while the decision model is allowed to consider the
+    # full ladder. The two differ by design, and tests/test_decision_routing.py
+    # pins the decision side. Do not "harmonise" them here -- it silently
+    # changes which models a configured decision model may pick.
+    floor_pos = cheap_first.index(min_model) if min_model and min_model in cheap_first else 0
     if ceiling in cheap_first:
         ceil_pos = cheap_first.index(ceiling)
     else:
@@ -402,15 +410,16 @@ def _window(cheap_first: list[str], ceiling: str, min_model: str) -> list[str]:
         # honour (defect fix, 2026-10-23). Append it as the most capable
         # position: the operator named it explicitly, so it outranks the
         # ladder for THIS request only. The window is returned, not mutated.
-        return list(cheap_first) + [ceiling]
-    # No configured floor -> position 0, i.e. the WHOLE ladder. This is the
-    # decision seam's long-standing behaviour and it is deliberately NOT the
-    # heuristic's rule: pick_serving_model pins to the ceiling when no floor is
-    # set ("no downgrade"), while the decision model is allowed to consider the
-    # full ladder. The two differ by design, and tests/test_decision_routing.py
-    # pins the decision side. Do not "harmonise" them here -- it silently
-    # changes which models a configured decision model may pick.
-    floor_pos = cheap_first.index(min_model) if min_model and min_model in cheap_first else 0
+        #
+        # FLOORED (audit w6, P2): this branch used to return the WHOLE ladder,
+        # dropping routing_min_model -- so under decision_mode=active a
+        # routing__<off-ladder> request could be SERVED by a model weaker than
+        # the operator's floor, a silent spend-control bypass. The decision
+        # model must be offered the same floor..ceiling window the heuristic
+        # walks (the invariant stated at the decide seam in
+        # resolve_routed_model). With no usable floor floor_pos is 0, which
+        # keeps the documented "full ladder" behaviour above.
+        return cheap_first[floor_pos:] + [ceiling]
     return cheap_first[min(floor_pos, ceil_pos) : ceil_pos + 1]
 
 
@@ -593,6 +602,39 @@ async def global_policy() -> str:
     except Exception as exc:
         log.warning("routing: global policy lookup failed (fail-safe 'off'): %s", exc)
     return "off"
+
+
+async def global_enabled() -> bool:
+    """The fleet-level routing KILL SWITCH (routing_config.enabled). NEVER raises.
+
+    P1-10 (audit 2026-10-30): the Routing panel's 'enabled' toggle was stored,
+    validated and DISPLAYED ("PAUSED") but the request path never read it --
+    only the display did -- so an operator pausing routing during an incident
+    watched decision-model spend and downgrades continue. routing_config's own
+    header has always promised "runtime on/off AND-ed with
+    settings.routing_enabled"; this is the reader that makes the promise true.
+    routes_admin's effective_enabled renders the SAME AND, so the pill and the
+    behaviour cannot disagree.
+
+    Read through the same TTL-cached routing_config.get_config() as
+    global_policy/global_min_model/global_ladder -- a cached dict read, never a
+    second DB read on the hot path.
+
+    Fail-OPEN (True): an unreadable config keeps routing ON, matching
+    routing_config.DEFAULTS["enabled"]=True and that module's degrade-not-fail
+    contract. A kill switch that failed CLOSED would turn a DB blip into a
+    routing outage, which is not what the operator paused.
+    """
+    try:
+        from . import routing_config as _rc
+
+        cfg = await _rc.get_config()
+        # .get(..., True): a config that does not mention the key (or a partial
+        # reader fake) must not pause routing -- only an explicit false does.
+        return bool(cfg.get("enabled", True))
+    except Exception as exc:
+        log.warning("routing: kill-switch lookup failed (fail-open: enabled): %s", exc)
+        return True
 
 
 def clear_policy_cache() -> None:
@@ -785,9 +827,15 @@ async def resolve_routed_model(
         # profile, not only on routing-named ones).
         policy, _ = await profile_routing_config(key.user_id)
         if policy in ("shadow", "active"):
+            # P1-10 (audit 2026-10-30): 'engaged' must mean the SAME thing the
+            # request gate below means, or a panel-paused profile still emits
+            # an active/shadow route header (the header is the operator's only
+            # per-request evidence of what routing did). The config read is
+            # short-circuited behind the env switch, so a master-off fleet
+            # pays nothing for it.
             return requested, RouteDecision(
                 policy=policy,
-                engaged=bool(settings.routing_enabled),
+                engaged=bool(settings.routing_enabled) and await global_enabled(),
                 ceiling=requested,
                 would=requested,
                 served=requested,
@@ -819,11 +867,15 @@ async def resolve_routed_model(
             return pseudo.target, RouteDecision()
 
         policy, min_model = await profile_routing_config(key.user_id)
-        if policy == "off" or not settings.routing_enabled:
-            # 'off' — or a fleet switch-down on an opted-in profile — is
-            # byte-for-byte today's behavior: BOTH pseudo names are plain
-            # unregistered aliases that cascade through model_order. The
-            # decision (policy, engaged) still rides out for the header.
+        # P1-10 (audit 2026-10-30): the panel's kill switch is the THIRD term
+        # of this AND. It used to be read only by the display, so a paused
+        # panel still paid for decision calls and still downgraded. Ordered
+        # after the env switch so a master-off fleet never pays for the read.
+        if policy == "off" or not settings.routing_enabled or not await global_enabled():
+            # 'off' — or a fleet switch-down / panel PAUSE on an opted-in
+            # profile — is byte-for-byte today's behavior: BOTH pseudo names
+            # are plain unregistered aliases that cascade through model_order.
+            # The decision (policy, engaged) still rides out for the header.
             return requested, RouteDecision(policy=policy, engaged=False)
 
         # Routing engages (shadow or active, master on). routing__X carries
@@ -1243,7 +1295,9 @@ def route_header(route: RouteDecision | None, actual_model: str = "") -> str | N
     routing state in effect for THIS response):
       shadow ceiling=<c> would=<w> reason=<r>
       active ceiling=<c> served=<s> reason=<r>
-      off                                  (opted-in profile, master switch off)
+      off                                  (opted-in profile, routing switched off:
+                                            settings.routing_enabled or the panel's
+                                            routing_config.enabled kill switch)
     `actual_model` (the post-gate serving model) wins over the router's
     pick in the active form: the header must not claim a model the budget
     gates then overruled.

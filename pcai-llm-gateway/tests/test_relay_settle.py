@@ -361,7 +361,7 @@ def test_relay_executor_enforces_rate_limit(relay_env, monkeypatch: pytest.Monke
 
     rate_calls = {"n": 0}
 
-    async def exhausted_rate(key_id, rpm, tpm, est, request_id=""):
+    async def exhausted_rate(key_id, rpm, tpm, est, request_id="", model=""):
         rate_calls["n"] += 1
         if rate_calls["n"] == 1:  # the request's own gate: room left
             return budgets_mod.GateResult(True, remaining_requests=1, remaining_tokens=100)
@@ -750,7 +750,9 @@ async def test_list_models_pcai_type_and_primary(monkeypatch) -> None:
     assert by_id["Qwen3.8-27B"]["pcai"] == {
         "type": "chat",
         "primary": True,
-        "capacity": {"ok": True, "remaining_tokens": None, "blocked_by": ""},
+        # 2026-11-03: capacity gained the warn band (the gate's 80/95 signal,
+        # team envelope included) — fail-open with no DB is ok + warn 0.
+        "capacity": {"ok": True, "remaining_tokens": None, "blocked_by": "", "warn": 0},
     }
     assert by_id["GLM-5.3-Flash"]["pcai"].get("primary") is None  # not first
     # auto entry still precedes with its own cascade type

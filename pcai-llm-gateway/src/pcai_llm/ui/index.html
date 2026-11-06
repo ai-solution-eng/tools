@@ -86,6 +86,42 @@
   .msg.assistant .chatimg { max-width: 100%; max-height: 340px; border-radius: 8px;
                             display: block; margin: 6px 0; border: 1px solid var(--border); }
   .msg.assistant a { color: var(--accent, #01a982); word-break: break-all; }
+  /* markdown body (assistant bubbles): pre-wrap is for literal text only */
+  .msg.assistant { max-width: 88%; }
+  .msg.md { white-space: normal; }
+  .msg.md p { margin: 0 0 8px; }
+  .msg.md > :first-child { margin-top: 0; }
+  .msg.md > :last-child { margin-bottom: 0; }
+  .msg.md .md-h { margin: 12px 0 6px; line-height: 1.25; }
+  .msg.md h2.md-h { font-size: 17px; }
+  .msg.md h3.md-h { font-size: 15.5px; }
+  .msg.md h4.md-h, .msg.md h5.md-h, .msg.md h6.md-h { font-size: 14px; }
+  .msg.md ul, .msg.md ol { margin: 4px 0 8px; padding-left: 22px; }
+  .msg.md li { margin: 2px 0; }
+  .msg.md li > ul, .msg.md li > ol { margin: 2px 0; }
+  .msg.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                 font-size: 12.5px; background: var(--bg); border: 1px solid var(--border);
+                 border-radius: 4px; padding: 1px 4px; }
+  .msg.md .md-code { margin: 8px 0; border: 1px solid var(--border); border-radius: 8px;
+                     overflow: hidden; background: var(--bg); }
+  .msg.md .md-codebar { display: flex; align-items: center; justify-content: space-between;
+                        padding: 3px 8px; background: var(--panel); border-bottom: 1px solid var(--border);
+                        font-size: 11px; color: var(--dim); }
+  .msg.md .md-lang { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg.md .md-copy { background: none; border: 1px solid var(--border); color: var(--dim);
+                     border-radius: 5px; padding: 1px 7px; font: inherit; font-size: 11px; cursor: pointer; }
+  .msg.md .md-copy:hover { color: var(--text); border-color: var(--accent); }
+  .msg.md pre { margin: 0; padding: 10px 12px; overflow-x: auto; white-space: pre; }
+  .msg.md pre code { background: none; border: 0; border-radius: 0; padding: 0;
+                     font-size: 12.5px; line-height: 1.45; }
+  .msg.md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--border);
+                       color: var(--dim); }
+  .msg.md hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+  .msg.md table { border-collapse: collapse; margin: 8px 0; font-size: 12.5px;
+                  display: block; overflow-x: auto; }
+  .msg.md th, .msg.md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+  .msg.md th { background: var(--bg); }
+  .msg.md input[type="checkbox"] { width: auto; margin-right: 4px; }
   details.iter { align-self: flex-start; max-width: 85%; border: 1px solid var(--border);
                  border-radius: 8px; background: var(--panel); font-size: 12.5px; }
   details.iter summary { cursor: pointer; padding: 6px 10px; color: var(--dim); user-select: none; }
@@ -227,10 +263,25 @@
        overrides the [hidden] attribute's UA display:none (the budget-strip
        lesson), and the hint must collapse fully at 0 / on older backends. -->
   <span id="modelwrap" style="display:flex;flex-direction:column;gap:1px;min-width:0">
-    <select id="model" title="Model to send requests to" aria-label="Model"></select>
+    <!-- The connection dot lives WITH the picker it describes (2026-11-03
+         owner report: it read as an orphan in the chip row). Its tooltip
+         carries the model count/errors; setConn also titles the select. -->
+    <span style="display:flex;align-items:center;gap:6px">
+      <select id="model" title="Model to send requests to" aria-label="Model"></select>
+      <span id="conn" class="conn" title="checking…">●</span>
+    </span>
     <span id="model-deny-hint" class="muted" style="max-width:340px" hidden></span>
   </span>
   <input id="apikey" type="password" placeholder="API key (hllm-…)" aria-label="API key" autocomplete="off">
+  <!-- w6 F1: the bearer key defaults to sessionStorage (same ruling as the
+       admin / team_leader consoles). This box is the ONLY path to
+       localStorage — unchecked by default; unchecking it (or signing out)
+       purges any previously persisted localStorage copy. -->
+  <label class="conn" for="remember-key" style="cursor:pointer;display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--dim)"
+         title="Unchecked: the key lives in this tab’s session only (gone when the tab closes). Checked: the key also persists in this browser and survives restarts.">
+    <input type="checkbox" id="remember-key" style="width:auto;margin:0">
+    <span>remember key</span>
+  </label>
   <button id="keyconnect" class="ghost mini" style="padding:6px 10px">Connect</button>
   <!-- Auth stack: the two pre-connect sign-in paths stacked vertically (one
        visual slot instead of two). #sso-open toggles `hidden` per self-mint
@@ -252,21 +303,33 @@
        seen 2026-10-07). -->
   <button id="budget-strip" type="button" class="ghost mini" hidden
           title="Budget usage vs limits — click for the full usage view"></button>
-  <span id="conn" class="conn" title="checking…">●</span>
-  <!-- identity chip row: same look as MM RAG's top bar (green dot + name +
-       source pill on SSO sessions; amber dot + 'API key' pill on pasted-key
-       sessions), with 'switch to API key' rendered INSIDE the chip on SSO
-       sessions + Sign out alongside -->
+  <!-- identity chip row: same look as MM RAG's top bar — the SSO identity as
+       the NAME (when the platform probe resolved one) and a PILL for what is
+       actually authenticating ('oidc' for an SSO-minted key, 'API key' for a
+       pasted one). No in-chip mode switches: only one credential is stored, so
+       a "switch" could only relabel the chip (removed 2026-11-03). Sign out
+       sits alongside and is shown whenever a key is connected. -->
   <span id="sso-chip" style="display:none;align-items:center;gap:8px;font-size:12px;color:var(--dim)"></span>
   <button id="signout-btn" class="ghost mini" style="padding:4px 10px" hidden
           title="End this session on this device — clears the stored key, and on an SSO session also signs out at the edge">Sign out</button>
+  <!-- Transient sign-out outcome note (bug A): the header's only place to
+       say "the platform session survived" — auto-clears after 9s. -->
+  <span id="signout-note" class="muted" style="max-width:320px;font-size:11.5px" hidden></span>
   <label class="conn" for="tools" style="cursor:pointer;display:flex;align-items:center;gap:4px"
          title="Tool relay: registered MCP servers (search, k8s, applygate, …) are available to the model when checked">
     <input type="checkbox" id="tools"> tools · MCPs
   </label>
   <button id="mcp-self" class="ghost mini" style="padding:4px 10px" hidden
           title="Manage YOUR key's MCP tools (grants) and per-server credentials — no admin needed">MCP tools</button>
-  <a href="/admin" title="Admin console (admin key required)" style="color:var(--accent2);font-size:13px">Admin</a>
+  <!-- Both consoles in ONE right-aligned stack: /admin is the fleet-wide
+       console, /team_leader is its enrollment-scoped sibling (a leader key
+       opens it, a plain chat key does not). Stacked rather than inline so
+       the header row does not grow a third link's width — the header is
+       flex-wrap:wrap on narrow screens and two short lines wrap cleanly. -->
+  <div style="display:flex;flex-direction:column;align-items:flex-end;line-height:1.35">
+    <a href="/admin" title="Admin console (admin key required)" style="color:var(--accent2);font-size:13px">Admin</a>
+    <a href="/team_leader" title="Team leader console (enrollment leader key required)" style="color:var(--accent2);font-size:13px">Team leader</a>
+  </div>
   <button id="theme" type="button" title="Toggle dark/light theme" aria-label="Toggle theme">◐</button>
 </header>
 <div id="convback"></div>
@@ -301,11 +364,6 @@
     <div class="fieldrow">
       <label>Invite code <input id="enroll-code" autocomplete="off" placeholder="enroll-…"></label>
       <label>Your name <input id="enroll-name" autocomplete="off" placeholder="Ada Lovelace"></label>
-      <label for="enroll-memory" style="flex-direction:row;align-items:center;display:flex;gap:8px;font-weight:400">
-        <input type="checkbox" id="enroll-memory" style="width:auto">
-        <span>Give me a private memory dataset</span>
-      </label>
-      <p class="muted" style="margin:0;font-size:12px">Opt-in: provisions your own memory dataset on the fleet RAG server and binds it to your new key. Leave unchecked unless you know you want it.</p>
     </div>
     <div id="enroll-err" aria-live="polite"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
@@ -356,29 +414,223 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch {} },
     del(k) { try { localStorage.removeItem(k); } catch {} },
   };
+  // w6 F1 (audit F3, product ruling 2026-11-02): the bearer key defaults to
+  // sessionStorage — the same ruling as the admin / team_leader consoles.
+  // The #remember-key box (unchecked by default) is the only path to
+  // localStorage; unchecking it — or signing out — purges the localStorage
+  // copy. A legacy plaintext localStorage key (older versions) is migrated
+  // to sessionStorage once at boot and never kept. Same iframe/
+  // privacy-mode guards as `store`: never let storage throw.
+  const KEY = 'pcai-llm-key', REMEMBER = 'pcai-key-remember', SSO = 'pcai-key-sso';
+  const sess = {
+    get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+    del(k) { try { sessionStorage.removeItem(k); } catch {} },
+  };
+  // PROVENANCE (2026-11-03): an SSO-minted key is NOT a pasted key — it is
+  // this browser's credential for the identity the platform edge already
+  // authenticated. The flag rides the SAME store as the key (session, or
+  // local when remembered) so boot can keep the "Signed in as <name> · oidc"
+  // chip instead of flipping to "API-key user" right after sign-in (operator
+  // report: "Can we keep the signed in as andrew-bydlon text mode?"), and so
+  // the mint card can stay hidden once this browser HAS the key.
+  function saveKey(v, sso) {
+    const remember = $('remember-key')?.checked;
+    // sso is THREE-STATE: true = an SSO-minted credential; false = a
+    // pasted/redeemed key; undefined = KEEP the current provenance. The
+    // undefined case is loadModels' post-connect "remember a WORKING key"
+    // call — without it that call would ERASE the provenance the mint just
+    // set (saveKey's old signature had no provenance to erase, so this is
+    // the one call site that must stay a no-op for the flag).
+    const keep = sso === undefined ? isSsoKey() : !!sso;
+    sess.set(KEY, v);
+    if (keep) sess.set(SSO, '1'); else sess.del(SSO);
+    if (remember) {
+      store.set(KEY, v); store.set(REMEMBER, '1');
+      if (keep) store.set(SSO, '1'); else store.del(SSO);
+    } else { store.del(KEY); store.del(REMEMBER); store.del(SSO); }
+  }
+  function isSsoKey() {
+    if (sess.get(SSO) === '1') return true;
+    return store.get(REMEMBER) === '1' && store.get(SSO) === '1';
+  }
+  function loadKey() {
+    const s = sess.get(KEY);
+    if (s != null) return s;
+    if (store.get(REMEMBER) === '1') return store.get(KEY);
+    const legacy = store.get(KEY);   // opt-in off: migrate the legacy copy once
+    if (legacy != null) { sess.set(KEY, legacy); store.del(KEY); }
+    return legacy;
+  }
+  function clearKey() {
+    sess.del(KEY); sess.del(SSO);
+    store.del(KEY); store.del(REMEMBER); store.del(SSO);
+  }
+  // ---- markdown renderer (pure; tests extract verbatim) ----
   // quote-safe HTML escape for any server-provided string rendered into markup
   const escHtml = s => String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  // SAFETY MODEL: parse the RAW text into blocks, escape every text chunk
+  // BEFORE applying inline rules, and emit only tags this file writes. A tag
+  // can only appear if one of OUR string literals produced it, so model output
+  // cannot inject markup. Links/images are http(s)-only and charset-restricted
+  // (no quotes/parens/whitespace), so javascript:/data: never become hrefs.
+  const MD_IMG = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
+  const MD_LINK = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
 
-  // Rich assistant rendering: escape EVERYTHING first, then convert only
-  // whitelisted markdown shapes on the escaped text. Server data can never
-  // inject markup — patterns must survive the escaper to render at all, and
-  // URLs are charset-restricted (no quotes/parens/whitespace).
+  function mdInline(raw) {
+    const stash = [];
+    const keep = html => '\u0001' + (stash.push(html) - 1) + '\u0001';
+    let s = escHtml(String(raw ?? '').replace(/[\u0000\u0001]/g, ''));
+    // inline code FIRST, stashed: no other rule may rewrite its body
+    s = s.replace(/`([^`\n]+)`/g, (m, code) => keep('<code>' + code + '</code>'));
+    // images before links (the ![..](..) shape must not become a link)
+    s = s.replace(MD_IMG, (m, alt, url) =>
+      keep('<img src="' + url + '" alt="' + alt + '" loading="lazy" referrerpolicy="no-referrer" class="chatimg">'));
+    s = s.replace(MD_LINK, (m, text, url) =>
+      keep('<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>'));
+    // bare URLs (models emit them constantly) — trailing punctuation stays out
+    s = s.replace(/(^|[\s(])(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])/g,
+      (m, pre, url) => pre + keep('<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>'));
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    s = s.replace(/__([^_\n]+)__/g, '<b>$1</b>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+    s = s.replace(/(^|[^_\w])_([^_\n]+)_(?!_)/g, '$1<i>$2</i>');
+    s = s.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
+    return s.replace(/\u0001(\d+)\u0001/g, (m, i) => stash[+i]);
+  }
+
+  function mdList(items) {
+    const base = items[0].indent;
+    let html = '', tag = '', openLi = false, k = 0;
+    while (k < items.length) {
+      const it = items[k];
+      if (it.indent > base) {
+        const sub = [];
+        while (k < items.length && items[k].indent > base) { sub.push(items[k]); k++; }
+        html += mdList(sub);   // a nested list stays INSIDE the open <li>
+        continue;
+      }
+      const t = it.ordered ? 'ol' : 'ul';
+      if (t !== tag) {
+        if (openLi) { html += '</li>'; openLi = false; }
+        if (tag) html += '</' + tag + '>';
+        html += '<' + t + '>'; tag = t;
+      } else if (openLi) { html += '</li>'; openLi = false; }
+      const task = /^\[( |x|X)\]\s+(.*)$/.exec(it.text);
+      html += '<li>' + (task
+        ? '<input type="checkbox" disabled' + (task[1].toLowerCase() === 'x' ? ' checked' : '') + '> ' + mdInline(task[2])
+        : mdInline(it.text));
+      openLi = true;
+      k++;
+    }
+    if (openLi) html += '</li>';
+    if (tag) html += '</' + tag + '>';
+    return html;
+  }
+
+  function mdTable(rows) {
+    const cells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+    const head = cells(rows[0]);
+    let html = '<table><thead><tr>' + head.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+    for (let r = 1; r < rows.length; r++) {
+      const cs = cells(rows[r]);
+      html += '<tr>' + head.map((_, i) => '<td>' + mdInline(cs[i] ?? '') + '</td>').join('') + '</tr>';
+    }
+    return html + '</tbody></table>';
+  }
+
+  function renderMarkdown(text) {
+    const src = String(text ?? '').replace(/[\u0000\u0001]/g, '').replace(/\r\n?/g, '\n');
+    const lines = src.split('\n');
+    const out = [], para = [];
+    const flush = () => { if (para.length) { out.push('<p>' + para.map(mdInline).join('<br>') + '</p>'); para.length = 0; } };
+    const isFence = l => /^\s{0,3}(`{3,}|~{3,})\s*([A-Za-z0-9+#._-]{0,24})\s*$/.exec(l);
+    const isItem = l => /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/.exec(l);
+    const isSep = l => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(l);
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      const fence = isFence(line);
+      if (fence) {
+        flush();
+        const mark = fence[1][0], lang = fence[2] || 'code';
+        // an UNCLOSED fence (still streaming) renders as a code block to the end
+        const close = mark === '`' ? /^\s{0,3}`{3,}\s*$/ : /^\s{0,3}~{3,}\s*$/;
+        const body = [];
+        i++;
+        while (i < lines.length) { if (close.test(lines[i])) { i++; break; } body.push(lines[i]); i++; }
+        out.push('<div class="md-code"><div class="md-codebar"><span class="md-lang">' + escHtml(lang)
+          + '</span><button type="button" class="md-copy" title="Copy this block">Copy</button></div>'
+          + '<pre><code>' + escHtml(body.join('\n')) + '</code></pre></div>');
+        continue;
+      }
+      if (!line.trim()) { flush(); i++; continue; }
+      const h = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
+      if (h) {
+        flush();
+        const lv = Math.min(h[1].length + 1, 6);
+        out.push('<h' + lv + ' class="md-h">' + mdInline(h[2]) + '</h' + lv + '>');
+        i++; continue;
+      }
+      if (/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { flush(); out.push('<hr>'); i++; continue; }
+      if (/^\s{0,3}>\s?/.test(line)) {
+        flush();
+        const buf = [];
+        while (i < lines.length && /^\s{0,3}>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s{0,3}>\s?/, '')); i++; }
+        out.push('<blockquote>' + buf.map(mdInline).join('<br>') + '</blockquote>');
+        continue;
+      }
+      if (line.includes('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
+        flush();
+        const rows = [line];
+        i += 2;
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(lines[i]); i++; }
+        out.push(mdTable(rows));
+        continue;
+      }
+      if (isItem(line)) {
+        flush();
+        const items = [];
+        while (i < lines.length) {
+          const m = isItem(lines[i]);
+          if (!m) {
+            if (/^\s{2,}\S/.test(lines[i]) && items.length) { items[items.length - 1].text += ' ' + lines[i].trim(); i++; continue; }
+            break;
+          }
+          items.push({ indent: m[1].replace(/\t/g, '  ').length, ordered: /\d/.test(m[2]), text: m[3] });
+          i++;
+        }
+        out.push(mdList(items));
+        continue;
+      }
+      para.push(line.trim());
+      i++;
+    }
+    flush();
+    return out.join('');
+  }
+  // ---- end markdown renderer ----
+
+  // Assistant bubbles are markdown; every other message class stays literal.
   function renderRich(el, text) {
     const meta = el.querySelector('.meta');
-    let h = escHtml(text);
-    // images: ![alt](https://...) — lazy, no referrer leak
-    h = h.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
-      (m, alt, url) => `<img src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer" class="chatimg">`);
-    // links: [text](https://...) — applied after images so ![..](..) is untouched
-    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-      (m, t, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${t}</a>`);
-    // bold: **text** (single line only)
-    h = h.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
-    el.innerHTML = h;
+    el.classList.add('md');
+    el.innerHTML = renderMarkdown(text);
     if (meta) el.appendChild(meta);   // renderRich rewrites the body — keep the meta chip
   }
+  // Re-parsing a long answer on every frame is not free: coalesce streaming
+  // repaints to ~8/s (the turn's final paint always renders, so the last frame
+  // is never stale).
+  let mdPaintedAt = 0;
+  function renderRichSoon(el, text) {
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now - mdPaintedAt < 120) return;
+    mdPaintedAt = now;
+    renderRich(el, text);
+  }
+
   const THEME_KEY = 'pcai-llm-theme';
   const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
   applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
@@ -411,6 +663,30 @@
     pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 48;
   }, { passive: true });
   function scroll() { if (pinned) chat.scrollTop = chat.scrollHeight; }
+
+  // Copy a rendered code block. Delegated on the chat container because
+  // renderRich replaces the bubble's innerHTML on every stream repaint — a
+  // per-button listener would be destroyed with it. The text comes from the
+  // sibling <pre>, never from an attribute (model output stays data).
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; } catch {}
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } finally { ta.remove(); }
+    return ok;
+  }
+  chat.addEventListener('click', async (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('.md-copy') : null;
+    if (!btn) return;
+    const block = btn.closest('.md-code');
+    const pre = block && block.querySelector('pre');
+    if (!pre) return;
+    const ok = await copyText(pre.textContent || '');
+    btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+  });
 
   function add(cls, text, meta) {
     const hint = chat.querySelector('.hint'); if (hint) hint.remove();
@@ -472,7 +748,12 @@
         paintDeniedHint(0);   // dead key: stale "hidden by your allowlist" advice goes too
         setConn(false, 'invalid key'); modelSel.innerHTML = ''; sendBtn.disabled = true;
         $('mcp-self').hidden = true;   // dead key: its self-service surface goes too
-        store.del('pcai-llm-key');   // a stored key that 401s is dead — stop pre-filling it
+        clearKey();   // a stored key that 401s is dead — stop pre-filling it (both stores + flag)
+        // 2026-11-03 cross-validation: the INPUT kept the dead text, so ready()
+        // stayed true and the mint card stayed hidden — a signed-in SSO user
+        // whose stored key had been revoked had NO affordance until a reload.
+        keyIn.value = '';
+        keyMode = false;             // bug B: a dead key must not hold the chip in API-key mode
         renderIdentityChip();        // F3: the amber chip + Sign out would outlive the dead key — re-render
         return;
       }
@@ -501,7 +782,7 @@
       }
       setConn(true, 'connected · ' + chatModels.length + ' model(s)');
       $('mcp-self').hidden = !(j.data || []).some(m => m.pcai?.type !== 'embedding');  // keyed user → their MCP tools
-      store.set('pcai-llm-key', keyIn.value.trim());   // remember a WORKING key for next boot
+      saveKey(keyIn.value.trim());   // remember a WORKING key (sessionStorage by default; localStorage only when remembered)
       // F10: no model → nothing to send to; keep Send disabled instead of
       // letting an empty model: '' request 400.
       sendBtn.disabled = !chatModels.length;
@@ -523,15 +804,36 @@
     loadConversations().catch(() => {});
   }
   $('newchat').addEventListener('click', newChat);
-  async function connectKey() {
+  async function connectKey(opts) {
     activeConvId = null;              // transcripts are per-key — never mix them
     resetChat();
+    // Chip flavor (2026-11-03): an SSO-MINTED key keeps the SSO identity
+    // ("Signed in as <name> · oidc") — the identity that authorizes it IS the
+    // platform identity, and flipping to "API-key user" the instant sign-in
+    // succeeds read as a logout. A pasted/connected key keeps the API-key
+    // flavor (bug B's rule: the chip follows the mode that actually
+    // authenticates, and the SSO path is a mode of its own).
+    keyMode = !(opts && opts.sso);
+    // Optimistic SSO flag until the server answers: the mint path KNOWS the
+    // key is SSO-bound, and the boot call passes the stored key's provenance
+    // (isSsoKey()) as opts.sso. A paste passes nothing -> false immediately,
+    // so an admin key never flashes the SSO state (no Sign out) before the
+    // probe confirms. The probe below then decides against the ledger.
+    keySsoBound = !!(opts && opts.sso);
+    // Provenance is set ONCE here, by the path that knows where the key came
+    // from (SSO mint / boot with a stored SSO key / explicit paste). Without
+    // this an explicit paste after an SSO mint would keep the old provenance
+    // and reload as an SSO session it no longer is.
+    saveKey(keyIn.value.trim(), !!(opts && opts.sso));
+    renderIdentityChip();             // every key-storing path runs through here
     await loadModels();
+    await probeKeyIdentity();         // server-authoritative: is THIS key SSO-bound?
+    renderIdentityChip();
     loadConversations().catch(() => {});
     refreshBudgetStrip().catch(() => {});   // at-a-glance budgets the moment the key is live
   }
-  $('keyconnect').addEventListener('click', connectKey);
-  keyIn.addEventListener('change', connectKey);
+  $('keyconnect').addEventListener('click', () => connectKey());
+  keyIn.addEventListener('change', () => connectKey());
 
   // ---- relay event rendering (per-iteration collapsibles) -----------------
   let history = [];
@@ -715,7 +1017,13 @@
           : `${(+tightest.spent).toLocaleString()} / ${(+tightest.limit).toLocaleString()} tok`;
         parts.push(`<b>${escHtml(tightest.label)}</b> ${escHtml(val)} ${bar(tightest.spent, tightest.limit)}`);
       } else {
-        parts.push('no budgets on this key');
+        // No PERIOD budget is a legitimate state (admin/CLI keys are
+        // uncapped), but "no budgets on this key" told the user nothing.
+        // Show the live minute window instead, so the strip always answers
+        // "what is this key doing right now?" (2026-11-03 owner report:
+        // "budgets aren't visible").
+        parts.push('unlimited · ' + (+tm.requests || 0).toLocaleString() + ' req / ' +
+          (+tm.tokens || 0).toLocaleString() + ' tok this min');
       }
       // rpm is deliberately NOT shown here (full view only): the strip is the
       // budget bar's one-line summary, and the rpm counter was header noise.
@@ -752,6 +1060,12 @@
         return;
       }
       const esc = escHtml;
+      // NOTE: there is deliberately NO memory-dataset card. Memory identity is
+      // a single per-key header override (mm-rag: X-API-Key, minted in the RAG
+      // app) merged over the server-level auth — the gateway does not know the
+      // RAG backend's dataset model and must not (SSO-managed ★ datasets
+      // resolve server-side from that key). The generic credential row below
+      // IS the attachment surface; it is never superseded for any server.
       body.innerHTML = j.servers.map(s => {
         const tools = s.tools || [];
         const grantedCount = tools.filter(t => t.granted).length;
@@ -779,13 +1093,14 @@
             </label>`).join('') : '<p class="muted" style="margin:4px 0">tool catalog unavailable</p>')}
           </div>
           <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
-            <input class="mcp-cred-name" data-server="${esc(s.server)}" placeholder="Header name (e.g. X-Dataset-Password)"
+            <input class="mcp-cred-name" data-server="${esc(s.server)}" placeholder="Header name (e.g. X-API-Key)"
                    style="flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font:inherit;font-size:12px">
             <input class="mcp-cred-value" data-server="${esc(s.server)}" type="password" placeholder="Value"
                    style="flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font:inherit;font-size:12px">
             <button type="button" class="ghost mini mcp-cred-save" data-server="${esc(s.server)}" style="padding:5px 10px">Save cred</button>
             ${s.cred_header_names.length ? `<button type="button" class="ghost mini mcp-cred-clear" data-server="${esc(s.server)}" style="padding:5px 10px">Clear</button>` : ''}
           </div>
+          ${s.cred_header_names.length ? `<div class="muted" style="font-size:11px;margin-top:4px">stored: <b>${esc(s.cred_header_names.join(', '))}</b> — a save replaces this set</div>` : ''}
         </div>`;
       }).join('');
       // per-tool toggles (existing behavior)
@@ -1031,7 +1346,6 @@
 
   function showEnrolled(j) {
     $('enroll-code').value = ''; $('enroll-name').value = '';
-    $('enroll-memory').checked = false;
     enrollError('');
     $('enroll-form').classList.add('hidden');
     $('enroll-done').classList.remove('hidden');
@@ -1047,7 +1361,8 @@
         'Memory dataset: ' + mem.dataset + ' — password (shown once): ' + mem.password;
       $('enroll-memory-note').classList.remove('hidden');
     } else if (mem.error) {
-      msg += ' (memory provisioning failed: ' + mem.error + ')';
+      msg += ' (memory provisioning failed: ' + mem.error
+        + ' — you can attach memory yourself later: MCP tools → mm-rag → X-API-Key)';
       $('enroll-memory-note').classList.add('hidden');
     } else {
       $('enroll-memory-note').classList.add('hidden');
@@ -1064,14 +1379,24 @@
     const go = $('enroll-go');
     go.disabled = true;
     try {
+      // subject (team tier): when the browser already holds a verified SSO
+      // identity (the probe resolved one), redeem WITH it — the minted key
+      // inherits the subject and its idp provenance instead of being
+      // unbound. Plain-key (no-SSO) redemptions send nothing: subject stays
+      // optional, exactly as before.
+      // NO memory_opt_in from this page: the redeem dialog no longer sells a
+      // private dataset (SSO-managed ★ datasets resolve server-side from the
+      // RAG key). Omitted => the profile preset, then the deployment default.
+      const body = { code, name };
+      if (ssoSeen && ssoSubject) body.subject = ssoSubject;
       const r = await fetch('/v1/enroll', { method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, name, memory_opt_in: $('enroll-memory').checked }) });
+        body: JSON.stringify(body) });
       if (r.ok) {
         const j = await r.json();
         showEnrolled(j);
         keyIn.value = j.key;                       // into the input…
-        store.set('pcai-llm-key', j.key);          // …persisted…
+        saveKey(j.key, false);   // …persisted (session, or local when remembered); a redeemed key is not SSO-provenance…
         connectKey();                              // …and auto-connected
         return;
       }
@@ -1095,7 +1420,6 @@
 
   function resetEnrollDlg() {
     $('enroll-code').value = ''; $('enroll-name').value = '';
-    $('enroll-memory').checked = false;
     $('enroll-memory-note').textContent = '';
     $('enroll-memory-note').classList.add('hidden');
     enrollError('');
@@ -1134,9 +1458,15 @@
   // (flags.self_mint). The card is a convenience, not a surface: 404 (older
   // backend), 503 (infra), flags off, 401/403 — every one of them just hides
   // the card, never an error banner.
-  // Chip session flavor, MM RAG's renderIdentityChip semantics (D23): an
-  // SSO-probe identity outranks a pasted key (ssoSeen stays true for the
-  // tab's lifetime — pasting a key never demotes the discovered session).
+  // Chip session flavor, MM RAG's renderIdentityChip semantics (D23),
+  // AMENDED 2026-10-30 (bug B): the chip follows the ACTIVE MODE, not a
+  // fixed precedence — the old "an SSO-probe identity always outranks a
+  // pasted key" made the chip lie after a Connect-with-key (still "Signed
+  // in as <sso-user> · oidc"), which read as "the button does nothing".
+  // Now: every key-storing path (connect button, invite redeem, SSO mint,
+  // boot auto-connect — all via connectKey) sets keyMode; the two in-chip
+  // links are the only mode switches; a 401 releases key mode (a dead key
+  // must not hold the chip).
   // Chip vs card are SEPARATE gates: the chip is identity disclosure — it
   // renders whenever the probe resolves a subject, flag state irrelevant
   // ("Signed in as <name> · oidc" pre-mint too, the MM RAG banner parity);
@@ -1144,50 +1474,124 @@
   // POST /v1/keys/for-me would succeed (flags.self_mint).
   let ssoSeen = false;                 // probe resolved a browser-header identity
   let ssoSubject = '';                 // the identity to render as-is (preferred_username-derived)
+  let keyMode = false;                 // bug B: an explicit key-storing path is what the chip claims
+  let ssoMintable = false;             // probe's flags.self_mint: a FIRST mint is possible here
+  // TRUE when the ACTIVE key is bound to the SAME subject as the browser's SSO
+  // identity — decided SERVER-SIDE by probeKeyIdentity (/v1/identity with the
+  // key). This is the SSO mode: green chip, 'oidc' pill, no local Sign out
+  // (the platform sign-out ends it). A pasted key bound to the identity lands
+  // here too, which is what makes the API-key path converge on the SSO
+  // treatment instead of needing a separate mode (2026-11-03 owner rule).
+  let keySsoBound = false;
 
   function renderIdentityChip() {
     const chip = $('sso-chip'), signout = $('signout-btn');
     if (!chip) return;
+    // THE MINT CARD IS A FIRST-MINT AFFORDANCE (2026-11-03). It used to be
+    // shown whenever the deployment allowed minting, even with a working key
+    // connected — so clicking it POSTed, got the one-key-per-identity 409 and
+    // offered to ROTATE: "Clicking the SSO button ALWAYS gets me a new
+    // rotated key" (operator report). With a key on this browser there is
+    // nothing to mint; the chip already says who you are.
+    const showMint = ssoMintable && !ready();
+    const open = $('sso-open');
+    if (open) open.hidden = !showMint;
+    const hintSso = document.getElementById('hint-sso');
+    if (hintSso) hintSso.style.display = showMint ? 'inline' : 'none';
     if (!ssoSeen && !ready()) {        // neither an SSO session nor a pasted key
       chip.style.display = 'none'; signout.hidden = true;
       return;
     }
     const dot = color => '<span style="display:inline-block;width:8px;height:8px;' +
       'border-radius:50%;background:' + color + '"></span>';
+    // IDENTITY + PROVENANCE, not a mode toggle (2026-11-03 owner report:
+    // "it should show signed in as andrew-bydlon … switching to SSO is a
+    // no-op, which does not make any sense"). Only ONE credential is stored,
+    // so a switch link could only RELABEL the chip — both links are gone.
+    // The chip now always names the SSO identity when the browser has one,
+    // and the PILL says which credential authenticates: 'oidc' for an
+    // SSO-minted key, 'API key' for a pasted one (bug B's requirement,
+    // expressed as provenance instead of a fake switch).
+    const keyed = ready();
+    // SSO MODE IS A PROPERTY OF THE ACTIVE CREDENTIAL, decided server-side by
+    // probeKeyIdentity: a key bound to the SAME subject as the browser
+    // identity is an SSO credential — minted here OR pasted from another
+    // device. That is what makes the API-key connect path converge on the SSO
+    // treatment instead of needing a separate mode (2026-11-03 owner rule:
+    // "If SSO, use SSO key, no sign-out, green; if not, allow sign-out").
+    const ssoBound = keyed && keySsoBound;
+    const name = ssoSeen ? escHtml(ssoSubject || 'unknown') : 'API-key user';
+    const keyPillTitle = ssoSeen
+      ? 'A pasted API key authenticates this browser; the identity above comes from the platform SSO session'
+      : 'Session from a pasted API key — stored in this browser only';
     let html;
-    if (ssoSeen) {
-      // SSO session: green dot, the probe's identity as-is, 'oidc' pill.
-      // The 'switch to API key' affordance lives HERE (click the chip), not
-      // as its own header link — one less element in the header row.
-      html = dot('var(--ok)') + '<span>Signed in as ' + escHtml(ssoSubject || 'unknown') + '</span>' +
-        '<span class="src-tag">oidc</span>' +
-        '<a href="#" id="use-key-link" title="Switch this session to a pasted API key"' +
-        ' style="color:var(--dim);text-decoration:none;font-size:11.5px">switch to API key</a>';
-    } else {
-      // Pasted key: amber dot + 'API key' pill (RAG's D23 paste-mode look)
-      html = dot('var(--warn)') + '<span>Signed in as API-key user</span>' +
-        '<span class="src-tag" title="Session from a pasted API key — stored in this browser only">API key</span>';
-    }
+    // DOT = "can I chat right now": green with a working key, amber when the
+    // identity resolved but no key is on this browser (action needed). The
+    // PILL carries provenance (oidc vs API key) — separate signals on purpose
+    // (2026-11-03 owner report: an amber dot beside a CONNECTED admin key
+    // read as a warning).
+    html = dot(keyed ? 'var(--ok)' : 'var(--warn)') +
+      '<span>Signed in as ' + name + '</span>' +
+      (ssoBound || (!keyed && ssoSeen)
+        ? '<span class="src-tag">oidc</span>'
+        : '<span class="src-tag" title="' + keyPillTitle + '">API key</span>') +
+      (!keyed && ssoSeen
+        ? '<span style="color:var(--dim);font-size:11.5px">no key on this browser yet</span>'
+        : '');
     chip.innerHTML = html;
     chip.style.display = 'flex';
-    signout.hidden = false;
+    // SIGN OUT is for a NON-SSO credential only (2026-11-03 owner rule):
+    // an SSO session is ended by the platform sign-out, so the button would
+    // lie; a keyless browser has nothing local to clear. A pasted key that is
+    // NOT bound to the browser identity gets the button — that was the
+    // "signed in with my admin key and can no longer sign out" regression.
+    signout.hidden = !(keyed && !ssoBound);
   }
 
-  // D24 sign-out, COMPLETE version: behind the edge chain there are TWO
-  // sessions to end — the remembered/pasted key (localStorage) and the edge
-  // SSO session (oauth2-proxy's HttpOnly cookie). Ending only the key
-  // reloads into the edge re-authenticating instantly. So: ALWAYS clear the
-  // local key; on an SSO-flavored session ALSO navigate to the standard
-  // same-origin oauth2-proxy sign-out (RAG's exact sequence).
+  // The header has no general-purpose banner — this small transient note is
+  // where the sign-out outcome can say the one thing the user must read
+  // (bug A: the platform session SURVIVED the local sign-out). Auto-clears.
+  let signoutNoteTimer = null;
+  function signoutNote(msg) {
+    const el = document.getElementById('signout-note');
+    if (!el) return;
+    el.textContent = msg;
+    el.hidden = false;
+    if (signoutNoteTimer) clearTimeout(signoutNoteTimer);
+    signoutNoteTimer = setTimeout(() => { el.hidden = true; el.textContent = ''; }, 9000);
+  }
+
+  // D24 sign-out, closeout edition (wave 3): behind the edge chain there
+  // are TWO sessions to end — the remembered/pasted key (sessionStorage, or
+  // localStorage when remembered) and
+  // the edge SSO session (oauth2-proxy's HttpOnly cookie). Clear the local
+  // key FIRST, then NAVIGATE to /oauth2/sign_out: the gateway route ALWAYS
+  // answers a redirect (302 to the platform proxy when
+  // PCAI_LLM_SSO_SIGN_OUT_URL is configured, else 302 to /?signout=local),
+  // so a JSON 404 is impossible and the bounce-back carries signout=local —
+  // boot reads that param and shows the honest "platform session survived"
+  // note (the wave-2 fetch probe is gone: it only existed while the route
+  // could 404).
+  //
+  // THE ACTIVE CREDENTIAL DECIDES THE EXIT (2026-11-03 owner rule: "If SSO,
+  // use SSO key, no sign-out … if not, allow sign-out"). The button is HIDDEN
+  // for an SSO-bound credential (renderIdentityChip), so this branch is
+  // defensive: an SSO session is ended by the platform sign-out, and the
+  // gateway route always redirects. A NON-SSO pasted key is this device's key
+  // alone — clear it and stay, because bouncing through the platform sign-out
+  // would end a console session the user never asked to end. The SSO identity
+  // disclosure stays (the platform session is still valid); the chip drops to
+  // the keyless state and the mint card returns.
   function signOut() {
-    store.del('pcai-llm-key');
+    const ssoBound = keySsoBound;
+    clearKey();   // w6 F1: both stores + the remember flag
     keyIn.value = '';
-    if (ssoSeen) location.href = '/oauth2/sign_out';
-    else {
-      ssoSeen = false;
-      resetChat();                     // transcripts are per-key — drop the active one
-      renderIdentityChip();
-    }
+    keyMode = false;                   // bug B: the cleared key releases key mode too
+    keySsoBound = false;
+    setConn(false, 'signed out');
+    resetChat();                       // transcripts are per-key — drop the active one
+    if (ssoBound) { location.href = '/oauth2/sign_out'; return; }   // always redirects
+    renderIdentityChip();
   }
 
   async function ssoProbeIdentity() {
@@ -1211,13 +1615,33 @@
       ssoSubject = String(j.subject);
     }
     // The MINT affordance alone stays flag-gated (Z4: the card only exists
-    // where POST /v1/keys/for-me would succeed) — and the boot hint's SSO
-    // clause tracks it, so the text never names an affordance that isn't there.
-    const mintable = !!(j.flags && j.flags.self_mint === true);
-    $('sso-open').hidden = !mintable;
-    const hintSso = document.getElementById('hint-sso');
-    if (hintSso) hintSso.style.display = mintable ? 'inline' : 'none';
+    // where POST /v1/keys/for-me would succeed). renderIdentityChip owns the
+    // VISIBILITY rule now — flag AND no key on this browser — so the card,
+    // the boot hint and the chip cannot disagree.
+    ssoMintable = !!(j.flags && j.flags.self_mint === true);
+    // The boot probe resolves the SUBJECT; now decide whether the key the
+    // browser already holds belongs to it. Ordering matters: connectKey runs
+    // first at boot and its probe may have answered before ssoSubject was
+    // known, so re-probe here and re-render once.
+    if (ready()) { await probeKeyIdentity(); }
     renderIdentityChip();
+  }
+
+  // SERVER-AUTHORITATIVE SSO MODE (2026-11-03 owner rule). Ask /v1/identity
+  // WITH the active key: the response's subject is the key's OWN binding
+  // (idp + subject of the ledger row). A key bound to the SAME subject as the
+  // browser identity is an SSO credential — minted here OR pasted from another
+  // device — so it gets the SSO treatment (green, 'oidc', no local Sign out).
+  // An admin/CLI key has no subject binding and stays a non-SSO credential
+  // (Sign out allowed). A fault keeps the optimistic flag set by connectKey.
+  async function probeKeyIdentity() {
+    if (!ready() || !ssoSubject) { keySsoBound = false; return; }
+    try {
+      const r = await fetch('/v1/identity', { headers: auth() });
+      if (!r.ok) return;
+      const j = await r.json();
+      keySsoBound = !!(j && j.authenticated && j.subject && String(j.subject) === ssoSubject);
+    } catch { /* keep the optimistic value */ }
   }
 
   // One reveal flow for both 201 (fresh mint) and 409→confirmed rotate:
@@ -1230,9 +1654,16 @@
     $('sso-key').textContent = j.key || '';
     ssoSeen = true;   // F4: a minted key IS oidc-provenance (sso-create) — green chip immediately, not after a reload
     renderIdentityChip();
+    // PERSIST + REMEMBER (2026-11-03): an SSO key is this browser's DEVICE
+    // credential, not a pasted secret. Auto-checking "remember key" is what
+    // makes the association survive a tab close — without it the next visit
+    // shows "Signed in as <name>" with no key, and the only way forward was
+    // another mint → 409 → rotate (the exact loop the operator reported).
+    // The box stays visible and un-checkable, so opting out is still one click.
+    $('remember-key').checked = true;
     keyIn.value = j.key;
-    store.set('pcai-llm-key', j.key);
-    connectKey();
+    saveKey(j.key, true);
+    connectKey({ sso: true });
   }
 
   function resetSsoDlg() {
@@ -1267,7 +1698,23 @@
     if (r.status === 409) {   // already has a live SSO key → rotate is destructive
       $('sso-busy').classList.add('hidden');
       $('sso-done').classList.add('hidden');
-      if (confirm('Replace your API key? The previous key stops authenticating immediately.')) {
+      // NAME what exists before offering to destroy it (2026-11-03): the
+      // owner view is prefix/name/created_at only, never the plaintext, so a
+      // user can tell "that is my key from last week" from "someone else
+      // minted one". A blind confirm() was the whole of the old UX.
+      let detail = '';
+      try {
+        const o = await (await fetch('/v1/keys/for-me')).json();
+        if (o && o.exists) {
+          const when = o.created_at ? new Date(o.created_at).toLocaleString() : '';
+          detail = 'Existing key ' + (o.key_prefix || '') + (when ? ', created ' + when : '') + '.\n\n';
+        }
+      } catch {}
+      if (confirm(
+        'This account already has an API key.\n\n' + detail +
+        'This browser does not have it (new tab, cleared storage, or another device).\n\n' +
+        'Replace it with a new one? The old key stops working everywhere immediately. ' +
+        'Your saved conversations are kept — they follow your key group.')) {
         ssoMint(true);
       } else {
         $('sso-dlg').close();
@@ -1280,12 +1727,12 @@
   }
 
   function ssoHideAndClose(msg) {
-    $('sso-open').hidden = true;
     // the boot hint's SSO clause tracks the mint affordance — a failed mint
     // must not leave the hint naming a button that just disappeared
     // (reviewer catch, 2026-10-07; self-healed on reload before this).
-    const hintSso = document.getElementById('hint-sso');
-    if (hintSso) hintSso.style.display = 'none';
+    // Clearing the flag + one render keeps card/hint/chip in lockstep.
+    ssoMintable = false;
+    renderIdentityChip();
     if ($('sso-dlg').open) $('sso-dlg').close();
     if (msg) $('sso-err').textContent = msg;   // cosmetic; dialog is closed
   }
@@ -1295,14 +1742,11 @@
   $('sso-start').addEventListener('click', () => $('sso-dlg').close());
   $('sso-dlg').addEventListener('close', resetSsoDlg);   // Esc too — nothing lingers
   $('signout-btn').addEventListener('click', signOut);
-  // 'switch to API key' lives INSIDE the chip (re-rendered per call) —
-  // delegate from the chip so the handler survives every re-render.
-  $('sso-chip').addEventListener('click', e => {
-    const link = e.target.closest('#use-key-link');
-    if (!link) return;
-    e.preventDefault();                  // RAG's openKeyModal seed: focus the key entry
-    keyIn.focus();
-  });
+  // NO in-chip mode switches (2026-11-03): there is only ONE stored
+  // credential, so "switch to API key" / "switch to SSO session" could only
+  // relabel the chip — a no-op the operator rightly rejected. Switching
+  // credentials is the explicit path: paste a key + Connect, or Sign out and
+  // use the SSO card. The chip reports identity + provenance instead.
   $('sso-copy').addEventListener('click', async () => {
     const k = $('sso-key').textContent;
     let ok = false;
@@ -1330,19 +1774,27 @@
 
     const bubble_ = add('assistant', '…');
     activeBubble = bubble_;
+    mdPaintedAt = 0;   // first delta of a turn paints immediately
     let acc = '', meta = '', thinkBox = null, thinkAcc = '';
 
     try {
       // Task B: with the relay defaulted on, a key without MCP grants gets a
       // deterministic 400 ("tool execution requested but this key has no MCP
-      // grants"). Retry ONCE without the header — the user still gets an
-      // answer instead of a dead end — unchecking the box so the failed
-      // round-trip isn't paid again.
+      // grants"). Retry ONCE with the relay hard off ('0') — the user still
+      // gets an answer instead of a dead end — unchecking the box so the
+      // failed round-trip isn't paid again.
       let useTools = toolsChk.checked;
       let resp = null, detail = '';
       for (let attempt = 0; attempt < 2; attempt++) {
         const hdrs = auth();
-        if (useTools) hdrs['X-PCAI-Execute-Tools'] = '1';
+        // Three-state wire value (routes_proxy._relay_wants): '1' forces the
+        // relay ON, '0' forces it OFF (even for relay_default keys), ABSENT
+        // falls back to the key's relay_default. The box states the user's
+        // intent, so it is sent in BOTH states — omitting the header when
+        // unchecked made the box a no-op for relay_default keys (w6 F2).
+        // The '0' relay-400 cannot fire from this page: it only applies to
+        // body-declared {type: mcp} tools, and the chat body carries none.
+        hdrs['X-PCAI-Execute-Tools'] = useTools ? '1' : '0';
         resp = await fetch('/v1/chat/completions', {
           method: 'POST', headers: hdrs,
           body: JSON.stringify({
@@ -1421,7 +1873,7 @@
             }
             if (delta.content) {
               acc += delta.content;
-              paint(() => { renderRich(bubble_, acc); });
+              paint(() => { renderRichSoon(bubble_, acc); });
             }
             if (j.usage) meta = (meta ? meta + ' · ' : '') + j.usage.total_tokens + ' tokens';
           } catch {}
@@ -1434,6 +1886,19 @@
         meta += ' · relay: ' + (relayToolSteps
           ? relayToolSteps + ' tool call' + (relayToolSteps === 1 ? '' : 's')
           : resp.headers.get('X-PCAI-Relay'));
+      }
+      // SERVED-MODEL DISCLOSURE (2026-11-02). The answer does NOT necessarily
+      // come from the model in the picker: a cascade alias resolves per
+      // request, and a rate/budget refusal on the chosen model fails over down
+      // the ordering. The gateway already names both facts on the wire
+      // (X-PCAI-Served-Model / X-PCAI-Fallback) and this console ignored them,
+      // so a turn served by a different model looked identical to one served
+      // by the picker's — which reads as a bug ("why did the answer change
+      // voice?") when it is really a failover doing its job.
+      const servedModel = resp.headers.get('X-PCAI-Served-Model');
+      const fellFrom = resp.headers.get('X-PCAI-Fallback');
+      if (servedModel && servedModel !== model) {
+        meta += ' · served by ' + servedModel + (fellFrom ? ' (fallback from ' + fellFrom + ')' : '');
       }
       // Off-peak billing: the data-plane may attach X-PCAI-Billing:
       // offpeak-<fraction> (e.g. "offpeak-0.5") ONLY while low-demand billing
@@ -1448,6 +1913,7 @@
       history.push({ role: 'assistant', content: acc });
       paint(() => {
         if (!acc) bubble_.textContent = '(empty response)';
+        else renderRich(bubble_, acc);   // final frame: never leave a throttled render stale
         let m = bubble_.querySelector('.meta');
         if (meta) {
           if (!m) { m = document.createElement('span'); m.className = 'meta'; bubble_.appendChild(m); }
@@ -1491,22 +1957,47 @@
   });
   sendBtn.disabled = true;
 
-  // remember the chat key across visits (iframe-safe store wrapper) — prefill
-  // and auto-connect; a stored key that 401s is dropped by loadModels.
-  const savedKey = store.get('pcai-llm-key');
+  // remember the chat key across visits — prefill and auto-connect; a stored
+  // key that 401s is dropped by loadModels. w6 F1: sessionStorage by default,
+  // localStorage only via the remember box (persisted as the flag), and a
+  // legacy localStorage key migrates to the session exactly once (loadKey).
+  if (store.get(REMEMBER) === '1') $('remember-key').checked = true;
+  const savedKey = loadKey();
   if (savedKey) {
     keyIn.value = savedKey;
-    connectKey();
+    // The stored PROVENANCE decides the chip flavor: an SSO-minted key keeps
+    // "Signed in as <name> · oidc" across reloads (the association the
+    // operator asked to happen automatically), a pasted key keeps the
+    // API-key flavor.
+    connectKey({ sso: isSsoKey() });
   }
 
   // Z4 boot (same best-effort posture as the enroll/usage surfaces): ask the
   // backend whether this browser session carries an SSO identity that may
-  // self-mint. Runs even WITH a pasted key — a discovered SSO session
-  // outranks it on the chip (RAG's paste-vs-session precedence) and the
-  // chip row is what renders first. Shows the card + chip, or nothing at
+  // self-mint. Runs even WITH a pasted key — with a stored key, boot's
+  // connectKey already set keyMode, so the chip names the SSO identity with
+  // an 'API key' provenance pill; without one, the same name renders with the
+  // 'oidc' pill (2026-11-03: identity + provenance, no mode switch). Shows
+  // the card + chip, or nothing at
   // all — never blocks the chat either way. No stored key and no SSO: the
   // chip row stays hidden (renderIdentityChip's !ssoSeen && !ready() branch) —
   // nothing to disclose until a key is pasted or an SSO identity resolves.
+  // signout=local (wave 3): the gateway bounced us back here after a
+  // LOCAL-ONLY sign-out (PCAI_LLM_SSO_SIGN_OUT_URL unset) — the platform
+  // SSO session SURVIVED. Show the note once, then strip the param with
+  // replaceState so a refresh does not re-show it.
+  (function stripSignoutParam() {
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.get('signout') === 'local') {
+        q.delete('signout');
+        const qs = q.toString();
+        history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+        signoutNote('Signed out on this device. Your platform SSO session is still active — use the platform sign-out (top-right of the PCAI console) to end it.');
+      }
+    } catch {}
+  })();
+
   ssoProbeIdentity().then(() => { if (!ssoSeen) renderIdentityChip(); }).catch(() => {});
 })();
 </script>

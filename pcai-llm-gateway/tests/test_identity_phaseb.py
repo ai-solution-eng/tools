@@ -441,11 +441,15 @@ class ShadowDB:
         if "FROM api_keys k" in sql and "bound_via" in sql:
             # (audit P2-6) the SQL now carries the subject lookup inline:
             # args are (idp, subject, bound_via) — resolve via the map.
+            # (audit r5 #5) SERVED HONESTLY: the newest row REGARDLESS of
+            # revoked state, with revoked_at expressed in the row — the real
+            # table keeps the row; the mapper's gate and resolve's
+            # _SHADOW_KEY_ANY_SQL probe are what read it.
             sid = self.subjects.get((args[0], args[1]))
-            live = [k for k in self.keys if k["subject_id"] == sid and k["bound_via"] == args[2] and not k["revoked"]]
-            if not live:
+            rows = [k for k in self.keys if k["subject_id"] == sid and k["bound_via"] == args[2]]
+            if not rows:
                 return None
-            newest = live[-1]
+            newest = rows[-1]
             return {
                 "id": newest["id"],
                 "user_id": newest["user_id"],
@@ -456,8 +460,8 @@ class ShadowDB:
                 "rate_limit_rpm": 60,
                 "rate_limit_tpm": 100_000,
                 "max_concurrent": 0,
-                "expires_at": None,
-                "revoked_at": None,
+                "expires_at": newest.get("expires_at"),
+                "revoked_at": datetime.now(UTC) if newest.get("revoked") else None,
                 "relay_default": False,
                 "stream_pcai_events": False,
                 "offpeak_fraction": None,
@@ -590,10 +594,12 @@ def test_shadow_key_provision_failure_never_raises(monkeypatch: pytest.MonkeyPat
     assert asyncio.run(identity.resolve_shadow_key("user-alice-1", None)) is None
 
 
-def test_shadow_key_revoked_key_not_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shadow_key_revoked_row_is_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     """The lookup is 'newest NON-REVOKED' — a revoked shadow key is never
-    handed out; with the flag on, the next sighting provisions a fresh
-    one (console revocation is the off switch)."""
+    handed out, and (audit r5 #5, 2026-10-30) the REFUSED row is TERMINAL:
+    console revocation is the off switch, so the next sighting must NOT
+    re-provision (the INSERT would mint a fresh, non-expiring, unbudgeted
+    key behind the operator's back)."""
     fake = ShadowDB()
     monkeypatch.setattr(identity, "db", fake)
     monkeypatch.setattr(settings, "token_shadow_keys", True)
@@ -601,11 +607,12 @@ def test_shadow_key_revoked_key_not_reused(monkeypatch: pytest.MonkeyPatch) -> N
     assert first is not None
     fake.keys[0]["revoked"] = True
     assert asyncio.run(identity.find_shadow_key("user-alice-1")) is None
-    second = asyncio.run(identity.resolve_shadow_key("user-alice-1", None))
-    assert second is not None and second.id != first.id
+    assert asyncio.run(identity.resolve_shadow_key("user-alice-1", None)) is None
+    assert len(fake.keys) == 1, "a revoked row must not re-provision"
 
 
 # ---------------------------------------------------------------------------
+
 
 class ExpiryShadowDB(ShadowDB):
     """ShadowDB + the two behaviours the audit C2/F2 fixes depend on:
@@ -636,9 +643,7 @@ class ExpiryShadowDB(ShadowDB):
         if "INSERT INTO users" in sql:
             for u in self.users:
                 if u["tenant_id"] == args[0] and u["name"] == args[1]:
-                    raise RuntimeError(
-                        "duplicate key value violates unique constraint \"users_tenant_id_name_key\""
-                    )
+                    raise RuntimeError('duplicate key value violates unique constraint "users_tenant_id_name_key"')
         return await super().fetchrow(sql, *args)
 
 
@@ -713,9 +718,10 @@ def test_c2_expired_shadow_key_does_not_authorize(monkeypatch: pytest.MonkeyPatc
     assert "k.mcp_admin" in identity._SHADOW_KEY_SQL
 
 
-def test_c2_resolve_shadow_key_reprovisions_past_an_expired_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An expired shadow key must not wedge the subject: with provisioning on,
-    the next sighting mints a fresh key (the same lifecycle as a revoke)."""
+def test_c2_expired_shadow_key_is_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An expired shadow key refuses (the C2 mapper gate) and — audit r5 #5,
+    2026-10-30 — is TERMINAL, not a re-provision trigger: the next sighting
+    must not self-heal a fresh non-expiring, unbudgeted key."""
     fake = ExpiryShadowDB()
     monkeypatch.setattr(identity, "db", fake)
     monkeypatch.setattr(settings, "token_shadow_keys", True)
@@ -725,18 +731,21 @@ def test_c2_resolve_shadow_key_reprovisions_past_an_expired_key(monkeypatch: pyt
     # filter); the mapper's expiry gate is what must refuse it.
     fake.expires_at_by_key[first.id] = datetime(2020, 1, 1, tzinfo=UTC)
     assert asyncio.run(identity.find_shadow_key("user-alice-1")) is None
+    assert asyncio.run(identity.resolve_shadow_key("user-alice-1", None)) is None
+    assert len(fake.keys) == 1, "an expired row must not re-provision"
 
 
-def test_f2_shadow_reprovision_after_revoke_reuses_the_user_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    """F2 — re-provisioning after a console revoke must not collide on
+def test_f2_user_row_reuse_on_repeat_provisioning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2 — a SECOND provisioning for the same human must not collide on
     users UNIQUE (tenant_id, name).
 
     PRE-FIX (_provision_shadow_key): a blind `INSERT INTO users` raised
     UniqueViolationError on the SECOND provisioning of the same human, the
     best-effort handler swallowed it into None, and that subject 401'd FOREVER
-    on valid tokens. Console revocation is the DOCUMENTED off switch, so this
-    hit the normal lifecycle — and two subjects sharing an email collided the
-    same way.
+    on valid tokens. (The original trigger — re-provision after console
+    revoke — is GONE since audit r5 #5 made a refused row terminal; user-row
+    reuse stays load-bearing for the collision that remains: two subjects
+    sharing an email.)
     """
     fake = ExpiryShadowDB()
     monkeypatch.setattr(identity, "db", fake)
@@ -745,11 +754,10 @@ def test_f2_shadow_reprovision_after_revoke_reuses_the_user_row(monkeypatch: pyt
     first = asyncio.run(identity.resolve_shadow_key("user-alice-1", claims))
     assert first is not None
 
+    # audit r5 #5: the revoked row is TERMINAL — no second provisioning
     fake.keys[0]["revoked"] = True  # the documented off switch
-    second = asyncio.run(identity.resolve_shadow_key("user-alice-1", claims))
-    assert second is not None, "a revoked shadow key must be re-provisionable"
-    assert second.id != first.id
-    assert len(fake.users) == 1, "the per-subject user row is REUSED, never re-inserted"
+    assert asyncio.run(identity.resolve_shadow_key("user-alice-1", claims)) is None
+    assert len(fake.keys) == 1, "a revoked row must not re-provision"
 
     # two subjects sharing one email (display_name) both provision
     other = asyncio.run(
@@ -757,7 +765,8 @@ def test_f2_shadow_reprovision_after_revoke_reuses_the_user_row(monkeypatch: pyt
             "user-bob-1", identity.TokenClaims(subject="user-bob-1", email="alice@corp", groups=[])
         )
     )
-    assert other is not None and other.id != second.id
+    assert other is not None and other.id != first.id
+    assert len(fake.users) == 1, "the per-display-name user row is REUSED, never re-inserted"
 
 
 # 4. require_key: the token rung live on /v1 (fall-through at the surface)
@@ -1094,6 +1103,12 @@ def forme_env(monkeypatch: pytest.MonkeyPatch):
     fake = ForMeDB()
     import pcai_llm.core.keys as keys_mod
 
+    # The autouse _token_env posture is FLAGS-OFF (it sets
+    # sso_key_create_enabled=False, line ~111). This section is the
+    # ENABLED-posture spec for /v1/keys/for-me — and the mint now ENFORCES
+    # the flag (audit w6 F1), so the enabled posture must be restated here
+    # (a fixture setattr runs after the autouse one and wins per-test).
+    monkeypatch.setattr(settings, "sso_key_create_enabled", True)
     monkeypatch.setattr(routes_enroll, "db", fake)
     monkeypatch.setattr(keys_mod, "db", fake)
     monkeypatch.setattr(identity, "db", fake)
@@ -1198,7 +1213,7 @@ def test_admin_group_path_allows_in_group_when_trust_on(monkeypatch: pytest.Monk
     tc = _admin_app(monkeypatch)
     r = tc.get(
         "/admin/keys",
-        headers={"X-Auth-Request-User": "ops", "X-Forwarded-Groups": "eng, platform-admin"},
+        headers={"X-Auth-Request-User": "ops", "X-Auth-Request-Groups": "eng, platform-admin"},
     )
     assert r.status_code == 200, r.text
 
@@ -1257,7 +1272,7 @@ def test_admin_rejected_bearer_does_not_fall_through_to_groups(
         headers={
             "Authorization": "Bearer wrong-key",
             "X-Auth-Request-User": "ops",
-            "X-Forwarded-Groups": "platform-admin",
+            "X-Auth-Request-Groups": "platform-admin",
         },
     )
     assert r.status_code == 401

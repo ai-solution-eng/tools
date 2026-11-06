@@ -83,9 +83,12 @@ function configMatches(cfg, q) {
   }
   if (!q) return true;
   const e = cfg.entry || {};
+  // notes carries the long-form operational detail that no longer fits in the
+  // MLIS-facing description; it stays searchable so "mem-fraction", a flag name
+  // or a bug number still finds the configuration it belongs to.
   const blob = [
     cfg.label, cfg.framework, cfg.quant, cfg.publisher, cfg.model_id,
-    e.name, e.image, e.description, e.tier, e.model_format,
+    e.name, e.image, e.description, e.notes, e.tier, e.model_format,
     (e.metadata && e.metadata.tags) || '',
   ].join(' ').toLowerCase();
   return q.split(/\s+/).filter(Boolean).every(term => blob.includes(term));
@@ -298,7 +301,9 @@ const detailsTitle = document.getElementById('details-title');
 const detailsBody = document.getElementById('details-body');
 
 function showDetails(e) {
-  detailsTitle.textContent = e.name + ' (v' + e.version + ')';
+  // No version in the title: the stored version is always 1 (MLIS assigns the
+  // real one on push), so printing it would claim the model IS v1.
+  detailsTitle.textContent = e.name;
   const copy = {};
   for (const [k, v] of Object.entries(e)) {
     if (k === 'catalog_id' || k === 'tier') continue;
@@ -345,7 +350,8 @@ addForm.addEventListener('submit', async (e) => {
   const entry = {
     tier: fd.get('tier'),
     name: fd.get('name'),
-    version: parseInt(fd.get('version') || '1', 10),
+    // Stored as 1: MLIS assigns the real version at push time.
+    version: 1,
     description: fd.get('description') || '',
     uri: fd.get('uri') || '',
     image: fd.get('image'),
@@ -360,7 +366,7 @@ addForm.addEventListener('submit', async (e) => {
     resource_limit_gpu: fd.get('resource_limit_gpu') || '',
     resource_gpu_type: fd.get('resource_gpu_type') || '',
     caching_enabled: fd.get('caching_enabled') === 'on',
-    project: '',
+    project: fd.get('project') || '',
     chat_template_path: fd.get('chat_template_path') || '',
     chat_template_contents: fd.get('chat_template_contents') || '',
     metadata: parseJsonSafe(fd.get('metadata'), { tags: '', modelCategory: 'other' }),
@@ -392,6 +398,96 @@ function parseKv(text) {
 
 function parseJsonSafe(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
+}
+
+// ---- Optional project for the push (download page's namespace combobox) ----
+//
+// The project a packaged model is filed under.  In PCAI a project IS a
+// namespace, so this offers the same /api/namespaces list the download page
+// uses, fetched lazily on first open; an RBAC denial leaves the field
+// free-text.  Empty keeps the historical behaviour: the config's own project
+// if it names one, else the chart default (catalog.defaultProject), else blank
+// -- which MLIS shows only under "All projects".
+const projectInput = document.getElementById('push-project-input');
+const projectToggle = document.getElementById('push-project-toggle');
+const projectMenu = document.getElementById('push-project-menu');
+let knownNamespaces = null;
+let namespacesPending = false;
+
+async function fetchNamespaces() {
+  if (knownNamespaces !== null) return knownNamespaces;
+  if (namespacesPending) return null;
+  namespacesPending = true;
+  try {
+    const r = await fetch('/api/namespaces');
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    knownNamespaces = data.namespaces || [];
+  } catch (e) {
+    console.error('namespace list fetch failed', e);
+    knownNamespaces = null;
+  } finally {
+    namespacesPending = false;
+  }
+  return knownNamespaces;
+}
+
+async function showProjectMenu() {
+  if (!projectMenu) return;
+  if (knownNamespaces === null) {
+    projectMenu.innerHTML = '<div class="combo-empty">Loading projects...</div>';
+    projectMenu.hidden = false;
+    if ((await fetchNamespaces()) === null) { projectMenu.hidden = true; return; }
+  }
+  const q = (projectInput.value || '').trim().toLowerCase();
+  const matches = (knownNamespaces || []).filter(ns => ns.toLowerCase().includes(q)).slice(0, 50);
+  projectMenu.innerHTML = '';
+  if (!matches.length) {
+    projectMenu.innerHTML = '<div class="combo-empty">No project-user-* namespace matches — you can still type one manually.</div>';
+  } else {
+    for (const ns of matches) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'combo-item';
+      item.innerHTML = '<span class="combo-item-id">' + esc(ns) + '</span>';
+      item.addEventListener('click', () => {
+        projectInput.value = ns;
+        projectMenu.hidden = true;
+      });
+      projectMenu.appendChild(item);
+    }
+  }
+  projectMenu.hidden = false;
+}
+
+if (projectInput && projectToggle && projectMenu) {
+  projectToggle.addEventListener('click', () => {
+    if (projectMenu.hidden) showProjectMenu();
+    else projectMenu.hidden = true;
+  });
+  projectInput.addEventListener('focus', () => showProjectMenu());
+  projectInput.addEventListener('input', () => {
+    if (knownNamespaces !== null) showProjectMenu();
+  });
+  projectInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' || e.key === 'Enter') projectMenu.hidden = true;
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.push-project')) projectMenu.hidden = true;
+  });
+}
+
+// The project to send with this push ('' = leave it to the config/chart
+// default).  Returns null after alerting on a value the server would reject.
+function selectedProject() {
+  const value = ((projectInput && projectInput.value) || '').trim();
+  if (!value) return '';
+  if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(value)) {
+    alert('Project must be a Kubernetes namespace name: lowercase letters, digits and "-", ' +
+      'starting and ending with a letter or digit.');
+    return null;
+  }
+  return value;
 }
 
 // ---- Push to MLIS ----
@@ -437,28 +533,43 @@ document.getElementById('push-direct-btn').addEventListener('click', async () =>
 });
 
 async function doPush(configs) {
-  pushResults.innerHTML = '<p class="hint">Pushing ' + configs.length + ' model(s) to MLIS...</p>';
+  const project = selectedProject();
+  if (project === null) return;
+  const url = '/api/push' + (project ? '?project=' + encodeURIComponent(project) : '');
+  pushResults.innerHTML = '<p class="hint">Pushing ' + configs.length + ' model(s) to MLIS' +
+    (project ? ' under <strong>' + esc(project) + '</strong>' : '') + '...</p>';
   try {
-    const r = await fetch('/api/push', {
+    const r = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(configs),
     });
     const data = await r.json();
-    renderPushResults(data);
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    renderPushResults(data, project);
   } catch (e) {
-    pushResults.innerHTML = '<p class="msg error">Error: ' + e + '</p>';
+    pushResults.innerHTML = '<p class="msg error">Error: ' + esc(e.message || e) + '</p>';
   }
 }
 
-function renderPushResults(data) {
+function renderPushResults(data, project) {
   const { results, pushed, skipped, errors } = data;
+  const bumped = results.filter(r => r.bumped).length;
   let html = '<div class="push-summary">Pushed: <strong>' + pushed + '</strong>' +
     ' | Skipped: <strong>' + skipped + '</strong>' +
-    ' | Errors: <strong>' + errors + '</strong></div>';
+    ' | Errors: <strong>' + errors + '</strong>' +
+    (project ? ' | Project: <strong>' + esc(project) + '</strong>' : '') + '</div>';
+  if (bumped) {
+    html += '<p class="msg">' + bumped + ' configuration' + (bumped === 1 ? '' : 's') +
+      ' landed as a NEW version: MLIS already has that model name with a different configuration. ' +
+      'The Version column shows what MLIS assigned.</p>';
+  }
   html += '<table class="catalog-table"><thead><tr><th>Name</th><th>Version</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
   for (const r of results) {
     const cls = r.status === 'pushed' ? 'push-ok' : r.status === 'skipped' ? 'push-skip' : 'push-err';
-    html += '<tr class="' + cls + '"><td>' + esc(r.name) + '</td><td>' + r.version + '</td><td>' + r.status + '</td><td>' + esc(r.detail) + '</td></tr>';
+    const version = r.status === 'error'
+      ? '\u2014'
+      : esc(r.version) + (r.bumped ? ' <em title="MLIS already has this name with a different configuration">new</em>' : '');
+    html += '<tr class="' + cls + '"><td>' + esc(r.name) + '</td><td>' + version + '</td><td>' + r.status + '</td><td>' + esc(r.detail) + '</td></tr>';
   }
   html += '</tbody></table>';
   pushResults.innerHTML = html;
@@ -466,7 +577,8 @@ function renderPushResults(data) {
 
 // "Add to Catalog": add the direct-JSON entries (single object or array) to
 // the catalog so they appear in the tiers table above.  Duplicates (same
-// catalog_id or name+version) are skipped server-side.
+// catalog_id, or same name + deployment configuration) are skipped
+// server-side; the version is always stored as 1 and assigned by MLIS on push.
 document.getElementById('add-direct-btn').addEventListener('click', async () => {
   const configs = parseDirectJson();
   if (!configs) return;

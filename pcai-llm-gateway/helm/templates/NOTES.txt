@@ -5,8 +5,64 @@
 {{- $mkSecret := .Values.secretsMasterKey.existingSecret -}}
 {{- $embedded := .Values.database.embedded.enabled -}}
 {{- $vs := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint -}}
+{{- /* HPA × dbPoolMax connection arithmetic (W6 F5): each replica pools its
+     own dbPoolMax connections, so worst-case aggregate demand is
+     maxReplicas × dbPoolMax. Budget = embedded.maxConnections (image default
+     100 when 0) in embedded mode, else the optional maxConnectionsBudget.
+     Warn (never fail) when demand exceeds a KNOWN budget; one-line
+     informational note when the DB is external and no budget is known. */ -}}
+{{- $hpaDemand := mul (int .Values.autoscaling.maxReplicas) (int .Values.settings.dbPoolMax) -}}
+{{- $hpaBudget := 0 -}}
+{{- if $embedded -}}
+{{- $hpaBudget = or (int .Values.database.embedded.maxConnections) 100 -}}
+{{- else -}}
+{{- if hasKey .Values.database "maxConnectionsBudget" -}}
+{{- $hpaBudget = int .Values.database.maxConnectionsBudget -}}
+{{- end -}}
+{{- end -}}
+{{- $hpaOver := and .Values.autoscaling.enabled (gt $hpaBudget 0) (gt $hpaDemand $hpaBudget) -}}
+{{- $hpaUnknown := and .Values.autoscaling.enabled (not $embedded) (le $hpaBudget 0) -}}
 
 pcai-llm-gateway {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+{{- if and .Values.settings.trustProxyIdentity (not .Values.ezua.authorizationPolicy.ingressGatewayPrincipals) }}
+⚠️  IDENTITY SPOOFING RISK — settings.trustProxyIdentity is ON but
+    ezua.authorizationPolicy.ingressGatewayPrincipals is EMPTY, so the
+    AuthorizationPolicy edge rule admits the ENTIRE ingressNamespace
+    ({{ .Values.ezua.authorizationPolicy.ingressNamespace }}) to every path:
+    any workload in that namespace can deliver spoofed X-Auth-Request-*
+    headers to the trusted-header surfaces (identity reads on /v1/identity,
+    key mints on POST /v1/keys/for-me, enrollment redemption on /v1/enroll)
+    and bind them to arbitrary subjects.
+    FIX: set ezua.authorizationPolicy.ingressGatewayPrincipals to the
+    ezaf-gateway ServiceAccount's SPIFFE ID, e.g.
+    cluster.local/ns/istio-system/sa/<sa> — discover the SA with:
+      kubectl -n istio-system get pod -l 'app=ezaf-gateway' \
+        -o jsonpath='{.items[0].spec.serviceAccountName}'
+    (deliberately non-fatal — this must not block a live deploy; tighten
+    the knob, then re-apply).
+{{ end }}
+{{- if $hpaOver }}
+⚠️  POSTGRES CONNECTION OVERSUBSCRIPTION — autoscaling scales to
+    {{ .Values.autoscaling.maxReplicas }} replicas, each holding a pool of up to
+    {{ .Values.settings.dbPoolMax }} connections: worst-case aggregate demand is
+    {{ .Values.autoscaling.maxReplicas }} × {{ .Values.settings.dbPoolMax }} = {{ $hpaDemand }}
+    connections, but the budget is only {{ $hpaBudget }}
+    ({{ if $embedded }}database.embedded.maxConnections{{ else }}database.maxConnectionsBudget{{ end }}).
+    Under the load spike that triggers the scale-up, pods fail to ACQUIRE
+    connections (bounded acquire → fast 503) — autoscaling amplifies the
+    pressure instead of relieving it.
+    FIX: raise {{ if $embedded }}database.embedded.maxConnections{{ else }}database.maxConnectionsBudget (and the real database limit){{ end }}
+    and/or lower settings.dbPoolMax or autoscaling.maxReplicas so that
+    maxReplicas × dbPoolMax fits the budget.
+{{ end }}
+{{- if $hpaUnknown }}
+NOTE (POSTGRES CONNECTIONS): autoscaling scales to
+    {{ .Values.autoscaling.maxReplicas }} replicas × dbPoolMax {{ .Values.settings.dbPoolMax }}
+    = {{ $hpaDemand }} connections of worst-case aggregate demand. The external
+    database's max_connections is unknown to this chart — verify it can cover
+    {{ $hpaDemand }} under spike, or set database.maxConnectionsBudget to the real
+    limit to turn this into a warning.
+{{ end }}
 
 ════════════════════════════════════════════════════════════════════
 1. SECRETS — the pod stays in CreateContainerConfigError until the

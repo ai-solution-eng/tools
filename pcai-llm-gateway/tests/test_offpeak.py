@@ -289,6 +289,7 @@ def test_first_float_no_number_returns_none() -> None:
     assert offpeak.first_float(None) is None
     assert offpeak.first_float("") is None
 
+
 # ---------------------------------------------------------------------------
 # D-3 (audit 2026-10-29): an EMPTY Prometheus result is NO SAMPLE, not zero
 # ---------------------------------------------------------------------------
@@ -303,9 +304,7 @@ def test_d3_first_float_empty_result_is_no_sample() -> None:
     exactly when demand was UNKNOWN: the fail-safe inverted. Empty result =
     None, whatever else the envelope contains."""
     assert (
-        offpeak.first_float(
-            {"status": "success", "data": {"resultType": "vector", "result": []}, "elapsed_ms": 3}
-        )
+        offpeak.first_float({"status": "success", "data": {"resultType": "vector", "result": []}, "elapsed_ms": 3})
         is None
     )
     assert (
@@ -335,7 +334,10 @@ def test_d3_real_samples_still_parse_after_empty_guard() -> None:
     """The empty-result guard must not eat REAL samples."""
     payload = '{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1730000000,"23.5"]}]}}'
     assert offpeak.first_float(_text_block(payload)) == 23.5
-    assert offpeak.first_float({"status": "success", "data": {"resultType": "scalar", "result": [1730000000, "7.5"]}}) == 7.5
+    assert (
+        offpeak.first_float({"status": "success", "data": {"resultType": "scalar", "result": [1730000000, "7.5"]}})
+        == 7.5
+    )
 
 
 def test_d3_empty_result_evaluator_fails_safe_full_price(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -390,7 +392,7 @@ class WeightedLedgerDB:
         return sum(
             _row(r)
             for r in self.ledger
-            if r["status"] in ("ok", "error")  # cache_hit rows are FREE
+            if r["status"] in budgets_mod._COSTED_STATUSES  # cache_hit rows are FREE
         )
 
     async def fetch(self, sql: str, *a: Any):

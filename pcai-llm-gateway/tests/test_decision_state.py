@@ -6,6 +6,7 @@ harness is usually harness plumbing -- a subagent-completion notice inside a
 every turn. `user_task` carries the opening ask so the model has something real
 to classify.
 """
+
 from pcai_llm.core import decision_routing as dr
 
 
@@ -19,7 +20,9 @@ def _body(*user_turns: str) -> dict:
 
 
 def test_first_and_last_turn_are_both_sent() -> None:
-    state = dr.build_state(_body("port the chart to PCAI", "Background subagent finished."), complexity=100, candidates=["A", "B"])
+    state = dr.build_state(
+        _body("port the chart to PCAI", "Background subagent finished."), complexity=100, candidates=["A", "B"]
+    )
     assert '"user_task": "port the chart to PCAI"' in state
     assert '"user_message": "Background subagent finished."' in state
 

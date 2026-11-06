@@ -2,9 +2,16 @@
 
 Reads the DB password from a Kubernetes Secret, connects to the AIOLI
 PostgreSQL database, and inserts model configurations into the
-packaged_models table.  Duplicate (name, version) entries are skipped.
-All blocking DB calls are pushed to a thread so the FastAPI event loop
-is not blocked.
+packaged_models table.
+
+VERSIONS ARE ASSIGNED HERE, NOT AUTHORED.  The catalog stores version 1 for
+every configuration; a push lands as v1 when the name is new on this MLIS
+instance and as max(version)+1 when the name already exists with a different
+configuration.  An identical configuration is skipped rather than versioned
+up, so re-pushing is idempotent.  See versioning.py for the rules.
+
+All blocking DB calls are pushed to a thread so the FastAPI event loop is
+not blocked.
 """
 
 import asyncio
@@ -14,6 +21,7 @@ import psycopg2
 from psycopg2.extras import Json
 
 from .k8s import K8sClient
+from .versioning import FINGERPRINT_COLUMNS, plan_push, resolve_project
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +47,11 @@ COLUMNS = [
     "metadata",
 ]
 JSONB_COLUMNS = {"environment", "metadata"}
-INT_COLUMNS = {"version"}
 BOOL_COLUMNS = {"caching_enabled"}
+
+# The row shape plan_push() expects: the assigned version plus every column
+# that defines the deployment (versioning.FINGERPRINT_COLUMNS).
+EXISTING_COLUMNS = ("version", *FINGERPRINT_COLUMNS)
 
 
 class AioliDB:
@@ -54,6 +65,7 @@ class AioliDB:
         secret_name: str,
         secret_ns: str,
         secret_key: str,
+        default_project: str = "",
     ):
         self.k8s = k8s
         self.host = host
@@ -63,15 +75,20 @@ class AioliDB:
         self.secret_name = secret_name
         self.secret_ns = secret_ns
         self.secret_key = secret_key
+        self.default_project = default_project
 
     async def _password(self) -> str:
         data = await self.k8s.read_secret(self.secret_ns, self.secret_name)
         return data[self.secret_key]
 
-    async def push_batch(self, configs: list[dict]) -> list[dict]:
-        """Insert configs into packaged_models. Returns per-config results."""
+    async def push_batch(self, configs: list[dict], project: str = "") -> list[dict]:
+        """Insert configs into packaged_models. Returns per-config results.
+
+        "project" is the project picked for this push (the UI's optional
+        namespace field); it files a config that names no project of its own.
+        """
         password = await self._password()
-        return await asyncio.to_thread(self._push_sync, configs, password)
+        return await asyncio.to_thread(self._push_sync, configs, password, project)
 
     async def fetch_packaged_uris(self) -> list[tuple[str, str]]:
         """Read-only SELECT of packaged_models (name, uri) for the GC cross-check.
@@ -102,7 +119,7 @@ class AioliDB:
         finally:
             conn.close()
 
-    def _push_sync(self, configs: list[dict], password: str) -> list[dict]:
+    def _push_sync(self, configs: list[dict], password: str, project: str = "") -> list[dict]:
         results = []
         conn = psycopg2.connect(
             host=self.host,
@@ -115,38 +132,71 @@ class AioliDB:
         try:
             with conn, conn.cursor() as cur:
                 for cfg in configs:
-                    results.append(self._push_one(cur, cfg))
+                    results.append(self._push_one(cur, self._with_default_project(cfg, project)))
         finally:
             conn.close()
         return results
 
+    def _with_default_project(self, cfg: dict, project: str = "") -> dict:
+        """Fill in the project a config names no project of its own.
+
+        Resolution: explicit entry > the project picked for this push (the UI's
+        namespace field) > catalog.defaultProject.  Applied BEFORE the
+        fingerprint, not at INSERT time: the stored row and every later push of
+        the same configuration must agree, or each re-push would look like a new
+        configuration and mint a version every time.  With nothing set the
+        config is returned untouched (the historical behaviour: MLIS rows carry
+        project "" and only show under "All projects").
+        """
+        resolved = resolve_project(cfg, project, self.default_project)
+        if resolved == str(cfg.get("project") or "").strip():
+            return cfg
+        return {**cfg, "project": resolved}
+
+    @staticmethod
+    def _existing_rows(cur, name: str) -> list[dict]:
+        """Every packaged_models row already holding this name.
+
+        One SELECT per config, not one per column: plan_push() needs the
+        whole set to tell "identical configuration" (skip) from "same name,
+        different configuration" (version up), and the same transaction sees
+        earlier inserts of the same batch.
+        """
+        cur.execute(
+            "SELECT " + ", ".join(EXISTING_COLUMNS) + " FROM packaged_models WHERE name = %s ORDER BY version",
+            (name,),
+        )
+        return [dict(zip(EXISTING_COLUMNS, row)) for row in cur.fetchall()]
+
     @staticmethod
     def _push_one(cur, cfg: dict) -> dict:
         name = str(cfg.get("name", "")).strip()
-        version = int(cfg.get("version", 1) or 1)
-        result = {"name": name, "version": version, "status": "", "detail": ""}
+        result = {"name": name, "version": 0, "status": "", "detail": "", "bumped": False}
 
         if not name or not cfg.get("image"):
             result["status"] = "error"
             result["detail"] = "missing required fields: name and image are required"
             return result
 
-        cur.execute(
-            "SELECT id FROM packaged_models WHERE name = %s AND version = %s",
-            (name, version),
+        plan = plan_push(AioliDB._existing_rows(cur, name), cfg)
+        result.update(
+            version=plan["version"],
+            status=plan["status"],
+            detail=plan["detail"],
+            bumped=plan["bumped"],
         )
-        if cur.fetchone():
-            result["status"] = "skipped"
-            result["detail"] = "already exists in MLIS"
+        if plan["status"] == "skipped":
             return result
 
         values = []
         for col in COLUMNS:
+            if col == "version":
+                # MLIS owns the sequence; the config's own version is ignored.
+                values.append(plan["version"])
+                continue
             val = cfg.get(col)
             if col in JSONB_COLUMNS:
                 values.append(Json(val if val is not None else {}))
-            elif col in INT_COLUMNS:
-                values.append(int(val) if val is not None else 1)
             elif col in BOOL_COLUMNS:
                 values.append(bool(val))
             elif col == "project":
@@ -163,6 +213,8 @@ class AioliDB:
             values,
         )
         row = cur.fetchone()
-        result["status"] = "pushed"
-        result["detail"] = f"id={row[0]}" if row else "inserted"
+        detail = f"id={row[0]}" if row else "inserted"
+        if plan["detail"]:
+            detail = f"{detail} - {plan['detail']}"
+        result["detail"] = detail
         return result

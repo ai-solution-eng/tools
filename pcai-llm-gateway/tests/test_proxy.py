@@ -12,6 +12,7 @@ warmed by earlier test modules).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -19,7 +20,7 @@ from typing import Any
 
 import httpx2
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from pcai_llm.api import routes_proxy
@@ -199,7 +200,6 @@ def test_responses_api_refuses_before_auth() -> None:
     r = tc.post("/v1/responses", json={"model": "m", "input": "hi"})
     assert r.status_code == 501
     assert r.json()["detail"]["code"] == "responses_api_unsupported"
-
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +464,6 @@ async def test_c6_stream_fallback_hop_rewrites_the_upstream_model_name(
     assert resp.headers.get("x-pcai-fallback") == MODEL
 
 
-
 # ---------------------------------------------------------------------------
 # relay-turn tests (audit wave 2026-10-29): tool_choice hygiene, iteration
 # histogram, canonical capture guard, handback flush boundary
@@ -493,9 +492,7 @@ def _tool_call_sse(name: str = "logsearch__search_logs") -> bytes:
 
 def _content_sse(text: str) -> bytes:
     return (
-        b'data: {"id":"c2","choices":[{"delta":{"content":"'
-        + text.encode()
-        + b'"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"c2","choices":[{"delta":{"content":"' + text.encode() + b'"},"finish_reason":null}]}\n\n'
         b'data: {"id":"c2","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n'
         b"data: [DONE]\n\n"
@@ -730,9 +727,7 @@ async def test_c4_context_budget_keeps_the_pending_tail_flush_boundary(monkeypat
 
     monkeypatch.setattr(routes_proxy, "db", CanonicalDB())
 
-    flush = routes_proxy._persist_conversation_state(
-        key, canonical_input=stored_untrimmed, relay_projection=projection
-    )
+    flush = routes_proxy._persist_conversation_state(key, canonical_input=stored_untrimmed, relay_projection=projection)
     await flush("thread-c4", final_from_relay, 3)
     assert saved.get("pending_tail") == json.dumps([assistant_tool_calls, tool_result], default=str), (
         "the awaiting-client tail must be persisted from the PROJECTION boundary"
@@ -836,3 +831,438 @@ def test_zc9_steady_state_refusal_reports_the_executed_count(monkeypatch) -> Non
     assert reason is not None
     assert "made 5x" in reason, f"steady-state count drifted: {reason!r}"
     assert "made 19999" not in reason
+
+
+# ---------------------------------------------------------------------------
+# audit w6 (P2): the conversation-incumbent read is ROUTING state — a pinned
+# request must not pay a model_stickiness SELECT it can never consume, and a
+# routing request must still pay it (the 2026-10-26 dual-review fix required
+# the read to be unconditional WITHIN the routing path).
+# ---------------------------------------------------------------------------
+
+
+def test_pinned_request_never_reads_conversation_stickiness(env, monkeypatch) -> None:
+    """A pinned request cannot use the routing incumbent/floor/writer.
+
+    Before the fix, `_routing_incumbent_state` ran on EVERY chat
+    request (it was not behind the `_routable` gate), so a plain
+    pinned turn issued one `model_stickiness` SELECT on the
+    pre-upstream path — a serialized DB round-trip in TTFT for state that
+    only a pseudo-model request ever reads.
+    """
+    tc, _ = env
+    from pcai_llm.core import stickiness
+
+    reads: list[tuple] = []
+
+    async def counting_get_sticky_row(key_id, thread_key):
+        reads.append((key_id, thread_key))
+
+    monkeypatch.setattr(stickiness, "get_sticky_row", counting_get_sticky_row)
+
+    body = {"model": MODEL, "messages": [{"role": "user", "content": "hello"}]}
+    r = tc.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer hllm-x"})
+    assert r.status_code == 200, r.text
+    assert reads == [], "a pinned request paid a model_stickiness SELECT it can never use"
+
+
+def test_routing_request_still_reads_conversation_stickiness(env, monkeypatch) -> None:
+    """The gate is `_routable`, not "the request will succeed": a
+    routing pseudo-model request must still read the incumbent BEFORE
+    resolution (hysteresis must work with sticky_routing off). The request
+    itself 404s here — this fixture has no profile ordering — which is the
+    point: the read happens before resolution, exactly as before.
+    """
+    tc, _ = env
+    from pcai_llm.core import stickiness
+
+    reads: list[tuple] = []
+
+    async def counting_get_sticky_row(key_id, thread_key):
+        reads.append((key_id, thread_key))
+
+    monkeypatch.setattr(stickiness, "get_sticky_row", counting_get_sticky_row)
+
+    body = {"model": "routing", "messages": [{"role": "user", "content": "hello"}]}
+    tc.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer hllm-x"})
+    assert reads, "a routing pseudo-model request must still read the conversation incumbent"
+
+
+# ---------------------------------------------------------------------------
+# audit w6 (P1): admission failover must move the request to the PROMOTED
+# model's ENDPOINT. The walk changes the model name; the pool was resolved for
+# the model that ARRIVED, so the bytes went to the endpoint that had just
+# refused (a 429 became a 400) while the headers/ledger named the promoted
+# model. No test asserted WHICH HOST the failover reached, which is exactly why
+# this survived.
+# ---------------------------------------------------------------------------
+
+_ADMIT_A = "admit-model-a"
+_ADMIT_B = "admit-model-b"
+_ADMIT_EMB = "admit-embed"
+
+
+class _OrderDB(FakeDB):
+    """FakeDB whose profile ordering is [A, B] (most-capable first)."""
+
+    def __init__(self, order: list[str]) -> None:
+        super().__init__()
+        self.order = order
+
+    async def fetchrow(self, sql: str, *args: Any):
+        if "profiles" in sql:
+            return {"model_order": list(self.order)}
+        return {"requests": 1, "tokens": 10}
+
+
+def _admit_env(monkeypatch: pytest.MonkeyPatch, order: list[str], types: dict[str, str]):
+    """Wire a route-level env with several pools; return (TestClient, calls)."""
+    import pcai_llm.api.auth as auth_mod
+    import pcai_llm.core.cascade as cascade_mod
+    import pcai_llm.core.costs as costs_mod
+
+    fake_db = _OrderDB(order)
+    monkeypatch.setattr(budgets_mod, "db", fake_db)
+    monkeypatch.setattr(cascade_mod, "db", fake_db)
+    monkeypatch.setattr(costs_mod, "db", fake_db)
+
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        calls.append({"host": request.url.host, "model": body.get("model")})
+        return httpx2.Response(
+            200,
+            json={
+                "id": "cmpl-1",
+                "object": "chat.completion",
+                "model": body.get("model"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16},
+            },
+        )
+
+    mock_router = Router.with_mock(handler)
+    for name in order:
+        mock_router.set_endpoints(
+            name,
+            [
+                Endpoint(
+                    id=f"ep-{name}",
+                    model_name=name,
+                    base_url=f"http://upstream-{name}/v1",
+                    model_type=types.get(name, "chat"),
+                )
+            ],
+        )
+    monkeypatch.setattr(routes_proxy, "model_router", mock_router)
+    # core.cascade.serves_chat (the chat-only admission filter) resolves the
+    # router singleton in ITS OWN module namespace, so the same mock must be
+    # installed there or the filter sees an empty registry and keeps everything.
+    monkeypatch.setattr(cascade_mod, "model_router", mock_router)
+
+    # The admission walk: the FIRST candidate is rate-limited, the next is
+    # admitted. This is the documented rate/budget failover, in isolation.
+    async def gates(key, model, est, endpoint, request_id, started, precomputed_budget=None):
+        if model == _ADMIT_A:
+            raise HTTPException(429, "TPM limit exceeded on " + _ADMIT_A)
+        return routes_proxy._GateOutcome()
+
+    monkeypatch.setattr(routes_proxy, "_run_gates", gates)
+
+    key = _key()
+
+    async def fake_authenticate(plaintext: str) -> KeyRecord:
+        return key
+
+    monkeypatch.setattr(auth_mod, "authenticate", fake_authenticate)
+    app = FastAPI()
+    app.include_router(routes_proxy.router)
+    return TestClient(app, raise_server_exceptions=False), calls
+
+
+def test_admission_failover_sends_the_request_to_the_promoted_models_endpoint(monkeypatch) -> None:
+    """The promoted model's bytes must go to the promoted model's host.
+
+    Pre-fix the single upstream call reached `upstream-admit-model-a` —
+    the endpoint whose gate had just returned 429 — carrying
+    {"model": "admit-model-b"} in the body, while X-PCAI-Served-Model and the
+    ledger row both said admit-model-b. A strict upstream 400s that (the
+    failover turns a 429 into a hard failure); a permissive one serves the
+    budget-refused model and bills another.
+    """
+    tc, calls = _admit_env(monkeypatch, [_ADMIT_A, _ADMIT_B], {})
+
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+        headers={"Authorization": "Bearer hllm-x"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1, calls
+    assert calls[0]["host"] == "upstream-" + _ADMIT_B, (
+        f"the failover was billed as {_ADMIT_B} but served by {calls[0]['host']}"
+    )
+    assert calls[0]["model"] == _ADMIT_B, "the wire body must name the model that host serves"
+    assert r.headers.get("x-pcai-served-model") == _ADMIT_B
+    assert r.headers.get("x-pcai-fallback") == _ADMIT_A
+
+
+def test_admission_failover_never_promotes_a_chat_request_onto_a_non_chat_pool(monkeypatch) -> None:
+    """The profile ordering is an ACL as well as a ladder, so it can carry
+    embedding/reranker pools (the seeder ships them). The admission walk has no
+    type check of its own -- _next_fallback_candidate does -- so an unfiltered
+    candidate list promotes a CHAT request onto an embedding pool, which every
+    upstream 400s. With no chat candidate left, the honest answer is the 429.
+    """
+    tc, calls = _admit_env(monkeypatch, [_ADMIT_A, _ADMIT_EMB], {_ADMIT_EMB: "embedding"})
+
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+        headers={"Authorization": "Bearer hllm-x"},
+    )
+
+    assert r.status_code == 429, r.text
+    assert calls == [], "a chat request must never be sent to a non-chat pool"
+
+
+# ---------------------------------------------------------------------------
+# audit w6 (P2): the decision endpoint must enter the circuit breaker like
+# every other upstream. Before the fix it never called pool.report, so a hung
+# decision model cost decision_timeout_ms on EVERY routed request, forever.
+# ---------------------------------------------------------------------------
+
+
+def test_decision_endpoint_breaker_opens_and_the_next_request_skips_it(monkeypatch) -> None:
+    """N consecutive timeouts must cool the endpoint, and the next routed
+    request must not pay another full decision_timeout_ms.
+
+    The contract this pins: a dead decision model costs a downgrade
+    opportunity, never 2.5 s of TTFT on every routed turn.
+    """
+    from pcai_llm.config import settings
+    from pcai_llm.core import decision_routing as dr
+
+    dm = "decision-model"
+    attempts: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(str(request.url))
+        raise httpx2.ReadTimeout("hung decision endpoint", request=request)
+
+    mock_router = Router.with_mock(handler)
+    ep = Endpoint(id="dm-ep", model_name=dm, base_url="http://decision-upstream/v1")
+    mock_router.set_endpoints(dm, [ep])
+    monkeypatch.setattr(routes_proxy, "model_router", mock_router)
+
+    caller = routes_proxy._decision_caller(dm, {"prompt": "pick one"})
+    assert caller is not None, "a healthy decision endpoint must produce a caller"
+
+    async def drive() -> None:
+        for _ in range(settings.endpoint_failure_threshold):
+            await dr.decide(
+                caller,
+                state="{}",
+                instructions="pick one",
+                candidates=["a", "b"],
+                min_confidence=0.6,
+                timeout_ms=2500,
+            )
+
+    asyncio.run(drive())
+
+    pool = mock_router.pool(dm)
+    assert pool is not None
+    assert len(attempts) == settings.endpoint_failure_threshold
+    assert pool.healthy() == [], "the breaker must open after the failure threshold"
+    assert pool.pick() is None
+
+    # The next routed request: no caller -> no upstream call -> no timeout wait.
+    started = time.monotonic()
+    assert routes_proxy._decision_caller(dm, {"prompt": "pick one"}) is None
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5, f"a tripped breaker must not wait the decision timeout (took {elapsed:.2f}s)"
+    assert len(attempts) == settings.endpoint_failure_threshold, "no further upstream attempt"
+
+
+# ---------------------------------------------------------------------------
+# masked replay x handback protocol break (audit w6): the mask drops every
+# chunk carrying tool-call argument fragments, but the handback pcai event and
+# the finish_reason: "tool_calls" terminal carry no classified field and used
+# to replay -- so the client was told to execute calls it never received.
+# ---------------------------------------------------------------------------
+
+
+def _sse(obj: dict[str, Any]) -> bytes:
+    return b"data: " + json.dumps(obj).encode() + b"\n\n"
+
+
+_HANDBACK_EVENT = _sse({"pcai": {"event": "handback", "tools": ["bash"], "iteration": 2, "thread": "t1"}})
+_TC_DELTA = _sse(
+    {
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"cmd":"cat ACME-SECRET"}'},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+)
+_TC_FINISH = _sse(
+    {
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "model": "m",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    }
+)
+_USAGE_CHUNK = _sse(
+    {
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "model": "m",
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+    }
+)
+
+
+class _MaskingGuard:
+    """post_call that masks the assembled text (the mask verdict)."""
+
+    async def run_post_call(self, guards: Any, text: str, http: Any) -> Any:
+        return "[masked answer]", [], False
+
+
+class _PassingGuard:
+    """post_call that returns the text unchanged (no mask)."""
+
+    async def run_post_call(self, guards: Any, text: str, http: Any) -> Any:
+        return text, [], False
+
+
+async def _drive_guarded(chunks: list[bytes], guard: Any, monkeypatch: pytest.MonkeyPatch) -> bytes:
+    import time as _time
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(routes_proxy, "guardrails", guard)
+    monkeypatch.setattr(routes_proxy, "model_router", SimpleNamespace(client=None))
+
+    async def inner():
+        for c in chunks:
+            yield c
+
+    out: list[bytes] = []
+    async for chunk in routes_proxy._guarded_sse(
+        inner(),
+        None,
+        [object()],
+        key=_key(),
+        model="m",
+        request_id="req-mask-handback",
+        started=_time.monotonic(),
+        relay_mode=True,
+    ):
+        out.append(chunk)
+    return b"".join(out)
+
+
+def _sse_objects(body: bytes) -> list[dict[str, Any]]:
+    objs: list[dict[str, Any]] = []
+    for line in body.split(b"\n"):
+        stripped = line.strip()
+        if not stripped.startswith(b"data:"):
+            continue
+        payload = stripped[len(b"data:") :].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            objs.append(obj)
+    return objs
+
+
+def _finish_reasons(objs: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for obj in objs:
+        choices = obj.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if isinstance(choice, dict) and choice.get("finish_reason"):
+                out.append(str(choice["finish_reason"]))
+    return out
+
+
+async def test_masked_replay_of_a_handback_turn_suppresses_it_and_forces_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PIN (a): the mask dropped the tool-call deltas, so the turn can no longer
+    be a handback: no handback event may reach the client, and the terminal
+    finish_reason must be "stop" (pre-fix BOTH shipped -> the client was asked
+    to execute calls it never received)."""
+    body = await _drive_guarded(
+        [_HANDBACK_EVENT, _TC_DELTA, _TC_FINISH, _USAGE_CHUNK, b"data: [DONE]\n\n"],
+        _MaskingGuard(),
+        monkeypatch,
+    )
+    objs = _sse_objects(body)
+    events = [o["pcai"].get("event") for o in objs if isinstance(o.get("pcai"), dict)]
+    assert "handback" not in events, f"the handback event survived the mask: {events}"
+    finishes = _finish_reasons(objs)
+    assert "tool_calls" not in finishes, f"a tool_calls terminal survived the mask: {finishes}"
+    assert "stop" in finishes, "the masked turn must close with finish_reason stop"
+    # the suppressed call's arguments never reach the client
+    assert b"ACME-SECRET" not in body
+    # non-text frames are not collateral damage: the usage chunk still replays
+    assert any(o.get("usage") for o in objs), "the usage chunk must still replay"
+
+
+async def test_masked_replay_of_a_non_handback_turn_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PIN (b): a masked turn that never handed back keeps today's shape —
+    the masked answer, a stop terminal, the usage chunk and ONE [DONE]."""
+    content = _sse(
+        {"choices": [{"index": 0, "delta": {"content": "the answer is ACME-SECRET"}, "finish_reason": None}]}
+    )
+    stop = _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    body = await _drive_guarded([content, stop, _USAGE_CHUNK, b"data: [DONE]\n\n"], _MaskingGuard(), monkeypatch)
+    objs = _sse_objects(body)
+    finishes = _finish_reasons(objs)
+    # today's shape: the replayed stop terminal PLUS the synthetic masked
+    # final's own stop. "Every terminal is stop" is what must not regress.
+    assert finishes and set(finishes) == {"stop"}, finishes
+    assert b"ACME-SECRET" not in body
+    assert any(o.get("usage") for o in objs), "the usage chunk must still replay"
+    assert body.count(b"data: [DONE]") == 1
+
+
+async def test_unmasked_handback_still_hands_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PIN (c): with NO mask the handback feature is untouched — the event, the
+    tool-call delta and the tool_calls terminal replay byte-identically."""
+    chunks = [_HANDBACK_EVENT, _TC_DELTA, _TC_FINISH, _USAGE_CHUNK, b"data: [DONE]\n\n"]
+    body = await _drive_guarded(chunks, _PassingGuard(), monkeypatch)
+    assert body == b"".join(chunks), "the pass path must stay byte-identical"
+    objs = _sse_objects(body)
+    events = [o["pcai"].get("event") for o in objs if isinstance(o.get("pcai"), dict)]
+    assert "handback" in events, "an unmasked handback must still reach the client"
+    assert "tool_calls" in _finish_reasons(objs), "an unmasked handback still terminates as tool_calls"

@@ -61,9 +61,16 @@ spec:
     #     pod-label SOURCE matcher (only principals/namespaces/ipBlocks),
     #     and the gateway pods' ServiceAccount names are SITE-specific.
     #     Tighten it with ingressGatewayPrincipals (SPIFFE IDs,
-    #     cluster.local/ns/<ns>/sa/<sa> — discover the gateway pods' SA
-    #     with kubectl -n istio-system get pod -l 'app=ezaf-gateway'
-    #     -o jsonpath='{.items[0].spec.serviceAccountName}').
+    #     cluster.local/ns/<ns>/sa/<sa>). Discover the gateway pods' SA with
+    #     kubectl -n istio-system get pod -l 'istio=ingressgateway'
+    #     -o jsonpath='{.items[0].spec.serviceAccountName}'. Do NOT select on
+    #     app=ezaf-gateway: on G2 no pod carries that label (verified
+    #     2026-11-02), so the query returns nothing — the ezaf-gateway
+    #     Gateway resource is served by the istio-ingressgateway pods, whose
+    #     SA on G2 is istio-ingressgateway-service-account, i.e.
+    #     cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account.
+    #     NOTE: source.principals requires mTLS from the gateway, so verify
+    #     the app namespace has injection on before relying on it.
     - from:
         - source:
             {{- if $ap.ingressGatewayPrincipals }}
@@ -73,10 +80,24 @@ spec:
             namespaces: ["{{ $ap.ingressNamespace }}"]
             {{- end }}
     # (ii) Same-namespace callers (registry scraping / ops tooling
-    #      co-deployed in the release namespace).
+    #      co-deployed in the release namespace) — on the service port,
+    #      EXCEPT the identity/mint/admin surfaces (audit #6): a bare
+    #      from: here admitted every meshed pod in the namespace to the
+    #      routes whose resolvers consume the trusted browser-header
+    #      rung (see rule iv) — a leg rule (iv) cannot close when
+    #      allowInClusterApi is on, because rules OR together. Every
+    #      excluded path ships in BOTH spellings — Istio notPaths are
+    #      EXACT matches unless suffixed /*, so "/admin" alone leaves
+    #      the whole /admin/* API subtree admitted (x-val on audit #6).
+    #      Same notPaths contract as rule (iv); /metrics (rule iii) and
+    #      the health/ready paths stay reachable.
     - from:
         - source:
             namespaces: ["{{ $ns }}"]
+      to:
+        - operation:
+            ports: ["{{ .Values.service.port }}"]
+            notPaths: ["/v1/identity", "/v1/identity/*", "/v1/keys/for-me", "/v1/keys/for-me/*", "/v1/enroll", "/v1/enroll/*", "/admin", "/admin/*"]
     {{- if $ap.allowMetricsScrape }}
     # (iii) Metrics scrape — ANY source, scoped to the metrics path on the
     #     service port ONLY. The 2026-10-07 G2 rollout proved a
@@ -104,15 +125,20 @@ spec:
     #      rules cannot match them (the (iii) lesson, same rollout). The
     #      app's own key auth remains the control on every admitted path —
     #      the edge classifies /v1/* exactly the same way. The
-    #      IDENTITY-BEARING paths (/v1/identity, /v1/keys/for-me — the
-    #      ONLY routes whose resolver consumes the browser-header rung,
-    #      routes_identity.py) stay reachable ONLY from the edge (rule i):
-    #      with trustProxyIdentity on, an in-cluster pod must never be
-    #      able to deliver spoofed X-Auth-Request-* headers to a mint.
+    #      IDENTITY/MINT/ADMIN paths (/v1/identity, /v1/keys/for-me,
+    #      /v1/enroll, /admin — every route whose resolver consumes the
+    #      browser-header rung: routes_identity.py, routes_enroll.py
+    #      POST /enroll, routes_admin.py require_admin; the old "two
+    #      paths" claim was stale — audit #6) stay reachable ONLY from
+    #      the edge (rule i): with trustProxyIdentity on, an in-cluster
+    #      pod must never be able to deliver spoofed X-Auth-Request-*
+    #      headers to a mint. BOTH spellings per path (see rule ii):
+    #      the bare form is the literal path, the /* form the subtree
+    #      the admin API router (prefix=/admin) actually serves.
     - to:
         - operation:
             ports: ["{{ .Values.service.port }}"]
-            notPaths: ["/v1/identity", "/v1/keys/for-me"]
+            notPaths: ["/v1/identity", "/v1/identity/*", "/v1/keys/for-me", "/v1/keys/for-me/*", "/v1/enroll", "/v1/enroll/*", "/admin", "/admin/*"]
     {{- end }}
     {{- end }}
 {{- end }}

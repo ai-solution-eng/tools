@@ -447,6 +447,125 @@ def test_admin_endpoints_merges_breaker_state(monkeypatch: pytest.MonkeyPatch) -
     assert gone["state"] == "disabled" and gone["consecutive_failures"] == 0
 
 
+class ModelPoolFakeDB:
+    """Rows for GET /admin/models/{name}/pool (the console edit read)."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.queries: list[tuple[str, tuple]] = []
+
+    async def fetch(self, sql: str, *a: Any):
+        self.queries.append((sql, a))
+        if "FROM model_endpoints" in sql and "WHERE model_name" in sql:
+            return self.rows
+        return []
+
+
+def test_model_pool_edit_read_returns_registration_not_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The console edit form needs the whole pool, but NEVER the credential.
+
+    api_key_secret is the by-reference K8s Secret NAME (the same pointer the
+    MCP registry exposes as auth_secret) and auth_configured is the boolean
+    "a panel token is stored" — the form uses it only to render "(unchanged)".
+    weight 0 is a REAL value (standby) and must survive the read."""
+    fake = ModelPoolFakeDB(
+        [
+            {
+                "base_url": "http://glm/v1",
+                "priority": 0,
+                "weight": 1,
+                "api_key_secret": "upstream-glm",
+                "auth_configured": True,
+                "model_type": "chat",
+            },
+            {
+                "base_url": "http://glm-standby/v1",
+                "priority": 1,
+                "weight": 0,
+                "api_key_secret": None,
+                "auth_configured": False,
+                "model_type": "chat",
+            },
+        ]
+    )
+    tc = _admin_client(monkeypatch, fake)
+    r = tc.get("/admin/models/glm/pool", headers=_ah())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model_name"] == "glm" and body["model_type"] == "chat"
+    assert [e["base_url"] for e in body["endpoints"]] == [
+        "http://glm/v1",
+        "http://glm-standby/v1",
+    ]
+    first, second = body["endpoints"]
+    assert first["api_key_secret"] == "upstream-glm"
+    assert first["auth_configured"] is True
+    assert second["api_key_secret"] is None and second["auth_configured"] is False
+    # standby weight survives unchanged
+    assert second["weight"] == 0
+    # no credential VALUE (or ciphertext) is ever selected or returned
+    for ep in body["endpoints"]:
+        assert "api_key" not in ep and "auth_token" not in ep and "auth_token_enc" not in ep
+    sql = fake.queries[0][0]
+    assert "auth_token_enc IS NOT NULL" in sql
+    assert "SELECT auth_token_enc" not in sql
+
+
+def test_model_pool_edit_read_404_and_mixed_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unknown pool is a 404; a pool whose rows disagree on model_type
+    reports None (the console then leaves auto-detect on and says so) rather
+    than silently pinning one endpoint's type."""
+    fake = ModelPoolFakeDB([])
+    tc = _admin_client(monkeypatch, fake)
+    r = tc.get("/admin/models/ghost/pool", headers=_ah())
+    assert r.status_code == 404
+
+    fake.rows = [
+        {
+            "base_url": "http://a/v1",
+            "priority": 0,
+            "weight": 1,
+            "api_key_secret": None,
+            "auth_configured": False,
+            "model_type": "chat",
+        },
+        {
+            "base_url": "http://b/v1",
+            "priority": 0,
+            "weight": 1,
+            "api_key_secret": None,
+            "auth_configured": False,
+            "model_type": "embedding",
+        },
+    ]
+    r2 = tc.get("/admin/models/mixed/pool", headers=_ah())
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["model_type"] is None
+
+
+def test_model_pool_edit_read_accepts_slash_in_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Slash-named pools ("Qwen/Qwen3.8-27B-FP8") are legal; the route must
+    carry the whole name, exactly like the probe route does."""
+    fake = ModelPoolFakeDB(
+        [
+            {
+                "base_url": "http://qwen/v1",
+                "priority": 0,
+                "weight": 1,
+                "api_key_secret": None,
+                "auth_configured": False,
+                "model_type": "chat",
+            }
+        ]
+    )
+    tc = _admin_client(monkeypatch, fake)
+    r = tc.get("/admin/models/Qwen/Qwen3.8-27B-FP8/pool", headers=_ah())
+    assert r.status_code == 200, r.text
+    assert fake.queries[0][1] == ("Qwen/Qwen3.8-27B-FP8",)
+
+
 class ProbeFakeDB(EndpointsFakeDB):
     async def fetch(self, sql: str, *a: Any):
         return []
@@ -1420,6 +1539,7 @@ def test_retention_prunes_when_configured(monkeypatch: pytest.MonkeyPatch) -> No
     assert "make_interval" in trace_del and "make_interval" in conv_del
     # ledger untouched
     assert not any("DELETE FROM usage_ledger" in s for s in sqls)
+
 
 # ---------------------------------------------------------------------------
 # F6 (audit 2026-10-29): /mcp rate-limit refusals settle "rate_limited"

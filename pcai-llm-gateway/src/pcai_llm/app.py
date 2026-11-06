@@ -10,12 +10,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -29,8 +33,9 @@ from .api.routes_enroll import admin_router as enroll_admin_router
 from .api.routes_enroll import router as enroll_router
 from .api.routes_identity import router as identity_router
 from .api.routes_mcp import mount as mount_mcp
+from .api.routes_team_leader import router as team_leader_router
 from .config import settings
-from .core import housekeeping, offpeak, registry
+from .core import health_probe, housekeeping, offpeak, registry, tracing
 from .db import PoolUnavailable, db
 from .routing.router import router as model_router
 
@@ -76,6 +81,67 @@ class DurationHeaderMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
+class ServerSpanMiddleware:
+    """One OpenTelemetry server span per HTTP request (pure ASGI, free when off).
+
+    WHY pure ASGI: the same reason as DurationHeaderMiddleware below — this
+    wraps every request, including SSE streams and the /mcp mount, and must not
+    reintroduce Starlette's BaseHTTPMiddleware task/memory-stream layer.
+
+    WHY the body is never read: a tracing layer that buffers the request body
+    would break streaming uploads and cost memory on the 32 MB max_body_bytes
+    path. The span carries routing/status facts only — method, PATH, status,
+    duration.
+
+    WHY the path and not the URL: scope["path"] structurally excludes the query
+    string (that is scope["query_string"]). A query can carry an API key, a
+    prompt, or a token; it must never reach a collector.
+
+    Disabled (the default) this is one boolean read and a straight pass-through:
+    no span object, no attribute dict, no task — see core.tracing.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Two independent entry conditions: a non-HTTP ASGI scope, or tracing off.
+        if scope["type"] != "http" or not tracing.enabled():
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method") or "")
+        path = str(scope.get("path") or "/")
+        span = tracing.start_span(f"{method} {path}", {"http.method": method, "http.target": path})
+        started = time.monotonic()
+        status_code = 0
+        failed = False
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # A raising app has no response status: record it as an error span,
+            # then let the app's exception handlers / the server deal with it.
+            failed = True
+            raise
+        finally:
+            # end() is a no-op for an unsampled span and never raises; on a
+            # client disconnect (CancelledError) it still runs, so the span is
+            # closed with whatever status the response reached.
+            span.end(
+                {
+                    "http.status_code": status_code,
+                    "duration_ms": f"{(time.monotonic() - started) * 1000:.3f}",
+                },
+                error=failed or status_code >= 500,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Bring up DB pool -> router client -> registry caches; reverse on shutdown.
@@ -96,6 +162,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if hasattr(model_router, "start"):
         await model_router.start()
     await registry.refresh()
+    # Active health probe (GOAL A): passive availability (breaker-not-cooling,
+    # traffic-fed) leaves an idle-but-broken model reading healthy forever.
+    # The probe gives Pool.healthy() a traffic-independent signal (GET
+    # {base_url}/models every interval). Inert (no task) when the flag is off
+    # or the interval is <= 0; never raises into the lifespan (start/stop are
+    # defensive by contract).
+    await health_probe.start()
     if settings.offpeak_enabled:
         await offpeak.start()
     # Housekeeping sweep (audit finding 16): rate_windows + operator-opted
@@ -103,9 +176,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (boot + admin writes only), so an idle-admin deployment grew
     # rate_windows for the process lifetime. Own loop, error-swallowed.
     await housekeeping.start()
+    # Cross-replica convergence (2026-10-30): the registry snapshot is
+    # process-local, so a mutation served by ONE replica left its siblings
+    # stale until they restarted (console "test" 404s, relay "unknown
+    # server"). The watcher polls a DB watermark and refreshes when it moves.
+    # Started AFTER the boot refresh; its first tick (one cadence later) may do
+    # one redundant refresh because no watermark is recorded yet — harmless, and
+    # seeding one at boot would be WORSE: a write landing between the boot
+    # refresh and the seed would be recorded as already-seen.
+    await registry.start_watcher()
     try:
         yield
     finally:
+        # Before the pool closes: the watcher's watermark query needs a
+        # connection, and a cancel mid-query must not outlive db.close().
+        await registry.stop_watcher()
+        await health_probe.stop()
         await housekeeping.stop()
         if settings.offpeak_enabled:
             await offpeak.stop()
@@ -122,6 +208,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.wait_for(drain_sticky_writes(), timeout=5.0)
         except Exception:  # shutdown must never hang on a pick write
             log.warning("sticky-write drain at shutdown did not complete cleanly", exc_info=True)
+        # Tracing: drain in-flight OTLP exports, then close the exporter client.
+        # Both are no-ops when tracing is off (no client, no pending task) and
+        # neither can raise, so shutdown ordering is otherwise unchanged.
+        await tracing.flush()
+        await tracing.aclose()
         await db.close()
 
 
@@ -136,14 +227,25 @@ def create_app() -> FastAPI:
         openapi_url=None,
     )
     app.include_router(routes_proxy.router)
+    # Native /rerank spelling (no /v1) for clients that strip the prefix,
+    # e.g. the RAG pipeline's MultiModalReranker.
+    app.include_router(routes_proxy.rerank_alias_router)
     app.include_router(routes_admin.router)
     app.include_router(conversations_router)
     if settings.distiller_enabled:
-        # session distiller: unmounted entirely when off (the routes_mcp_self pattern - an off surface 404s like a route that never existed); even when on, per-key attachment gates make it inert for keys without the memory pair (routes_distill.memory_attached)
+        # session distiller: unmounted entirely when off (the routes_mcp_self pattern - an off surface 404s like a route that never existed); even when on, per-key attachment gates make it inert for keys the backend reports unattached (routes_distill.memory_attached)
         app.include_router(distill_router)
     app.include_router(enroll_router)
     app.include_router(enroll_admin_router)
     app.include_router(identity_router)
+    # Team leader tier: the enrollment-scoped mini control plane. Its gate is
+    # its OWN dependency (routes_team_leader.require_team_leader — a hash
+    # match against enrollments.team_leader_key_hash), deliberately NOT the
+    # admin dependency: a leader key must never reach /admin, and an admin
+    # key is not a leader key. An enrollment with no leader key simply has no
+    # valid credential here, so the surface 401s — there is nothing to mount
+    # conditionally and no flag to turn on.
+    app.include_router(team_leader_router)
     # effective-prompt review (wave C): the admin gate lives in
     # routes_admin.require_admin, imported — not copied — by this router.
     app.include_router(effective_router)
@@ -165,6 +267,14 @@ def create_app() -> FastAPI:
 
         app.include_router(routes_dispatch.router)
     mount_mcp(app)  # MCP federation mounts its own routes/middleware
+
+    # OpenTelemetry server spans: ONE span per HTTP request (class docstring
+    # has the WHY). Registered BEFORE the duration middleware so that one stays
+    # the OUTERMOST layer — its position is pinned by
+    # tests/test_backend_hardening.py, and the span loses nothing one layer in:
+    # the only work outside it is the duration header stamp. Free when
+    # PCAI_LLM_OTEL_ENABLED is false (one boolean read + pass-through).
+    app.add_middleware(ServerSpanMiddleware)
 
     # Pure-ASGI duration stamping (class docstring has the WHY). Registered
     # FIRST via add_middleware so it is the OUTERMOST layer: the header
@@ -255,6 +365,23 @@ def create_app() -> FastAPI:
         async def admin_console(request: Request) -> Response:
             """Admin console (keys / profiles / MCP / usage / models)."""
             return _ui_response(admin_html, request)
+
+        # Team leader console: the enrollment-scoped sibling of /admin. Same
+        # static-page discipline (no data in the page; it prompts for the
+        # leader key, keeps it in sessionStorage and sends it as a Bearer on
+        # every fetch to /team_leader/*). Read in its OWN try: a slim install
+        # that ships without this page must still serve / and /admin — the
+        # outer guard already tolerates a missing ui/ directory, but a single
+        # missing FILE must not take the other consoles down with it.
+        try:
+            team_leader_html = (resources.files("pcai_llm") / "ui" / "team_leader.html").read_text(encoding="utf-8")
+
+            @app.get("/team_leader", include_in_schema=False)
+            async def team_leader_console(request: Request) -> Response:
+                """Team leader console (keys / advertised / usage / traces)."""
+                return _ui_response(team_leader_html, request)
+        except FileNotFoundError:
+            log.warning("ui/team_leader.html not present; /team_leader console disabled")
     except (ModuleNotFoundError, FileNotFoundError):
         log.warning("UI assets not present; / and /admin console disabled (API-only install)")
 
@@ -276,6 +403,43 @@ def create_app() -> FastAPI:
             raise HTTPException(503, "database unreachable")
         return {"status": "ready"}
 
+    # --- SSO sign-out (browser path; public by design) ---------------------
+    # WHY the gateway owns this path: the chat/admin consoles link "Sign out",
+    # and behind the platform edge chain the oauth2-proxy session is a
+    # DOMAIN-WIDE HttpOnly cookie that the page's JS cannot clear. Before this
+    # route the link went to /oauth2/sign_out, which (on any deployment whose
+    # VirtualService catch-all sends / to the gateway) reached FastAPI and
+    # rendered {"detail":"Not Found"} — the cookie survived, so the user came
+    # back "still signed in". That is the whole bug: a dead end that LOOKED
+    # like a sign-out.
+    #
+    # Two shapes, both a redirect (never a 404):
+    #   * PCAI_LLM_SSO_SIGN_OUT_URL set -> 302 to the proxy's own sign-out
+    #     (cross-host is fine: the cookie is set on the parent domain, so the
+    #     proxy can clear it and bounce back through rd);
+    #   * unset -> 302 to "/?signout=local", which the console reads to say
+    #     "signed out on this device; the platform session is still active"
+    #     instead of pretending it ended. Honest beats silent.
+    # A chart VirtualService route for /oauth2/ (ezua.virtualService.ssoProxy)
+    # supersedes this handler entirely by sending the path to the proxy
+    # directly — same-origin, no config needed. This is the fallback.
+    @app.get("/oauth2/sign_out", include_in_schema=False)
+    async def sso_sign_out(rd: str = "/") -> RedirectResponse:
+        """End the browser session: proxy sign-out when configured, else an
+        honest local-only redirect. Never a 404 (see the block comment)."""
+        # rd is a RETURN path, so it must stay on this origin: a relative path
+        # only (no scheme, no protocol-relative //host). Anything else would
+        # make this endpoint an open redirect, which is a phishing primitive
+        # on a page that holds bearer keys in sessionStorage.
+        target = rd if rd.startswith("/") and not rd.startswith("//") else "/"
+        configured = settings.sso_sign_out_url.strip()
+        if not configured:
+            return RedirectResponse("/?signout=local", status_code=302)
+        # Preserve an existing query on the configured URL (some proxies mount
+        # it with a required param) instead of assuming there is none.
+        joiner = "&" if "?" in configured else "?"
+        return RedirectResponse(f"{configured}{joiner}rd={quote(target, safe='')}", status_code=302)
+
     if settings.metrics_enabled:
         # Import-guarded per the fleet's additive-metrics convention: an
         # optional dependency must never take the whole gateway down.
@@ -285,6 +449,31 @@ def create_app() -> FastAPI:
             app.mount("/metrics", make_asgi_app())
         except ImportError:
             log.warning("prometheus_client not installed; /metrics disabled")
+
+    def _json_safe(value: Any) -> Any:
+        """Replace non-finite floats so a 422 body can always be serialized.
+
+        WHY (found in the 2026-10-30 cross-model review): pydantic echoes the
+        offending INPUT back inside a validation error, and Starlette's
+        JSONResponse is allow_nan=False. A body carrying NaN/Infinity — which
+        Python's json module happily parses — therefore produced a 500 while
+        BUILDING the 422, on every constrained float field in the API: the
+        refusal was right and the response was unbuildable. Stringify only the
+        non-finite values (the error type already says what was wrong); the
+        payload shape is otherwise FastAPI's own.
+        """
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, dict):
+            return {k: _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        return value
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """The default 422 body, made always-serializable (see _json_safe)."""
+        return JSONResponse(status_code=422, content={"detail": _json_safe(exc.errors())})
 
     @app.exception_handler(PoolUnavailable)
     async def pool_unavailable(request: Request, exc: PoolUnavailable) -> JSONResponse:

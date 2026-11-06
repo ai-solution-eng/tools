@@ -148,6 +148,21 @@ settings:
   # One extra attempt per relay TURN when a bounded model call expires on timeout; the retry
   # budget comes out of the remaining wall clock. 0 = fail immediately.
   toolRelayCallRetries: 1
+  # --- Active endpoint health probe (2026-11-03) ---------------------------
+  # GETs {base_url}/models per endpoint every intervalS; an endpoint that fails
+  # `failuresToTrip` CONSECUTIVE sweeps drops out of rotation. Closes the
+  # "idle-but-broken reads healthy" gap in the load-aware cascade.
+  # OFF here: the probe defaults OFF after the 2026-11-03 incident (an auth-less
+  # probe marked the g2 fleet probe-failed and every request answered
+  # 503 "no healthy upstream"). The four guards are in place (endpoint
+  # credentials; 401/403 = alive; 4xx-other = unknown; never-empty invariant +
+  # hysteresis), but a site should observe its own fleet probed OK before
+  # trusting it. Flip to true, then check GET /admin/endpoints.
+  healthProbe:
+    enabled: false
+    intervalS: 30
+    timeoutS: 5
+    failuresToTrip: 2
   # Complexity routing (pseudo-models `routing` / `routing__<model>`): behavior is gated PER
   # PROFILE by routing_policy ('off'|'shadow'|'active') — these are the scoring knobs.
   routingEnabled: true

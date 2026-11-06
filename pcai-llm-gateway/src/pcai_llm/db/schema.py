@@ -153,6 +153,27 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_subject ON api_keys(subject_id);
 -- landing on the old id AFTER the rotate commits are still counted.
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS spend_ancestors UUID[] NOT NULL DEFAULT '{}';
 
+-- Key group (conversation continuity across rotation, 2026-11-03): the
+-- stable identity of "this credential" across rotations. Every rotate copies
+-- the OLD key's key_group onto the new row, so a chain A -> B -> C is ONE
+-- group even though it is three key ids. Backfill derives the group from the
+-- spend_ancestors lineage (its first entry IS the chain root) so rotations
+-- that predate this column group correctly; a key with no ancestors is its
+-- own root.
+--
+-- WHY not scope saved conversations by key_id alone: rotation revokes the
+-- old row and mints a new id, and the chat console's history is keyed by the
+-- credential — so every rotation silently orphaned the user's transcripts
+-- ("Conversations aren't saved for the key after rotation", operator report).
+-- The group is the narrowest identity that survives a rotation: it does NOT
+-- widen visibility across a user's INDEPENDENT keys (those get their own
+-- group), which user_id scoping would.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_group UUID;
+UPDATE api_keys SET key_group = COALESCE(spend_ancestors[1], id) WHERE key_group IS NULL;
+ALTER TABLE api_keys ALTER COLUMN key_group SET DEFAULT gen_random_uuid();
+ALTER TABLE api_keys ALTER COLUMN key_group SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_api_keys_group ON api_keys(key_group);
+
 -- Embedding cache: dedupes identical (model, input) embedding calls.
 -- MultimodalRAG and other clients re-embed the same chunks constantly
 -- (re-ingestion, re-chunking, repeated queries); a cached hit costs zero
@@ -168,6 +189,24 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_embcache_model ON embedding_cache(model, created_at DESC);
+
+-- Exact-match RESPONSE cache for non-streaming chat (2026-11-02).
+-- Distinct from embedding_cache (vectors) and from the upstream PREFIX cache
+-- (which only saves re-prefill): a hit here skips the model entirely - zero
+-- GPU, zero budget - and settles a free cache_hit ledger row.
+-- Keyed on (key_id, model, sha256 of the canonical request), so one tenant's
+-- answer can never be served to another, and the body is stored as BYTEA so
+-- replay is byte-identical to what the upstream returned.
+CREATE TABLE IF NOT EXISTS response_cache (
+    key_id        UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    model         TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    response_body BYTEA NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (key_id, model, request_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_response_cache_expiry ON response_cache(expires_at);
 
 CREATE TABLE IF NOT EXISTS budgets (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -192,6 +231,18 @@ CREATE TABLE IF NOT EXISTS cost_budgets (
     UNIQUE (key_id, model, period)
 );
 CREATE INDEX IF NOT EXISTS idx_cost_budgets_key ON cost_budgets(key_id);
+
+-- 2026-11-02: quarterly/yearly budget periods. The inline CHECK above cannot
+-- be widened on an existing database, so both tables re-state it (idempotent:
+-- DROP IF EXISTS then ADD). 'hour' is deliberately NOT added - the rate
+-- limiter already owns per-minute windows, and an hourly BUDGET has no
+-- consumer.
+ALTER TABLE budgets DROP CONSTRAINT IF EXISTS budgets_period_check;
+ALTER TABLE budgets ADD CONSTRAINT budgets_period_check
+    CHECK (period IN ('day','week','month','quarter','year'));
+ALTER TABLE cost_budgets DROP CONSTRAINT IF EXISTS cost_budgets_period_check;
+ALTER TABLE cost_budgets ADD CONSTRAINT cost_budgets_period_check
+    CHECK (period IN ('day','week','month','quarter','year'));
 
 CREATE TABLE IF NOT EXISTS usage_ledger (
     -- PARTITIONING NOTE (2026-09-24): created UNPARTITIONED for zero-friction
@@ -227,7 +278,8 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
 );
 -- CHECK constraints (audit finding 20): the status vocabulary was enforced
 -- only by writer discipline — a typo'd status silently broke the budget
--- gate's `status IN ('ok','error')` SUM semantics and the PrometheusRule's
+-- gate's SUM semantics (core.budgets._COSTED_STATUSES: ok/error/
+-- guardrail_blocked — a blocked call still spent real upstream tokens) and the PrometheusRule's
 -- status alerting. Additive + idempotent (NOT VALID keeps the migration
 -- instant even on a huge ledger; existing rows are trusted, new writes
 -- are checked — VALIDATE later if desired).
@@ -365,6 +417,30 @@ ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAU
 -- to 'all'; allowlists the admin actually built are preserved.
 UPDATE mcp_servers SET tool_policy = 'all'
 WHERE allowed_tools_json IN ('[]', '', NULL) AND tool_policy <> 'all';
+-- Tool-relay governance, in UNITS — not model rounds (2026-11-03).
+-- The relay's per-turn bound used to be a COUNT of model iterations
+-- (settings.tool_relay_max_iterations). A count cannot express "this server
+-- is expensive": one call to a heavyweight server can cost far more upstream
+-- work than ten calls to a cheap one, and a count charged both the same. The
+-- bound is therefore a BUDGET denominated in UNITS, where every call charges
+-- its server's tool_weight (below) — a 0.1-weight call spends 0.1 units, so a
+-- cheap server is ~10x cheaper against the same budget. Fractional on
+-- purpose; a budget of 8.0 is "eight neutral calls", not "eight rounds".
+--
+-- profiles.tool_relay_budget: the per-profile override. NULL = INHERIT
+-- settings.tool_relay_max_iterations (read as a unit budget), so every
+-- existing profile keeps today's NUMBER until an operator sets one — but the
+-- UNIT changed with it: a batch of k parallel calls now costs k, not 1, so a
+-- parallel-heavy turn is bounded TIGHTER than before. INTEGER on purpose: an operator types "8", not "8.0"; the fractional
+-- side of the arithmetic lives in the weights, not in the budget.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS tool_relay_budget INTEGER;
+-- mcp_servers.tool_weight: what ONE call to this server charges, in the same
+-- units. REAL (not INTEGER) is the whole point: 0.1 is the useful shape for a
+-- cheap server ("a tenth of a neutral call"). 1.0 = neutral, and it is the
+-- NOT NULL default, so every pre-existing row charges one unit per call:
+-- the old NUMBER, on the new (call) unit. The admin API floors the value at 0.01 — a 0 weight would make a
+-- server's calls FREE and let a loop on it run to the wall-clock bound alone.
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tool_weight REAL NOT NULL DEFAULT 1.0;
 ALTER TABLE model_endpoints ADD COLUMN IF NOT EXISTS auth_token_enc TEXT;
 ALTER TABLE model_endpoints ADD COLUMN IF NOT EXISTS model_type TEXT NOT NULL DEFAULT 'chat';
 
@@ -411,12 +487,33 @@ ALTER TABLE agent_traces ADD CONSTRAINT ck_traces_status
 CREATE INDEX IF NOT EXISTS idx_traces_request ON agent_traces(request_id);
 CREATE INDEX IF NOT EXISTS idx_traces_key_ts  ON agent_traces(key_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_user_ts ON agent_traces(user_id, ts DESC);
+-- ts-leading (audit A-3, 2026-11-02): the admin/team explorer filters on ts
+-- ONLY when no actor filter is given (its since defaults to 30 days) and then
+-- groups by request_id. Without this every such page is a sequential scan +
+-- hash aggregate over a table that is NEVER pruned by default
+-- (retention_trace_days = 0), on the pool the data plane shares. Exactly the
+-- idx_ledger_ts shape added for the same reason (audit P1-4).
+CREATE INDEX IF NOT EXISTS idx_traces_ts      ON agent_traces(ts DESC);
 -- Conversation grouping: a stable fingerprint of (key, first user message).
 -- Harness loops (DSH) re-send the accumulated history every step, so one
 -- long multi-turn conversation spans MANY request_ids — the thread key is
 -- what groups them into one trace conversation.
 ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS thread_id TEXT;
+-- Prefix-cache hits reported by the upstream for this step (2026-11-02).
+-- The trace table is the "what did the agent do" surface; cached tokens are
+-- what makes the conversation's INPUT cost legible (a 98%-cached turn and a
+-- cold turn look identical on prompt_tokens alone).
+ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS cached_tokens BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_traces_thread ON agent_traces(thread_id);
+-- Conversation READ path (2026-11-02): the explorer picks the N most recent
+-- conversations under the actor filters and then reads EVERY row of them.
+-- The thread_id-only index above still earns its keep for the UNSCOPED
+-- selection (an index-ordered GROUP BY thread_id avoids the sort), but it
+-- cannot serve the scoped one: with a key_id (or enrollment) filter the
+-- selection is "newest conversations of THIS key", and the fetch that
+-- follows is a ts-ordered read per thread. Shape mirrors
+-- idx_effective_prompts_thread (effective_prompts: key_id, thread_id, created_at).
+CREATE INDEX IF NOT EXISTS idx_traces_key_thread_ts ON agent_traces(key_id, thread_id, ts DESC);
 
 -- Saved conversations (per API key): server-side transcripts so the chat
 -- console's left panel survives tabs and devices. The client pushes the
@@ -426,11 +523,21 @@ CREATE TABLE IF NOT EXISTS conversations (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     key_id     UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     user_id    UUID,
+    -- The KEY GROUP that owns this transcript (rotation-stable; see the
+    -- api_keys.key_group migration above). key_id stays as provenance —
+    -- "which credential created this row" — and keeps the cascade FK.
+    key_group  UUID,
     title      TEXT NOT NULL DEFAULT 'New conversation',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_key ON conversations(key_id, updated_at DESC);
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS key_group UUID;
+-- Backfill from the creating key's group; every existing row has a key_id.
+UPDATE conversations c SET key_group = k.key_group
+  FROM api_keys k WHERE c.key_id = k.id AND c.key_group IS NULL;
+ALTER TABLE conversations ALTER COLUMN key_group SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(key_group, updated_at DESC);
 
 -- Session distiller state (2026-10): one row per distilled conversation.
 -- Mirrors the DSH plugin's session lifecycle: a conversation is distilled
@@ -528,6 +635,25 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     UNIQUE (conversation_id, seq)
 );
 
+-- Compressed tool-result originals (X-PCAI-Compress-Tools, 2026-11-04).
+-- The model sees a compressed result plus a marker; this table holds the
+-- exact original so the model can call pcai__retrieve and page it back.
+-- KEY-SCOPED by primary key: a digest resolves only for the key that
+-- produced it (a globally addressable store would be a cross-tenant read
+-- primitive). Expiry is housekeeping's job (tool_compress_store_ttl_s),
+-- never the lookup's: a row that outlives its TTL is still correct to
+-- serve, just overdue for reclamation.
+CREATE TABLE IF NOT EXISTS tool_compress_store (
+    key_id     UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    digest     TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    chars      INT  NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_id, digest)
+);
+CREATE INDEX IF NOT EXISTS tool_compress_store_created_at
+    ON tool_compress_store (created_at);
+
 -- Self-service key enrollment (invite codes): the admin mints a code bound
 -- to tenant+profile; anyone holding it redeems at POST /v1/enroll for a
 -- personal key with the profile's budgets/cascade/grants applied. Codes are
@@ -538,12 +664,122 @@ CREATE TABLE IF NOT EXISTS enrollments (
     label      TEXT NOT NULL DEFAULT '',
     tenant_id  UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
-    max_uses   INT  NOT NULL DEFAULT 0,        -- 0 = unlimited
+    max_uses   INT  NOT NULL DEFAULT 1,        -- strictly positive; 0 is refused (2026-10-30)
     uses       INT  NOT NULL DEFAULT 0,
     expires_at TIMESTAMPTZ,
     revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ============================================================================
+-- Team leader tier (2026-10-30). An enrollment code is a TEAM INVITE: every
+-- key redeemed from it carries api_keys.enrollment_id, which groups those keys
+-- into one budget ENVELOPE (a HARD cap on the team's SUM) and gives the
+-- enrollment a scoped control plane at /team_leader over exactly its own keys,
+-- usage and traces. ALL ADDITIVE / idempotent, same discipline as every
+-- migration above.
+-- ============================================================================
+
+-- Which enrollment (team) a key belongs to. ON DELETE SET NULL, never CASCADE:
+-- deleting an enrollment must not delete the keys its teammates are still
+-- holding (usage_ledger references them, and an orphaned key would be a
+-- 500-shaped hole in the data plane) — the keys simply become un-grouped,
+-- which is exactly the pre-feature behavior. NULL = outside any team, which is
+-- every key that predates this migration.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enrollment_id UUID REFERENCES enrollments(id) ON DELETE SET NULL;
+-- Serves the team console's "keys in this enrollment" list and team_spend's
+-- per-enrollment ledger JOIN (both filter api_keys BY enrollment_id).
+CREATE INDEX IF NOT EXISTS idx_api_keys_enrollment ON api_keys(enrollment_id);
+
+-- The team budget envelope. NULL = that cap is NOT set; an enrollment with
+-- both NULL enforces nothing (its keys behave exactly as before — the grouping
+-- is then reporting-only). budget_period is validated APP-SIDE against
+-- core.teams.TEAM_PERIODS (day|week|month) rather than by a CHECK constraint,
+-- matching this file's tolerance for values written by older builds and raw
+-- JSON presets: a bad value normalizes to 'month' at READ time, whereas a
+-- CHECK would fail the whole multi-statement schema apply on a live database.
+-- 2026-10-30: max_uses is STRICTLY POSITIVE — 0 no longer means "unlimited"
+-- (it is EXHAUSTED, and the redeem predicate fails closed on it). The CREATE
+-- TABLE default only applies to a fresh database, so an existing deployment
+-- needs this ALTER to stop minting unlimited codes by omission.
+ALTER TABLE enrollments ALTER COLUMN max_uses SET DEFAULT 1;
+
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS budget_tokens BIGINT;          -- NULL = no team token cap
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS budget_usd NUMERIC(12,4);      -- NULL = no team USD cap
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS budget_period TEXT NOT NULL DEFAULT 'month';  -- day|week|month
+-- TRUE (the default) = the UNALLOCATED remainder of the envelope is a shared
+-- overflow pool: a key may exceed its own allocation while the team still has
+-- headroom. FALSE = each key is hard-capped at its own allocation (the
+-- envelope still caps the team). Default TRUE keeps an existing team usable
+-- without minting a per-key allocation for every teammate.
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS overflow_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- The team leader key: a control-plane credential scoped to ONE enrollment
+-- (the analog of the admin key, not of an api_key). HASH-ONLY, exactly like
+-- api_keys.key_hash and enrollments.code_hash — the plaintext is returned once
+-- at mint/rotate and is never stored, logged or projected. prefix +
+-- created_at exist so the console can show WHICH credential is live;
+-- revoked_at (not a row delete) is the kill switch core.teams.authenticate_leader
+-- enforces in SQL, so a revoke keeps its audit trail (prefix/created_at stay).
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS team_leader_key_hash TEXT;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS team_leader_key_prefix TEXT NOT NULL DEFAULT '';
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS team_leader_key_created_at TIMESTAMPTZ;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS team_leader_key_revoked_at TIMESTAMPTZ;
+-- WHEN the leader credential was last used. created_at answers "when was it
+-- minted", never "is it still in use" — and a stale-credential review (rotate
+-- it? revoke it? hand the console to someone else?) is exactly that second
+-- question. Stamped BEST-EFFORT on a successful leader auth by
+-- core.teams.stamp_leader_used, throttled to one write per hour per enrollment
+-- (the console polls; a row per request would be pure write amplification).
+-- NULL = never used since it was minted, which is itself the signal.
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS team_leader_key_last_used_at TIMESTAMPTZ;
+-- One live leader credential per hash, enforced BY THE DATABASE: a duplicate
+-- (a copied row, a buggy rotate that reuses a hash) must fail the UPDATE
+-- instead of silently authorizing the wrong team's console. Partial index
+-- because the column is NULL for every enrollment without a leader key.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_enrollments_leader_hash
+    ON enrollments(team_leader_key_hash) WHERE team_leader_key_hash IS NOT NULL;
+
+-- BUDGET TOP-UP REQUESTS (team leader tier): the enrollment CAP is the admin's
+-- alone, but a leader who has hit "available 0" otherwise has no way to ask for
+-- more except out-of-band. This is the ask/approve QUEUE: the leader files one
+-- open request, an admin approves (which raises the cap) or denies.
+--
+-- WHY a table and not a flag on enrollments: the request is an EVENT with a
+-- resolution — who asked, when, what was approved versus what was requested,
+-- and who resolved it. Overwriting a column would lose exactly the audit story
+-- an approval trail exists to keep, and a rejected ask is information too.
+--
+-- requested_* are NULLABLE PER KIND: "another 5M tokens" and "another $20" are
+-- different asks (the envelope is per kind), so a request carries either or
+-- both, and the approver may OVERRIDE the amounts. No CHECK constraint on the
+-- pair — an all-NULL row is rejected app-side (the request body needs at least
+-- one amount), matching how budget_period is validated in code, not in DDL.
+--
+-- status: 'pending' | 'approved' | 'denied'. A partial-ish index on status
+-- serves the console's "pending" card (the only unbounded-growth query shape);
+-- the per-enrollment index serves the leader's own history.
+CREATE TABLE IF NOT EXISTS enrollment_topup_requests (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    enrollment_id    UUID NOT NULL REFERENCES enrollments(id) ON DELETE CASCADE,
+    requested_tokens BIGINT,          -- NULL = not asking for tokens
+    requested_usd    NUMERIC(12,4),   -- NULL = not asking for USD
+    note             TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at      TIMESTAMPTZ,
+    resolved_by      TEXT NOT NULL DEFAULT ''   -- admin actor label ('' = unresolved)
+);
+CREATE INDEX IF NOT EXISTS idx_topup_status ON enrollment_topup_requests(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topup_enrollment ON enrollment_topup_requests(enrollment_id, created_at DESC);
+-- ONE OPEN ASK PER TEAM, enforced BY THE DATABASE. The route checks for a
+-- pending row before inserting, but check-then-INSERT is a race: two concurrent
+-- POSTs (a double-click on a slow link) both see "none pending" and both insert,
+-- and the admin then approves two asks that were meant to be one. The partial
+-- unique index makes the loser fail instead — the route maps the violation to
+-- the same 409 the pre-check raises, so the caller sees one contract either way.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_topup_one_pending
+    ON enrollment_topup_requests(enrollment_id) WHERE status = 'pending';
 
 -- Per-key MCP credential overrides (the memory-MCP pattern: identity via
 -- request headers like X-Memory-Dataset / X-Dataset-Password). Fernet-
@@ -613,6 +849,13 @@ CREATE TABLE IF NOT EXISTS guardrails (
     enabled     BOOLEAN NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 2026-11-02: the secrets engine joined the framework. CREATE TABLE IF NOT
+-- EXISTS cannot widen an existing CHECK, so the constraint is re-stated for
+-- databases created before this wave (DROP IF EXISTS + ADD is idempotent).
+ALTER TABLE guardrails DROP CONSTRAINT IF EXISTS guardrails_engine_check;
+ALTER TABLE guardrails ADD CONSTRAINT guardrails_engine_check
+    CHECK (engine IN ('blocklist','regex_pii','length','webhook','secrets'));
 
 CREATE TABLE IF NOT EXISTS model_guardrails (
     model_name   TEXT NOT NULL,
@@ -974,6 +1217,14 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     name          TEXT NOT NULL UNIQUE,         -- the model id clients request
     description   TEXT NOT NULL DEFAULT '',     -- what this agent is FOR (shown in /v1/models)
     servers       TEXT[] NOT NULL DEFAULT '{}', -- MCP server names this agent may see
+    -- Per-server TOOL narrowing, JSON object {server: [tool, ...]} (TEXT, not
+    -- JSONB: the pool registers no JSONB codec, so a jsonb column arrives as a
+    -- raw string anyway — same shape as profiles.defaults_json). A server
+    -- ABSENT from this object is WHOLE-SERVER (every tool it exposes) — the
+    -- pre-2026-11-04 meaning, so existing rows keep working untouched. Present
+    -- = only those tools. Narrowing can only HIDE: the agent's surface is
+    -- still intersected with the key's grants at request time.
+    tools         TEXT NOT NULL DEFAULT '{}',
     model         TEXT NOT NULL DEFAULT '',     -- '' = profile cascade; else a pinned model
     system_prompt TEXT NOT NULL DEFAULT '',     -- prepended system message (phase 2)
     enabled       BOOLEAN NOT NULL DEFAULT TRUE,
@@ -981,6 +1232,9 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_agent_profiles_enabled ON agent_profiles(enabled, name);
+-- 2026-11-04: agents gained per-server tool narrowing. ADD COLUMN IF NOT
+-- EXISTS keeps this idempotent for deployments that already have the table.
+ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS tools TEXT NOT NULL DEFAULT '{}';
 
 -- Which profiles OFFER which agents. A key inherits its USER's profile, so this
 -- join is the whole authorization story: the profile is the envelope (what this
@@ -999,4 +1253,67 @@ CREATE TABLE IF NOT EXISTS profile_agents (
     PRIMARY KEY (profile_id, agent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_profile_agents_agent ON profile_agents(agent_id);
+
+-- ============================================================================
+-- Cross-replica registry convergence (2026-10-30) — modification stamps.
+-- ADDITIVE / idempotent, same discipline as every migration above.
+-- ============================================================================
+-- WHY: the gateway caches mcp_servers + model_endpoints in PROCESS memory and
+-- reloaded that snapshot only at boot and after a mutation THIS process served.
+-- On an HPA'd deployment (minReplicas 2) a server registered on one replica was
+-- therefore invisible to its sibling until that pod restarted — the console's
+-- "test" button 404'd "not in the enabled registry" on roughly half the clicks
+-- and the relay answered "unknown server" on the stale pod. core.registry now
+-- polls these stamps and refreshes the snapshot when they move.
+--
+-- WHY A TRIGGER rather than `updated_at = now()` in each write statement: the
+-- manual POST /admin/registry/refresh exists precisely because operators make
+-- OUT-OF-BAND changes (psql, seeding scripts, tooling) that bypass the admin
+-- API. Those edits must converge across replicas too, and only the database can
+-- see them. The stamp therefore belongs to the ROW, not to a code path.
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE model_endpoints ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- clock_timestamp(), NOT now(): now() is TRANSACTION-START time, so two
+-- concurrent admin writes would carry the same stamp (the later one could not
+-- move the MAX and its replica would never see it). clock_timestamp() is the
+-- moment the row actually changed. The residual is a literal microsecond tie
+-- between two writes — the next registry write moves the watermark again, so a
+-- tie costs one delayed convergence, never a permanently invisible row.
+CREATE OR REPLACE FUNCTION pcai_touch_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $pcai$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END;
+$pcai$;
+
+-- CREATE TRIGGER has no IF NOT EXISTS, and a bare DROP + CREATE is NOT atomic
+-- against a sibling replica booting at the same moment: MEASURED on a throwaway
+-- Postgres (5/5 rounds), the loser's whole schema apply rolls back on
+-- "trigger already exists" — and because SCHEMA_SQL is one implicit
+-- transaction, that pod crash-loops once before healing. The DO block's
+-- duplicate_object handler makes the second creator a no-op; the trigger is
+-- byte-identical either way, so there is nothing to reconcile.
+DROP TRIGGER IF EXISTS mcp_servers_touch_updated_at ON mcp_servers;
+DO $pcai$
+BEGIN
+    CREATE TRIGGER mcp_servers_touch_updated_at
+        BEFORE UPDATE ON mcp_servers
+        FOR EACH ROW EXECUTE FUNCTION pcai_touch_updated_at();
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END;
+$pcai$;
+
+DROP TRIGGER IF EXISTS model_endpoints_touch_updated_at ON model_endpoints;
+DO $pcai$
+BEGIN
+    CREATE TRIGGER model_endpoints_touch_updated_at
+        BEFORE UPDATE ON model_endpoints
+        FOR EACH ROW EXECUTE FUNCTION pcai_touch_updated_at();
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END;
+$pcai$;
 """

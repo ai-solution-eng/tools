@@ -11,6 +11,7 @@ so pool choice is a real lever.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ import httpx2
 
 from ..config import settings
 from ..core import metrics as _metrics  # breaker gauge/counters (no-op shims w/o prometheus_client)
+
+log = logging.getLogger(__name__)
 
 
 def upstream_client(**kwargs: Any) -> httpx2.AsyncClient:
@@ -65,17 +68,64 @@ class Endpoint:
     last_ok_at: float = 0.0
     last_fail_at: float = 0.0
 
+    # ACTIVE probe state (stamped by Pool.report_probe, fed by the
+    # core.health_probe background task; WALL-CLOCK epoch seconds like the
+    # passive surface above). probe_ok None = NEVER probed = healthy — the
+    # probe is an additional signal, not a prerequisite: a cold pod (first
+    # tick not run yet) or a probe-disabled deployment must not read broken.
+    probe_ok: bool | None = None
+    probe_at: float = 0.0
+    probe_error: str = ""
+    # Consecutive probe failures (hysteresis, 2026-11-03 incident). The probe
+    # flips probe_ok to False only at settings.health_probe_failures_to_trip;
+    # one blip must not drop an endpoint out of rotation.
+    probe_failures: int = 0
+
 
 @dataclass
 class Pool:
     endpoints: list[Endpoint] = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Set when the never-empty invariant had to fire (see healthy()); reset as
+    # soon as the probe has an opinion again, so each outage logs exactly once.
+    _probe_fail_open_warned: bool = field(default=False, compare=False)
 
     def healthy(self) -> list[Endpoint]:
         now = time.monotonic()
-        return [e for e in self.endpoints if e.cooldown_until < now]
+        # TWO availability signals, one idiom: the breaker cooldown (passive,
+        # traffic-fed) AND the active probe (core.health_probe). A probe_ok
+        # False endpoint is EXCLUDED — it is the fix for the idle-but-broken
+        # model that passive availability reads healthy forever. probe_ok
+        # None (never probed) or True stays HEALTHY: fail-open by design — a
+        # cold pod must not be treated as broken, and a dead/absent probe
+        # task must not dark out the fleet.
+        breaker_ok = [e for e in self.endpoints if e.cooldown_until < now]
+        probed = [e for e in breaker_ok if e.probe_ok is not False]
+        if breaker_ok and not probed:
+            # NEVER-EMPTY INVARIANT (2026-11-03 INCIDENT). The probe must
+            # DEGRADE an endpoint, never gate the pool: when the probe alone
+            # would exclude every endpoint, ignore the probe and serve the
+            # breaker view. This is the structural guarantee that a probe bug
+            # (or an upstream that auth-gates /models, which marked the whole
+            # fleet probe-failed and answered every chat request with
+            # "503 no healthy upstream") can never dark out a pool. The
+            # breaker — fed by REAL traffic — is still fully enforced above.
+            # Logged once per state change: healthy() runs per request, so a
+            # per-call line would be the loudest thing in the log.
+            if not self._probe_fail_open_warned:
+                self._probe_fail_open_warned = True
+                log.error(
+                    "pool: ALL %d endpoint(s) are probe-failed — IGNORING the probe and "
+                    "serving the breaker view (fail-open). The probe is misconfigured "
+                    "(credentials? /models path?) or the upstream is down: %s",
+                    len(breaker_ok),
+                    ", ".join(f"{e.id}={e.probe_error or 'fail'}" for e in breaker_ok),
+                )
+            return breaker_ok
+        self._probe_fail_open_warned = False
+        return probed
 
-    def pick(self) -> Endpoint | None:
+    def pick(self, preferred_id: str | None = None) -> Endpoint | None:
         """Weighted pick within the best (lowest) healthy priority tier.
 
         Semantics: priority orders tiers (failover); weight splits traffic
@@ -85,10 +135,22 @@ class Pool:
         served in deterministic list order (strict priority order, no
         randomization) — "all weights zero = follow the order they were
         registered in".
+
+        `preferred_id` (session affinity): when that endpoint is in this
+        pool, enabled, and not cooling down, it is returned BEFORE any
+        priority/weight math — the conversation keeps hitting the same
+        server's KV cache. It is a PREFERENCE validated against the live
+        pool on every read (routing state, never policy): an unknown id, an
+        endpoint absent from the pool (disabled/removed), or an open breaker
+        all fall through to the normal pick below.
         """
         candidates = self.healthy()
         if not candidates:
             return None
+        if preferred_id:
+            for e in candidates:
+                if e.id == preferred_id:
+                    return e
         best_priority = min(e.priority for e in candidates)
         tier = [e for e in candidates if e.priority == best_priority]
         if len(tier) == 1:
@@ -127,6 +189,34 @@ class Pool:
                 ep.cooldown_until = time.monotonic() + settings.endpoint_cooldown_s
                 ep.consecutive_failures = 0
                 _metrics.breaker_trip(ep.id)
+
+    def report_probe(self, ep: Endpoint, ok: bool, error: str = "", threshold: int | None = None) -> None:
+        """Stamp one ACTIVE probe outcome (core.health_probe) on the endpoint.
+
+        Deliberately NOT the breaker: a probe failure must not burn the
+        endpoint's strike budget (the breaker is fed by REAL traffic, and a
+        probe hitting a transient blip would trip a real request into a
+        60 s cooldown), and a probe success must not clear a pending
+        cooldown (rotation semantics unchanged). This only moves the
+        probe_ok gate that healthy() reads; `error` is a short reason
+        (exception type name / upstream status), never a URL dump.
+        """
+        ep.probe_at = time.time()
+        if ok:
+            ep.probe_failures = 0
+            ep.probe_ok = True
+            ep.probe_error = ""
+            return
+        # HYSTERESIS (2026-11-03 incident): a single failed sweep must not drop
+        # an endpoint out of rotation. probe_ok stays at its previous value
+        # (None on a cold pod = still fail-open/healthy) until `threshold`
+        # CONSECUTIVE failures, which is the same posture the breaker gives
+        # real traffic (endpoint_failure_threshold).
+        ep.probe_failures += 1
+        ep.probe_error = error
+        limit = settings.health_probe_failures_to_trip if threshold is None else threshold
+        if ep.probe_failures >= max(1, limit):
+            ep.probe_ok = False
 
 
 class Router:
@@ -179,17 +269,27 @@ class Router:
         the snapshot are REMOVED (set_endpoints alone would serve stale pools
         for models disabled/removed in the DB until pod restart).
 
-        Breaker state (consecutive_failures, cooldown_until) is CARRIED
-        across the swap by endpoint id (perf audit): the old behavior reset
-        every failure counter on each refresh, so a console save during an
-        upstream outage handed a dead endpoint a fresh strike budget and
-        kept it in rotation (each hit = a 10 s connect timeout for clients).
+        Breaker state (consecutive_failures, cooldown_until) AND active-probe
+        state (probe_ok/probe_at/probe_error) are CARRIED across the swap by
+        endpoint id (perf audit): the old behavior reset every failure
+        counter on each refresh, so a console save during an upstream outage
+        handed a dead endpoint a fresh strike budget and kept it in rotation
+        (each hit = a 10 s connect timeout for clients). The probe fields
+        follow the same rule — a console save while an upstream is down must
+        not hand a probe-failed endpoint a fresh never-probed (healthy) state.
         """
-        preserved: dict[str, tuple[int, float]] = {}
+        preserved: dict[str, tuple[int, float, bool | None, float, str, int]] = {}
         for pool in self._pools.values():
             for e in pool.endpoints:
-                if e.consecutive_failures or e.cooldown_until:
-                    preserved[e.id] = (e.consecutive_failures, e.cooldown_until)
+                if e.consecutive_failures or e.cooldown_until or e.probe_ok is not None:
+                    preserved[e.id] = (
+                        e.consecutive_failures,
+                        e.cooldown_until,
+                        e.probe_ok,
+                        e.probe_at,
+                        e.probe_error,
+                        e.probe_failures,
+                    )
                 elif e.id:
                     # An endpoint that refreshed with NO breaker state is
                     # healthy — clear a stale open gauge left by a previous
@@ -200,7 +300,14 @@ class Router:
             for e in eps:
                 state = preserved.get(e.id)
                 if state is not None:
-                    e.consecutive_failures, e.cooldown_until = state
+                    (
+                        e.consecutive_failures,
+                        e.cooldown_until,
+                        e.probe_ok,
+                        e.probe_at,
+                        e.probe_error,
+                        e.probe_failures,
+                    ) = state
             new_pools[m] = Pool(endpoints=eps)
         self._pools = new_pools
 

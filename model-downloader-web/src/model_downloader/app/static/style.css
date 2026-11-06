@@ -463,10 +463,16 @@ tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
 /* ---- Catalog controls ---- */
 .catalog-controls {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   margin-bottom: 16px;
 }
+/* Optional project for the MLIS push: the download page's namespace combobox,
+   inline in the control bar (label defaults to a column, hence the override). */
+.push-project { flex-direction: row; align-items: center; gap: 8px; }
+.push-project > span { margin-bottom: 0; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.push-project .combo { width: 250px; }
 /* Inline result of the control-bar actions (refresh / refresh-from-github /
    add-to-catalog): sits right beside the buttons so feedback is visible
    without scrolling past the whole table. */

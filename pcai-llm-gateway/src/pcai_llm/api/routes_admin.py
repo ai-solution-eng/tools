@@ -27,9 +27,11 @@ import csv
 import io
 import json
 import logging
+import re
 import socket
 import time
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
@@ -41,16 +43,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..config import settings
 from ..core import agents as agents_mod
-from ..core import costs, registry, secretbox, url_guard
+from ..core import costs, mcp_weights, registry, secretbox, teams, url_guard
 from ..core import metrics as _metrics
 from ..core.audit import audit_action, stable_actor_label
 from ..core.budgets import (
     MAX_LIMIT_TOKENS,
     MAX_LIMIT_USD,
+    _budget_token_expr,
     budget_status,
     budget_status_many,
     split_preset_budgets,
 )
+from ..core.guardrails import GUARDRAIL_ENGINES as _GUARDRAIL_ENGINES
 from ..core.identity import (
     IDP_ADMIN_ASSERTED,
     VIA_ADMIN_CONSOLE,
@@ -74,7 +78,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 VALID_SCOPES = {"proxy", "mcp", "admin"}
-VALID_PERIODS = {"day", "week", "month"}
+VALID_PERIODS = {"day", "week", "month", "quarter", "year"}
 MAX_LIST_LEN = 100  # reject absurd payloads early, before they hit the DB
 # Bounded registration-time DNS lookup for the SSRF gate (see _check_url):
 # a wedged resolver must not hang an admin request. A lookup that does not
@@ -134,22 +138,36 @@ async def require_admin(request: Request) -> None:
     """
     if not settings.admin_api_keys.strip():
         raise HTTPException(503, "admin API disabled")
+    hashes = _admin_key_hashes()
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        presented = hash_key(auth[7:].strip())
-        if presented in _admin_key_hashes():
-            return
-        # A bearer that FAILED the admin-hash check: refuse. Deliberately
-        # NO fall-through to the group path — a caller presenting admin
-        # key material is a direct caller; group trust must not launder a
-        # rejected key (and header assertions are the proxy's to make,
-        # never the bearer's).
+    bearer_present = auth.lower().startswith("bearer ")
+    bearer_valid = bearer_present and hash_key(auth[7:].strip()) in hashes
+    # (a) a VALID bearer authenticates — today's path, untouched.
+    if bearer_valid:
+        return
+    # (b) the SECOND envelope (audit W6 follow-up F4): X-API-Key, hash-
+    # compared exactly like the Bearer, consulted whenever the bearer did
+    # not already authenticate — ABSENT or INVALID. The replace-header SSO
+    # chain (the proxy swaps its id_token in for the console's Bearer) is
+    # exactly the posture ui/admin.html ships this envelope for: a caller
+    # holding a VALID admin envelope is an admin, and there is no privilege
+    # gained by accepting it.
+    envelope = request.headers.get("x-api-key", "").strip()
+    if envelope and hash_key(envelope) in hashes:
+        return
+    # (c) a credential was presented and NEITHER envelope validated: hard
+    # 401 with the same detail as today. THE INVARIANT: a bad credential is
+    # a hard 401; it is never a downgrade to a weaker rung.
+    if bearer_present or envelope:
         log.warning("admin auth failed: invalid admin key on %s", request.url.path)
         _metrics.admin_auth_failure("invalid-key")
         raise HTTPException(401, "invalid admin key")
-    # no bearer: the browser-identity group path (when CONFIGURED — empty
-    # admin_groups = the path does not exist, the request is the same
-    # missing-bearer 401 it has always been).
+    # (d) NO credential envelope was presented at all: the browser-identity
+    # group path (when CONFIGURED — empty admin_groups = the path does not
+    # exist, the request is the same missing-bearer 401 it has always been).
+    # A present-but-invalid bearer, or an invalid X-API-Key, can never reach
+    # this rung — group trust must not launder a rejected credential (and
+    # header assertions are the proxy's to make, never the caller's).
     admin_groups = _admin_group_set()
     if admin_groups:
         groups = _browser_admin_identity(request)
@@ -199,7 +217,10 @@ AUDIT_ACTIONS_DOC = (
     "mcp.acl.set mcp.acl.server.set mcp.acl.copy mcp.creds.set mcp.creds.delete profile.upsert "
     "profile.delete profile.limits.propagate user.profile.set tenant.create user.create "
     "guardrail.create guardrail.patch guardrail.delete guardrail.models.set offpeak.set "
-    "enroll.code.mint enroll.code.revoke enroll.redeem"
+    "enroll.code.mint enroll.code.revoke enroll.redeem enroll.envelope.patch "
+    "team.key.create team.key.patch team.key.revoke team.key.rotate team.budget.set "
+    "team.settings.set team.topup.request "
+    "enroll.topup.approve enroll.topup.deny"
 )
 
 
@@ -263,6 +284,8 @@ async def _audit(
     resource_id: str,
     details: dict[str, Any] | None = None,
     actor_key_id: int | None = None,
+    actor_source: str | None = None,
+    actor_subject: str | None = None,
 ) -> None:
     """The one call every mutating admin route makes after its write
     commits. Best-effort (core.audit.audit_action): a failed audit row is
@@ -277,12 +300,19 @@ async def _audit(
     conn is deliberately OMITTED (audit_action's own ``audit.db`` seam):
     the trail must never be an operation-fake's concern — tests fake the
     operation seams, the trail rides its own.
+
+    actor_source / actor_subject OVERRIDES (team-leader wave): a surface
+    that authenticates with a NON-admin credential (the /team_leader router
+    — its bearer is a team leader key, whose actor vocabulary is
+    'team-leader' + the ENROLLMENT LABEL, never key material) calls this
+    same writer and passes its actor explicitly. The defaults are exactly
+    today's resolution, so every admin call site stays byte-identical.
     """
     await audit_action(
         None,
         actor_key_id=actor_key_id,
-        actor_subject=_actor_subject_of(request),
-        actor_source=_actor_source_of(request),
+        actor_subject=actor_subject if actor_subject is not None else _actor_subject_of(request),
+        actor_source=actor_source if actor_source is not None else _actor_source_of(request),
         action=action,
         resource_type=resource_type,
         resource_id=resource_id,
@@ -297,17 +327,48 @@ async def _audit(
 # ---------------------------------------------------------------------------
 
 
+# THE NAME CHARSET (audit W6 FIX 7 — the admin twins of the teams zone's
+# pattern). A key name is a DISPLAY value rendered by the console, the traces
+# explorer and the CSV exports; the sinks escape (admin.html), so the STORED
+# value is closed at the edge with the SAME rule TeamKeyMint/TeamKeyPatch and
+# the public enroll door enforce — all three doors must agree. THIS module is
+# the ONE definition: routes_team_leader imports it (its "from .routes_admin
+# import ..." block already existed for _audit/BudgetSpec) and routes_enroll
+# imports it too, so there is no second copy left to drift. (An earlier
+# revision believed a cycle forbade the import and replicated the constant;
+# that was wrong — routes_admin imports neither module — and the copy is gone.)
+# pydantic-core compiles pattern= with Rust's regex engine
+# (no \A/\Z; "$" is strict end-of-text). Conservative on purpose — spaces,
+# unicode and . - _ / : ( ) all pass; only HTML metacharacters and control
+# characters are refused, as a clean 422.
+_NAME_PATTERN = r"""^[^<>"'&\x00-\x1f]+$"""
+
+
 class TenantCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit W6 follow-up F1): tenant names render in the
+    # console dropdowns and the CSV exports — the same rule every other name
+    # surface enforces (keys here, routes_team_leader mint, the public enroll
+    # door since FIX 8). INVARIANT: a lower-privileged writer must never gain
+    # this field without the same rule.
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
 
 
 class UserCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit W6 follow-up F1): user names render in the
+    # console's Keys/Usage/Traces tables and the CSV exports. INVARIANT: a
+    # lower-privileged writer must never gain this field without the same
+    # rule. WRITER INVENTORY for users.name: the enroll door (EnrollRequest.
+    # name — pattern'd since FIX 8), the team-leader mint (TeamKeyMint.name —
+    # pattern'd by the teams zone), and shadow-key provisioning (email/
+    # subject-derived display_name written by direct SQL in core.identity —
+    # it bypasses pydantic, so this constraint cannot 422 it, and it cannot
+    # legitimately carry markup: it is an IdP email or subject claim).
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
 
 
 class KeyCreate(BaseModel):
     user_id: uuid.UUID
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
     scopes: list[str] = ["proxy"]
     allowed_models: list[str] = []
     # gt=0 (audit finding 20 — KeyPatch parity): rpm/tpm of 0 or negative
@@ -387,7 +448,14 @@ class BudgetSpec(BaseModel):
     period: str
     # exactly ONE of the two limits per entry (validated below)
     limit_tokens: int | None = None
-    limit_usd: float | None = None
+    # allow_inf_nan=False is load-bearing, not cosmetic: a NaN survives the
+    # routes' `<= 0` guard (every comparison with NaN is False), silently SKIPS
+    # the team envelope check for the same reason, and then persists — Postgres
+    # NUMERIC accepts NaN and `CHECK (limit_usd > 0)` passes because NaN sorts
+    # above every number. The key's gate would then refuse forever ("non-finite
+    # limit") and every JSON projection of the row would 500 (Starlette's
+    # JSONResponse is allow_nan=False). Rejected at the model instead.
+    limit_usd: float | None = Field(None, allow_inf_nan=False)
 
 
 class BudgetsReplace(BaseModel):
@@ -431,6 +499,21 @@ class ModelUpsert(BaseModel):
     model_type: str | None = None
 
 
+# THE MCP SERVER NAME IS A URL PATH SEGMENT (owner-approved fix, audit W6):
+# PATCH /admin/mcp-servers/{name} and GET /admin/mcp-servers/{name}/tools
+# address rows by it — and FastAPI path params do not match "/", so a row
+# registered as "foo/bar" could never be edited or inspected again. Refused:
+# "/", "?", "#", "%" and control characters (the "%" also blocks the encoded
+# form: "foo%2Fbar" DECODES to a slash after routing). Kept per the key-name
+# rule's permissive spirit: spaces, unicode, ".", "-", "_", ":", "(", ")".
+# CARVE-OUT — legacy rows must not be frozen: a name that already exists AS
+# STORED is accepted as-is (the console re-saves the whole row through the
+# upsert), so the rule applies to a NEW or CHANGED name only — hence the
+# check lives in the handler (which can compare against the stored row), NOT
+# on the pydantic model.
+_MCP_SERVER_NAME_PATTERN = r"""^[^/?#%\x00-\x1f]+$"""
+
+
 class McpServerUpsert(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     url: str
@@ -457,6 +540,21 @@ class McpServerUpsert(BaseModel):
     # orders the registry snapshot, hence mcp_catalog / tools/list output
     # and the flattened-call failover chain.
     priority: int = 0
+    # What ONE call to this server charges the relay's per-turn BUDGET, in
+    # fractional units (2026-11-03). FRACTIONAL on purpose: 0.1 prices a
+    # cheap server at a tenth of a neutral call, which is what makes the
+    # budget express COST instead of call count. 1.0 = neutral (the column
+    # default, so an unweighted fleet keeps today's bound). Floor 0.01: a 0
+    # weight would make the server free and let a loop on it run until the
+    # wall-clock guard alone. Ceiling 100 keeps a single typo from spending
+    # a whole turn's budget on one call.
+    # THREE-STATE on purpose — the same destructive-by-omission hazard
+    # ProfileCreate.agents documents above. None = the caller did not speak, so
+    # an upsert that does not mention the weight must NOT reset it: an older
+    # console (or any API client) re-posting a server would otherwise silently
+    # reprice an expensive server back to neutral, a config wipe that looks
+    # like a successful save. The SQL applies COALESCE on both branches.
+    tool_weight: float | None = Field(None, ge=0.01, le=100)
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +562,13 @@ class McpServerUpsert(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _check_list_len(items: list[Any], what: str) -> None:
-    """Reject oversized lists: a 10k-element upsert is a config error, not data."""
+def _check_list_len(items: Collection[Any], what: str) -> None:
+    """Reject oversized collections: a 10k-element upsert is a config error, not data.
+
+    Collection, not list: the same bound guards the {model: [...]} and
+    {model: {description}} maps (model_modalities, model_cards), and typing it
+    as list was a lie the checker had flagged since the modalities map landed.
+    """
     if len(items) > MAX_LIST_LEN:
         raise HTTPException(400, f"{what} exceeds maximum length of {MAX_LIST_LEN}")
 
@@ -548,6 +651,7 @@ def _resolve_host_addresses(host: str) -> list[str]:
     so the timeout is read HERE, at call time.
     """
     return url_guard.resolve_host_addresses(host, timeout_s=_URL_RESOLVE_TIMEOUT_S)
+
 
 def _check_url(url: str, what: str) -> None:
     """Validate an admin-registered upstream URL (model endpoint base_url,
@@ -686,6 +790,7 @@ def _denied_ip_reason(host: str) -> str:
     (PCAI_LLM_URL_DENY_CIDRS) exactly as before."""
     return url_guard.denied_ip_reason(host, extra_cidrs=settings.url_deny_cidrs)
 
+
 def _check_scopes(scopes: list[str]) -> None:
     _check_list_len(scopes, "scopes")
     bad = set(scopes) - VALID_SCOPES
@@ -743,6 +848,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "POST   /admin/tenants/{tenant_id}/users",
             "POST   /admin/models",
             "GET    /admin/models",
+            "GET    /admin/models/{model_name}/pool",
             "DELETE /admin/models/{model_name}",
             "POST   /admin/models/{model_name}/probe",
             "POST   /admin/models/{model_name}/detect-type",
@@ -772,6 +878,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "GET    /admin/routing/stats",
             "PUT    /admin/routing/config",
             "POST   /admin/routing/prompt-preview",
+            "GET    /admin/endpoint-metrics",
             "GET    /admin/presented-models",
         ],
     }
@@ -890,9 +997,7 @@ async def bind_sso_users(tenant_id: uuid.UUID, request: Request, _: AdminDep) ->
             "tenant has no SSO default profile — set one (PUT /admin/tenants/{id}/sso-default-profile)"
             " before binding users to it",
         )
-    pending = await db.fetchval(
-        "SELECT count(*) FROM users WHERE tenant_id = $1 AND profile_id IS NULL", tenant_id
-    )
+    pending = await db.fetchval("SELECT count(*) FROM users WHERE tenant_id = $1 AND profile_id IS NULL", tenant_id)
     tag = await db.execute(
         "UPDATE users SET profile_id = $2 WHERE tenant_id = $1 AND profile_id IS NULL",
         tenant_id,
@@ -1116,7 +1221,12 @@ async def revoke_key_endpoint(key_id: uuid.UUID, request: Request, _: AdminDep) 
 
 
 @router.get("/keys")
-async def list_keys_endpoint(_: AdminDep, include_revoked: bool = False) -> list[dict[str, Any]]:
+async def list_keys_endpoint(
+    _: AdminDep,
+    include_revoked: bool = False,
+    enrollment_id: uuid.UUID | None = None,
+    enrollment: str | None = None,
+) -> list[dict[str, Any]]:
     """List keys across all users. Hashes are never included in projections.
     Revoked keys are hidden unless include_revoked=true (their ledger rows
     remain — history stays attributable).
@@ -1126,8 +1236,20 @@ async def list_keys_endpoint(_: AdminDep, include_revoked: bool = False) -> list
     (budget_status_many; audit finding 6: the per-key loop ran 2 ledger
     aggregates per key — ~401 sequential queries at 200 keys — against the
     pool the data plane shares).
+
+    Enrollment filters (team-leader wave, both optional and AND-ed):
+    `enrollment_id` narrows to the keys minted from one enrollment;
+    `enrollment` is a case-insensitive SUBSTRING match on the enrollment
+    label ("show me everything minted from the *station* codes"). Forwarded
+    to core.keys.list_keys — the JOIN and the ILIKE live there; this route
+    only trims the needle so an all-whitespace search is a no-filter call.
     """
-    rows = await list_keys(include_revoked=include_revoked)
+    needle = enrollment.strip() if enrollment else ""
+    rows = await list_keys(
+        include_revoked=include_revoked,
+        enrollment_id=enrollment_id,
+        enrollment_search=needle[:100] or None,
+    )
     statuses = await budget_status_many([r["id"] for r in rows])
     for row in rows:
         row["budget_status"] = statuses.get(row["id"], [])
@@ -1142,7 +1264,7 @@ class KeyPatch(BaseModel):
     convention; editing a hash would be a self-inflicted outage).
     """
 
-    name: str | None = Field(None, min_length=1, max_length=200)
+    name: str | None = Field(None, min_length=1, max_length=200, pattern=_NAME_PATTERN)
     scopes: list[str] | None = None
     allowed_models: list[str] | None = None
     rate_limit_rpm: int | None = Field(None, gt=0)
@@ -1278,7 +1400,7 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
         "SELECT user_id, name, scopes, allowed_models, rate_limit_rpm, "
         "rate_limit_tpm, max_concurrent, expires_at, relay_default, "
         "stream_pcai_events, mcp_admin, revoked_at, spend_ancestors, "
-        "subject_id, bound_via, bound_at "
+        "subject_id, bound_via, bound_at, enrollment_id, key_group "
         "FROM api_keys WHERE id = $1",
         key_id,
     )
@@ -1313,8 +1435,8 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
             "INSERT INTO api_keys (user_id, name, key_hash, key_prefix, scopes, "
             "allowed_models, rate_limit_rpm, rate_limit_tpm, expires_at, relay_default, "
             "stream_pcai_events, max_concurrent, spend_ancestors, subject_id, bound_via, "
-            "bound_at, mcp_admin) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id",
+            "bound_at, mcp_admin, enrollment_id, key_group) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id",
             old["user_id"],
             old["name"],
             key_hash,
@@ -1345,6 +1467,29 @@ async def rotate_key(key_id: uuid.UUID, _: AdminDep, request: Request) -> KeyRot
             # plain dict in the test fakes, and a MISSING column must degrade to
             # the fail-closed default rather than raise mid-rotation.
             old.get("mcp_admin", False),
+            # Team membership (team leader tier) carries over like every other
+            # identity attribute — and here it is not cosmetic: a rotated key
+            # that loses enrollment_id silently LEAVES its team. Its ledger
+            # rows stop counting in teams.team_spend (which matches on
+            # k.enrollment_id, so the enrollment's HARD cap under-counts and
+            # the team can overspend), it vanishes from the leader's console
+            # (list_keys' enrollment filter), and its budget rows are still
+            # copied — an allocation the envelope can no longer see. Exactly
+            # the "rotation enumerates columns" bug class the docstring above
+            # warns about, this time for team membership.
+            # .get: production rows are asyncpg Records, test fakes are dicts,
+            # and a missing column must degrade to "no team" (None), never
+            # raise mid-rotation.
+            old.get("enrollment_id"),
+            # KEY GROUP (2026-11-03): the new credential joins the OLD one's
+            # group, so saved conversations (and anything else group-scoped)
+            # survive the rotation. Rotation enumerates INSERT columns — a
+            # group NOT named here would silently orphan the user's history,
+            # the exact "rotation enumerates columns" bug class documented
+            # above (2026-09-18 grants, 2026-10-09 spend, this time history).
+            # .get + the old id fallback: a fake/pre-column row degrades to
+            # "its own group", which is still a valid group of one.
+            old.get("key_group") or key_id,
         )
         assert row is not None  # INSERT ... RETURNING always yields a row
         new_id: uuid.UUID = row["id"]
@@ -1614,6 +1759,13 @@ async def replace_budgets(key_id: uuid.UUID, body: BudgetsReplace, request: Requ
             raise HTTPException(400, "limit_tokens must be > 0")
         if has_usd and b.limit_usd is not None and b.limit_usd <= 0:
             raise HTTPException(400, "limit_usd must be > 0")
+        # Column bounds (the same limits core.budgets.split_preset_budgets
+        # enforces for profile presets): past these the INSERT itself fails, so
+        # the operator gets a named 400 instead of a 500 from asyncpg.
+        if has_tokens and b.limit_tokens is not None and b.limit_tokens > MAX_LIMIT_TOKENS:
+            raise HTTPException(400, f"limit_tokens exceeds the column maximum {MAX_LIMIT_TOKENS}")
+        if has_usd and b.limit_usd is not None and b.limit_usd > MAX_LIMIT_USD:
+            raise HTTPException(400, f"limit_usd exceeds the column maximum {MAX_LIMIT_USD}")
     token_rows = [(key_id, b.model, b.period, b.limit_tokens) for b in body.budgets if b.limit_tokens is not None]
     usd_rows = [(key_id, b.model, b.period, b.limit_usd) for b in body.budgets if b.limit_usd is not None]
     async with db.acquire() as conn, conn.transaction():
@@ -1666,6 +1818,18 @@ async def key_usage(key_id: uuid.UUID, _: AdminDep) -> dict[str, Any]:
 
 
 USAGE_GROUP_BYS = {"key", "model", "tenant", "day", "subject"}
+
+
+def _billable_tokens_sql(alias: str) -> str:
+    """The BUDGET expression for token spend (2026-10-30).
+
+    The usage tables' "Billed tokens" column means "what period budgets
+    consumed" — so it must use the gate's OWN expression: cached tokens at the
+    configured exemption (0.9 = 10% weight) times the off-peak billing fraction.
+    Imported rather than re-spelled, so the console, the team bar and the gate can
+    never tell two different stories about one number.
+    """
+    return _budget_token_expr(alias)
 
 
 @router.get("/usage")
@@ -2084,6 +2248,51 @@ async def list_models(_: AdminDep) -> list[str]:
     return model_router.models()
 
 
+@router.get("/models/{model_name:path}/pool")
+async def get_model_pool(model_name: str, _: AdminDep) -> dict[str, Any]:
+    """Full registration for ONE pool — the console's edit surface.
+
+    GET /admin/models returns live NAMES only, and the endpoint-health surface
+    carries no credential state, so the register form's edit mode needs this
+    read. Credential VALUES are never here: `api_key_secret` is the
+    by-reference K8s Secret NAME (the same pointer GET /admin/mcp-servers
+    exposes as `auth_secret`), and `auth_configured` is the boolean "a
+    panel-managed token is stored" — the console uses it only to render
+    "(unchanged)" and can never receive the token itself.
+
+    `{model_name:path}` because pool names legitimately contain "/"
+    ("Qwen/Qwen3.8-27B-FP8"); a plain path param 404s those.
+    """
+    rows = await db.fetch(
+        "SELECT base_url, priority, weight, api_key_secret, "
+        "(auth_token_enc IS NOT NULL) AS auth_configured, model_type "
+        "FROM model_endpoints WHERE model_name = $1 "
+        "ORDER BY priority, base_url",
+        model_name,
+    )
+    if not rows:
+        raise HTTPException(404, f"model {model_name!r} has no registered endpoints")
+    types = {r["model_type"] for r in rows if r["model_type"]}
+    return {
+        "model_name": model_name,
+        # One pool, one type. None = the rows disagree (legacy/hand-edited
+        # data) or carry no type; the console then leaves auto-detect on and
+        # says so rather than silently pinning one endpoint's type.
+        "model_type": next(iter(types)) if len(types) == 1 else None,
+        "endpoints": [
+            {
+                "base_url": r["base_url"],
+                "priority": r["priority"],
+                "weight": r["weight"],
+                "api_key_secret": r["api_key_secret"],
+                "auth_configured": bool(r["auth_configured"]),
+                "model_type": r["model_type"],
+            }
+            for r in rows
+        ],
+    }
+
+
 def _iso_epoch(ts: float) -> str | None:
     """Epoch (wall clock) -> ISO-8601 UTC, or None when never stamped."""
     if not ts:
@@ -2206,7 +2415,11 @@ async def _probe_endpoint_type(
     from .routes_proxy import _upstream_headers  # deferred: no import cycle
 
     class _Ep:  # the minimal shape _upstream_headers needs
-        pass
+        # Declared so the type checker sees the attributes the stub sets below;
+        # _upstream_headers only reads these three fields off its Endpoint.
+        base_url: str
+        api_key_secret: str | None
+        auth_token_enc: str | None
 
     ep_stub = _Ep()
     ep_stub.base_url = base_url
@@ -2214,7 +2427,9 @@ async def _probe_endpoint_type(
     ep_stub.auth_token_enc = auth_token_enc
 
     base = (base_url or "").rstrip("/")
-    headers = _upstream_headers(ep_stub, f"detect-{uuid.uuid4().hex[:12]}")
+    # Duck-typed stub, not an Endpoint: _upstream_headers reads only the three
+    # fields declared above (the alternative is constructing a registry row).
+    headers = _upstream_headers(ep_stub, f"detect-{uuid.uuid4().hex[:12]}")  # type: ignore[arg-type]
     headers["Content-Type"] = "application/json"
 
     async with upstream_client(
@@ -2799,6 +3014,22 @@ async def copy_mcp_grants_from(
 @router.post("/mcp-servers")
 async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep) -> dict[str, Any]:
     """Upsert an MCP server registration, then resync the registry."""
+    # PATH-SAFE NAME (owner-approved fix, audit W6) — see the pattern's
+    # comment above for the WHY. Handler-side, not model-side, so the
+    # carve-out can compare against the stored row: a name that already
+    # exists AS STORED is accepted as-is (the console re-save of a legacy
+    # row must keep working); a NEW or CHANGED name must match the rule.
+    # First thing in the handler: a refused registration writes nothing and
+    # pays no DNS resolution.
+    if not re.fullmatch(_MCP_SERVER_NAME_PATTERN, body.name) and (
+        await db.fetchval("SELECT 1 FROM mcp_servers WHERE name = $1", body.name) is None
+    ):
+        raise HTTPException(
+            422,
+            f"MCP server name {body.name!r} must be a URL path segment — it cannot "
+            "contain '/', '?', '#', '%' or control characters "
+            "(PATCH /admin/mcp-servers/{name} addresses rows by it)",
+        )
     await _check_url_async([body.url], "url")
     if body.tool_policy not in ("all", "allowlist"):
         raise HTTPException(400, "tool_policy must be 'all' or 'allowlist'")
@@ -2825,8 +3056,8 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
         token_write = False  # omitted — keep existing (COALESCE)
     row = await db.fetchrow(
         "INSERT INTO mcp_servers (name, url, headers_json, auth_secret, auth_token_enc, "
-        "tool_policy, allowed_tools_json, enabled, priority, description) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+        "tool_policy, allowed_tools_json, enabled, priority, description, tool_weight) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
         "ON CONFLICT (name) DO UPDATE SET url = $2, headers_json = $3, "
         "auth_secret = $4, "
         + (
@@ -2837,10 +3068,17 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
             else "auth_token_enc = COALESCE($5, mcp_servers.auth_token_enc), "
         )
         + "tool_policy = $6, allowed_tools_json = $7, enabled = $8, priority = $9, "
-        "description = $10 "
-        "RETURNING id, name, url, auth_secret, "
+        "description = $10, "
+        # THREE-STATE, expressed as SQL-text branching (the same idiom the
+        # auth_token_enc arm above uses) rather than COALESCE($11, ...): the
+        # static SQL<->schema gate counts expressions by splitting VALUES on
+        # commas, so a comma-bearing expression reads as an extra column and
+        # the arity check fails. Behaviour is identical — an omitted weight
+        # keeps the stored value, an explicit one is written.
+        + ("tool_weight = $11 " if body.tool_weight is not None else "tool_weight = mcp_servers.tool_weight ")
+        + "RETURNING id, name, url, auth_secret, "
         "(auth_token_enc IS NOT NULL) AS auth_configured, "
-        "tool_policy, allowed_tools_json, enabled, priority, description",
+        "tool_policy, allowed_tools_json, enabled, priority, description, tool_weight",
         body.name,
         body.url,
         # headers_json is a TEXT column — serialize explicitly. (asyncpg has
@@ -2853,8 +3091,15 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
         body.enabled,
         body.priority,
         body.description or "",
+        # INSERT arm needs a concrete value (the column is NOT NULL); the
+        # UPDATE arm ignores it when the caller omitted the weight, so a
+        # resolved 1.0 here can never reset an existing row.
+        body.tool_weight if body.tool_weight is not None else 1.0,
     )
     assert row is not None
+    # The relay reads weights through a TTL cache (core.mcp_weights): drop it
+    # so this write is live on the NEXT relay turn instead of up to 60s later.
+    mcp_weights.invalidate()
     await _refresh_registry_best_effort()
     # details: registration shape + credential PRESENCE markers. auth_token
     # and header VALUES never appear — the audit records the DB OUTCOME
@@ -2877,6 +3122,7 @@ async def upsert_mcp_server(body: McpServerUpsert, request: Request, _: AdminDep
             "allowed_tools": body.allowed_tools,
             "enabled": body.enabled,
             "priority": body.priority,
+            "tool_weight": body.tool_weight,
             "header_names": sorted(body.headers),
         },
     )
@@ -2900,7 +3146,31 @@ async def list_mcp_servers(_: AdminDep) -> list[dict[str, Any]]:
     # SAME vocabulary as core.audit._SECRET_KEY_RE (audit P2-1: the lists
     # drifted once - X-Dataset-Password was redacted in the audit trail but
     # echoed in cleartext here). Imported, not copied, so they cannot drift.
-    return _redact_server_headers(await registry.mcp_servers())
+    #
+    # Cross-replica freshness (2026-10-30): the snapshot is per-process, so a
+    # server registered on ANOTHER replica used to be missing from this list
+    # (and from the "test" button below) until this pod restarted. Re-check the
+    # DB watermark on read — rate-limited to registry_admin_fresh_s, fail-open.
+    await registry.ensure_fresh()
+    servers = _redact_server_headers(await registry.mcp_servers())
+    # tool_weight is a RELAY-GOVERNANCE knob, not part of the data-plane
+    # registry snapshot (the snapshot is what the federation needs to CALL a
+    # server), so it is read here — one small control-plane query, and NOT
+    # the enabled-only TTL cache: the console must show the weight an
+    # operator stored on a disabled row too. A read failure degrades to the
+    # neutral 1.0 rather than 500ing the whole MCP page.
+    try:
+        weight_rows = await db.fetch("SELECT name, tool_weight FROM mcp_servers")
+    except Exception:
+        log.warning("mcp-servers: tool_weight lookup failed — reporting the neutral 1.0", exc_info=True)
+        weight_rows = []
+    stored: dict[str, float] = {}
+    for wr in weight_rows or []:
+        raw = wr.get("tool_weight")
+        stored[str(wr["name"])] = 1.0 if raw is None else float(raw)
+    for sv in servers:
+        sv["tool_weight"] = stored.get(str(sv.get("name")), 1.0)
+    return servers
 
 
 class McpServerPatch(BaseModel):
@@ -2951,6 +3221,10 @@ async def patch_mcp_server(name: str, body: McpServerPatch, request: Request, _:
         priority,
     )
     assert updated is not None
+    # A PATCH can FLIP `enabled`, which changes the enabled-only weights map
+    # the relay caches — invalidate unconditionally (cheap, and a stale map
+    # would keep charging a disabled server for up to 60s).
+    mcp_weights.invalidate()
     await _refresh_registry_best_effort()
     # details: only the fields the PATCH actually changed (body.model_fields_set).
     await _audit(
@@ -3029,6 +3303,12 @@ async def list_server_tools(name: str, _: AdminDep) -> dict[str, Any]:
     catalog (unfiltered; tenant filtering only ever happens on /mcp)."""
     from .routes_mcp import _fetch_tools
 
+    # Cross-replica freshness (2026-10-30): without this, a server registered
+    # on the SIBLING replica 404s here ("not in the enabled registry") even
+    # though the console just rendered its row from that same cache. The
+    # watermark check makes the console converge in ~registry_admin_fresh_s
+    # instead of waiting for a pod restart; it is fail-open and rate-limited.
+    await registry.ensure_fresh()
     servers = {sv["name"]: sv for sv in await registry.mcp_servers()}
     target = servers.get(name)
     if target is None:
@@ -3170,6 +3450,14 @@ class ProfileCreate(BaseModel):
     # Off-peak billing fraction for keys under this profile (null = inherit
     # the gateway default PCAI_LLM_OFFPEAK_FRACTION during low-demand).
     offpeak_fraction: float | None = Field(None, gt=0.0, le=1.0)
+    # Per-profile tool-relay BUDGET, in fractional UNITS (2026-11-03) — NOT a
+    # count of model rounds. Every tool call charges its MCP server's
+    # tool_weight (0.1 = a cheap call), so 8.0 is "eight neutral calls".
+    # null = INHERIT the site default (settings.tool_relay_max_iterations,
+    # read as the same unit budget), which is the pre-feature bound. ge=1: a
+    # sub-1 budget would refuse the turn's first call, which reads as an
+    # outage rather than a limit; le=4096 matches the iteration cap's scale.
+    tool_relay_budget: int | None = Field(None, ge=1, le=4096)
     # Per-profile model-routing rollout (consumed by the proxy through
     # core.model_routing.profile_routing_config, TTL-cached ~60s per user —
     # console edits take effect within a minute, no restart). 'off' keeps
@@ -3252,11 +3540,13 @@ async def _preset_stamp_catalogs() -> tuple[dict[str, list[dict[str, Any]]], lis
 # ============================================================================
 # Agent profiles (2026-10-29) — named tool surfaces exposed as model endpoints.
 # ============================================================================
-# An agent is a bundle of MCP servers a request can select by naming it as its
-# MODEL (core.agents is the resolver; GET /v1/models advertises them with
+# An agent is a bundle of MCP servers — optionally narrowed to specific TOOLS on
+# each server — that a request can select by naming it as its MODEL
+# (core.agents is the resolver; GET /v1/models advertises them with
 # pcai.type="agent"). The tool surface a request then sees is the INTERSECTION
-# of the key's grants and the agent's servers — the profile narrows the agent,
-# the agent narrows the profile, and the key stays the hard boundary.
+# of the key's grants and the agent's (server, tool) selection — the profile
+# narrows the agent, the agent narrows the profile, and the key stays the hard
+# boundary.
 #
 # WHY A SEPARATE TABLE and not a profiles.defaults_json key: create_profile
 # rebuilds defaults_json from the request body, so anything stored there is
@@ -3270,6 +3560,12 @@ class AgentUpsert(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field("", max_length=400)
     servers: list[str] = Field(default_factory=list, max_length=100)
+    # Per-server TOOL narrowing: {server: [tool, ...]}. A server OMITTED here is
+    # WHOLE-SERVER (every tool it exposes) — the pre-2026-11-04 meaning, so an
+    # older console that never sends this field keeps saving whole-server
+    # agents. A key in this map that is not in 'servers' is refused (dead
+    # config would silently narrow nothing).
+    tools: dict[str, list[str]] = Field(default_factory=dict)
     # '' = let the profile chat cascade pick the serving model (the agent then
     # chooses TOOLS + prompt, not the model). A pinned name must be a
     # registered CHAT model and is still bounded by the key's allowed_models at
@@ -3316,6 +3612,49 @@ async def _validate_agent_servers(servers: list[str]) -> list[str]:
     return wanted
 
 
+# Bound on the total number of narrowed tool names an agent may carry. Well
+# above any real fleet surface (the reference deployment exposes ~111 tools);
+# the cap exists so a bad script cannot store an unbounded blob.
+_MAX_AGENT_TOOLS = 2000
+
+
+def _validate_agent_tools(tools: dict[str, list[str]], servers: list[str]) -> dict[str, list[str]]:
+    """Validate per-server tool narrowing. Returns a deduped, stripped map.
+
+    Tool names are NOT checked against a live catalog: that would make a save
+    depend on an MCP server being up, and a stale/unknown name is SAFE here —
+    narrowing can only hide, so a name the server does not expose simply
+    matches nothing. Server names ARE checked against 'servers', because that
+    one is pure config (nothing to probe).
+    """
+    if not tools:
+        return {}
+    allowed = set(servers)
+    unknown = sorted(set(tools) - allowed)
+    if unknown:
+        raise HTTPException(
+            400,
+            f"agent tools name server(s) not in servers: {unknown} — servers: {servers}",
+        )
+    out: dict[str, list[str]] = {}
+    total = 0
+    for server, names in tools.items():
+        picked = list(dict.fromkeys(str(n).strip() for n in names if str(n).strip()))
+        if not picked:
+            raise HTTPException(
+                400,
+                f"agent tools for {server!r} is empty — remove the server from 'servers' instead",
+            )
+        long_names = [n for n in picked if len(n) > 200]
+        if long_names:
+            raise HTTPException(400, f"agent tool names must be ≤200 chars: {long_names[:3]}")
+        total += len(picked)
+        if total > _MAX_AGENT_TOOLS:
+            raise HTTPException(400, f"an agent may narrow at most {_MAX_AGENT_TOOLS} tools")
+        out[server] = picked
+    return out
+
+
 def _validate_agent_model(model: str) -> str:
     """'' (cascade) or a registered CHAT model. Anything else is dead config."""
     name = model.strip()
@@ -3323,8 +3662,15 @@ def _validate_agent_model(model: str) -> str:
         return ""
     if name not in model_router.models():
         raise HTTPException(400, f"agent model {name!r} is not a registered model")
+    from ..core.cascade import pool_serves_chat  # local: keeps this module import-light
+
     pool = model_router.pool(name)
-    if pool is not None and pool.endpoints and pool.endpoints[0].model_type != "chat":
+    # serves_chat's any() predicate — the ONE chat-type rule (same as the data
+    # plane's admission gates). The old endpoints[0] test REFUSED a mixed pool
+    # whose first-registered endpoint happened to be non-chat even when another
+    # member serves chat, so a legitimate agent save was rejected purely for
+    # registration order (cross-review 2026-11-03).
+    if pool is not None and not pool_serves_chat(pool):
         raise HTTPException(
             400,
             f"agent model {name!r} is a {pool.endpoints[0].model_type} endpoint, not chat —"
@@ -3344,16 +3690,18 @@ async def upsert_agent(body: AgentUpsert, request: Request, _: AdminDep) -> dict
     """
     name = _validate_agent_name(body.name, set(model_router.models()))
     servers = await _validate_agent_servers(body.servers)
+    tools = _validate_agent_tools(body.tools, servers)
     model = _validate_agent_model(body.model)
     row = await db.fetchrow(
-        "INSERT INTO agent_profiles (name, description, servers, model, system_prompt, enabled) "
-        "VALUES ($1, $2, $3, $4, $5, $6) "
-        "ON CONFLICT (name) DO UPDATE SET description = $2, servers = $3, model = $4, "
-        "system_prompt = $5, enabled = $6, updated_at = now() "
-        "RETURNING id, name, description, servers, model, system_prompt, enabled",
+        "INSERT INTO agent_profiles (name, description, servers, tools, model, system_prompt, enabled) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+        "ON CONFLICT (name) DO UPDATE SET description = $2, servers = $3, tools = $4, model = $5, "
+        "system_prompt = $6, enabled = $7, updated_at = now() "
+        "RETURNING id, name, description, servers, tools, model, system_prompt, enabled",
         name,
         body.description,
         servers,
+        json.dumps(tools, sort_keys=True),
         model,
         body.system_prompt,
         body.enabled,
@@ -3361,6 +3709,7 @@ async def upsert_agent(body: AgentUpsert, request: Request, _: AdminDep) -> dict
     assert row is not None
     out = dict(row)
     out["servers"] = list(out.get("servers") or [])
+    out["tools"] = {s: list(t) for s, t in agents_mod.parse_tools(out.get("tools")).items()}
     # The prompt is operator prose up to 8 000 chars: audit its LENGTH, never
     # its body (the append-only trail must not carry prompt text — same
     # discipline as the routing-prompt audit row).
@@ -3372,6 +3721,9 @@ async def upsert_agent(body: AgentUpsert, request: Request, _: AdminDep) -> dict
         details={
             "description": body.description,
             "servers": servers,
+            # tool NAMES are config, not secrets, but the trail wants the shape
+            # (how much narrower than the servers), not a second copy of it.
+            "tools": {s: len(t) for s, t in tools.items()},
             "model": model,
             "enabled": body.enabled,
             "system_prompt_chars": len(body.system_prompt),
@@ -3403,6 +3755,7 @@ async def list_agents(_: AdminDep) -> list[dict[str, Any]]:
             "name": agent.name,
             "description": agent.description,
             "servers": list(agent.servers),
+            "tools": {s: list(t) for s, t in agent.tools.items()},
             "model": agent.model,
             "system_prompt": agent.system_prompt,
             "system_prompt_chars": len(agent.system_prompt),
@@ -3427,6 +3780,7 @@ async def delete_agent(name: str, request: Request, _: AdminDep) -> Response:
     await _audit(request, action="agent.delete", resource_type="agent", resource_id=name, details={})
     return Response(status_code=204)
 
+
 @router.post("/profiles", status_code=201)
 async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> dict[str, Any]:
     """Create/update a profile: named key-creation defaults.
@@ -3445,7 +3799,25 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # a preset the redeem or the create-key seeding would refuse.
     if "budgets" in body.model_fields_set:
         try:
-            split_preset_budgets([b.model_dump() for b in body.budgets])
+            presets = [b.model_dump() for b in body.budgets]
+            split_preset_budgets(presets)
+            # CROSS-ENTRY check (audit W6 follow-up F6): two presets for the
+            # SAME (model, period) KIND pass the per-entry validator and then
+            # PK-collide at every stamp (the seeding INSERT carries no ON
+            # CONFLICT) — a permanent 500 for every key this profile mints or
+            # redeems. Refused HERE, naming the duplicate. Same (model,
+            # period) with DIFFERENT kinds is legitimate: a token cap and a
+            # USD cap are different tables and different limits.
+            seen: set[tuple[str, str, str]] = set()
+            for preset in presets:
+                kind = "tokens" if preset.get("limit_tokens") is not None else "usd"
+                mpp = (str(preset.get("model") or "*"), str(preset.get("period")), kind)
+                if mpp in seen:
+                    raise ValueError(
+                        f"duplicate budget preset for model {mpp[0]!r} period {mpp[1]!r} ({mpp[2]}) — "
+                        "every key minted from this profile would fail to stamp"
+                    )
+                seen.add(mpp)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
     # --- MERGE, NOT REPLACE (2026-10-29) -------------------------------------
@@ -3471,7 +3843,7 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     provided = set(body.model_fields_set)
     prev = await db.fetchrow(
         "SELECT id, model_order, defaults_json, offpeak_fraction, routing_policy, "
-        "routing_min_model FROM profiles WHERE name = $1",
+        "routing_min_model, tool_relay_budget FROM profiles WHERE name = $1",
         body.name,
     )
     # .get, not [] — asyncpg Records and the test fakes both implement it, and a
@@ -3506,6 +3878,14 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
         body.offpeak_fraction
         if "offpeak_fraction" in provided
         else (prev.get("offpeak_fraction") if prev is not None else None)
+    )
+    # Tool-relay budget: same MERGE rule as every other scalar here — a
+    # partial save (say, agents only) must not clear a stored budget, while an
+    # explicit null DOES clear it (= back to inheriting the site default).
+    tool_relay_budget = (
+        body.tool_relay_budget
+        if "tool_relay_budget" in provided
+        else (prev.get("tool_relay_budget") if prev is not None else None)
     )
     if "budgets" in provided:
         # exclude_none keeps each stored preset to its ONE limit key, so a
@@ -3607,20 +3987,33 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
         # pairs it once expanded to (the operator is editing the grants now).
         defaults.pop("mcp_grant_preset", None)
     row = await db.fetchrow(
-        "INSERT INTO profiles (name, model_order, defaults_json, offpeak_fraction, "
+        # The NEW column is bound at $7 and listed FIRST, while the argument
+        # tuple keeps the historical order (name, model_order, defaults,
+        # offpeak, routing_policy, routing_min_model, tool_relay_budget):
+        # $5/$6 stay the routing pair, so every existing positional reader
+        # (the admin tests' args[3..5] fakes, the console) is unchanged.
+        "INSERT INTO profiles (tool_relay_budget, name, model_order, defaults_json, offpeak_fraction, "
         "routing_policy, routing_min_model) "
-        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "VALUES ($7, $1, $2, $3, $4, $5, $6) "
         "ON CONFLICT (name) DO UPDATE SET model_order = $2, defaults_json = $3, "
-        "offpeak_fraction = $4, routing_policy = $5, routing_min_model = $6 "
+        "offpeak_fraction = $4, routing_policy = $5, routing_min_model = $6, "
+        "tool_relay_budget = $7 "
         "RETURNING id, name, model_order, defaults_json, offpeak_fraction, "
-        "routing_policy, routing_min_model",
+        "routing_policy, routing_min_model, tool_relay_budget",
         body.name,
         model_order,
         json.dumps(defaults),
         offpeak_fraction,
         routing_policy,
         routing_min_model,
+        tool_relay_budget,
     )
+    # PROFILE PRESETS FEED DERIVED TEAM CAPS (2026-10-30 review): the gate
+    # caches each key's TeamEnrollment (model_caps included) for a short TTL, so
+    # a preset edit must invalidate it exactly like an enrollment write —
+    # otherwise the OLD N x preset caps keep enforcing for up to the TTL after
+    # this save. "ANY write that changes an envelope" includes this one.
+    teams.invalidate()
     # --- agent selection (2026-10-29) ---------------------------------------
     # Written to its OWN table, in ONE statement (delete+insert), because
     # create_profile rebuilds defaults_json from this request body — an agent
@@ -3689,6 +4082,7 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
             "offpeak_fraction": offpeak_fraction,
             "routing_policy": routing_policy,
             "routing_min_model": routing_min_model,
+            "tool_relay_budget": tool_relay_budget,
             "provided": sorted(provided),
             "memory": defaults.get("memory"),
             "live_grants": bool(defaults.get("live_grants")),
@@ -3733,7 +4127,7 @@ async def list_profiles(_: AdminDep) -> list[dict[str, Any]]:
     out = []
     for r in await db.fetch(
         "SELECT id, name, model_order, defaults_json, offpeak_fraction, "
-        "routing_policy, routing_min_model FROM profiles ORDER BY name"
+        "routing_policy, routing_min_model, tool_relay_budget FROM profiles ORDER BY name"
     ):
         d = dict(r)
         try:
@@ -3816,6 +4210,7 @@ async def propagate_profile_limits(profile_id: uuid.UUID, request: Request, _: A
     )
     return {"propagated": tag, "fields": [s.split(" =")[0] for s in sets]}
 
+
 @router.post("/profiles/{profile_id}/propagate-grants")
 async def propagate_profile_grants(profile_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
     """Push the profile's MCP grant presets onto ALL keys of attached users.
@@ -3895,7 +4290,6 @@ async def propagate_profile_grants(profile_id: uuid.UUID, request: Request, _: A
     return {"propagated": int(keys or 0), "grants": len(pairs), "tag": tag}
 
 
-
 @router.delete("/profiles/{profile_id}")
 async def delete_profile(profile_id: uuid.UUID, request: Request, _: AdminDep, force: bool = False) -> dict[str, Any]:
     """Delete a profile.
@@ -3951,7 +4345,7 @@ async def assign_profile(user_id: uuid.UUID, body: UserAssignProfile, request: R
 
 
 @router.get("/usage/summary")
-async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]:
+async def usage_summary(_: AdminDep, since: str | None = None, until: str | None = None) -> dict[str, Any]:
     """Ledger rollup: requests, tokens (in/out/cached split), cache hits,
     and USD totals — the numbers a capacity/chargeback view needs.
 
@@ -3963,10 +4357,13 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
 
     Bounded (audit P1-4): defaults to the last 30 days; the ledger is never
     pruned and an unbounded aggregate on the pool the data plane shares
-    stalls tenant traffic on every console refresh. Pass since= to widen
-    (max 366 days).
+    stalls tenant traffic on every console refresh. Pass since= to widen,
+    and since= together with until= for a CUSTOM range (quarterly/yearly
+    chargeback reports pin both ends; span max 366 days, until >= since,
+    both ISO-8601 WITH a UTC offset — 400 otherwise). The response's
+    window block echoes the effective since/until either way.
     """
-    _since_dt, _until_dt = _bounded_window(since, default_days=30)
+    _since_dt, _until_dt = _bounded_window(since, default_days=30, until=until)
     _cond = " WHERE ts >= $1 AND ts <= $2" if _since_dt else ""
     _cond_l = " WHERE l.ts >= $1 AND l.ts <= $2" if _since_dt else ""
     _win = [_since_dt, _until_dt] if _since_dt else []
@@ -3982,13 +4379,18 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
           -- TOKEN-WEIGHTED cache hit rate (audit follow-up: the raw request-level
           -- count read 0 while 4.7B of 4.75B input tokens were upstream
           -- prompt-cached — vLLM/SGLang report those as cached_tokens>0 on 'ok'
-          -- rows, not as status='cache_hit' rows, which are the EMBEDDING-cache
-          -- hits only). cached/input is the number an operator means.
-          CASE WHEN COALESCE(SUM(prompt_tokens), 0) > 0
-               THEN ROUND(100.0 * SUM(cached_tokens) / SUM(prompt_tokens), 1)
+          -- rows, not as status='cache_hit' rows). cache_hit rows are the
+          -- GATEWAY response cache (embeddings, and chat since 2026-11-02):
+          -- they never reached an upstream, so including them would report a
+          -- 100%-cached request as if the model server had served it from
+          -- prefix cache. The rate is therefore computed over rows that
+          -- actually hit the upstream. cached/input is the number an
+          -- operator means.
+          CASE WHEN COALESCE(SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 0) > 0
+               THEN ROUND(100.0 * SUM(cached_tokens) FILTER (WHERE status <> 'cache_hit') / SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 1)
                ELSE NULL END                                          AS cache_hit_rate_pct,
           COALESCE(SUM(cost_usd), 0)::float                           AS cost_usd,
-          COALESCE(SUM(total_tokens * billing_fraction), 0)::float    AS billed_tokens,
+          COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billed_tokens,
           COALESCE(SUM(cost_usd * billing_fraction), 0)::float        AS billed_cost_usd
         FROM usage_ledger{_cond}
         """,
@@ -4002,11 +4404,12 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
                COALESCE(SUM(completion_tokens), 0)::bigint         AS output_tokens,
                COALESCE(SUM(cached_tokens), 0)::bigint             AS cached_tokens,
                count(*) FILTER (WHERE status = 'cache_hit')        AS cache_hits,
-               CASE WHEN COALESCE(SUM(prompt_tokens), 0) > 0
-                    THEN ROUND(100.0 * SUM(cached_tokens) / SUM(prompt_tokens), 1)
+               CASE WHEN COALESCE(SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 0) > 0
+                    THEN ROUND(100.0 * SUM(cached_tokens) FILTER (WHERE status <> 'cache_hit') / SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 1)
                     ELSE NULL END                                  AS cache_hit_rate_pct,
                COALESCE(SUM(cost_usd), 0)::float                   AS cost_usd,
                COALESCE(SUM(total_tokens * billing_fraction), 0)::float AS billed_tokens,
+               COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billable_tokens,
                COALESCE(SUM(cost_usd * billing_fraction), 0)::float     AS billed_cost_usd
         FROM usage_ledger{_cond} GROUP BY model ORDER BY cost_usd DESC
         """,
@@ -4035,11 +4438,12 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
                COALESCE(SUM(l.completion_tokens), 0)::bigint       AS output_tokens,
                COALESCE(SUM(l.cached_tokens), 0)::bigint           AS cached_tokens,
                count(*) FILTER (WHERE l.status = 'cache_hit')      AS cache_hits,
-               CASE WHEN COALESCE(SUM(l.prompt_tokens), 0) > 0
-                    THEN ROUND(100.0 * SUM(l.cached_tokens) / SUM(l.prompt_tokens), 1)
+               CASE WHEN COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.status <> 'cache_hit'), 0) > 0
+                    THEN ROUND(100.0 * SUM(l.cached_tokens) FILTER (WHERE l.status <> 'cache_hit') / SUM(l.prompt_tokens) FILTER (WHERE l.status <> 'cache_hit'), 1)
                     ELSE NULL END                                  AS cache_hit_rate_pct,
                COALESCE(SUM(l.cost_usd), 0)::float                 AS cost_usd,
                COALESCE(SUM(l.total_tokens * l.billing_fraction), 0)::float AS billed_tokens,
+               COALESCE({_billable_tokens_sql("l")}, 0)::float             AS billable_tokens,
                COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd
         FROM usage_ledger l
         LEFT JOIN api_keys k ON k.id = l.key_id
@@ -4060,8 +4464,8 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
                COALESCE(SUM(l.prompt_tokens), 0)::bigint           AS input_tokens,
                COALESCE(SUM(l.completion_tokens), 0)::bigint       AS output_tokens,
                COALESCE(SUM(l.cached_tokens), 0)::bigint           AS cached_tokens,
-               CASE WHEN COALESCE(SUM(l.prompt_tokens), 0) > 0
-                    THEN ROUND(100.0 * SUM(l.cached_tokens) / SUM(l.prompt_tokens), 1)
+               CASE WHEN COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.status <> 'cache_hit'), 0) > 0
+                    THEN ROUND(100.0 * SUM(l.cached_tokens) FILTER (WHERE l.status <> 'cache_hit') / SUM(l.prompt_tokens) FILTER (WHERE l.status <> 'cache_hit'), 1)
                     ELSE NULL END                                  AS cache_hit_rate_pct,
                COALESCE(SUM(l.cost_usd), 0)::float                 AS cost_usd,
                COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float AS billed_cost_usd
@@ -4082,7 +4486,7 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
     # deployment does not have. Report the real oldest row instead and let the
     # console say 'since <date>' honestly. One cheap indexed MIN() on
     # idx_ledger_ts; bounded by the same window as everything else.
-    oldest = await db.fetchval('SELECT MIN(ts) FROM usage_ledger')
+    oldest = await db.fetchval("SELECT MIN(ts) FROM usage_ledger")
     return {
         "totals": dict(row) if row else {},
         "by_model": [dict(r) for r in by_model],
@@ -4110,22 +4514,24 @@ async def usage_summary(_: AdminDep, since: str | None = None) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _parse_since(since: str | None) -> datetime | None:
+def _parse_since(since: str | None, name: str = "since") -> datetime | None:
     """ISO-8601 `since` query param -> datetime; 400 on garbage.
 
     The trace explorer is a human console feed — a clear 400 beats FastAPI's
     generic 422 (and a silent ignore would show stale data with no hint why).
+    `name` labels the offending param in the 400s: the same parser serves the
+    custom chargeback range's `until`.
     """
     if since is None:
         return None
     try:
         dt = datetime.fromisoformat(since)
     except ValueError:
-        raise HTTPException(400, "since must be an ISO-8601 datetime (e.g. 2025-01-01T00:00:00Z)") from None
+        raise HTTPException(400, f"{name} must be an ISO-8601 datetime (e.g. 2025-01-01T00:00:00Z)") from None
     # audit P2-6: a naive datetime would be interpreted as container-local
     # time by asyncpg (astimezone(utc)) - silently shifted on any non-UTC image.
     if dt.tzinfo is None:
-        raise HTTPException(400, "since must include a UTC offset (e.g. 2025-01-01T00:00:00Z)")
+        raise HTTPException(400, f"{name} must include a UTC offset (e.g. 2025-01-01T00:00:00Z)")
     return dt
 
 
@@ -4134,21 +4540,32 @@ TRACE_LIMIT_CAP = 200
 _MAX_WINDOW_DAYS = 366
 
 
-def _bounded_window(since: str | None, default_days: int | None) -> tuple[datetime | None, datetime | None]:
+def _bounded_window(
+    since: str | None, default_days: int | None, until: str | None = None
+) -> tuple[datetime | None, datetime | None]:
     """Shared console-window bound (audit P1-4): the ledger and trace
     tables are never pruned; an unbounded aggregate on the pool the data
     plane shares stalls tenant traffic on every console refresh. Returns
-    (since_dt, until_dt=now) - or (None, None) when no bound applies.
-    A span beyond _MAX_WINDOW_DAYS is a 400 (a typo, not an intent)."""
+    (since_dt, until_dt) — until_dt is `now` unless an explicit `until`
+    is passed (the custom chargeback range pins both ends), or (None, None)
+    when no bound applies. A span beyond _MAX_WINDOW_DAYS is a 400 (a typo,
+    not an intent), and so is an `until` earlier than the window start (an
+    inverted range) — same mirror-of-_parse_since 400 style for garbage."""
     dt = _parse_since(since)
+    dt_until = _parse_since(until, name="until")
     if dt is None:
         if default_days is None:
+            if dt_until is not None:
+                raise HTTPException(400, "until requires an explicit since")
             return None, None
         dt = datetime.now(UTC) - timedelta(days=default_days)
     now = datetime.now(UTC)
-    if (now - dt).days > _MAX_WINDOW_DAYS:
+    end = dt_until if dt_until is not None else now
+    if dt > end:
+        raise HTTPException(400, "until must not be earlier than since")
+    if (end - dt).days > _MAX_WINDOW_DAYS:
         raise HTTPException(400, f"window too large: more than {_MAX_WINDOW_DAYS} days")
-    return dt, now
+    return dt, end
 
 
 @router.get("/traces")
@@ -4164,7 +4581,11 @@ async def list_traces(
     and the actor join (key_name / user_name).
 
     Filters (AND-ed): user_id, key_id, since (ISO-8601); `limit` bounds the
-    number of REQUESTS returned, capped at 200 (default 50).
+    number of CONVERSATIONS returned — a conversation is one request-group
+    (a thread_id, or a single request with no thread), and every request OF
+    a returned conversation comes back with it, so a long conversation
+    renders COMPLETE. Capped at 200 (default 50). Mirrors core.traces.recent's
+    own contract ("limit bounds CONVERSATIONS, not requests").
     """
     from ..core import traces
 
@@ -4349,14 +4770,19 @@ async def put_distiller_config(body: DistillerConfigPatch, request: Request, _: 
 #
 # These endpoints only REGISTER and WIRE guardrails (the guardrails /
 # model_guardrails tables + the model_endpoints picker). The runtime engine
-# that EVALUATES them on model calls lives in core.guardrails and is
-# deliberately NOT imported here — the contract between the two halves is
-# the table shape, so the admin plane cannot grow an accidental dependency
-# on (or regress) the hot path.
+# that EVALUATES them on model calls lives in core.guardrails and its
+# evaluation machinery is deliberately NOT imported here — the contract
+# between the two halves is the table shape, so the admin plane cannot grow
+# an accidental dependency on (or regress) the hot path. ONE exception, the
+# engine-NAME registry below: a hand-copied set here is how "secrets" shipped
+# to the runtime while the admin plane still refused to register it.
 # ---------------------------------------------------------------------------
 
 GUARDRAIL_MODES = {"pre_call", "post_call"}
-GUARDRAIL_ENGINES = {"blocklist", "regex_pii", "length", "webhook"}
+# Single source of truth: the runtime module's own registry (a tuple there,
+# a set here). Names only — the evaluation engine is still never imported
+# at module scope, and the cache-clear import below stays lazy.
+GUARDRAIL_ENGINES = set(_GUARDRAIL_ENGINES)
 REGEX_PII_ENTITIES = {"EMAIL", "PHONE", "CREDIT_CARD"}
 GUARDRAIL_ACTIONS = {"block", "mask"}
 
@@ -4719,6 +5145,13 @@ async def delete_guardrail(guardrail_id: uuid.UUID, request: Request, _: AdminDe
 # iterate on wording without littering the trail.
 
 
+# Per-card description cap. A card is inlined into the criteria of EVERY
+# decision call, so this is a per-request cost bound, not a UI nicety: 4000
+# chars is ~4x the longest role description the fleet ships and still leaves
+# the whole criteria map well inside the endpoint's validated input budget.
+_CARD_DESCRIPTION_MAX = 4000
+
+
 class RoutingConfigPatch(BaseModel):
     """Body of PUT /routing/config.
 
@@ -4749,6 +5182,10 @@ class RoutingConfigPatch(BaseModel):
     routing_policy: str | None = None
     model_order: list[str] | None = None
     prompt: str | None = Field(None, max_length=20000)
+    # {model: {"description": str}} — one card per ROUTABLE model, rendered
+    # into the decision model's criteria at call time. Bounded per card so a
+    # paste-bomb cannot inflate every decision call's prompt.
+    model_cards: dict[str, dict[str, Any]] | None = None
     inject_gpu_load: bool | None = None
     gpu_load_source: str | None = None
     max_prompt_chars: int | None = Field(None, ge=200, le=60000)
@@ -4784,6 +5221,9 @@ class RoutingPromptPreview(BaseModel):
     prompt: str | None = None
     decision_model: str | None = None
     inject_gpu_load: bool | None = None
+    # Unsaved card edits, so "preview" shows the descriptions as typed rather
+    # than as last saved. Null/absent = use the saved map.
+    model_cards: dict[str, dict[str, Any]] | None = None
 
 
 def _routing_decision_models() -> list[str]:
@@ -4812,10 +5252,17 @@ def _routing_chat_models() -> list[str]:
     routes_proxy's /v1/models routing block — one definition, so the admin view
     and the data plane cannot disagree about what "a chat model" is.
     """
+    from ..core.cascade import pool_serves_chat  # local: keeps this module import-light
+
     out: list[str] = []
     for m in model_router.models():
         pool = model_router.pool(m)
-        if pool is not None and pool.endpoints and pool.endpoints[0].model_type == "chat":
+        # "has endpoints AND can serve chat" — serves_chat's any() predicate is
+        # the SAME rule the data plane uses, so the docstring above is true at
+        # the edge too (a mixed pool's first endpoint no longer decides it).
+        # The explicit endpoints check is kept: a pool with none is not a
+        # routing candidate at all, which is a different question from type.
+        if pool is not None and pool.endpoints and pool_serves_chat(pool):
             out.append(m)
     return out
 
@@ -4853,6 +5300,15 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         "env_enabled": settings.routing_enabled,
         "effective_enabled": bool(cfg.get("enabled")) and settings.routing_enabled,
         "placeholders": list(routing_config.PLACEHOLDERS),
+        # The per-model CARD tokens (resolved against one model's own row) and
+        # the coverage count. Both are served rather than duplicated in the
+        # browser: the legend, the warning and the renderer must agree.
+        "criteria_placeholders": list(routing_config.CRITERIA_PLACEHOLDERS),
+        # Counted over the CHAT pools, not the allowlisted subset: this answers
+        # "does every model the panel can offer carry a description", and the
+        # panel counts the same set -- two different denominators for one
+        # concept is how a "3/3 described" panel disagrees with its own API.
+        "card_coverage": routing_config.describe_coverage(cfg.get("model_cards"), _routing_chat_models()),
         "gpu": await routing_config.gpu_load_snapshot(),
     }
 
@@ -4955,7 +5411,6 @@ async def get_routing_stats(_: AdminDep) -> dict[str, Any]:
                 except ValueError:
                     continue
 
-
     head_picks: dict[str, float] = {}
     for s in _samples("gateway_cascade_head_picks_total"):
         if s.name != "gateway_cascade_head_picks_total":
@@ -4984,9 +5439,7 @@ async def get_routing_stats(_: AdminDep) -> dict[str, Any]:
             "decision_calls": calls,
             "served_rate": (served / calls) if calls else None,
             "abstain_rate": (decision.get("abstained", 0.0) / calls) if calls else None,
-            "switch_rate": (
-                switches.get("switched", 0.0) / calls if calls else None
-            ),
+            "switch_rate": (switches.get("switched", 0.0) / calls if calls else None),
         },
         "config": {
             "decision_mode": str(cfg.get("decision_mode") or "off"),
@@ -5102,16 +5555,57 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
                 f"chat pools: {chat_models}. A capability declared for a model the router "
                 "can never choose is dead config that reads as if it were in effect.",
             )
-        bad_mods = sorted({
-            str(x) for v in modalities.values() if isinstance(v, (list, tuple)) for x in v
-            if str(x) not in ("text", "image", "video", "audio")
-        })
+        bad_mods = sorted(
+            {
+                str(x)
+                for v in modalities.values()
+                if isinstance(v, (list, tuple))
+                for x in v
+                if str(x) not in ("text", "image", "video", "audio")
+            }
+        )
         if bad_mods:
             raise HTTPException(
                 400,
-                f"model_modalities has unknown modalities {bad_mods} — "
-                "allowed: text, image, video, audio",
+                f"model_modalities has unknown modalities {bad_mods} — allowed: text, image, video, audio",
             )
+    # model_cards is a {model: {"description": str}} map: same registry check
+    # as model_modalities (a card for a model the router can never choose is
+    # dead config that reads as if it were in effect), plus a length bound —
+    # every card is inlined into EVERY decision call, so one pasted essay
+    # would tax every routed request.
+    cards = provided.get("model_cards")
+    if cards is not None:
+        if not isinstance(cards, dict):
+            raise HTTPException(400, "model_cards must be an object of {model: {description}}")
+        _check_list_len(cards, "model_cards")
+        bad_card_models = [m for m in cards if m not in chat_models]
+        if bad_card_models:
+            raise HTTPException(
+                400,
+                f"model_cards entries are not registered CHAT models: {bad_card_models} — "
+                f"chat pools: {chat_models}. A card for a model the router can never "
+                "choose is dead config that reads as if it were in effect.",
+            )
+        for name, card in cards.items():
+            if not isinstance(card, dict):
+                raise HTTPException(400, f"model_cards[{name!r}] must be an object with a description")
+            unknown_card_keys = [k for k in card if k not in ("description",)]
+            if unknown_card_keys:
+                raise HTTPException(
+                    400,
+                    f"model_cards[{name!r}] has unknown keys {unknown_card_keys} — "
+                    "only 'description' is rendered into the criteria",
+                )
+            desc = card.get("description")
+            if desc is not None and not isinstance(desc, str):
+                raise HTTPException(400, f"model_cards[{name!r}].description must be a string")
+            if isinstance(desc, str) and len(desc) > _CARD_DESCRIPTION_MAX:
+                raise HTTPException(
+                    400,
+                    f"model_cards[{name!r}].description is {len(desc)} chars; "
+                    f"the cap is {_CARD_DESCRIPTION_MAX} (it is inlined into every decision call)",
+                )
     merged = await routing_config.set_values(provided)
     # P3 (audit 2026-10-29): the per-user policy cache must drop on a GLOBAL
     # routing write too — the kill switch (routing_policy), the global floor
@@ -5133,7 +5627,19 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
         details={
             "keys": sorted(provided),
             "values": {
-                k: (f"<{len(v)} chars>" if k == "prompt" and isinstance(v, str) else v) for k, v in provided.items()
+                k: (
+                    # Cards are operator PROSE too (a card is a paragraph per
+                    # model). Record their shape, not their text -- the same
+                    # reason the prompt is length-redacted.
+                    {
+                        name: f"<{len(str(c.get('description') or ''))} chars>"
+                        for name, c in v.items()
+                        if isinstance(c, dict)
+                    }
+                    if k == "model_cards" and isinstance(v, dict)
+                    else (f"<{len(v)} chars>" if k == "prompt" and isinstance(v, str) else v)
+                )
+                for k, v in provided.items()
             },
         },
     )
@@ -5159,7 +5665,17 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
     from ..core import routing_config
 
     cfg = await routing_config.get_config()
+    # The LIVE path resolves an empty prompt to the shipped default
+    # ("policy['prompt'] or DEFAULT_INSTRUCTIONS"). The preview must mirror
+    # that, or "clear the prompt and press Preview" shows a blank (or, with
+    # prompt omitted, the OLD saved text) for a configuration that actually
+    # serves the built-in policy -- which is precisely the question the preview
+    # exists to answer.
     template = body.prompt if body.prompt is not None else str(cfg.get("prompt") or "")
+    if not template.strip():
+        from ..core import decision_routing
+
+        template = decision_routing.DEFAULT_INSTRUCTIONS
     decision_model = body.decision_model if body.decision_model is not None else str(cfg.get("decision_model") or "")
     inject = body.inject_gpu_load if body.inject_gpu_load is not None else bool(cfg.get("inject_gpu_load"))
     # CHAT pools only: the router's ladder is a chat concept, and the prompt
@@ -5182,6 +5698,34 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
     if truncated:
         rendered = rendered[:cap]
     used = [name for name in routing_config.PLACEHOLDERS if "{{" + name + "}}" in template]
+    # The criteria half of the question. Previewed alongside the instructions
+    # because the two are ONE call: an operator approving the instructions
+    # while the option descriptions are empty (or stale) has not seen what the
+    # model is actually given.
+    cards = body.model_cards if body.model_cards is not None else cfg.get("model_cards")
+    try:
+        from ..core import costs as _costs
+
+        prices = await _costs.price_hints(models)
+    except Exception:  # a pricing fault costs a hint, never the preview
+        prices = {}
+    criteria = routing_config.render_criteria(
+        cards,
+        models,
+        gpu=gpu,
+        costs=prices,
+        modalities=cfg.get("model_modalities") or None,
+    )
+    used_criteria = sorted(
+        {
+            token
+            for token in routing_config.CRITERIA_PLACEHOLDERS
+            if isinstance(cards, dict)
+            and any(
+                isinstance(c, dict) and "{{" + token + "}}" in str(c.get("description") or "") for c in cards.values()
+            )
+        }
+    )
     return {
         "rendered": rendered,
         "truncated": truncated,
@@ -5189,11 +5733,62 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
         "gpu": snapshot,
         "models": models,
         "used_placeholders": used,
+        "criteria": criteria,
+        "used_criteria_placeholders": used_criteria,
+        # Same DENOMINATOR as the panel and the GET: the chat pools, not the
+        # allowlisted subset this preview happens to render. Otherwise a site
+        # with a 2-of-3 allowlist sees "2/2 described" here and "2/3" in the
+        # panel for the same config.
+        "card_coverage": routing_config.describe_coverage(cards, _routing_chat_models()),
     }
+
+
+def _endpoint_pools() -> dict[str, list[str]]:
+    """Pool name -> its endpoint base URLs, for the metrics panel's join.
+
+    The pod a metric comes from is identified by IP/pod name, never by the
+    gateway's model name, so the collector needs this map to attribute a row.
+    Built from the live registry per call (pools are edited at runtime).
+    """
+    out: dict[str, list[str]] = {}
+    for name in model_router.models():
+        pool = model_router.pool(name)
+        if pool is None:
+            continue
+        urls = [ep.base_url for ep in pool.endpoints if getattr(ep, "base_url", "")]
+        if urls:
+            out[name] = urls
+    return out
+
+
+@router.get("/endpoint-metrics")
+async def get_endpoint_metrics(window_s: int = 300, _: AdminDep = None) -> dict[str, Any]:
+    """Live per-endpoint throughput and load, from the inference servers' metrics.
+
+    Read-only and NEVER raises: an unreachable prometheus answers
+    available=false with the error, so the panel degrades to "no data"
+    instead of a 500. window_s is the rate() window (clamped in the collector).
+    """
+    from ..core import endpoint_metrics
+
+    return await endpoint_metrics.snapshot(window_s=window_s, pools=_endpoint_pools())
 
 
 @router.get("/presented-models")
 async def presented_models(_: AdminDep) -> dict[str, Any]:
+    """Everything GET /v1/models can advertise (the panel's Advertised tab).
+
+    Delegates to presented_models_payload() — the route's only job is the
+    admin gate. The payload (and the full honesty-contract docstring that
+    specifies it) lives there, so the team-leader console can serve the
+    BYTE-IDENTICAL view through its own gate
+    (GET /team_leader/presented-models) without importing an admin route
+    handler or duplicating the builder.
+    """
+    return await presented_models_payload()
+
+
+async def presented_models_payload() -> dict[str, Any]:
     """Everything GET /v1/models can advertise — REGISTRY TRUTH + CONFIG TRUTH.
 
     WHY an admin route instead of reading /v1/models: that listing is
@@ -5365,3 +5960,240 @@ async def presented_models(_: AdminDep) -> dict[str, Any]:
         },
         "counts": {"presented": presented, "registered": len(registered)},
     }
+
+
+# ---------------------------------------------------------------------------
+# enrollment budget top-up requests (THREAD B, closeout): the admin side of
+# the leader-initiated pool queue. The LEADER writes pending rows only
+# (routes_team_leader); approve/deny HERE is the only path a
+# leader-initiated amount can reach an enrollment cap, and it is
+# admin-gated like every other cap write.
+# ---------------------------------------------------------------------------
+
+
+class TopupApprove(BaseModel):
+    """Optional OVERRIDE amounts for an approve: omitted (or an absent
+    body) = approve AS REQUESTED. Bounds mirror the cap columns the
+    approve writes (a limit the column cannot hold would 500 the
+    resolution — an admin-action contract of 400/422)."""
+
+    tokens: int | None = Field(default=None, gt=0, le=MAX_LIMIT_TOKENS)
+    usd: float | None = Field(default=None, gt=0, allow_inf_nan=False, le=MAX_LIMIT_USD)
+
+
+class TopupDeny(BaseModel):
+    """Optional admin note ON THE DENIAL. The queue table has no
+    deny-note column (the schema is deliberately minimal), so the note
+    lives in the AUDIT trail's details — the trail is the record of the
+    resolution commentary, the table is the queue state."""
+
+    note: str | None = Field(default=None, max_length=500)
+
+
+_TOPUP_STATUSES = ("pending", "approved", "denied")
+
+
+@router.get("/topup-requests")
+async def list_topup_requests(
+    _: AdminDep,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """The top-up queue across ALL enrollments, newest first, bounded at
+    200 (default 100) — the same console-page discipline as /admin/audit.
+    Optional status filter (pending|approved|denied); rows carry the
+    enrollment label + tenant name so the admin can act without a join
+    of their own."""
+    if status is not None and status not in _TOPUP_STATUSES:
+        raise HTTPException(400, f"status must be one of {list(_TOPUP_STATUSES)}")
+    capped = max(1, min(limit, 200))
+    conds: list[str] = []
+    args: list[Any] = []
+    if status is not None:
+        args.append(status)
+        conds.append(f"r.status = ${len(args)}")
+    where = f"WHERE {' AND '.join(conds)}" if conds else ""
+    args.append(capped)
+    rows = await db.fetch(
+        f"""
+        SELECT r.id, r.enrollment_id, r.requested_tokens, r.requested_usd, r.note,
+               r.status, r.created_at, r.resolved_at, r.resolved_by,
+               e.label AS enrollment_label, t.name AS tenant_name
+        FROM enrollment_topup_requests r
+        JOIN enrollments e ON e.id = r.enrollment_id
+        JOIN tenants t ON t.id = e.tenant_id
+        {where}
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT ${len(args)}
+        """,
+        *args,
+    )
+    return [dict(r) for r in rows]
+
+
+async def _topup_or_404(topup_id: uuid.UUID) -> dict[str, Any]:
+    """The queue row, or the honest 404 (unknown id). The status gate
+    (409 on an already-resolved row) lives at the call sites."""
+    row = await db.fetchrow(
+        "SELECT id, enrollment_id, requested_tokens, requested_usd, note, status, created_at, resolved_at, resolved_by "
+        "FROM enrollment_topup_requests WHERE id = $1",
+        topup_id,
+    )
+    if row is None:
+        raise HTTPException(404, f"top-up request {topup_id} not found")
+    return dict(row)
+
+
+@router.post("/topup-requests/{topup_id}/approve")
+async def approve_topup_request(
+    topup_id: uuid.UUID, request: Request, _: AdminDep, body: TopupApprove | None = None
+) -> dict[str, Any]:
+    """Approve a top-up: THE ONLY PATH by which a leader-initiated amount
+    reaches an enrollment cap, admin-gated like every other cap write.
+
+    CAP SEMANTICS (the contract): the approved amount is ADDED to the
+    existing cap of that kind; when the enrollment has NO cap of that
+    kind, the approved amount BECOMES the cap (the \'establish a cap\'
+    case — a team launched without a USD cap gets one the moment an
+    amount of that kind is approved). A kind the request does not name
+    (and no override provides) is left UNTOUCHED.
+
+    The override lets the admin approve LESS than asked (never more than
+    the column bounds). The resolution and the cap change commit AS ONE
+    transaction, and the cap UPDATE does the ADDITION IN SQL
+    (COALESCE(cap, 0) + amount) so two concurrent approvals of two
+    different requests serialize on the row lock and BOTH add — never a
+    lost update. teams.invalidate() afterwards: the gate caches the
+    enrollment row for 30s, and a raised cap must be live immediately.
+
+    409 when the request is already resolved (the conditional UPDATE
+    re-checks status inside the transaction — a double-click resolves
+    once and the loser refuses)."""
+    row = await _topup_or_404(topup_id)
+    if row["status"] != "pending":
+        raise HTTPException(
+            409,
+            f"top-up request {topup_id} is already {row['status']} (resolved {row['resolved_at']}) — refusing to resolve it twice",
+        )
+    override_tokens = body.tokens if body is not None else None
+    override_usd = body.usd if body is not None else None
+    applied_tokens = override_tokens if override_tokens is not None else row["requested_tokens"]
+    applied_usd = override_usd if override_usd is not None else row["requested_usd"]
+    if applied_tokens is None and applied_usd is None:
+        raise HTTPException(400, "this request asks for nothing (no tokens, no USD) — nothing to approve")
+    # column-bound guard on the RESULT: each amount was bounded at write
+    # time, but existing + approved can still overflow the column — refuse
+    # BEFORE the transaction (the DB bound is the backstop, this is the
+    # readable 400).
+    enroll = await db.fetchrow(
+        "SELECT budget_tokens, budget_usd, budget_period FROM enrollments WHERE id = $1",
+        row["enrollment_id"],
+    )
+    if enroll is None:
+        raise HTTPException(404, f"enrollment {row['enrollment_id']} not found")
+    if applied_tokens is not None and (enroll["budget_tokens"] or 0) + applied_tokens > MAX_LIMIT_TOKENS:
+        raise HTTPException(400, "resulting token cap would exceed the column maximum")
+    if applied_usd is not None and float(enroll["budget_usd"] or 0.0) + applied_usd > MAX_LIMIT_USD:
+        raise HTTPException(400, "resulting USD cap would exceed the column maximum")
+    resolved_by = _actor_subject_of(request)
+    async with db.acquire() as conn, conn.transaction():
+        resolved = await conn.fetchrow(
+            "UPDATE enrollment_topup_requests SET status = 'approved', resolved_at = now(), resolved_by = $2 "
+            "WHERE id = $1 AND status = 'pending' "
+            "RETURNING id, enrollment_id, requested_tokens, requested_usd, note, status, created_at, resolved_at, resolved_by",
+            topup_id,
+            resolved_by,
+        )
+        if resolved is None:
+            # lost the race with a concurrent resolution — the read above
+            # saw pending, the conditional UPDATE did not
+            raise HTTPException(
+                409,
+                f"top-up request {topup_id} was resolved concurrently — refusing to resolve it twice",
+            )
+        # THE cap write: ADD in SQL (never replace) — concurrent approvals
+        # serialize on the row lock and both add. A kind with no cap and no
+        # approved amount keeps its value (the CASE skips it); a NULL cap
+        # plus an approved amount ESTABLISHES the cap.
+        caps = await conn.fetchrow(
+            "UPDATE enrollments SET "
+            "budget_tokens = CASE WHEN $2::bigint IS NULL THEN budget_tokens ELSE COALESCE(budget_tokens, 0) + $2::bigint END, "
+            "budget_usd = CASE WHEN $3::numeric IS NULL THEN budget_usd ELSE COALESCE(budget_usd, 0) + $3::numeric END "
+            "WHERE id = $1 "
+            "RETURNING budget_tokens, budget_usd, budget_period",
+            row["enrollment_id"],
+            applied_tokens,
+            applied_usd,
+        )
+        assert caps is not None
+    # the cap changed — the gate's cached enrollment row must not serve the
+    # old cap for up to a TTL
+    teams.invalidate(row["enrollment_id"])
+    await _audit(
+        request,
+        action="enroll.topup.approve",
+        resource_type="topup",
+        resource_id=str(topup_id),
+        details={
+            "enrollment_id": str(row["enrollment_id"]),
+            "requested_tokens": row["requested_tokens"],
+            "requested_usd": row["requested_usd"],
+            "applied_tokens": applied_tokens,
+            "applied_usd": applied_usd,
+            "new_caps": {
+                "budget_tokens": caps["budget_tokens"],
+                "budget_usd": float(caps["budget_usd"]) if caps["budget_usd"] is not None else None,
+                "budget_period": caps["budget_period"],
+            },
+        },
+    )
+    out = dict(resolved)
+    out["applied"] = {"tokens": applied_tokens, "usd": applied_usd}
+    out["enrollment_caps"] = {
+        "budget_tokens": caps["budget_tokens"],
+        "budget_usd": float(caps["budget_usd"]) if caps["budget_usd"] is not None else None,
+        "budget_period": caps["budget_period"],
+    }
+    return out
+
+
+@router.post("/topup-requests/{topup_id}/deny")
+async def deny_topup_request(
+    topup_id: uuid.UUID, request: Request, _: AdminDep, body: TopupDeny | None = None
+) -> dict[str, Any]:
+    """Deny a top-up request: the queue row resolves, the enrollment caps
+    are untouched (nothing to invalidate), and the optional admin note
+    lives in the audit trail (the table has no deny-note column — see
+    TopupDeny). Same 409-on-double-resolve guard as approve."""
+    row = await _topup_or_404(topup_id)
+    if row["status"] != "pending":
+        raise HTTPException(
+            409,
+            f"top-up request {topup_id} is already {row['status']} (resolved {row['resolved_at']}) — refusing to resolve it twice",
+        )
+    resolved_by = _actor_subject_of(request)
+    resolved = await db.fetchrow(
+        "UPDATE enrollment_topup_requests SET status = 'denied', resolved_at = now(), resolved_by = $2 "
+        "WHERE id = $1 AND status = 'pending' "
+        "RETURNING id, enrollment_id, requested_tokens, requested_usd, note, status, created_at, resolved_at, resolved_by",
+        topup_id,
+        resolved_by,
+    )
+    if resolved is None:
+        raise HTTPException(
+            409,
+            f"top-up request {topup_id} was resolved concurrently — refusing to resolve it twice",
+        )
+    await _audit(
+        request,
+        action="enroll.topup.deny",
+        resource_type="topup",
+        resource_id=str(topup_id),
+        details={
+            "enrollment_id": str(row["enrollment_id"]),
+            "requested_tokens": row["requested_tokens"],
+            "requested_usd": row["requested_usd"],
+            "deny_note": (body.note if body is not None else None),
+        },
+    )
+    return dict(resolved)

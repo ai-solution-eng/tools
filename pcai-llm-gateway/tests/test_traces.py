@@ -515,7 +515,15 @@ def test_recent_groups_requests_with_totals(fake_db: TraceFakeDB) -> None:
     assert a["model"] == "m1"
     assert a["started_ts"] < a["last_ts"]
     assert [s["phase"] for s in a["steps"]] == ["chat", "tool", "chat"]
-    assert a["totals"] == {"steps": 3, "tool_ms": 30, "chat_ms": 170, "tool_calls": 1, "handed_back": 0}
+    assert a["totals"] == {
+        "steps": 3,
+        "tool_ms": 30,
+        "chat_ms": 170,
+        "tool_calls": 1,
+        "handed_back": 0,
+        "cached_tokens": 0,
+        "prompt_tokens": 10,
+    }
     assert a["steps"][1] == {
         "iteration": 0,
         "phase": "tool",
@@ -531,13 +539,17 @@ def test_recent_groups_requests_with_totals(fake_db: TraceFakeDB) -> None:
 def test_recent_filters_and_limit_binding(fake_db: TraceFakeDB) -> None:
     uid, kid = uuid.uuid4(), uuid.uuid4()
     since = datetime(2025, 3, 1, tzinfo=UTC)
+    fake_db.grouped = [_grouped_row("req-a")]  # a unit is picked, so the fetch runs too
     asyncio.run(traces.recent(user_id=uid, key_id=kid, since=since, limit=7))
-    sql, args = fake_db.queries[-1]
-    assert uid in args and kid in args and since in args
-    assert args[-1] == 7, "limit binds last"
-    assert "t.user_id = $" in sql and "t.key_id = $" in sql and "t.ts >= $" in sql
-    assert "GROUP BY t.request_id" in sql and "json_agg" in sql
-    assert "LEFT JOIN api_keys" in sql and "LEFT JOIN users" in sql
+    sel_sql, sel_args = fake_db.queries[-2]
+    assert uid in sel_args and kid in sel_args and since in sel_args
+    assert sel_args[-1] == 7, "the CONVERSATION limit binds last on the selection"
+    assert "t.user_id = $" in sel_sql and "t.key_id = $" in sel_sql and "t.ts >= $" in sel_sql
+    fetch_sql, fetch_args = fake_db.queries[-1]
+    assert "GROUP BY t.request_id" in fetch_sql and "json_agg" in fetch_sql
+    assert "LEFT JOIN api_keys" in fetch_sql and "LEFT JOIN users" in fetch_sql
+    assert "LIMIT" not in fetch_sql, "a selected conversation comes back in full"
+    assert fetch_args[-2] == [] and fetch_args[-1] == ["req-a"], "unit ids bind as arrays"
 
 
 def test_recent_parses_json_string_steps(fake_db: TraceFakeDB) -> None:
@@ -546,8 +558,30 @@ def test_recent_parses_json_string_steps(fake_db: TraceFakeDB) -> None:
     row["steps"] = json.dumps(row["steps"])
     fake_db.grouped = [row]
     out = asyncio.run(traces.recent())
-    assert out[0]["totals"] == {"steps": 3, "tool_ms": 30, "chat_ms": 170, "tool_calls": 1, "handed_back": 0}
+    assert out[0]["totals"] == {
+        "steps": 3,
+        "tool_ms": 30,
+        "chat_ms": 170,
+        "tool_calls": 1,
+        "handed_back": 0,
+        "cached_tokens": 0,
+        "prompt_tokens": 10,
+    }
     assert len(out[0]["steps"]) == 3
+
+
+def test_identity_columns_survive_the_conversation_read(fake_db: TraceFakeDB) -> None:
+    """The Phase A identity projection (bound_via / subject / subject_idp)
+    must reach the console through the ROW query of the two-phase read: the
+    unit-selection query carries no projection, so this is the behavioural
+    pin that the identity columns are not lost by the conversation read."""
+    row = _grouped_row("req-a")
+    row.update({"bound_via": "sso", "subject": "alice@example.com", "subject_idp": "keycloak"})
+    fake_db.grouped = [row]
+    out = asyncio.run(traces.recent(limit=1))
+    assert out[0]["bound_via"] == "sso"
+    assert out[0]["subject"] == "alice@example.com"
+    assert out[0]["subject_idp"] == "keycloak"
 
 
 def test_recent_no_filters_runs_unconditional_group_by(fake_db: TraceFakeDB) -> None:
@@ -555,8 +589,9 @@ def test_recent_no_filters_runs_unconditional_group_by(fake_db: TraceFakeDB) -> 
     out = asyncio.run(traces.recent(limit=25))
     assert out == []
     sql, args = fake_db.queries[-1]
-    assert "WHERE" not in sql
+    assert "t.user_id = $" not in sql and "t.key_id = $" not in sql and "t.ts >= $" not in sql
     assert args == (25,)
+    assert len(fake_db.queries) == 1, "empty selection stops after the selection query"
 
 
 def test_get_returns_trace_or_none(fake_db: TraceFakeDB) -> None:
@@ -599,7 +634,15 @@ def test_admin_traces_list_200(admin_client: TestClient, fake_db: TraceFakeDB) -
     assert r.status_code == 200
     body = r.json()
     assert isinstance(body, list) and body[0]["request_id"] == "req-a"
-    assert body[0]["totals"] == {"steps": 3, "tool_ms": 30, "chat_ms": 170, "tool_calls": 1, "handed_back": 0}
+    assert body[0]["totals"] == {
+        "steps": 3,
+        "tool_ms": 30,
+        "chat_ms": 170,
+        "tool_calls": 1,
+        "handed_back": 0,
+        "cached_tokens": 0,
+        "prompt_tokens": 10,
+    }
     assert body[0]["key_name"] == "k1"
 
 
@@ -938,3 +981,229 @@ def test_relay_stream_steps_share_one_thread(relay_fake) -> None:
     assert all(r[COL["thread_id"]] == next(iter(tids)) for r in later), (
         "the follow-up request joins the SAME conversation thread"
     )
+
+
+# ---------------------------------------------------------------------------
+# conversation-grouped reads (owner request 2026-11-02): the read limit must
+# bound CONVERSATIONS, and a selected conversation must come back IN FULL.
+# ---------------------------------------------------------------------------
+
+
+class TraceTableFakeDB:
+    """In-memory agent_traces that MODELS the read semantics.
+
+    The canned-row fake above cannot pin a LIMIT semantic — it returns the
+    same rows whatever the SQL says. This one answers each read shape the
+    module can issue and applies that shape's bound the way Postgres would,
+    so a test can prove the limit bounds CONVERSATIONS rather than requests.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.queries: list[tuple[str, tuple]] = []
+        self.inserts: list[tuple] = []
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.inserts.append(args)
+        return "INSERT 0 1"
+
+    def _units(self, limit: int) -> list[dict[str, Any]]:
+        """The N most recent conversation units: a non-NULL thread, or one
+        request when the thread is NULL."""
+        units: list[tuple[datetime, str | None, str | None]] = []
+        for tid in {r["thread_id"] for r in self.rows if r.get("thread_id") is not None}:
+            units.append((max(r["ts"] for r in self.rows if r.get("thread_id") == tid), tid, None))
+        for rid in {r["request_id"] for r in self.rows if r.get("thread_id") is None}:
+            units.append(
+                (
+                    max(r["ts"] for r in self.rows if r["request_id"] == rid and r.get("thread_id") is None),
+                    None,
+                    rid,
+                )
+            )
+        units.sort(key=lambda u: u[0], reverse=True)
+        return [{"thread_id": t, "request_id": r, "last_ts": ts} for ts, t, r in units[:limit]]
+
+    def _group(self, rows: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
+        by_req: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_req.setdefault(r["request_id"], []).append(r)
+        out: list[dict[str, Any]] = []
+        for rid, steps in by_req.items():
+            steps.sort(key=lambda s: (s["ts"], s["id"]))
+            out.append(
+                {
+                    "request_id": rid,
+                    "key_id": steps[0]["key_id"],
+                    "user_id": steps[0].get("user_id"),
+                    "thread_id": steps[0].get("thread_id"),
+                    "model": steps[0]["model"],
+                    "started_ts": steps[0]["ts"],
+                    "last_ts": steps[-1]["ts"],
+                    "steps_total": len(steps),
+                    "tool_ms": sum(int(s["ms"] or 0) for s in steps if s["phase"] == "tool"),
+                    "chat_ms": sum(int(s["ms"] or 0) for s in steps if s["phase"] == "chat"),
+                    "tool_calls": sum(1 for s in steps if s["phase"] == "tool"),
+                    "handed_back": sum(1 for s in steps if s["phase"] == "tool" and s["status"] == "handed_back"),
+                    "steps": [
+                        {
+                            "iteration": s["iteration"],
+                            "phase": s["phase"],
+                            "server": s["server"],
+                            "tool": s["tool"],
+                            "ms": s["ms"],
+                            "prompt_tokens": s["prompt_tokens"],
+                            "completion_tokens": s["completion_tokens"],
+                            "status": s["status"],
+                        }
+                        for s in steps
+                    ],
+                    "key_name": "k1",
+                    "user_name": "alice",
+                }
+            )
+        out.sort(key=lambda r: r["last_ts"], reverse=True)
+        return out[:limit] if limit is not None else out
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.queries.append((sql, args))
+        if "UNION ALL" in sql:
+            return self._units(int(args[-1]))
+        if "= ANY(" in sql:
+            threads, requests = args[-2], args[-1]
+            picked = [
+                r
+                for r in self.rows
+                if (r.get("thread_id") is not None and r["thread_id"] in threads)
+                or (r.get("thread_id") is None and r["request_id"] in requests)
+            ]
+            return self._group(picked)
+        return self._group(self.rows, int(args[-1]))
+
+
+def _trace_row(request_id: str, thread_id: str | None, ts: datetime, **over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": 0,
+        "request_id": request_id,
+        "thread_id": thread_id,
+        "key_id": uuid.uuid4(),
+        "user_id": uuid.uuid4(),
+        "model": "m1",
+        "iteration": 0,
+        "phase": "chat",
+        "server": "",
+        "tool": "",
+        "ms": 10,
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "status": "ok",
+        "ts": ts,
+    }
+    row.update(over)
+    return row
+
+
+@pytest.fixture
+def table_db(monkeypatch: pytest.MonkeyPatch):
+    def _install(rows: list[dict[str, Any]]) -> TraceTableFakeDB:
+        fake = TraceTableFakeDB(rows)
+        monkeypatch.setattr(traces, "db", fake)
+        return fake
+
+    return _install
+
+
+def test_recent_limit_bounds_conversations_not_requests(table_db) -> None:
+    """OWNER REQUEST: limit=1 CONVERSATION returns all 5 requests of that
+    thread. The old read bounded REQUESTS, so the console rendered only the
+    fragment of a conversation that happened to land in the window."""
+    rows = [_trace_row(f"req-a{i}", "thread-a", datetime(2026, 1, 2, 0, i, tzinfo=UTC)) for i in range(5)] + [
+        _trace_row(f"req-b{i}", "thread-b", datetime(2026, 1, 1, 0, i, tzinfo=UTC)) for i in range(2)
+    ]
+    fake = table_db(rows)
+    out = asyncio.run(traces.recent(limit=1))
+    assert [t["request_id"] for t in out] == ["req-a4", "req-a3", "req-a2", "req-a1", "req-a0"]
+    assert all(t["thread_id"] == "thread-a" for t in out)
+    fetch_sql, _ = fake.queries[-1]
+    assert "LIMIT" not in fetch_sql, "the full-thread fetch must not be limited"
+
+
+def test_recent_null_thread_rows_are_their_own_units(table_db) -> None:
+    """thread_id IS NULL (pre-column rows, the distill trace write, requests
+    with no user message) must fall back to PER-REQUEST grouping — never
+    collapsed into one pseudo-conversation, never dropped."""
+    rows = [
+        _trace_row("req-threaded-1", "thread-a", datetime(2026, 1, 1, tzinfo=UTC)),
+        _trace_row("req-threaded-2", "thread-a", datetime(2026, 1, 1, 0, 1, tzinfo=UTC)),
+        _trace_row("req-null-1", None, datetime(2026, 1, 2, tzinfo=UTC)),
+        _trace_row("req-null-2", None, datetime(2026, 1, 2, 0, 1, tzinfo=UTC)),
+    ]
+    fake = table_db(rows)
+    out = asyncio.run(traces.recent(limit=3))
+    # 3 most recent UNITS = the 2 unthreaded requests + the 1 thread (2 requests)
+    assert [t["request_id"] for t in out] == [
+        "req-null-2",
+        "req-null-1",
+        "req-threaded-2",
+        "req-threaded-1",
+    ]
+    assert len([t for t in out if t["thread_id"] is None]) == 2, "one row per unthreaded request"
+    sel_sql, _ = fake.queries[0]
+    assert "t.thread_id IS NULL" in sel_sql and "t.thread_id IS NOT NULL" in sel_sql
+
+
+def test_totals_come_from_sql_so_a_short_step_array_cannot_under_report() -> None:
+    """A conversation returns in full now, so the payload is bounded by moving
+    the TOTALS into SQL: they must stay exact whatever the array carries."""
+    row = _grouped_row("req-a", steps=[_step("chat", 100)])
+    row.update({"steps_total": 9, "tool_ms": 40, "chat_ms": 900, "tool_calls": 3, "handed_back": 1})
+    out = traces._shape(row)
+    assert out["totals"] == {
+        "steps": 9,
+        "tool_ms": 40,
+        "chat_ms": 900,
+        "tool_calls": 3,
+        "handed_back": 1,
+        "cached_tokens": 0,
+        "prompt_tokens": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# prefix-cache visibility (2026-11-02): In / Out / Cached columns
+# ---------------------------------------------------------------------------
+
+
+def test_insert_sql_carries_cached_tokens() -> None:
+    """The write path persists the upstream's cached_tokens per step."""
+    assert "cached_tokens" in traces._INSERT_SQL
+    assert "$14" in traces._INSERT_SQL
+
+
+def test_step_projection_carries_cached_tokens() -> None:
+    """The read projection exposes it per step, so the console can column it."""
+    assert "'cached_tokens', t.cached_tokens" in traces._STEP_JSON
+
+
+def test_record_persists_cached_tokens(fake_db: TraceFakeDB) -> None:
+    asyncio.run(traces.record("r-cache", uuid.uuid4(), uuid.uuid4(), "m", 0, "chat", cached_tokens=42))
+    assert fake_db.inserts[0][13] == 42
+
+
+def test_totals_carry_cached_and_prompt_from_sql(fake_db: TraceFakeDB) -> None:
+    """The request totals expose cached/prompt so the header can show a rate."""
+    fake_db.grouped = [
+        _grouped_row(
+            "req-c",
+            steps_total=3,
+            tool_ms=30,
+            chat_ms=170,
+            tool_calls=1,
+            handed_back=0,
+            cached_tokens=900,
+            prompt_tokens=1000,
+        )
+    ]
+    out = asyncio.run(traces.recent())
+    assert out[0]["totals"]["cached_tokens"] == 900
+    assert out[0]["totals"]["prompt_tokens"] == 1000

@@ -42,9 +42,9 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ..config import settings
-from ..core import enroll_memory, secretbox
+from ..core import enroll_memory, secretbox, teams
 from ..core.audit import audit_action
-from ..core.budgets import split_preset_budgets
+from ..core.budgets import MAX_LIMIT_TOKENS, MAX_LIMIT_USD, split_preset_budgets
 from ..core.identity import (
     IDP_OAUTH2_PROXY,
     IDP_SELF_ASSERTED,
@@ -61,7 +61,7 @@ from ..core.identity import (
 from ..core.keys import create_key, hash_key
 from ..db import db
 from ..routing.router import router as model_router
-from .routes_admin import AdminDep
+from .routes_admin import _NAME_PATTERN, AdminDep
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +91,12 @@ _REDEEM_SQL = (
     "UPDATE enrollments SET uses = uses + 1 "
     "WHERE code_hash = $1 AND revoked_at IS NULL "
     "AND (expires_at IS NULL OR expires_at > now()) "
-    "AND (max_uses = 0 OR uses < max_uses) "
+    # STRICTLY POSITIVE (2026-10-30): the old "max_uses = 0 OR ..." made 0 mean
+    # UNLIMITED, which is the one shape a mint allowance must never have — the
+    # team ceiling is derived from it, so an unbounded N silently unbounded the
+    # envelope too. A legacy 0 row is now EXHAUSTED (0 uses < 0 is false): fail
+    # closed, and the admin fixes it with PATCH .../enrollments/{id}.
+    "AND (uses < max_uses) "
     "RETURNING id, tenant_id, profile_id"
 )
 _GENERIC_CODE_REJECTION = "invalid, expired, or exhausted code"
@@ -179,7 +184,7 @@ async def _enroll_audit(
     action: str,
     resource_type: str,
     resource_id: str,
-    actor_source: str,
+    actor_source: str = "",
     actor_subject: str = "",
     details: dict[str, Any] | None = None,
 ) -> None:
@@ -189,20 +194,37 @@ async def _enroll_audit(
     actor_source='enroll' for the PUBLIC redeem door (unauthenticated by
     design — the code is the credential, so the actor is the created
     key/subject, never an admin), 'admin-key' for the AdminDep-gated
-    management routes, 'proxy-identity' when a trusted browser identity is
-    present. Redaction happens at the single writer; details here carry
-    counts and ids only."""
-    auth = request.headers.get("authorization", "")
-    if actor_source != "enroll" and auth.lower().startswith("bearer "):
-        from .routes_admin import stable_actor_label
+    management routes (resolved from the request's admin bearer when the
+    caller omits the argument), 'proxy-identity' when a trusted browser
+    identity is present, 'key' for the self-service surfaces (a ledger key,
+    never an admin credential).
 
-        actor_subject = actor_subject or stable_actor_label(auth[7:].strip())
-        actor_source = "admin-key"
-    elif actor_source != "enroll" and settings_trust_proxy_identity():
-        browser = browser_identity_from_headers(dict(request.headers))
-        if browser is not None:
-            actor_subject = actor_subject or browser[0]
-            actor_source = "proxy-identity"
+    EXPLICIT-ACTOR RULE (audit w6 F3): an actor_source the caller SUPPLIES
+    is authoritative and is never overwritten — the bearer/browser
+    resolution below runs only when the caller supplied none. The previous
+    behavior relabeled ANY non-'enroll' actor carrying a Bearer to
+    'admin-key', which misattributed self-service writes (mcp.creds.self,
+    actor_source='key') and SSO self-mints ('proxy-identity' — behind the
+    SSO chain the proxy injects its id_token Bearer into every request) to
+    the admin actor class in the hash-chained trail. No new vocabulary: the
+    callers' own values simply stand, and no subject is fabricated for a
+    source the bearer-label vocabulary does not describe (an explicit
+    non-admin source carries the subject it names, or none).
+
+    Redaction happens at the single writer; details here carry counts and
+    ids only."""
+    if not actor_source:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            from .routes_admin import stable_actor_label
+
+            actor_subject = actor_subject or stable_actor_label(auth[7:].strip())
+            actor_source = "admin-key"
+        elif settings_trust_proxy_identity():
+            browser = browser_identity_from_headers(dict(request.headers))
+            if browser is not None:
+                actor_subject = actor_subject or browser[0]
+                actor_source = "proxy-identity"
     rid = getattr(request.state, "request_id", None)
     fwd = request.headers.get("x-forwarded-for", "")
     source_ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else None)
@@ -263,7 +285,18 @@ def _throttle_redeem(request: Request) -> None:
 
 class EnrollRequest(BaseModel):
     code: str = Field(min_length=1, max_length=200)
-    name: str  # 1-64 chars AFTER strip (validated below — pydantic sees the raw string)
+    # THE NAME CHARSET ON THE RAW VALUE (audit W6 FIX 8 — the public door):
+    # this field IS api_keys.name via the redeem create_key, and the admin
+    # console renders it — the stored-XSS source the UI zone closed at the
+    # sinks closes HERE, at the edge, with the SAME pattern the admin
+    # (_NAME_PATTERN, routes_admin) and team-leader mint surfaces enforce.
+    # A pydantic 422 fires BEFORE the handler runs, so an invalid name never
+    # burns the code. Interplay with _clean_name (strips below): whitespace
+    # passes the pattern and is all the cleaner removes, so a pattern-passing
+    # raw value always strips to a pattern-clean name; a raw value with
+    # control chars at the edges (tab / newline) is now a 422 instead of a
+    # silent strip — refuse-don't-mutate at an unauthenticated door.
+    name: str = Field(pattern=_NAME_PATTERN)  # 1-64 chars AFTER strip (validated below)
     # OPTIONAL self-asserted subject ("who am I"): bound to the minted key
     # with idp='self-asserted' — a CLAIM, honestly provenance-stamped (the
     # UI renders the "self-asserted" chip) and never a verification. When
@@ -487,8 +520,19 @@ async def enroll(body: EnrollRequest, request: Request) -> dict[str, Any]:
         # client) PARSES the in-stream {"pcai": …} telemetry (consumer-inventory
         # finding) — enroll keys opt in even though the new-key default is now
         # spec-clean FALSE. SSO for-me keys below take the new default.
+        # enrollment_id stamps the minted key into the TEAM (team-leader
+        # wave): the team-leader console and the team budget envelope only
+        # see keys minted from THIS enrollment because the column says so.
+        # None-safe: a legacy row (or a fake) lacking the column still
+        # redeems — redeemed["id"] is always present on the RETURNING row.
         plaintext, key_id = await create_key(
-            user["id"], body.name, ENROLL_SCOPES, allowed_models or None, stream_pcai_events=True, conn=conn
+            user["id"],
+            body.name,
+            ENROLL_SCOPES,
+            allowed_models or None,
+            stream_pcai_events=True,
+            conn=conn,
+            enrollment_id=redeemed["id"],
         )
         if profile_id is not None and profile_seed is not None:
             budgets, _pd, _order = await _seed_profile_defaults(profile_id, key_id, profile_seed, conn=conn)
@@ -655,7 +699,8 @@ async def _parse_for_me_body(request: Request) -> ForMeMintRequest:
 _FOR_ME_SUBJECT_SQL = "SELECT id FROM subjects WHERE idp = $1 AND subject = $2"
 
 _FOR_ME_KEY_SQL = """
-SELECT k.id, k.user_id, k.key_prefix, k.name, k.created_at, k.spend_ancestors
+SELECT k.id, k.user_id, k.key_prefix, k.name, k.created_at, k.spend_ancestors,
+       k.key_group
 FROM api_keys k
 WHERE k.subject_id = $1 AND k.bound_via = $2 AND k.revoked_at IS NULL
 ORDER BY k.created_at DESC, k.id DESC
@@ -663,6 +708,7 @@ LIMIT 1
 """
 
 _FOR_ME_REVOKE_SQL = "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL"
+
 
 async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, Any] | None) -> None:
     """Bind an SSO-created user to the tenant default profile when it has none.
@@ -690,7 +736,6 @@ async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, A
         user_id,
         profile["id"],
     )
-
 
 
 async def _sso_default_profile(conn: Any, tenant_id: uuid.UUID) -> dict[str, Any] | None:
@@ -823,8 +868,9 @@ async def get_key_for_me(request: Request) -> dict[str, Any]:
     """Owner-safe masked view of the CALLING BROWSER IDENTITY's own key.
 
     Same gates as the POST, read-only otherwise: 403 when the trust flag
-    is off (the surface does not exist in that deployment posture), 401
-    without the oauth2-proxy browser headers. The response is the SPA's
+    or ``sso_key_create_enabled`` is off (the surface does not exist in
+    that deployment posture), 401 without the oauth2-proxy browser
+    headers. The response is the SPA's
     branching contract — HTTP 200 ALWAYS (a 404 here would be
     indistinguishable from route-absent on older backends), with
     ``exists`` carrying the state: {"exists": false} when the subject
@@ -834,6 +880,13 @@ async def get_key_for_me(request: Request) -> dict[str, Any]:
     the owner's own key. No audit: a read mutates nothing.
     """
     if not settings_trust_proxy_identity():
+        raise HTTPException(403, "SSO key creation is not enabled on this deployment")
+    # THE OTHER POSTURE SWITCH (audit w6 F1): sso_key_create_enabled is the
+    # documented kill switch the probe's flags.self_mint already ANDs in —
+    # consulted HERE, before the browser-header read and the eligibility
+    # lookup, so a flags-off deployment never touches subject data and every
+    # caller gets the byte-identical surface-off refusal.
+    if not settings.sso_key_create_enabled:
         raise HTTPException(403, "SSO key creation is not enabled on this deployment")
     browser = browser_identity_from_headers(dict(request.headers))
     if browser is None:
@@ -873,7 +926,8 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
 
     WHO may call: a request whose identity resolves through the
     oauth2-proxy BROWSER HEADERS under PCAI_LLM_TRUST_PROXY_IDENTITY=true
-    (ladder rung 1 — the deployment precondition is the enforcing proxy +
+    AND settings.sso_key_create_enabled=true (ladder rung 1 — the
+    deployment precondition is the enforcing proxy +
     AuthorizationPolicy, documented in core/identity.py). Any other
     caller shape (bearer key, token, nothing) is a 401: this surface is
     the browser's, deliberately NOT a bearer-key self-service door (a
@@ -884,8 +938,8 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     escalation here: scopes are fixed (proxy+mcp), limits are fixed
     defaults, no allowed_models, no profile, no subject choice — grants
     remain admin-controlled (federation ACLs are default-deny until an
-    admin grants). 403 when the trust flag is off (the surface does not
-    exist in that deployment posture).
+    admin grants). 403 when the trust flag or ``sso_key_create_enabled``
+    is off (the surface does not exist in that deployment posture).
 
     WHY the user row: api_keys.user_id is NOT NULL (schema contract,
     review §1.2 "do NOT merge users into subjects") — the key needs a
@@ -912,6 +966,13 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     rotate alike.
     """
     if not settings_trust_proxy_identity():
+        raise HTTPException(403, "SSO key creation is not enabled on this deployment")
+    # THE OTHER POSTURE SWITCH (audit w6 F1): sso_key_create_enabled is the
+    # documented kill switch the probe's flags.self_mint already ANDs in —
+    # consulted HERE, before the browser-header read and the eligibility
+    # lookup, so a flags-off deployment never touches subject data and every
+    # caller gets the byte-identical surface-off refusal.
+    if not settings.sso_key_create_enabled:
         raise HTTPException(403, "SSO key creation is not enabled on this deployment")
     browser = browser_identity_from_headers(dict(request.headers))
     if browser is None:
@@ -1035,9 +1096,15 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
             # presets land first, per-key edits merge on top without
             # duplication). Both writes JOIN the transaction.
             await conn.fetchrow(
-                "UPDATE api_keys SET spend_ancestors = $2 WHERE id = $1",
+                # KEY GROUP (2026-11-03): the replacement credential joins the
+                # OLD key's group. Rotation is the flow that used to orphan
+                # saved conversations (the new key_id listed nothing), and the
+                # SSO "Sign in with SSO" click is exactly the path that
+                # rotates — so this is the line that makes history survive it.
+                "UPDATE api_keys SET spend_ancestors = $2, key_group = $3 WHERE id = $1",
                 key_id,
                 list(existing["spend_ancestors"] or []) + [existing["id"]],
+                existing.get("key_group") or existing["id"],
             )
             for btable, bcols in (
                 ("budgets", "model, period, limit_tokens"),
@@ -1050,6 +1117,36 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                     key_id,
                     existing["id"],
                 )
+            # GRANT + CREDENTIAL carry-over (2026-11-03 cross-validation): the
+            # ADMIN rotate has copied these since the 2026-09-18 incident (a
+            # rotated key dropped from ~102 federated tools to 2); THIS branch
+            # never did, so an SSO "Sign in with SSO" replacement silently
+            # dropped per-key grants AND the memory attachment — and the
+            # distill sweep's attachment gate joins mcp_server_creds, so the
+            # user's history also stopped being distilled. Two sharp edges:
+            #   * the profile stamp above already inserted rows for the fresh
+            #     key, so a plain INSERT..SELECT raises on the
+            #     (key_id, server, tool) PK -> 500 on EVERY SSO rotate. DO
+            #     UPDATE, not DO NOTHING: the OLD key's per-key reality must
+            #     win, including a deliberate DENY row (allowed=FALSE) — DO
+            #     NOTHING would leave the profile's allow in place and
+            #     RESURRECT a grant the operator turned off.
+            #   * mcp_server_creds has no profile-stamped rows on the fresh
+            #     key, so a verbatim copy is safe (same shape as the admin
+            #     rotate).
+            await conn.execute(
+                "INSERT INTO mcp_tool_acls (key_id, server, tool, allowed) "
+                "SELECT $1, server, tool, allowed FROM mcp_tool_acls WHERE key_id = $2 "
+                "ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = EXCLUDED.allowed",
+                key_id,
+                existing["id"],
+            )
+            await conn.execute(
+                "INSERT INTO mcp_server_creds (key_id, server_name, headers_enc) "
+                "SELECT $1, server_name, headers_enc FROM mcp_server_creds WHERE key_id = $2",
+                key_id,
+                existing["id"],
+            )
             await conn.execute(_FOR_ME_REVOKE_SQL, existing["id"])
     else:
         user = await _create_enroll_user(tenant_id, subject)
@@ -1113,8 +1210,39 @@ class EnrollmentCreate(BaseModel):
     label: str = Field(min_length=1, max_length=200)
     tenant_id: uuid.UUID
     profile_id: uuid.UUID | None = None
-    max_uses: int = Field(default=0, ge=0)  # 0 = unlimited
-    expires_days: int | None = Field(default=None, ge=1)
+    # STRICTLY POSITIVE (2026-10-30): required, no unlimited option. 0 used to
+    # mean "unlimited", which made the derived team envelope (N x the profile's
+    # per-key presets) unbounded as well — the exact hole the envelope exists to
+    # close. le: INT column bound, so an oversized value is a 422 and never a
+    # NumericValueOutOfRange 500 from the INSERT.
+    max_uses: int = Field(gt=0, le=2_147_483_647)
+    # le: a huge value overflows timedelta inside the handler (OverflowError ->
+    # 500). 100 years is past any deployment's horizon; refuse it at the edge.
+    expires_days: int | None = Field(default=None, ge=1, le=36500)
+    # --- team budget envelope (team-leader wave) ---
+    # The enrollment is a TEAM invite: these set the HARD cap on the whole
+    # team's spend per budget_period (None = no cap of that kind), and each
+    # teammate key's own allocation draws against it (the /team_leader
+    # console enforces the envelope at allocation time). bounds mirror the
+    # column limits the way core.budgets.MAX_LIMIT_* does for budget rows —
+    # a limit the column cannot hold would 500 the mint (a key-creation
+    # site whose contract is 400/422), so the API is the gate.
+    budget_tokens: int | None = Field(default=None, gt=0, le=MAX_LIMIT_TOKENS)
+    budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False, le=MAX_LIMIT_USD)
+    # Validated app-side against core.teams.TEAM_PERIODS (a 400, not a
+    # 422 — the period set lives in the core module, so a CHECK-less
+    # column stays a code-owned vocabulary; see db/schema.py).
+    budget_period: str = "month"
+    # TRUE (default) = a teammate key may exceed its own allocation while
+    # the enrollment envelope still has headroom (the unallocated remainder
+    # is a shared overflow pool); FALSE = each key is hard-capped at its
+    # own allocation.
+    overflow_enabled: bool = True
+    # Mint a team leader key in the same breath: its plaintext is returned
+    # ONCE in this response (hash-only storage, the enroll-code convention),
+    # so the admin hands it to the team lead in the same action that mints
+    # the invite.
+    with_team_leader: bool = False
 
 
 @admin_router.post("/enrollments", status_code=201)
@@ -1124,7 +1252,18 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
     The plaintext code is in THIS response only — the row stores its
     SHA-256 hash, so no admin endpoint (and no database leak) can ever
     recover it. Reissue = mint a new code.
+
+    Team envelope (team-leader wave): the budget fields ride the INSERT;
+    budget_period is validated app-side against core.teams.TEAM_PERIODS
+    (400 — the period set is a code-owned vocabulary, see the model).
+    with_team_leader also mints the TEAM LEADER key here and returns its
+    plaintext once (team_leader_key) — mint AFTER the insert commits:
+    a failed mint can then only leave an enrollment without a leader key
+    (the operator rotates one in), never a leader key without an
+    enrollment row — the over-provision-on-crash posture rotate_key uses.
     """
+    if body.budget_period not in teams.TEAM_PERIODS:
+        raise HTTPException(400, f"budget_period must be one of {sorted(teams.TEAM_PERIODS)}")
     if not await _exists("tenants", body.tenant_id):
         raise HTTPException(404, f"tenant {body.tenant_id} not found")
     if body.profile_id is not None and not await _exists("profiles", body.profile_id):
@@ -1132,8 +1271,9 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
     code = generate_code()
     expires_at = datetime.now(UTC) + timedelta(days=body.expires_days) if body.expires_days else None
     row = await db.fetchrow(
-        "INSERT INTO enrollments (code_hash, label, tenant_id, profile_id, max_uses, expires_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "INSERT INTO enrollments (code_hash, label, tenant_id, profile_id, max_uses, expires_at, "
+        "budget_tokens, budget_usd, budget_period, overflow_enabled) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
         "RETURNING id, label, tenant_id, profile_id, max_uses, uses, expires_at, revoked_at, created_at",
         hash_key(code),
         body.label,
@@ -1141,10 +1281,19 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
         body.profile_id,
         body.max_uses,
         expires_at,
+        body.budget_tokens,
+        body.budget_usd,
+        body.budget_period,
+        body.overflow_enabled,
     )
     assert row is not None
     out = dict(row)
     out["code"] = code
+    leader_plaintext: str | None = None
+    if body.with_team_leader:
+        leader_plaintext, leader_prefix = await teams.mint_leader_key(row["id"])
+        out["team_leader_key"] = leader_plaintext
+        out["team_leader_key_prefix"] = leader_prefix
     # AUDIT (enroll.code.mint): the CODE/hash never rides the trail — the
     # label + bounds are the metadata a compliance review needs.
     await _enroll_audit(
@@ -1152,31 +1301,131 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
         action="enroll.code.mint",
         resource_type="enrollment",
         resource_id=str(row["id"]),
-        actor_source="admin-key",
         details={
             "label": body.label,
             "tenant_id": str(body.tenant_id),
             "profile_id": str(body.profile_id) if body.profile_id else None,
             "max_uses": body.max_uses,
             "expires_days": body.expires_days,
+            "budget_tokens": body.budget_tokens,
+            "budget_usd": body.budget_usd,
+            "budget_period": body.budget_period,
+            "overflow_enabled": body.overflow_enabled,
+            "with_team_leader": body.with_team_leader,
         },
     )
+    if leader_plaintext is not None:
+        # AUDIT (team.key.create): the leader mint is its own trail row — the
+        # plaintext (and its hash) never rides the details, same discipline as
+        # every key-minting surface.
+        await _enroll_audit(
+            request,
+            action="team.key.create",
+            resource_type="enrollment",
+            resource_id=str(row["id"]),
+            details={"via": "enrollment-create", "label": body.label},
+        )
     return out
 
 
 @admin_router.get("/enrollments")
 async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
     """All enrollment codes with usage state. code_hash is deliberately
-    absent from the projection — the hash never needs to leave the DB."""
+    absent from the projection — the hash never needs to leave the DB.
+
+    Team-envelope columns (team-leader wave) are ADDITIVE: the console's
+    existing JS renders from the keys it already knows; the new keys
+    (budget_*, overflow_enabled, team_leader_key_*, key_count,
+    spend_tokens, allocated_tokens) only add columns. spend/allocated
+    ride the core.teams helpers so the numbers CANNOT drift from what
+    the budget gate enforces (visibility that disagrees with the gate is
+    worse than none), computed per row for that enrollment's own period;
+    a lookup fault degrades that row's numbers to 0 (logged) rather than
+    500ing a console listing.
+    """
     rows = await db.fetch(
         "SELECT e.id, e.label, t.name AS tenant_name, p.name AS profile_name, "
-        "e.max_uses, e.uses, e.expires_at, e.revoked_at, e.created_at "
+        "e.max_uses, e.uses, e.expires_at, e.revoked_at, e.created_at, "
+        "e.budget_tokens, e.budget_usd, e.budget_period, e.overflow_enabled, p.defaults_json, "
+        "e.team_leader_key_prefix, e.team_leader_key_created_at, e.team_leader_key_revoked_at, "
+        "e.team_leader_key_last_used_at, "
+        "(SELECT count(*) FROM api_keys ak WHERE ak.enrollment_id = e.id) AS key_count "
         "FROM enrollments e "
         "JOIN tenants t ON t.id = e.tenant_id "
         "LEFT JOIN profiles p ON p.id = e.profile_id "
         "ORDER BY e.created_at DESC"
     )
-    return [dict(r) for r in rows]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = dict(r)
+        # .get-safe: a fake row (or an older snapshot shape) missing the new
+        # columns degrades to the no-envelope defaults, never a KeyError.
+        period = row.get("budget_period") or "month"
+        try:
+            spend_tokens, _spend_usd = await teams.team_spend(row["id"], period)
+            alloc_tokens, _alloc_usd = await teams.team_allocated(row["id"], period)
+        except Exception:
+            log.warning(
+                "enrollments listing: spend/allocated lookup failed for %s — reporting 0",
+                row.get("id"),
+                exc_info=True,
+            )
+            spend_tokens, alloc_tokens = 0, 0
+        # The SELECT projects every new column; setdefault keeps the ADDITIVE
+        # contract honest even when a row (test fake, mid-migration snapshot)
+        # arrives without them — the console can always read these keys.
+        row.setdefault("budget_tokens", None)
+        row.setdefault("budget_usd", None)
+        row.setdefault("budget_period", "month")
+        row.setdefault("overflow_enabled", True)
+        # DERIVED ENVELOPE (2026-10-30): same rule the gate and the team console
+        # use — an enrollment with a profile and a mint allowance but no explicit
+        # cap reports max_uses x the profile's per-key presets for its period.
+        # Without this the admin table said "—" while the team console showed a
+        # real, enforced cap.
+        # ONE derivation for display and enforcement (2026-10-30 review): the
+        # shared helper strips caps of an explicitly-capped dimension, so the
+        # table can never advertise a per-model pool the gate does not enforce.
+        row["budget_tokens"], row["budget_usd"], derived_dims, caps = teams.apply_derived_envelope(
+            row.pop("defaults_json", None),
+            row.get("max_uses"),
+            row.get("budget_period") or "month",
+            row.get("budget_tokens"),
+            row.get("budget_usd"),
+        )
+        row["budget_derived"] = bool(derived_dims)
+        row.setdefault("team_leader_key_prefix", "")
+        row.setdefault("team_leader_key_created_at", None)
+        row.setdefault("team_leader_key_revoked_at", None)
+        row.setdefault("team_leader_key_last_used_at", None)
+        row.setdefault("key_count", 0)
+        row["spend_tokens"] = spend_tokens
+        row["allocated_tokens"] = alloc_tokens
+        # The PER-MODEL caps of a derived envelope (2026-10-30): the console
+        # renders one line per limit instead of one opaque pooled number, so
+        # "budget 48M / allocated 24M" stops reading as nonsense. Empty for
+        # an explicit envelope (the pooled budget_* fields are the truth).
+        if caps:
+            # PER-CAP SPEND (2026-10-30 review): the admin cell shows one line
+            # per pool, so each line must carry the number that pool has
+            # consumed — otherwise the team-wide Spent column sits beside
+            # per-model caps and reads as if it were one pool's spend.
+            cap_spends = await teams.team_cap_spend(row["id"], [(c.model, c.period) for c in caps])
+            row["budget_caps"] = [
+                {
+                    "model": c.model,
+                    "period": c.period,
+                    "limit_tokens": c.limit_tokens,
+                    "limit_usd": c.limit_usd,
+                    "spent_tokens": int(cap_spends.get((c.model, c.period), (0, 0.0))[0]),
+                    "spent_usd": float(cap_spends.get((c.model, c.period), (0, 0.0))[1]),
+                }
+                for c in caps
+            ]
+        else:
+            row["budget_caps"] = []
+        out.append(row)
+    return out
 
 
 @admin_router.post("/enrollments/{enrollment_id}/revoke")
@@ -1194,7 +1443,157 @@ async def revoke_enrollment(enrollment_id: uuid.UUID, request: Request, _: Admin
         action="enroll.code.revoke",
         resource_type="enrollment",
         resource_id=str(enrollment_id),
-        actor_source="admin-key",
+    )
+    return {"revoked": True}
+
+
+@admin_router.delete("/enrollments/{enrollment_id}")
+async def delete_enrollment(enrollment_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Forget a REVOKED enrollment row — the cleanup half of revoke.
+
+    Deletion is restricted to already-revoked codes on purpose: revoke is the
+    soft off switch every other surface understands (redemption dies, minted
+    keys keep working), while DELETE removes the row entirely — its top-up
+    requests cascade away, and minted keys keep working but lose the team
+    grouping (api_keys.enrollment_id is ON DELETE SET NULL), so the team
+    envelope stops applying to them. An ACTIVE code is a 409, never a silent
+    delete.
+    """
+    row = await db.fetchrow("SELECT label, revoked_at FROM enrollments WHERE id = $1", enrollment_id)
+    if row is None:
+        raise HTTPException(404, f"enrollment {enrollment_id} not found")
+    if row["revoked_at"] is None:
+        raise HTTPException(
+            409,
+            "enrollment is not revoked — revoke it first (delete is for revoked rows only)",
+        )
+    # The key count is audit context, not a blocker: the FK hands those keys
+    # enrollment_id = NULL and they keep working on their own per-key budgets.
+    keys_left = await db.fetchval("SELECT count(*) FROM api_keys WHERE enrollment_id = $1", enrollment_id)
+    await db.execute("DELETE FROM enrollments WHERE id = $1", enrollment_id)
+    # The deleted row's cached ENVELOPE (and the cached negatives of the keys
+    # it just un-grouped) must not keep refusing against a deleted cap for up
+    # to the 30s TTL — the same immediate-visibility rule the PATCH path
+    # follows (core.teams.invalidate drops that team's entries AND every
+    # cached negative).
+    teams.invalidate(enrollment_id)
+    await _enroll_audit(
+        request,
+        action="enroll.delete",
+        resource_type="enrollment",
+        resource_id=str(enrollment_id),
+        details={"label": row["label"], "keys_ungrouped": int(keys_left or 0)},
+    )
+    return {"deleted": True, "keys_ungrouped": int(keys_left or 0)}
+
+
+class EnrollmentPatch(BaseModel):
+    """Partial enrollment update — all fields optional; only provided ones change.
+
+    The team envelope is EDITABLE after mint (the operator tightens or
+    widens a team's cap without re-issuing codes). budget_period None
+    (omitted) = untouched; an EXPLICIT value replaces it and is validated
+    against core.teams.TEAM_PERIODS exactly like the create path. budgets
+    carry the same column bounds the create model enforces (a limit the
+    column cannot hold would 500 the UPDATE — a key-creation-site
+    contract of 400/422). expires_at explicit null clears; omitted =
+    untouched (model_fields_set, the admin KeyPatch convention).
+    """
+
+    # None = untouched; a value must be positive (0 is refused — see the create
+    # model). This is also the repair path for a legacy max_uses=0 row.
+    max_uses: int | None = Field(default=None, gt=0, le=2_147_483_647)
+    expires_at: datetime | None = None
+    budget_tokens: int | None = Field(default=None, gt=0, le=MAX_LIMIT_TOKENS)
+    budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False, le=MAX_LIMIT_USD)
+    budget_period: str | None = None
+    overflow_enabled: bool | None = None
+
+
+@admin_router.patch("/enrollments/{enrollment_id}")
+async def patch_enrollment(
+    enrollment_id: uuid.UUID, body: EnrollmentPatch, request: Request, _: AdminDep
+) -> dict[str, Any]:
+    """Edit an enrollment's budget envelope / overflow switch / bounds.
+
+    Scoped by id: an unknown enrollment is a 404 (no oracle distinction).
+    core.teams.invalidate() runs after the write — the envelope change
+    must be visible to the budget gate immediately, not up to a cache
+    TTL later.
+    """
+    if not await _exists("enrollments", enrollment_id):
+        raise HTTPException(404, f"enrollment {enrollment_id} not found")
+    if body.budget_period is not None and body.budget_period not in teams.TEAM_PERIODS:
+        raise HTTPException(400, f"budget_period must be one of {sorted(teams.TEAM_PERIODS)}")
+    sets: list[str] = []
+    args: list[Any] = []
+    for col in ("max_uses", "budget_tokens", "budget_usd", "budget_period", "overflow_enabled"):
+        val = getattr(body, col)
+        if val is not None:
+            args.append(val)
+            sets.append(f"{col} = ${len(args)}")
+    if "expires_at" in body.model_fields_set:
+        args.append(body.expires_at)
+        sets.append(f"expires_at = ${len(args)}")
+    if not sets:
+        raise HTTPException(400, "no editable fields provided")
+    # column names above are a fixed tuple, never user input
+    row = await db.fetchrow(
+        f"UPDATE enrollments SET {', '.join(sets)} WHERE id = ${len(args) + 1} "
+        "RETURNING id, label, max_uses, expires_at, budget_tokens, budget_usd, budget_period, overflow_enabled",
+        *args,
+        enrollment_id,
+    )
+    assert row is not None
+    # the envelope feeds the budget gate through teams.enrollment_for_key's
+    # cache — a stale entry would enforce the OLD cap for up to a TTL
+    teams.invalidate(enrollment_id)
+    await _enroll_audit(
+        request,
+        action="enroll.envelope.patch",
+        resource_type="enrollment",
+        resource_id=str(enrollment_id),
+        details={field: getattr(body, field) for field in sorted(body.model_fields_set)},
+    )
+    return dict(row)
+
+
+@admin_router.post("/enrollments/{enrollment_id}/team-leader/rotate", status_code=201)
+async def rotate_team_leader(enrollment_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Mint a NEW team leader key for the enrollment, replacing the old one.
+
+    core.teams.mint_leader_key overwrites the hash/prefix and clears the
+    revoked stamp, so the previous leader key stops authenticating the
+    moment this commits (authenticate_leader reads the single hash
+    column). The plaintext is in THIS response only — shown once, the
+    enroll-code convention. Unknown enrollment: 404 (mint_leader_key's
+    LookupError translated).
+    """
+    if not await _exists("enrollments", enrollment_id):
+        raise HTTPException(404, f"enrollment {enrollment_id} not found")
+    plaintext, prefix = await teams.mint_leader_key(enrollment_id)
+    await _enroll_audit(
+        request,
+        action="team.key.rotate",
+        resource_type="enrollment",
+        resource_id=str(enrollment_id),
+    )
+    return {"team_leader_key": plaintext, "team_leader_key_prefix": prefix}
+
+
+@admin_router.post("/enrollments/{enrollment_id}/team-leader/revoke")
+async def revoke_team_leader(enrollment_id: uuid.UUID, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Kill the enrollment's team leader key. Idempotent: an enrollment
+    without a live leader key still reports revoked (the core helper's
+    UPDATE simply matches nothing)."""
+    if not await _exists("enrollments", enrollment_id):
+        raise HTTPException(404, f"enrollment {enrollment_id} not found")
+    await teams.revoke_leader_key(enrollment_id)
+    await _enroll_audit(
+        request,
+        action="team.key.revoke",
+        resource_type="enrollment",
+        resource_id=str(enrollment_id),
     )
     return {"revoked": True}
 
@@ -1285,7 +1684,6 @@ async def put_mcp_creds(key_id: uuid.UUID, body: McpCredsUpsert, request: Reques
         action="mcp.creds.set",
         resource_type="key",
         resource_id=str(key_id),
-        actor_source="admin-key",
         details={"server": body.server, "header_names": sorted(clean), "header_count": len(clean)},
     )
     return {"key_id": str(key_id), "server": body.server, "header_names": sorted(clean)}
@@ -1335,7 +1733,6 @@ async def delete_mcp_creds(key_id: uuid.UUID, server: str, request: Request, _: 
         action="mcp.creds.delete",
         resource_type="key",
         resource_id=str(key_id),
-        actor_source="admin-key",
         details={"server": server},
     )
     return {"deleted": True, "server": server}

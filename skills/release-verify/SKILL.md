@@ -9,7 +9,7 @@ A deployed tag is a **claim**, not evidence. Verify layer by layer, top down; st
 Each check below has lied before.
 
 Deployment values (registry, image, namespace, label selector, version file) are **not** universal — read
-them from the project's own build script, chart values, or release. See **Reference instantiation** at the
+them from the project's own build script, chart values, or release. See **Deployment values to resolve locally** at the
 end for one concrete set.
 
 ## The verification chain (run in order)
@@ -83,7 +83,7 @@ If deploys go through a platform UI rather than helm/kubectl:
 Stale image confirmed → the fix is a release, not a cluster repair. Cause genuinely unknown →
 `cluster-triage`. A shared file was involved → `fleet-drift` (two channels must both move).
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One deployment's concrete values — re-derive locally, do not copy:
 

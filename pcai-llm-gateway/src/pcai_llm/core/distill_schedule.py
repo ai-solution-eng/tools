@@ -155,10 +155,13 @@ async def due_conversations(limit: int = 20) -> list[dict[str, Any]]:
     distilled OR continued since the last distill).
 
     "Quiet" = no message write in the debounce window (the DSH debounce,
-    at housekeeping cadence). "Memory-attached" = the key carries the
-    stamped memory pair (joined via mcp_server_creds - the same source
-    the attachment gate reads). The sweep NEVER distills a key that has
-    no memory feature: inert by construction, not by exception.
+    at housekeeping cadence). "Memory-attached" = the key carries a stored
+    credential override for the memory server (joined via mcp_server_creds -
+    ANY header counts, e.g. the mm-rag X-API-Key; the row is the per-key
+    identity's source, not a dataset model). This join is a cheap PREFILTER:
+    whether that identity can actually write is the capability probe's call
+    (routes_distill.memory_attached), so the sweep never distills a key that
+    has no memory feature - inert by construction, not by exception.
     """
     from ..core import distiller_config
 
@@ -173,17 +176,32 @@ async def due_conversations(limit: int = 20) -> list[dict[str, Any]]:
     try:
         return await db.fetch(
             """
-            SELECT c.id AS conversation_id, c.key_id, count(m.id) AS msg_count, c.title,
+            SELECT c.id AS conversation_id, k.id AS key_id, count(m.id) AS msg_count, c.title,
                    d.gate_failed_at
             FROM conversations c
             JOIN conversation_messages m ON m.conversation_id = c.id
-            JOIN api_keys k ON k.id = c.key_id
+            -- ROTATION CONTINUITY (2026-11-03 cross-validation): resolve a LIVE
+            -- key in the conversation's key GROUP, never the row's CREATING key.
+            -- The old join (k.id = c.key_id AND k.revoked_at IS NULL) dropped
+            -- every conversation whose creator had been rotated, so the sweep
+            -- silently stopped distilling a user's history after ONE rotate —
+            -- the exact store the console keeps showing. Newest live key wins
+            -- (the same newest-wins order authenticate uses); c.key_group is
+            -- NOT NULL and backfilled, and the returned key_id is the one the
+            -- scheduled path loads (a revoked creator would load as None).
+            JOIN LATERAL (
+                SELECT k2.id
+                FROM api_keys k2
+                WHERE k2.key_group = c.key_group
+                  AND k2.revoked_at IS NULL
+                  AND (k2.expires_at IS NULL OR k2.expires_at > now())
+                ORDER BY k2.created_at DESC, k2.id DESC
+                LIMIT 1
+            ) k ON true
             JOIN mcp_server_creds cred
-              ON cred.key_id = c.key_id AND cred.server_name = $1
+              ON cred.key_id = k.id AND cred.server_name = $1
             LEFT JOIN conversation_distills d ON d.conversation_id = c.id
             WHERE c.updated_at < now() - make_interval(mins => $2)
-              AND k.revoked_at IS NULL
-              AND (k.expires_at IS NULL OR k.expires_at > now())
               AND (d.conversation_id IS NULL OR (
                     SELECT count(*) FROM conversation_messages m2
                     WHERE m2.conversation_id = c.id) > d.distilled_seq)
@@ -191,7 +209,7 @@ async def due_conversations(limit: int = 20) -> list[dict[str, Any]]:
                    OR d.gate_failed_at < now() - make_interval(secs => $4))
               AND (d.conversation_id IS NULL OR d.lease_until IS NULL
                    OR d.lease_until < now())
-            GROUP BY c.id, c.key_id, c.title, d.gate_failed_at
+            GROUP BY c.id, k.id, c.title, d.gate_failed_at
             ORDER BY c.updated_at ASC
             LIMIT $3
             """,
@@ -336,7 +354,9 @@ async def sweep() -> int:
         try:
             await mark_canonical_gate_skip(row["key_id"], str(row["thread_id"]))
         except Exception:
-            log.warning("title-row backoff write skipped (thread=%s)", str(row.get("thread_id", ""))[:16], exc_info=True)
+            log.warning(
+                "title-row backoff write skipped (thread=%s)", str(row.get("thread_id", ""))[:16], exc_info=True
+            )
     attempted = 0
     written = 0
     started = time.monotonic()

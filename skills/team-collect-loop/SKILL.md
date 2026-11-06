@@ -1,6 +1,6 @@
 ---
 name: team-collect-loop
-description: Use when waiting on or collecting results from running teammates — during an audit wave, remediation wave, or any fan-out where several agents run in parallel and the lead must gather reports without duplicating or losing any. Message-driven collection first (completion notices arrive as lead messages — do not busy-wait); chunked waits only as a fallback (no-wakeup delivery, explicit user request) or as the heartbeat for unattended/autonomous runs; per-agent report file conventions; completion reconciliation. Companion to subagent-teams (spawn discipline) and ptc-team-runtime (call mechanics). Use ptc-team-runtime for a single tool call's mechanics; use THIS when a multi-agent wave is in flight.
+description: 'Use when waiting on or collecting results from running teammates, during an audit wave, a remediation wave, or any fan-out where several agents run in parallel and the lead must gather reports without duplicating or losing any. Message-driven collection first, chunked waits only as a fallback or as the heartbeat for unattended runs, plus per-agent report conventions and completion reconciliation. NOT for the mechanics of a single tool call (that is ptc-team-runtime) and NOT for deciding who to spawn (that is subagent-teams).'
 ---
 
 # team-collect-loop — gathering a fan-out without duplicates or losses

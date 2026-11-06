@@ -1,6 +1,6 @@
 ---
 name: lessons-loop
-description: Use when building an agent that should learn from its own resolutions — a self-improvement / lesson-distillation loop, a "remember what worked" instruction store, or a domain-adaptive prompt layer. Domain-agnostic: applies to SQL, API calls, shell work, or any tool surface. NOT for session/memory curation (that is memory-curation), and not a substitute for a held-out eval set.
+description: 'Use when building an agent that should learn from its own resolutions — a self-improvement / lesson-distillation loop, a "remember what worked" instruction store, or a domain-adaptive prompt layer. Domain-agnostic: applies to SQL, API calls, shell work, or any tool surface. NOT for session/memory curation (that is memory-curation), and not a substitute for a held-out eval set.'
 ---
 
 # Lessons loop (self-improving agent, two-dataset guardrail)
@@ -119,7 +119,7 @@ those existing rules cover are your eval set.
 - Deploying the loop is a release: verify the running version with `release-verify`. Model-pair assumptions
   behind the distill/review LLM are checked with `model-roster-check`.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One implementation (SQL domain) — re-derive locally:
 

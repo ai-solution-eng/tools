@@ -533,6 +533,18 @@ class TestModeStamping:
         meta = rh.parse_setup("H200_sglang_dflash2_hicachex3_replicasx3_ol")
         assert meta["arrival"] == "open" and meta["engine"] == "SGLang"
 
+    def test_parse_setup_nvlink_topology(self):
+        # 4x H200 on a G2 medium: two NVLink pairs, not an 8-way box
+        meta = rh.parse_setup("H200x4_NVLink2_hicachex6")
+        assert meta["gpu"] == "NVIDIA H200 (PCIe)" and meta["gpu_count"] == 4
+        assert meta["nvlink"] == 2 and meta["hicache"] == 6
+        assert meta["hints"] == []  # consumed as topology, not left unknown
+        # the other spellings in the committed tree
+        assert rh.parse_setup("H200x8_8waynvlink_hicache_1TB")["nvlink"] == 8
+        assert rh.parse_setup("H200x4_nvlinkx2")["nvlink"] == 2
+        # unmarked files make no topology claim
+        assert rh.parse_setup("H200x4")["nvlink"] is None
+
     def test_header_mode_lines_closed(self, capsys):
         args = parse_args(["--url", "http://x", "--number_users", "1"])
         # Extract the MODE: arrival line from a main()-style header build.

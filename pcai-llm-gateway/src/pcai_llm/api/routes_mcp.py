@@ -96,7 +96,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 import fastapi
 import httpx2
@@ -502,12 +502,21 @@ async def resolve_mcp_headers(
     return headers
 
 
-async def _upstream_session[T](
+# PEP 695 type-parameter lists (def f[T]()) are Python 3.12+ syntax; the
+# package floor is 3.11 (pyproject requires-python) — audit #40. A
+# module-level TypeVar is the 3.11-compatible spelling of the same generic
+# signature (T is private to this helper; _T keeps that scope explicit).
+# ruff's UP047 asks for the PEP 695 form, which is exactly what would break
+# the declared floor; the noqa is the floor winning over the moderniser.
+_T = TypeVar("_T")
+
+
+async def _upstream_session(  # noqa: UP047
     url: str,
     headers: dict[str, str],
-    operation: Callable[[ClientSession], Awaitable[T]],
+    operation: Callable[[ClientSession], Awaitable[_T]],
     timeout_s: float | None = None,
-) -> T:
+) -> _T:
     """Run one async operation against an upstream MCP server in a fresh
     session. Per-call client (TODO: pool per running loop once upstream
     traffic justifies it); follow_redirects=False for SSRF hardening.
@@ -587,6 +596,13 @@ async def _fetch_tools(url: str, headers: dict[str, str], timeout_s: float | Non
 _LISTING_TIMEOUT_S = 15.0
 """Metadata-fetch bound (the catalog audit): a hung upstream must not park
 discovery — or now the flat tools/list — for the full 600 s upstream timeout."""
+
+# F1 (audit w6): the per-request ceiling on the DISCOVERY fan-out. The rate
+# gate meters requests; this caps what ONE cold request may open at once,
+# so a cold-TTL tools/list cannot open one upstream session per registered
+# server simultaneously. Per-request semaphore — never cross-tenant
+# contention. _flat_tools is already serial and needs no cap.
+_CATALOG_FETCH_CONCURRENCY = 4
 
 _tools_listing_cache: dict[tuple[str, ...], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -809,6 +825,7 @@ async def _mcp_catalog(server: str | None = None) -> str:
     Each server's "tools" carries ONLY the (server, tool) pairs the calling
     key holds (REMEDIATION 11c; see the per-server filter below).
     """
+    await _gate_discovery("mcp_catalog")
     key = _current_key()
     servers = await registry.mcp_servers()  # priority-ordered (priority ASC, name ASC)
     grants = await load_grants(key.id)
@@ -829,8 +846,16 @@ async def _mcp_catalog(server: str | None = None) -> str:
     # fleet-wide and the TTL cache warms for all servers, not just this
     # key's grants) — but the fan-out is now CONCURRENT (asyncio.gather;
     # independent bounded fetches) instead of serial. A cold cache costs
-    # max(per-server bound) instead of N x bound.
-    fetches = [_cached_upstream_tools(server) for server in servers]
+    # max(per-server bound) instead of N x bound. F1: the fan-out is BOUNDED
+    # (_CATALOG_FETCH_CONCURRENCY), not N-parallel — the rate gate meters
+    # requests, this caps the per-request amplification.
+    sem = asyncio.Semaphore(_CATALOG_FETCH_CONCURRENCY)
+
+    async def _bounded_fetch(srv: dict[str, Any]) -> list[dict[str, Any]]:
+        async with sem:
+            return await _cached_upstream_tools(srv)
+
+    fetches = [_bounded_fetch(server) for server in servers]
     listings = await asyncio.gather(*fetches, return_exceptions=True)
     # NOTE: the loop variable MUST NOT be named `server` — it would shadow the
     # `server` PARAMETER, so the narrowing below would read the last iterated
@@ -971,6 +996,45 @@ async def _settle_quiet(
         request_id=request_id,
         detail=detail,
     )
+
+
+async def _gate_discovery(surface: str) -> None:
+    """F1 (audit w6): tools/list and mcp_catalog are the /mcp DISCOVERY
+    surfaces and ran NO rate gate — with a cold TTL one request opens N
+    concurrent upstream listing sessions (one per server), so a cheap
+    caller could amplify into the upstream fleet. Metered like every other
+    call on this surface — the SAME check_rate_limit, the SAME refusal
+    shape (settle "rate_limited" + ToolError, F6) — under a discovery
+    endpoint. No new limiter, no new status vocabulary.
+
+    FAIL-OPEN vs FAIL-CLOSED (w6 follow-up): the gate distinguishes "the
+    limiter could not be evaluated" from "the limit was exceeded". A DB
+    blip raises INSIDE check_rate_limit; refusing there would turn a
+    limiter outage into a discovery outage for every key, so an
+    INFRASTRUCTURE error is logged at WARNING and the listing proceeds —
+    the amplification stays capped even ungated (TTL caches, the 15 s
+    metadata bound, _CATALOG_FETCH_CONCURRENCY). An EXCEEDED limit still
+    refuses exactly as before: fail-open NEVER applies to the over-limit
+    path."""
+    key = _current_key()
+    started = time.monotonic()
+    request_id = f"mcp-{uuid.uuid4()}"
+    try:
+        gate = await check_rate_limit(key.id, key.rate_limit_rpm, key.rate_limit_tpm, 0)
+    except Exception as exc:
+        # INFRASTRUCTURE failure only — the DB-backed limiter could not be
+        # evaluated. Loud (WARNING) so a broken limiter is visible, but the
+        # listing proceeds; see the docstring for the trade and the caps
+        # that still bound an ungated request.
+        log.warning(
+            "mcp discovery rate gate unavailable (%s: %s) — discovery proceeding, ungated this request",
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if not gate.ok:
+        await _settle_quiet(key.id, f"mcp:_discovery:{surface}", "rate_limited", started, request_id)
+        raise ToolError(f"rate limited: {gate.reason}")
 
 
 async def _gated_mcp_call(
@@ -1301,7 +1365,10 @@ class _GatewayMCPServer(MCPServer):
         """The two gateway tools + (flat mode) this key's granted flattened
         upstream tools. Fail-safe: any failure computing the flat layer
         degrades to the gateway tools — a broken OPTIONAL surface must never
-        break discovery."""
+        break discovery. The RATE gate is deliberately OUTSIDE that
+        fail-safe (F1): a refused discovery is a refusal, not a degradation.
+        """
+        await _gate_discovery("tools_list")
         base = await super().list_tools()
         # SERVER DIRECTORY (2026-10-28). Without it the model must spend a
         # discovery call to learn that mm-rag even exists — measured live: an

@@ -1,6 +1,6 @@
 ---
 name: subagent-teams
-description: Use when about to spawn any subagent or reviewer model, when a spawned subagent goes invisible or its job id stops resolving, or when stopping or collecting spawned agents. Requires durable agent-team teammates over anonymous background children, with spawn → verify-addressability → collect discipline, because an invisible spawn plus a blind retry is how the same agent gets set up twice.
+description: 'Use when about to spawn any subagent or reviewer model, when a spawned subagent goes invisible or its job id stops resolving, or when stopping and collecting spawned agents. Requires durable agent-team teammates over anonymous background children, with spawn, verify-addressability, and collect discipline, because an invisible spawn plus a blind retry is how the same agent gets set up twice. NOT for the mechanics of one individual call (that is ptc-team-runtime) and NOT for the collection loop across a wave (that is team-collect-loop).'
 ---
 
 # subagent-teams (spawn discipline for subagents)
@@ -135,7 +135,7 @@ Prompt hygiene for spawned agents (verbatim git prohibition, write zones, timeou
 `audit-wave` — which also owns zone partitioning via the shared task board. This skill governs only
 HOW agents are set up and collected, not what they do.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One harness's tools and limits — re-derive locally:
 
@@ -148,9 +148,36 @@ One harness's tools and limits — re-derive locally:
   where the deployment mounts them.
 - Limits (reference harness, verified 2026-10): max 8 live continuable children, delegation depth 1;
   tool bindings accept lossless-JSON arguments only — pass `{}`, never a bare undefined.
-- Providers verified 2026-10-04 via `list_subagent_models`: `pcai-model-endpoint-flow` (models
-  `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`) and `glm53-flash-sproket` (model
-  `glm-5.3-flash`).
+- **Two routes, and they are not interchangeable.**
+  - `pcai-model-endpoint-subagent` — the subagent/teammate route, and the default for unpinned
+    spawns (`tool-agent-team.defaultProvider`; `defaultModel: Deepseek-V4.1-Flash-1017`). It sends
+    `X-PCAI-Conversation: raw`, the gateway's escape hatch: no canonical row is written, so
+    **nothing is ever due for distill**. That is deliberate — N subagents on one task otherwise
+    write N near-identical project summaries (measured 2026-10-22: 19 summaries of one RRF
+    investigation in 100 s; 41% of a 940-doc store was cross-session duplication). Models:
+    `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `routing`.
+  - `pcai-model-endpoint-flow` — the Lead / main-agent route. This one DOES enter the canonical
+    store and IS distilled. Do not pin a subagent to it.
+- **The allowed-route list is written into the session at CREATION and never refreshed.** It is a
+  `subagent/model-selection-policy` event appended while the session is composed — before any user
+  message — and `subagentModelSelectionPolicy` returns that record from then on;
+  `settings.current()` is consulted only when no record exists yet. Three consequences:
+  - **Resuming never refreshes it.**
+  - **An empty session keeps the list from its creation date.** A conversation that *feels* new
+    today can be an old, never-used session the UI revived. Check the session's `createdAt` and its
+    recorded policy before trusting the route list.
+  - `not allowed for this Session` therefore means *this session's record predates the setting*,
+    not that the provider is unauthorized. Verify against `$DSH_PROFILE_DIR/cordis.patch.yml`
+    (`subagent-model-selection-settings.allowedModels`) and the session's own event; only a
+    genuinely new session picks up the current list.
+  (2026-11-04: a session created 2026-10-15 holding 4 events and zero turns still listed
+  `glm53-flash-sproket` and no subagent route at all, while every session created since listed the
+  subagent route. The config was never wrong.)
+- Spawn-route failure modes (verified 2026-10-28): `member.provider` always reads `"spawn"` because
+  the plugin overrides `spawn_teammate`'s `provider` with its configured `freshProvider`; only
+  `model` reaches the gateway. An unresolvable model id degrades to `routing` SILENTLY — that is the
+  not-pinned sentinel (not `"auto"`). The same cause one step later surfaces as `status: "failed"`
+  plus "initial prompt was not durably accepted". Verify `member.model`; never retry the same string.
 - The 2026-10-06 incident's exact tell: spawn "succeeded", then `unknown job <uuid>` from job
   output, `list subagents: 1 agents` (lead only), `0 background jobs`,
   `Wait for subagent: No active subagents` — while the UI showed the subagent running.

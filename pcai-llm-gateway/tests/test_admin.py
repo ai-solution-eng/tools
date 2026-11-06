@@ -106,6 +106,283 @@ def _h() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# key-name charset (audit W6 FIX 7, defence in depth): the ADMIN twins of the
+# teams zone's TeamKeyMint/TeamKeyPatch name pattern. A key name is a DISPLAY
+# value rendered by the console, the traces explorer and the CSV exports; the
+# sinks escape (admin.html), so the STORED value is closed at the edge.
+# IDENTICAL pattern to routes_team_leader._NAME_PATTERN — the two mint
+# surfaces must agree. Ordinary display names (unicode, spaces, and
+# . - _ / : ( )) still pass; only HTML metacharacters and control characters
+# are refused, as a clean 422.
+# ---------------------------------------------------------------------------
+
+
+def test_key_name_rejects_markup_on_create_and_patch(client) -> None:
+    tc, _fake = client
+    uid = str(uuid.uuid4())
+    r = tc.post("/admin/keys", json={"user_id": uid, "name": "<script>x</script>"}, headers=_h())
+    assert r.status_code == 422, r.text
+    r2 = tc.patch(f"/admin/keys/{uuid.uuid4()}", json={"name": "<script>x</script>"}, headers=_h())
+    assert r2.status_code == 422, r2.text
+
+
+def test_key_name_accepts_ordinary_display_names(client) -> None:
+    tc, _fake = client
+    uid = str(uuid.uuid4())
+    for name in (
+        "etl - nightly (prod) / v2:quotes",
+        "clé de facturation — 关键",  # unicode + spaces
+        "dot.dash_under_score:colon(paren)slash/",
+    ):
+        r = tc.post("/admin/keys", json={"user_id": uid, "name": name}, headers=_h())
+        assert r.status_code == 201, r.text
+        r2 = tc.patch(f"/admin/keys/{uuid.uuid4()}", json={"name": name}, headers=_h())
+        assert r2.status_code == 200, r2.text
+
+
+# ---------------------------------------------------------------------------
+# follow-up wave pins (F1 tenant/user name charset, F2 traces docstring
+# contract, F4 the X-API-Key admin envelope, F6 duplicate preset refusal)
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_and_user_names_reject_markup(client) -> None:
+    """F1: the admin twins of the name charset on TenantCreate/UserCreate.
+    The enroll door enforces the same rule since FIX 8, so the
+    one-column-two-rule-sets objection is gone. INVARIANT: a
+    lower-privileged writer must never gain these fields without the same
+    rule. Ordinary unicode display names still succeed."""
+    tc, _fake = client
+    r = tc.post("/admin/tenants", json={"name": "<script>x</script>"}, headers=_h())
+    assert r.status_code == 422, r.text
+    tid = tc.post("/admin/tenants", json={"name": "acme"}, headers=_h()).json()["id"]
+    r2 = tc.post(f"/admin/tenants/{tid}/users", json={"name": "<img src=x onerror=alert(1)>"}, headers=_h())
+    assert r2.status_code == 422, r2.text
+    r3 = tc.post("/admin/tenants", json={"name": "clé — 关键 (prod)"}, headers=_h())
+    assert r3.status_code == 201, r3.text
+    tid2 = r3.json()["id"]
+    r4 = tc.post(f"/admin/tenants/{tid2}/users", json={"name": "álice — 运维"}, headers=_h())
+    assert r4.status_code == 201, r4.text
+
+
+def test_admin_traces_docstring_bounds_conversations() -> None:
+    """F2: the admin traces route's contract text must describe what the
+    accounting zone's conversation-grouping made TRUE — limit bounds
+    CONVERSATIONS (each returned conversation carries ALL its requests),
+    never a bare request count."""
+    import inspect
+
+    from pcai_llm.api import routes_admin as ra
+
+    doc = inspect.getdoc(ra.list_traces) or ""
+    assert "CONVERSATIONS" in doc
+    assert "REQUESTS returned" not in doc
+
+
+def test_admin_x_api_key_envelope(client) -> None:
+    """F4 (Lead-corrected ordering): X-API-Key is a SECOND credential
+    envelope, consulted whenever the Authorization bearer fails — the
+    replace-header SSO posture (the proxy swaps its id_token in) is exactly
+    the case the console's second envelope exists for. THE INVARIANT: a bad
+    credential is a hard 401; it is never a downgrade to a weaker rung —
+    a present-but-invalid bearer, or an invalid X-API-Key, NEVER reaches the
+    browser-group path."""
+    tc, _fake = client
+    # envelope alone, valid -> 200
+    r = tc.get("/admin/models", headers={"X-API-Key": "admin-secret-123"})
+    assert r.status_code == 200, r.text
+    # wrong Authorization + VALID envelope -> 200 (the changed case: the
+    # replace-header SSO posture)
+    r2 = tc.get("/admin/models", headers={"Authorization": "Bearer nope", "X-API-Key": "admin-secret-123"})
+    assert r2.status_code == 200, r2.text
+    # wrong envelope alone -> 401 (no fall-through to the group path)
+    r3 = tc.get("/admin/models", headers={"X-API-Key": "not-the-key"})
+    assert r3.status_code == 401
+    # wrong Authorization + wrong envelope -> 401
+    r4 = tc.get("/admin/models", headers={"Authorization": "Bearer nope", "X-API-Key": "not-the-key"})
+    assert r4.status_code == 401
+    # the bearer path itself is untouched
+    assert tc.get("/admin/models", headers=_h()).status_code == 200
+
+
+def test_admin_group_path_reachability_matrix(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4 invariant (d): the browser-group rung is reachable ONLY when NO
+    credential envelope was presented at all. A present-but-invalid bearer
+    never reaches it (group trust must not launder a rejected credential —
+    header assertions are the proxy's to make, never the caller's), and an
+    invalid X-API-Key never reaches it either."""
+    tc, _fake = client
+    monkeypatch.setattr(settings, "admin_groups", "admin-fleet")
+    monkeypatch.setattr(settings, "trust_proxy_identity", True)
+    groups = {"X-Auth-Request-Groups": "admin-fleet", "X-Auth-Request-User": "op"}
+    # no envelope at all + the group claim -> the group path authenticates
+    r = tc.get("/admin/models", headers=groups)
+    assert r.status_code == 200, r.text
+    # wrong Authorization + groups, no X-API-Key -> 401 (never reaches groups)
+    r2 = tc.get("/admin/models", headers={"Authorization": "Bearer nope", **groups})
+    assert r2.status_code == 401, r2.text
+    # invalid X-API-Key + groups (no Authorization) -> 401 (never reaches groups)
+    r3 = tc.get("/admin/models", headers={"X-API-Key": "not-the-key", **groups})
+    assert r3.status_code == 401, r3.text
+
+
+class _McpNameDB:
+    """Just the statements the MCP-server name pins exercise: the carve-out
+    lookup, the upsert INSERT, and the PATCH select/update."""
+
+    def __init__(self) -> None:
+        self.exists = False  # carve-out lookup: does a row with this name exist?
+        self.inserts: list[str] = []
+
+    async def fetchval(self, sql: str, *args: Any):
+        if "SELECT 1 FROM mcp_servers WHERE name" in sql:
+            return 1 if self.exists else None
+        return 1
+
+    async def fetchrow(self, sql: str, *args: Any):
+        s = " ".join(sql.split())
+        if "INSERT INTO mcp_servers" in s:
+            self.inserts.append(s)
+            return {
+                "id": "row-1",
+                "name": "n",
+                "url": "u",
+                "auth_secret": None,
+                "auth_configured": False,
+                "tool_policy": "all",
+                "allowed_tools_json": "[]",
+                "enabled": True,
+                "priority": 0,
+                "description": "",
+            }
+        if "UPDATE mcp_servers SET" in s:
+            # faithful: echo the SET value (args[1] is the UPDATE's enabled)
+            return {
+                "id": "row-1",
+                "name": "legacy",
+                "url": "http://legacy.internal/mcp",
+                "auth_secret": None,
+                "tool_policy": "all",
+                "allowed_tools_json": "[]",
+                "enabled": bool(args[1]),
+                "priority": 0,
+            }
+        if "FROM mcp_servers WHERE name = $1" in s:
+            return {
+                "url": "http://legacy.internal/mcp",
+                "headers_json": "{}",
+                "auth_secret": None,
+                "tool_policy": "all",
+                "allowed_tools_json": "[]",
+                "enabled": True,
+                "priority": 0,
+            }
+        return None
+
+    async def fetch(self, sql: str, *args: Any):
+        return []
+
+    async def execute(self, sql: str, *args: Any):
+        return "UPDATE 1"
+
+
+def test_mcp_server_name_is_path_safe_at_registration(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owner-approved fix: the MCP server name is ALSO a URL path segment
+    (PATCH /admin/mcp-servers/{name}, GET .../{name}/tools address rows by
+    it) — and path params do not match "/", so a row registered as
+    "foo/bar" could never be edited or inspected. A NEW or CHANGED name is
+    refused unless path-safe ("/", "?", "#", "%" and control chars —
+    including the ENCODED form "foo%2Fbar", which decodes to a slash after
+    routing). CARVE-OUT: a name a row ALREADY has is accepted as-is (the
+    console's whole-row re-save of a legacy row must keep working)."""
+    tc, _fake = client
+    # (a) a NEW unsafe name is a 422 — and writes NO row (the refusal
+    # precedes every write, including the DNS-resolving url check)
+    db = _McpNameDB()
+    monkeypatch.setattr(routes_admin, "db", db)
+    r = tc.post("/admin/mcp-servers", json={"name": "foo/bar", "url": "http://mm-rag.internal/mcp"}, headers=_h())
+    assert r.status_code == 422, r.text
+    assert "path segment" in r.json()["detail"]
+    assert db.inserts == [], "a refused registration must not write a row"
+    # (c) the encoded-delimiter shape is the same refusal: the literal name
+    # "foo%2Fbar" carries a "%" — it would DECODE to "foo/bar" after routing.
+    # (The only name-writing surface is this upsert: McpServerPatch has NO
+    # name field, so PATCH cannot rename — "changing a name TO foo/bar"
+    # collapses into registering under the new unsafe name.)
+    r_enc = tc.post("/admin/mcp-servers", json={"name": "foo%2Fbar", "url": "http://mm-rag.internal/mcp"}, headers=_h())
+    assert r_enc.status_code == 422, r_enc.text
+    # (b) CARVE-OUT: a row that ALREADY carries the legacy-unsafe name —
+    # the console's whole-row re-save is accepted as-is, unchanged name
+    db2 = _McpNameDB()
+    db2.exists = True
+    monkeypatch.setattr(routes_admin, "db", db2)
+    r2 = tc.post("/admin/mcp-servers", json={"name": "foo/bar", "url": "http://legacy.internal/mcp"}, headers=_h())
+    assert r2.status_code == 200, r2.text
+    assert db2.inserts, "the re-save must proceed to the upsert"
+
+    # (b-guard) the PATCH surface carries NO name constraint (it cannot
+    # rename): a legacy-unsafe name reaching the handler is edited as-is.
+    # NOTE probed empirically: in this stack "%2F" decodes to a path
+    # separator BEFORE routing, so a legacy-unsafe row is unaddressable by
+    # any {name} ROUTE over HTTP — the upsert re-save above is the one
+    # write that can still touch it. This unit-level call pins that the
+    # handler itself adds no charset rule to PATCH.
+    async def _patch_direct() -> None:
+        from types import SimpleNamespace
+
+        req = SimpleNamespace(headers={}, client=None, state=SimpleNamespace(), url=SimpleNamespace(path="/x"))
+        out = await routes_admin.patch_mcp_server(
+            "foo/bar",
+            routes_admin.McpServerPatch(enabled=False),
+            req,
+            None,  # type: ignore[arg-type]
+        )
+        assert out["enabled"] is False
+
+    asyncio.run(_patch_direct())
+    # (d) ordinary names — unicode, spaces, and . - _ : ( ) — still register
+    # (NO slash: the pattern's whole job is that the name stays ONE segment)
+    for name in ("mm-rag (prod) - main:read", "clé — 关键", "dot.dash_under:score(paren)"):
+        db3 = _McpNameDB()
+        monkeypatch.setattr(routes_admin, "db", db3)
+        r4 = tc.post("/admin/mcp-servers", json={"name": name, "url": "http://mm-rag.internal/mcp"}, headers=_h())
+        assert r4.status_code == 200, r4.text
+        r5 = tc.patch("/admin/mcp-servers/whatever", json={"enabled": False}, headers=_h())
+        assert r5.status_code == 200, r5.text
+
+
+def test_profile_rejects_duplicate_model_period_preset(client) -> None:
+    """F6: two presets for the same (model, period) KIND pass the per-entry
+    validator and then PK-collide at every mint/redeem stamp (the seeding
+    INSERT carries no ON CONFLICT) — a permanent 500 for every key of the
+    profile. Refused at SAVE, naming the duplicate. Same (model, period)
+    with DIFFERENT kinds is legitimate: a token cap and a USD cap are
+    different tables and different limits."""
+    tc, _fake = client
+    dup = {
+        "name": "dup-presets",
+        "budgets": [
+            {"model": "*", "period": "month", "limit_tokens": 1000},
+            {"model": "*", "period": "month", "limit_tokens": 2000},
+        ],
+    }
+    r = tc.post("/admin/profiles", json=dup, headers=_h())
+    assert r.status_code == 400, r.text
+    assert "duplicate budget preset" in r.json()["detail"]
+    assert "month" in r.json()["detail"]
+    # same (model, period) with DIFFERENT kinds is fine
+    ok = {
+        "name": "mixed-kinds",
+        "budgets": [
+            {"model": "*", "period": "month", "limit_tokens": 1000},
+            {"model": "*", "period": "month", "limit_usd": 5},
+        ],
+    }
+    r2 = tc.post("/admin/profiles", json=ok, headers=_h())
+    assert r2.status_code == 201, r2.text
+
+
+# ---------------------------------------------------------------------------
 # propagate-grants (2026-10-29): the "send the profile's grants to every key"
 # button — the stamped-grants twin of apply limits
 # ---------------------------------------------------------------------------
@@ -390,6 +667,7 @@ def test_propagate_grants_404s_an_unknown_profile(monkeypatch: pytest.MonkeyPatc
     tc = _grant_env(monkeypatch, db)
     assert tc.post(f"/admin/profiles/{uuid.uuid4()}/propagate-grants", headers=_h()).status_code == 404
 
+
 # ---------------------------------------------------------------------------
 # F10 (audit 2026-10-29): a degenerate distiller max_tokens must not validate
 # ---------------------------------------------------------------------------
@@ -527,6 +805,93 @@ def test_create_budget_nonpositive_400(client) -> None:
     assert r.status_code == 400
 
 
+class _WriteSpyDB(FakeDB):
+    """FakeDB that records EVERY write on the budget door (the DELETE pair AND
+    the INSERT), so "nothing was written" is provable and not just "no INSERT".
+
+    FakeConn.execute delegates here; FakeConn.executemany records into
+    `executed` (the FakeDB convention). Both are checked by the caller.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[tuple] = []
+
+    async def execute(self, sql: str, *args: Any):
+        self.writes.append((sql, args))
+        return "INSERT 0 1"
+
+
+def _wire_client(monkeypatch: pytest.MonkeyPatch):
+    """A TestClient over the REAL app (create_app) with the usual db seams faked.
+
+    WHY not the module-level `client` fixture: the 422 for a non-finite
+    limit_usd is produced by the app's RequestValidationError handler
+    (app._json_safe), not by the router alone — a bare FastAPI() app surfaces
+    the unbuildable default 422 body as a 500 and the test would pin the wrong
+    layer. audit.db is faked too (the module documents audit.db as the seam
+    unit tests fake) so a successful control case does not log a lost audit row.
+    """
+    import pcai_llm.core.audit as audit_mod
+    import pcai_llm.core.budgets as budgets_mod
+    import pcai_llm.core.keys as keys_mod
+    from pcai_llm.app import create_app
+
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    spy = _WriteSpyDB()
+    monkeypatch.setattr(routes_admin, "db", spy)
+    monkeypatch.setattr(keys_mod, "db", spy)
+    monkeypatch.setattr(budgets_mod, "db", spy)
+    monkeypatch.setattr(audit_mod, "db", spy)
+    return TestClient(create_app(), raise_server_exceptions=False), spy
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_budget_non_finite_usd_is_a_422_and_writes_nothing(monkeypatch: pytest.MonkeyPatch, literal: str) -> None:
+    """P1-12 (audit 2026-10-30): a NaN must never reach cost_budgets.
+
+    The live-key door re-implements the USD validation inline and tests
+    `<= 0` — which NaN passes (every comparison with NaN is False), so the
+    F1 guard in core.budgets.split_preset_budgets never saw this path. The
+    model's allow_inf_nan=False is what refuses it, and it is the ONLY thing
+    that can: json.loads accepts a bare NaN literal (this test sends the raw
+    bytes rather than a pre-built dict, exactly the audit's repro), and
+    Postgres NUMERIC would have accepted and persisted it.
+
+    Pinned at the WIRE, not at the model: the model-level refusal already has
+    its own test (test_admin_audit); what was untested is that the refusal
+    happens BEFORE the route body, i.e. before the DELETE/INSERT pair.
+    """
+    tc, spy = _wire_client(monkeypatch)
+    r = tc.post(
+        f"/admin/keys/{uuid.uuid4()}/budgets",
+        content='{"budgets": [{"model": "*", "period": "day", "limit_usd": ' + literal + "}]}",
+        headers={**_h(), "content-type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"][0]["type"] == "finite_number"
+    assert r.json()["detail"][0]["loc"] == ["body", "budgets", 0, "limit_usd"]
+    assert spy.writes == [] and spy.executed == [], "a refused budget must not reach the DELETE/INSERT pair"
+
+
+def test_budget_finite_usd_still_passes_the_same_door(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control: the guard rejects only NON-FINITE values, so a legitimate
+    dollar budget still replaces the key's rows (and the DELETE+INSERT pair
+    this test's sibling proves is skipped on refusal does run)."""
+    tc, spy = _wire_client(monkeypatch)
+    kid = uuid.uuid4()
+    r = tc.post(
+        f"/admin/keys/{kid}/budgets",
+        json={"budgets": [{"model": "*", "period": "day", "limit_usd": 12.5}]},
+        headers=_h(),
+    )
+    assert r.status_code == 200, r.text
+    inserts = [w for w in spy.executed if "INSERT INTO cost_budgets" in w[0]]
+    assert inserts, "a finite budget must be written"
+    assert inserts[0][1][0][3] == 12.5
+    assert any("DELETE FROM cost_budgets" in sql for sql, _ in spy.writes)
+
+
 def test_create_model_bad_url_400(client) -> None:
     tc, _ = client
     r = tc.post(
@@ -652,6 +1017,7 @@ class RotateDB(FakeDB):
         self.budget_copy_tag = budget_copy_tag
         self.calls: list[str] = []
         self.insert_args: tuple = ()
+        self.insert_sql: str = ""
         self.grant_copy_args: tuple = ()
         self.grant_copy_sql: str = ""
         self.creds_copy_args: tuple = ()
@@ -671,6 +1037,7 @@ class RotateDB(FakeDB):
         if "INSERT INTO api_keys" in sql:
             self.calls.append("insert new key")
             self.insert_args = args
+            self.insert_sql = sql
             return {"id": uuid.uuid4()}
         if "UPDATE api_keys" in sql and "revoked_at IS NULL" in sql:
             self.calls.append("revoke old key")
@@ -740,8 +1107,21 @@ def test_rotate_key_full_contract(client, monkeypatch: pytest.MonkeyPatch) -> No
     insert_args = db.insert_args
     # 16 as of the Phase A identity columns; 17 since 2026-10-26 (P0-3 adds
     # mcp_admin, the MCP admin opt-in, which rotation must carry like every
-    # other identity attribute).
-    assert len(insert_args) == 17
+    # other identity attribute); 18 since 2026-10-30 — enrollment_id, the team
+    # membership. NOT cosmetic: a rotated key that loses it silently leaves its
+    # team, which stops the enrollment's HARD cap counting its spend
+    # (teams.team_spend matches on k.enrollment_id) and hides the key from the
+    # leader's console. Rotation enumerates its columns, so this is the
+    # grants-carry-over bug class one more time.
+    # 19 since 2026-11-03 — key_group, the rotation-stable conversation scope.
+    # Rotation enumerates its columns, so a group NOT carried here would
+    # orphan the user's saved conversations on every rotate (the same
+    # "rotation enumerates columns" bug class as grants/spend/team).
+    assert len(insert_args) == 19
+    assert "enrollment_id" in db.insert_sql
+    assert "key_group" in db.insert_sql
+    assert insert_args[17] is None  # this key belongs to no team
+    assert insert_args[18] == old["id"]  # a pre-column row falls back to its own id
     assert insert_args[0] == old["user_id"]
     assert insert_args[1] == "ci-bot"  # same NAME (feedback: "same name")
     assert insert_args[4] == ["proxy", "mcp"]  # scopes
@@ -1420,7 +1800,8 @@ def test_admin_console_has_profile_reassign_control() -> None:
     # so the picker offers it and sends an explicit null
     assert '<option value="">' in html
     assert "|| null" in html
-    # the keys table gained exactly one column (10 -> 11) and the empty-row
-    # colspan follows, or the no-keys state renders a ragged table
+    # the keys table column count and the empty-row colspan must follow it,
+    # or the no-keys state renders a ragged table. 2026-10-30 (team tier):
+    # the Enrollment column after User brought the table from 11 to 12.
     assert ">Profile</th>" in html
-    assert 'colspan="11"' in html
+    assert 'colspan="12"' in html

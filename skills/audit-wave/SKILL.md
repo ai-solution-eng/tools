@@ -85,12 +85,12 @@ Hand off to `release-verify` for the build/deploy/verify path. Two rules that bi
 - One cross-validation wave. The second wave is where the fixes' own defects surface.
 - Declaring green tests a verdict. 19 defects were found in already-green code.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
 One deployment's concrete values (2026-10-02) — re-derive locally, never hardcode:
 
-- Target repo: `/home/andrew/Code/HPE/MultimodalRAG/`, version `v5.3.2`; report at `documentation/AUDIT-2026-10-02.md`.
-- Subagent provider ids (verified 2026-10-04 via `list_subagent_models`): `pcai-model-endpoint-flow` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `auto`). These differ from the `pcai-ds` / `pcai-glm` shorthands used elsewhere — those are model *names*, not spawnable provider ids.
+- Target repo: `<your MultimodalRAG checkout>/`, version `v5.3.2`; report at `documentation/AUDIT-2026-10-02.md`.
+- Subagent route (enumerate — ids rot): spawn on `pcai-model-endpoint-subagent` (models `Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`, `Qwen3.8-27B`, `routing`). It is the default spawn route and sends `X-PCAI-Conversation: raw`, so subagent sessions never enter the canonical store and are never distilled into memory — that is the design, not a workaround. `pcai-model-endpoint-flow` is the Lead route (it IS distilled); do not pin subagents to it. These differ from the `pcai-ds` / `pcai-glm` shorthands used elsewhere — those are model *names*, not spawnable provider ids.
 - Breadth/depth split: GLM-5.3-Flash took breadth (API/identity, processors, helm); DeepSeek-V4.1-Flash took depth (MCP tool surface, data core).
 - Over-claim #2's file: `src/multimodal_rag/utils/pcai_models.py` (gitignored; absent from the shipped tarballs).
 - Build script named in Phase 5: `automation.sh`.

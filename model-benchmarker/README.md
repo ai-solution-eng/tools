@@ -437,7 +437,7 @@ Runs land in `results/<model-dir>/<SETUP>.md` — one file per (model × serving
 | `results/qwen_38_27b/H200_sglang_dflash2_hicachex3_replicasx3.md` | Full capacity suite: 1× H200, SGLang + DFlash2, HiCache ×3, 3 replicas — 1/4/32/64 users, ctx 0/32768, multiturn + separate tasks, `Status: complete` |
 | `results/qwen_38_27b/RTXPRO6000_vllm_fp8.md` vs `…_vllm_nvfp4.md` | Same 1× RTX PRO 6000 box under vLLM, FP8 vs NVFP4 weights — the quantization A/B pair |
 | `results/deepseek_v4_flash_0731/H200Sx4_hicachex2.md`, `…/RTXPRO6000x2_hicachex16.md` | DeepSeek-V4-Flash-0731 on 4× H200 (HiCache ×2) and the memory-tight 2× RTX PRO 6000 (HiCache ×16) |
-| `results/glm-5.3-flash/H200x4_NVLink2_hicachex6.md` | GLM-5.3-Flash, 4× H200 dual NVLink, HiCache ×6 |
+| `results/glm-5.3-flash/H200x4_NVLink2_hicachex6.md` | GLM-5.3-Flash, 4× H200 on a G2 medium (2-way NVLink), HiCache ×6 |
 | `results/glm-5.2/H200x8_8waynvlink_hicache_1TB.md` | GLM-5.2-753B, 8× H200 — `Status: in progress — 25/30 levels`: an interrupted run whose completed levels are still valid |
 | `results/RAG/rag_benchmark_scale_large_n_100.md` | Multimodal-RAG scale-run transcripts — historically produced by the retired `MultimodalRAG/tests/benchmark.py`; going forward, produce these with the universal tool's `--md` (same `results/<dir>/` convention, parsed by the same report path) |
 | `results/benchmark_report.html` | Generated snapshot of all of the above — **re-run `results_to_html.py` after adding files**; it is not live |

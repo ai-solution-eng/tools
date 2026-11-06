@@ -445,6 +445,20 @@ def test_compare_knee_carried(compare_app):
     assert b["knee"] is None
 
 
+def test_compare_explicit_reference_flips_baseline(compare_app):
+    """ref= moves the baseline: that run leads the section and the deltas
+    are signed against it instead of the first selected run."""
+    status, body = _call(compare_app, "GET", "/api/results/compare?ids=ep-run-a,ep-run-b&ref=ep-run-b")
+    assert status == 200
+    data = json.loads(body)
+    (ep,) = data["sections"]
+    assert ep["reference_run"] == "ep-run-b"
+    assert ep["runs"] == ["ep-run-b", "ep-run-a"]  # reference first
+    n4 = next(row for row in ep["rows"] if row["label"] == "N=4")
+    # ep-run-a's 250 rps against the ep-run-b baseline of 500 = -50%
+    assert n4["delta_vs_reference"]["rps"]["ep-run-a"] == -50.0
+
+
 # -- unit tests: compare.py pure logic ---------------------------------------
 
 
@@ -508,6 +522,22 @@ def test_build_comparison_zero_ref_value_no_delta():
     out = C.build_comparison(runs)
     (row,) = out["sections"][0]["rows"]
     assert row["delta_vs_reference"] == {}  # divide-by-zero guarded
+
+
+def test_build_comparison_explicit_reference_reorders_and_resigns():
+    runs = [
+        {"run_id": "new", "kind": "endpoint", "rows": [{"label": "N=1", "metrics": {"rps": 200.0}}]},
+        {"run_id": "base", "kind": "endpoint", "rows": [{"label": "N=1", "metrics": {"rps": 100.0}}]},
+    ]
+    out = C.build_comparison(runs, reference="base")
+    (section,) = out["sections"]
+    assert section["reference_run"] == "base"
+    assert section["runs"] == ["base", "new"]
+    (row,) = section["rows"]
+    assert row["delta_vs_reference"]["rps"] == {"new": 100.0}
+    # an unknown / foreign reference id falls back to the first selected run
+    out = C.build_comparison(runs, reference="not-compared")
+    assert out["sections"][0]["reference_run"] == "new"
 
 
 def test_normalize_endpoint_rows_key_shapes():
@@ -656,6 +686,16 @@ def test_library_scan_shapes(monkeypatch, tmp_path, library_root):
     assert kinds["H200_sglang_hicachex2.md"] == "chat"
     assert kinds["H200_memory.md"] == "memory"
     assert "NOTES.md" not in kinds  # prose is not machine-readable
+
+
+def test_setup_label_names_nvlink_topology():
+    """Two 4x H200 setups are only distinguishable by fabric: the label must
+    say 2-way NVLink, and unmarked setups must not claim a topology."""
+    from model_benchmarker.webapp.library import _setup_label
+
+    label = _setup_label({"gpu": "NVIDIA H200 (PCIe)", "gpu_count": 4, "nvlink": 2, "hicache": 6})
+    assert label == "NVIDIA H200 (PCIe) x4 · 2-way NVLink · HiCache x6"
+    assert "NVLink" not in _setup_label({"gpu": "NVIDIA H200 (PCIe)", "gpu_count": 4, "hicache": 4})
 
 
 def test_library_disabled_without_results_dir(monkeypatch):
@@ -1074,6 +1114,75 @@ def test_public_index_carries_target_aliases(compare_app):
     # every row carries a model identity field (None when the artifact is
     # anonymous — the UI renders a dash, never a guess)
     assert all("model" in r for r in data["runs"])
+
+
+def test_results_hidden_roundtrip(compare_app):
+    """Hide/unhide is page management, not deletion: the hidden list is
+    shared (persisted) and the run itself stays in the index."""
+    payload = json.dumps({"ids": ["ep-run-a", "lib:mymodel/H200_sglang_hicachex2"], "hidden": True}).encode()
+    status, body = _call(
+        compare_app,
+        "POST",
+        "/api/results/hidden",
+        headers={"X-API-Key": "test-key-1", "Content-Type": "application/json"},
+        body=payload,
+    )
+    assert status == 200
+    hidden = json.loads(body)["hidden"]
+    assert "ep-run-a" in hidden and "lib:mymodel/H200_sglang_hicachex2" in hidden
+    # the public index carries the hidden list for the page filter, and the
+    # run stays listed (hide != delete)
+    _status, body = _call(compare_app, "GET", "/api/results")
+    data = json.loads(body)
+    assert "ep-run-a" in data["hidden"]
+    assert any(r["run_id"] == "ep-run-a" for r in data["runs"])
+    # unhide
+    status, body = _call(
+        compare_app,
+        "POST",
+        "/api/results/hidden",
+        headers={"X-API-Key": "test-key-1"},
+        body=json.dumps({"ids": ["ep-run-a"], "hidden": False}).encode(),
+    )
+    assert status == 200
+    assert "ep-run-a" not in json.loads(body)["hidden"]
+
+
+def test_results_hidden_requires_key(compare_app):
+    status, _body = _call(compare_app, "POST", "/api/results/hidden", body=b'{"ids": ["ep-run-a"]}')
+    assert status == 401
+
+
+def test_results_hidden_validation(compare_app):
+    headers = {"X-API-Key": "test-key-1"}
+    status, _body = _call(compare_app, "POST", "/api/results/hidden", headers=headers, body=b"")
+    assert status == 400
+    status, _body = _call(
+        compare_app, "POST", "/api/results/hidden", headers=headers, body=json.dumps({"ids": []}).encode()
+    )
+    assert status == 400
+    status, _body = _call(
+        compare_app,
+        "POST",
+        "/api/results/hidden",
+        headers=headers,
+        body=json.dumps({"ids": ["ep-run-a"], "hidden": "yes"}).encode(),
+    )
+    assert status == 400
+
+
+def test_hidden_ids_persist_and_survive_corruption(tmp_path):
+    from model_benchmarker.webapp.runner import RunManager
+
+    m = RunManager(tmp_path)
+    assert m.hidden_ids() == []
+    assert m.set_hidden(["run-a", "lib:m/x"], True) == ["run-a", "lib:m/x"]
+    assert m.set_hidden(["run-a"], False) == ["lib:m/x"]
+    # a fresh manager (new process) reads the same list off the work dir
+    assert RunManager(tmp_path).hidden_ids() == ["lib:m/x"]
+    # a corrupt file reads as "nothing hidden" instead of breaking the page
+    (tmp_path / "hidden.json").write_text("{not json", encoding="utf-8")
+    assert m.hidden_ids() == []
 
 
 # ---------------------------------------------------------------------------

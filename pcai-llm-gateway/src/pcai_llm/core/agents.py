@@ -9,8 +9,11 @@ An agent is a MODEL-NAME entry point. GET /v1/models advertises it next to the
 real pools (pcai.type="agent"); a request naming it resolves to the agent model
 when one is pinned, else through the profile chat cascade exactly as "auto"
 does. Its tool surface is the INTERSECTION of the key grants and the agent
-servers — the profile narrows the agent, the agent narrows the profile, and the
-KEY remains the hard boundary (an agent can only ever hide tools).
+SERVERS, further narrowed — per server — to the TOOLS the operator picked
+(2026-11-04): a server absent from 'tools' means every tool it exposes, which
+is also the pre-tool-picker meaning, so old rows keep working byte for byte.
+The profile narrows the agent, the agent narrows the profile, and the KEY
+remains the hard boundary (an agent can only ever hide tools).
 
 THREE SETS, NOT TWO (the rule that keeps this honest). One grant set feeds three
 consumers, and they must NOT be the same set:
@@ -33,9 +36,10 @@ reported as a permission decision.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..db import db
 from .cascade import DEMAND_AWARE_ALIAS
@@ -55,6 +59,36 @@ class AgentRegistryUnavailable(RuntimeError):
     """The agent registry could not be read — the caller must NOT fall through."""
 
 
+def parse_tools(raw: object) -> dict[str, tuple[str, ...]]:
+    """A stored 'tools' value -> {server: (tool, ...)}. PURE, tolerant.
+
+    Accepts the TEXT column (JSON), a dict (tests / a future JSONB column) or
+    NULL. Malformed input reads as an EMPTY dict, i.e. whole-server for every
+    server the agent lists — the pre-2026-11-04 meaning. That is the honest
+    degradation: the operator's SERVER selection still applies, and a corrupt
+    tools blob must not silently empty an agent's surface (which would look
+    like "the agent is broken", not like "the row is corrupt").
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else {}
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for server, tools in raw.items():
+        name = str(server).strip()
+        if not name or not isinstance(tools, (list, tuple)):
+            continue
+        picked = tuple(dict.fromkeys(str(t).strip() for t in tools if str(t).strip()))
+        if picked:
+            out[name] = picked
+    return out
+
+
 @dataclass(frozen=True)
 class Agent:
     id: uuid.UUID
@@ -70,6 +104,9 @@ class Agent:
     # outcomes differ by a privilege boundary, so they must never be conflated
     # by a missing lookup.
     offered: bool = True
+    # {server: (tool, ...)} — a server ABSENT here is whole-server. Empty dict =
+    # no tool-level narrowing at all (the pre-2026-11-04 shape).
+    tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _row_to_agent(row: object) -> Agent:
@@ -85,6 +122,7 @@ def _row_to_agent(row: object) -> Agent:
         name=str(row["name"]),  # type: ignore[index]
         description=str(row.get("description") or ""),  # type: ignore[attr-defined]
         servers=tuple(str(s) for s in servers),
+        tools=parse_tools(row.get("tools")),  # type: ignore[attr-defined]
         model=str(row.get("model") or ""),  # type: ignore[attr-defined]
         system_prompt=str(row.get("system_prompt") or ""),  # type: ignore[attr-defined]
         enabled=bool(row.get("enabled", True)),  # type: ignore[attr-defined]
@@ -93,7 +131,7 @@ def _row_to_agent(row: object) -> Agent:
 
 
 _FOR_KEY_SQL = """
-SELECT a.id, a.name, a.description, a.servers, a.model, a.system_prompt,
+SELECT a.id, a.name, a.description, a.servers, a.tools, a.model, a.system_prompt,
        a.enabled,
        (u.profile_id IS NULL OR pa.agent_id IS NOT NULL) AS offered
   FROM agent_profiles a
@@ -135,7 +173,7 @@ async def list_all() -> list[Agent]:
     """
     try:
         rows = await db.fetch(
-            "SELECT id, name, description, servers, model, system_prompt, enabled "
+            "SELECT id, name, description, servers, tools, model, system_prompt, enabled "
             "FROM agent_profiles ORDER BY name"
         )
     except Exception:
@@ -172,26 +210,56 @@ def near_miss(agents: list[Agent], name: str) -> Agent | None:
             return a
     return None
 
-def narrow_grants(grants: set[tuple[str, str]], servers: tuple[str, ...] | None) -> set[tuple[str, str]]:
-    """Grants narrowed to an agent servers. None = no agent, unchanged. PURE.
 
-    Used for the OFFERED surface and the DISPATCH gate only — never for the
-    read+egress gate, which must keep the key whole set (module docstring).
+def _tool_allowed(server: str, tool: str, tools: dict[str, tuple[str, ...]] | None) -> bool:
+    """Is this tool inside the agent per-server narrowing? PURE.
+
+    A server absent from the map is whole-server (True). A tool the stored
+    list does not name is hidden — narrowing can only ever subtract, so an
+    unknown/stale tool name simply matches nothing.
+    """
+    if not tools:
+        return True
+    wanted = tools.get(server)
+    return wanted is None or tool in wanted
+
+
+def narrow_grants(
+    grants: set[tuple[str, str]],
+    servers: tuple[str, ...] | None,
+    tools: dict[str, tuple[str, ...]] | None = None,
+) -> set[tuple[str, str]]:
+    """Grants narrowed to an agent servers AND its per-server tools. PURE.
+
+    None servers = no agent, unchanged. Used for the OFFERED surface and the
+    DISPATCH gate only — never for the read+egress gate, which must keep the
+    key whole set (module docstring).
     """
     if servers is None:
         return grants
     keep = set(servers)
-    return {pair for pair in grants if pair[0] in keep}
+    return {pair for pair in grants if pair[0] in keep and _tool_allowed(pair[0], pair[1], tools)}
 
 
-def narrow_catalog(catalog: list[dict], servers: tuple[str, ...] | None) -> list[dict]:
-    """A tool catalog narrowed to an agent servers. None = no agent. PURE.
+def narrow_catalog(
+    catalog: list[dict],
+    servers: tuple[str, ...] | None,
+    tools: dict[str, tuple[str, ...]] | None = None,
+) -> list[dict]:
+    """A tool catalog narrowed to an agent servers AND per-server tools. PURE.
 
-    The hybrid surface derives its server DIRECTORY from this list
-    (core.tool_surface.meta_tool_spec), so narrowing here is what makes the
-    model discovery tool show exactly the profile-and-agent intersection.
+    The hybrid surface derives its server DIRECTORY and its per-server tool
+    counts from this list (core.tool_surface.meta_tool_spec), so narrowing
+    here is what makes the model discovery tool show exactly the
+    profile-and-agent intersection — a narrowed server lists only the picked
+    tools, and 'describe' can only promote those.
     """
     if servers is None:
         return catalog
     keep = set(servers)
-    return [t for t in catalog if str(t.get("server") or "") in keep]
+    return [
+        t
+        for t in catalog
+        if str(t.get("server") or "") in keep
+        and _tool_allowed(str(t.get("server") or ""), str(t.get("tool") or ""), tools)
+    ]

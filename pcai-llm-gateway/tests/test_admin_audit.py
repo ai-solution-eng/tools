@@ -463,7 +463,11 @@ def test_enroll_redeem_audited(monkeypatch: pytest.MonkeyPatch, trail) -> None:
 
 def test_enrollment_mint_audited(env) -> None:
     tc, _fake, trail = env
-    r = tc.post("/admin/enrollments", json={"label": "onboarding", "tenant_id": str(uuid.uuid4())}, headers=ADMIN_H)
+    r = tc.post(
+        "/admin/enrollments",
+        json={"label": "onboarding", "tenant_id": str(uuid.uuid4()), "max_uses": 4},
+        headers=ADMIN_H,
+    )
     assert r.status_code == 201, r.text
     row = trail.rows[0]
     assert row["action"] == "enroll.code.mint" and row["resource_type"] == "enrollment"
@@ -697,3 +701,59 @@ def test_redaction_vocabulary_covers_cookie() -> None:
     assert out["headers"]["Cookie"] == REDACTED
     # the metadata contract still holds: bare key compounds stay readable
     assert not _SECRET_KEY_RE.search("key_id")
+
+
+def test_audit_keeps_token_counts_but_redacts_credentials() -> None:
+    """Redaction is a SECRET filter, not a keyword filter (regression,
+    2026-10-30 review): the team-tier audit rows carry token AMOUNTS
+    (requested_tokens / applied_tokens / budget_tokens), and the blanket
+    "token" match was blanking them to <redacted> — a budget approval trail
+    that records who approved which row but not HOW MUCH is not a budget
+    trail. The _tokens TAIL requirement is what keeps credentials redacted:
+    auth_token / api_tokens / bearer / password must still vanish.
+    """
+    from pcai_llm.core.audit import details_redact
+
+    out = details_redact(
+        {
+            "requested_tokens": 5_000_000,
+            "applied_tokens": 5_000_000,
+            "budget_tokens": 1_000_000,
+            "allocated_tokens": 12,
+            "requested_usd": 20.0,
+            "limit_tokens": 7,
+            "auth_token": "SECRET-1",
+            "api_tokens": "SECRET-2",
+            "bearer": "SECRET-3",
+            "password": "SECRET-4",
+        }
+    )
+    assert out["requested_tokens"] == 5_000_000
+    assert out["applied_tokens"] == 5_000_000
+    assert out["budget_tokens"] == 1_000_000
+    assert out["allocated_tokens"] == 12
+    assert out["requested_usd"] == 20.0
+    assert out["limit_tokens"] == 7
+    for secret in ("auth_token", "api_tokens", "bearer", "password"):
+        assert out[secret] == "<redacted>", f"{secret} must never survive redaction"
+
+
+def test_budget_spec_rejects_non_finite_usd() -> None:
+    """NaN/Infinity must never reach the INSERT (review P1, 2026-10-30).
+
+    A NaN slips past every `<= 0` guard (comparisons with NaN are False), so it
+    would also silently SKIP the team envelope check, then persist — Postgres
+    NUMERIC accepts NaN and CHECK (limit_usd > 0) passes because NaN sorts
+    above every number. The key's budget gate would refuse forever and every
+    JSON projection of the row would 500. The model refuses it at the edge.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    from pcai_llm.api.routes_admin import BudgetSpec
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            BudgetSpec(model="*", period="month", limit_usd=bad)
+    # finite values still parse
+    assert BudgetSpec(model="*", period="month", limit_usd=1.5).limit_usd == 1.5

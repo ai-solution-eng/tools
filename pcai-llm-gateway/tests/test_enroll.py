@@ -252,10 +252,108 @@ def test_enroll_atomic_redeem_statement(env) -> None:
     assert "uses = uses + 1" in sql
     assert "revoked_at IS NULL" in sql
     assert "(expires_at IS NULL OR expires_at > now())" in sql
-    assert "(max_uses = 0 OR uses < max_uses)" in sql
+    # STRICTLY POSITIVE (2026-10-30): 0 used to mean "unlimited" — the one shape
+    # a mint allowance must never have, because the team envelope is derived
+    # from it. A legacy 0 row is now exhausted (0 uses < 0 is false).
+    assert "(uses < max_uses)" in sql
+    assert "max_uses = 0" not in sql, "the unlimited branch must not come back"
     assert "RETURNING id, tenant_id, profile_id" in sql
     assert args[0] == hash_key(code)
-    assert code not in args
+
+
+def test_enroll_name_rejects_markup_at_the_public_door(env) -> None:
+    """FIX 8 (audit W6): the PUBLIC, UNAUTHENTICATED door feeds api_keys.name
+    via the redeem create_key — the stored-XSS SOURCE the UI zone closed at
+    the sinks closes HERE, at the edge, with the same name charset the admin
+    and team-leader mint surfaces enforce. Markup in the name is a pydantic
+    422 BEFORE the handler runs: the code is never redeemed, nothing is
+    written. An ordinary unicode name still redeems."""
+    tc, fake = env
+    fake.enroll_row = _redeemed(None)  # a LIVE code: pre-fix the redeem would burn it
+    r = tc.post("/v1/enroll", json={"code": _code(), "name": "<script>x</script>"})
+    assert r.status_code == 422, r.text
+    # the refusal is pre-handler: the code was NOT consumed, nothing written
+    assert fake.redeem_stmts() == [], "a 422 at the edge must never burn the code"
+    assert fake.fetchrows == [] and fake.executed == []
+
+    # positive control: an ordinary (unicode) display name still redeems
+    fake.enroll_row = _redeemed(None)
+    r2 = tc.post("/v1/enroll", json={"code": _code(), "name": "clé de facturation — 关键"})
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["user"] == "clé de facturation — 关键"
+
+
+def test_enroll_audit_explicit_actor_source_is_authoritative(monkeypatch) -> None:
+    """F3: an explicitly supplied actor_source is NEVER clobbered — the
+    self-service surfaces record actor_source='key' (a ledger key, not an
+    admin credential) even when the request carries a Bearer; an admin
+    surface that omits the argument still resolves 'admin-key' from the
+    bearer. The old behavior relabeled BOTH to 'admin-key', misattributing
+    tenant actions to the admin actor class in the hash-chained trail."""
+    rows: list[tuple] = []
+
+    class _Cap:
+        async def execute(self, sql: str, *args: Any):
+            rows.append(args)
+            return "INSERT 0 1"
+
+    from pcai_llm.core import audit as audit_mod
+
+    monkeypatch.setattr(audit_mod, "db", _Cap())
+    req = SimpleNamespace(
+        # lowercase: _enroll_audit reads a plain mapping (the ASGI convention);
+        # a real Request's Headers are case-insensitive, the shim is not
+        headers={"authorization": "Bearer hllm-userkey"},
+        client=None,
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/v1/mcp/creds/mm-rag"),
+    )
+    asyncio.run(
+        routes_enroll._enroll_audit(
+            req, action="mcp.creds.self", resource_type="key", resource_id="kid", actor_source="key"
+        )
+    )
+    assert rows[-1][2] == "key", rows[-1]  # pre-fix: 'admin-key' (clobbered)
+    assert rows[-1][1] == ""  # nothing fabricated for a non-admin source
+    # the omitted-argument path still resolves the admin vocabulary
+    rows.clear()
+    asyncio.run(routes_enroll._enroll_audit(req, action="mcp.creds.set", resource_type="key", resource_id="kid"))
+    assert rows[-1][2] == "admin-key"
+    assert rows[-1][1].startswith("admin-key:")
+
+
+def test_delete_enrollment_invalidates_the_team_cache(env, monkeypatch) -> None:
+    """F5: DELETE drops the deleted enrollment's cached envelope (and the
+    cached negatives of the keys it just un-grouped) IMMEDIATELY — the same
+    immediate-visibility rule the PATCH path follows — instead of letting
+    the 30s TTL keep refusing against a deleted cap."""
+    tc, _fake = env
+    calls: list[uuid.UUID] = []
+
+    def _spy(enrollment_id=None):
+        calls.append(enrollment_id)
+
+    monkeypatch.setattr(routes_enroll.teams, "invalidate", _spy)
+
+    class _DeleteRowDB:
+        """Just the three statements the delete handler runs."""
+
+        async def fetchrow(self, sql: str, *args: Any):
+            if "SELECT label, revoked_at FROM enrollments" in sql:
+                return {"label": "team-x", "revoked_at": datetime.now(UTC)}
+            return None
+
+        async def fetchval(self, sql: str, *args: Any):
+            return 0  # keys_left
+
+        async def execute(self, sql: str, *args: Any):
+            return "DELETE 1"
+
+    monkeypatch.setattr(routes_enroll, "db", _DeleteRowDB())
+    eid = uuid.uuid4()
+    r = tc.delete(f"/admin/enrollments/{eid}", headers=ADMIN_H)
+    assert r.status_code == 200, r.text
+    assert calls == [eid]
 
 
 def test_enroll_dead_codes_all_identical_400(env) -> None:
@@ -369,7 +467,11 @@ def test_admin_create_enrollment_code_shown_once(env) -> None:
 def test_admin_create_enrollment_unknown_tenant_404(env) -> None:
     tc, fake = env
     fake.tenant_exists = False
-    r = tc.post("/admin/enrollments", json={"label": "l", "tenant_id": str(uuid.uuid4())}, headers=ADMIN_H)
+    r = tc.post(
+        "/admin/enrollments",
+        json={"label": "l", "tenant_id": str(uuid.uuid4()), "max_uses": 4},
+        headers=ADMIN_H,
+    )
     assert r.status_code == 404
 
 
@@ -378,18 +480,32 @@ def test_admin_create_enrollment_unknown_profile_404(env) -> None:
     fake.profile_exists = False
     r = tc.post(
         "/admin/enrollments",
-        json={"label": "l", "tenant_id": str(uuid.uuid4()), "profile_id": str(uuid.uuid4())},
+        json={"label": "l", "tenant_id": str(uuid.uuid4()), "profile_id": str(uuid.uuid4()), "max_uses": 4},
         headers=ADMIN_H,
     )
     assert r.status_code == 404
 
 
-def test_admin_create_enrollment_negative_max_uses_422(env) -> None:
+@pytest.mark.parametrize("bad", [0, -1])
+def test_admin_create_enrollment_nonpositive_max_uses_422(env, bad: int) -> None:
+    """STRICTLY POSITIVE (2026-10-30): 0 used to mean "unlimited", which also
+    made the DERIVED team envelope (max_uses x the profile's per-key presets)
+    unbounded — the exact hole the envelope exists to close. 0 and negatives are
+    both refused at the model, so the row can never be written."""
     tc, _ = env
     r = tc.post(
-        "/admin/enrollments", json={"label": "l", "tenant_id": str(uuid.uuid4()), "max_uses": -1}, headers=ADMIN_H
+        "/admin/enrollments", json={"label": "l", "tenant_id": str(uuid.uuid4()), "max_uses": bad}, headers=ADMIN_H
     )
     assert r.status_code == 422
+
+
+def test_admin_create_enrollment_requires_max_uses(env) -> None:
+    """Omitting the field is a 422, not a silent unlimited code — the create
+    model has no default any more."""
+    tc, _ = env
+    r = tc.post("/admin/enrollments", json={"label": "l", "tenant_id": str(uuid.uuid4())}, headers=ADMIN_H)
+    assert r.status_code == 422
+    assert "max_uses" in r.text
 
 
 def test_admin_list_enrollments_no_code_material(env) -> None:
@@ -993,6 +1109,7 @@ def test_enroll_invalid_preset_refuses_without_burning_the_code(env) -> None:
     assert "limit_tokens" in r.json()["detail"] or "limit_usd" in r.json()["detail"]
     # nothing was stamped (the refusal precedes every preset write)
     assert not [s for s, _ in fake.bulk if "INSERT INTO" in s]
+
 
 # ---------------------------------------------------------------------------
 # SSO default profile -> the USER row (2026-10-29)

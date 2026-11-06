@@ -1,0 +1,1655 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCAI LLM Gateway — Team Leader</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<style>
+  /* The Team Leader console is a SMALLER SIBLING of admin.html — the same
+     :root variables, the same control idioms (pill / card / row / ghost /
+     banner / key-once), so a leader who has seen the admin console finds the
+     same hand on this one. Dark default + light theme via data-theme,
+     persisted in the SAME 'pcai-llm-theme' key so both consoles match. */
+  :root {
+    color-scheme: dark;
+    --bg: #0f1117; --panel: #1a1d27; --border: #2a2e3d;
+    --text: #e6e8ee; --dim: #8b90a3;
+    --accent: #01a982; --accent-contrast: #04110d;
+    --accent2: #4b8bbe; --user-bubble: #23364a;
+    --err: #e05252; --err-bg: rgba(224,82,82,.08);
+    --ok: #01a982; --warn: #d9a036; --focus: #01a98266;
+    /* per-user shading ramps (usage rows + trace cards) — same six subtle
+       overlays admin.html uses, so a user reads as one color across pages */
+    --ushade-0: rgba(255,255,255,.02); --ushade-1: rgba(255,255,255,.04);
+    --ushade-2: rgba(255,255,255,.06); --ushade-3: rgba(255,255,255,.08);
+    --ushade-4: rgba(255,255,255,.10); --ushade-5: rgba(255,255,255,.12);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
+    --text: #191919; --dim: #5f6773;
+    --accent: #00815f; --accent-contrast: #ffffff;
+    --accent2: #2c6a9e; --user-bubble: #e3f2ee;
+    --err: #b42323; --err-bg: rgba(180,35,35,.06);
+    --focus: #00815f55;
+    --ushade-0: rgba(0,0,0,.03); --ushade-1: rgba(0,0,0,.05);
+    --ushade-2: rgba(0,0,0,.07); --ushade-3: rgba(0,0,0,.09);
+    --ushade-4: rgba(0,0,0,.11); --ushade-5: rgba(0,0,0,.13);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--border);
+           position: sticky; top: 0; z-index: 5; --header-h: 48px; }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header .hpe { color: var(--accent); }
+  /* The Chat link sits LEFT of the title — a leader's first move is usually
+     "back to chat". Same ghost-border family as the header controls. */
+  header a.backlink { color: var(--accent2); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 7px; padding: 5px 10px; }
+  header a.backlink:hover { border-color: var(--accent2); }
+  header input[type=password] { background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+    font-size: 13px; width: 300px; }
+  header .spacer { flex: 1; }
+  #theme { background: none; border: 1px solid var(--border); border-radius: 6px;
+           padding: 4px 9px; cursor: pointer; color: var(--text); }
+  /* Sticky tab bar — same parking trick as admin.html: top is the measured
+     header height, z-index below the header (5) and the error strip (9). */
+  nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px 0; background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        position: sticky; top: var(--header-h, 49px); z-index: 4; }
+  nav button { background: none; border: none; color: var(--dim); padding: 8px 14px;
+               cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  /* Key-row action grid — the admin console's 2-column equal-cell block:
+     row height stays predictable no matter how many actions a key shows. */
+  .rowacts { display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+             width: 168px; align-items: stretch; }
+  .rowacts button { width: 100%; padding: 4px 6px; font-size: 12px;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rowacts .wide { grid-column: 1 / -1; }
+  main { padding: 18px 16px 60px; max-width: 1200px; margin: 0 auto; }
+  section { display: none; } section.active { display: block; }
+  h2 { font-size: 16px; margin: 6px 0 12px; }
+  h3 { font-size: 13.5px; margin: 14px 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: none; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 14px; overflow-x: auto; }
+  /* ONE PLANE PER LINE (2026-11-03, r2) — the same contract as admin.html's
+     forms, kept identical on purpose so the two consoles cannot drift.
+     align-items:start aligns on the TOP of the control slot, so anything that
+     hangs BELOW a control (a trailing .hint, a "+ new" button, a show/hide
+     toggle) can no longer lift that field's input above its neighbours.
+     layoutFormRows() publishes, per FLEX LINE (a wrapped row has several
+     planes): --fhead-h (title line), --hint-h (band reserved under the
+     control), --ctl-top (non-field items) and --chk-top (checkbox labels).
+     With no JS the hints simply sit in flow (no alignment, no overlap). */
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: start; }
+  .row > label { position: relative; padding-bottom: var(--hint-h, 0px); }
+  .row > label:not(.chk) > .hint {
+    position: absolute; left: 0; right: 0; top: calc(100% - var(--hint-h, 0px));
+    margin: 0; padding-top: 4px;
+  }
+  .row > *:not(label) { margin-top: var(--ctl-top, 0px); }
+  .row > label:has(input[type="checkbox"]) { margin-top: var(--chk-top, 0px); }
+  /* A checkbox label carrying an INLINE hint opts out of the band (legacy
+     shape): it neither measures nor pads, so it keeps today's shape. */
+  .row > label.chk:has(> .hint) { padding-bottom: 0; }
+  .row.row-hinted { margin-bottom: 6px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+  .hint { margin-top: 4px; font-size: 12px; color: var(--dim); line-height: 1.45; }
+  .hint ul { margin: 2px 0 0; padding-left: 16px; }
+  .hint li { margin: 1px 0; }
+  .form-hint { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);
+    font-size: 12px; color: var(--dim); }
+  .form-hint ul { margin: 4px 0 0; padding-left: 18px; }
+  .form-hint li { margin: 2px 0; }
+  .showpw { flex: none; align-self: flex-start; }
+  /* Field title line: the label's own text, with an optional reveal toggle at
+     its right edge (structureFormRows wraps it, layoutFormRows pads it). */
+  .fhead { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+  .row > label > .fhead, .ep-row > label > .fhead { min-height: var(--fhead-h, 0px); }
+  .fhead > .showpw { border: 0; background: none; padding: 0; margin: 0; font: inherit;
+    font-size: 11px; line-height: 1.4; color: var(--dim); text-decoration: underline dotted;
+    cursor: pointer; }
+  .fhead > .showpw:hover { color: var(--text); }
+  input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 9px; font: inherit; font-size: 13px; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--focus); }
+  button.btn { background: var(--accent); color: var(--accent-contrast); border: 0; border-radius: 7px;
+    padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.btn:disabled, button.primary:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-contrast); border: 0;
+    border-radius: 7px; padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.ghost { background: none; border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  button.danger { background: none; border: 1px solid var(--err); color: var(--err); }
+  button.mini { padding: 3px 9px; font-size: 12px; border-radius: 5px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+          background: var(--bg); border: 1px solid var(--border); color: var(--dim); margin-right: 4px; }
+  .pill.on { color: var(--accent); border-color: var(--accent); }
+  .pill.off { color: var(--err); border-color: var(--err); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .banner { border: 1px solid var(--accent); background: var(--user-bubble); padding: 12px 14px;
+            border-radius: 8px; margin: 10px 0; font-size: 13px; }
+  .banner code { font-size: 14px; user-select: all; }
+  .banner.error { border-color: var(--err); background: var(--err-bg); color: var(--err); }
+  /* shown-once key reveal (mint): the full plaintext is displayed exactly
+     once — big, selectable, one-click copyable, with the warning beside it */
+  .key-once-warn { color: var(--warn); margin-bottom: 8px; }
+  .key-once-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .key-once-row code { font-family: ui-monospace, monospace; font-size: 14px;
+    user-select: all; word-break: break-all; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; }
+  .muted { color: var(--dim); font-size: 12px; }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .hidden { display: none !important; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+           border-radius: 12px; padding: 18px; max-width: 720px; width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  /* A standalone inline checkbox: the default label stacks above its text */
+  label.chk { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
+  /* Any label wrapping a checkbox is a ROW (checkbox as the bullet) */
+  label:has(input[type="checkbox"]) { flex-direction: row; align-items: center; gap: 7px; color: var(--text); }
+  label:has(input[type="checkbox"]) input[type="checkbox"] {
+    width: 15px; height: 15px; padding: 0; margin: 0; flex: none; accent-color: var(--ok); }
+  /* agent traces: one stacked table per conversation — same shapes as the
+     admin Traces tab (turn-header rows + step rows back-to-back) */
+  .trace-thread { border: 1px dashed var(--border); border-radius: 8px; padding: 8px 10px; margin: 10px 0; }
+  .trace-thread > summary { cursor: pointer; user-select: none; }
+  .trace-steps { margin-top: 6px; border: 0; }
+  .trace-steps th, .trace-steps td { font-size: 12px; padding: 4px 8px; }
+  tr.trace-turn td { border-top: 3px double var(--dim); }
+  tr.trace-turn td:first-child { border-top-left-radius: 6px; }
+  tr.trace-turn:last-child td:last-child { border-top-right-radius: 6px; }
+  .trace-turn-label { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  .st-err { color: var(--err); }
+  .st-warn { color: var(--warn); }
+  .st-info { color: var(--dim); }
+  a { color: var(--accent2); }
+  @media (max-width: 720px) {
+    header { flex-wrap: wrap; }
+    header input[type=password], header input { width: 100% !important; }
+    table { display: block; overflow-x: auto; white-space: nowrap; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="hpe">HPE</span> Team Leader — <span id="tl-label" class="muted">…</span></h1>
+  <div class="spacer"></div>
+  <!-- Chat sits immediately left of the key input — the SAME slot as
+       admin.html (2026-10-30: it was left of the title here, so the two
+       consoles disagreed about where the way back lives). -->
+  <a class="backlink" href="/" title="Back to the chat console">← Chat</a>
+  <input id="tlkey" type="password" placeholder="Team leader key" aria-label="Team leader key" autocomplete="off">
+  <button id="connect" class="btn">Connect</button>
+  <span id="conn" class="muted"></span>
+  <button id="theme" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+</header>
+<nav>
+  <button data-tab="keys" class="active">Keys</button>
+  <button data-tab="advertised">Advertised</button>
+  <button data-tab="usage">Usage</button>
+  <button data-tab="traces">Traces</button>
+</nav>
+<div id="errstrip" class="hidden" aria-live="polite" style="position:sticky;top:0;z-index:9;background:var(--err-bg);
+     color:var(--err);border-bottom:1px solid var(--err);padding:6px 16px;font-size:12px;
+     font-family:ui-monospace,monospace;white-space:pre-wrap;max-height:140px;overflow:auto"></div>
+<main>
+  <div id="banner" aria-live="polite"></div>
+
+  <!-- Connect prompt: visible until a key is verified against the server -->
+  <div id="tl-connect">
+    <div class="card">
+      <h2>Team leader console</h2>
+      <p class="hint" style="margin:0">This console is scoped to <b>one enrollment</b> — the keys minted from
+      it, its usage, and its traces. Enter the team leader key above and press <b>Connect</b>. The key was
+      shown exactly once (at mint, or when the admin minted/rotated it); it is not recoverable afterwards.</p>
+    </div>
+  </div>
+
+  <!-- ============ KEYS ============ -->
+  <section id="tab-keys" class="active">
+    <div class="card">
+      <h2>Mint a teammate key</h2>
+      <div class="row">
+        <label>Key name <input id="k-name" placeholder="alice"></label>
+        <label>Subject
+          <input id="k-subject" placeholder="alice@corp" style="width:190px">
+          <div class="hint">Optional SSO identity binding.</div>
+        </label>
+        <label>RPM <input id="k-rpm" type="number" value="60" style="width:80px"></label>
+        <label>TPM <input id="k-tpm" type="number" value="100000" style="width:110px"></label>
+        <label>Expires in days <input id="k-expdays" type="number" min="1" placeholder="—" style="width:110px">
+          <div class="hint">Optional.</div>
+        </label>
+        <label>Budget tokens <input id="k-budget-tokens" type="number" placeholder="—" style="width:120px"></label>
+        <label>Budget USD <input id="k-budget-usd" type="number" step="0.01" placeholder="—" style="width:110px"></label>
+        <button class="btn" id="k-create">Mint key</button>
+      </div>
+      <div class="form-hint"><ul>
+        <li>The key lands in <b>this enrollment</b> — the team tenant and profile are stamped by the server; you only set name, identity and limits.</li>
+        <li><b>Budget</b> is the key's own allocation (tokens OR USD, monthly). The enrollment envelope checks total allocation against remaining headroom and refuses over-allocation (409).</li>
+      </ul></div>
+      <div id="k-plaintext" class="banner hidden"></div>
+    </div>
+    <h2>Keys <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:10px">
+      <input type="checkbox" id="show-revoked"> show revoked
+    </label></h2>
+    <!-- Client-side filter over the already-loaded list (admin.html's pattern):
+         the whole list is in memory, so a round-trip per keystroke would be
+         worse than useless. -->
+    <div class="row" style="margin-bottom:8px;align-items:center">
+      <input id="k-search" type="search" placeholder="search keys — name, user, prefix, or subject…"
+             style="flex:1;min-width:260px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px"
+             oninput="filterKeys()">
+      <span id="k-search-count" class="muted"></span>
+      <button class="ghost mini" onclick="clearKeySearch()">clear</button>
+    </div>
+    <table id="keys-table"><thead>
+      <tr><th>Name</th><th>User</th><th>Key</th><th>Subject</th><th>Limits</th><th>Allocation</th><th>Status</th><th></th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+
+  <!-- ============ ADVERTISED (registry view) ============ -->
+  <section id="tab-advertised">
+    <div class="card">
+      <h2>Presented endpoints</h2>
+      <div class="hint" style="margin:-4px 0 8px">The FULL registry view — what <span class="mono">/v1/models</span> advertises (aliases, routing pseudo-models, pools, agents), with the reason any entry is absent.</div>
+      <div class="row" style="align-items:center;margin-bottom:8px">
+        <button class="ghost mini" id="pe-reload" title="Re-read GET /team_leader/presented-models">↻ refresh</button>
+        <span id="pe-counts" class="muted"></span>
+      </div>
+      <div id="pe-block"><span class="muted">not loaded yet — open this tab or press refresh</span></div>
+    </div>
+  </section>
+
+  <!-- ============ USAGE ============ -->
+  <section id="tab-usage">
+  <!-- Overview card: the Usage tab only. The envelope (the team's
+       hard budget cap) with spend, allocation and the unallocated overflow
+       pool — the numbers that answer "how much is left for my team". -->
+  <div id="ovr" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0" id="ovr-title">Team</h2>
+        <button class="ghost mini" id="ovr-reload" title="Reload the overview">↻ refresh</button>
+      </div>
+      <div class="muted" id="ovr-sub" style="margin-top:4px"></div>
+      <div class="row" style="margin-top:10px;align-items:center">
+        <span id="ovr-overflow" class="pill">overflow —</span>
+        <label class="chk" title="Auto-overflow: with it ON a teammate key may exceed its own allocation while the unallocated pool has headroom; with it OFF every allocation is a hard cap. Changing it PATCHes the enrollment and re-reads the overview.">
+          <input type="checkbox" id="ovr-overflow-tog"> auto-overflow
+        </label>
+        <span id="ovr-keys" class="pill">keys —</span>
+        <span id="ovr-leader" class="muted mono"></span>
+      </div>
+      <div class="muted" id="ovr-overflow-help" style="font-size:11.5px;margin-top:3px"></div>
+      <h3>Team budget envelope <span id="ovr-period" class="muted"></span></h3>
+      <div id="ovr-bars"></div>
+      <div id="ovr-nocap" class="hint" style="margin-top:8px"></div>
+      <!-- Budget top-up queue (wave 3): the cap is admin-only, so a leader
+           at available 0 asks in-band instead of out-of-band. The button
+           hides while one request is pending (one open ask at a time);
+           recent resolved requests list under it. -->
+      <div class="row" style="margin-top:10px;align-items:center;gap:8px">
+        <button class="ghost mini" id="ovr-topup" title="Ask your admin to raise the team cap — the request lands in the admin's approval queue (Enroll tab). The admin decides; you get no write access to the cap.">Request more budget</button>
+        <span id="ovr-topup-pill"></span>
+      </div>
+      <div id="ovr-topup-resolved" class="muted" style="font-size:11.5px;margin-top:4px"></div>
+      <p class="hint" style="margin-top:10px">The envelope is a HARD cap on the whole team. Per dimension:
+      <b>Total</b> (or "no cap") · <b>Spent</b> (real usage this period) · <b>Committed</b> (still promised to
+      keys under their allocations) · <b>Available</b> = total − spent − committed — what you may still hand
+      out; the bar fills with spent + committed. Actual spend eats the pool: available, not the old
+      "unallocated", is the number you allocate from.</p>
+    </div>
+  </div>
+
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h2 style="margin:0">Team usage <span class="muted">— scoped to this enrollment's keys</span></h2>
+      <button class="ghost mini" id="u-reload" title="Reload rollup and ledger">↻ refresh</button>
+    </div>
+    <h3>Totals <span class="muted">— this enrollment's ledger; cache_hit rows are visible but cost no budget</span></h3>
+    <table id="usage-summary"><thead>
+      <tr><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th>Cached tokens</th><th title="token-weighted: cached input ÷ total input tokens — upstream prompt-cache hits ride OK rows as cached_tokens">Cache hit rate</th><th>Cost (USD)</th><th title="what budgets actually consumed: tokens × the billing fraction in force (off-peak discounts show here)">Billed tokens</th><th title="cost × billing fraction — the budget-gate view of spend">Billed cost</th></tr>
+    </thead><tbody></tbody></table>
+    <h3>By model</h3>
+    <table id="usage-by-model"><thead>
+      <tr><th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted)">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
+    </thead><tbody></tbody></table>
+    <h3>By key <span class="muted">— chargeback view; who consumed what</span></h3>
+    <div class="row" style="margin-bottom:6px">
+      <label>Window
+        <select id="usage-window">
+          <option value="1">Last 24 hours</option>
+          <option value="7">Last 7 days</option>
+          <option value="30">Last 30 days</option>
+          <option id="usage-window-max" value="366" selected>Max</option>
+        </select>
+      </label>
+      <span class="muted" id="usage-window-note"></span>
+    </div>
+    <table id="usage-by-key"><thead>
+      <tr><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted) — per KEY">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
+    </thead><tbody></tbody></table>
+    <h2 style="margin-top:18px">Recent usage (ledger) <span class="muted" id="u-meta"></span></h2>
+    <div class="row" style="margin-bottom:8px">
+      <label>Key
+        <select id="u-key" style="min-width:150px"><option value="">all keys</option></select>
+      </label>
+      <label>Since <input id="u-since" type="datetime-local"></label>
+      <a class="ghost" id="u-csv" href="#" style="padding:6px 12px;border:1px solid var(--border);border-radius:7px;font-size:13px;color:var(--text);text-decoration:none" title="Download the same filtered ledger as CSV">export CSV</a>
+    </div>
+    <table id="usage-table"><thead>
+      <tr><th>Time</th><th>User</th><th>Key</th><th>Subject</th><th>Model</th><th>Endpoint</th><th>Input</th><th>Output</th><th>Cached</th><th>Total</th><th>Cost</th><th>Status</th><th>ms</th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+
+  <!-- ============ TRACES ============ -->
+  <section id="tab-traces">
+    <div class="card">
+      <h2>Agent traces</h2>
+      <p class="hint" style="margin:0 0 8px">One card per relay request: model iterations, tool calls and wall-clock totals — scoped to this enrollment's keys.</p>
+      <div class="row">
+        <label>Key
+          <select id="t-key" style="min-width:150px"><option value="">all keys</option></select>
+        </label>
+        <label>Since
+          <input id="t-since" type="datetime-local">
+        </label>
+        <label>Limit <input id="t-limit" type="number" value="50" min="1" max="200" style="width:80px"></label>
+        <button class="btn" id="t-reload">Reload</button>
+        <span class="muted" id="t-meta"></span>
+      </div>
+    </div>
+    <div id="traces-list"><p class="muted">no traces yet</p></div>
+  </section>
+</main>
+<dialog id="dlg"><div id="dlg-body"></div></dialog>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+
+// ---- diagnostics FIRST — before anything that can throw (admin.html's
+// guard: Firefox blocks sessionStorage inside cross-site iframes, and an
+// unguarded access dies before any handler exists — dead page, zero clues).
+const errLines = [];
+function reportError(src) {
+  errLines.push(src);
+  const strip = document.getElementById('errstrip');
+  if (strip) { strip.classList.remove('hidden');
+    strip.textContent = errLines.slice(-6).join('\n'); }
+}
+window.addEventListener('error', e =>
+  reportError('[JS] ' + e.message + ' @ line ' + e.lineno));
+window.addEventListener('unhandledrejection', e =>
+  reportError('[promise] ' + (e.reason && e.reason.message || e.reason)));
+
+// storage can be BLOCKED (iframes / privacy mode) — never let it throw.
+// The LEADER KEY is a bearer credential: sessionStorage (shorter lifetime
+// than localStorage for a secret — the audit's ruling on the admin key).
+const sessionStore = {
+  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+};
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// Same theme key as admin.html — a leader and an admin on one machine see
+// one consistent look across both consoles.
+const THEME_KEY = 'pcai-llm-theme';
+const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
+applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+$('theme').onclick = () => { const n = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  store.set(THEME_KEY, n); applyTheme(n); };
+
+const KEY_STORE = 'pcai_team_leader_key';
+const key = () => $('tlkey').value.trim();
+const state = { overview: null, keys: [] };
+
+function banner(msg, cls = '', timeout) {
+  const b = $('banner');
+  b.innerHTML = `<div class="banner ${cls}">${msg}</div>`;
+  if (timeout) setTimeout(() => { b.innerHTML = ''; }, timeout);
+}
+// Security: esc must be safe inside double-quoted attributes (the admin
+// console's audit-#3 fix) — the pages hold bearer keys, so every dynamic
+// string that reaches innerHTML goes through this first.
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Disable-during-request: a double-click on a mint button must never
+// double-fire (two keys created → the first shown-once secret is destroyed).
+async function withBtn(btn, fn) {
+  if (btn && btn.disabled) return;
+  if (btn) btn.disabled = true;
+  try { return await fn(); } finally { if (btn) btn.disabled = false; }
+}
+const guarded = (id, fn) => (...args) => withBtn($(id), () => fn(...args));
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch { // fallback for clipboard-permission edge cases
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); return true; }
+    finally { ta.remove(); }
+  }
+}
+
+const fmtInt = v => (v == null || v === '' ? '0' : (+v || 0).toLocaleString());
+const fmtUSD = v => (v == null ? '—' : '$' + Number(v).toFixed(Number(v) > 0 && Number(v) < 0.01 ? 6 : 4));
+// w7 (owner 2026-11-02): the single-control ALLOCATION lifecycle. The keys
+// table used to stack one pill per budget (a 6-budget key made rows ~400px
+// tall); the row now shows ONE button — count + worst-state colour — using
+// the same thresholds as admin's F9 burn-down column: >=95% is the state
+// that REFUSES, so it renders red and can never be hidden behind yellow
+// (an over-allocation is >=100% → red, and the per-row "spending from the
+// overflow pool" note below still says what it means); >=80% warns. No
+// budgets → the neutral dash. Click → every budget in the existing #dlg.
+// The button carries the row's budget list as esc'd JSON in data-b (the
+// data-attribute idiom of admin's viewTools); esc() on every server string.
+const budgetPct = b => {
+  if (typeof b.pct === 'number') return b.pct;
+  if (b.kind === 'usd') return b.limit_usd ? (b.spent_usd || 0) / b.limit_usd : 0;
+  return b.limit ? (b.spent || 0) / b.limit : 0;
+};
+const budgetState = b => { const p = budgetPct(b); return p >= .95 ? 'off' : p >= .8 ? 'warn' : 'on'; };
+const budgetWorst = list => list.some(b => budgetState(b) === 'off') ? 'off' : list.some(b => budgetState(b) === 'warn') ? 'warn' : 'on';
+window.viewBudgets = btn => {
+  let list = [];
+  try { list = JSON.parse(btn.dataset.b || '[]') || []; } catch { list = []; }
+  const rows = list.map(b => {
+    const over = b.kind === 'usd'
+      ? (b.limit_usd != null && (b.spent_usd || 0) > Number(b.limit_usd))
+      : (b.limit != null && (b.spent || 0) > Number(b.limit));
+    const capTxt = b.limit == null ? 'no cap' : fmtInt(b.limit) + ' tok';
+    const capUsd = b.limit_usd == null ? 'no cap' : fmtUSD(b.limit_usd);
+    const shown = b.kind === 'usd' ? `${fmtUSD(b.spent_usd)} / ${capUsd}` : `${fmtInt(b.spent)} / ${capTxt}`;
+    const detail = `${b.kind === 'usd' ? `${fmtUSD(b.spent_usd)} spent of ${capUsd}` : `${fmtInt(b.spent)} tok spent of ${capTxt}`} allocated${over ? ' — spending from the overflow pool' : ''}`;
+    return `<tr><td><span class="pill ${budgetState(b)}">${esc(b.model)} ${esc(b.period)}</span></td>
+      <td class="mono" title="${esc(detail)}">${esc(shown)} · ${Math.round(budgetPct(b) * 100)}%</td></tr>`;
+  }).join('');
+  dlg(`<h2>Budgets — ${esc(btn.dataset.name || '')}</h2>
+    <table><thead><tr><th>Model · period</th><th>spent / limit</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="2" class="muted">no budgets</td></tr>'}</tbody></table>`);
+};
+// Per-user shading (admin.html's helper): djb2 over the user name → one of
+// six subtle overlays, so one user reads as one color across usage + traces.
+function shadeFor(name) {
+  let h = 5381;
+  const s = String(name || '');
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return 'var(--ushade-' + (h % 6) + ')';
+}
+
+// The 401 path: a miss is a miss — clear the key (storage AND input) and
+// restore the connect prompt. An invalid key must never sit in the input
+// masquerading as a live credential.
+function loseAuth() {
+  sessionStore.set(KEY_STORE, '');
+  $('tlkey').value = '';
+  $('tl-label').textContent = '…';
+  setConn(false);
+  $('ovr').classList.add('hidden');
+  $('tl-connect').classList.remove('hidden');
+}
+
+async function api(path, opts = {}) {
+  if (!key()) throw new Error('enter the team leader key first');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);   // no request hangs unbounded
+  let r;
+  try {
+    r = await fetch('/team_leader' + path, {
+      ...opts,
+      signal: ctrl.signal,
+      // X-API-Key is REQUIRED here, not belt-and-braces: behind the platform
+      // SSO chain oauth2-proxy INJECTS its own `Authorization: Bearer <id_token>`
+      // into every forwarded request, overwriting whatever the page set — so
+      // the leader key would never arrive and every call would 401. The route
+      // (routes_team_leader._leader_credential) prefers X-API-Key for exactly
+      // this reason, and both sibling consoles already send it (admin.html,
+      // index.html). Without it the console is unusable on a chained deployment.
+      headers: { 'Authorization': 'Bearer ' + key(), 'X-API-Key': key(),
+                 'Content-Type': 'application/json',
+                 ...(opts.headers || {}) },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch (e) {
+    reportError(`[fetch] ${opts.method || 'GET'} ${path} — ` +
+      (e.name === 'AbortError' ? 'TIMED OUT after 20s' : e.message));
+    throw e;
+  } finally { clearTimeout(timer); }
+  if (r.status === 401) {
+    loseAuth();
+    throw new Error('401 — team leader key invalid, revoked, or expired (enter a new key and Connect)');
+  }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`${r.status} — ${typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail || j)}`);
+  return j;
+}
+
+function setConn(ok) { $('conn').textContent = ok ? 'connected' : 'not connected';
+  $('conn').style.color = ok ? 'var(--accent)' : 'var(--err)'; }
+
+// ---------- overview ----------
+// One spend-aware budget block for one dimension (tokens or USD), wave 2:
+// the pool is SPEND-AWARE — actual spend eats it, so the number the leader
+// allocates FROM is "available" (total − spent − committed), not the old
+// "unallocated". Rendered per the user's corrected model, in order:
+//   Total (cap, or "no cap") · Spent · Committed · Available
+// with Available the visually dominant figure (it answers "how much can I
+// still hand out?"). The bar fills with SPENT + COMMITTED vs total. A NULL
+// cap renders "no cap" HONESTLY — no fake 0% bar, no fake available number;
+// an available of 0 says so plainly instead of rendering 0 as if spendable.
+function budgetBlock(label, total, spent, committed, available, fmt) {
+  const s = spent == null ? 0 : Number(spent);
+  const c = committed == null ? 0 : Number(committed);
+  const capped = total != null && Number(total) > 0;
+  const used = s + c;
+  const pct = capped ? Math.min(1, used / Number(total)) : 0;
+  const color = !capped ? 'var(--border)'
+    : pct > .95 ? 'var(--err)' : pct > .8 ? 'var(--warn)' : 'var(--ok)';
+  const availHtml = available == null
+    ? (capped ? '<span class="muted">—</span>' : '<span class="muted">no cap</span>')
+    : (Number(available) <= 0
+        ? '<span class="pill off">pool exhausted</span> <span class="muted">free budget or raise the cap with your admin</span>'
+        : `<span style="color:var(--accent);font-weight:600;font-size:14.5px" title="What you may still allocate">${fmt(Number(available))}</span>`);
+  const right = capped
+    ? `${Math.round(pct * 100)}% of ${fmt(Number(total))}`
+    : `no cap — ${fmt(s)} spent`;
+  return `<div style="margin-top:10px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span class="muted" style="width:56px;flex:none">${esc(label)}</span>
+      <div title="filled = spent + committed vs the envelope" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden">
+        <div style="background:${color};width:${capped ? pct * 100 : 0}%;height:100%"></div>
+      </div>
+      <span class="mono muted" style="min-width:120px;text-align:right;flex:none">${right}</span></div>
+    <div class="row" style="margin-top:4px;gap:14px;padding-left:66px;font-size:12.5px">
+      <span class="muted">Total <b style="color:var(--text)">${capped ? fmt(Number(total)) : 'no cap'}</b></span>
+      <span class="muted">Spent <b style="color:var(--text)">${fmt(s)}</b></span>
+      <span class="muted">Committed <b style="color:var(--text)">${fmt(c)}</b></span>
+      <span class="muted">Available ${availHtml}</span>
+    </div></div>`;
+}
+  // One DERIVED per-model cap = one filled bar (2026-10-30): every profile
+  // preset x the mint allowance is its own team pool — the gate enforces each
+  // one, and overflow draws ONLY on the pool of the limit that refused. The
+  // bar fills with SPENT (the pooled blocks above carry committed/available;
+  // per-model committed would need a per-key-per-model aggregate the overview
+  // does not compute — spend vs cap is the number the gate enforces).
+  function capBlock(label, limit, spent, fmt) {
+    const s = spent == null ? 0 : Number(spent);
+    const capped = limit != null && Number(limit) > 0;
+    const pct = capped ? Math.min(1, s / Number(limit)) : 0;
+    const color = !capped ? 'var(--border)' : pct > .95 ? 'var(--err)' : pct > .8 ? 'var(--warn)' : 'var(--ok)';
+    return `<div style="margin-top:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="muted mono" style="width:210px;flex:none;font-size:11.5px" title="${esc(label)} — team pool = preset × mint allowance">${esc(label)}</span>
+        <div title="spent ${fmt(s)} — filled = team spend vs this cap" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden">
+          <div style="background:${color};width:${capped ? pct * 100 : 0}%;height:100%"></div>
+        </div>
+        <span class="mono muted" style="min-width:130px;text-align:right;flex:none">${capped ? Math.round(pct * 100) + '% of ' + fmt(Number(limit)) : 'no cap'}</span></div>
+    </div>`;
+  }
+async function loadOverview() {
+  const o = await api('/overview');
+  state.overview = o;
+  const en = o.enrollment || {};
+  const b = o.budget || {};
+  $('tl-label').textContent = en.label || 'team';
+  document.title = 'PCAI LLM Gateway — Team Leader — ' + (en.label || '');
+  $('ovr-title').textContent = en.label || 'Team';
+  $('ovr-sub').textContent =
+    'tenant ' + (en.tenant_name || '—') +
+    (en.profile_name ? ' · profile ' + en.profile_name : ' · no profile') +
+    (b.period ? ' · envelope period: ' + b.period : '');
+  $('ovr-overflow').className = 'pill ' + (b.overflow_enabled === false ? 'off' : 'on');
+  $('ovr-overflow').textContent = b.overflow_enabled === false ? 'overflow off' : 'overflow on';
+  // The toggle's checkbox mirrors the flag (setting .checked does not fire
+  // its onchange — no feedback loop); the one-line help tracks the state.
+  $('ovr-overflow-tog').checked = b.overflow_enabled !== false;
+  $('ovr-overflow-help').textContent = b.overflow_enabled === false
+    ? 'auto-overflow OFF — every key is hard-capped at its own allocation (the envelope still caps the team)'
+    : 'auto-overflow ON — a teammate key may exceed its own allocation while the pool has headroom';
+  const kc = o.keys || {};
+  // "active / N" where N is the MINT ALLOWANCE (max_uses), not the number of
+  // keys that happen to exist. "2 / 2" on an enrollment that may mint four
+  // read as "the team is complete" and hid the real ceiling (2026-10-30).
+  // max_uses is strictly positive for every code minted since 2026-10-30; a
+  // LEGACY 0 row is EXHAUSTED (the redeem predicate fails closed), so say that
+  // rather than claiming "unlimited".
+  $('ovr-keys').textContent = kc.max_uses
+    ? `${kc.active ?? 0} / ${kc.max_uses} keys active`
+    : `${kc.active ?? 0} keys active — legacy code, now exhausted (re-mint with a mint allowance)`;
+  const ld = o.leader || {};
+  $('ovr-leader').textContent = ld.key_prefix
+    ? `leader key ${ld.key_prefix}…${ld.created_at ? ' · minted ' + new Date(ld.created_at).toLocaleString() : ''}`
+    : 'no leader key';
+  $('ovr-period').textContent = b.period ? '· ' + b.period : '';
+  // Spend-aware pool (wave 2): committed = still promised to keys under
+  // their allocations; available = what the leader may STILL allocate
+  // (null = no cap on that dimension). Both are new to the overview —
+  // budgetBlock degrades honestly (— / no cap) when an older backend lacks
+  // them.
+  const sp = o.spend || {}, cm = o.committed || {}, av = o.available || {};
+  // PER-LIMIT POOLS (2026-10-30): a derived envelope renders one bar per
+  // profile preset x the mint allowance — the exact set of pools the gate
+  // enforces. An explicit envelope has no caps: the two bars above ARE the
+  // envelope, and nothing extra renders.
+  const caps = Array.isArray(o.caps) ? o.caps : [];
+  let capsHtml = '';
+  for (const c of caps) {
+    const isTok = c.limit_tokens != null;
+    const label = (c.model === '*' ? 'any model' : (c.model || '*')) + ' · ' + c.period;
+    capsHtml += capBlock(
+      label,
+      isTok ? c.limit_tokens : c.limit_usd,
+      isTok ? c.spent_tokens : c.spent_usd,
+      isTok ? fmtInt : fmtUSD,
+    );
+  }
+  if (capsHtml) {
+    capsHtml = '<div class="muted" style="margin-top:16px;font-size:12px;text-transform:uppercase;letter-spacing:.04em">Per-limit pools — profile preset × ' + (b.max_uses ?? 0) + ' mints · overflow draws on the pool of the limit that refused</div>' + capsHtml;
+  }
+  $('ovr-bars').innerHTML =
+    budgetBlock('tokens', b.tokens, sp.tokens, cm.tokens, av.tokens, fmtInt) +
+    budgetBlock('USD', b.usd, sp.usd, cm.usd, av.usd, fmtUSD) +
+    capsHtml;
+  // "no cap" is TRUE but unhelpful on its own: with no team envelope the gate
+  // returns the per-key verdict untouched, so every key is capped on its own
+  // and the real team ceiling is the SUM of their allocations. Say that
+  // (2026-10-30 — a leader with N keys on one profile expects "N x the key
+  // limits", and the bare "no cap" read as "unlimited team").
+  const keyCount = kc.total ?? 0;
+  const allocTok = (Number(cm.tokens) || 0) + (Number(sp.tokens) || 0);
+  const allocUsd = (Number(cm.usd) || 0) + (Number(sp.usd) || 0);
+  const noTok = b.tokens == null;
+  const noUsd = b.usd == null;
+  const bits = [];
+  // PROVENANCE (2026-10-30): a derived cap is a real cap — the gate enforces
+  // it — but an operator must be able to tell it from one they typed, and to
+  // know the number moves when max_uses or the profile changes.
+  if (b.derived) {
+    bits.push('<b>Envelope derived</b> from the profile\'s per-key presets × ' + (b.max_uses ?? 0) +
+      ' mints — every per-limit pool below is one preset × N and the ONLY overflow pool for its kind; it moves with either; set an explicit cap at enrollment mint to override it.');
+  }
+  if (noTok && noUsd) {
+    // NOTHING is capped: the ceiling really is the sum of the key allocations.
+    // Only quote a dimension that HAS allocations — with no USD rows the
+    // "sum" would be the spend, and calling spend an allocation is a lie.
+    const parts = [];
+    if (allocTok > 0) parts.push(fmtInt(allocTok) + ' tokens');
+    if (allocUsd > 0) parts.push(fmtUSD(allocUsd));
+    bits.push('<b>No team envelope is set.</b> Every key is capped on its own, so the team ceiling is the SUM of ' +
+      'their allocations' + (parts.length ? ' — ' + parts.join(' · ') + ' across ' + keyCount + ' key(s)' : '') +
+      '. Give the enrollment a profile with per-key presets and a mint allowance, or set the envelope at mint.');
+  } else if (noTok || noUsd) {
+    // HALF-capped (the common case: the profile presets tokens, not USD). Say
+    // which dimension is bounded and which is not — the old single sentence
+    // claimed "no team envelope is set" while the token bar sat at 50%.
+    const missing = noTok ? 'token' : 'USD';
+    const bounded = noTok ? 'USD' : 'token';
+    bits.push('<b>No ' + missing + ' cap</b> — no ' + missing + ' preset or explicit limit is set, so that ' +
+      'dimension is unbounded; the ' + bounded + ' envelope above still applies.');
+  }
+  $('ovr-nocap').innerHTML = bits.join(' ');
+  $('ovr').classList.remove('hidden');
+  return o;
+}
+
+// Auto-overflow toggle (wave 2): the user asked the TEAM LEADER to control
+// it, not only the admin. Optimistic-free by design — send the PATCH, then
+// re-read the overview; a failed PATCH reverts the checkbox and surfaces
+// the error, so the toggle can never lie about the server's state. The
+// 401 path runs inside api() (clear key + connect prompt) like everywhere.
+let overflowBusy = false;
+$('ovr-overflow-tog').onchange = async () => {
+  const tog = $('ovr-overflow-tog');
+  if (overflowBusy) { tog.checked = !tog.checked; return; }   // in flight: revert the click
+  overflowBusy = true;
+  const desired = tog.checked;
+  try {
+    await api('/settings', { method: 'PATCH', body: { overflow_enabled: desired } });
+    await loadOverview();   // re-read: the pill, the help line, and the pool truth all refresh
+  } catch (e) {
+    tog.checked = !desired;   // never leave the toggle lying
+    banner(esc(e.message), 'error', 9000);
+  } finally { overflowBusy = false; }
+};
+
+// ---------- budget top-up requests (wave 3) ----------
+// The cap is admin-only by design — a leader at available 0 has no in-band
+// way to ask for more. This side only CREATES a request and watches its
+// state; the admin approves (optionally overriding the amount) or denies.
+// One open ask at a time: the server 409s a second pending request and its
+// detail surfaces verbatim — no client-side duplicate bookkeeping.
+function topupAmountsHtml(r) {
+  const parts = [];
+  if (r.requested_tokens) parts.push(fmtInt(r.requested_tokens) + ' tok');
+  if (r.requested_usd != null) parts.push(fmtUSD(r.requested_usd));
+  return parts.join(' · ') || '—';
+}
+function topupAge(ts) {
+  const m = Math.floor(Math.max(0, Date.now() - new Date(ts).getTime()) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+async function loadTopups() {
+  let reqs;
+  try { reqs = await api('/topup-requests'); }
+  catch (e) {
+    if (String(e.message).startsWith('401')) return;   // loseAuth already fired + prompted
+    banner(esc(e.message), 'error', 7000);
+    return;
+  }
+  state.topups = reqs || [];
+  const pending = (reqs || []).find(r => r.status === 'pending');
+  const btn = $('ovr-topup'), pill = $('ovr-topup-pill'), list = $('ovr-topup-resolved');
+  if (pending) {
+    btn.hidden = true;   // one open ask at a time
+    pill.innerHTML = `<span class="pill warn" title="Your admin sees this in the Enroll tab and can approve or deny it">top-up pending: ${topupAmountsHtml(pending)} · requested ${topupAge(pending.created_at)}</span>`;
+  } else {
+    btn.hidden = false;
+    pill.innerHTML = '';
+  }
+  const resolved = (reqs || []).filter(r => r.status !== 'pending').slice(0, 3);
+  list.innerHTML = resolved.length
+    ? 'recently resolved: ' + resolved.map(r =>
+        `${r.status === 'approved' ? '<span class="pill on">approved</span>' : '<span class="pill off">denied</span>'} ${topupAmountsHtml(r)} · ${esc(new Date(r.resolved_at || r.created_at).toLocaleDateString())}`).join('  ·  ')
+    : '';
+}
+$('ovr-topup').addEventListener('click', () => {
+  dlg(`<h2>Request more budget</h2>
+    <p class="muted">This asks your ADMIN to raise the team cap — the request lands in their approval
+    queue; you get no write access. Leave an amount blank to ask for only the other. At most ONE open
+    request at a time.</p>
+    <div class="row">
+      <label>Tokens <input id="tu-tokens" type="number" min="1" placeholder="—" style="width:130px"></label>
+      <label>USD <input id="tu-usd" type="number" step="0.01" min="0.01" placeholder="—" style="width:110px"></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label style="flex:1">Note <input id="tu-note" maxlength="500" placeholder="e.g. model training run next week" style="width:100%"></label>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" onclick="this.closest('dialog').close()">cancel</button>
+      <button class="primary" id="tu-send">Send request</button>
+    </div>`);
+  $('tu-send').onclick = guarded('tu-send', async () => {
+    const body = {};
+    if (+$('tu-tokens').value > 0) body.tokens = +$('tu-tokens').value;
+    if (+$('tu-usd').value > 0) body.usd = +$('tu-usd').value;
+    if ($('tu-note').value.trim()) body.note = $('tu-note').value.trim();
+    try {
+      await api('/topup-requests', { method: 'POST', body });
+      $('dlg').close();
+      banner('top-up request sent to your admin', '', 4000);
+      await loadTopups();
+    } catch (e) { banner(esc(e.message), 'error', 9000); }   // 409 "one open ask at a time" — verbatim
+  });
+});
+
+// ---------- keys ----------
+// Shown-once secret reveal (admin.html's convention): the full plaintext in a
+// selectable monospace field with one-click copy, plus the explicit warning
+// that this is the ONLY copy that will ever exist.
+function showPlaintextOnce(leadHtml, plaintext, noteHtml) {
+  const b = $('k-plaintext');
+  b.classList.remove('hidden');
+  b.innerHTML =
+    `<div class="key-once-warn">⚠ ${leadHtml}<br><b>Shown only once — copy it now; it cannot be recovered.</b></div>` +
+    `<div class="key-once-row"><code>${esc(plaintext)}</code>` +
+    `<button class="ghost mini" id="copy-new-key">copy</button></div>` +
+    (noteHtml ? `<div class="muted" style="margin-top:6px">${noteHtml}</div>` : '');
+  $('copy-new-key').onclick = async () => {
+    (await copyText(plaintext))
+      ? banner('key copied to clipboard', '', 2500)
+      : banner('clipboard blocked — select the key text and copy manually', 'error', 6000);
+  };
+  b.scrollIntoView({ block: 'nearest' });
+}
+
+$('k-create').onclick = guarded('k-create', async () => {
+  const name = $('k-name').value.trim();
+  if (!name) return banner('the key needs a name', 'error', 4000);
+  const body = { name };
+  const subject = $('k-subject').value.trim();
+  if (subject) body.subject = subject;
+  if ($('k-rpm').value.trim() !== '') body.rate_limit_rpm = +$('k-rpm').value;
+  if ($('k-tpm').value.trim() !== '') body.rate_limit_tpm = +$('k-tpm').value;
+  if (+$('k-expdays').value > 0) body.expires_days = +$('k-expdays').value;
+  if (+$('k-budget-tokens').value > 0) body.budget_tokens = +$('k-budget-tokens').value;
+  if (+$('k-budget-usd').value > 0) body.budget_usd = +$('k-budget-usd').value;
+  try {
+    const j = await api('/keys', { method: 'POST', body });
+    showPlaintextOnce(`Key <b>${esc(j.key_prefix)}…</b> minted into this enrollment — the FULL key is below.`, j.key,
+      j.message ? esc(j.message) : '');
+    $('k-name').value = ''; $('k-subject').value = '';
+    $('k-budget-tokens').value = ''; $('k-budget-usd').value = '';
+    await loadKeys(); await loadOverview();
+  } catch (e) { banner(esc(e.message), 'error', 7000); }
+});
+
+async function loadKeys() {
+  const showRevoked = $('show-revoked')?.checked ? '?include_revoked=true' : '';
+  const keys = await api('/keys' + showRevoked);
+  state.keys = keys;
+  const tb = $('keys-table').querySelector('tbody');
+  // ALLOCATION cell, w7 single-control edition: ONE button per row (count +
+  // worst-state colour) — the stacked one-pill-per-budget form made rows
+  // ~400px tall for a 6-budget key. The display order is preserved in the
+  // dialog: SPENT first, then the allocation ("how much of my 10k have I
+  // used?"), and the leader's "who is riding the pool?" question survives —
+  // an overrun is >=100% → red, with the per-row "spending from the
+  // overflow pool" note. Click → every budget in the existing #dlg
+  // (viewBudgets).
+  const allocCell = k => {
+    const list = k.budget_status || [];
+    if (!list.length) return '<span class="muted">—</span>';
+    return `<button type="button" class="pill ${budgetWorst(list)}" data-name="${esc(k.name)}" data-b="${esc(JSON.stringify(list))}" onclick="viewBudgets(this)" title="This key's allocation — click for every budget">${list.length} ${list.length === 1 ? 'budget' : 'budgets'}</button>`;
+  };
+  // Subject cell: the bound subject (or "unbound") with an honest provenance
+  // chip — "self-asserted" is a CLAIM, anything else a verified identity.
+  // The provenance rides in the TITLE on every row; only a NON-default one
+  // gets a visible chip (2026-11-02, owner request). "self-asserted" (typed
+  // at redemption) is the DEFAULT for enrolled keys, so chipping it marked
+  // the normal case as if it were noteworthy — noise, not signal. A chip now
+  // means "this identity was verified, or set by someone authoritative" —
+  // the case an operator actually needs to spot. Hover still states the
+  // provenance for EVERY row, so the distinction is not lost.
+  const subjectCell = k => {
+    if (!k.subject) return '<span class="muted">unbound</span>';
+    const idp = k.subject_idp || '';
+    const prov = idp === 'self-asserted'
+      ? 'self-asserted at redemption — a claim, not a verified identity'
+      : (idp ? `bound via ${idp}${k.bound_via ? ' (' + k.bound_via + ')' : ''}` : 'provenance unknown');
+    const chip = idp && idp !== 'self-asserted'
+      ? ` <span class="pill" title="${esc(prov)}">${esc(idp)}</span>`
+      : '';
+    return `<span class="mono" title="${esc(prov)}">${esc(k.subject)}</span>${chip}`;
+  };
+  tb.innerHTML = keys.map(k => {
+    const status = k.revoked_at ? '<span class="pill off">revoked</span>'
+      : (k.expires_at && new Date(k.expires_at) < new Date() ? '<span class="pill off">expired</span>' : '<span class="pill on">active</span>');
+    // data-search: the filter haystack, from the handle fields only.
+    const hay = [k.name, k.user_name, k.key_prefix, k.subject, k.enrollment_label]
+      .filter(Boolean).join(' ').toLowerCase();
+    return `<tr data-search="${esc(hay)}">
+      <td>${esc(k.name)}</td>
+      <td>${esc(k.user_name || '—')}</td>
+      <td class="mono" title="The full key was shown exactly once — at mint. Rotate to get a new secret.">${esc(k.key_prefix)}…</td>
+      <td>${subjectCell(k)}</td>
+      <td class="muted">${(k.rate_limit_rpm ?? 0)}/min · ${(k.rate_limit_tpm ?? 0).toLocaleString()}/min tokens</td>
+      <td>${allocCell(k)}</td>
+      <td>${status}</td>
+      <td>
+        <div class="rowacts">
+          <button class="ghost mini" onclick="tlEditKey(this,'${k.id}')" title="Name, rate limits, concurrency, expiry">edit</button>
+          <button class="ghost mini" onclick="tlBudgets(this,'${k.id}')" title="This key's allocation — checked against the team envelope">budgets</button>
+          <button class="ghost mini" onclick="tlUsage(this,'${k.id}')" title="Recent usage for this key">usage</button>
+          ${!k.revoked_at ? `<button class="ghost mini danger" onclick="tlRevoke(this,'${k.id}')" title="Permanently revoke this key — immediate and irreversible">revoke</button>` : ''}
+        </div>
+      </td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted">no keys yet — mint the first one above</td></tr>';
+  fillKeyFilters();
+  // Re-apply the search after every reload (admin.html's invariant: a
+  // filtered-out key stays filtered out once the list refreshes).
+  filterKeys();
+}
+// The Usage/Traces tabs share a per-key filter select — repopulated from the
+// loaded key list (a key minted mid-session appears without a reload).
+function fillKeyFilters() {
+  for (const id of ['u-key', 't-key']) {
+    const sel = $(id);
+    if (!sel) continue;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">all keys</option>' +
+      state.keys.map(k => `<option value="${esc(k.id)}">${esc(k.name)}${k.user_name ? ' — ' + esc(k.user_name) : ''}</option>`).join('');
+    if (cur && state.keys.some(k => k.id === cur)) sel.value = cur;
+  }
+}
+// Client-side key filter — hides rows, never re-fetches (no flicker, no lost
+// scroll position), matching the admin console's pattern.
+// "clear" button in the key-filter row. It MUST live on window: the button
+// is an INLINE onclick, and an inline handler is evaluated against window, not
+// the script's lexical scope. A bare `$` there is a ReferenceError — `$` is a
+// top-level `const`, which is SCRIPT-scoped, not global — which is exactly how
+// the clear button broke (the click threw and the field was never cleared).
+// filterKeys never had the problem because it is explicitly window.filterKeys.
+// Keep the DOM access in here, not in the attribute.
+window.clearKeySearch = () => {
+  const el = $('k-search');
+  if (el) el.value = '';
+  filterKeys();
+};
+window.filterKeys = () => {
+  const el = $('k-search');
+  const tb = $('keys-table') && $('keys-table').querySelector('tbody');
+  if (!el || !tb) return;
+  const q = (el.value || '').trim().toLowerCase();
+  const rows = [...tb.querySelectorAll('tr')];
+  let shown = 0;
+  for (const tr of rows) {
+    if (tr.querySelector('td[colspan]')) continue;
+    const hay = (tr.dataset.search || tr.textContent || '').toLowerCase();
+    const hit = !q || hay.includes(q);
+    tr.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  }
+  const cnt = $('k-search-count');
+  if (cnt) {
+    const real = rows.filter(tr => !tr.querySelector('td[colspan]')).length;
+    cnt.textContent = q ? `${shown} of ${real} shown` : (real ? `${real} keys` : '');
+  }
+};
+
+// Key edit (PATCH /team_leader/keys/{id}): the admin-patch subset the
+// contract allows — name / rpm / tpm / max_concurrent / expires_at. Blank
+// fields = omitted = unchanged; "clear expiry" sends explicit null.
+window.tlEditKey = (btn, id) => withBtn(btn, async () => {
+  const k = (state.keys || []).find(x => x.id === id);
+  if (!k) return;
+  const name = k.name || 'key';
+  const expLocal = k.expires_at ? new Date(k.expires_at).toISOString().slice(0, 16) : '';
+  dlg(`<h2>Edit key — ${esc(name)}</h2>
+    <p class="muted">Blank fields stay unchanged. Edits apply to the NEXT request (keys are re-read per request — no restart).</p>
+    <label>Name <input id="ek-name" value="${esc(name)}" style="width:100%"></label>
+    <label>Rate limit — requests/min <input id="ek-rpm" type="number" value="${+k.rate_limit_rpm || ''}" style="width:100%"></label>
+    <label>Rate limit — tokens/min <input id="ek-tpm" type="number" value="${+k.rate_limit_tpm || ''}" style="width:100%"></label>
+    <label>Max concurrent (0 = unlimited) <input id="ek-mc" type="number" placeholder="unchanged" style="width:100%"></label>
+    <label>Expires at (local time; blank = unchanged) <input id="ek-exp" type="datetime-local" value="${esc(expLocal)}" style="width:100%"></label>
+    <label class="chk"><input id="ek-clear" type="checkbox"> clear expiry (key never expires)</label>
+    <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" onclick="this.closest('dialog').close()">cancel</button>
+      <button id="ek-save" class="primary">save changes</button>
+    </div>`);
+  $('ek-save').onclick = guarded('ek-save', async () => {
+    const body = {};
+    const nm = $('ek-name').value.trim();
+    if (nm && nm !== name) body.name = nm;
+    const rpm = $('ek-rpm').value.trim();
+    if (rpm !== '') body.rate_limit_rpm = +rpm;
+    const tpm = $('ek-tpm').value.trim();
+    if (tpm !== '') body.rate_limit_tpm = +tpm;
+    const mc = $('ek-mc').value.trim();
+    if (mc !== '') body.max_concurrent = +mc;
+    if ($('ek-clear').checked) body.expires_at = null;
+    else {
+      const ex = $('ek-exp').value;
+      if (ex) body.expires_at = new Date(ex).toISOString();
+    }
+    try {
+      await api(`/keys/${id}`, { method: 'PATCH', body });
+      $('dlg').close();
+      banner(`key updated — limits live immediately (${esc(nm || name)})`, '', 3500);
+      await loadKeys();
+    } catch (e) { banner(esc(e.message), 'error', 7000); }
+  });
+});
+
+// The enrollment's AVAILABLE pool, as a sentence for the budgets dialog
+// (wave 2: spend-aware — the server REFUSES an allocation that would overdraw
+// it (409), and the 409 names cap / spent / committed / available /
+// requested, so the leader sees the ceiling BEFORE typing, not after the
+// failure). "available" is what may still be allocated; "unallocated" alone
+// ignores that spend eats the pool too.
+function envelopeHeadroomHtml() {
+  const o = state.overview;
+  if (!o || !o.budget) return '<span class="muted">envelope unknown — the overview has not loaded</span>';
+  const b = o.budget, av = o.available || {}, cm = o.committed || {}, sp = o.spend || {};
+  const tok = av.tokens == null ? '<b>no token cap</b>' : `<b>${fmtInt(av.tokens)} tok</b> still available`;
+  const usd = av.usd == null ? '<b>no USD cap</b>' : `<b>${fmtUSD(av.usd)}</b> still available`;
+  return `Available pool (${esc(b.period)}) — what you may still allocate: ${tok} · ${usd}
+    <span class="muted">(spent ${fmtInt(sp.tokens || 0)} tok / ${fmtUSD(sp.usd || 0)} · committed ${fmtInt(cm.tokens || 0)} tok / ${fmtUSD(cm.usd || 0)})</span>
+    ${b.overflow_enabled === false
+      ? '<span class="pill off">overflow off</span> — each key is hard-capped at its own allocation'
+      : '<span class="pill on">overflow on</span> — a key may exceed its allocation while the pool lasts'}`;
+}
+
+// Budget dialog: the key's allocation rows with the envelope headroom on top.
+// The working COPY edits locally (add / remove) and one Save PUTs the whole
+// set — replace-all semantics (same body shape as /admin/keys/{id}/budgets).
+// A 409 (allocation exceeds envelope headroom) surfaces the server's message
+// VERBATIM — it names the envelope, what is already allocated, and the new
+// request, and re-wrapping it here would lose that.
+window.tlBudgets = (btn, id) => withBtn(btn, async () => {
+  const k = (state.keys || []).find(x => x.id === id) || {};
+  let u;
+  try { u = await api(`/keys/${id}/usage`); }
+  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  // Working rows: the budget_status projection mapped to the PUT shape.
+  const rows = (u.budgets || []).map(b => b.kind === 'usd'
+    ? { model: b.model, period: b.period, limit_usd: b.limit_usd }
+    : { model: b.model, period: b.period, limit_tokens: b.limit });
+  dlg(`<h2>Budgets — ${esc(k.name || 'key')}</h2>
+    <p class="muted">This key's allocation within the team envelope. Saving writes exactly the rows shown (replace-all). The server refuses an allocation that overdraws the envelope — the refusal names the envelope and both amounts.</p>
+    <div class="banner" style="margin:8px 0">${envelopeHeadroomHtml()}</div>
+    <table id="tb-table"><thead><tr><th>Model</th><th>Period</th><th>Limit</th><th></th></tr></thead><tbody></tbody></table>
+    <h3>Add budget</h3>
+    <div class="row">
+      <label>Model <input id="tb-model" value="*" style="width:100px"></label>
+      <label>Period <select id="tb-period"><option>month</option><option>quarter</option><option>year</option><option>week</option><option>day</option></select></label>
+      <label>Limit type <select id="tb-type"><option value="tokens">tokens</option><option value="usd">USD</option></select></label>
+      <label><span id="tb-limit-label">Tokens</span> <input id="tb-limit" type="number" value="200000" style="width:130px"></label>
+      <button class="btn mini" id="tb-add">Add row</button>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" onclick="this.closest('dialog').close()">close</button>
+      <button class="primary" id="tb-save">Save budgets</button>
+    </div>`);
+  const renderRows = () => {
+    $('tb-table').querySelector('tbody').innerHTML = rows.map((r, i) =>
+      `<tr><td>${esc(r.model)}</td><td>${esc(r.period)}</td>
+       <td class="mono">${r.limit_usd != null ? fmtUSD(r.limit_usd) : fmtInt(r.limit_tokens) + ' tok'}</td>
+       <td><button class="ghost mini danger" data-tb-rm="${i}" title="Remove this row on save">remove</button></td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">no allocation — the key runs on the team pool only</td></tr>';
+    $('tb-table').querySelectorAll('[data-tb-rm]').forEach(b =>
+      b.onclick = () => { rows.splice(+b.dataset.tbRm, 1); renderRows(); });
+  };
+  renderRows();
+  $('tb-type').onchange = () => {
+    const usd = $('tb-type').value === 'usd';
+    $('tb-limit-label').textContent = usd ? 'USD' : 'Tokens';
+    $('tb-limit').value = usd ? 20 : 200000;
+  };
+  $('tb-add').onclick = () => {
+    const entry = { model: $('tb-model').value.trim() || '*', period: $('tb-period').value };
+    if ($('tb-type').value === 'usd') entry.limit_usd = +$('tb-limit').value;
+    else entry.limit_tokens = +$('tb-limit').value;
+    rows.push(entry);
+    renderRows();
+  };
+  $('tb-save').onclick = guarded('tb-save', async () => {
+    try {
+      await api(`/keys/${id}/budgets`, { method: 'PUT', body: { budgets: rows } });
+      $('dlg').close();
+      banner('budgets saved', '', 3000);
+      await loadKeys(); await loadOverview();
+    } catch (e) { banner(esc(e.message), 'error', 9000); }
+  });
+});
+
+// Per-key usage dialog (GET /team_leader/keys/{id}/usage → {budgets, recent})
+// — the same two-part view admin.html's usage button opens.
+window.tlUsage = (btn, id) => withBtn(btn, async () => {
+  const k = (state.keys || []).find(x => x.id === id) || {};
+  let u;
+  try { u = await api(`/keys/${id}/usage`); }
+  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  const rows = (u.recent || []).map(r2 =>
+    `<tr><td>${new Date(r2.ts).toLocaleString()}</td><td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
+     <td>${r2.prompt_tokens}</td><td>${r2.completion_tokens}</td><td>${r2.total_tokens}</td>
+     <td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('');
+  dlg(`<h2>Usage — ${esc(k.name || 'key')}</h2>
+    <table><thead><tr><th>Time</th><th>Model</th><th>Endpoint</th><th>P</th><th>C</th><th>Total</th><th>Status</th><th>ms</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="8" class="muted">no requests yet</td></tr>'}</tbody></table>
+    <div style="margin-top:12px;display:flex;justify-content:flex-end">
+      <button class="ghost" onclick="this.closest('dialog').close()">close</button>
+    </div>`);
+});
+
+window.tlRevoke = (btn, id) => withBtn(btn, async () => {
+  const k = (state.keys || []).find(x => x.id === id) || {};
+  if (!confirm(`Revoke "${k.name || 'this key'}"? Clients using it get 401 immediately.`)) return;
+  try {
+    await api(`/keys/${id}`, { method: 'DELETE' });
+    banner('key revoked', '', 3000);
+    await loadKeys(); await loadOverview();
+  } catch (e) { banner(esc(e.message), 'error', 7000); }
+});
+
+// ---------- advertised (full registry view) ----------
+// Mirrors admin.html's loadPresentedModels rendering 1:1 — same tables, same
+// pills, same honest "absent" reasons — because this IS the same payload
+// (the contract routes it through the admin presenter unchanged). Only the
+// env note differs: for a leader the enrollment-blindness is the POINT.
+async function loadPresentedModels() {
+  const block = $('pe-block');
+  if (!block) return;
+  block.innerHTML = '<span class="muted">loading…</span>';
+  let d;
+  try {
+    d = await api('/presented-models');
+    if (!d || typeof d !== 'object') throw new Error('malformed payload');
+  } catch (e) {
+    block.innerHTML = '<span class="muted">presented-models unavailable — ' +
+      esc(e && e.message ? e.message : 'unknown error') + '</span>';
+    const c0 = $('pe-counts');
+    if (c0) c0.textContent = '';
+    return;
+  }
+  const env = d.env || {};
+  const counts = d.counts || {};
+  $('pe-counts').textContent =
+    (counts.presented != null ? counts.presented : '?') + ' presented · ' +
+    (counts.registered != null ? counts.registered : '?') + ' registered';
+  const envNote = 'env: routing ' + (env.routing_enabled !== false ? 'on' : 'OFF (PCAI_LLM_ROUTING_ENABLED=false)') +
+    ' · load-aware cascade ' + (env.load_aware_cascade ? 'on' : 'off') +
+    ' — team view: the full advertised registry, enrollment-blind by design';
+  const presentPill = (present, reason) => present === false
+    ? '<span class="pill off" title="' + esc(reason || '') + '">absent</span>'
+    : '<span class="pill on" title="' + esc(reason || '') + '">present</span>';
+  const aliasRows = (d.aliases || []).map(a =>
+    '<tr><td class="mono"><b>' + esc(a.id) + '</b></td>' +
+    '<td><span class="pill">' + esc(a.type || 'alias') + '</span></td>' +
+    // order is an ARRAY (contract §3) — render it as the cascade chain, not
+    // String(array) ('a,b,c'). A scalar shape is tolerated for older payloads.
+    '<td class="muted">' + (Array.isArray(a.order)
+      ? (a.order.length ? 'cascade: ' + a.order.map(esc).join(' → ') : 'cascade: (empty)')
+      : (a.order != null ? 'cascade slot ' + esc(String(a.order)) : '—')) + '</td>' +
+    '<td>' + (a.demand_aware ? '<span class="pill on">demand-aware</span>' : '<span class="muted">—</span>') + '</td>' +
+    '<td>' + presentPill(a.present, a.reason) + '</td>' +
+    '<td class="muted">' + esc(a.reason || '') + '</td></tr>').join('');
+  const routingRows = (d.routing || []).map(r =>
+    '<tr><td class="mono"><b>' + esc(r.id) + '</b></td>' +
+    '<td><span class="pill">' + esc(r.type || 'routing') + '</span></td>' +
+    '<td>' + presentPill(r.present, r.reason) + '</td>' +
+    '<td class="muted">' + esc(r.reason || '') + '</td></tr>').join('');
+  const agentRows = (d.agents || []).map(a =>
+    '<tr><td class="mono"><b>' + esc(a.id) + '</b></td>' +
+    '<td><span class="pill">' + esc(a.type || 'agent') + '</span></td>' +
+    '<td class="muted">' + ((a.servers || []).length ? (a.servers || []).map(esc).join(', ') : 'none — chat only') + '</td>' +
+    '<td class="mono">' + esc(a.model || 'cascade') + '</td>' +
+    '<td class="muted">' + ((a.profiles || []).length ? (a.profiles || []).map(esc).join(', ') : 'unassigned') + '</td>' +
+    '<td>' + presentPill(a.present, a.reason) + '</td>' +
+    '<td class="muted">' + esc(a.reason || '') + '</td></tr>').join('');
+  const modelRows = (d.models || []).map(m => {
+    const op = m.offpeak || {};
+    return '<tr><td class="mono">' +
+      (m.primary ? '<span style="color:var(--ok)" title="primary pool">★</span> ' : '') +
+      '<b>' + esc(m.id) + '</b></td>' +
+      '<td><span class="pill">' + esc(m.type || 'chat') + '</span></td>' +
+      '<td class="muted">' + (m.endpoints != null
+        ? esc(String(m.healthy != null ? m.healthy : '?')) + '/' + esc(String(m.endpoints)) + ' healthy'
+        : '—') + '</td>' +
+      '<td class="muted">' + (m.max_tokens_ceiling != null ? esc(String(m.max_tokens_ceiling)) + ' tok' : '—') + '</td>' +
+      '<td class="muted">' + (op.value_pct != null
+        ? esc(String(op.value_pct)) + '%' +
+          (op.active === true ? ' <span class="pill on">off-peak</span>' : '') +
+          (op.active === true && op.fraction != null ? ' bills at ' + esc(String(op.fraction)) + '×' : '')
+        : '—') + '</td>' +
+      '<td>' + (m.demand_aware_excluded ? '<span class="pill warn" title="excluded from the demand-aware alias">demand-aware excluded</span> ' : '') +
+      (m.routing_eligible === true ? '<span class="pill on">routing-eligible</span>' : '') + '</td>' +
+      '<td>' + (m.healthy != null && m.endpoints != null && m.healthy === 0
+        ? '<span class="pill off" title="no healthy endpoint — this pool cannot serve right now">unservable</span>'
+        : '<span class="pill on" title="has a healthy endpoint">servable</span>') + '</td></tr>';
+  }).join('');
+  block.innerHTML =
+    '<p class="muted" style="margin:0 0 8px">' + esc(envNote) + '</p>' +
+    '<h3>Aliases <span class="muted">— cascade entry points</span></h3>' +
+    '<table><thead><tr><th>Id</th><th>Type</th><th>Slot</th><th>Demand-aware</th><th>Presented</th><th>Reason</th></tr></thead>' +
+    '<tbody>' + (aliasRows || '<tr><td colspan="6" class="muted">no aliases</td></tr>') + '</tbody></table>' +
+    '<h3>Routing pseudo-models <span class="muted">— per-model router aliases</span></h3>' +
+    '<table><thead><tr><th>Id</th><th>Type</th><th>Presented</th><th>Reason</th></tr></thead>' +
+    '<tbody>' + (routingRows || '<tr><td colspan="4" class="muted">no routing entries</td></tr>') + '</tbody></table>' +
+    '<h3>Agents <span class="muted">— tool surfaces selectable as a model</span></h3>' +
+    '<table><thead><tr><th>Id</th><th>Type</th><th>Servers</th><th>Model</th><th>Offered by</th><th>Presented</th><th>Reason</th></tr></thead>' +
+    '<tbody>' + (agentRows || '<tr><td colspan="7" class="muted">no agents defined</td></tr>') + '</tbody></table>' +
+    '<h3>Registered pools <span class="muted">— real endpoint pools</span></h3>' +
+    '<table><thead><tr><th>Model</th><th>Type</th><th>Endpoints</th><th>Ceiling</th><th>Off-peak</th><th>Flags</th><th>Presented</th></tr></thead>' +
+    '<tbody>' + (modelRows || '<tr><td colspan="7" class="muted">none registered</td></tr>') + '</tbody></table>';
+}
+$('pe-reload').addEventListener('click', () =>
+  loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000)));
+
+// ---------- usage (scoped rollups + ledger) ----------
+// The SAME three tables the admin console shows (totals / by model / by key),
+// scoped server-side to this enrollment. A leader reads chargeback for their
+// team; the pricing editor stays admin-only.
+async function loadUsage() {
+  const winSel = $('usage-window');
+  if (winSel && !winSel.dataset.bound) {
+    winSel.dataset.bound = '1';
+    winSel.addEventListener('change', () => loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  }
+  const winDays = winSel ? winSel.value : '366';
+  const winSince = new Date(Date.now() - Number(winDays) * 86400000).toISOString();
+  let sum = null;
+  try { sum = await api('/usage/summary?since=' + encodeURIComponent(winSince)); }
+  catch (e) { sum = null; }
+  const rate = v => (v == null ? '—' : v + '%');
+  const t = (sum && sum.totals) || {};
+  $('usage-summary').querySelector('tbody').innerHTML = sum === null
+    ? '<tr><td colspan="8" class="muted">summary unavailable</td></tr>'
+    : '<tr><td>' + fmtInt(t.requests) + '</td><td>' + fmtInt(t.input_tokens) + '</td>' +
+      '<td>' + fmtInt(t.output_tokens) + '</td><td>' + fmtInt(t.cached_tokens) + '</td>' +
+      '<td>' + rate(t.cache_hit_rate_pct) + '</td><td>' + fmtUSD(t.cost_usd) + '</td>' +
+      '<td>' + fmtInt(t.billed_tokens) + '</td><td>' + fmtUSD(t.billed_cost_usd) + '</td></tr>';
+  const models = (sum && sum.by_model) || [];
+  $('usage-by-model').querySelector('tbody').innerHTML = models.length
+    ? models.map(r => '<tr><td class="mono">' + esc(r.model || '—') + '</td><td>' + fmtInt(r.requests) + '</td>' +
+        '<td>' + fmtInt(r.input_tokens) + '</td><td>' + fmtInt(r.output_tokens) + '</td><td>' + fmtInt(r.cached_tokens) + '</td>' +
+        '<td>' + rate(r.cache_hit_rate_pct) + '</td><td>' + fmtUSD(r.cost_usd) + '</td><td>' + fmtInt(r.billable_tokens) + '</td><td>' + fmtUSD(r.billed_cost_usd) + '</td></tr>').join('')
+    : '<tr><td colspan="9" class="muted">no requests recorded yet</td></tr>';
+  const keys = (sum && sum.by_key) || [];
+  $('usage-by-key').querySelector('tbody').innerHTML = keys.length
+    ? keys.map(r => '<tr><td class="mono">' + esc(r.key_name || '—') + '</td><td class="muted">' + esc(r.user_name || '—') + '</td>' +
+        '<td>' + fmtInt(r.requests) + '</td><td>' + fmtInt(r.input_tokens) + '</td><td>' + fmtInt(r.output_tokens) + '</td>' +
+        '<td>' + fmtInt(r.cached_tokens) + '</td><td>' + rate(r.cache_hit_rate_pct) + '</td>' +
+        '<td>' + fmtUSD(r.cost_usd) + '</td><td>' + fmtInt(r.billable_tokens) + '</td><td>' + fmtUSD(r.billed_cost_usd) + '</td></tr>').join('')
+    : '<tr><td colspan="10" class="muted">no requests recorded yet</td></tr>';
+  // Label the widest option from REAL retention (scoped to this team) and say
+  // in words what the window does — the admin's lesson: a silently truncated
+  // total looks like it is DROPPING as old rows roll out.
+  const w = (sum && sum.window) || {};
+  const maxDays = w.max_days;
+  const maxOpt = $('usage-window-max');
+  if (maxOpt && maxDays) {
+    maxOpt.value = String(maxDays);
+    let label = 'Max (' + maxDays + 'd)';
+    if (w.oldest_ts) {
+      const ageDays = Math.floor((Date.now() - new Date(w.oldest_ts).getTime()) / 86400000);
+      label = ageDays < maxDays ? 'Max (' + Math.max(1, ageDays) + 'd retained)' : 'Max (' + maxDays + 'd cap)';
+    }
+    maxOpt.textContent = label;
+    if (winSel && winSel.value === '366') winSel.value = String(maxDays);
+  }
+  const note = $('usage-window-note');
+  if (note) {
+    if (w.since) {
+      const atMax = maxDays && Number(winDays) >= Number(maxDays);
+      const tail = !atMax
+        ? ' — totals RESET at the window edge, they are not lifetime figures'
+        : (w.oldest_ts ? ' — this team has rows back to ' + new Date(w.oldest_ts).toLocaleDateString() : ' — no rows yet');
+      note.textContent = 'showing ' + new Date(w.since).toLocaleString() + ' → now' + tail;
+    } else {
+      note.textContent = '';
+    }
+  }
+  // Ledger: last 100 rows under the current key/since filters.
+  const params = new URLSearchParams();
+  params.set('limit', '100');
+  if ($('u-key').value) params.set('key_id', $('u-key').value);
+  const sinceRaw = $('u-since').value;
+  if (sinceRaw) {
+    const d = new Date(sinceRaw);
+    if (!isNaN(d)) params.set('since', d.toISOString());   // backend wants ISO-8601
+  }
+  const qs = params.toString();
+  // The CSV export rides the SAME filters — rebuilt per load so the link
+  // never lags the visible state. Fetched (not a bare anchor) because a
+  // plain navigation carries no Authorization header and the route is
+  // bearer-gated.
+  $('u-csv').dataset.qs = qs + (qs ? '&' : '') + 'format=csv';
+  let rows;
+  try { rows = await api('/usage?' + qs); }
+  catch (e) {
+    $('usage-table').querySelector('tbody').innerHTML =
+      `<tr><td colspan="13" class="muted">ledger unavailable — ${esc(e.message)}</td></tr>`;
+    return;
+  }
+  $('u-meta').textContent = `${(rows || []).length} ledger rows`;
+  $('usage-table').querySelector('tbody').innerHTML = (rows || []).map(r2 =>
+    `<tr style="background:${shadeFor(r2.user_name)}">
+      <td>${new Date(r2.ts).toLocaleString()}</td>
+      <td class="muted">${esc(r2.user_name || '—')}</td>
+      <td class="muted" title="${esc(r2.key_prefix || '')}…">${esc(r2.key_name || '—')}${r2.key_prefix ? ' <span class="mono">' + esc(r2.key_prefix) + '…</span>' : ''}</td>
+      <td class="muted">${r2.subject ? esc(r2.subject) + (r2.subject_idp === 'self-asserted' ? ' <span title="self-asserted">~</span>' : '') : '—'}</td>
+      <td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
+      <td>${fmtInt(r2.prompt_tokens)}</td><td>${fmtInt(r2.completion_tokens)}</td><td>${fmtInt(r2.cached_tokens)}</td>
+      <td>${fmtInt(r2.total_tokens)}</td><td>${fmtUSD(r2.cost_usd)}</td><td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('')
+    || '<tr><td colspan="13" class="muted">no requests recorded yet</td></tr>';
+  fillKeyFilters();
+}
+// Authenticated CSV download: fetch with the Bearer header, stream to a
+// blob, click a transient anchor (a bare navigation would lose the key).
+$('u-csv').addEventListener('click', async ev => {
+  ev.preventDefault();
+  const qs = $('u-csv').dataset.qs;
+  if (!qs) return;
+  try {
+    if (!key()) throw new Error('enter the team leader key first');
+    // same two-envelope rule as api(): the SSO chain overwrites Authorization.
+    const r = await fetch('/team_leader/usage?' + qs, {
+      headers: { 'Authorization': 'Bearer ' + key(), 'X-API-Key': key() } });
+    if (!r.ok) throw new Error(r.status + ' — CSV export refused');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'team-usage.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { banner(esc(e.message), 'error', 6000); }
+});
+$('u-reload').addEventListener('click', () =>
+  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+// (the rollup-by selector is gone: the tab now renders the admin's three
+// tables — totals, by model, by key — and the window selector binds inside
+// loadUsage() on first call.)
+$('u-key').addEventListener('change', () =>
+  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+$('u-since').addEventListener('change', () =>
+  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+
+// ---------- traces (request-grouped cards, admin.html's rendering) ----------
+function traceStatusCell(status) {
+  const st = String(status || 'ok').toLowerCase();
+  const cls = st === 'ok' || st === 'success' ? ''
+    : st === 'handed_back' ? 'st-info'   // executed by the CLIENT later — informational
+    : (st === 'rate_limited' || st === 'budget_exceeded') ? 'st-warn' : 'st-err';
+  return `<td class="${cls}">${esc(st)}</td>`;
+}
+function traceStepRows(steps) {
+  return steps.map(s => {
+    const where = s.phase === 'tool'
+      ? [s.server, s.tool].filter(Boolean).join('/') || '—'
+      : (s.tool || 'model');
+    const tokens = (s.prompt_tokens != null || s.completion_tokens != null)
+      ? `${s.prompt_tokens ?? '—'} + ${s.completion_tokens ?? '—'}` : '—';
+    return `<tr><td>${esc(s.iteration ?? '')}</td>
+      <td title="${esc(s.phase === 'tool' ? 'tool call' : 'model iteration')}">${s.phase === 'tool' ? '🔧' : '💬'}</td>
+      <td class="mono">${esc(where)}</td>
+      <td>${esc(s.ms ?? '—')}</td>
+      <td>${esc(tokens)}</td>
+      ${traceStatusCell(s.status)}</tr>`;
+  }).join('');
+}
+function traceTurnHead(tr, tot, steps, shade) {
+  return `<tr class="trace-turn" style="background:${shade}">
+    <td colspan="6"><div class="trace-turn-label">
+      <b>${esc(tr.user_name || 'unknown user')}</b>
+      <span class="muted">· ${esc(tr.key_name || 'unknown key')}</span>
+      ${tr.subject ? `<span class="muted">· ${esc(tr.subject)}${tr.subject_idp === 'self-asserted' ? ' <span title="self-asserted">~</span>' : ''}</span>` : ''}
+      <span class="pill">${esc(tr.model || '?')}</span>
+      <span class="muted">${tr.started_ts ? esc(new Date(tr.started_ts).toLocaleTimeString()) : ''}</span>
+      <span class="muted">· ${esc(tot.steps ?? steps.length)} steps · model ${esc(tot.chat_ms ?? 0)}ms · tools ${esc(tot.tool_ms ?? 0)}ms${(+tot.handed_back > 0 ? ` · ${esc(tot.handed_back)} handed to client` : '')}</span>
+    </div></td>
+  </tr>`;
+}
+const TRACE_HEAD = `<tr><th>Iter</th><th></th><th>Server / tool</th><th>ms</th>
+  <th title="prompt (input) + completion (output) tokens this step billed — tool rows are 0+0">Tokens (in + out)</th><th>Status</th></tr>`;
+function traceThread(group) {
+  const reqs = group.reqs;
+  const models = [...new Set(reqs.map(r => r.model).filter(Boolean))];
+  const totSteps = reqs.reduce((n, r) => n + ((r.totals || {}).steps || 0), 0);
+  const handbacks = reqs.reduce((n, r) => n + ((r.totals || {}).handed_back || 0), 0);
+  const first = reqs[0];
+  const last = reqs[reqs.length - 1];
+  const span = first.started_ts
+    ? `${esc(new Date(first.started_ts).toLocaleTimeString())} → ${esc(new Date(last.started_ts || first.started_ts).toLocaleTimeString())}`
+    : '';
+  return `<details class="trace-thread" open>
+    <summary><b>conversation</b> <span class="pill">${esc(models.join(' → '))}</span>
+      <span class="muted">· ${reqs.length} requests · ${totSteps} steps · ${handbacks} handed to client · ${span}</span></summary>
+    <table class="trace-steps"><thead>${TRACE_HEAD}</thead>
+      <tbody>${reqs.map(r => traceTableBody(r, true)).join('')}</tbody></table>
+  </details>`;
+}
+function traceTableBody(tr, withTurn) {
+  const steps = Array.isArray(tr.steps) ? tr.steps : [];
+  const tot = tr.totals || {};
+  const stepRows = traceStepRows(steps) || '<tr><td colspan="6" class="muted">no steps recorded</td></tr>';
+  return (withTurn ? traceTurnHead(tr, tot, steps, shadeFor(tr.user_name)) : '') + stepRows;
+}
+function traceCard(tr) {
+  return `<table class="trace-steps"><thead>${TRACE_HEAD}</thead>
+    <tbody>${traceTableBody(tr, false)}</tbody></table>`;
+}
+async function loadTraces() {
+  const list = $('traces-list');
+  if (!list) return;
+  list.innerHTML = '<p class="muted">loading…</p>';
+  const params = new URLSearchParams();
+  if ($('t-key').value) params.set('key_id', $('t-key').value);
+  const sinceRaw = $('t-since') ? $('t-since').value : '';
+  if (sinceRaw) {
+    const d = new Date(sinceRaw);
+    if (!isNaN(d)) params.set('since', d.toISOString());
+  }
+  const lim = Math.min(Math.max(+($('t-limit') ? $('t-limit').value : 50) || 50, 1), 200);
+  params.set('limit', String(lim));
+  let rows;
+  try {
+    rows = await api('/traces' + (params.toString() ? '?' + params.toString() : ''));
+  } catch (e) {
+    list.innerHTML = `<p class="muted">traces unavailable — ${esc(e.message)}</p>`;
+    return;
+  }
+  rows = Array.isArray(rows) ? rows : [];
+  // Conversation grouping: rows sharing a thread_id collapse into ONE
+  // grouped event (admin.html's pattern); unthreaded rows render per-request.
+  const groups = [];
+  const byThread = new Map();
+  for (const r of rows) {
+    const tid = r.thread_id || ('req:' + r.request_id);
+    let g = byThread.get(tid);
+    if (!g) { g = { thread_id: tid, reqs: [] }; byThread.set(tid, g); groups.push(g); }
+    g.reqs.push(r);
+  }
+  for (const g of groups) {
+    g.reqs.sort((a, b) => new Date(a.started_ts || 0) - new Date(b.started_ts || 0));
+  }
+  $('t-meta').textContent = rows.length + ' request(s) · ' + groups.length + ' conversation(s)';
+  list.innerHTML = groups.map(g => g.reqs.length > 1 ? traceThread(g) : traceCard(g.reqs[0])).join('')
+    || '<p class="muted">no traces yet</p>';
+}
+$('t-key').addEventListener('change', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
+$('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
+
+// ---------- form plane: structure + measurement (admin.html's contract) ----
+// Kept BYTE-FOR-BYTE equivalent to admin.html so the two consoles cannot drift.
+//   1. structureFormRows() wraps a field's TITLE text in .fhead so a password
+//      reveal toggle can live ON the title line instead of stacking under the
+//      input (which lifted that field's control above its neighbours).
+//   2. layoutFormRowsNow() measures each row per FLEX LINE and publishes
+//      --fhead-h / --hint-h / --ctl-top / --chk-top; the CSS pads every label
+//      to those heights and paints the hint in a band reserved under the
+//      controls, so all controls on a line share ONE horizontal plane.
+// Both are idempotent; the explicit call sites measure synchronously, the
+// observer/resize path is coalesced.
+function structureFormRows(root) {
+  for (const label of (root || document).querySelectorAll('.row > label, .ep-row > label')) {
+    if (label.dataset.headed) continue;
+    const hint = label.querySelector(':scope > .hint');
+    if (label.classList.contains('chk')) {
+      // The checkbox IS the first child, so there is no title BEFORE a control
+      // to wrap. Only a hint-carrying checkbox gets restructured (its hint is
+      // already styled to stay inline — see the CSS opt-out).
+      if (!hint) continue;
+      label.dataset.headed = '1';
+      continue;
+    }
+    // Everything before the first control is this field's title.
+    const ctl = [...label.children].find(el => el.matches('input, select, textarea, .chkrow'));
+    if (!ctl) continue;
+    const nodes = [];
+    for (let n = label.firstChild; n && n !== ctl; n = n.nextSibling) nodes.push(n);
+    if (!nodes.length) continue;
+    const head = document.createElement('span');
+    head.className = 'fhead';
+    label.insertBefore(head, ctl);
+    for (const n of nodes) head.appendChild(n);
+    label.dataset.headed = '1';
+  }
+}
+
+// Typing-reveal for every password input in the panel. CLIENT-SIDE ONLY — the
+// write-only credential contract is untouched (no endpoint ever returns a
+// stored value; this just unmasks what the operator is typing into a blank
+// field). The toggle rides the field's TITLE line when it has one and only
+// falls back to sitting after the input for bare controls (the header key).
+// Idempotent: marked on the input, so a dialog re-render arms only new fields.
+function armPasswordToggles(root) {
+  structureFormRows(root);
+  for (const input of (root || document).querySelectorAll('input[type="password"]')) {
+    if (input.dataset.pwArmed) continue;
+    input.dataset.pwArmed = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost mini showpw';
+    btn.textContent = 'show';
+    btn.setAttribute('aria-label', 'Show password');
+    btn.onclick = () => {
+      const reveal = input.type === 'password';
+      input.type = reveal ? 'text' : 'password';
+      btn.textContent = reveal ? 'hide' : 'show';
+    };
+    const head = input.parentElement && input.parentElement.querySelector(':scope > .fhead');
+    if (head) head.appendChild(btn);
+    else input.after(btn);
+  }
+}
+
+// Publish the per-line plane variables (see "ONE PLANE PER LINE" in the CSS).
+// Grouping is captured BEFORE any variable is written — writing one shifts the
+// next item's box, so a second read would regroup wrongly. Every variable is
+// CLEARED first so the measurement is natural, not last pass's reserved band.
+function layoutFormRowsNow() {
+  structureFormRows(document);
+  for (const row of document.querySelectorAll('.row, .ep-row')) {
+    const items = [...row.children];
+    if (!items.length) continue;
+    for (const el of items) {
+      el.style.removeProperty('--hint-h');
+      el.style.removeProperty('--fhead-h');
+      el.style.removeProperty('--ctl-top');
+      el.style.removeProperty('--chk-top');
+    }
+    // One group per rendered line (a flex line / a grid row).
+    const lines = new Map();
+    for (const el of items) {
+      const top = Math.round(el.getBoundingClientRect().top);
+      if (!lines.has(top)) lines.set(top, []);
+      lines.get(top).push(el);
+    }
+    let rowHinted = false;
+    for (const line of lines.values()) {
+      let headH = 0, hintH = 0;
+      for (const el of line) {
+        if (el.tagName !== 'LABEL') continue;
+        const head = el.querySelector(':scope > .fhead');
+        if (head) headH = Math.max(headH, head.getBoundingClientRect().height);
+        // A hint-carrying checkbox keeps its hint inline (legacy shape) and is
+        // therefore NOT part of the band measurement.
+        if (el.classList.contains('chk')) continue;
+        const hint = el.querySelector(':scope > .hint');
+        if (hint) hintH = Math.max(hintH, hint.getBoundingClientRect().height);
+      }
+      if (hintH > 0) rowHinted = true;
+      for (const el of line) {
+        el.style.setProperty('--hint-h', hintH + 'px');
+        if (el.tagName !== 'LABEL') {
+          // buttons / bare controls: start exactly on the control plane
+          el.style.setProperty('--ctl-top', (headH ? headH + 4 : 0) + 'px');
+          continue;
+        }
+        if (el.querySelector(':scope > .fhead')) el.style.setProperty('--fhead-h', headH + 'px');
+        // Checkbox-bearing labels are row-shaped (label:has(checkbox) flips the
+        // direction), so they have no title line: centre the 18px line in the
+        // 34px control slot. Covers .chk, a .chkrow label and inline checkboxes.
+        if (el.querySelector('input[type="checkbox"]')) {
+          el.style.setProperty('--chk-top', (headH ? headH + 4 + 8 : 0) + 'px');
+        }
+      }
+    }
+    row.classList.toggle('row-hinted', rowHinted);
+  }
+}
+let formLayoutQueued = false;
+function layoutFormRows() {
+  if (formLayoutQueued) return;
+  formLayoutQueued = true;
+  setTimeout(() => { formLayoutQueued = false; layoutFormRowsNow(); }, 0);
+}
+
+// ---------- tabs + connect ----------
+function dlg(html) { $('dlg-body').innerHTML = html; $('dlg').showModal(); layoutFormRowsNow(); }
+
+function activateTab(name) {
+  const btn = document.querySelector(`nav button[data-tab="${CSS.escape(name)}"]`);
+  if (!btn) return false;
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
+  btn.classList.add('active'); $(`tab-${name}`).classList.add('active');
+  if (name === 'keys') loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'advertised') loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'usage') {
+    // The envelope card lives on THIS tab now (2026-10-30: it was pinned above
+    // every tab, where three of the four pages had no use for it), so opening
+    // the tab re-reads it — the numbers here are spend-aware and stale the
+    // moment a key is minted or a request settles.
+    loadOverview().catch(e => banner(esc(e.message), 'error', 5000));
+    loadUsage().catch(e => banner(esc(e.message), 'error', 5000));
+  }
+  if (name === 'traces') loadTraces().catch(e => banner(esc(e.message), 'error', 5000));
+  // The plane variables are measured per VISIBLE row — a section that was
+  // display:none measured as 0, so every activation re-measures (synchronously).
+  layoutFormRowsNow();
+  return true;
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  // Remember the tab for THIS tab-session (admin.html's F5-restore pattern,
+  // same iframe-safe store as the leader key).
+  sessionStore.set('pcai-team-leader-tab', b.dataset.tab);
+  activateTab(b.dataset.tab);
+});
+function restoreSavedTab() {
+  const saved = sessionStore.get('pcai-team-leader-tab');
+  if (!saved || saved === 'keys') return;
+  try { if (activateTab(saved)) return; } catch { /* fall through to Keys */ }
+  sessionStore.set('pcai-team-leader-tab', 'keys');
+}
+
+$('ovr-reload').addEventListener('click', () =>
+  loadOverview().then(() => loadKeys()).then(() => loadTopups())
+    .catch(e => banner(esc(e.message), 'error', 6000)));
+$('show-revoked').addEventListener('change', () =>
+  loadKeys().catch(e => banner(esc(e.message), 'error', 5000)));
+
+async function connect() {
+  const btn = $('connect');
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  sessionStore.set(KEY_STORE, key());
+  try {
+    await loadOverview();
+    setConn(true);
+    $('tl-connect').classList.add('hidden');
+    restoreSavedTab();      // a restored tab's loader needs the overview loaded first
+    loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
+    loadTopups().catch(e => banner(esc(e.message), 'error', 5000));   // the queue is overview-adjacent
+    btn.textContent = 'Connected ✓';
+  } catch (e) {
+    setConn(false); btn.textContent = 'Connect';
+    banner(esc(e.message), 'error', 6000);
+  }
+  btn.disabled = false;
+}
+$('connect').addEventListener('click', connect);
+$('tlkey').addEventListener('change', connect);
+$('tlkey').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+
+// ---- boot: the header key gets the same show/hide affordance admin.html
+// gives its header input — armPasswordToggles() places the toggle after a BARE
+// input (the header key has no .fhead title line) — and a remembered key
+// auto-connects (restore the tab FIRST, then fetch — the loaders need the key
+// populated).
+armPasswordToggles(document);
+layoutFormRowsNow();
+window.addEventListener('resize', layoutFormRows);
+new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });
+const storedKey = sessionStore.get(KEY_STORE);
+if (storedKey) {
+  $('tlkey').value = storedKey;
+  connect();
+}
+})();
+</script>
+</body>
+</html>

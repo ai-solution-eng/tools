@@ -112,6 +112,72 @@ def test_non_http_schemes_are_denied(url: str) -> None:
     assert _reason("searxng", "fetch_content", {"url": url}) == ap.REASON_SCHEME
 
 
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        # The fragment is never transmitted, so appending one must not change
+        # the verdict: "#%20" decoded to a trailing space, the decoded string
+        # re-ran RULE 1 and check_string returned '' (ALLOWED) before any host
+        # or scheme rule ran (AUDIT-r5 #1).
+        ("http://169.254.169.254/latest/meta-data/iam/security-credentials/#%20", ap.REASON_DESTINATION),
+        ("http://169.254.169.254/#%20", ap.REASON_DESTINATION),
+        ("http://169.254.169.254/#a b", ap.REASON_DESTINATION),  # raw space in the fragment
+        ("http://169.254.169.254/%23%20", ap.REASON_DESTINATION),  # percent-encoded '#'
+        # The same trick on the path/query, which IS transmitted.
+        ("http://169.254.169.254/?q=%20", ap.REASON_DESTINATION),
+        ("http://169.254.169.254/a%20b", ap.REASON_DESTINATION),
+        # ... and it defeated the scheme deny just as easily.
+        ("file:///etc/passwd#%20", ap.REASON_SCHEME),
+        ("gopher://127.0.0.1:6379/_x%20", ap.REASON_SCHEME),
+    ],
+)
+def test_percent_encoded_whitespace_cannot_exempt_a_destination(url: str, reason: str) -> None:
+    """AUDIT-r5 #1 (P0): one percent-encoded whitespace disabled the whole
+    destination policy, because the decode re-ran RULE 1 (the "not a token"
+    guard) and returned ALLOWED before RULE 2/3/4. The bytes the tool sends
+    are identical to the refused request - a fragment is never on the wire."""
+    assert _reason("searxng", "fetch_content", {"url": url}) == reason
+
+
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        # A client percent-encodes a raw space, so these put the same bytes on
+        # the wire as the refused ".../a%20b" (the AUDIT-r5 #1 residual).
+        ("http://169.254.169.254/a b", ap.REASON_DESTINATION),
+        ("http://169.254.169.254/a\tb", ap.REASON_DESTINATION),
+        ("//169.254.169.254/a b", ap.REASON_DESTINATION),  # protocol-relative
+        ("//169.254.169.254/a\tb", ap.REASON_DESTINATION),
+        ("file:///etc/passwd x", ap.REASON_SCHEME),
+        ("gopher://127.0.0.1:6379/_x y", ap.REASON_SCHEME),
+    ],
+)
+def test_raw_whitespace_in_a_url_cannot_exempt_a_destination(url: str, reason: str) -> None:
+    """RULE 1 ("whitespace means not a destination") is the false-positive
+    guard, but a hierarchical URL is its one exception: the space sits in the
+    path and the host is still the destination (AUDIT-r5 #1)."""
+    assert _reason("searxng", "fetch_content", {"url": url}) == reason
+
+
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        # "//host/path" is an RFC 3986 network-path reference: a client that
+        # urljoin()s the argument against a base URL keeps the scheme and takes
+        # THIS host, so it is the same destination as its "http://" twin
+        # (AUDIT-r5 #1 family, cross-review xv-glm-a).
+        ("//169.254.169.254/latest/meta-data/", ap.REASON_DESTINATION),
+        ("//127.0.0.1:8080/x", ap.REASON_DESTINATION),
+        ("//localhost/x", ap.REASON_DESTINATION),
+    ],
+)
+def test_protocol_relative_reference_cannot_bypass_the_destination_policy(url: str, reason: str) -> None:
+    """AUDIT-r5 #1 family (xv-glm-a): "//host/path" was ALLOWED while
+    "http://host/path" was refused, although urljoin() sends both to the same
+    denied host. Only destination-named keys are classified (RULE 4's gate)."""
+    assert _reason("searxng", "fetch_content", {"url": url}) == reason
+
+
 def test_operator_deny_cidrs_apply_to_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "url_deny_cidrs", ["10.0.0.0/8"], raising=False)
     assert _reason("searxng", "fetch_content", {"url": "http://10.1.2.3/"}) == ap.REASON_DESTINATION
@@ -173,7 +239,9 @@ def test_public_https_fetch_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
         (
             "applygate",
             "apply_manifest",
-            {"manifest": "apiVersion: v1\nkind: Service\nmetadata:\n  name: x\n  annotations:\n    url: http://169.254.169.254/\n"},
+            {
+                "manifest": "apiVersion: v1\nkind: Service\nmetadata:\n  name: x\n  annotations:\n    url: http://169.254.169.254/\n"
+            },
         ),
         # kubectl argv (workbench.run_command / k8s-ops)
         ("workbench", "run_command", {"command": ["kubectl", "get", "pods", "-n", "prod"]}),
@@ -210,6 +278,145 @@ def test_false_positive_payload_arguments_may_carry_a_url(server: str, tool: str
     own confinement bounds it - so a URL-valued payload is data, not a
     destination."""
     assert ap.check_arguments(server, tool, arguments) == ""
+
+
+def test_percent_encoded_whitespace_still_exempts_a_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The decode-then-whitespace rule is the false-positive guard, not the
+    bug (AUDIT-r5 #1): an encoded SQL / YAML / command payload is not a
+    destination, and a URL without a fragment keeps its verdict."""
+    monkeypatch.setattr(ap.url_guard, "resolve_host_addresses", lambda *a, **k: ["93.184.216.34"])
+    for server, tool, arguments in (
+        ("sqlhandler", "run_sql", {"sql": "select%20*%20from%20users"}),
+        ("sqlhandler", "run_sql", {"sql": "SELECT *\nFROM users\nWHERE host='127.0.0.1'"}),
+        ("workbench", "run_command", {"command": ["grep", "-r", "foo", "."]}),
+        ("workbench", "run_command", {"command": "grep -r foo ."}),
+        ("searxng", "fetch_content", {"url": "https://example.com/docs?q=1"}),
+        ("searxng", "fetch_content", {"url": "https://example.com/docs?q=1#section"}),
+        ("applygate", "apply_manifest", {"manifest": "url: http://169.254.169.254/#%20"}),
+        ("mm-rag", "add_memory", {"text": "http://169.254.169.254/#%20"}),
+    ):
+        assert ap.check_arguments(server, tool, arguments) == "", f"{server}.{tool} must not be refused"
+
+
+def test_raw_whitespace_exemption_does_not_reach_non_url_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The RULE 1 exception requires the "scheme://" authority form, so a drive
+    path, prose, a command line and a payload-valued URL keep their ALLOW
+    verdicts (AUDIT-r5 #1)."""
+    monkeypatch.setattr(ap.url_guard, "resolve_host_addresses", lambda *a, **k: ["93.184.216.34"])
+    for server, tool, arguments in (
+        ("searxng", "fetch_content", {"url": "https://example.com/a b"}),
+        ("workbench", "write_file", {"content": "C:\\Program Files\\x"}),
+        ("sqlhandler", "run_sql", {"sql": "note: foo bar"}),
+        ("workbench", "run_command", {"command": "curl http://169.254.169.254/x"}),
+        ("workbench", "write_file", {"content": "http://169.254.169.254/a b"}),
+    ):
+        assert ap.check_arguments(server, tool, arguments) == "", f"{server}.{tool} must not be refused"
+
+
+def test_protocol_relative_reference_leaves_paths_and_payloads_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "//" rule must not turn a path reference, a UNC-style path in a
+    destination key, a raw-space string or a payload argument into a refusal
+    (AUDIT-r5 #1 family, xv-glm-a)."""
+    monkeypatch.setattr(ap.url_guard, "resolve_host_addresses", lambda *a, **k: ["93.184.216.34"])
+    for server, tool, arguments in (
+        ("searxng", "fetch_content", {"url": "//example.com/x"}),
+        ("searxng", "fetch_content", {"url": "//fileserver/share"}),
+        ("searxng", "fetch_content", {"url": "///etc/passwd"}),
+        ("searxng", "fetch_content", {"url": "/v1/chat"}),
+        ("searxng", "fetch_content", {"url": "// TODO fix"}),
+        ("searxng", "fetch_content", {"url": "//example.com/a b"}),
+        ("workbench", "write_file", {"content": "//169.254.169.254/x"}),
+    ):
+        assert ap.check_arguments(server, tool, arguments) == "", f"{server}.{tool} must not be refused"
+
+
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        # A bracketed IPv6 literal has no _BARE_HOST_RE host class, so RULE 1b
+        # decodes it with url_guard's IP machinery (AUDIT-r5 #1 family).
+        ("//[::1]/x", ap.REASON_DESTINATION),
+        ("//[fe80::1]/x", ap.REASON_DESTINATION),
+    ],
+)
+def test_protocol_relative_ipv6_literal_is_decoded(url: str, reason: str) -> None:
+    """A "//[::1]/x" reference is the same destination as "http://[::1]/x"."""
+    assert _reason("searxng", "fetch_content", {"url": url}) == reason
+
+
+@pytest.mark.parametrize("url", ["//[2001:4860:4860::8888]/x", "//[::1", "//[]/x"])
+def test_protocol_relative_ipv6_public_or_unterminated_is_not_a_host(url: str) -> None:
+    """A public v6 literal stays allowed, and an unterminated/empty bracket is
+    not a host at all - RULE 1b must not invent a destination from it."""
+    assert _reason("searxng", "fetch_content", {"url": url}) == ""
+
+
+@pytest.mark.parametrize("key", ["path", "paths"])
+def test_path_arguments_are_destination_keys(key: str) -> None:
+    """'paths' is mm-rag's DOWNLOAD vector and 'path' is its singular spelling:
+    both are destination keys, so RULE 4/RULE 1b classify a bare or
+    protocol-relative denied host in them (AUDIT-r5 #1 family, xv-glm-a)."""
+    assert _reason("mm-rag", "dataset_add_documents", {key: "//169.254.169.254/x"}) == ap.REASON_DESTINATION
+    assert _reason("mm-rag", "dataset_add_documents", {key: "169.254.169.254/latest"}) == ap.REASON_DESTINATION
+
+
+@pytest.fixture()
+def _public_dns(monkeypatch: pytest.MonkeyPatch):
+    """The hostname path resolves to a PUBLIC address, so a denial in the
+    userinfo/backslash tests below can only come from the AUTHORITY rule,
+    never from the resolver (the file runs no network)."""
+    monkeypatch.setattr(ap.url_guard, "resolve_host_addresses", lambda host, timeout_s=None: ["93.184.216.34"])
+
+
+def test_authority_userinfo_or_backslash_is_refused_whatwg_differential(_public_dns) -> None:
+    """AUDIT w6 F3 (the WHATWG parse differential): this parser takes the host
+    after the LAST '@' while a WHATWG-grade client ends the authority at the
+    first '/' or backslash — 'http://127.0.0.1\\@evil.com/' parsed as
+    host evil.com (allowed, DNS-checked) while the fetching client connects
+    to 127.0.0.1. Conservative rule: an authority carrying USERINFO at all,
+    or a BACKSLASH, is refused — legitimate MCP destinations never carry
+    credentials in the URL. Ordinary credentials-free URLs stay allowed."""
+    denied = [
+        "http://127.0.0.1\\@evil.com/",  # the differential itself
+        "//127.0.0.1\\@evil.com/x",  # protocol-relative twin
+        "http://user:pass@internal.example.com/",  # credentials in the URL
+        "http://user@internal.example.com/",  # bare userinfo
+        "http://127.0.0.1\\path",  # WHATWG: backslash ends the authority
+    ]
+    for url in denied:
+        assert _reason("searxng", "fetch_content", {"url": url}) == ap.REASON_DESTINATION, url
+    allowed = [
+        "http://host:8080/path",
+        "https://host/path",
+        "https://internal.example.com/x",  # no userinfo: still fine
+    ]
+    for url in allowed:
+        assert _reason("searxng", "fetch_content", {"url": url}) == "", url
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "data/file.json",
+        "/data/x",
+        "a/b/c",
+        # Parent-relative paths: _BARE_HOST_RE stops the host run at the first
+        # "/", so "../x" yields ".." - which must NOT be treated as a host (a
+        # DNS name has no empty label). Wave 1 allowed these; the "paths?" delta
+        # made them an enforce-mode false positive (wave-2 review).
+        "../up/x.txt",
+        "../x",
+        "../../etc",
+        "..0/x",
+        "a../b",
+    ],
+)
+def test_local_path_arguments_are_still_allowed(value: str) -> None:
+    """The path-key gate must not resolve or refuse a LOCAL path: for a
+    non-egress server _host_reason never looks at DNS, a leading "/" is never
+    a host, and a parent-relative run is not a host either."""
+    assert ap.check_arguments("mm-rag", "dataset_add_documents", {"paths": [value]}) == ""
+    assert ap.check_arguments("workbench", "write_file", {"workspace": "w", "path": value}) == ""
 
 
 @pytest.mark.parametrize(
@@ -395,7 +602,10 @@ def test_non_string_arguments_are_ignored() -> None:
 
 
 def test_stringy_nested_lists_are_walked() -> None:
-    assert ap.check_arguments("mm-rag", "dataset_add_documents", {"paths": ["https://ok.example", "http://127.0.0.1/"]}) != ""
+    assert (
+        ap.check_arguments("mm-rag", "dataset_add_documents", {"paths": ["https://ok.example", "http://127.0.0.1/"]})
+        != ""
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +645,7 @@ def test_gate_call_refuses_admin_tools_without_the_mcp_admin_flag(monkeypatch: p
 def test_gate_call_admin_refusal_precedes_the_argument_policy() -> None:
     """Order matters: an admin-only refusal must not be upstaged by (or leak)
     the argument verdict."""
-    decision = ap.gate_call(
-        "sqlhandler", "admin_grants", {"url": "http://169.254.169.254/"}, key_mcp_admin=False
-    )
+    decision = ap.gate_call("sqlhandler", "admin_grants", {"url": "http://169.254.169.254/"}, key_mcp_admin=False)
     assert decision.reason == ap.ADMIN_TOOL_REASON
 
 
@@ -484,6 +692,7 @@ def test_gate_call_single_class_grants_are_not_a_violation(monkeypatch: pytest.M
     for grants in ({("searxng", "fetch_content")}, {("logsearch", "search_logs")}, set()):
         assert not ap.gate_call("logsearch", "search_logs", {"pattern": "x"}, grants=grants).refused
 
+
 # ---------------------------------------------------------------------------
 # FAIL-CLOSED seam (cross-validation wave 1, P1)
 # ---------------------------------------------------------------------------
@@ -516,9 +725,7 @@ def test_read_egress_predicate_fault_refuses(monkeypatch: pytest.MonkeyPatch) ->
         raise RuntimeError("predicate broken")
 
     monkeypatch.setattr(ap._federation, "read_egress_violation", boom)
-    decision = ap.gate_call(
-        "logsearch", "search_logs", {"pattern": "x"}, grants={("logsearch", "search_logs")}
-    )
+    decision = ap.gate_call("logsearch", "search_logs", {"pattern": "x"}, grants={("logsearch", "search_logs")})
     assert decision.refused
     assert decision.reason == ap.READ_EGRESS_UNAVAILABLE
 

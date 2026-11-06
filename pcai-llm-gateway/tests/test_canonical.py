@@ -915,9 +915,7 @@ def test_wiring_feature_switch_inert(wiring_env, monkeypatch: pytest.MonkeyPatch
     assert len(fake.canonical_writes) == before_writes
 
 
-def test_wiring_reasoning_is_bounded_not_stripped(
-    wiring_env, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_wiring_reasoning_is_bounded_not_stripped(wiring_env, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reasoning is CAPPED on the way through, not deleted (2026-10-26).
 
     SUPERSEDES test_wiring_reasoning_stripped_before_reconciliation. That test
@@ -1408,7 +1406,7 @@ def test_wiring_new_user_turn_resets_iteration_budget(caplog: pytest.LogCaptureF
 
         r2 = _relay_post(tc, turn2)
         assert r2.status_code == 200, r2.text
-        assert "max tool iterations" not in r2.text, (
+        assert "tool budget exhausted" not in r2.text, (
             "a fresh user turn must reset the iteration budget — the guard "
             "ran with the prior turn's counter and aborted before the model call"
         )
@@ -1559,7 +1557,7 @@ def test_wiring_handback_continuation_resumes_budget(caplog: pytest.LogCaptureFi
         assert r2.status_code == 200, r2.text
         # the continuation RESUMED (the guard fired at the cap on its first
         # round) and the wrap-up produced the answer — the turn is bounded.
-        assert "max tool iterations (2) reached" in r2.text, (
+        assert "tool budget exhausted (3.00/2.00 units)" in r2.text, (
             "the continuation must RESUME the turn's counter — if the cap "
             "never fires the counter restarted and the per-turn bound is a lie"
         )

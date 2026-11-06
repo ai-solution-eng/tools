@@ -18,11 +18,6 @@ Choose only from this set. Never name a model that is not listed. The order abov
 ## How to choose
 1. Image request? First eliminate any candidate whose `modalities` list is present and lacks `image`.
 2. Classify the turn from the user's own words first. The words outrank the shape: a long message can be a simple question, a short one can be a hard bug.
-3. Apply the roles:
-   - **Deepseek-V4.1-Flash-1017** -- the default for agent work. Coding, refactors, multi-file changes, debugging, multi-step plans, tool-driven loops, long context, anything expensive to get wrong. Strong coding default.
-   - **GLM-5.3-Flash** -- pick when the deliverable IS judgement: reviewing a diff, verifying a claim, fact-checking, careful summarisation, second opinions, contract and consistency checks.
-   - **Qwen3.8-27B** -- pick only for simpler tasks: a greeting, lookups, reformat, classification. Okay for smaller coding projects too. 256k token limit.
+3. Apply the roles based on the criteria.
 4. Break remaining ties by `gpu_util` (do not pile onto a hot model for work a cooler one handles equally well), then by `cost`.
 
-## Current GPU load
-{{gpu_load}}

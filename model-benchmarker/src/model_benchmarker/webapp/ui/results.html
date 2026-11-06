@@ -57,6 +57,16 @@
   .cmp-tabs button { font: inherit; font-size: 12px; background: var(--panel2); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
   .cmp-tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* --- results list: grouped, collapsible, hideable --- */
+  .r-listbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); font-size: 12px; }
+  .r-listbar button { font-size: 11.5px; padding: 3px 9px; }
+  tr.grp-row { cursor: pointer; background: var(--panel2); }
+  tr.grp-row:hover { background: var(--panel); }
+  tr.grp-row td { border-top: 1px solid var(--border); }
+  .grp-caret { color: var(--muted); font-size: 13px; text-align: center; width: 24px; }
+  .grp-label { font-size: 13px; }
+  .grp-meta { font-size: 11.5px; color: var(--muted); }
 </style>
 <script type="text/html" id="hpe-logo-template"><svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 432 288" style="flex-shrink:0">
       <path fill="#01a982" d="M126.617,109.327v15.861h55.218v-15.861H126.617z M178.384,121.737h-48.316v-8.959h48.316V121.737z"/>
@@ -122,9 +132,9 @@
 <body>
 <main>
   <h1>Benchmark results</h1>
-  <p class="sub">Every run persisted on the deployment's storage — status, artifacts, full reports, and side-by-side comparisons. Public: share links freely; only launching benchmarks needs the API key.</p>
+  <p class="sub">Every run persisted on the deployment's storage — status, artifacts, full reports, and side-by-side comparisons. Grouped per model or target; hide what you don't need. Public: share links freely; only launching benchmarks and hiding entries needs the API key.</p>
   <div class="panel" style="padding:10px 14px">
-    <input id="f-filter" placeholder="filter by target or kind…" style="width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:inherit" oninput="render()">
+    <input id="f-filter" placeholder="filter by model, target, kind or run id…" style="width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:inherit" oninput="render()">
   </div>
   <div id="r-compare"></div>
   <div id="r-compare-toolbar"></div>
@@ -140,7 +150,13 @@
   var $ = function (id) { return document.getElementById(id); };
   var RUNS = [];
   var SELECTED = [];        // compare selection, in pick order (max 4)
+  var HIDDEN = [];          // ids hidden from the list (server-persisted)
+  var SHOW_HIDDEN = false;  // include hidden entries (dimmed) in the list
+  var EXPANDED = {};        // group key -> true|false (explicit user state)
+  var SHOW_FUSED = {};      // run id -> true (its fused source rows are shown)
+  var LAST_GROUPS = [];     // groups from the last render (expand/collapse all)
   var CMP = null;           // loaded comparison payload (or null)
+  var CMP_REF = "";         // user-picked reference run id ("" = first picked)
   var CMP_DEEPLINKED = false;
 
   var MAX_CMP = 4;
@@ -168,6 +184,7 @@
   var params = new URLSearchParams(location.search);
   var deepRun = params.get("run");
   var deepCmp = params.get("compare");
+  var deepRef = params.get("ref");
   if (deepRun) {
     fetch("/api/runs/" + encodeURIComponent(deepRun))
       .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("not found")); })
@@ -179,11 +196,13 @@
       id = id.trim();
       if (id && SELECTED.indexOf(id) < 0 && SELECTED.length < MAX_CMP) SELECTED.push(id);
     });
+    if (deepRef && SELECTED.indexOf(deepRef) >= 0) CMP_REF = deepRef;
     CMP_DEEPLINKED = true;
   }
 
   fetch("/api/results").then(function (r) { return r.json(); }).then(function (d) {
     RUNS = d.runs || [];
+    HIDDEN = d.hidden || [];
     render();
     if (CMP_DEEPLINKED && SELECTED.length >= 2) loadCompare();
   }).catch(function (e) {
@@ -206,6 +225,234 @@
     return true;
   }
 
+  // ---------------------------------------------------------------------
+  // Results list: grouped per model (chat runs + that model's committed
+  // baselines) or per target (endpoint runs, which carry no model identity),
+  // collapsed by default. Hiding is page management, NOT deletion: the server
+  // keeps a hidden-id list and every artifact stays on the PVC.
+  // ---------------------------------------------------------------------
+
+  function isHidden(id) { return HIDDEN.indexOf(id) >= 0; }
+
+  function targetKeyOf(r) {
+    var t = (r.target_aliases && r.target_aliases[0]) || r.target_url || "?";
+    t = String(t);
+    while (t.slice(-1) === "/") t = t.slice(0, -1);
+    return t.toLowerCase();
+  }
+
+  function targetLabelOf(r) {
+    var t = (r.target_aliases && r.target_aliases[0]) || r.target_url || "unknown target";
+    try { return new URL(t).host; } catch (e) { return String(t); }
+  }
+
+  function groupOfRun(r) {
+    if (r.model) return { key: "model:" + String(r.model).toLowerCase(), label: r.model };
+    return { key: "target:" + targetKeyOf(r), label: targetLabelOf(r) };
+  }
+
+  function groupOfLib(s, m) {
+    var name = s.model || m.name || m.slug;
+    return { key: "model:" + String(name).toLowerCase(), label: name };
+  }
+
+  function buildGroups(runs, libRows) {
+    var order = [], byKey = {};
+    function ensure(g) {
+      var grp = byKey[g.key];
+      if (!grp) {
+        grp = byKey[g.key] = { key: g.key, label: g.label, runs: [], libs: [], statuses: {}, latest: "" };
+        order.push(g.key);
+      }
+      return grp;
+    }
+    runs.forEach(function (r) {
+      var g = ensure(groupOfRun(r));
+      g.runs.push(r);
+      g.statuses[r.status] = (g.statuses[r.status] || 0) + 1;
+      if ((r.started_utc || "") > g.latest) g.latest = r.started_utc || "";
+    });
+    libRows.forEach(function (e) {
+      var g = ensure(groupOfLib(e.s, e.model));
+      g.libs.push(e);
+      g.statuses[e.s.status] = (g.statuses[e.s.status] || 0) + 1;
+    });
+    return order.map(function (k) { return byKey[k]; });
+  }
+
+  function statusSummary(statuses) {
+    return Object.keys(statuses).sort(function (a, b) { return statuses[b] - statuses[a]; })
+      .map(function (s) { return statuses[s] + " " + s; }).join(" · ");
+  }
+
+  function groupIds(g) {
+    var ids = [];
+    g.runs.forEach(function (r) { ids.push(r.run_id); });
+    g.libs.forEach(function (e) { ids.push(e.s.id); });
+    return ids;
+  }
+
+  function selCountOf(g) {
+    var n = 0;
+    g.runs.forEach(function (r) { if (inSel(r.run_id)) n++; });
+    g.libs.forEach(function (e) { if (inSel(e.s.id)) n++; });
+    return n;
+  }
+
+  function setHidden(ids, hidden) {
+    return MB.api("/api/results/hidden", { method: "POST", body: JSON.stringify({ ids: ids, hidden: hidden }) })
+      .then(function (d) {
+        HIDDEN = (d && d.hidden) || [];
+        if (hidden) {
+          var gone = {};
+          ids.forEach(function (id) { gone[id] = true; });
+          SELECTED = SELECTED.filter(function (id) { return !gone[id]; });
+        }
+        render();
+      })
+      .catch(function (e) {
+        $("r-list").insertAdjacentHTML("afterbegin", '<div class="banner bad">hide failed: ' + MB.esc(e.message) + "</div>");
+      });
+  }
+
+  function groupRowHtml(g, open) {
+    var counts = [];
+    if (g.runs.length) counts.push(g.runs.length + (g.runs.length === 1 ? " run" : " runs"));
+    if (g.libs.length) counts.push(g.libs.length + (g.libs.length === 1 ? " baseline" : " baselines"));
+    var hiddenCount = 0;
+    g.runs.forEach(function (r) { if (isHidden(r.run_id)) hiddenCount++; });
+    g.libs.forEach(function (e) { if (isHidden(e.s.id)) hiddenCount++; });
+    var meta = counts.join(" · ");
+    if (g.latest) meta += " · latest " + g.latest.replace("T", " ").slice(0, 16);
+    if (hiddenCount) meta += " · " + hiddenCount + " hidden";
+    var n = selCountOf(g);
+    var total = g.runs.length + g.libs.length;
+    // a fully hidden group (only visible under "show hidden") offers the
+    // inverse action, so hiding a model is not a one-way trip
+    var action = hiddenCount && hiddenCount === total
+      ? '<a href="#" data-unhide-grp="' + MB.esc(g.key) + '" style="margin-left:8px">unhide all</a>'
+      : '<a href="#" data-hide-grp="' + MB.esc(g.key) + '" style="margin-left:8px">hide all</a>';
+    return '<tr class="grp-row" data-grp="' + MB.esc(g.key) + '">' +
+      '<td class="grp-caret">' + (open ? "▾" : "▸") + "</td>" +
+      '<td class="grp-label" colspan="3"><strong>' + MB.esc(g.label) + "</strong>" +
+        (n ? ' <span class="cmp-hint">' + n + " selected</span>" : "") + "</td>" +
+      '<td class="grp-meta" colspan="5">' + MB.esc(meta) +
+        " · " + MB.esc(statusSummary(g.statuses)) + " " + action + "</td>" +
+      "</tr>";
+  }
+
+  function runRowHtml(r, gkey, open) {
+    var checked = inSel(r.run_id);
+    var full = !checked && SELECTED.length >= MAX_CMP;
+    var hidden = isHidden(r.run_id);
+    var fusedN = (r.fused_from || []).length;
+    var style = (open ? "" : "display:none") + (hidden ? ";opacity:.5" : "");
+    var fusedChip = fusedN
+      ? ' <a href="#" data-fused-toggle="' + MB.esc(r.run_id) + '" class="cmp-hint" title="fused with: ' + MB.esc(r.fused_from.join(", ")) + '">+' + fusedN + " fused</a>"
+      : "";
+    var html = '<tr data-row-grp="' + MB.esc(gkey) + '" style="' + style + '">' +
+      '<td><input type="checkbox" data-cmp="' + MB.esc(r.run_id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison"></td>' +
+      '<td class="mono" title="model identity from the run report">' + MB.esc(r.model || "—") + "</td>" +
+      '<td class="mono">' + MB.esc(r.run_id.slice(0, 19)) + fusedChip + "</td>" +
+      "<td>" + MB.esc(r.kind) + "</td>" +
+      '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + MB.esc(r.target_url) + "</td>" +
+      "<td>" + badge(r.status) + "</td>" +
+      "<td>" + MB.esc((r.started_utc || "").replace("T", " ").slice(0, 19)) + "</td>" +
+      '<td class="num">' + (r.artifacts || []).length + "</td>" +
+      '<td><a href="#" data-detail="' + MB.esc(r.run_id) + '">open</a> · ' +
+        '<a href="#" data-cmp-link="' + MB.esc(r.run_id) + '">' + (checked ? "unpick" : "compare") + "</a> · " +
+        (hidden ? '<a href="#" data-unhide="' + MB.esc(r.run_id) + '">unhide</a>' : '<a href="#" data-hide="' + MB.esc(r.run_id) + '">hide</a>') +
+      "</td></tr>";
+    (r.fused_from || []).forEach(function (fid) {
+      var show = open && !!SHOW_FUSED[r.run_id];
+      html += '<tr data-fused-of="' + MB.esc(r.run_id) + '" style="' + (show ? "" : "display:none") + ';opacity:.55">' +
+        "<td></td>" +
+        '<td class="mono">' + MB.esc(r.model || "—") + "</td>" +
+        '<td class="mono" style="padding-left:26px">↳ ' + MB.esc(fid.slice(0, 19)) + "</td>" +
+        '<td colspan="4" class="muted" style="font-size:11.5px">fused into ' + MB.esc(r.run_id.slice(0, 19)) + " — its completed levels are represented there (resume source)</td>" +
+        "<td></td>" +
+        '<td><a href="#" data-detail="' + MB.esc(fid) + '">open</a></td>' +
+        "</tr>";
+    });
+    return html;
+  }
+
+  function libRowHtml(e, gkey, open) {
+    var s = e.s, m = e.model;
+    var checked = inSel(s.id);
+    var full = !checked && SELECTED.length >= MAX_CMP;
+    var hidden = isHidden(s.id);
+    var comparable = s.kind === "chat";
+    var style = (open ? "" : "display:none") + (hidden ? ";opacity:.5" : (s.status === "partial" ? ";opacity:.6" : ""));
+    return '<tr data-row-grp="' + MB.esc(gkey) + '" style="' + style + '">' +
+      "<td>" + (comparable
+        ? '<input type="checkbox" data-cmp="' + MB.esc(s.id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison">'
+        : '<span class="cmp-hint" title="capacity/latency record, not comparable">—</span>') + "</td>" +
+      '<td class="mono">' + MB.esc(s.model || m.name) + "</td>" +
+      '<td class="mono" title="committed baseline: ' + MB.esc(s.id) + '">' + MB.esc(m.name) + "</td>" +
+      "<td>" + MB.esc(s.kind) + '</td><td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + MB.esc(s.setup || s.label) + '">' + MB.esc(s.setup || s.label) + "</td>" +
+      "<td>" + (s.status === "partial" ? '<span class="badge idle">partial</span>' : '<span class="badge ok">complete</span>') + "</td>" +
+      "<td>—</td>" +
+      '<td class="num">—</td>' +
+      "<td>" + (comparable ? '<a href="#" data-cmp-link="' + MB.esc(s.id) + '">' + (checked ? "unpick" : "compare") + "</a> · " : "") +
+        (hidden ? '<a href="#" data-unhide="' + MB.esc(s.id) + '">unhide</a>' : '<a href="#" data-hide="' + MB.esc(s.id) + '">hide</a>') + "</td>" +
+      "</tr>";
+  }
+
+  function wireList() {
+    var box = $("r-list");
+    box.querySelectorAll("a[data-detail]").forEach(function (a) {
+      a.addEventListener("click", function (ev) { ev.preventDefault(); openRun(a.getAttribute("data-detail")); });
+    });
+    box.querySelectorAll("a[data-cmp-link]").forEach(function (a) {
+      a.addEventListener("click", function (ev) { ev.preventDefault(); toggleSelect(a.getAttribute("data-cmp-link")); });
+    });
+    box.querySelectorAll("input[data-cmp]").forEach(function (cb) {
+      cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
+    });
+    box.querySelectorAll("a[data-hide]").forEach(function (a) {
+      a.addEventListener("click", function (ev) { ev.preventDefault(); ev.stopPropagation(); setHidden([a.getAttribute("data-hide")], true); });
+    });
+    box.querySelectorAll("a[data-unhide]").forEach(function (a) {
+      a.addEventListener("click", function (ev) { ev.preventDefault(); ev.stopPropagation(); setHidden([a.getAttribute("data-unhide")], false); });
+    });
+    function groupAction(attr, hidden) {
+      box.querySelectorAll("a[" + attr + "]").forEach(function (a) {
+        a.addEventListener("click", function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          var key = a.getAttribute(attr);
+          var g = null;
+          LAST_GROUPS.forEach(function (x) { if (x.key === key) g = x; });
+          if (g) setHidden(groupIds(g), hidden);
+        });
+      });
+    }
+    groupAction("data-hide-grp", true);
+    groupAction("data-unhide-grp", false);
+    box.querySelectorAll("a[data-fused-toggle]").forEach(function (a) {
+      a.addEventListener("click", function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var rid = a.getAttribute("data-fused-toggle");
+        SHOW_FUSED[rid] = !SHOW_FUSED[rid];
+        render();
+      });
+    });
+    box.querySelectorAll("tr.grp-row").forEach(function (tr) {
+      tr.addEventListener("click", function (ev) {
+        if (ev.target.closest && ev.target.closest("a")) return;
+        var key = tr.getAttribute("data-grp");
+        EXPANDED[key] = EXPANDED[key] !== true;
+        render();
+      });
+    });
+    var ex = $("r-expand");
+    if (ex) ex.addEventListener("click", function () { LAST_GROUPS.forEach(function (g) { EXPANDED[g.key] = true; }); render(); });
+    var co = $("r-collapse");
+    if (co) co.addEventListener("click", function () { LAST_GROUPS.forEach(function (g) { EXPANDED[g.key] = false; }); render(); });
+    var sh = $("r-showhidden");
+    if (sh) sh.addEventListener("change", function () { SHOW_HIDDEN = this.checked; render(); });
+  }
+
   function render() {
     var q = ($("f-filter").value || "").toLowerCase();
     function hits(text) { return !q || String(text || "").toLowerCase().indexOf(q) >= 0; }
@@ -224,78 +471,41 @@
         }
       });
     });
-    if (!runs.length && !libRows.length) {
+    if (!SHOW_HIDDEN) {
+      runs = runs.filter(function (r) { return !isHidden(r.run_id); });
+      libRows = libRows.filter(function (e) { return !isHidden(e.s.id); });
+    }
+    var groups = buildGroups(runs, libRows);
+    LAST_GROUPS = groups;
+    if (!groups.length) {
       $("r-list").innerHTML = '<div class="banner">' + (RUNS.length || (LIB && LIB.models || []).length
-        ? "no runs match the filter"
+        ? (HIDDEN.length && !SHOW_HIDDEN
+          ? 'everything here is hidden — tick "show hidden" to bring it back'
+          : "no runs match the filter")
         : "no benchmark runs yet — launch one from the benchmark pages") + "</div>";
       return;
     }
-    var html = '<div class="panel" style="padding:0;overflow:auto"><table><thead><tr>' +
+    var total = 0;
+    groups.forEach(function (g) { total += g.runs.length + g.libs.length; });
+    var html = '<div class="panel" style="padding:0;overflow:auto">' +
+      '<div class="r-listbar"><span class="muted">' + groups.length + " groups · " + total + " entries" +
+        (HIDDEN.length ? " · " + HIDDEN.length + " hidden" : "") + "</span>" +
+        '<button class="secondary" id="r-expand">expand all</button>' +
+        '<button class="secondary" id="r-collapse">collapse all</button>' +
+        '<label style="display:flex;align-items:center;gap:5px"><input type="checkbox" id="r-showhidden"' + (SHOW_HIDDEN ? " checked" : "") + "> show hidden</label>" +
+      "</div>" +
+      '<table><thead><tr>' +
       '<th style="width:28px" title="pick 2–4 to compare"><span class="cmp-hint">cmp</span></th>' +
       "<th>Model</th><th>Run / baseline</th><th>Kind</th><th>Target / setup</th><th>Status</th><th>Started</th><th class=\"num\">Artifacts</th><th></th></tr></thead><tbody>";
-    runs.forEach(function (r) {
-      var checked = inSel(r.run_id);
-      var full = !checked && SELECTED.length >= MAX_CMP;
-      var fused = r.fused_from && r.fused_from.length
-        ? ' <span class="cmp-hint" title="fused with: ' + MB.esc(r.fused_from.join(", ")) + '">+' + r.fused_from.length + " fused</span>"
-        : "";
-      html += '<tr>' +
-        '<td><input type="checkbox" data-cmp="' + MB.esc(r.run_id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison"></td>' +
-        '<td class="mono" title="model identity from the run report">' + MB.esc(r.model || "—") + "</td>" +
-        '<td class="mono">' + MB.esc(r.run_id.slice(0, 19)) + fused + "</td>" +
-        "<td>" + MB.esc(r.kind) + "</td>" +
-        '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + MB.esc(r.target_url) + "</td>" +
-        "<td>" + badge(r.status) + "</td>" +
-        "<td>" + MB.esc((r.started_utc || "").replace("T", " ").slice(0, 19)) + "</td>" +
-        '<td class="num">' + (r.artifacts || []).length + "</td>" +
-        '<td><a href="#" data-detail="' + MB.esc(r.run_id) + '">open</a> · <a href="#" data-cmp-link="' + MB.esc(r.run_id) + '">' + (checked ? "unpick" : "compare") + "</a></td>" +
-        "</tr>";
-      // absorbed runs: one muted line per fused source, each still openable
-      (r.fused_from || []).forEach(function (fid) {
-        html += '<tr style="opacity:.55"><td></td>' +
-          '<td class="mono">' + MB.esc(r.model || "—") + "</td>" +
-          '<td class="mono" style="padding-left:26px">↳ ' + MB.esc(fid.slice(0, 19)) + "</td>" +
-          '<td colspan="4" class="muted" style="font-size:11.5px">fused into ' + MB.esc(r.run_id.slice(0, 19)) + " — its completed levels are represented there (resume source)</td>" +
-          "<td></td>" +
-          '<td><a href="#" data-detail="' + MB.esc(fid) + '">open</a></td>' +
-          "</tr>";
-      });
-    });
-    libRows.forEach(function (e) {
-      var s = e.s, m = e.model;
-      var checked = inSel(s.id);
-      var full = !checked && SELECTED.length >= MAX_CMP;
-      var comparable = s.kind === "chat";
-      html += '<tr' + (s.status === "partial" ? ' style="opacity:.6"' : "") + '>' +
-        "<td>" + (comparable
-          ? '<input type="checkbox" data-cmp="' + MB.esc(s.id) + '"' + (checked ? " checked" : "") + (full ? " disabled" : "") + ' title="select for comparison">'
-          : '<span class="cmp-hint" title="capacity/latency record, not comparable">—</span>') + "</td>" +
-        '<td class="mono">' + MB.esc(s.model || m.name) + "</td>" +
-        '<td class="mono" title="committed baseline: ' + MB.esc(s.id) + '">' + MB.esc(m.name) + "</td>" +
-        "<td>" + MB.esc(s.kind) + '</td><td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + MB.esc(s.setup || s.label) + '">' + MB.esc(s.setup || s.label) + "</td>" +
-        "<td>" + (s.status === "partial" ? '<span class="badge idle">partial</span>' : '<span class="badge ok">complete</span>') + "</td>" +
-        "<td>—</td>" +
-        '<td class="num">—</td>' +
-        "<td>" + (comparable ? '<a href="#" data-cmp-link="' + MB.esc(s.id) + '">' + (checked ? "unpick" : "compare") + "</a>" : "") + "</td>" +
-        "</tr>";
+    groups.forEach(function (g) {
+      var open = !!q || EXPANDED[g.key] === true || (EXPANDED[g.key] === undefined && selCountOf(g) > 0);
+      html += groupRowHtml(g, open);
+      g.runs.forEach(function (r) { html += runRowHtml(r, g.key, open); });
+      g.libs.forEach(function (e) { html += libRowHtml(e, g.key, open); });
     });
     html += "</tbody></table></div>";
     $("r-list").innerHTML = html;
-    $("r-list").querySelectorAll("a[data-detail]").forEach(function (a) {
-      a.addEventListener("click", function (ev) {
-        ev.preventDefault();
-        openRun(a.getAttribute("data-detail"));
-      });
-    });
-    $("r-list").querySelectorAll("a[data-cmp-link]").forEach(function (a) {
-      a.addEventListener("click", function (ev) {
-        ev.preventDefault();
-        toggleSelect(a.getAttribute("data-cmp-link"));
-      });
-    });
-    $("r-list").querySelectorAll("input[data-cmp]").forEach(function (cb) {
-      cb.addEventListener("change", function () { toggleSelect(cb.getAttribute("data-cmp")); });
-    });
+    wireList();
   }
 
   // Test atoms → faceted atom BROWSER (MB-DB): the store is the source of
@@ -532,6 +742,7 @@
     if (clear) clear.addEventListener("click", function () {
       SELECTED = [];
       CMP = null;
+      CMP_REF = "";
       CMP_DEEPLINKED = false;
       $("r-compare").innerHTML = "";
       render();
@@ -540,8 +751,11 @@
 
   function loadCompare() {
     if (SELECTED.length < 2 || SELECTED.length > MAX_CMP) return;
+    if (CMP_REF && SELECTED.indexOf(CMP_REF) < 0) CMP_REF = "";  // pick left the selection
     $("r-compare").innerHTML = '<p class="muted"><span class="spinner"></span>building comparison…</p>';
-    MB.api("/api/results/compare?ids=" + encodeURIComponent(SELECTED.join(",")))
+    var cmpUrl = "/api/results/compare?ids=" + encodeURIComponent(SELECTED.join(","));
+    if (CMP_REF) cmpUrl += "&ref=" + encodeURIComponent(CMP_REF);
+    MB.api(cmpUrl)
       .then(function (d) { CMP = d; renderCompare(); })
       .catch(function (e) {
         $("r-compare").innerHTML = '<div class="banner bad">compare failed: ' + MB.esc(e.message) + "</div>";
@@ -787,7 +1001,7 @@
               }
               return { x: x, y: m };
             });
-            return { name: r.name, color: RUN_COLORS[r.idx], ref: r.ref, points: pts };
+            return { name: r.name, color: cmpColor(r.rid), ref: r.ref, points: pts };
           });
           if (series.every(function (s) { return !s.points.some(function (p) { return p.y != null; }); })) return;
           if (CMP_FILTER.hideSparse) {
@@ -811,7 +1025,7 @@
             var row = section.rows.find(function (rw) { return parseLevel(rw.label).x === x; });
             return { x: x, y: row ? (row.cells[metric] || {})[r.rid] : null };
           });
-          return { name: r.name, color: RUN_COLORS[r.idx], ref: r.ref, points: pts };
+          return { name: r.name, color: cmpColor(r.rid), ref: r.ref, points: pts };
         });
         if (series.every(function (s) { return !s.points.some(function (p) { return p.y != null; }); })) return;
         charts.push({ title: meta.label + " vs concurrency", xLabel: "N (concurrent requests)", yLabel: meta.unit, yUnit: meta.unit, series: series, metric: metric });
@@ -821,6 +1035,15 @@
   }
 
   var RUN_COLORS = ["#01a982", "#2563eb", "#d97706", "#9333ea"];
+
+  // A series colour follows the RUN, never its position in a section: the
+  // server lists the reference first, so a position-keyed colour would swap
+  // between the run card and the chart every time the reference flips.
+  function cmpColor(rid) {
+    var i = -1;
+    ((CMP && CMP.runs) || []).forEach(function (r, j) { if (r.run_id === rid) i = j; });
+    return RUN_COLORS[(i < 0 ? 0 : i) % RUN_COLORS.length];
+  }
 
   function renderChartGrid(charts) {
     var grid = '<div class="cmp-charts">';
@@ -862,7 +1085,7 @@
           var best = (meta.better === "lower" ? v === mn : v === mx) && finite.length > 1;
           html2 += '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
             '<div style="flex:1;background:var(--border);border-radius:3px;height:12px;overflow:hidden">' +
-            '<div style="width:' + (frac * 100).toFixed(0) + "%;height:100%;background:" + RUN_COLORS[idx] + '"></div></div>' +
+            '<div style="width:' + (frac * 100).toFixed(0) + "%;height:100%;background:" + cmpColor(rid) + '"></div></div>' +
             '<span class="mono" style="font-size:11px;min-width:52px;text-align:right' + (best ? ";font-weight:700" : "") + '">' + MB.fmtNum(v, v >= 100 ? 0 : 1) + "</span></div>";
         });
         html2 += "</td></tr>";
@@ -870,7 +1093,8 @@
       html2 += "</tbody></table>";
       html2 += '<div class="cmp-legend">' + section.runs.map(function (rid, idx) {
         var run = CMP.runs.find(function (r) { return r.run_id === rid; }) || {};
-        return '<span class="lg"><span class="swatch" style="background:' + RUN_COLORS[idx] + '"></span>' + MB.esc(seriesName(run, idx)) + "</span>";
+        return '<span class="lg"><span class="swatch" style="background:' + cmpColor(rid) + '"></span>' + MB.esc(seriesName(run, idx)) +
+          (rid === section.reference_run ? '<span class="chip">ref</span>' : "") + "</span>";
       }).join("") + "</div></div>";
       html += html2;
     });
@@ -882,7 +1106,20 @@
     if (!CMP) return;
     var html = '<div class="panel" id="cmp-panel"><h2 style="margin-top:0">Run comparison ' +
       '<a href="#" id="cmp-close" style="float:right;font-weight:400">✕ close</a></h2>';
+    var effectiveRef = CMP_REF || ((CMP.sections[0] || {}).reference_run || "");
+    // only runs that actually have a section can be a baseline (a run with no
+    // comparable rows is listed as a card but has nothing to be the reference of)
+    var refChoices = [];
+    CMP.sections.forEach(function (s) { s.runs.forEach(function (rid) { if (refChoices.indexOf(rid) < 0) refChoices.push(rid); }); });
     html += '<p class="sub">Positive deltas are improvements against the reference run (first column). ' +
+      '<label style="margin-left:10px">reference ' +
+      '<select id="cmp-ref" style="min-width:230px">' +
+      CMP.runs.map(function (r, idx) {
+        if (refChoices.indexOf(r.run_id) < 0) return "";
+        return '<option value="' + MB.esc(r.run_id) + '"' + (r.run_id === effectiveRef ? " selected" : "") + ">" +
+          MB.esc(seriesName(r, idx)) + "</option>";
+      }).join("") +
+      "</select></label>" +
       '<button id="cmp-csv" class="secondary" style="margin-left:8px">copy as CSV</button></p>';
     // per-run header cards, colored by run index (matches the chart series)
     html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0">';
@@ -968,7 +1205,7 @@
             var v = (row.cells[metric] || {})[rid];
             var d = (row.delta_vs_reference[metric] || {})[rid];
             html += '<div class="' + (idx === 0 ? "cmp-ref-col" : "") + '"><span class="cmp-cell-wrap">' +
-              '<span class="mono" style="color:' + RUN_COLORS[idx] + '">' + fmtMetric(metric, v) + "</span>" +
+              '<span class="mono" style="color:' + cmpColor(rid) + '">' + fmtMetric(metric, v) + "</span>" +
               (idx === 0 ? "" : deltaCell(d)) + "</span></div>";
           });
           html += "</td>";
@@ -1013,10 +1250,13 @@
     if (cfCtx) cfCtx.addEventListener("change", function () { CMP_FILTER.ctx = this.value; renderCompare(); });
     var cfSparse = $("cf-sparse");
     if (cfSparse) cfSparse.addEventListener("change", function () { CMP_FILTER.hideSparse = this.value === "hide"; renderCompare(); });
+    var cfRef = $("cmp-ref");
+    if (cfRef) cfRef.addEventListener("change", function () { CMP_REF = this.value; loadCompare(); });
     var close = $("cmp-close");
     if (close) close.addEventListener("click", function (ev) {
       ev.preventDefault();
       CMP = null;
+      CMP_REF = "";
       $("r-compare").innerHTML = "";
       render();
     });

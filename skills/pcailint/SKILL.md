@@ -8,7 +8,7 @@ description: Use when running ruff or mypy on PCAI code, formatting Python in th
 ## THE FACT (read twice)
 
 Every PCAI repo lints through ONE shared script, `formatter.sh`, hardlinked fleet-wide (canonical copy:
-`~/Code/HPE/pcai_utils/formatter.sh`). Per target it runs, in order:
+`<your pcai_utils checkout>/formatter.sh`). Per target it runs, in order:
 
 1. `ruff format <target>`
 2. `ruff check --fix <target>`
@@ -17,7 +17,7 @@ Every PCAI repo lints through ONE shared script, `formatter.sh`, hardlinked flee
 Any failed step fails the whole run; success prints `FORMATTER: all clean`. SKIP lines are skips, NOT
 failures ("no ruff.toml found" / "mypy.ini not found next to ruff.toml" / "no Python files").
 
-Config is canonical in `~/Code/HPE/pcai_utils/` (`ruff.toml`, `mypy.ini`) and hardlinked into every repo
+Config is canonical in `<your pcai_utils checkout>/` (`ruff.toml`, `mypy.ini`) and hardlinked into every repo
 root — one inode, every repo. The script locates the repo root by walking up from its own location to the
 first directory containing `ruff.toml`.
 
@@ -25,17 +25,17 @@ first directory containing `ruff.toml`.
 
 | You want | Do this |
 |---|---|
-| Full repo pass (default) | `~/Code/HPE/pcai_utils/formatter.sh <repo-root>` — any explicit arg = repo-wide run (all `src/*` packages + `tests/`), regardless of which copy you invoke |
+| Full repo pass (default) | `<your pcai_utils checkout>/formatter.sh <repo-root>` — any explicit arg = repo-wide run (all `src/*` packages + `tests/`), regardless of which copy you invoke |
 | One package + its tests | run the copy at `<repo>/src/<pkg>/formatter.sh` (no arg) |
 | tests/ only | run `<repo>/tests/formatter.sh` (no arg) |
-| pcai_utils itself | `cd ~/Code/HPE/pcai_utils && ./formatter.sh` (no `src/` tree → lints the flat root files + `tests/`) |
+| pcai_utils itself | `cd <your pcai_utils checkout> && ./formatter.sh` (no `src/` tree → lints the flat root files + `tests/`) |
 | Identify issues WITHOUT touching files | `ruff check --no-cache <target>` · `ruff format --check --no-cache <target>` · `mypy --config-file <repo-root>/mypy.ini --cache-dir=<writable-dir> <target>` |
 
 - **`formatter.sh` MUTATES** (format + autofix). "Identify issues" = the read-only row; "make it clean" = the run rows.
 - **Sandboxed/agent runs MUST bypass the tool caches** (verified 2026-10-06): under the DSH file sandbox
-  `~/Code/...` is read-only, and both tools crash writing their caches there — ruff dies with
+  your repo tree is read-only, and both tools crash writing their caches there — ruff dies with
   `Failed to create temporary file ... .ruff_cache` (exit 2), mypy 2.3.0 with an INTERNAL ERROR (exit 2).
-  Add `--no-cache` to every ruff call and `--cache-dir=/home/andrew/.dsh/<tmp>` to every mypy call. Both
+  Add `--no-cache` to every ruff call and `--cache-dir=$DSH_HOME/<tmp>` to every mypy call. Both
   workarounds verified clean on pcai_utils; a bare invocation that exits 2 is usually this, not a code finding.
 - `ruff check --fix` applies only safe autofixes; whatever remains is reported and needs hand-editing. mypy is
   always report-only — it never rewrites code.
@@ -58,7 +58,7 @@ first directory containing `ruff.toml`.
   fleet drift by definition.
 - **Never edit `ruff.toml`/`mypy.ini` in a consumer repo** — same inode everywhere; the edit lands in every
   repo instantly. Edit in place in pcai_utils (truncate-and-write; a temp-file-and-rename edit breaks every
-  hardlink), then run the drift gate: `cd ~/Code/HPE/pcai_utils && ./fleet_drift_check.sh`. A config change
+  hardlink), then run the drift gate: `cd <your pcai_utils checkout> && ./fleet_drift_check.sh`. A config change
   is a fleet-drift event (see fleet-drift).
 
 ## Gotchas

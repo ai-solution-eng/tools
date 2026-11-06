@@ -73,10 +73,10 @@ re-run the tsdown leg alone).
 
 From a terminal OUTSIDE the harness (this kills every session, including the one you were in):
 
-    ~/.local/bin/dsh_sb web        # bubblewrap-sandboxed launcher (the normal one)
-    # or: ~/.dsh/bin/dsh_nos web   # no sandbox, same env
+    <your sandboxed launcher> web        # bubblewrap-sandboxed (the normal one)
+    # or: <your unsandboxed launcher> web   # no sandbox, same env
 
-The launchers own: CA bundle env (`NODE_EXTRA_CA_CERTS`), conda env, `DSH_HOME`, and the task-board
+The launchers own: CA bundle env (`NODE_EXTRA_CA_CERTS`), the Python env, `DSH_HOME`, and the task-board
 stale-lock check. If the start refuses with "task-board lock held by running pid", the old host is
 still alive — kill it first rather than forcing with `DSH_NO_TASKBOARD_LOCK_CHECK=1` (two writers on
 one ledger = corruption).
@@ -109,20 +109,22 @@ rebuild (step 2) + restore `$DSH_HOME` from the backup dir + restart. If session
 rollback, it is usually a session-format version skew — restore the sessions dir from the SAME
 backup as the rest of `$DSH_HOME`, not selectively.
 
-## Reference instantiation
+## Deployment values to resolve locally
 
-One deployment's values — re-derive locally:
+Resolve your own equivalents — nothing here is a default:
 
-- Repo: `/home/andrew/Projects/deepseek-harness` (origin: github.com/deepseek-ai/deepseek-harness).
-  Host runs `apps/cli/lib/bin.js web` from the repo working tree.
-- `$DSH_HOME` = `/home/andrew/.dsh`; profiles at `$DSH_HOME/profiles/web` — its
-  `node_modules/@deepseek-ai/*` entries are symlinks INTO the repo, so repo rebuilds flow through
-  with no install step.
-- Launchers: `~/.local/bin/dsh_sb` (bwrap sandbox) and `~/.dsh/bin/dsh_nos` (no sandbox). Both set
-  `NODE_EXTRA_CA_CERTS=$DSH_HOME/certs/dsh-trust-bundle.pem` and the conda env (ML14).
+- Repo: your checkout of `github.com/deepseek-ai/deepseek-harness` (`$DSH_REPO`). The host runs
+  `apps/cli/lib/bin.js web` from the repo working tree.
+- `$DSH_HOME` is your harness home (commonly `~/.dsh`); the profile is `$DSH_PROFILE_DIR`
+  (`$DSH_HOME/profiles/<name>`). Its `node_modules/@deepseek-ai/*` entries are symlinks INTO the
+  repo, so repo rebuilds flow through with no install step.
+- Launchers: two wrapper scripts — one sandboxed (bwrap), one not. Each must export
+  `NODE_EXTRA_CA_CERTS=$DSH_HOME/certs/dsh-trust-bundle.pem`, activate your Python env, set
+  `DSH_HOME`, and run the task-board stale-lock check.
 - Update probes: `$DSH_HOME/.dsh_update_preset_check.mjs` (preset drift, read-only, exits 0 with
   `preset-drift:` lines), `$DSH_HOME/.dsh_update_heal.mjs` (profile module fallback probe).
 - Build marker: `$DSH_HOME/.dsh_update_build_marker` (hash + built-at + HEAD).
 - Session-format migration: repo script `pnpm run migrate:sessions-to-v4` (needed only when the
   release bumps the format; check release notes).
-- Fossil record motivating the backup rule: `$DSH_HOME/.dsh_update_bak_20261004-*` (4 dirs, 1 day).
+- Why the backup rule is non-negotiable: a preset schema change can retire an entire preset, and a
+  one-day-old update backup dir was the only rollback that existed.

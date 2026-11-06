@@ -616,11 +616,12 @@ def test_rest_dead_envelope_only_401(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # ---------------------------------------------------------------------------
 # 4. browser-header additions (2026-10-06 lead scope ADDITION, §Z1 zone):
-#    preferred_username subject preference + X-Auth-Request-Groups fallback
+#    preferred_username subject preference + X-Auth-Request-Groups groups
 #    — the platform oauth2-proxy injects these (verified live); WITHOUT the
-#    fallback the adminGroups/browser path silently saw no groups behind
-#    the chain because the platform proxy does NOT inject
-#    X-Forwarded-Groups.
+#    X-Auth-Request-Groups read the adminGroups/browser path silently saw
+#    no groups behind the chain because the platform proxy does NOT inject
+#    X-Forwarded-Groups. (audit r5 #4, 2026-10-30: the forwarded spelling is
+#    since DEMOTED to the fallback — client-supplied on this platform.)
 # ---------------------------------------------------------------------------
 
 
@@ -659,15 +660,20 @@ def test_browser_groups_fallback_to_auth_request_groups() -> None:
     ) == ("alice", ["eng", "platform-admin"])
 
 
-def test_browser_groups_forwarded_still_wins_byte_identical() -> None:
-    """(a) Precedence: X-Forwarded-Groups present ⇒ the behavior is
-    byte-for-byte unchanged (the fallback never reorders it), including
-    the empty-string fall-through to the second header."""
+def test_browser_groups_auth_request_wins_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(a) Precedence (audit r5 #4 + the xv follow-up, 2026-10-30 — REVERSED
+    from the original Z1 pin): X-Auth-Request-Groups — the spelling the
+    platform oauth2-proxy actually injects — wins; X-Forwarded-Groups is
+    never platform-injected (DEPLOYMENT.md; helm/ strips nothing), so when
+    BOTH arrive the forwarded value is client-supplied and must not mask
+    the proxy's assertion. An EMPTY (not absent) X-Auth-Request-Groups
+    still falls through to the forwarded header — behind the trust flag,
+    since the forwarded spelling is consulted only behind
+    PCAI_LLM_TRUST_FORWARDED_GROUPS."""
     both = {"X-Auth-Request-User": "a", "X-Forwarded-Groups": "fwd", "X-Auth-Request-Groups": "arg"}
-    assert browser_identity_from_headers(both) == ("a", ["fwd"])
-    # an EMPTY (not absent) X-Forwarded-Groups falls through — an empty
-    # header is no groups assertion
-    assert browser_identity_from_headers({**both, "X-Forwarded-Groups": "   "}) == ("a", ["arg"])
+    assert browser_identity_from_headers(both) == ("a", ["arg"])
+    monkeypatch.setattr(settings, "trust_forwarded_groups", True)
+    assert browser_identity_from_headers({**both, "X-Auth-Request-Groups": "   "}) == ("a", ["fwd"])
     # neither groups header: empty groups (unchanged)
     assert browser_identity_from_headers({"X-Auth-Request-User": "a"}) == ("a", [])
 

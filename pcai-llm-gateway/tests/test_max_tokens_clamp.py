@@ -182,7 +182,6 @@ def test_setting_field_exists_and_defaults_empty() -> None:
     assert "PCAI_LLM_" + "max_tokens_ceiling".upper() == "PCAI_LLM_MAX_TOKENS_CEILING"
 
 
-
 # ---------------------------------------------------------------------------
 # audit F5 (2026-10-29) — the MODERN cap field must be clamped too
 # ---------------------------------------------------------------------------
@@ -219,13 +218,13 @@ def test_f5_max_completion_tokens_contract_edges() -> None:
     ceilings = {MODEL: CEILING}
     # at or below the ceiling: no-op, SAME object
     for value in (1, CEILING):
-        body = {"model": MODEL, "max_completion_tokens": value}
+        body: dict[str, Any] = {"model": MODEL, "max_completion_tokens": value}
         assert clamp_max_tokens(body, MODEL, ceilings) is body
     # non-numeric / bool / non-positive: untouched
-    for value in ("999999", 999999.5, None, True, 0, -5):
-        body = {"model": MODEL, "max_completion_tokens": value}
-        assert clamp_max_tokens(body, MODEL, ceilings) is body, f"{value!r} must be untouched"
-        assert body["max_completion_tokens"] == value
+    for odd in ("999999", 999999.5, None, True, 0, -5):
+        body = {"model": MODEL, "max_completion_tokens": odd}
+        assert clamp_max_tokens(body, MODEL, ceilings) is body, f"{odd!r} must be untouched"
+        assert body["max_completion_tokens"] == odd
     # an uncapped model and an ignored (non-positive) ceiling stay inert
     body = {"model": "other", "max_completion_tokens": 999_999}
     assert clamp_max_tokens(body, "uncapped", ceilings) is body
@@ -250,6 +249,7 @@ def test_f5_proxy_forwards_the_clamped_modern_field(env, ceilings) -> None:
     assert r.status_code == 200, r.text
     assert seen["body"]["max_completion_tokens"] == CEILING
     assert json.dumps(body, sort_keys=True) == snapshot, "the client's request body was mutated"
+
 
 # ---------------------------------------------------------------------------
 # integration harness (test_ttft_gate.py shape: MockTransport + FakeDB)

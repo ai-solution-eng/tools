@@ -110,7 +110,8 @@ one smoke check (full battery in [`VERIFICATION.md`](changelogs/VERIFICATION.md)
   registered, Admin ▸ Off-peak shows live state (enabled/active/fraction/
   last sample or error); it auto-refreshes only while the tab is visible.
 - **Creds dialog (per-user MCP headers)**: Admin ▸ Keys ▸ `creds` on a key
-  → set e.g. `X-Memory-Dataset` / `X-Dataset-Password` for the memory MCP —
+  → set e.g. `X-API-Key` for the memory MCP (a key minted in the RAG app;
+  the legacy `X-Memory-Dataset` / `X-Dataset-Password` pair still works) —
   values are write-only (the dialog lists header NAMES back, never values).
 - **Audit tab + metrics**: after an upgrade that adds them — Admin ▸ Audit
   lists one row per admin mutation; with `metrics.enabled: true` the
@@ -154,7 +155,7 @@ paste it into the *Helm Values* editor, adjust the `# SITE:` lines, apply.
 | | **Internal G2** (`values-examples/values.g2.yaml`) | **Hosted trial** (`values-examples/values.hosted-trial.yaml`) |
 |---|---|---|
 | `ezua.virtualService.endpoint` | Literal host in the packaged example (`pcai-llm-gateway.your-cluster.example`); the live site copy carries `pcai-llm-gateway.${DOMAIN_NAME}` — fine through the PCAI values editor, but a raw CLI `helm upgrade` must sed-resolve the placeholder FIRST: istio's webhook DENIES the literal and the release lands `failed` (§ Gateway exposure) | `pcai-llm-gateway.${DOMAIN_NAME}` — keep the placeholder; PCAI substitutes pasted values before rendering |
-| `ezua.authorizationPolicy` | **ON (live 2026-10-07)** with the G2 relief knobs: `allowMetricsScrape: true` (the ANY-SOURCE `/metrics` rule), `allowInClusterApi: true` (unmeshed in-cluster consumers; `/v1/identity` + `/v1/keys/for-me` stay edge-only), `excludeInboundPorts: []` — applied in the ordered § SSO self-mint rollout. The packaged `values.g2.yaml` ships exactly this posture (2026-10-07 sync — enable stays ATOMIC with the namespace injection) | `enabled: true` (example default) — baseline ALLOW rules only (ezaf-gateway + same-namespace); no relief knobs until the SSO rollout is applied to the trial |
+| `ezua.authorizationPolicy` | **ON (live 2026-10-07)** with the G2 relief knobs: `allowMetricsScrape: true` (the ANY-SOURCE `/metrics` rule), `allowInClusterApi: true` (unmeshed in-cluster consumers; `/v1/identity` + `/v1/keys/for-me` + `/v1/enroll` + `/admin` stay edge-only), `excludeInboundPorts: []` — applied in the ordered § SSO self-mint rollout. The packaged `values.g2.yaml` ships exactly this posture (2026-10-07 sync — enable stays ATOMIC with the namespace injection) | `enabled: true` (example default) — baseline ALLOW rules only (ezaf-gateway + same-namespace); no relief knobs until the SSO rollout is applied to the trial |
 | Edge path classification (once the host is SSO-chained through oauth2-proxy) | Same classification for both profiles (§ SSO self-mint rollout step 3): `/`, `/ui` SSO-chained; `/v1/identity` + `/v1/keys/for-me` SSO-chained (NOT skip-auth); every other `/v1/*`, `/mcp/*` and `/admin` skip-auth — the app's own key is the control; `/health`, `/ready`, `/metrics` skip-auth or unrouted. **No blanket 302** (the MM RAG lesson) | Same table; the hosted-trial example additionally sets `ezua.routeAdmin: true` (the policy caller-gates the mesh). G2 keeps the chart default `false` — with the catch-all route still forwarding `/admin` to the same destination, so the difference is routing-declarative only |
 | Secrets strategy | Operator-managed out-of-band, referenced BY NAME (the packaged example is deliberately secret-free); the live release also runs `database.embedded.enabled: true` (co-deployed PG + the `pcai-llm-gateway-pg-auth` Secret) | Chart-generated `*.create: true` recommended on trials (admin keys, Fernet master key, embedded-PG auth) — generated once, `lookup()`-preserved on every later apply |
 | Metrics | `metrics.enabled: true` (the live G2 convention; the packaged example ships it `true`) — REQUIRED to pair with `allowMetricsScrape` once the policy is on, or the scrapes die | `metrics.enabled: true` + the PrometheusRule default ruleset on (dashboards are part of what a trial demonstrates) |
@@ -318,6 +319,8 @@ touch these directly. Every app knob in `src/pcai_llm/config.py` is
 | `PCAI_LLM_ROUTING_TIER1_TOKENS` / `PCAI_LLM_ROUTING_TIER2_TOKENS` | `settings.routingTier1Tokens` / `settings.routingTier2Tokens` (defaults 1500 / 6000) — the two cut points mapping the request's complexity score onto the profile's cheap-first ladder: below tier 1 serves the floor (`routing_min_model`), below tier 2 the middle of the floor..ceiling window, at/above tier 2 the ceiling. The score is prompt text (chars/4) + a flat per-image charge + a per-turn adder + capped `max_tokens`; tool definitions are deliberately NOT scored (an agent harness ships the same catalog every turn, so they are a constant, not a signal). Tune per fleet from the shadow-ledger data |
 | `PCAI_LLM_ROUTING_TURN_ADDER_TOKENS` | `settings.routingTurnAdderTokens` (default 100) — score adder per message beyond the first (conversation state demands capability even when the latest turn is short) |
 | `PCAI_LLM_MCP_FLAT_TOOLS` | `settings.mcpFlatTools` (default true) — `/mcp` tools/list re-exposes the calling key's GRANTED upstream tools as individual `{server}__{tool}` MCP tools (upstream inputSchemas + annotations, ACL-filtered per request; the gateway tools `mcp_catalog`/`mcp_call` stay listed first). `0` = kill switch back to the exact pre-flat two-tool surface |
+| `PCAI_LLM_REGISTRY_WATCH_S` | `settings.registryWatchS` (default 5) — cross-replica registry convergence: each replica polls `(count(*), max(updated_at))` over `mcp_servers` + `model_endpoints` on this cadence and refreshes its in-memory snapshot only when the watermark moved (the stamps are maintained by a DB trigger, so out-of-band SQL edits converge too). `0` disables the poll — correct ONLY on a single replica; with the HPA at 2+ pods, disabling it restores the "registered on one pod, 404 on the other" bug |
+| `PCAI_LLM_REGISTRY_ADMIN_FRESH_S` | `settings.registryAdminFreshS` (default 1) — the admin console's `GET /admin/mcp-servers` and `GET /admin/mcp-servers/{name}/tools` (the "test" button) re-check the watermark on read, at most once per this interval; fail-open (a watermark failure keeps the current snapshot and never 500s the read). `0` disables the fast path, leaving the console on the watcher cadence |
 | `PCAI_LLM_MCP_CATALOG_CACHE_S` | `settings.mcpCatalogCacheS` (default 60) — TTL seconds for the per-server upstream tool-listing cache (key-independent payload, server-level auth only, invalidated on every registry mutation, stale listing served on upstream error) |
 | `PCAI_LLM_MCP_FAILOVER_ATTEMPTS` | `settings.mcpFailoverAttempts` (default 2) — retries AFTER the primary when a FLATTENED `{server}__{tool}` call hits a transport failure (next priority-ordered enabled server with an explicit key grant + policy-admitted tool in its cached listing); explicit `mcp_call` targets never fail over |
 | `PCAI_LLM_MCP_ARG_POLICY` | `settings.mcpArgPolicy` (default **enforce**) — argument-level destination policy, the P0-1 stage that runs on BOTH MCP paths (`/mcp`'s gate chain and the RELAY executor, i.e. the tool calls a model makes during a chat turn). `enforce` \| `warn` \| `off`; an unrecognised value fails CLOSED to `enforce`. It blocks *where* a tool may send a request, not *what* it sends — exfiltration by URL payload survives this stage by design |
@@ -342,7 +345,8 @@ touch these directly. Every app knob in `src/pcai_llm/config.py` is
 | `PCAI_LLM_TOKEN_SHADOW_KEYS` / `PCAI_LLM_TOKEN_SHADOW_TENANT_ID` / `PCAI_LLM_TOKEN_SHADOW_KEY_NAME` | `settings.tokenShadowKeys` (default **false**) / `.tokenShadowTenantId` (default `""`) / `.tokenShadowKeyName` (default `token-shadow`) — token shadow-keys: a first-seen VALID token subject lazily gets a user + ledger key (`bound_via='token-shadow'`, scopes proxy+mcp) so usage attribution keeps its `key_id` anchor. Requires `tokenShadowTenantId` — without it the flag is inert. Off = tokens validate but never provision (anonymous-fp posture) |
 | `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_RPM` / `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_TPM` | `settings.tokenShadowRateLimitRpm` / `.tokenShadowRateLimitTpm` (defaults 60 / 100000) — the rate limits stamped on lazily-provisioned shadow keys (config-sourced; the console can tighten them per key afterwards, exactly like enrollment-created keys) |
 | `PCAI_LLM_SSO_KEY_CREATE_ENABLED` | `settings.ssoKeyCreateEnabled` (default **false**) — `POST /v1/keys/for-me`: a trusted browser identity may mint a key bound to its OWN subject (`sso-create`). Requires `trustProxyIdentity=true`; 403 otherwise. Scopes/limits are fixed (proxy+mcp, 60 rpm / 100k tpm); grants stay admin-controlled |
-| `PCAI_LLM_TRUST_PROXY_IDENTITY` | `settings.trustProxyIdentity` (default **false**) — trust the oauth2-proxy identity headers (`X-Auth-Request-User` / `X-Email` / `X-Forwarded-Groups`) on the gateway's browser identity rung. The headers are client-spoofable at the pod — set this ONLY where an enforcing proxy overwrites them on every request AND an Istio AuthorizationPolicy keeps unauthenticated callers from bypassing the proxy (pcai-helm-lib `_authorizationpolicy.tpl`) |
+| `PCAI_LLM_TRUST_PROXY_IDENTITY` | `settings.trustProxyIdentity` (default **false**) — trust the oauth2-proxy identity headers (`X-Auth-Request-User` / `X-Email` / `X-Auth-Request-Groups`) on the gateway's browser identity rung. The headers are client-spoofable at the pod — set this ONLY where an enforcing proxy overwrites them on every request AND an Istio AuthorizationPolicy keeps unauthenticated callers from bypassing the proxy (pcai-helm-lib `_authorizationpolicy.tpl`) |
+| `PCAI_LLM_TRUST_FORWARDED_GROUPS` | `settings.trustForwardedGroups` (default **false**) — consult `X-Forwarded-Groups` for browser-rung groups. Fail closed: the platform oauth2-proxy does NOT inject that header (see the Platform oauth2-proxy facts below), so an arriving value is client-supplied — a groupless proxy identity could otherwise self-grant `PCAI_LLM_ADMIN_GROUPS` by adding it (audit r5 #4, 2026-10-30). Enable ONLY for chains whose proxy injects and overwrites the forwarded header on every request |
 | `PCAI_LLM_MCP_CALLER_ATTRIBUTION` | `settings.mcpCallerAttribution` (default true) — stamp `X-MCP-Caller` (`<subject or key-fp>@gateway`) plus, when a real subject resolved, the companions `X-MCP-Caller-Subject` / `X-MCP-Caller-Class` on every upstream fleet MCP call (attribution-never-authorization; upstreams may record it in their audit chain, never authorize off it). All three names are RESERVED — tenants cannot supply them via per-key MCP credential overrides (400) and the gateway stamp overwrites any stale value after the last-wins merge |
 | `PCAI_LLM_MCP_SEPARATE_READ_EGRESS` | `settings.mcpSeparateReadEgress` (default `warn`) — read+egress separation (P0-3): flag or refuse a key whose grant set holds BOTH a read-class server (k8s-ops, logsearch, mm-rag, prometheus, seaborn, sqlhandler read tools) and an egress-class server (searxng) — the read-data-then-send-it combination. Server classes come from ONE constant, `mcpf/federation.py::MCP_SERVER_CLASSES`. **`warn` (default):** the call PROCEEDS; ticks metric `gateway_mcp_policy_blocked_total{reason="read+egress-warn"}` (the `-warn` suffix is deliberate — the series name says *blocked* and warn does not block) + one WARNING naming the key id and the offending (read, egress) pair. **`enforce`:** ticks `{reason="read+egress"}` and refuses EVERY call from a both-classes key (the whole grant set is the violation — the key is mis-scoped, not the individual call), so the rollout order is: run `warn`, review the flagged pairs, RE-SCOPE/split the keys (preset stamps via POST /admin/profiles `mcp_grant_preset`, or per-key PUT /admin/keys/{id}/mcp-grants) until warn is silent, THEN flip to `enforce`. `off` disables. The admin-tool hard stop (sqlhandler `admin_*` refused on the MCP surface unless the key carries `mcp_admin=TRUE`, default FALSE) is NOT behind this knob — it is unconditional |
 | `PCAI_LLM_ADMIN_GROUPS` | `settings.adminGroups` (default `""`) — admin gate second path: a trusted browser identity in ANY of these groups (comma-separated) may call the admin API. Empty = the group path is off; the bearer admin-key path is unchanged and always works. Same deployment precondition as `trustProxyIdentity` |
@@ -484,11 +488,15 @@ is CNI-layer; `ezua.authorizationPolicy.*` is mesh L7 (requires
     clearwing…) — unmeshed callers carry no peer identity, so
     per-namespace rules cannot match them either. The app's own key auth
     remains the control on every admitted path (the edge classifies
-    `/v1/*` identically). The two identity paths are the ONLY routes
-    whose resolver consumes the browser-header rung (`routes_identity.py`)
-    — they stay reachable ONLY from the edge namespace, which is what
-    makes `settings.trustProxyIdentity` safe: an in-cluster pod can never
-    deliver spoofed `X-Auth-Request-*` headers to a mint.
+    `/v1/*` identically). The identity-bearing surfaces — `/v1/identity`,
+    `/v1/keys/for-me`, `/v1/enroll` and `/admin` — are the routes whose
+    resolvers consume the browser-header rung (`routes_identity.py`,
+    `routes_enroll.py`, `routes_admin.require_admin`), so they stay
+    reachable ONLY from the edge namespace. That exclusion is what makes
+    `settings.trustProxyIdentity` safe: an in-cluster pod can never
+    deliver spoofed `X-Auth-Request-*` headers to a mint or an admin
+    action. (Rule (ii)'s same-namespace leg carries the same `notPaths`
+    set as this one — audit r5 #6.)
 Kubelet probes cannot be admitted by AuthorizationPolicy (outside the mesh,
 no separate probe port). Relief valve: `excludeInboundPorts: [9200]` stamps
 `traffic.sidecar.istio.io/excludeInboundPorts` on the pod — that port then
@@ -601,7 +609,11 @@ pod config, 2026-10-06): on chained hosts it injects
 `X-Auth-Request-Groups`. It does **NOT** inject `X-Forwarded-Groups` —
 the gateway's browser-identity reader accepts the `X-Auth-Request-Groups`
 spelling too, but any module that reads only `X-Forwarded-Groups` sees no
-groups behind the chain.
+groups behind the chain. The gateway itself reads `X-Forwarded-Groups`
+only behind `PCAI_LLM_TRUST_FORWARDED_GROUPS` (default **false** = fail
+closed): without that flag a groupless proxy identity plus a
+client-supplied forwarded header self-granted admin groups (audit r5 #4,
+2026-10-30).
 
 ## Kyverno vendor labels (optional)
 
@@ -626,8 +638,8 @@ token, even in-cluster. Three modes, first hit wins:
    Rotation = paste the new key + Save — **no pod restart**. Per-endpoint
    keys are the normal case: every model can have its own. The same panel
    path stores per-KEY MCP header overrides (Admin ▸ Keys ▸ `creds`) —
-   e.g. the memory-MCP `X-Memory-Dataset` / `X-Dataset-Password` pair that
-   gives each tenant its own dataset identity.
+   e.g. the memory-MCP `X-API-Key` that gives each tenant its own identity
+   (the legacy `X-Memory-Dataset` / `X-Dataset-Password` pair also works).
 2. **By-reference Secret** (ops-managed tokens): `api_key_secret` /
    `auth_secret` names + `upstreamKeySecrets[]` / `mcpKeySecrets[]` chart
    values (env `PCAI_LLM_UPSTREAM_KEY__*` / `PCAI_LLM_MCP_KEY__*`).

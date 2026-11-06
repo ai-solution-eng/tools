@@ -1,10 +1,13 @@
 """Key-scoped saved-conversation API (data-plane, per API token).
 
 Server-side transcripts behind the SAME bearer auth as the proxy: every
-route resolves the virtual key via ``require_key`` and hands ``key.id`` to
-the core layer, which scopes every query by it — a key can only ever see
-and mutate its own conversations, and a foreign/unknown id is a plain 404
-(no existence oracle). The router deliberately carries NO prefix: the
+route resolves the virtual key via ``require_key`` and hands its KEY GROUP
+(``key.key_group``, the rotation-stable identity; ``_group()`` falls back
+to the id for a legacy/fake record) to the core layer, which scopes every
+query by it — a key can only ever see and mutate its own GROUP's
+conversations, and a foreign/unknown id is a plain 404 (no existence
+oracle). Rotation therefore keeps the history while an unrelated key of the
+same user stays isolated. The router deliberately carries NO prefix: the
 paths below carry ``/v1/conversations`` literally (the parent wires
 ``app.include_router(router)``).
 
@@ -47,6 +50,18 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": message})
 
 
+def _group(key: KeyRecord) -> uuid.UUID:
+    """The key's rotation-stable KEY GROUP.
+
+    Every conversation query scopes by this, never by ``key.id``: rotation
+    mints a new id and revokes the old one, and the operator report was
+    exactly "Conversations aren't saved for the key after rotation". A
+    legacy/fake record with no group reads as its own group of one, which is
+    the pre-feature behaviour.
+    """
+    return key.key_group or key.id
+
+
 def _conversation_id(raw: str) -> uuid.UUID | None:
     """Parse a raw path segment; garbage is None (→ 404, never 500/422)."""
     try:
@@ -87,7 +102,7 @@ async def _json_object(request: Request) -> dict[str, Any] | JSONResponse:
 @router.get("/v1/conversations")
 async def list_conversations(key: KeyRecord = fastapi.Depends(require_key)) -> dict[str, Any]:
     """The calling key's conversations, newest activity first."""
-    return {"data": await conversations.list(key.id)}
+    return {"data": await conversations.list(_group(key))}
 
 
 @router.post("/v1/conversations", status_code=201)
@@ -102,7 +117,7 @@ async def create_conversation(
     title = body.get("title")
     if title is not None and not isinstance(title, str):
         return _error(400, "title must be a string")
-    conv = await conversations.create(key.id, key.user_id, title=title)
+    conv = await conversations.create(key.id, key.user_id, title=title, group_id=_group(key))
     return {"id": conv["id"], "title": conv["title"], "updated_at": conv["updated_at"]}
 
 
@@ -115,7 +130,7 @@ async def get_conversation(
     cid = _conversation_id(conversation_id)
     if cid is None:
         return _error(404, "not found")
-    conv = await conversations.get(key.id, cid)
+    conv = await conversations.get(_group(key), cid)
     if conv is None:
         return _error(404, "not found")
     return conv
@@ -139,7 +154,7 @@ async def rename_conversation(
         return _error(400, "title is required")
     if not isinstance(title, str):
         return _error(400, "title must be a string")
-    renamed = await conversations.rename(key.id, cid, title)
+    renamed = await conversations.rename(_group(key), cid, title)
     if renamed is None:
         return _error(404, "not found")
     return renamed
@@ -167,12 +182,12 @@ async def replace_conversation_messages(
     if not isinstance(messages, list):
         return _error(400, "messages must be a list")
     try:
-        saved = await conversations.replace_messages(key.id, cid, messages)
+        saved = await conversations.replace_messages(_group(key), cid, messages)
     except ConversationNotFound:
         return _error(404, "not found")
     except ConversationValidationError as exc:
         return _error(413 if exc.code in _TOO_LARGE_CODES else 400, str(exc))
-    head = await conversations.get_meta(key.id, cid)
+    head = await conversations.get_meta(_group(key), cid)
     # The conversation continued: drop the distilled marker so the scheduled
     # sweep RE-distills it (the DSH plugin lifecycle - the stored memory
     # tracks the conversation's latest state). Best-effort, never affects
@@ -196,6 +211,6 @@ async def delete_conversation(
     cid = _conversation_id(conversation_id)
     if cid is None:
         return _error(404, "not found")
-    if not await conversations.delete(key.id, cid):
+    if not await conversations.delete(_group(key), cid):
         return _error(404, "not found")
     return {"deleted": True}

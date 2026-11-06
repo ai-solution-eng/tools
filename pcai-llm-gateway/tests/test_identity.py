@@ -152,7 +152,7 @@ def test_schema_uses_gen_random_uuid_for_subjects() -> None:
 
 def test_browser_identity_parses_user_email_groups() -> None:
     ident = browser_identity_from_headers(
-        {"X-Auth-Request-User": "alice", "X-Forwarded-Groups": "eng, platform-admin ,"}
+        {"X-Auth-Request-User": "alice", "X-Auth-Request-Groups": "eng, platform-admin ,"}
     )
     assert ident == ("alice", ["eng", "platform-admin"])
     # email fallback when the user header is absent
@@ -216,7 +216,7 @@ def test_ladder_browser_headers_need_the_flag(monkeypatch: pytest.MonkeyPatch) -
     ONLY under PCAI_LLM_TRUST_PROXY_IDENTITY=true. Flag off (the default) =
     today's pseudonymous behavior — a caller cannot rotate fake identity
     headers into an identity (the RAG_TRUST_PROXY_IDENTITY rule)."""
-    headers = {"X-Auth-Request-User": "alice", "X-Forwarded-Groups": "eng"}
+    headers = {"X-Auth-Request-User": "alice", "X-Auth-Request-Groups": "eng"}
     kid = uuid.uuid4()
     k = _key(id=kid)
 
@@ -514,7 +514,7 @@ def test_enroll_browser_sso_headers_win_over_self_asserted(enroll_env, monkeypat
     r = tc.post(
         "/v1/enroll",
         json={"code": routes_enroll.generate_code(), "name": "Alice", "subject": "typed@example"},
-        headers={"X-Auth-Request-User": "sso-alice", "X-Forwarded-Groups": "eng"},
+        headers={"X-Auth-Request-User": "sso-alice", "X-Auth-Request-Groups": "eng"},
     )
     assert r.status_code == 201, r.text
     body = r.json()
@@ -776,8 +776,16 @@ def test_rotate_carries_binding(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "subject_id" in fake.insert_sql and "bound_via" in fake.insert_sql and "bound_at" in fake.insert_sql
     # 12 base cols (stream_pcai_events joined) + spend_ancestors + 3 identity
     # + mcp_admin (2026-10-26 hardening plan P0-3: the MCP admin opt-in is an
-    # identity attribute and must survive rotation, like subject/bound_via).
-    assert len(fake.insert_args) == 17
+    # identity attribute and must survive rotation, like subject/bound_via)
+    # + enrollment_id (2026-10-30: team membership — dropping it would silently
+    # remove the rotated key from its team's hard budget cap).
+    # 19 since 2026-11-03 — key_group, the rotation-stable conversation scope
+    # (a group not carried through rotation orphans saved conversations).
+    assert len(fake.insert_args) == 19
+    assert "enrollment_id" in fake.insert_sql
+    assert "key_group" in fake.insert_sql
+    assert fake.insert_args[17] is None  # this SSO-bound key belongs to no team
+    assert fake.insert_args[18] == old["id"]  # pre-column row -> its own group
     assert fake.insert_args[16] in (False, None)  # mcp_admin default: not an MCP admin
     assert fake.insert_args[13] == old_subject_id
     assert fake.insert_args[14] == VIA_ENROLLMENT
@@ -951,6 +959,13 @@ class ProjectionDB:
 
     async def fetch(self, sql: str, *args: Any):
         self.queries.append((sql, args))
+        if "UNION ALL" in sql:
+            # The trace read is TWO-PHASE since 2026-11-02: the first query
+            # selects conversation UNITS (thread ids, or request ids for
+            # unthreaded rows) and the second reads their rows. Hand back one
+            # unit so the row-producing query — the one these tests inspect —
+            # actually runs. No other endpoint in this file issues a UNION.
+            return [{"thread_id": "t-proj", "request_id": None, "last_ts": None}]
         return []
 
     async def fetchval(self, sql: str, *args: Any):
@@ -996,6 +1011,14 @@ def test_usage_group_by_subject(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_traces_project_subject_join(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trace read projects the Phase A identity columns (bound_via /
+    subject / subject_idp) through the key→subject join.
+
+    INSPECT THE ROW-PRODUCING QUERY, NOT THE FIRST ONE (2026-11-02): the read
+    is two-phase — query 0 selects conversation UNITS (thread ids, or request
+    ids for unthreaded rows) and carries no projection at all; query 1 builds
+    the timeline rows and is the only place the actor/identity joins can live.
+    """
     from pcai_llm.core import traces
 
     monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
@@ -1006,9 +1029,10 @@ def test_traces_project_subject_join(monkeypatch: pytest.MonkeyPatch) -> None:
     tc = TestClient(app, raise_server_exceptions=False)
     r = tc.get("/admin/traces", headers=ADMIN_H)
     assert r.status_code == 200
-    sql, _ = fake.queries[0]
+    assert len(fake.queries) == 2, "unit selection + row fetch"
+    sql, _ = fake.queries[-1]
     assert "LEFT JOIN subjects s ON s.id = k.subject_id" in sql
-    assert "s.subject AS subject" in sql
+    assert "s.subject AS subject" in sql and "k.bound_via AS bound_via" in sql
     # the new columns are GROUP-BY-safe (every projection is grouped)
     for col in ("k.bound_via", "s.subject", "s.idp"):
         assert col in sql.split("GROUP BY", 1)[1], f"{col} must be in the GROUP BY"
@@ -1039,6 +1063,7 @@ def test_list_keys_projects_subject(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "LEFT JOIN subjects s ON s.id = k.subject_id" in sql
     assert "k.bound_via" in sql and "s.subject AS subject" in sql
 
+
 # ---------------------------------------------------------------------------
 # audit C4 (2026-10-29) — the browser-header rung must be REACHABLE from the
 # auth surfaces (attribution), and must never become an authorization input.
@@ -1053,9 +1078,9 @@ def test_list_keys_projects_subject(monkeypatch: pytest.MonkeyPatch) -> None:
 # The three segments live in separate constants so no three-part token exists
 # in the source at all (an f-string of three names never matches the scanner's
 # dot-joined JWT pattern, and none of the names is secret-shaped).
-_JWT_HEADER = "eyJhbGciOiJSUzI1NiJ9"   # {"alg":"RS256"}
-_JWT_PAYLOAD = "eyJzdWIiOiJ0b2tlbi1zdWIifQ"   # {"sub":"token-sub"}
-_JWT_SIGNATURE = "c2ln"   # "sig"
+_JWT_HEADER = "eyJhbGciOiJSUzI1NiJ9"  # {"alg":"RS256"}
+_JWT_PAYLOAD = "eyJzdWIiOiJ0b2tlbi1zdWIifQ"  # {"sub":"token-sub"}
+_JWT_SIGNATURE = "c2ln"  # "sig"
 JWT_SHAPED = f"{_JWT_HEADER}.{_JWT_PAYLOAD}.{_JWT_SIGNATURE}"
 
 
@@ -1079,7 +1104,7 @@ def test_c4_data_plane_attribution_uses_the_browser_rung(monkeypatch: pytest.Mon
     async def fake_authenticate(_plaintext: str) -> KeyRecord:
         return record
 
-    headers = {"authorization": "Bearer hllm-abc", "x-auth-request-user": "alice", "x-forwarded-groups": "eng"}
+    headers = {"authorization": "Bearer hllm-abc", "x-auth-request-user": "alice", "x-auth-request-groups": "eng"}
     key, caller = asyncio.run(auth_mod.resolve_bearer_key(None, authenticate=fake_authenticate, headers=headers))
 
     assert key is not None and key.id == kid, "authorization still rides the presented key"
@@ -1148,3 +1173,52 @@ def test_c4_browser_rung_never_authorizes(monkeypatch: pytest.MonkeyPatch) -> No
     assert key is not None and key.id == shadow.id
     assert shadow_subjects == ["token-sub"], "authorization must anchor on the token subject"
     assert caller is not None and caller.subject_kind == KIND_BROWSER and caller.subject == "alice"
+
+
+# ---------------------------------------------------------------------------
+# (audit r5 #4 + xv cross-validation follow-up, 2026-10-30) Groups-header
+# trust: the proxy-injected X-Auth-Request-Groups is the ONLY source by
+# default; X-Forwarded-Groups is consulted ONLY behind
+# PCAI_LLM_TRUST_FORWARDED_GROUPS (the platform proxy never injects it —
+# module comment; DEPLOYMENT.md "Platform oauth2-proxy facts"; helm/
+# carries no strip/overwrite — so an arriving forwarded value is
+# client-supplied, and a GROUPLESS proxy identity could otherwise
+# self-grant adminGroups by adding it).
+# ---------------------------------------------------------------------------
+
+
+def test_browser_groups_proxy_spelling_wins_over_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BOTH headers present, flag off AND on: the group comes from
+    X-Auth-Request-Groups (the proxy-injected spelling); the client-supplied
+    X-Forwarded-Groups value is discarded either way."""
+    headers = {
+        "X-Auth-Request-User": "alice",
+        "X-Auth-Request-Groups": "eng",
+        "X-Forwarded-Groups": "platform-admin",
+    }
+    monkeypatch.setattr(settings, "trust_forwarded_groups", False)
+    assert browser_identity_from_headers(headers) == ("alice", ["eng"])
+    monkeypatch.setattr(settings, "trust_forwarded_groups", True)
+    assert browser_identity_from_headers(headers) == ("alice", ["eng"])
+
+
+def test_browser_groups_forwarded_only_needs_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FORWARDED-only groups header is client-supplied on the platform
+    chain: flag off (the default) yields NO groups; the flag is the explicit
+    opt-in for chains whose proxy injects the header."""
+    headers = {"X-Auth-Request-User": "alice", "X-Forwarded-Groups": "eng"}
+    monkeypatch.setattr(settings, "trust_forwarded_groups", False)
+    assert browser_identity_from_headers(headers) == ("alice", [])
+    monkeypatch.setattr(settings, "trust_forwarded_groups", True)
+    assert browser_identity_from_headers(headers) == ("alice", ["eng"])
+
+
+def test_browser_groups_empty_proxy_header_still_falls_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An EMPTY (not absent) X-Auth-Request-Groups is no groups assertion —
+    behind the flag it falls through to X-Forwarded-Groups; flag off (the
+    default) the fall-through lands nowhere: no groups."""
+    headers = {"X-Auth-Request-User": "a", "X-Auth-Request-Groups": "   ", "X-Forwarded-Groups": "fwd"}
+    monkeypatch.setattr(settings, "trust_forwarded_groups", True)
+    assert browser_identity_from_headers(headers) == ("a", ["fwd"])
+    monkeypatch.setattr(settings, "trust_forwarded_groups", False)
+    assert browser_identity_from_headers(headers) == ("a", [])

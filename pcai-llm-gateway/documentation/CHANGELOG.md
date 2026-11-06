@@ -5,6 +5,420 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## Unreleased
+
+- **Distiller off-peak scheduling follows the summarizer model, not the
+  fleet average (2026-11-05 operator report).** The Memory Distiller's
+  `offpeak_only` gate read the GLOBAL evaluator, so a busy fleet average kept
+  the sweep paused even when the distiller's own model was idle — live:
+  Qwen3.8-27B at ~1.6% (off-peak) while the fleet average sat at ~24%, and
+  the automatic feed wrote nothing for hours. The gate now reads
+  `offpeak.model_active(<summarizer model>)` first: the model's own
+  per-model PromQL (the Off-peak panel's per-model rows) decides. A busy
+  per-model state blocks the sweep even if the global state is active; an
+  off-peak per-model state opens it even if the global state is idle. When
+  no model is pinned (empty = caller routing) or no per-model query is
+  configured, it falls back to the global hysteresis exactly as before. The
+  admin panel hint, the config docstring and FEATURES.md state which
+  evaluator governs. Explicit `/v1/distill` calls are unchanged (they always
+  run). Tests: busy-model blocks, idle-model opens, global fallback in both
+  directions, and unpinned-model fallback.
+
+- **Live pools get an edit surface, and both registry tables share one action
+  block (2026-11-05 operator request).** The Models tab could register a pool
+  but never edit one, so changing a priority or a weight meant re-typing
+  every endpoint. Each Live pools row now carries an `edit` button that loads
+  the FULL registration into the top form — the same register+edit surface
+  the MCP tab uses: base URLs, priorities, weights, by-ref Secret names and
+  the pool's model type. The model name is fixed while editing (it is the
+  pool key; a POST under a new name would create a second pool and leave the
+  old one behind — remove and re-register to rename), `Cancel` returns to
+  register mode, and a blank API key keeps the stored credential. The read is
+  a new admin-only `GET /admin/models/{model_name}/pool`: `GET /admin/models`
+  returns names only and the health surface carries no credential state, so
+  the form needs its own read. Credential VALUES never cross it —
+  `api_key_secret` is the by-reference Secret NAME (the same pointer the MCP
+  registry exposes) and `auth_configured` is the boolean "a panel token is
+  stored", used only to render `(unchanged)`. The Live pools and Registered
+  servers action cells now render the SAME block: equal ghost buttons in the
+  `.rowacts` grid, with the test result on its own line underneath. Inline
+  results used to sit beside the buttons, so a wider `ok · 122ms` or a fail
+  message wrapped on some rows and not others — row heights changed and the
+  table stretched past the card. The result line is pinned to the block width
+  and long text wraps inside it; weight `0` (standby) is preserved through
+  the edit paint AND the save. Tests: the pool read (round-trip, mixed type,
+  404, slash-named pools, no credential values), plus source-shape pins on
+  the edit flow and the shared action cell.
+
+- **Deterministic tool-result compression for relayed turns
+  (2026-11-04, opt-in).** Oversized tool results were re-prefilled on every
+  later iteration of a turn, and the only bound was a blunt 32,000-char head
+  cap — which throws away the END, where the error usually is. A new
+  model-free layer (`core/toolcompress.py`) detects five content kinds (JSON
+  arrays, NDJSON, logs, search output, unified diffs) and keeps the signal
+  instead: error records and boundary context for JSON, ERROR/stack-trace/
+  summary lines for logs, first matches per file for search, changed lines
+  for diffs. Every rewrite is reversible: the original is stored in
+  `tool_compress_store` under a content digest (KEY-SCOPED by primary key,
+  TTL-reclaimed by housekeeping) and the synthetic `pcai__retrieve` tool
+  pages it back. Determinism is the cache contract — the client re-sends its
+  history every turn and the same bytes must compress to the same bytes, or
+  the provider prefix cache would be invalidated on every request. Off by
+  default; `X-PCAI-Compress-Tools: 1` enables per request, `shadow` measures
+  the saving without rewriting, and `X-PCAI-Compress-Tools` announces the
+  mode on the response. Settings: `toolCompressDefault`,
+  `toolCompressMinChars` (4096), `toolCompressRatioFloor` (0.15),
+  `toolCompressStoreTtlS` (86400), `toolCompressMaxStoreChars` (1,000,000
+  — a larger original passes through rather than pinning multi-MB text for
+  the TTL). A store failure or an over-ceiling original passes the original
+  through — never a marker pointing at a digest that was never persisted.
+
+- **Agents can name specific TOOLS per server, not just whole servers
+  (2026-11-04 operator request).** An agent's surface used to be the
+  intersection of the key's grants and the agent's server list, so selecting
+  `prometheus` meant all 10 tools whether the role needed one or all. The
+  Agents tab now expands each server into its LIVE catalog
+  (`GET /admin/mcp-servers/{name}/tools` — the same call the MCP tab uses) and
+  lets the operator tick individual tools; the save carries
+  `tools: {server: [tool, ...]}`. Semantics: a server ABSENT from `tools` is
+  whole-server (the pre-2026-11-04 meaning, so existing agents are untouched);
+  a listed server keeps only the named tools; narrowing can only ever HIDE,
+  and an unknown/stale tool name simply matches nothing (so a save never
+  depends on an MCP server being up). Both consumers narrow identically — the
+  OFFERED catalog (the hybrid `pcai_tools` directory and per-server tool
+  counts, and `describe`'s promotion set) and the DISPATCH gate
+  (`offered_grants`) — while the read+egress gate keeps the key's WHOLE grant
+  set, unchanged: a per-request switchable selector must never become a way to
+  split read and egress across two agents. Storage is `agent_profiles.tools`
+  (TEXT JSON, same shape as `profiles.defaults_json`; `ADD COLUMN IF NOT
+  EXISTS` for live deployments). Validation refuses a tools key that is not
+  in `servers` (dead config), an empty/blank list (remove the server
+  instead), and more than 2000 narrowed names. The console table shows the
+  narrowing per server (`k8s-ops · 3`), and a ticked server whose whole
+  catalog is checked still saves as whole-server. Tests: pure narrowing
+  (grants + catalog, unknown tools, whole-server absence, malformed TEXT),
+  admin validation/round-trip, and a source-shape pin on the picker.
+
+- **The chat console renders markdown (2026-11-04 operator request).** Assistant
+  replies were escaped text with only bold/links/images expanded, so fenced
+  code, inline code, headings, bullets, quotes and tables printed as raw
+  syntax. A self-contained `renderMarkdown` block in `index.html` now renders
+  fenced code (language label + per-block **Copy**), inline code, headings,
+  nested ordered/unordered and task lists, blockquotes, horizontal rules, GFM
+  tables, bold/italic/strikethrough, http(s) links/images and bare URLs.
+  **Safety:** model output is untrusted — every text chunk is escaped BEFORE
+  inline rules apply, and only tags the renderer's own literals produce are
+  emitted, so `<script>`, attribute injection and `javascript:`/`data:` URLs
+  stay inert. The block is extracted verbatim by the UI tests and run under
+  node against adversarial fixtures (`test_markdown_renderer_*`), including an
+  unclosed fence (the streaming shape). Streaming stays live but repaints are
+  coalesced to ~8/s (`renderRichSoon`), and the turn's final paint always
+  renders — the last frame can never be a stale mid-throttle render. Markdown
+  bubbles drop `white-space: pre-wrap` (literal text keeps it) and widen to
+  88%; no new dependencies, no CSP change (classes only, no inline styles).
+
+- **The MCP-tools dialog stops modelling a RAG dataset (2026-11-04, operator
+  decision: "we shouldn't specialize so much — just set the X-API-Key for a
+  rag application").** The homepage dialog no longer renders a **Private
+  memory dataset** card and `GET /v1/mcp/selfservice` no longer carries a
+  `memory` object. The current RAG model is SSO-managed: the user mints an
+  API key in the RAG app (`/access`, D25), ★-binds a dataset there, and the
+  backend resolves dataset+password server-side from the presented key — so
+  the gateway only ever needs ONE header override per key (`mm-rag` →
+  `X-API-Key`). Consequences: the memory server's generic credential row is
+  no longer superseded (it IS the attachment surface), each row now shows its
+  stored header NAMES ("a save replaces this set") so a legacy set stays
+  replaceable/clearable, the placeholder reads `X-API-Key`, the redeem page
+  no longer offers the legacy private-dataset opt-in (the API/profile
+  `memory_opt_in` path and its `X-Memory-Dataset`/`X-Dataset-Password` stamp
+  remain for explicit callers), and `PCAI_LLM_MEMORY_APP_URL` /
+  `settings.memoryAppUrl` is retired — its only consumer was the card's
+  RAG-app link. No distiller behavior change: the attachment gate was already
+  capability-based (`memory_status` probed with the key's own credential
+  merge), so an `X-API-Key` key is attached exactly like any other; the
+  stale pair-stamp wording in `config.py`, the chart comments and API.md is
+  corrected to match. Legacy pair users keep two paths: replace/clear the
+  stored set from the same generic row, or store both headers with the admin
+  console's multi-row editor.
+
+- **Cross-validation round (DeepSeek + GLM, 2026-11-03): three rotation-continuity
+  defects found by BOTH cells and fixed.** The two-model review of the SSO +
+  key-group wave independently produced the same HIGH, plus a latent twin and a
+  consumer the wave had missed:
+
+  * **HIGH — `load_key_record` omitted `k.key_group`.** The by-id door (the
+    scheduled-distill sweep) feeds the SAME `key_record_from_row` as
+    `authenticate`, and the mapper's fallbacks are silent: it reported the
+    key's OWN id as its group. The sweep then scoped `conversations.get` by
+    the new id, missed every rotated conversation, and dropped its marker as
+    "gone/purged" on every pass — never distilled, one lying warning per
+    sweep. Fixed (SELECT now names `k.key_group` and `k.mcp_admin`, with the
+    column-parity contract documented).
+  * **LOW latent — `_SHADOW_KEY_SQL` omitted `k.key_group` too**, so the
+    token (JWT/SSO) door resolved a shadow key's group as its id while the
+    bearer door read the DB column — a rotated shadow key could never see
+    history the token door wrote. Fixed (same SELECT parity).
+  * **HIGH — the due sweep joined the CREATING key** (`k.id = c.key_id AND
+    k.revoked_at IS NULL`), so ONE rotation removed the user's whole store
+    from distillation while the console kept showing it. Fixed: the query now
+    resolves the group's NEWEST LIVE non-expired key via `JOIN LATERAL` and
+    uses that key for the attachment gate and the scheduled load. Semantics
+    note: distill spend now bills the group's newest live credential (a group
+    with no live key drops out — the honest outcome, same as before).
+  * **NEW (found by neither cell, confirmed by both) — the SSO rotate dropped
+    per-key grants and the memory attachment.** It copied lineage/group/
+    budgets but not `mcp_tool_acls`/`mcp_server_creds`, which the admin rotate
+    has copied since the 2026-09-18 incident. Worse than continuity: the
+    profile re-stamp re-ALLOWED a per-key DENY row, and the lost creds row
+    silently excluded the group from the distill sweep. Fixed with two
+    INSERT..SELECTs inside the existing transaction; the ACL copy is
+    `ON CONFLICT ... DO UPDATE SET allowed = EXCLUDED.allowed` because the
+    profile stamp already wrote rows for the fresh key (a plain INSERT 500s;
+    DO NOTHING would resurrect the deny).
+
+  Also fixed from the review: a stale `routes_conversations` docstring, the
+  401 branch leaving a dead key's text in the input (which kept the mint card
+  hidden), and the `model_capacity` docstring now states that a REFUSED
+  model's `warn` is the band accumulated before the refusal (the gate's
+  header only rides admitted calls). Accepted with rationale: the overflow
+  probe's fault discards the capacity map (callers catch; fail-open) and the
+  `/v1/models` routing-window residuals (display-only; admission enforces).
+  Regression tests added for all three SELECT/join fixes and the SSO-rotate
+  carry-over; `due_canonical_conversations` still keys on the creating
+  credential (canonical store has no group column) — flagged, not changed.
+
+- **SSO sign-in associates once and stays associated; conversations survive
+  rotation (2026-11-03, operator report).** Three UX defects, one root cause —
+  the SSO session and the credential were two disconnected things:
+
+  * "It knows my identity … but cannot chat": the chip rendered the SSO
+    subject while the chat required a key, with no explanation. The keyless
+    SSO chip now says "no key on this browser yet".
+  * "Clicking the SSO button ALWAYS gets me a new rotated key": the mint card
+    was shown whenever minting was ALLOWED, even with a working key
+    connected; clicking it hit the one-key-per-identity 409 and the only way
+    forward was a rotate. The card is now a FIRST-mint affordance (flag AND
+    no key on this browser), the minted key is stored with SSO PROVENANCE and
+    auto-remembered (a device credential — the remember box stays visible and
+    un-checkable), boot auto-connects it in the SSO chip flavor, and the 409
+    dialog names the existing key (prefix/created-at from
+    `GET /v1/keys/for-me`) before offering the destructive replace.
+  * "Can we keep the signed in as andrew-bydlon text mode" (and the follow-up
+    "switching to SSO is a no-op, which does not make any sense"): the chip
+    now reports IDENTITY + PROVENANCE, not a mode. It always names the
+    platform identity when the probe resolved one ("Signed in as
+    andrew-bydlon"), and the pill says what authenticates — 'oidc' for an
+    SSO-minted key, 'API key' for a pasted one. The two in-chip "switch"
+    links are REMOVED: only one credential is stored, so they could only
+    relabel the chip. Switching credentials is explicit — paste a key +
+    Connect, or Sign out and use the SSO card.
+  * "I signed in using my admin key and can no longer sign out" → refined to
+    the owner rule **"If SSO, use SSO key, no sign-out, green; if not, allow
+    sign-out"**. SSO mode is a property of the ACTIVE CREDENTIAL's binding,
+    decided SERVER-SIDE: `GET /v1/identity` WITH the key returns its own
+    subject, and a key bound to the browser's SSO subject is SSO — minted here
+    OR pasted from another device, so the API-key connect path converges on
+    the same treatment. An SSO-bound key gets the green dot + 'oidc' pill and
+    NO local Sign out (the platform sign-out ends it); a non-SSO key
+    (admin/CLI, no subject binding) keeps Sign out, which clears this device
+    only and stays.
+  * Header status (screenshot review, 2026-11-03): the connection/model-count
+    dot moved OUT of the chip row and next to the MODEL PICKER it describes;
+    the chip's dot now means "can I chat" (green = working key, amber =
+    identity resolved but no key on this browser) while the pill keeps
+    provenance; and an uncapped key's strip no longer dead-ends at "no budgets
+    on this key" — it shows the live minute window ("unlimited · N req /
+    N tok this min"), so the strip always says what the key is doing.
+  * "Conversations aren't saved for the key after rotation": conversations
+    are scoped by `api_keys.key_group` — a rotation-stable id every rotate
+    copies forward (backfilled from the `spend_ancestors` lineage root for
+    existing chains) — instead of the raw key id. Admin rotate and the SSO
+    rotate both carry it; independent keys of one user keep their own group,
+    so this does not widen visibility across them. The chat API is unchanged
+    for callers: any key in the group reads/writes the same transcripts.
+
+  Tests: conversation group scoping + rotation continuity (data layer and
+  routes), rotate column/arg carry (admin + SSO), and the UI provenance /
+  first-mint-only / chip-flavor rules.
+
+- **Budget-aware routing and model selection: TEAM overhead included, "about to
+  run out" / "unavailable to you" surfaced (2026-11-03, operator report).** The
+  complexity router's availability filter and `GET /v1/models`'
+  `pcai.capacity` both read `budgets.model_capacity`, which stopped at the
+  key's OWN budget rows. A key whose TEAM pool (or per-model team cap) was
+  exhausted therefore still looked available: the router offered the model, the
+  decision model saw it in `{{model_list}}`, the picker showed it usable — and
+  admission then 429'd the request, which walked the ordering for nothing. The
+  mirror image was wrong too: a key over its own allocation but riding an
+  `overflow_enabled` team pool looked UNAVAILABLE, so routing degraded instead
+  of using the pool the gate would have admitted.
+
+  `model_capacity` is now a faithful projection of `check_budgets`, sharing
+  its evaluators instead of copying the math (`_eval_token_rows`,
+  `_eval_usd_rows`, `_envelope_eval`, `_cap_overflow_verdict`,
+  `_pooled_overflow_verdict`): per-key rows charged with the admission
+  estimate, the team envelope (per-model caps, pooled outer bound, overflow
+  swallow with its UNCOMMITTED-headroom test), and the 80/95 warn band from
+  BOTH layers. `est_tokens` is a new argument — the routing path passes the
+  request's estimate so a model with 5k tokens left is not offered for a 100k
+  request; the listing keeps the historical est-0 "has headroom" read.
+
+  On the wire: `pcai.capacity` gained `warn` and, when the key belongs to a
+  capped enrollment, a `team` block (`period`/`ok`/`warn`/`blocked_by`);
+  `routing` / `routing__X` entries gained `pcai.capacity` aggregated over
+  their floor..ceiling window (`ok` = any rung servable, `warn` = the
+  tightest rung's band, `candidates` = {ok, blocked} counts) so a picker can
+  say "Unavailable to you" and "You are about to run out".
+  `X-Budget-Warning` now carries the tighter of the per-key and team bands.
+  Query cost is unchanged for keys without a team (same probe fast path); a
+  team-capped key pays ONE extra aggregate, and the overflow swallow costs at
+  most one round trip per configured cap scope, memoised across the whole
+  listing. Fail-open is unchanged: a budget or team aggregate fault degrades to
+  the previous listing, never to an empty one.
+
+- **Admin + team-leader forms: ONE horizontal plane per line (2026-11-03, operator report).**
+  The MCP server form, the model-pool form and both key forms lifted one input above its
+  neighbours: a password field's `show` toggle was stacked UNDER the box, and a trailing field
+  hint under Subject / Expires made that label taller — and the row's `align-items:end` aligned
+  BOTTOMS, so the taller field's input floated up (25px on MCP/Models, 21-26px on the keys
+  rows). Fixed structurally, not per page:
+
+  * `show` / `hide` now rides the field's TITLE line (`.fhead`), never a row of its own; a bare
+    input (the header admin key) keeps the toggle beside it.
+  * Rows align on the TOP of the control slot; a trailing `.hint` leaves the flow into a band
+    reserved under the controls and the title line is padded, so neither a hint nor a wrapped
+    title can shift one control off the plane.
+  * The band and title heights are MEASURED per flex line (`--hint-h`, `--fhead-h`, `--ctl-top`,
+    `--chk-top`) after every render, tab switch, dialog open and resize — a wrapped row gets one
+    plane per line, and a hidden section (which measures as 0) re-measures on activation.
+  * The old opt-in `.row-hints` hack (absolute hint + hard-coded 26px reserve) is gone, which
+    also removes the hint-over-buttons overlap it left on the MCP form.
+  * Both consoles carry the same implementation; a test compares the four helpers
+    function-by-function so admin.html and team_leader.html cannot drift.
+
+- **INCIDENT 2026-11-03: the health probe took the fleet down ("503 no healthy upstream" on
+  every request).** Root cause chain, all four links ours: the probe shipped **enabled by default**;
+  it made an **auth-less** `GET {base_url}/models`; it classified **every non-2xx as a failure**
+  (including 401); and `Pool.healthy()` excluded `probe_ok is False`. An upstream that gates
+  `/models` therefore answered 401 to the first sweep, the whole fleet was marked probe-failed, every
+  pool emptied, and `pool.pick()` returned None → `503 {"detail":"no healthy upstream"}` for every
+  chat request. Two details made it hard to see: the transition-only logging treated "never probed →
+  fail" as NOT a transition (so the first, fleet-wide failure logged nothing), and there was no probe
+  metric.
+
+  Four fixes, each aimed at one link:
+  1. **Credentials** — the probe presents the endpoint's OWN credential through
+     `core.upstream_auth.upstream_headers(..., quiet=True)`, the same resolution the forward path
+     uses (`quiet` because a 30 s sweep must not turn a missing credential into a log flood; the
+     forward path still shouts).
+  2. **Honest classification** (`health_probe._classify`) — 2xx = ok; 5xx / transport = fail;
+     **401/403 = OK** (the server answered, so it is ALIVE — availability is not authorization; the
+     forward path surfaces the 401 honestly); **any other 4xx = UNKNOWN** (the probe request was
+     wrong — path shape, method, no `/models` card — so the endpoint's state is left untouched).
+     Our own misconfiguration must never remove a healthy model from rotation.
+  3. **NEVER-EMPTY INVARIANT** — `Pool.healthy()` IGNORES the probe entirely when the probe alone
+     would exclude every endpoint, serving the breaker view and logging one ERROR per state change.
+     The probe can now only DEGRADE an endpoint, never gate a pool — which is what the module
+     docstring claimed all along. The breaker (fed by real traffic) stays fully enforced.
+  4. **HYSTERESIS** — `probe_ok` flips to False only after `health_probe_failures_to_trip` (default 2)
+     CONSECUTIVE failed sweeps, the same posture the breaker gives real traffic. One blip no longer
+     drops an endpoint.
+  Plus: first-tick failures log (that silence hid the outage), and the probe now **ships disabled**
+  (`health_probe_enabled: False`, `settings.healthProbe.enabled: false` in the chart) — a signal that
+  can empty a pool earns its default by being observed working first. Chart values added for
+  enabled/interval/timeout/failuresToTrip (previously the knobs existed only in code, so there was no
+  values-level kill switch).
+  Tests: 6 new/rewritten in `test_health_probe` (4xx policy, credential header, hysteresis,
+  never-empty-with-loud-log, single-endpoint invariance, first-tick logging); 3145 green.
+
+- **Relay tool budget is now governed per PROFILE and priced per SERVER (2026-11-03).** Reported
+  symptom: "max tool iterations (32) reached" mid-recon, twice in 24h. The cap counted MODEL ROUNDS
+  against one site-wide number, so it could not express COST: a 32-step recon of cheap calls (list
+  pods, grep) and 32 expensive SQL crawls exhausted it identically. Measured on the live gateway:
+  4667 relay turns in 24h, **229 (4.9%) reached or exceeded the 32-round ceiling** and 158 more sat
+  in the 24-32 band — systemic, not a fluke. PTC makes it worse: every `run_code` step is one relay
+  round, so a one-program-per-step agent burns the cap in exactly the phase that needs it.
+
+  *The budget is now UNITS, and the unit price is a property of the SERVER:*
+  `mcp_servers.tool_weight` (REAL, default 1.0, **fractional** — 0.1 prices a cheap server at a tenth
+  of a neutral call, which is what makes the budget express cost instead of call count) × the calls
+  in the batch. *The CAP is a property of the PROFILE:* `profiles.tool_relay_budget` (NULL = inherit
+  `settings.tool_relay_max_iterations`), resolved into `KeyRecord` by the auth JOIN exactly like
+  `offpeak_fraction` — a save is live on the next request, with no restart and no extra query.
+  Weights ride a 60 s TTL cache (`core.mcp_weights`, never raises: a DB fault degrades to {} = every
+  server neutral, so governance can never fail a request). Server attribution resolves through the
+  existing name-algebra, so a harness-prefixed spelling is priced as the server it names. The abort
+  message now names the spend and the ceiling (`tool budget exhausted (33.00/32.00 units)`), and the
+  ask-the-user-to-continue handoff keys off that prefix; the identical-call loop detection and the
+  wall clock are untouched, so runaway protection never depends on this number.
+
+  Console: the MCP page gains an inline `edit` button beside `test` (block editor row, fractional
+  weight, help text). `tool_weight` is **THREE-STATE** on the upsert (None = keep): the POST is a
+  full upsert, so a weight-omitting client would otherwise silently reprice an expensive server back
+  to neutral — the same destructive-by-omission hazard `ProfileCreate.agents` already guards.
+  Tests: 17 (`test_toolrelay_governance`) + admin round-trips; full suite 3141.
+
+- **A model that is dead but idle no longer reads healthy (2026-11-03).** Availability had ONE
+  input, `cooldown_until`, fed only by traffic that actually arrives — so an upstream that 400s
+  every call read as `0.00%` GPU util and ranked 0 (best) in the load-aware cascade until a real
+  request landed on it and died; and a permanently broken upstream cycled trip → 60 s cooldown →
+  healthy → trip. `core.health_probe` now GETs `{base_url}/models` every **30 s** (configurable,
+  0 = inert) on every chat/embedding/reranker endpoint and stamps `Endpoint.probe_ok`; `Pool.healthy()`
+  excludes `probe_ok is False` regardless of cooldown. **Fail-open by construction:** `probe_ok None`
+  (never probed — cold pod, probe disabled) stays healthy, so the probe can degrade an endpoint but
+  never gate one; `report_probe` deliberately does not burn breaker strikes; probe state is carried
+  across `replace_pools` by endpoint id, so a console save during an outage cannot hand a dead
+  endpoint a fresh strike budget. Transition-only logging.
+
+  **Failover now triggers on model-attributable 4xx.** Both failover sites walked the chain only on
+  5xx ("4xx is the caller's fault — never re-rolled"), which is right for client-shape errors and
+  wrong when the upstream rejects THE MODEL: a 404 on the fixed `/chat/completions` path is
+  model-not-found, and a 400 naming the model / context length / message role is a model property —
+  another chain candidate could have answered. `_is_model_attributable_4xx` (404 always; 400 only on
+  an explicit marker list or a body quoting the model; 401/403/429/generic 400 never) gates both
+  sites; every attempt still settles under its ACTUAL model and still reports the breaker.
+  **And the chat-type gate stopped reading `endpoints[0]`:** `_next_fallback_candidate`, both
+  admission gates and the relay tail now use `cascade.serves_chat`'s `any(...)` predicate, so a pool
+  whose FIRST endpoint happens to be non-chat is no longer 400'd (or silently dropped from the chain)
+  when another member can serve — endpoint re-registration order is not a policy. That order
+  dependence is the shape a redeploy produces, and it is a 400 the old trigger could never re-roll.
+  Tests: 43 (`test_health_probe`), including a 21-row 4xx policy table and both-sites chain walks.
+
+- **Memory datasets are now attachable from the homepage — the inert-memory dead end is gone.**
+  Reported symptom: a key minted from the homepage held every mm-rag tool, the user believed they had
+  opted into a private memory dataset, and `memory_status` answered `200 {memory_available: false,
+  dataset: null}`. Nothing in the console said the key was unbound, and the RAG dataset list showed
+  no `mem-*` dataset at all.
+
+  *Root cause of the silence (not of a missing feature):* provisioning exists ONLY on the
+  enrollment-code redemption path (`POST /v1/enroll`, opt-in) — the SSO self-mint
+  (`/v1/keys/for-me`) never provisions, and the enroll path reports a failure in the redeem
+  response that is easy to miss (`memory.provisioned: false`). Either way the key stays live and the
+  memory tools stay inert.
+
+  *The guided path ships* (`GET /v1/mcp/selfservice` → `memory`): the MCP dialog now opens with a
+  **Private memory dataset** card that (a) states whether THIS key is bound — both headers, not one,
+  (b) links the RAG app (`PCAI_LLM_MEMORY_APP_URL`, else the registry URL when browser-reachable; an
+  in-cluster host is never linked), and (c) saves `{X-Memory-Dataset, X-Dataset-Password}` in ONE
+  `PUT /v1/mcp/creds/mm-rag`. One PUT is load-bearing: the creds endpoint replaces a server's stored
+  set wholesale, so the generic per-server editor's two single-header saves would keep only the last
+  header — a half pair, i.e. still inert. That editor is superseded for the memory server (the card is
+  the only place its credentials are set) and gains a "saving REPLACES" tooltip elsewhere. `memory`
+  is `null` when no ENABLED memory server is registered, and `storage_enabled: false` when
+  `PCAI_LLM_SECRETS_MASTER_KEY` is unset (the card says so instead of offering a form that 503s).
+  The enrollment failure message now points at the card.
+
+  Tests: 6 API (`test_mcp_self`) + 1 UI source pin (`test_ui`).
+
+- **Homepage "Sign out" is hidden on SSO sessions (owner report, 2026-11-02).** The button cleared the
+  local key and navigated to `/oauth2/sign_out`, but behind the platform chain that path is
+  **oauth2-proxy's** handler: it clears `_oauth2_proxy` and 302s to `/`, the IdP (Keycloak) session
+  survives, and the next request re-authenticates silently — the identity chip came straight back and the
+  click read as a no-op. The button now renders only for a pasted-key session, where clearing the key IS
+  the sign-out; ending an SSO session stays the platform's own sign-out (PCAI console, top-right). The
+  `/oauth2/sign_out` route and the `?signout=local` boot note are unchanged — still correct for direct
+  visits, and the button's navigation branch is kept for the day the platform wires RP-initiated logout.
+
 ## 2.9.2
 
 - **TPM rate limiting: cached prompt tokens are now measured BEFORE throttling, not
@@ -56,6 +470,286 @@ feature is listed under the LATER version.
   request rate x context size exceeds the budget — this release fixes the ACCOUNTING,
   not the size of the budget.
 ## Unreleased
+
+- **Trace console: input / output / cached columns, and conversation
+  coalescing for harness loops (2026-11-02).**
+
+  * **Columns.** The step table's single "Tokens (in + out)" cell is now
+    **In / Out / Cached**: the accumulated prompt, the generated completion,
+    and how much of that input the upstream served from its PREFIX cache
+    (vLLM/SGLang `prompt_tokens_details.cached_tokens`, now persisted per
+    step on `agent_traces`). The per-request header and the conversation
+    header carry the derived cache rate (`98% cached`), so a warm turn and a
+    cold turn are distinguishable at a glance — which is the whole point of
+    the column.
+  * **Grouping.** A harness that re-sends a fresh conversation fingerprint
+    every turn used to render one card per turn with the same header
+    repeated. The console now COALESCES a run of single-request conversations
+    that share key + actor and sit within 30 minutes of each other into one
+    conversation block, labelled `· grouped` so the inference is visible. A
+    genuine multi-request thread keeps its identity untouched; only singleton
+    runs merge. **Inside a conversation the repeated identity bar is gone**:
+    the caller (`conversation  <user> · <key>`) and the model header appear
+    ONCE on the conversation summary, and a request boundary is a 2px green
+    rule on its first step row — no extra rows, no extra spacing. (1px was
+    invisible: `border-collapse` merges adjacent borders and the WIDER one
+    wins, so the rule lost to the row's own 1px `border-bottom`.) A 32-request
+    thread reads as one header plus 32 thin rules instead of 32 identical bars.
+  * **Cumulative iteration.** The relay's iteration counter is per TURN — a
+    fresh user turn gets a fresh tool budget by design (the max-iterations
+    handoff), so the raw value restarts mid-conversation. The console now
+    offsets each request by the conversation's running total, so the Iter
+    column keeps rising; the raw per-turn number stays in the cell tooltip.
+    (The fingerprint itself is unchanged: `canonical.thread_key`
+    is stable for the current harness preamble — verified against the real
+    preamble shapes — so this is a display fix for the cases the fingerprint
+    cannot see.)
+
+  Schema: `agent_traces.cached_tokens` (additive, applied at startup).
+  Covered by `tests/test_traces.py` (4 new).
+
+- **Five capability waves landed together (2026-11-02).**
+
+  * **OpenTelemetry tracing, with no SDK dependency.** `core/tracing.py` emits
+    OTLP/HTTP JSON to `{otelEndpoint}/v1/traces` via httpx2 — no
+    `opentelemetry` import, no new package, so an air-gapped image gains the
+    capability without a wheel change. One server span per request
+    (`http.method`, `http.target` = PATH ONLY, `http.status_code`,
+    `duration_ms`), deterministic per-trace hash sampling, fire-and-forget
+    export with every failure swallowed. Off by default; the disabled path
+    allocates nothing. Chart: `settings.otelEnabled/otelEndpoint/
+    otelServiceName/otelSampleRatio`.
+  * **Secrets guardrail engine (mask-only).** A fifth engine next to
+    blocklist/regex_pii/length/webhook: AWS access/secret keys, PEM private
+    keys, JWTs, `hllm-`/`sk-`/GitHub/Slack tokens, bearer tokens. Actions
+    `mask` (default) / `flag` / `block`, optional `kinds` subset. No
+    token→original mapping is stored, so masking is irreversible by design;
+    the DB CHECK is widened idempotently for existing deployments.
+  * **Session affinity (`X-PCAI-Session`).** A chat conversation can pin its
+    ENDPOINT, not just the cascade head, so its prefix keeps hitting the same
+    server's KV cache. Stored as a third namespaced scope in
+    `model_stickiness` (`ep:`), validated against the live pool on every
+    read, dropped on a breaker trip or transport error, refreshed on a
+    successful serve. Routing state, never policy. Off by default; streaming
+    reads a pin but does not refresh it.
+  * **Audio passthrough.** `POST /v1/audio/speech` (JSON in, audio bytes out)
+    and `POST /v1/audio/transcriptions` (multipart in, JSON out) relay the
+    body BYTES unchanged behind the same key/gates/breaker/ledger as every
+    other route. Model resolution: body field (speech), or `?model=` /
+    `X-PCAI-Model` / the multipart `model` field (transcriptions). Audio
+    endpoints report no usage, so one ledger row settles an ESTIMATE — TTS by
+    characters (`audio_tts_chars_per_token`), ASR by duration
+    (`audio_asr_tokens_per_second`) — because a zero-token row would be a
+    budget bypass.
+  * **Quarterly/yearly budget periods + a custom chargeback window.**
+    `budgets`/`cost_budgets` accept `quarter` and `year` (CHECK widened
+    idempotently; the spend SUMs bind five numbered `::timestamptz`
+    placeholders with the numbering guard extended), mirrored in
+    `TEAM_PERIODS` and every admin period dropdown. The usage/chargeback
+    explorer gains Quarterly (90d) / Yearly (365d) presets and a **Custom**
+    range (start + end `datetime-local`, ISO with offset) backed by a new
+    `until=` parameter on `GET /admin/usage/summary` (validated: ISO with
+    offset, until ≥ since, span ≤ 366 days).
+
+  **G2 site values** enable what is safe to enable: `responseCacheMode: shadow`
+  (measure would-be hits before serving any), `sessionAffinityEnabled: true`
+  (a no-op until a pool has two endpoints), and the audio billing heuristics.
+  OTel stays `false` — G2 has Prometheus but no OTLP collector, so
+  `otelEndpoint` is pre-pointed and one flip away.
+
+- **Exact-match response cache for non-streaming chat (2026-11-02).** A
+  repeated identical deterministic request now skips the model entirely —
+  zero GPU, zero budget — instead of paying a full prefill + decode. This is
+  the embeddings cache generalised to chat, with three deliberate limits:
+  **deterministic only** (`temperature: 0`; absent temperature is a sample,
+  not a fact), **non-streaming only** (SSE replay is a different feature;
+  relay turns are never cached), and **opt-in by mode**
+  (`response_cache_mode` = `off | shadow | active`).
+
+  * **Shadow first.** `shadow` computes the key and records WOULD-BE hits
+    (`gateway_response_cache_total{mode="shadow"}`) without serving, so the
+    duplicate rate is measured before any answer is ever replayed.
+  * **Keying.** sha256 over the canonical request with transport-only fields
+    excluded (`stream`, `stream_options`, `user`, `metadata`,
+    `request_id`); everything that changes the answer stays in the hash.
+    Rows are keyed `(key_id, model, request_hash)`, so one tenant's answer
+    can never be served to another.
+  * **Hit economics.** A hit settles ONE `cache_hit` ledger row with the
+    estimated prompt tokens and zero cost — the budget SUM excludes that
+    status, exactly like the embeddings cache — and returns `X-Cache: HIT`
+    with the stored bytes replayed verbatim. Expiry is a housekeeping purge;
+    the TTL (default 1 h) is the policy.
+  * **Fail-open.** Every cache call is error-swallowed: a cache fault is a
+    miss, never a failed request.
+
+  Chart: `settings.responseCacheMode` / `responseCacheTtlS`. Covered by
+  `tests/test_response_cache.py` and `tests/test_response_cache_route.py`.
+
+- **`POST /v1/rerank` — rerankers join the governed data plane (2026-11-02).**
+  The fleet runs rerankers (Qwen3-VL-Reranker) that the RAG pipeline called
+  DIRECTLY at the upstream, so retrieval scoring was the one model hop with no
+  key, no budget gate, no ledger row and no attribution. The new route mirrors
+  the embeddings contract: `model`/`query`/`documents` validated, the pool
+  must be `reranker`-typed (400 otherwise), the same budget/rate/concurrency
+  gates run, the body is forwarded unchanged to `{base_url}/rerank`, and every
+  call settles one `endpoint='rerank'` ledger row with
+  `X-PCAI-Served-Model`/`X-PCAI-Endpoint` on the response. vLLM reports
+  `usage.total_tokens` (no `prompt_tokens`); on non-chat surfaces that total
+  IS the prompt count, so settle uses it and falls back to the estimate when
+  absent. No response cache — a score vector is tied to one (query, doc-set)
+  pair. Covered by `tests/test_rerank_route.py`.
+
+- **TPM admission cache prediction is now scoped per (key, model), not per key
+  (2026-11-02).** `rate_limit_predict_cached` discounts the admission estimate
+  by a MEASURED prefix-cache ratio. That ratio was read from the key's last N
+  ledger rows with no model filter, so it blended workloads with opposite cache
+  behaviour: the chat pools on this fleet run 94-99.7% prefix-cache hits while
+  embedding/reranker/voice pools sit near zero (one forward pass per unique
+  input). A chat-heavy key therefore discounted its embedding/rerank calls to
+  ~5% of the estimate, and a key whose recent rows were embedding-heavy charged
+  its first big chat call the FULL estimate — still 429ing on tokens the
+  upstream would have served from cache, which is exactly the failure the knob
+  exists to prevent. The lookup now carries `AND model = $2` (and the
+  in-process ratio cache is keyed per (key, model)); a caller with no model in
+  hand, or a model with no history, charges the full estimate — fail-safe, never
+  a blended discount. Settlement reconciliation is unchanged: it still corrects
+  to the true billable total, so the prediction only decides WHEN tokens are
+  charged, never HOW MANY. Covered by `tests/test_cache_ratio_scope.py` and a
+  per-model integration test in `tests/test_tpm_cache_exempt.py`.
+
+
+- **Registry convergence across replicas (2026-10-30).** A newly registered MCP
+  server was visible only to the gateway pod that accepted the registration: the
+  registry snapshot (`mcp_servers` + `model_endpoints`) is per-process, and
+  `registry.refresh()` fired only at boot and after a mutation THAT process
+  served. On the HPA'd deployment (`minReplicas: 2`) the console's "test" button
+  therefore returned `404 — MCP server 'skills-mcp' is not in the enabled
+  registry` on roughly half the clicks — while the server's row still rendered,
+  because the table and the test read the SAME cache from DIFFERENT pods — and
+  the relay answered `unknown server` for it on the stale replica. Only servers
+  registered AFTER the last pod roll were affected, which is why it presented as
+  one endpoint's problem rather than a gateway-wide one.
+
+  * **Watermark poll**: `mcp_servers`/`model_endpoints` gained `updated_at`
+    (bumped by a DB trigger, so out-of-band psql/seed edits converge too);
+    `core.registry` polls `(count(*), max(updated_at))` per table every
+    `PCAI_LLM_REGISTRY_WATCH_S` (5 s) and refreshes only when it moved — one
+    aggregate over two tiny tables in the steady state.
+  * **Console fast path**: `GET /admin/mcp-servers` and
+    `GET /admin/mcp-servers/{name}/tools` re-check the watermark on read,
+    rate-limited by `PCAI_LLM_REGISTRY_ADMIN_FRESH_S` (1 s) and fail-open, so
+    the admin plane converges in ~1 s and the data plane in ~5 s — neither needs
+    a restart or the manual `POST /admin/registry/refresh`.
+  * **Failure discipline**: a failed refresh does NOT advance the watermark (the
+    next tick retries), an unreadable/unknown-shape watermark is a SKIP (never a
+    500 on an admin read), and a refresh already in flight is not stacked.
+  * Verified: 17 new tests (a stale replica learns a new server on one tick; an
+    unchanged watermark never refreshes; a failed refresh retries; rate limit;
+    fail-open; both console routes consult it) + the full suite green.
+
+- **Team leader tier: an enrollment code is now a TEAM invite (2026-10-30).**
+  The in-between rung the operator asked for — neither a chat user nor an admin.
+  Every enrollment can carry a **team leader key** (hash-only, the analog of the
+  admin key for exactly one enrollment) whose holder gets a scoped mini console
+  at `/team_leader`: that team's keys, that team's usage, that team's traces,
+  and the FULL advertised-models view. `GET /team_leader` is a new page next to
+  `/admin`; both consoles gained a `← Chat` link back to the homepage.
+
+  * **Provenance**: `api_keys.enrollment_id` is stamped at redemption, so a key
+    belongs to the team that minted it. Everything the team console returns is
+    resolved with `WHERE ... AND enrollment_id = $2` — a foreign id is a 404,
+    never a 403 that would leak existence.
+  * **Team budget envelope** (`enrollments.budget_tokens` / `budget_usd` per
+    `budget_period`, a HARD cap on the whole team) enforced in the ONE budget
+    gate (`core.budgets.check_budgets`), using the same ledger predicate,
+    `billing_fraction` weighting and cache-discount expression as every per-key
+    budget — the console and the gate cannot tell two stories about "spent".
+  * **Auto-overflow (default ON)**: a teammate's `budgets`/`cost_budgets` rows
+    are an ALLOCATION — a claim on the pool, not a separate budget. At run time
+    a key may exceed its own allocation while the pool still has headroom
+    (`overflow_enabled = FALSE` makes the allocation a hard per-key cap; the
+    envelope still caps the team), and the team leader owns that switch
+    (`PATCH /team_leader/settings`) while the enrollment TOTAL stays the
+    admin's alone.
+  * **Allocation is spend-aware (grant-time)**: a seat allocated later gets
+    less, because the team has already burned part of what it would be
+    claiming. `committed = max(0, alloc - spent)` per key and
+    `available = cap - spent - SUM(committed over the other keys)`; an
+    over-grant is a 409 naming cap, spent, committed, available and the
+    request, with nothing written. Worked example: 12 seats x 1M/month, six
+    allocated, 9M already spent (all six past their own allocations, so
+    nothing more is reserved) => `available = 12M - 9M - 0 = 3M`; seats 7-9
+    get 1M each, seat 10 is refused at 0. The console shows
+    Total / Spent / Committed / **Available**, so the leader always allocates
+    from the honest number.
+  * **Leader-key health**: `team_leader_key_last_used_at` is stamped
+    (best-effort, throttled ~1/hour) on every successful leader-console auth,
+    and the admin Enrollments table renders a never-used / unused-30d /
+    rotate-age nudge from it — a credential nobody uses is worth noticing.
+  * **The leader key is a separate credential space**: it authorizes nothing on
+    `/admin` and nothing on `/v1`, and a revoked or expired enrollment closes
+    its console. Scopes on teammate keys are FIXED (`proxy,mcp`) with no
+    `mcp_admin` — a delegated console can never mint a credential-minting key.
+  * **"Which SSO user picked up this key?"** — the Keys page already carried the
+    bound `subject`/`subject_idp` (with an honest provenance chip:
+    `self-asserted` is a CLAIM, `oauth2-proxy` a verified identity). Two
+    additions make it actually answerable: the chat console's invite dialog now
+    sends the SSO `subject` it already displays, and the admin Keys page can be
+    searched/filtered by enrollment (`?enrollment=` label substring,
+    `?enrollment_id=`) with a new Enrollment column.
+  * **Two long-standing chat-console bugs fixed** (user-reported):
+    (a) Sign out navigated to `/oauth2/sign_out`, which this deployment does not
+    route to the oauth2-proxy — the user landed on the gateway's
+    `{"detail":"Not Found"}` page with the SSO cookie still alive. The path is
+    now owned by the GATEWAY (`GET /oauth2/sign_out`), which always answers a
+    302: to the platform proxy's own sign-out when
+    `PCAI_LLM_SSO_SIGN_OUT_URL`/`settings.ssoSignOutUrl` is set, otherwise to
+    `/?signout=local` where the console states honestly that the platform
+    session survived. The chart's new `ezua.virtualService.ssoProxy` route
+    (enabled in the G2 overlay) supersedes the handler by sending `/oauth2/` on
+    the app host straight to `oauth2-proxy` — the cookie is domain-wide, so a
+    Set-Cookie from this host clears it and the sign-out actually terminates
+    the session. No code path can strand the user on an error page any more.
+    (b) After connecting with a pasted API key the chip still read "Signed in as
+    <sso-user> · oidc", so Connect looked broken. The chip now follows the
+    ACTIVE MODE (`keyMode`), with symmetric "switch to API key" / "switch to SSO
+    session" links.
+  * **Budget top-up queue**: the enrollment CAP stays the admin's alone, but a
+    leader who has hit "available 0" can now ASK — `POST
+    /team_leader/topup-requests` (one open ask at a time), reviewed in the admin
+    Enroll tab (`GET /admin/topup-requests`, approve with an optional amount
+    override, or deny). Approval raises the cap **additively in SQL** inside the
+    same transaction that resolves the row (`COALESCE(cap,0) + amount`), so
+    concurrent approvals serialize and both add, a double-click is a 409 and
+    never doubles a budget, and a NULL cap plus an approved amount ESTABLISHES
+    the cap. Both sides audited (`team.topup.request` / `enroll.topup.approve`
+    / `enroll.topup.deny`).
+  * **Cross-model review (GLM-5.3-Flash + DeepSeek-V4.1-Flash, 2026-10-30) found
+    six real defects, all fixed and each verified against a real Postgres:**
+    (1) `rotate_key` did not carry `api_keys.enrollment_id`, so rotating a team
+    key silently dropped it out of its team — its spend stopped counting against
+    the HARD envelope (`team_spend` matches on `enrollment_id`) and it vanished
+    from the leader's console: the "rotation enumerates columns" bug one more
+    time; (2) the team console sent only `Authorization`, which the SSO chain
+    overwrites with its own id_token Bearer, so every console call would have
+    401'd on a chained deployment — it now sends `X-API-Key` like both sibling
+    consoles; (3) `BudgetSpec` accepted NaN/Infinity, and a NaN silently SKIPPED
+    the envelope check (every NaN comparison is False) then persisted (PG NUMERIC
+    accepts NaN; `CHECK > 0` passes because NaN sorts high) — refusing that key
+    forever and 500ing every projection; now rejected at the model, with the 422
+    body made serializable app-wide (`_json_safe`); (4) the mint's envelope check
+    ignored the PROFILE PRESET rows the same transaction stamps onto the key, so
+    N mints could promise N× the cap; (5) audit redaction blanked
+    `requested_tokens`/`applied_tokens`/`budget_tokens` to `<redacted>` — the
+    approval trail recorded who approved which row but not the amount; (6) "one
+    open top-up ask" was check-then-INSERT, so a double-click could create two —
+    now a partial unique index, with the route mapping the violation to the same
+    409. Also bounded `expires_days` (a huge value overflowed timedelta into a
+    500).
+  * Tests: 69 core (`test_teams_core`), 51 API (`test_team_leader_api`),
+    29 enrollment (`test_enrollment_team`), 18 UI (`test_team_leader_ui`), plus
+    the gateway sign-out route in `test_ui`;
+    full suite 2648 passed / 1 pre-existing failure.
 
 - **Profile → keys, for real (2026-10-29).** The tenant SSO default profile only ever
   landed as STAMPED PRESETS on the minted key; it never reached `users.profile_id`. So the

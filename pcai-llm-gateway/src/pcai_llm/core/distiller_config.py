@@ -10,9 +10,12 @@ Configured here (the asks):
   * model            - the summarizer model (empty = the calling key own
                        routing). "Qwen" in the fleet bundle.
   * offpeak_only     - when true, housekeeping-driven distills run ONLY
-                       while the offpeak evaluator reports low demand
-                       (the GPU-sparing default); explicit /v1/distill
-                       calls always run (a human asked).
+                       while the DISTILLER MODEL's per-model off-peak
+                       evaluator reports low demand (the GPU-sparing
+                       default; the global evaluator is the fallback when
+                       no model is pinned or no per-model query exists).
+                       Explicit /v1/distill calls always run (a human
+                       asked).
   * enabled          - runtime on/off over the env flag (both must be
                        true for the surface to act; the env flag still
                        unmounts the router entirely).

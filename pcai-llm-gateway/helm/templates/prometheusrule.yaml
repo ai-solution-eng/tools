@@ -26,9 +26,14 @@ spec:
 {{ toYaml .Values.metrics.prometheusRule.rules | indent 8 }}
         {{- else }}
         - alert: GatewayHighErrorRatio
+          # AUDIT-r5 #39: a bare ratio is a valid instant vector, so this
+          # fired on ANY traffic instead of above 10% — the comparison is
+          # the alert, not decoration.
           expr: |
-            sum(rate(gateway_requests_total{status!="ok",status!="cache_hit"}[5m]))
-              / clamp_min(sum(rate(gateway_requests_total[5m])), 0.001)
+            (
+              sum(rate(gateway_requests_total{status!="ok",status!="cache_hit"}[5m]))
+                / clamp_min(sum(rate(gateway_requests_total[5m])), 0.001)
+            ) > 0.10
           for: 10m
           labels:
             severity: warning
@@ -97,7 +102,16 @@ spec:
           # whole expression would never fire (same class of bug as the stall
           # rule above). Rows due for an hour with a zero write counter IS the
           # stall.
-          expr: (max(gateway_distill_due_rows) > 0 and on() (increase(gateway_distill_writes_total{outcome="ok"}[1h]) == 0)) or (max(gateway_distill_due_rows) > 0 and on() (max(gateway_distill_writes_total{outcome="ok"}) == 0))
+          #
+          # PER-REPLICA COUNTER, AGGREGATE IT (2026-10-30, found live on the
+          # 2-replica G2 site): increase() returns one series PER POD, so
+          # "increase(...) == 0" matched the replica that has not written —
+          # and with the sweep LEASE only one replica distils, so the idle
+          # replica's counter sits at 0 for the whole hour and the rule is
+          # true whenever any row is due. The alert was permanently pending
+          # on a healthy feed (and guaranteed for ~1h after every restart).
+          # max() asks the only question that matters: did ANY replica write?
+          expr: (max(gateway_distill_due_rows) > 0 and on() (max(increase(gateway_distill_writes_total{outcome="ok"}[1h])) == 0)) or (max(gateway_distill_due_rows) > 0 and on() (max(gateway_distill_writes_total{outcome="ok"}) == 0))
           for: 1h
           labels:
             severity: warning

@@ -142,3 +142,136 @@ async def test_list_models_fails_open_on_capacity_fault(monkeypatch, two_models)
     res = await routes_proxy.list_models(_key())
     assert {m["id"] for m in res["data"]} == {"GLM-5.3-Flash", "Qwen3.8-27B"}
     assert all("capacity" not in m["pcai"] for m in res["data"])
+
+
+async def test_list_models_routing_entries_carry_windowed_capacity(monkeypatch, two_models) -> None:
+    """A routing pseudo-model's capacity is its floor..ceiling WINDOW.
+
+    ok = at least one rung can serve (the router walks the window); warn = the
+    tightest rung's band; the candidate counts let a client say "1 of 2 rungs
+    is out of budget". This is what lets a picker render "Unavailable to you"
+    for a routing selection the key's budget cannot use at all.
+    """
+
+    async def cap(key_id, models):
+        return {
+            "GLM-5.3-Flash": {"ok": True, "remaining_tokens": 500, "blocked_by": "", "warn": 80},
+            "Qwen3.8-27B": {"ok": False, "remaining_tokens": 0, "blocked_by": "day budget", "warn": 0},
+        }
+
+    monkeypatch.setattr(budgets_mod, "model_capacity", cap)
+
+    async def order(key_id):
+        return ["GLM-5.3-Flash", "Qwen3.8-27B"]
+
+    async def policy(user_id):
+        return ("active", "Qwen3.8-27B")  # floor = the cheap model
+
+    async def enabled():
+        return True
+
+    monkeypatch.setattr(routes_proxy, "profile_order_for_key", order)
+    monkeypatch.setattr(routes_proxy.model_routing, "profile_routing_config", policy)
+    monkeypatch.setattr(routes_proxy.model_routing, "global_enabled", enabled)
+    monkeypatch.setattr(routes_proxy.settings, "routing_enabled", True)
+
+    res = await routes_proxy.list_models(_key())
+    by_id = {m["id"]: m for m in res["data"]}
+    # Bare "routing" ceilings at order[0] (GLM); floor Qwen -> window [Qwen, GLM].
+    bare = by_id["routing"]["pcai"]["capacity"]
+    assert bare["ok"] is True
+    assert bare["warn"] == 80
+    assert bare["candidates"] == {"ok": 1, "blocked": 1}
+    # routing__Qwen has a ONE-rung window (floor == ceiling) and that rung is
+    # out of budget: the selection is unavailable to this key.
+    qwen = by_id["routing__Qwen3.8-27B"]["pcai"]["capacity"]
+    assert qwen["ok"] is False
+    assert qwen["blocked_by"]
+    assert qwen["candidates"] == {"ok": 0, "blocked": 1}
+    # routing__GLM spans the same two-rung window, so it stays usable.
+    assert by_id["routing__GLM-5.3-Flash"]["pcai"]["capacity"]["ok"] is True
+
+
+async def test_list_models_routing_window_demotes_an_unticked_head(monkeypatch, two_models) -> None:
+    """Bare "routing" ceilings at the most capable TICKED model (R2).
+
+    The request path demotes an unticked ladder head to the most capable
+    allowlisted model; the listing must use the SAME ceiling, or it counts a
+    rung the router never picks.
+    """
+    from pcai_llm.core import routing_config
+
+    async def cap(key_id, models):
+        return {
+            "GLM-5.3-Flash": {"ok": True, "remaining_tokens": 500, "blocked_by": "", "warn": 0},
+            "Qwen3.8-27B": {"ok": False, "remaining_tokens": 0, "blocked_by": "day budget", "warn": 0},
+        }
+
+    async def order(key_id):
+        return ["GLM-5.3-Flash", "Qwen3.8-27B"]
+
+    async def policy(user_id):
+        return ("active", "")  # no floor
+
+    async def enabled():
+        return True
+
+    async def cfg():
+        # GLM (the ladder head) is UNTICKED; only Qwen is routable.
+        return {"allowed_models": ["Qwen3.8-27B"]}
+
+    monkeypatch.setattr(budgets_mod, "model_capacity", cap)
+    monkeypatch.setattr(routes_proxy, "profile_order_for_key", order)
+    monkeypatch.setattr(routes_proxy.model_routing, "profile_routing_config", policy)
+    monkeypatch.setattr(routes_proxy.model_routing, "global_enabled", enabled)
+    monkeypatch.setattr(routes_proxy.settings, "routing_enabled", True)
+    monkeypatch.setattr(routing_config, "get_config", cfg)
+
+    res = await routes_proxy.list_models(_key())
+    by_id = {m["id"]: m for m in res["data"]}
+    bare = by_id["routing"]["pcai"]["capacity"]
+    # One-rung window (Qwen only) and that rung is out of budget.
+    assert bare["candidates"] == {"ok": 0, "blocked": 1}
+    assert bare["ok"] is False
+
+
+async def test_list_models_routing_window_includes_ticked_off_ladder_models(monkeypatch, two_models) -> None:
+    """A ticked model ABSENT from model_order is a real rung (expand_candidates).
+
+    The request path widens the ladder with allowlisted off-ladder models at
+    the cheap end; a listing that only walked model_order would hide a rung the
+    router can actually pick.
+    """
+    from pcai_llm.core import routing_config
+
+    async def cap(key_id, models):
+        return {
+            "GLM-5.3-Flash": {"ok": True, "remaining_tokens": 500, "blocked_by": "", "warn": 0},
+            "Qwen3.8-27B": {"ok": False, "remaining_tokens": 0, "blocked_by": "day budget", "warn": 0},
+        }
+
+    async def order(key_id):
+        return ["GLM-5.3-Flash"]  # Qwen is NOT on the ladder
+
+    async def policy(user_id):
+        return ("active", "")
+
+    async def enabled():
+        return True
+
+    async def cfg():
+        return {"allowed_models": ["GLM-5.3-Flash", "Qwen3.8-27B"]}
+
+    monkeypatch.setattr(budgets_mod, "model_capacity", cap)
+    monkeypatch.setattr(routes_proxy, "profile_order_for_key", order)
+    monkeypatch.setattr(routes_proxy.model_routing, "profile_routing_config", policy)
+    monkeypatch.setattr(routes_proxy.model_routing, "global_enabled", enabled)
+    monkeypatch.setattr(routes_proxy.settings, "routing_enabled", True)
+    monkeypatch.setattr(routing_config, "get_config", cfg)
+
+    res = await routes_proxy.list_models(_key())
+    by_id = {m["id"]: m for m in res["data"]}
+    bare = by_id["routing"]["pcai"]["capacity"]
+    # Qwen (off-ladder, ticked) rides the cheap end; GLM is the ceiling.
+    assert bare["candidates"] == {"ok": 1, "blocked": 1}
+    assert bare["ok"] is True

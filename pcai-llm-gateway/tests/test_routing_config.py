@@ -755,3 +755,212 @@ async def test_r3_set_values_roundtrips_the_global_floor(monkeypatch: pytest.Mon
         assert any(len(q) >= 2 and q[1] == "routing_min_model" for q in conn.queries)
     finally:
         await rc.invalidate()
+
+
+# ---------------------------------------------------------------------------
+# per-model cards -> the criteria channel (2026-10-30)
+# ---------------------------------------------------------------------------
+
+
+def test_criteria_without_cards_still_carries_the_machine_facts() -> None:
+    """An unconfigured site must not be BLINDER than it was before the cards.
+
+    The request state stopped carrying modalities/gpu/cost (they belong to the
+    criteria channel now), so an empty card map has to render the facts itself
+    -- otherwise the shipped default hands the decision model bare labels AND
+    no capability, load or price, strictly less than the pre-cards behaviour.
+    """
+    gpu = {"inject": True, "models": {"a": {"value_pct": 0.0, "active": True}}}
+    costs = {"b": "in 0.1 / out 0.9 USD per 1M tokens"}
+    mods = {"a": ["text", "image"]}
+    got = rc.render_criteria({}, ["a", "b"], gpu=gpu, costs=costs, modalities=mods)
+    assert got["a"].startswith("a | ")
+    assert "gpu 0.0% (low demand)" in got["a"]
+    assert "modalities text, image" in got["a"]
+    assert "cost in 0.1 / out 0.9 USD per 1M tokens" in got["b"]
+
+
+def test_criteria_does_not_repeat_a_fact_the_card_already_uses() -> None:
+    """A card that writes {{gpu_util}} itself must not ALSO get the appended one."""
+    cards = {"a": {"description": "cheap, load {{gpu_util}}"}}
+    gpu = {"inject": True, "models": {"a": {"value_pct": 42.0, "active": True}}}
+    got = rc.render_criteria(cards, ["a"], gpu=gpu)["a"]
+    assert got == "cheap, load 42.0%"
+
+
+def test_criteria_appends_nothing_when_injection_is_off() -> None:
+    cards = {"a": {"description": "cheap"}}
+    gpu = {"inject": False, "models": {"a": {"value_pct": 42.0, "active": True}}}
+    assert rc.render_criteria(cards, ["a"], gpu=gpu)["a"] == "cheap"
+
+
+def test_criteria_substitutes_each_models_own_live_row() -> None:
+    """{{gpu_util}} in ONE card is that model's number, never the fleet's."""
+    cards = {"a": {"description": "cheap {{gpu_util}} ({{low_demand}})"}, "b": {"description": "strong {{gpu_util}}"}}
+    gpu = {
+        "inject": True,
+        "models": {
+            "a": {"value_pct": 0.0, "active": True},
+            "b": {"value_pct": 91.5, "active": False},
+        },
+    }
+    got = rc.render_criteria(cards, ["a", "b"], gpu=gpu)
+    assert got["a"] == "cheap 0.0% (low demand)"
+    assert got["b"] == "strong 91.5%"
+
+
+def test_criteria_respects_injection_off() -> None:
+    """A card must not smuggle live numbers past inject_gpu_load=false.
+
+    This is the same defect class the instructions path already fixed once: a
+    site that deliberately turned load injection OFF still shipped real
+    numbers through the other channel.
+    """
+    cards = {"a": {"description": "load {{gpu_util}}"}}
+    gpu = {"inject": False, "models": {"a": {"value_pct": 42.0, "active": True}}}
+    got = rc.render_criteria(cards, ["a"], gpu=gpu)
+    assert "42.0" not in got["a"]
+    assert rc._GPU_INJECTION_OFF in got["a"]
+
+
+def test_criteria_unknown_model_reads_no_data() -> None:
+    cards = {"a": {"description": "{{gpu_util}} / {{cost}} / {{modalities}}"}}
+    got = rc.render_criteria(cards, ["a"], gpu={"inject": True, "models": {}})
+    assert got["a"] == "no data / no data / not declared"
+
+
+def test_criteria_never_invents_high_demand_for_an_unsampled_model() -> None:
+    """A utilisation sample with no hysteresis state is not evidence of load.
+
+    Rendering "high demand" there is the same class of lie as a fabricated 0%,
+    and it steers traffic away from a model nobody measured.
+    """
+    # The REAL never-sampled shape: the evaluator's dataclass default is
+    # value_pct=None AND active=False. Keying the demand word off active alone
+    # reported "high demand" here, which is why this case (not active=None)
+    # is the one that pins the fix.
+    cards = {"a": {"description": "load {{gpu_util}}, {{low_demand}}"}}
+    gpu = {"inject": True, "models": {"a": {"value_pct": None, "active": False}}}
+    assert rc.render_criteria(cards, ["a"], gpu=gpu)["a"] == "load no data, no data"
+    # ...and a sample with no hysteresis state is "demand unknown", not "high"
+    gpu2 = {"inject": True, "models": {"a": {"value_pct": 12.0, "active": None}}}
+    assert rc.render_criteria(cards, ["a"], gpu=gpu2)["a"] == "load 12.0%, demand unknown"
+
+
+def test_criteria_survives_a_junk_snapshot() -> None:
+    """This renderer runs on a READ route (the panel preview) and on every
+    decision: a hand-edited or half-populated snapshot must degrade to
+    "no data", never raise."""
+    cards = {"a": {"description": "{{gpu_util}} {{low_demand}} {{gpu_line}} {{modalities}}"}}
+    junk = {"inject": True, "models": {"a": {"value_pct": "oops", "active": "yes", "fraction": "x"}}}
+    got = rc.render_criteria(cards, ["a"], gpu=junk, modalities={"a": 5})["a"]
+    assert got.startswith("no data no data no data")
+    assert "not declared" in got
+
+
+def test_criteria_leaves_unknown_tokens_verbatim() -> None:
+    """A typo must be visible in the preview, not silently eaten."""
+    cards = {"a": {"description": "x {{gpu-util}} y"}}
+    assert "{{gpu-util}}" in rc.render_criteria(cards, ["a"])["a"]
+
+
+def test_criteria_blank_description_falls_back_to_the_name() -> None:
+    cards = {"a": {"description": "   "}, "b": {"description": "real role"}}
+    got = rc.render_criteria(cards, ["a", "b"])
+    assert got["a"].split(" | ")[0] == "a"
+    assert got["b"].split(" | ")[0] == "real role"
+
+
+def test_describe_coverage_names_the_undescribed_models() -> None:
+    got = rc.describe_coverage({"a": {"description": "role"}}, ["a", "b", "c"])
+    assert got["models"] == 3 and got["described"] == 1
+    assert got["undescribed"] == ["b", "c"]
+
+
+def test_put_model_cards_roundtrips_as_a_dict(admin_env) -> None:
+    tc, fake, _r, _audited = admin_env
+    body = {"model_cards": {"llm-chat": {"description": "light work {{gpu_util}}"}}}
+    r = tc.put("/admin/routing/config", json=body, headers=ADMIN_H)
+    assert r.status_code == 200, r.text
+    # stored through the d: tag, decoded back as a dict (not a str repr)
+    assert isinstance(fake.rows["model_cards"], str) and fake.rows["model_cards"].startswith("d:")
+    d = tc.get("/admin/routing/config", headers=ADMIN_H).json()
+    assert d["config"]["model_cards"] == body["model_cards"]
+    assert d["card_coverage"]["described"] == 1
+
+
+def test_put_model_card_for_an_unregistered_model_is_400(admin_env) -> None:
+    """A card for a model the router can never choose is dead config."""
+    tc, _fake, _r, _audited = admin_env
+    r = tc.put(
+        "/admin/routing/config",
+        json={"model_cards": {"ghost-model": {"description": "x"}}},
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 400
+    assert "not registered CHAT models" in r.text
+
+
+def test_put_model_card_description_is_bounded(admin_env) -> None:
+    tc, _fake, _r, _audited = admin_env
+    r = tc.put(
+        "/admin/routing/config",
+        json={"model_cards": {"llm-chat": {"description": "x" * (routes_admin._CARD_DESCRIPTION_MAX + 1)}}},
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 400
+    assert "the cap is" in r.text
+
+
+def test_put_model_card_unknown_key_is_400(admin_env) -> None:
+    tc, _fake, _r, _audited = admin_env
+    r = tc.put(
+        "/admin/routing/config",
+        json={"model_cards": {"llm-chat": {"descripton": "typo"}}},
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 400
+    assert "unknown keys" in r.text
+
+
+def test_preview_renders_the_criteria_half_too(admin_env) -> None:
+    """The instructions and the option descriptions are ONE call.
+
+    An operator who approved the prompt while the criteria were empty has not
+    seen what the model is actually given.
+    """
+    tc, _fake, _r, _audited = admin_env
+    r = tc.post(
+        "/admin/routing/prompt-preview",
+        json={
+            "prompt": "policy only",
+            "model_cards": {"llm-chat": {"description": "light work {{gpu_util}}"}},
+        },
+        headers=ADMIN_H,
+    )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["criteria"]["llm-chat"].startswith("light work")
+    assert d["criteria"]["llm-big"] == "llm-big"  # no card -> bare name
+    assert d["used_criteria_placeholders"] == ["gpu_util"]
+    assert d["card_coverage"]["described"] == 1
+
+
+def test_preview_of_a_cleared_prompt_shows_the_shipped_default(admin_env) -> None:
+    """An empty prompt means "use the built-in policy" to the LIVE path.
+
+    The preview used to render the empty string (or, with prompt omitted, the
+    OLD saved text), so "clear the box and press Preview" showed anything but
+    what the model would actually receive. Same fallback, both paths.
+    """
+    from pcai_llm.core import decision_routing
+
+    tc, _fake, _r, _audited = admin_env
+    # a SAVED prompt that the operator is trying to get rid of
+    tc.put("/admin/routing/config", json={"prompt": "OLD SAVED PROMPT"}, headers=ADMIN_H)
+    d = tc.post("/admin/routing/prompt-preview", json={"prompt": ""}, headers=ADMIN_H).json()
+    assert d["rendered"] == decision_routing.DEFAULT_INSTRUCTIONS
+    assert "OLD SAVED PROMPT" not in d["rendered"]
+    # and with the field OMITTED the saved prompt still wins (unchanged rule)
+    d2 = tc.post("/admin/routing/prompt-preview", json={}, headers=ADMIN_H).json()
+    assert d2["rendered"] == "OLD SAVED PROMPT"

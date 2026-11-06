@@ -10,9 +10,11 @@ ATTACHMENT GATE (the inert contract): the surface does nothing for a key
 whose memory feature is not attached. Attached means BOTH:
   * the memory server (settings.enroll_memory_server, default mm-rag) is
     an ENABLED row in the MCP registry, and
-  * the calling key carries the stamped {X-Memory-Dataset,
-    X-Dataset-Password} pair in mcp_server_creds (enroll_memory put it
-    there at redemption; admin-attached rows count identically).
+  * the backend's capability probe (distiller_memory_probe_tool) answers
+    memory_available + writable for THIS key's credential merge.
+The gateway does not inspect a dataset model: the key's identity is whatever
+header override it carries (mm-rag: X-API-Key over an SSO-managed dataset;
+the legacy {X-Memory-Dataset, X-Dataset-Password} pair counts identically).
 An unattached key gets HTTP 200 {"ok": false, "inert": true, ...} - a
 harmless no-op, so harness shims can call unconditionally with no gating
 logic of their own (the flag-off 404 of routes_mcp_self extended to per-
@@ -478,9 +480,11 @@ async def _mcp_call_for(key: KeyRecord):
     """Bind memory_write.mcp_call to the registered memory server.
 
     Headers: routes_mcp.resolve_mcp_headers - server-level auth first, the
-    key stamped {X-Memory-Dataset, X-Dataset-Password} pair LAST-WINS (the
-    exact merge the relay uses; no second credential path). The URL is the
-    registry row (enroll_memory.resolve_memory_server) - never an env.
+    key's own override headers LAST-WINS (the exact merge the relay uses; no
+    second credential path). Whatever identity header the key carries is what
+    the backend resolves (mm-rag: X-API-Key; legacy dataset pair equally).
+    The URL is the registry row (enroll_memory.resolve_memory_server) - never
+    an env.
     """
     target = await enroll_memory.resolve_memory_server(settings.enroll_memory_server)
     if target is None:
@@ -531,9 +535,7 @@ async def _mcp_search_for(key: KeyRecord):
         async def do(session: Any) -> Any:
             return await session.call_tool(settings.distiller_memory_search_tool, arguments)
 
-        result = await _upstream_session(
-            str(target["url"]), headers, do, timeout_s=memory_write.WRITE_TIMEOUT_S
-        )
+        result = await _upstream_session(str(target["url"]), headers, do, timeout_s=memory_write.WRITE_TIMEOUT_S)
         text = ""
         for block in result.content or []:
             t = getattr(block, "text", None)
@@ -682,7 +684,7 @@ async def distill_conversation(
     cid = _conversation_id(conversation_id)
     if cid is None:
         return _error(404, "not found")
-    conv = await conversations.get(key.id, cid)
+    conv = await conversations.get(getattr(key, "key_group", None) or key.id, cid)
     if conv is None:
         return _error(404, "not found")
     transcript = build_transcript(conv.get("messages") or [], str(conv.get("title") or ""))
@@ -808,7 +810,10 @@ async def distill_due_conversation(row: dict[str, Any], *, deadline: float | Non
                 int(distill_schedule.gate_backoff_seconds()),
             )
         return False
-    conv = await conversations.get(key_id, cid)
+    # Scope by the key GROUP (rotation-stable), not the raw id: the scheduled
+    # row may point at a credential that has since been rotated, and the
+    # transcript now lives under the group.
+    conv = await conversations.get(getattr(key, "key_group", None) or key_id, cid)
     if conv is None:
         # gone/purged: the FK on conversation_distills (REFERENCES conversations
         # ON DELETE CASCADE) REJECTS a marker INSERT for a nonexistent row - the
@@ -888,6 +893,7 @@ async def distill_due_conversation(row: dict[str, Any], *, deadline: float | Non
         # re-spends it every pass until the server returns.
         await distill_schedule.mark_gate_skip(cid, key_id)
         return False
+    verdict: list[str] = []
     ok, detail = await memory_write.write_memory(
         key_id,
         mcp_call,
@@ -896,13 +902,45 @@ async def distill_due_conversation(row: dict[str, Any], *, deadline: float | Non
         kind=memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK,
         fallback_doc=transcript if distilled else "",
         fallback_session_id=str(cid),
+        verdict_out=verdict,
     )
     # the marker is written ONLY on a successful write: a failed write (both
     # summary and fallback refused) leaves the conversation due, so the next
     # sweep retries — a transient RAG outage must not permanently mark
     # sessions as distilled-with-nothing-written (cross-review finding).
+    #
+    # THE TWO PERMANENT VERDICTS ARE NOT FAILURES (audit A-1, 2026-11-02 —
+    # the same treatment the canonical path got in audit D-2). write_memory
+    # returns (False, ...) for a near-duplicate and for a body under the
+    # length floor; BOTH conditions reproduce on every retry, so "leave the
+    # row due" meant the whole ~25-call map-reduce was re-spent every lease
+    # lapse (~300 s) for as long as the row stayed due — measured shape:
+    # ~7k upstream calls/day for one stuck conversation, with no marker and
+    # no backoff to stop it.
     if ok:
         await distill_schedule.mark_distilled(cid, key_id, int(row.get("msg_count") or 0))
+    elif verdict and verdict[-1] == memory_write.VERDICT_SUPPRESSED:
+        # The store already holds the memory this document duplicates, so
+        # nothing is lost by claiming the row: mark it exactly like a
+        # successful distill (the due predicate is "message count >
+        # distilled_seq", so a conversation that CONTINUES re-becomes due).
+        await distill_schedule.mark_distilled(cid, key_id, int(row.get("msg_count") or 0))
+        log.info(
+            "scheduled distill conv=%s: write suppressed as a near-duplicate - marked so it stops re-distilling",
+            cid,
+        )
+    elif verdict and verdict[-1] == memory_write.VERDICT_FLOORED:
+        # A stub summary is not a write, so this must NOT be a distilled
+        # marker — but it must leave the oldest-first window, or the sweep
+        # re-runs the full map-reduce on this row forever. The gate-skip
+        # backoff keeps the row DUE (distilled_seq is preserved), so a later
+        # sweep that produces a real summary still writes it.
+        await distill_schedule.mark_gate_skip(cid, key_id)
+        log.warning(
+            "scheduled distill conv=%s: summary body under the floor - backed off %ss (not marked distilled)",
+            cid,
+            int(distill_schedule.gate_backoff_seconds()),
+        )
     log.info("scheduled distill conv=%s ok=%s detail=%s", cid, ok, detail[:80])
     return bool(ok)
 

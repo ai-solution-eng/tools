@@ -190,6 +190,34 @@ def test_routing_entries_are_gated_by_the_fleet_switch(proxy_env, monkeypatch: p
     assert "routing" not in ids and not any(i.startswith("routing__") for i in ids)
 
 
+def test_routing_entries_follow_the_panel_kill_switch(proxy_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """audit r5 #10 (residual): the panel's PAUSE must also hide the names.
+
+    PRE-FIX the listing ANDed only settings.routing_enabled with the key's
+    profile policy, so a PAUSED router still advertised `routing` /
+    `routing__X` — names that then behave as plain aliases while the panel
+    and the X-PCAI-Routing header say "off". An operator who paused routing
+    during an incident kept a dropdown full of names implying it was on.
+    """
+    import pcai_llm.core.model_routing as mr
+
+    monkeypatch.setattr(settings, "routing_enabled", True)
+
+    async def _policy(user_id: Any) -> tuple[str, str]:
+        return "shadow", ""
+
+    monkeypatch.setattr(mr, "profile_routing_config", _policy)
+    tc = proxy_env()
+
+    _fake_config(monkeypatch, enabled=True)
+    ids = [m["id"] for m in tc.get("/v1/models", headers=KEY_H).json()["data"]]
+    assert "routing" in ids and "routing__llm-chat" in ids, ids
+
+    _fake_config(monkeypatch, enabled=False)  # the panel's PAUSE
+    ids = [m["id"] for m in tc.get("/v1/models", headers=KEY_H).json()["data"]]
+    assert "routing" not in ids and not any(i.startswith("routing__") for i in ids), ids
+
+
 # ---------------------------------------------------------------------------
 # GET /admin/presented-models
 # ---------------------------------------------------------------------------

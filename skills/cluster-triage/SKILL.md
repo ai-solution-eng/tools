@@ -133,13 +133,20 @@ they scored **51% vs 47%**. Both are competent and they fail differently.
   users' predictors. `/tmp` does not persist between bash calls: every verification must be one self-contained call.
   Never run `git checkout`/`restore`/`clean`/`stash` while investigating (see **guard-uncommitted-work**).
 
-## Reference instantiation (one deployment's values — re-derive locally)
+## Deployment values to resolve locally
 
 Examples, not defaults: resolve your own equivalents (see PORTABILITY.md) before using any of them.
 
-- Gateway connection prefix `pcai-llm-gateway` → `mcp__pcai-llm-gateway__<server>__<tool>`; servers seen:
-  `prometheus`, `logsearch`, `k8s-ops`, `applygate`, `mm-rag`, `sqlhandler`, `workbench`.
-- Namespaces: app `mm-rag`; MLIS/KServe predictor isvcs in `project-user-andrew-bydlon`.
+- Gateway MCP: one tool, `pcai_tools` (the relay).
+  MCP access is via the gateway RELAY: call the `pcai_tools` tool DIRECTLY (a normal tool
+  call, not inside `run_code`) with `{action:"describe", server:"<name>"}` to promote that
+  server, after which its tools (`<server>_<tool>`) are directly callable for the rest of
+  the turn. `{action:"list"}` (no server) returns every tool with a one-line summary.
+  There are NO `tools[...]` bindings and no `mcp_catalog`/`mcp_call` client tools — the
+  MCP client connection is disabled; those names only exist on the gateway's own /mcp
+  surface, which this harness no longer connects to.
+  Servers seen: `prometheus`, `logsearch`, `k8s-ops`, `applygate`, `mm-rag`, `sqlhandler`, `workbench`.
+- Namespaces: app `mm-rag`; MLIS/KServe predictor isvcs in `project-user-<you>`.
 - Platform: "G2" cluster with an EzUA console; scheduler-stamping admission policy
   `assign-custom-scheduler-for-ezua-user-vendor-pods` (`failurePolicy=Fail`) selecting on the `hpe-ezua/type` label;
   console app-discovery keys `hpe-ezua/type: vendor-service` + `hpe-ezua/app: <chart-name>`.

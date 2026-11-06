@@ -56,7 +56,7 @@ A model with thinking enabled and a **small `max_tokens`** budget can return **e
 budget spent on the reasoning trace. Empty content = retry with more budget or lower effort, **not** a
 refusal and not "the model had nothing to say".
 
-## Reference instantiation (2026-10-03)
+## Deployment values to resolve locally
 
 One deployment's pair — re-derive locally:
 
@@ -66,9 +66,15 @@ One deployment's pair — re-derive locally:
 | Home turf | Terminal/SaaS/code agents (AutomationBench 69% #3 overall, best open) | kube RCA (ITBench 51% vs DS 47%); chat-shaped knowledge |
 | Role | Primary for coding/terminal/agentic | Primary for k8s RCA + reviewer of DS's facts |
 
-- Method doc: `/home/andrew/Code/HPE/ModelDeploymentApproaches/MODEL_CROSS_VALIDATION.md`; implementation
+- Method doc: `<your ModelDeploymentApproaches checkout>/MODEL_CROSS_VALIDATION.md`; implementation
   `ensemble_flow.py` (25 for reviews, 50 for DS primaries).
-- Providers: `pcai-model-endpoint-flow` — enumerate with `list_subagent_models`.
+- Providers: enumerate with `list_subagent_models({ provider })` — ids and model sets both rot.
+  Spawn on `pcai-model-endpoint-subagent` (`Deepseek-V4.1-Flash-1017`, `GLM-5.3-Flash`,
+  `Qwen3.8-27B`, `routing`) — the default spawn route, `X-PCAI-Conversation: raw`, so subagent
+  chatter is never distilled into memory. `pcai-model-endpoint-flow` is the Lead route and IS
+  distilled. "not allowed for this Session" means this session's recorded route list predates the
+  setting (written at session creation; resuming does not refresh it, and an empty session keeps
+  its creation-date list) — not a dead id.
 - Auth/TLS: endpoints in `ModelBenchmarker/src/model_benchmarker/utils/pcai_models.py`;
   `REMOTE_CA_BUNDLE=$DSH_HOME/hpe-private-ssl-ca.pem` (without it the CLI disables verification and warns
   on stderr).

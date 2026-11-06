@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -187,8 +187,9 @@ def test_state_omits_modalities_when_undeclared() -> None:
 
 
 def test_state_text_free_body_has_no_user_message_key() -> None:
-    state = json.loads(dr.build_state({"messages": [{"role": "system", "content": "s"}]},
-                                      complexity=10, candidates=["a"]))
+    state = json.loads(
+        dr.build_state({"messages": [{"role": "system", "content": "s"}]}, complexity=10, candidates=["a"])
+    )
     assert "user_message" not in state["request"]
 
 
@@ -274,15 +275,22 @@ class _Key:
     user_id = "00000000-0000-0000-0000-000000000001"
 
 
-def _resolve(decide, order, *, min_model=""):
-    """Run the real resolver with an injected decision seam."""
+def _resolve(decide, order, *, min_model="", requested=None, registered=None):
+    """Run the real resolver with an injected decision seam.
+
+    requested / registered default to the historical shape (the ladder head is
+    the named ceiling); an OFF-ladder ceiling is what audit w6's floor pin
+    needs, so both are overridable.
+    """
+    target = requested or ("routing__" + order[0])
+    regs = set(order) if registered is None else set(registered)
 
     async def _go():
         return await mr.resolve_routed_model(
             _Key(),
             {"messages": [{"role": "user", "content": "hi"}]},
-            "routing__" + order[0],
-            set(order),
+            target,
+            regs,
             [],
             order,
             available=None,
@@ -422,3 +430,181 @@ def test_r1_finite_confidence_still_served() -> None:
 def test_r1_negative_inf_abstains() -> None:
     r = dr.parse_choice(_answer("b", float("-inf")), ["a", "b"], min_confidence=0.6)
     assert not r.ok and r.reason == "nonfinite_confidence"
+
+
+# ---------------------------------------------------------------------------
+# the WIRE contract: cards -> criteria (2026-10-30)
+# ---------------------------------------------------------------------------
+# The decision model is told what each candidate is FOR through the criteria
+# channel -- the option description it scores against. Nothing pinned that the
+# configured cards actually reach the wire, so a save could have looked fine in
+# the panel while every call shipped bare labels.
+
+
+class _FakeResponse:
+    status_code = 200
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+        self.content = b""
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def post(self, url: str, *, json: Any = None, headers: Any = None, timeout: Any = None) -> _FakeResponse:
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return _FakeResponse(_answer("b", 0.99))
+
+
+def _caller_env(
+    monkeypatch: pytest.MonkeyPatch,
+    cards: dict[str, Any],
+    modalities: dict[str, Any] | None = None,
+    prompt: str = "",
+):
+    from pcai_llm.api import routes_proxy
+    from pcai_llm.core import routing_config
+
+    client = _FakeClient()
+
+    class _Ep:
+        base_url = "http://decision.test/v1"
+        api_key_secret = None
+        auth_token_enc = None
+
+    class _Pool:
+        # ClassVar: a shared fixture, not per-instance state (ruff RUF012).
+        endpoints: ClassVar[list[Any]] = [_Ep()]
+
+        def pick(self) -> Any:
+            return self.endpoints[0]
+
+        async def report(self, ep: Any, ok: bool, error: str = "") -> None:
+            """The real Pool's breaker seam (audit w6 wired the decision call
+            into it); this stub only has to satisfy the interface."""
+
+    monkeypatch.setattr(routes_proxy.model_router, "pool", lambda name: _Pool())
+    # Router.client is a read-only property (it asserts the router started), so
+    # it is replaced on the CLASS, not on the instance.
+    monkeypatch.setattr(type(routes_proxy.model_router), "client", property(lambda self: client))
+    monkeypatch.setattr(routes_proxy, "_upstream_headers", lambda ep, rid: {})
+
+    async def _cfg() -> dict[str, Any]:
+        return {"inject_gpu_load": True}
+
+    async def _gpu() -> dict[str, Any]:
+        return {
+            "available": True,
+            "inject": True,
+            "models": {
+                "a": {"value_pct": 1.5, "active": True},
+                "b": {"value_pct": 88.0, "active": False},
+            },
+        }
+
+    async def _prices(models: list[str]) -> dict[str, str]:
+        return {"b": "in 0.1 / out 0.2 USD per 1M tokens"}
+
+    monkeypatch.setattr(routing_config, "get_config", _cfg)
+    monkeypatch.setattr(routing_config, "gpu_load_snapshot", _gpu)
+    from pcai_llm.core import costs
+
+    monkeypatch.setattr(costs, "price_hints", _prices)
+
+    policy = {"cards": cards, "modalities": modalities or {}, "prompt": prompt}
+    caller = routes_proxy._decision_caller("decision-model", policy)
+    assert caller is not None
+    return caller, client
+
+
+def test_criteria_on_the_wire_come_from_the_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    cards = {
+        "a": {"description": "light work, load {{gpu_util}} ({{low_demand}})"},
+        "b": {"description": "hard work, cost {{cost}}"},
+    }
+    caller, client = _caller_env(monkeypatch, cards, prompt="policy")
+    payload = asyncio.run(caller("{}", "policy", ["a", "b"], 2500, []))
+    sent = client.calls[0]["json"]
+    assert payload["answers"]["answer"]["choice"] == "b"
+    # each option carries ITS OWN live row, not the fleet's. A card that writes
+    # a token itself is not given the appended duplicate; the facts it did NOT
+    # write are appended.
+    assert sent["questions"]["answer"]["criteria"] == {
+        "a": "light work, load 1.5% (low demand)",
+        "b": "hard work, cost in 0.1 / out 0.2 USD per 1M tokens | gpu 88.0% (high demand)",
+    }
+    # the operator prompt rides as instructions, unrendered (it has no placeholders)
+    assert sent["questions"]["answer"]["instructions"] == "policy"
+
+
+def test_instructions_default_to_the_shipped_policy_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty operator prompt falls back to the SHIPPED text, which is the
+    model-agnostic policy -- the roles are in the criteria, never in here."""
+    caller, client = _caller_env(monkeypatch, {})
+    asyncio.run(caller("{}", "", ["a", "b"], 2500, []))
+    sent = client.calls[0]["json"]
+    assert sent["questions"]["answer"]["instructions"] == dr.DEFAULT_INSTRUCTIONS
+    assert "{{" not in sent["questions"]["answer"]["instructions"]
+
+
+def test_criteria_without_cards_still_carry_the_live_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No cards must still tell the model the load -- that is the whole point
+    of the facts living in the criteria channel rather than the state."""
+    caller, client = _caller_env(monkeypatch, {})
+    asyncio.run(caller("{}", "policy", ["a", "b"], 2500, []))
+    crit = client.calls[0]["json"]["questions"]["answer"]["criteria"]
+    assert crit["a"].startswith("a | ")
+    assert "gpu 1.5% (low demand)" in crit["a"]
+    assert "gpu 88.0% (high demand)" in crit["b"]
+
+
+def test_modalities_reach_the_criteria(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, client = _caller_env(
+        monkeypatch,
+        {"a": {"description": "reads {{modalities}}"}},
+        modalities={"a": ["text", "image"]},
+    )
+    asyncio.run(caller("{}", "policy", ["a", "b"], 2500, []))
+    sent = client.calls[0]["json"]
+    assert sent["questions"]["answer"]["criteria"]["a"].startswith("reads text, image")
+
+
+def test_the_decision_window_is_floored_when_the_named_ceiling_is_off_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 (audit w6): a spend control the decision channel used to bypass.
+
+    _window's off-ladder-ceiling branch returned the WHOLE ladder and dropped
+    routing_min_model, so under decision_mode=active a request naming
+    routing__<off-ladder-model> could be SERVED by a model weaker than the
+    operator's floor. The heuristic channel on the identical request pins to
+    the named ceiling, so the floor must only remove rungs BELOW it -- never
+    make the request unservable.
+    """
+    monkeypatch.setattr(mr, "profile_routing_config", _fake_policy("active", min_model="mid"))
+    monkeypatch.setattr(mr.settings, "routing_enabled", True)
+
+    offered: list[str] = []
+
+    async def decide(candidates, body, score):
+        offered.extend(candidates)
+        return mr.DecisionOutcome(ok=True, choice="small", confidence=0.9, reason="decision")
+
+    model, _route = _resolve(
+        decide,
+        ["big", "mid", "small"],  # most-capable first: cheap_first = [small, mid, big]
+        requested="routing__offladder",
+        registered=["big", "mid", "small", "offladder"],
+    )
+
+    assert "small" not in offered, f"a model below routing_min_model was offered: {offered}"
+    assert model != "small", "the decision model must not serve below the operator's floor"
+    assert model == "offladder", "the named ceiling is still the heuristic's answer for this request"

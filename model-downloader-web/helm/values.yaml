@@ -33,7 +33,7 @@ fullnameOverride: ""
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.7.1
+  tag: v1.8.0
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -237,6 +237,14 @@ catalog:
   storageClassName: ""
   # Raw URL of the seed catalog JSON; the "Refresh from GitHub" button hides when empty.
   githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-downloader-web/src/model_downloader/app/seed_catalog.json"
+  # Project recorded on a packaged model that names none (empty = leave it
+  # blank, the historical behaviour).  The target is MLIS's "project" filter:
+  # a row with an empty project only shows under "All projects".  PCAI projects
+  # are namespaces, so the value is normally a project-user-* namespace --
+  # confirm the exact string MLIS filters on with ONE push before rolling it
+  # out.  Changing it later mints a new version of every affected model, because
+  # project is part of the configuration fingerprint.
+  defaultProject: ""
 
 # ============================================================================
 # MLIS database

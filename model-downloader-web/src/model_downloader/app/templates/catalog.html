@@ -64,6 +64,16 @@
     </div>
     <div class="catalog-controls">
       <button id="add-model-btn" type="button" class="secondary-btn">+ Add Model</button>
+      <label class="push-project" title="Optional: file the pushed models under this project. In PCAI a project is a namespace, so this offers the same project-user-* list as the download page. Empty = the config's own project, else the chart default, else unfiled (MLIS shows unfiled models only under All projects).">
+        <span>Project</span>
+        <div class="combo">
+          <input id="push-project-input" autocomplete="off" spellcheck="false"
+                 placeholder="project-user-… (optional)"
+                 pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?">
+          <button type="button" id="push-project-toggle" class="combo-toggle" aria-label="Project suggestions">&#9662;</button>
+          <div id="push-project-menu" class="combo-menu" hidden></div>
+        </div>
+      </label>
       <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
       {% if catalog_github_url %}
       <button id="refresh-github-btn" type="button" class="secondary-btn">Refresh from GitHub</button>
@@ -80,7 +90,7 @@
       ({% for t in tiers %}{{ tier_labels[t] }}: {{ tier_info[t].quants|join(', ') }} · {{ tier_info[t].vram_gb }} GB{% if not loop.last %} — {% endif %}{% endfor %}) — a missing or misspelled tier silently defaults to <code>h200</code>.
       The tier shows up as part of the configuration's label under its model; the lab and model grouping is derived from the model itself, not from <code>tier</code>.
       <code>tier</code> is not pushed to MLIS (MLIS-side GPU class is <code>resource_gpu_type</code>).
-      Note: an entry is skipped if its <code>name</code> + <code>version</code> already exist in <em>any</em> tier — bump the version or rename the model to add a new variant.</p>
+      Note: entries are deduplicated by <code>name</code> + configuration, so re-adding the same configuration is skipped while a different configuration of the same model is kept. <code>version</code> is assigned by MLIS on push, not authored here.</p>
     <textarea id="direct-json" class="json-input" rows="12" placeholder='{"name": "my-model", ...}  — or —  [{"name": "mc1", ...}, {"name": "mc2", ...}]'></textarea>
     <button id="push-direct-btn" type="button">Push to MLIS</button>
     <button id="add-direct-btn" type="button" class="secondary-btn">Add to Catalog</button>
@@ -95,6 +105,7 @@
         </div>
         <div class="modal-body-scroll">
           <form id="add-model-form" autocomplete="off">
+            <p class="hint">Version is assigned by MLIS at push time: <code>v1</code> for a model name MLIS has not seen, otherwise one above the highest version MLIS already holds for that name. Re-pushing an identical configuration is skipped.</p>
             <div class="form-grid">
               <label>
                 <span>Tier</span>
@@ -108,13 +119,13 @@
                 <span>Name *</span>
                 <input name="name" required placeholder="my-model">
               </label>
-              <label>
-                <span>Version</span>
-                <input name="version" type="number" value="1" min="1">
-              </label>
               <label class="full-width">
                 <span>Description</span>
                 <input name="description" placeholder="Optional description">
+              </label>
+              <label>
+                <span>Project (optional)</span>
+                <input name="project" placeholder="project-user-andrew-bydlon">
               </label>
               <label class="full-width">
                 <span>URI</span>
@@ -201,6 +212,7 @@
           <span id="details-title">Model Configuration</span>
           <button class="modal-close" type="button">&times;</button>
         </div>
+        <p class="hint">version is assigned by MLIS on push: <code>v1</code> for a new name, otherwise one above the highest version MLIS already holds for that name.</p>
         <pre id="details-body"></pre>
       </div>
     </div>

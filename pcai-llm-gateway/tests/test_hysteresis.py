@@ -7,6 +7,7 @@ from typing import ClassVar
 # switch hysteresis (2026-10-26) -- a challenger must beat the incumbent
 # ---------------------------------------------------------------------------
 
+
 def _hyst_run(choice, conf, probs, incumbent, margin, order=("big", "mid", "small"), text="hi"):
     """Resolve one routed request with an injected decision + incumbent."""
     from pcai_llm.core import model_routing as _mr
@@ -19,9 +20,7 @@ def _hyst_run(choice, conf, probs, incumbent, margin, order=("big", "mid", "smal
         return "active", "small"
 
     async def _decide(_c, _b, _s):
-        return _mr.DecisionOutcome(
-            ok=True, choice=choice, confidence=conf, reason="decision", probabilities=probs
-        )
+        return _mr.DecisionOutcome(ok=True, choice=choice, confidence=conf, reason="decision", probabilities=probs)
 
     async def _go():
         return await _mr.resolve_routed_model(
@@ -67,7 +66,11 @@ def test_hysteresis_hold_serves_the_incumbent_not_the_heuristic() -> None:
     incumbent'. The re-prefill the margin exists to prevent was paid anyway.
     """
     model, route = _hyst_run(
-        "mid", 0.60, {"mid": 0.60, "small": 0.55, "big": 0.05}, "small", 0.10,
+        "mid",
+        0.60,
+        {"mid": 0.60, "small": 0.55, "big": 0.05},
+        "small",
+        0.10,
         text="x" * 40000,  # huge body => heuristic picks the ceiling
     )
     assert model == "small", "a held switch must serve the incumbent"

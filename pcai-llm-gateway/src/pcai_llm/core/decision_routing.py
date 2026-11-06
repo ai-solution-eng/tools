@@ -107,30 +107,17 @@ DEFAULT_INSTRUCTIONS = """You are the model router for an LLM gateway. Pick the 
 
 Your pick is a proposal, not a command. The gateway applies its own confidence floor, a switch margin against the model already serving this conversation, and a never-downgrade guard. A low-confidence pick is discarded and a size-based heuristic decides instead -- the request is still served, but it goes wherever prompt length happens to point, regardless of task shape or GPU load. So hedging does not buy a safer route; it buys no route from you at all. Commit to a pick unless the candidates are genuinely interchangeable.
 
-## Candidates
-{{model_list}}
-
-Choose only from this set. Never name a model that is not listed. The order above is not a ranking.
-
-## The state you receive
-- `request.user_task` -- the conversation's ORIGINAL ask: what this session is for. **When it is present, classify the work from THIS.**
-- `request.user_message` -- the most recent user turn (absent when that turn carried no text, e.g. an image-only turn). In an agent loop this is often harness plumbing (a subagent-completion notice, a tool result) rather than a person asking something: read it as what is happening RIGHT NOW, not as what kind of work this is.
-- `request.estimated_prompt_tokens`, `message_count`, `tool_count`, `max_tokens`, `stream` -- request shape.
-- `request.has_image` / `request.image_count` -- if an image is present, a candidate whose `modalities` list is present and lacks `image` cannot serve it. Never pick one. When no candidate carries `modalities`, ignore this rule.
-- `request.current_model` and `request.switch_cost` -- present only when a conversation already has an incumbent: the model currently serving it, and what leaving costs (a switch re-prefills the whole context). Only switch when the capability gain clearly beats that cost.
-- `candidates[].cost`, `candidates[].gpu_util`, `candidates[].low_demand` -- per-model price and live load.
+## What you are given
+- STATE describes the request: the user's own words, the request shape, and -- when this conversation is already being served -- the incumbent and what leaving it costs.
+- OPTIONS are the candidates, and each one carries what this deployment knows about that model: what it is for, its live load and its capabilities. Read them: what separates the candidates is there, not in their names.
 
 ## How to choose
-1. Image request? First eliminate any candidate whose `modalities` list is present and lacks `image`.
-2. Classify the turn from the user's own words first. The words outrank the shape: a long message can be a simple question, a short one can be a hard bug.
-3. Apply the roles:
-   - **Deepseek-V4.1-Flash-1017** -- the default for agent work. Coding, refactors, multi-file changes, debugging, multi-step plans, tool-driven loops, long context, anything expensive to get wrong. Strong coding default.
-   - **GLM-5.3-Flash** -- pick when the deliverable IS judgement: reviewing a diff, verifying a claim, fact-checking, careful summarisation, second opinions, contract and consistency checks.
-   - **Qwen3.8-27B** -- pick only for simpler tasks: a greeting, lookups, reformat, classification. Okay for smaller coding projects too. 256k token limit.
-4. Break remaining ties by `gpu_util` (do not pile onto a hot model for work a cooler one handles equally well), then by `cost`.
-
-## Current GPU load
-{{gpu_load}}"""
+1. Classify the work from the user's own words, not from the request shape. A long message can be a simple question; a short one can be a hard bug. `request.user_message` is the turn being served -- classify from IT. `request.user_task` is the conversation's OPENING ask and it may be stale: use it only when `request.user_message` is not a person asking something (a tool result, a subagent notice, a harness line). A thread that opened with "hello" can be a hard question two turns later.
+2. If `request.has_image` is true and an option's description says it cannot read images, eliminate that option.
+3. Match the work to the option whose description claims it. Prefer the WEAKEST option that genuinely fits: do not spend a strong model on light work, and do not hand work that is expensive to get wrong to a weak one.
+4. Use live load only to break a genuine tie between two options that both fit.
+5. If the conversation already has an incumbent, keep it unless the capability gain clearly beats `request.switch_cost`.
+6. An option that says nothing about what it is FOR carries no role claim. Treat it as unknown rather than unsuitable, and never invent a role for it."""
 
 
 @dataclass
@@ -170,6 +157,22 @@ def _switch_cost_label(context_tokens: int) -> str:
     if context_tokens >= _SWITCH_COST_HIGH_TOKENS // 4:
         return f"moderate: switching re-prefills ~{context_tokens} tokens"
     return "low: short context, cheap to re-prefill"
+
+
+def _bounded_scalar(value: Any) -> Any:
+    """A client-supplied scalar, coerced to something small. PURE.
+
+    max_tokens is the only request field copied from the body into the state,
+    and it is attacker-controlled (any client can send a 20 KB string). An int
+    passes through; anything else is stringified and cut, and None stays None
+    so an absent field stays absent instead of becoming "None".
+    """
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)[:32]
 
 
 def _pct(value: Any) -> str:
@@ -380,6 +383,7 @@ def build_state(
     costs: dict[str, Any] | None = None,
     modalities: dict[str, list[str]] | None = None,
     current_model: str | None = None,
+    include_candidates: bool = True,
 ) -> str:
     """A compact, JSON-encoded description of the request and the candidates.
 
@@ -406,6 +410,13 @@ def build_state(
     -- so the model must know what it would be switching FROM to weigh that.
     Without it the model has no concept of an incumbent and treats every turn
     as a cold start.
+
+    include_candidates=False emits the REQUEST ONLY, no candidates[] block.
+    That is the shape the caller uses once the per-model facts (role, live
+    load, cost, modalities) ride in the CRITERIA channel: the same number in
+    both channels is the duplication this flag removes, and the candidate SET
+    is already the criteria keys. Default True keeps the historical shape for
+    callers (and operator prompts) that still read candidates[].
     """
     messages = body.get("messages") or []
     tools = body.get("tools") or []
@@ -416,7 +427,11 @@ def build_state(
         "estimated_prompt_tokens": int(complexity),
         "message_count": len(messages) if isinstance(messages, list) else 0,
         "tool_count": len(tools) if isinstance(tools, list) else 0,
-        "max_tokens": body.get("max_tokens"),
+        # Coerced and bounded: max_tokens is copied straight from the CLIENT
+        # body, so a 20 000-char string would otherwise be carried into the
+        # state verbatim and blow MAX_STATE_CHARS with nothing left to shed
+        # (the candidate steps are inert on the request-only shape).
+        "max_tokens": _bounded_scalar(body.get("max_tokens")),
         "stream": bool(body.get("stream")),
     }
     # The routing signal. Empty string is omitted rather than sent as "" so a
@@ -440,44 +455,47 @@ def build_state(
     if current_model:
         request_block["current_model"] = current_model
         request_block["switch_cost"] = _switch_cost_label(int(complexity))
-    state: dict[str, Any] = {
-        "request": request_block,
-        "candidates": [],
-    }
-    gpu_models = (gpu or {}).get("models") if isinstance(gpu, dict) else None
-    if not isinstance(gpu_models, dict):
-        gpu_models = {}
-    for name in candidates:
-        entry: dict[str, Any] = {"model": name}
-        if isinstance(costs, dict) and name in costs:
-            entry["cost"] = costs[name]
-        # Capability claim, only when the caller actually knows it: a VLM
-        # candidate is offered to image requests, a text-only one is visibly
-        # unsuitable rather than silently chosen.
-        if isinstance(modalities, dict):
-            mods = modalities.get(name)
-            if isinstance(mods, (list, tuple)) and mods:
-                entry["modalities"] = [str(m) for m in mods]
-        g = gpu_models.get(name)
-        if isinstance(g, dict):
-            entry["gpu_util"] = _pct(g.get("value_pct"))
-            entry["low_demand"] = bool(g.get("active"))
-        state["candidates"].append(entry)
+    state: dict[str, Any] = {"request": request_block}
+    if include_candidates:
+        state["candidates"] = []
+        gpu_models = (gpu or {}).get("models") if isinstance(gpu, dict) else None
+        if not isinstance(gpu_models, dict):
+            gpu_models = {}
+        for name in candidates:
+            entry: dict[str, Any] = {"model": name}
+            if isinstance(costs, dict) and name in costs:
+                entry["cost"] = costs[name]
+            # Capability claim, only when the caller actually knows it: a VLM
+            # candidate is offered to image requests, a text-only one is
+            # visibly unsuitable rather than silently chosen.
+            if isinstance(modalities, dict):
+                mods = modalities.get(name)
+                if isinstance(mods, (list, tuple)) and mods:
+                    entry["modalities"] = [str(m) for m in mods]
+            g = gpu_models.get(name)
+            if isinstance(g, dict):
+                entry["gpu_util"] = _pct(g.get("value_pct"))
+                entry["low_demand"] = bool(g.get("active"))
+            state["candidates"].append(entry)
 
     text = json.dumps(state, sort_keys=True, default=str)
     if len(text) > MAX_STATE_CHARS:
         # Shed signal in the order that costs the LEAST routing quality:
         # costs first (a tie-breaker), then the candidate list. The user's
         # text is never shed -- without it the whole call is a constant.
-        if any("cost" in c for c in state["candidates"]):
-            for c in state["candidates"]:
+        # A REQUEST-ONLY state (include_candidates=False) has no candidate
+        # block at all, so every step below is guarded: the size path must
+        # degrade the same way for both shapes instead of raising KeyError.
+        cands = state.get("candidates")
+        if cands is not None and any("cost" in c for c in cands):
+            for c in cands:
                 c.pop("cost", None)
             text = json.dumps(state, sort_keys=True, default=str)
-        if len(text) > MAX_STATE_CHARS:
+        if cands is not None and len(text) > MAX_STATE_CHARS:
             # Truncate the CANDIDATE list rather than the JSON mid-object: a
             # decision model given invalid JSON would abstain every time.
-            keep = max(2, len(state["candidates"]) // 2)
-            state["candidates"] = state["candidates"][:keep]
+            keep = max(2, len(cands) // 2)
+            del cands[keep:]
             text = json.dumps(state, sort_keys=True, default=str)
         # Last resorts, in order. NEVER slice the serialized JSON: a raw
         # character cut emits invalid JSON and the decision model abstains on
@@ -491,16 +509,16 @@ def build_state(
             keep_chars = max(200, len(msg) - overflow)
             state["request"]["user_message"] = msg[:keep_chars]
             text = json.dumps(state, sort_keys=True, default=str)
-        while len(text) > MAX_STATE_CHARS and len(state["candidates"]) > 1:
+        while cands and len(text) > MAX_STATE_CHARS and len(cands) > 1:
             # Drop the LAST candidate (cheapest-to-lose end of the window) and
             # re-serialize; the JSON stays valid at every step.
-            state["candidates"].pop()
+            cands.pop()
             text = json.dumps(state, sort_keys=True, default=str)
-        if len(text) > MAX_STATE_CHARS:
+        if cands and len(text) > MAX_STATE_CHARS:
             # Single candidate still too big: strip the optional decorations
             # rather than the structure. A minimal valid document beats an
             # informative invalid one.
-            for cand in state["candidates"]:
+            for cand in cands:
                 cand.pop("modalities", None)
                 cand.pop("cost", None)
             state["request"].pop("user_message", None)
@@ -621,9 +639,7 @@ async def decide(
         import inspect
 
         _params = inspect.signature(caller).parameters
-        _takes_images = len(_params) >= 5 or any(
-            p.kind is inspect.Parameter.VAR_POSITIONAL for p in _params.values()
-        )
+        _takes_images = len(_params) >= 5 or any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in _params.values())
     except (TypeError, ValueError):
         # Unintrospectable callable (C function / partial): assume modern.
         _takes_images = True
@@ -632,8 +648,12 @@ async def decide(
             payload = await caller(state, instructions, list(candidates), bounded, list(images or []))
         else:
             # A caller written against the pre-images 4-arg signature. Dropping
-            # the image hint must cost the hint, never the decision.
-            payload = await caller(state, instructions, list(candidates), bounded)
+            # the image hint must cost the hint, never the decision. mypy: the
+            # protocol declares the 5-arg form; this branch exists precisely for
+            # callables that predate it (arity is checked above).
+            payload = await caller(  # type: ignore[call-arg]
+                state, instructions, list(candidates), bounded
+            )
     except TimeoutError:
         return DecisionResult(reason="timeout", latency_ms=int((time.monotonic() - t0) * 1000))
     except Exception as exc:

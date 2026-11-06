@@ -65,12 +65,39 @@ run's detail view) and press Compare — or deep-link `/results?compare=<id1>,<i
 The comparison is backed by public GET /api/results/compare?ids=… (read-only,
 same posture as the rest of the results surface): rows are aligned across
 runs by level label, each later run's values carry signed percent deltas
-against the reference run (the first selected run of each kind; positive =
-better, direction-aware — faster TTFT and higher throughput both show
-green), runs of different kinds land in separate sections with their own
-reference and columns, and a "copy as CSV" button exports the merged
-table. Runs missing their machine-readable artifacts (interrupted runs)
+against the reference run (the first selected run of each kind unless you
+pick another; positive = better, direction-aware — faster TTFT and higher
+throughput both show green), runs of different kinds land in separate
+sections with their own reference and columns, and a "copy as CSV" button
+exports the merged table. The comparison header's **reference** select
+(or `/results?compare=<id1>,<id2>&ref=<id2>`, or GET
+`/api/results/compare?ids=…&ref=…`) moves the baseline: the chosen run is
+listed first, keeps its series colour, and every delta is re-signed against
+it. Use it when the newest run is not the one you want to measure against
+— e.g. comparing a 4× H200 run on a 2-way-NVLink G2 medium against the same
+model on an 8-way box. Runs missing their machine-readable artifacts (interrupted runs)
 appear with a note rather than silently vanishing.
+
+### The list is grouped — and you can hide what you don't need
+
+A flat list stops working at a few dozen runs, so /results renders **one
+collapsed group per model** (chat runs and that model's committed baselines
+together) or **per target** (endpoint runs, which carry no model identity).
+A group header shows the entry counts, status mix and latest start; clicking
+it expands the runs, "expand all"/"collapse all" do the obvious, and the
+filter box auto-expands whatever it matches. Fused partial runs sit behind
+the representative row's `+N fused` link instead of occupying their own
+rows.
+
+Rows and whole groups can be **hidden** from the list (per row: `hide`;
+per group: `hide all`). Hiding is page management, **not deletion**: the
+hidden-id list lives in `<work-dir>/hidden.json`, the artifacts stay on the
+PVC, and a hidden run is still comparable and downloadable by id. Hidden
+entries reappear dimmed under "show hidden", where they can be unhidden.
+Because the list is shared, POST `/api/results/hidden`
+(`{"ids": [...], "hidden": true}`) is gated by the web-app API key — the
+page prompts for it on the first hide; GET `/api/results` stays public and
+returns the hidden list beside the runs.
 
 ### The results library (committed baselines)
 

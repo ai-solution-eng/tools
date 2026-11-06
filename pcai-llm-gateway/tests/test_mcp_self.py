@@ -8,6 +8,7 @@ catalog is 403; credentials are write-only and scoped to the CALLER's key
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -397,3 +398,30 @@ def test_overview_lists_deny_row_as_ungranted(env, monkeypatch: pytest.MonkeyPat
     (srv,) = body["servers"]
     tools = {t["tool"]: t for t in srv["tools"]}
     assert set(tools) == {"search_logs"}
+
+
+# ---------------------------------------------------------------------------
+# de-specialized memory (2026-11-04): credentials are the attachment surface
+# ---------------------------------------------------------------------------
+# Operator decision: stop modelling a RAG dataset in the gateway. Per-user
+# memory identity is ONE per-key header override on the memory server
+# (mm-rag: X-API-Key) over an SSO-managed ★ dataset the RAG app resolves
+# server-side, and the distiller's gate probes the backend's own capability
+# (routes_distill.memory_attached) instead of reading a gateway-side stamp.
+
+
+def test_overview_has_no_memory_card_and_reports_credentials_generically(env) -> None:
+    """The dialog payload carries NO gateway-modelled `memory` object; the
+    generic per-server listing IS the attachment surface (stored header NAMES
+    only — values never leave the DB), for the memory server like any other."""
+    tc, fake, _key = env
+    from pcai_llm.core import secretbox
+
+    fake.cred_rows = [
+        {"server_name": "logsearch", "headers_enc": secretbox.encrypt(json.dumps({"X-API-Key": "rag-key"}))}
+    ]
+    body = tc.get("/v1/mcp/selfservice", headers=_h()).json()
+    assert "memory" not in body, "the gateway must not model a RAG dataset"
+    (srv,) = body["servers"]
+    assert srv["server"] == "logsearch"
+    assert srv["cred_header_names"] == ["X-API-Key"]

@@ -72,6 +72,38 @@ class Settings(BaseSettings):
     # cools down for this long before being retried.
     endpoint_failure_threshold: int = 5
     endpoint_cooldown_s: float = 60.0
+    # --- active health probe (GOAL A) -------------------------------------
+    # Availability today is PASSIVE only: Pool.healthy() is the breaker-not-
+    # cooling, fed exclusively by traffic that happens to arrive — an idle-
+    # but-broken model (upstream 400s every call) reads healthy forever and
+    # keeps ranking as free/idle. core.health_probe GETs {base_url}/models on
+    # every endpoint of every chat|embedding|reranker pool and reports probe_
+    # ok into the pool: a probe_ok=False endpoint is EXCLUDED from
+    # Pool.healthy(), while probe_ok None (never probed) stays HEALTHY —
+    # fail-open, a cold pod must not be treated as broken.
+    # DEFAULT OFF (2026-11-03 INCIDENT). Shipped on, and it took the fleet
+    # down: the first sweep marked every endpoint probe-failed and every chat
+    # request answered "503 no healthy upstream". Two causes are fixed (the
+    # probe now sends the endpoint's OWN credentials, and Pool.healthy() has a
+    # never-empty fail-open), but a signal that can empty a pool earns its
+    # default by being observed working first. Flip to true per site after
+    # checking GET /admin/endpoints shows the fleet probed OK.
+    health_probe_enabled: bool = False
+    # Probe cadence, seconds. 0 disables (inert no-op). WHY 30: the probe is
+    # OFF the request path (N upstream GETs per 30 s, not per request), so a
+    # broken endpoint drops out of rotation within one or two scrape cycles
+    # at negligible upstream load — 30 s is ~2x a typical 15 s scrape
+    # interval, which endpoint_cooldown_s (seconds) also assumes.
+    health_probe_interval_s: float = 30.0
+    # Per-endpoint probe timeout. 5 s: long enough for a cold but alive
+    # upstream's /models to answer, short enough that a dead one is marked
+    # within the interval instead of stalling the whole sweep.
+    health_probe_timeout_s: float = 5.0
+    # CONSECUTIVE failed sweeps before an endpoint is marked probe_ok=False.
+    # 2, not 1: the same hysteresis the breaker gives real traffic. One blip
+    # (a slow scrape, a 5xx during a rollout) must not drop an endpoint out of
+    # rotation, and a single bad sweep is the cheapest possible false positive.
+    health_probe_failures_to_trip: int = 2
     # CA bundle for the UPSTREAM httpx client (model endpoints + MCP servers).
     # Empty (default) = httpx's default trust store (system CAs). Set it to a
     # mounted CA-bundle path when a site's PCAI ingress presents a PRIVATE CA:
@@ -142,6 +174,49 @@ class Settings(BaseSettings):
     rate_limit_predict_rows: int = 50
     rate_limit_predict_ttl_s: int = 60
 
+    # --- exact-match response cache (chat, non-streaming) ------------------
+    # off    = no lookup, no store (byte-identical legacy path)
+    # shadow = compute the key and RECORD would-be hits; nothing is served.
+    #          This is how the duplicate rate is measured before any answer
+    #          is ever replayed (gateway_response_cache_total{mode="shadow"}).
+    # active = serve a stored answer on a hit, store on a miss.
+    # Only DETERMINISTIC requests are eligible (temperature == 0, not
+    # streamed, not relayed); see core.response_cache.eligible.
+    response_cache_mode: str = "off"
+    # How long a stored answer stays servable. Keep it short: a cached answer
+    # is a stale answer by definition, and agent traffic re-sends the same
+    # prefix with NEW content, which the request hash already distinguishes.
+    response_cache_ttl_s: int = 3600
+    # Do not store answers above this size (a 200k-token JSON blob is not
+    # worth a row, and replaying it would distort latency expectations).
+    response_cache_max_bytes: int = 256 * 1024
+
+    # --- OpenTelemetry tracing (optional dependency) -----------------------
+    # Off by default: the SDK is an optional import (like prometheus_client),
+    # so a deployment with no collector pays nothing. OTLP/HTTP (4318) is the
+    # default exporter - fewer moving parts than gRPC and it survives a
+    # corporate proxy better. The span tree is one parent per request with a
+    # child per relay hop (model call / tool call).
+    otel_enabled: bool = False
+    otel_endpoint: str = "http://otel-collector:4318"
+    otel_service_name: str = "pcai-llm-gateway"
+    otel_sample_ratio: float = 1.0
+
+    # --- session affinity (provider + key pin) -----------------------------
+    # A conversation may pin the ENDPOINT (not just the cascade head) so its
+    # prefix keeps hitting the same server's KV cache. Routing STATE, never
+    # policy: a pin that no longer qualifies is discarded on read.
+    session_affinity_enabled: bool = False
+    session_affinity_ttl_s: int = 3600
+
+    # --- audio passthrough billing heuristics ------------------------------
+    # TTS/ASR report no token usage, but a route that settles zero tokens is a
+    # budget bypass. Bill an ESTIMATE instead: TTS by characters (4 chars ~
+    # 1 token, the same heuristic the text path uses), ASR by audio duration
+    # (~3 tokens/second ~ 180/minute, roughly 150 spoken words).
+    audio_tts_chars_per_token: int = 4
+    audio_asr_tokens_per_second: float = 3.0
+
     # --- period-budget cached exemption (budget_cached_exempt_fraction) ---
     # The SAME problem the TPM refund fixes, on the slower axis: period token
     # budgets summed FULL prompt_tokens, so a ~500k-token context re-sent
@@ -206,6 +281,32 @@ class Settings(BaseSettings):
     # generations that actually completed server-side is why this is bounded
     # to one.
     tool_relay_call_retries: int = 1
+
+    # --- tool-result compression (X-PCAI-Compress-Tools, 2026-11-04) -----
+    # Deterministic, model-free SELECTION over oversized tool results: keep
+    # the signal (error records, boundary context, changed lines, relevant
+    # matches), drop the redundancy, and store the original for on-demand
+    # retrieval via the synthetic pcai__retrieve tool. NOT a summarizer —
+    # generation belongs in a subagent, not the request path (design review:
+    # "the gateway compresses structure; agents summarize meaning").
+    #
+    # Default OFF. The header is the per-request switch and outranks this
+    # value; "shadow" computes and reports the saving without rewriting, so
+    # a site can measure the ratio on real traffic before enabling.
+    tool_compress_default: str = "off"
+    # Below this size the marker costs more attention than the omission
+    # saves. 4096 matches the relay's existing result-cap intuition.
+    tool_compress_min_chars: int = 4096
+    # Minimum FINAL saving (marker included) to justify a rewrite. A 5%
+    # saving is not worth the retrieval risk or the model's attention.
+    tool_compress_ratio_floor: float = 0.15
+    # Retrieval window for stored originals; 0 disables reclamation.
+    tool_compress_store_ttl_s: int = 86_400
+    # Largest original worth retaining. A result above this passes through
+    # uncompressed rather than pinning multi-MB text for the full TTL: the
+    # feature's win is on the 10-500 KB payloads that dominate tool output,
+    # and an unbounded store is a memory/disk liability, not a feature.
+    tool_compress_max_store_chars: int = 1_000_000
 
     # --- reasoning continuity (2026-10-26) -------------------------------
     # Whether the model is shown its OWN prior reasoning: in-loop (the
@@ -364,6 +465,23 @@ class Settings(BaseSettings):
     # first listing after boot still pays the upstream fan-out (bounded at
     # the 15 s metadata timeout per server) — accepted.
     mcp_catalog_cache_s: float = 60.0
+    # --- cross-replica registry convergence (2026-10-30) ---
+    # The registry snapshot (mcp_servers + model_endpoints) is PROCESS-LOCAL
+    # and used to reload only at boot and after a mutation THIS process served.
+    # On an HPA'd deployment (minReplicas 2) a server registered on one replica
+    # was therefore invisible to its sibling until that pod restarted: the
+    # console's "test" button 404'd "not in the enabled registry" on roughly
+    # half the clicks, and the relay answered "unknown server" for it. The
+    # watcher polls a DB watermark (row counts + max(updated_at), one aggregate
+    # over two tiny tables) on this cadence and refreshes only when it moved.
+    # 0 = disabled — correct ONLY for a single-replica deployment, and it
+    # re-introduces the stale-sibling bug the moment the HPA adds a pod.
+    registry_watch_s: float = 5.0
+    # The admin console's registry reads (server list + the "test" button) also
+    # re-check the watermark ON DEMAND, at most once per this interval — that
+    # is what bounds the CONSOLE's staleness to ~1 s instead of the watcher
+    # cadence. 0 = disabled (console reads then rely on the watcher alone).
+    registry_admin_fresh_s: float = 1.0
     # Flattened-call failover: retries AFTER the primary server on
     # transport-level failure (unreachable/timeout/protocol error — never on
     # upstream tool-error results, which are real answers). Explicit
@@ -654,7 +772,7 @@ class Settings(BaseSettings):
 
     # --- identity (Phase A of the fleet identity architecture) ---
     # Trust the oauth2-proxy identity headers (X-Auth-Request-User / X-Email /
-    # X-Forwarded-Groups) on the browser rung of the identity resolver
+    # X-Auth-Request-Groups) on the browser rung of the identity resolver
     # (core/identity.py). DEFAULT OFF: the headers are client-spoofable at
     # the pod — the flag is safe ONLY where an enforcing proxy overwrites
     # them on every request AND an Istio AuthorizationPolicy (pcai-helm-lib
@@ -663,6 +781,31 @@ class Settings(BaseSettings):
     # flipping it without proxy + AuthorizationPolicy lets any caller assert
     # any identity. Mirrors RAG_TRUST_PROXY_IDENTITY (the fleet convention).
     trust_proxy_identity: bool = False
+    # Consult X-Forwarded-Groups for browser-rung groups — ONLY for chains
+    # whose proxy INJECTS that header and overwrites it on every request.
+    # The platform oauth2-proxy does NOT set it (DEPLOYMENT.md "Platform
+    # oauth2-proxy facts"), so on PCAI an arriving X-Forwarded-Groups is
+    # client-supplied by definition; default false = fail closed to the
+    # proxy-injected X-Auth-Request-Groups spelling (audit r5 #4 + the xv
+    # cross-validation follow-up, 2026-10-30: without this gate a groupless
+    # proxy identity could self-grant adminGroups via the forwarded header).
+    trust_forwarded_groups: bool = False
+    # Absolute URL of the platform oauth2-proxy's sign-out endpoint, e.g.
+    # https://oauth2-proxy.<domain>/oauth2/sign_out. Empty (default) = the
+    # gateway's /oauth2/sign_out route answers `/?signout=local` (a local-only
+    # sign-out, stated honestly in the UI) instead of the old behaviour, which
+    # was to let the path fall through to a JSON 404 while the SSO cookie
+    # survived — the "sign out does nothing" report.
+    #
+    # WHY config and not a hardcoded same-origin path: the proxy's host and
+    # mount point are PLATFORM decisions. In the G2 deployment the proxy serves
+    # only /oauth2/callback on its own host and nothing on the app's host, so
+    # there is no same-origin URL that ends the session; elsewhere (the
+    # MM RAG posture) the proxy IS mounted at /oauth2 on the app host. One
+    # env var covers both without a code change, and the chart's
+    # ezua.virtualService.ssoProxy route can make the same-origin form true
+    # by routing /oauth2/ to the proxy service.
+    sso_sign_out_url: str = ""
     # Stamp X-MCP-Caller: <subject or key-fp> on every upstream fleet MCP
     # call (resolve_mcp_headers — the single choke point both the /mcp call
     # path and the relay executor use). ATTRIBUTION-NEVER-AUTHORIZATION:
@@ -759,15 +902,17 @@ class Settings(BaseSettings):
     # rare collision), the name is suffixed -2/-3/-4 up to this many EXTRA
     # attempts before provisioning is abandoned (reported, never fatal).
     enroll_memory_name_retries: int = 3
-
     # --- session distiller (the harness-independent memory pipeline) ---
     # Master switch for the /v1/distill surface. False leaves the router
     # UNMOUNTED (the routes_mcp_self pattern: an off surface 404s like a
     # route that never existed). Even when on, the surface is INERT for a
-    # key whose memory feature is not attached: no enabled registry row for
-    # enroll_memory_server, or no stamped {X-Memory-Dataset,
-    # X-Dataset-Password} pair on the key - both are required (see
-    # routes_distill.memory_attached).
+    # key the backend reports as unattached: the memory server must be an
+    # enabled registry row, and the backend's own capability probe
+    # (distiller_memory_probe_tool) must answer memory_available + writable
+    # for THAT key's credential merge (routes_distill.memory_attached). The
+    # gateway does not know the backend's dataset model - a key whose memory
+    # is a single header override (mm-rag: X-API-Key over an SSO-managed
+    # dataset) is attached exactly like any other.
     distiller_enabled: bool = False
     # Which registered MCP server is THE memory server for the distiller, and
     # which tool writes memories on it (mm-rag: add_memory). Deployment

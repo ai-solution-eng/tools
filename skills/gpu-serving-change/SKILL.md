@@ -58,7 +58,7 @@ mem-fraction *frees* boot headroom for graphs and autotune transients.
 Boot ledger to budget against: weights+engram+draft 74.7 GB/rank; eager warmup+tuners ≈11.2; verify
 graph pools 18.34 GiB (deterministic); decode graph pools ≈6–12; boot runtime ≈36–42 GB.
 
-## Worked example — a model-specific config (any model; this is the reference instantiation)
+## Worked example — a model-specific config (any model; evidence, not a default)
 
 - **BF16 KV is forced, not a compromise.** SGLang's `--kv-cache-dtype` is **global across the target's hybrid
   layers**, and the **11 TileLang-DSA layers** force the whole pool to bf16. Cheap anyway: 34/45 text layers are KDA
@@ -200,7 +200,7 @@ SGLang cookbook (`docs/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1.mdx` at th
 the cookbook's H200 cell is 8xH200 TP8/EP8, so its `--cuda-graph-max-bs-decode 64` and TP/EP values do **not**
 transfer to a 4xH200 TP4/EP4 box. Take the *rules*, not the literals.
 
-## Reference instantiation (one deployment's values — re-derive locally)
+## Deployment values to resolve locally
 
 - Fleet: 4×H200 nodes `scs04` / `scs05`; two models co-scheduled on an 8-GPU node. Models: `GLM-5.3-Flash` (served
   target) + its `DFlash2` draft; `DeepSeek-V4.1-Flash`.

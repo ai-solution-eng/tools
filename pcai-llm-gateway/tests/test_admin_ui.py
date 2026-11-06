@@ -327,7 +327,9 @@ def test_console_profile_routing_knobs() -> None:
     for v in ("off", "shadow", "active"):
         assert f'<option value="{v}"' in s
     assert 'id="p-routing-min"' in s
-    assert "must be one of the profile's models; empty = no downgrade" in s
+    # the operator-facing hint carries the same two facts it always did
+    # (2026-10-30 copy pass moved it under the input)
+    assert "One of the profile's models. Empty = no downgrade." in s
     assert "~60s" in s  # the proxy-cache staleness hint
     # save body carries both fields
     assert "routing_policy: $('p-routing-policy').value" in s
@@ -803,7 +805,9 @@ def test_split_preset_budgets_contract() -> None:
         [{"period": "month", "limit_tokens": True}],  # bool is an int subclass
         [{"period": "month", "limit_usd": 0}],
         [{"period": "month", "limit_usd": "5"}],
-        [{"period": "year", "limit_usd": 5}],
+        # 2026-11-02: "year" (and "quarter") are VALID periods now — the still-
+        # invalid shape is "hour", which belongs to the rate limiter, not budgets.
+        [{"period": "hour", "limit_usd": 5}],
     ):
         with _pytest.raises(ValueError):
             split_preset_budgets(bad)
@@ -931,14 +935,17 @@ NAV_GROUP_TABS = [
     "keys|profiles|enroll",
     # agents sit with the registry tabs: an agent IS a model entry in the data
     # plane (GET /v1/models, pcai.type="agent"), so it belongs next to Models.
-    "models|agents|mcp",
+    # 2026-10-30: "Advertised" (the registry view split out of Models) and
+    # "Metrics" (live endpoint throughput/load) join the inventory group —
+    # both are about the objects the Models tab registers.
+    "models|advertised|agents|mcp|metrics",
     "usage|traces|audit|guardrails",
     "offpeak|distiller|routing",
 ]
 
 
 def test_console_nav_groups_with_green_separators() -> None:
-    """5a: the twelve tabs are grouped into exactly FOUR .navgroup divs —
+    """5a: the tabs are grouped into exactly FOUR .navgroup divs —
     identity, inventory, observability (Usage folded in with
     traces/audit/guardrails — the Lead's ruling), background GPU-economy
     (off-peak, distiller, routing) — separated by a thin green rule. The
@@ -985,21 +992,86 @@ def test_console_routing_panel() -> None:
     body = fn.group(0)
     assert "unavailable" in body, "panel must degrade to the unavailable pill on a failed fetch"
     assert "env-off" in body and "effective_enabled" in body, "pill must distinguish config-paused from env-off"
-    # save body: the allowlist array + GPU injection checkbox ride along
-    assert ".rt-allowed-model:checked" in s
+    # save body: the three card-derived shapes + GPU injection checkbox ride along
+    assert ".rt-card-routable:checked" in s
     assert "inject_gpu_load: $('rt-inject').checked" in s
+    assert "model_cards: cardForm.model_cards" in s
+    assert "model_modalities: cardForm.model_modalities" in s
     # GPU-load availability line mirrors the Off-peak panel's honesty gate
     gpu = re.search(r"function paintRoutingGpu\(gpu\) \{.*?\n\}", s, re.DOTALL)
     assert gpu and "available" in gpu.group(0)
-    # muted footer: the decision model IS called on routed requests (it is no
-    # longer config-storage-only -- core.decision_routing landed). The copy must
-    # say what shadow vs active actually DO, since that is the operator's whole
-    # question when they open this panel.
-    assert "IS called on routed requests" in s
-    assert "records its pick without serving it" in s
-    # and the shadow help text must not repeat the old "no latency risk" claim:
-    # shadow DOES pay one bounded decision call per routed request.
-    assert "pays one extra decision call" in s
+    # the footer states WHEN routing engages (the operator's whole question
+    # when they open this panel), and the mode help says what shadow vs active
+    # actually DO.
+    assert "Routing engages only when a request names" in s
+    assert "the model is asked and its pick recorded, the heuristics still serve" in s
+
+
+def test_console_routing_model_cards() -> None:
+    """One card per routable model, and the CARD TEXT is the criteria.
+
+    2026-10-30: the per-model role text moved out of the prompt (which named
+    three models) into per-model cards, because the candidate set is
+    per-request. The panel is the only place an operator can say what a model
+    is for, so the contract it must keep is: render from the available chat
+    models, save all three shapes from ONE read of the form, and surface the
+    models that have no description (a decision model given bare labels has no
+    basis to discriminate -- measured 0/15 commits when the roles were removed
+    and not relocated).
+    """
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # the panel exists, and it is painted from the chat pools
+    assert 'id="rt-cards"' in s
+    fn = re.search(r"function paintRoutingCards\(models, allowed, modalities, cards, chat\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "paintRoutingCards not extractable"
+    body = fn.group(0)
+    assert "rt-card-routable" in body and "rt-card-desc" in body and "rt-card-image" in body
+    # empty allowed_models means "every chat model", so every card renders ticked
+    assert "allowAll" in body
+    # descriptions are set through .value, never parsed as markup
+    assert "ta.value = " in body
+    # one reader for all three shapes
+    rd = re.search(r"function readRoutingCards\(models\) \{.*?\n\}", s, re.DOTALL)
+    assert rd, "readRoutingCards not extractable"
+    rbody = rd.group(0)
+    assert "allowed_models" in rbody and "model_modalities" in rbody and "model_cards" in rbody
+    # coverage line names the undescribed models
+    cov = re.search(r"function paintRoutingCoverage\(\) \{.*?\n\}", s, re.DOTALL)
+    assert cov and "described" in cov.group(0)
+    # the card placeholder legend is served, not invented in the browser
+    assert "criteria_placeholders" in s
+    assert "CARD_PLACEHOLDER_HELP" in s
+    # live statistics are their OWN panel: a counter read-out must not compete
+    # with the config form for the same scroll
+    assert s.index("Live statistics") > s.index("Model cards")
+    assert s.index("Live statistics") > s.index("Decision prompt")
+
+
+def test_console_mcp_server_description_tooltip() -> None:
+    """The MCP server name carries its description on hover/focus.
+
+    title= was rejected on purpose: it cannot be reached by keyboard and it
+    renders outside the page's control, so the cell builds a focusable bubble
+    and escapes the description like every other server string.
+    """
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    fn = re.search(r"function mcpNameCell\(sv\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "mcpNameCell not extractable"
+    body = fn.group(0)
+    # tabindex="0", not merely "tabindex": -1 matches the substring and is NOT
+    # keyboard reachable, which is the whole point of not using title=
+    assert "tip-bubble" in body and 'tabindex="0"' in body
+    assert "esc(desc)" in body, "the description must be escaped like any server string"
+    assert "mcpNameCell(sv)" in s, "the MCP table must use the cell"
+    assert ".tip > .tip-bubble" in s, "the bubble needs its CSS"
+    assert ".tip:focus > .tip-bubble" in s, "keyboard focus must open it"
+    assert "max-height" in s and "overflow: auto" in s, "a long description must scroll inside the bubble"
+    # fixed, not absolute: the card is a clipping context and would cut the bubble
+    assert "position: fixed" in s
 
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1085,11 @@ def test_console_agents_tab() -> None:
     """The Agents tab is a full CRUD surface: it must be reachable from the nav,
     lazy-load on activation, and drive the three /admin/agents verbs. The server
     picker is the ONLY place an operator says what an agent may see, so its
-    checkboxes are pinned by class (the save reads exactly that class)."""
+    checkboxes are pinned by class (the save reads exactly that class).
+
+    2026-11-04: the picker grew per-server TOOL narrowing — a server row carries
+    its include checkbox, an expander that loads the live catalog, and the tool
+    checkboxes; the save derives both lists in agSelection()."""
     import re
 
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
@@ -1024,8 +1100,15 @@ def test_console_agents_tab() -> None:
     assert 'encodeURIComponent(name), { method: "DELETE" }' in s
     # the picker + save contract
     assert 'id="ag-servers"' in s
-    assert 'class="ag-srv"' in s
-    assert 'document.querySelectorAll("#ag-servers input.ag-srv")' in s
+    assert 'class="ag-srv-box"' in s and "ag-tools-btn" in s
+    assert "function agSelection()" in s and "tools: sel.tools" in s
+    assert '"/mcp-servers/" + encodeURIComponent(server) + "/tools"' in s
+    # live report 2026-11-04: the expander opened once and never closed, and a
+    # deselected server still showed every tool ticked. Both are pinned here:
+    # the [hidden] selector is what makes retraction possible at all, and
+    # agSyncToolPanel is what keeps the checkboxes honest about inclusion.
+    assert ".ag-srvrow .ag-tools[hidden] { display: none; }" in s
+    assert "function agSyncToolPanel(" in s and "server not included" in s
     assert 'id="ag-prompt"' in s and 'id="ag-model"' in s
     # the honest legend: an agent HIDES tools, it never grants them
     assert "can only ever HIDE tools, never add one" in s
@@ -1042,7 +1125,6 @@ def test_console_agents_tab() -> None:
     assert "state.agentsLoaded ? pAgentSelection() : undefined" in s
     # starting from a preset/profile must reset the picker, not carry ticks over
     assert s.count("pRenderAgents([])") >= 1
-
 
 
 def test_console_profile_agents_picker() -> None:
@@ -1084,14 +1166,13 @@ def test_console_profile_agents_picker() -> None:
     assert "stamped" in s and "LIVE grants" in s
 
 
-
 def test_console_presented_endpoints_lists_agents() -> None:
     """An agent IS a model entry in the data plane, so the panel that claims to
     show what /v1/models advertises must list them — with the servers, the
     resolved model, and the profiles that offer each one."""
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
     assert "const agentRows = (d.agents || []).map(" in s
-    assert "Agents <span class=\"muted\">— tool surfaces selectable as a model</span>" in s
+    assert 'Agents <span class="muted">— tool surfaces selectable as a model</span>' in s
     assert "no agents defined" in s
     for col in ("Servers", "Offered by", "Presented"):
         assert col in s
@@ -1104,12 +1185,18 @@ def test_console_presented_endpoints_block() -> None:
     a muted counts line — loaded on tab activation AND from the refresh
     button, degrading to a muted unavailable line on older backends."""
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
-    assert "Presented endpoints — what /v1/models advertises" in s
+    # the heading lost its subtitle in the 2026-10-30 copy pass; the fact it
+    # carried (this is what /v1/models advertises) moved to the hint below it
+    assert "Presented endpoints</h2>" in s
+    assert 'What <span class="mono">/v1/models</span> advertises' in s
     # refresh button wired like the distiller's ↻ (intermediate-var binding)
     assert 'id="pe-reload"' in s and "const peReloadBtn = $('pe-reload')" in s
     assert "peReloadBtn.addEventListener('click', loadPresentedModels)" in s
     assert "api('/presented-models')" in s
-    assert "if (name === 'models') loadPresentedModels().catch(" in s
+    # split out of Models on 2026-10-30: its own tab owns the lazy load
+    assert "if (name === 'advertised') loadPresentedModels().catch(" in s
+    assert 'id="tab-advertised"' in s
+    assert "if (name === 'models') loadPresentedModels" not in s
     # the three row families + the counts line (N presented · M registered)
     for marker in ("Aliases", "Routing pseudo-models", "Registered pools"):
         assert marker in s
@@ -1201,6 +1288,72 @@ def test_live_pools_show_model_type() -> None:
     assert "mixed" in s
 
 
+def test_console_live_pools_edit_loads_the_whole_registration() -> None:
+    """2026-11-05 operator request: Live pools had test/fallbacks/remove but no
+    edit, so changing a pool meant re-typing every endpoint. The row's edit
+    button now loads the FULL registration into the top form — the same
+    register+edit surface the MCP tab uses.
+
+    The read is a dedicated admin call (GET /admin/models returns NAMES only,
+    and the health surface carries no credential state). Credential VALUES
+    never cross it: the form receives the by-ref Secret NAME and the boolean
+    auth_configured (for the "(unchanged)" placeholder), never the token."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # the action + its inline-onclick export
+    assert 'onclick="editModel(this)"' in s
+    assert re.search(r"window\.editModel = async btn =>", s), "editModel must be a window global"
+    # the form grew an edit identity and a cancel path
+    assert 'id="mo-form-title"' in s and 'id="mo-cancel"' in s
+    assert "function modelFormReset(" in s
+    assert "$('mo-cancel').onclick" in s
+    # the pool read, path-encoded (pool names may contain "/")
+    assert "encodeURIComponent(name)}/pool`" in s
+    # the edit lands BELOW the sticky header + nav, not under them
+    assert "function scrollFormTitleIntoView(" in s
+    assert "scrollFormTitleIntoView($('mo-form-title'))" in s
+    # the model name is the pool key: editing must not silently rename/create
+    assert "nameInput.readOnly = true" in s and "name.readOnly = false" in s
+    assert "model_name: editingModel || $('mo-name').value" in s
+    # blank key = keep stored credential; the form knows which rows have one
+    assert "e.auth_configured ? '(unchanged)'" in s
+    # weight 0 is standby — the edit paint and the save must both preserve it
+    assert "e.weight != null ? e.weight : 1" in s
+    assert "Number.isFinite(w) ? w : 1" in s
+    # removing the pool that is open in the form clears the dead editor
+    assert "editingModel === name" in s
+
+
+def test_console_table_action_cells_share_one_block() -> None:
+    """2026-11-05 operator request: the MCP and Live pools rows must lay out
+    their actions identically. Both render the same .rowacts grid of equal
+    ghost buttons and put the test result on its OWN .rowres line underneath.
+    Inline results made the cell width depend on the pill text, so a wider
+    "ok · 122ms" or a fail message wrapped on some rows and not others — row
+    heights changed and the table stretched past the card."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # both tables render the shared grid + result line
+    assert s.count('<div class="rowacts">') >= 3  # keys + profiles + MCP + models
+    assert '<div class="rowres"><span class="mcp-test"' in s
+    assert '<div class="rowres"><span class="probe-out"' in s
+    # the result is OUTSIDE the button grid: testMcp must look it up from the cell
+    assert "btn.closest('td')" in s
+    assert "btn.parentElement.querySelector('.mcp-test')" not in s
+    # the result line is pinned to the grid width and long text wraps inside it
+    rule = re.search(r"\.rowres \{[^}]*\}", s)
+    assert rule and "width: 168px" in rule.group(0)
+    pill = re.search(r"\.rowres \.pill \{[^}]*\}", s)
+    assert pill, "the result pill needs its own rule"
+    assert "max-width: 100%" in pill.group(0)
+    assert "white-space: normal" in pill.group(0)
+    assert "overflow-wrap: anywhere" in pill.group(0)
+    # the models table carries the new edit action in the same block
+    assert 'onclick="editModel(this)"' in s
+
+
 def test_nav_is_sticky_below_the_header() -> None:
     """The tab strip scrolled away on a long page, forcing a scroll back to
     the top to change section. It must stick, and it must stick BELOW the
@@ -1248,3 +1401,510 @@ def test_keys_page_has_a_search_filter() -> None:
     assert "data-search=" in s
     # the filter must survive a reload, or editing a key silently resets it
     assert "filterKeys();" in s
+
+
+def test_console_endpoint_metrics_panel() -> None:
+    """The Metrics tab is the engine's own view: token rates split by phase,
+    queue depth, KV-cache occupancy, per POD.
+
+    Three contracts matter and each has bitten before:
+      * it polls only while the tab is VISIBLE (an admin console left open all
+        day must not hammer Prometheus);
+      * it degrades to a line of text, never a dead tab, when the collector
+        cannot reach Prometheus;
+      * an unattributed pod SURVIVES as an "unmapped" row -- dropping it is how
+        a busy pool reads as idle.
+    """
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'data-tab="metrics"' in s and 'id="tab-metrics"' in s
+    assert "api('/endpoint-metrics')" in s
+    # lazy-load + poll lifecycle, mirroring the off-peak tab
+    assert "if (name === 'metrics') {" in s
+    assert "startEndpointMetricsAuto()" in s and "stopEndpointMetricsAuto()" in s
+    assert "document.visibilityState === 'hidden'" in s
+    assert "clearInterval(emTimer)" in s
+    # the columns the question is about
+    # "Prompt t/s", not "Prefill t/s": the counter includes prefix-cache hits,
+    # so calling it prefill claimed GPU work the engine never did
+    for col in ("Prompt t/s", "Decode t/s", "Running", "Queue", "KV%", "Cache hit", "Prefill share"):
+        assert col in s, col
+    assert "Prefill t/s" not in s
+    # unmapped pods are rendered, not dropped
+    assert "unmapped" in s
+    # idle is a WORD, not a zero that reads as a fault
+    assert "· idle" in s
+    # a failed fetch degrades the pill instead of throwing
+    fn = re.search(r"async function loadEndpointMetrics\(\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "loadEndpointMetrics not extractable"
+    body = fn.group(0)
+    assert "unavailable" in body and "no endpoints reporting" in body
+    # chunked prefill is stated, not papered over with a binary state
+    assert "chunked prefill" in s
+    # a real-but-small KV reading must not round to "0.0" (it reads as "empty
+    # cache" when the engine is holding a little) -- percentages get their own
+    # formatter, and the exact value rides in the title
+    assert "function emPct(v, digits)" in s
+    assert "emPct(r.kv_cache_pct, 2)" in s, "KV% needs two decimals: the pool is huge"
+    assert "emPct(r.cache_hit_pct)" in s
+    # a value below the printed precision must say so, not print a zero
+    assert "return '<' + floor.toFixed(d);" in s
+    # the fraction is unreadable without the absolute
+    assert "function emKvTitle(r)" in s and "tokens held" in s
+    assert "% of the KV cache in use" in s
+    # the endpoint cell must show ONE identity, not pod twice
+    assert "function emEndpoint(r)" in s and "function emEndpointSub(r)" in s
+
+
+def test_console_offpeak_per_model_panel_is_its_own_card() -> None:
+    """Per-model utilisation left the global evaluator's card (2026-10-30).
+
+    It is a different object (one row per model, its own PromQL, its own
+    hysteresis state) and it made the billing card scroll; it now has its own
+    heading and its own hint.
+    """
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    i = s.index('<section id="tab-offpeak"')
+    j = s.index("</section>", i)
+    panel = s[i:j]
+    assert panel.count('<div class="card">') == 2, "off-peak must be two cards"
+    assert "Per-model utilization" in panel
+    # the util block is inside the SECOND card, after the global table
+    assert panel.index("Per-model utilization") > panel.index('id="op-table"')
+    assert 'id="op-models"' in panel
+
+
+def test_banner_escapes_server_data_by_default() -> None:
+    """w6 F1 (REPRODUCED): a key name set by a TEAM LEADER crossed into the
+    admin console unescaped — the key-edit save banner interpolated it raw
+    into innerHTML, and the fleet admin key sits one sessionStorage read
+    away from the resulting stored XSS. banner() must therefore escape by
+    DEFAULT; a call site composes markup itself only via the explicit
+    html=true opt-in, in which case it esc()s every dynamic fragment.
+
+    Behavioral pin: extract esc() + banner() verbatim from the page and run
+    them under node against a fake DOM — a hostile key name renders inert
+    on the default path, live markup survives on the opt-in, and no call
+    site pre-escapes (a double-escape would render &#39; literally in
+    error banners carrying server details with quotes)."""
+    import re
+    import subprocess
+    import tempfile
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    esc_fn = re.search(r"function esc\(s\) \{.*?\n\}", s, re.DOTALL)
+    banner_fn = re.search(r"function banner\(.*?\n\}", s, re.DOTALL)
+    assert esc_fn and banner_fn, "esc/banner not extractable from admin.html"
+    # the contract is in the signature: markup is opt-in, not the default
+    assert re.search(r"function banner\(msg, cls = '', timeout, html = false\)", banner_fn.group(0))
+    # no call site may pre-escape: under the default-esc contract that is a
+    # redundant call that turns a quoted server detail into a literal &#39;
+    assert "banner(esc(" not in s, "banner call site pre-escapes (double-escape)"
+
+    harness = (
+        "const el = { _h: '', set innerHTML(v) { this._h = v; }, get innerHTML() { return this._h; } };\n"
+        "const $ = id => (id === 'banner' ? el : {});\n"
+        "const t = (n, cond) => { if (!cond) { console.error('FAIL ' + n); process.exit(1); } };\n"
+    )
+    calls = (
+        # hostile key name (the exact F1 vector) must render INERT on the
+        # default path: no live element, and the escape entities are present
+        "banner('key updated - limits live immediately (x\"><img src=x onerror=alert(1)>)', '', 0);\n"
+        't("no-live-element", !/<img/i.test(el.innerHTML));\n'
+        't("escaped", el.innerHTML.includes("&lt;img src=x onerror=alert(1)&gt;"));\n'
+        # a server detail with quotes gets ONE escape, never a double
+        'el.innerHTML = ""; banner("400: agent \\"a\\" missing", "", 0);\n'
+        't("single-escape", el.innerHTML.includes("agent &quot;a&quot; missing") && !el.innerHTML.includes("&amp;"));\n'
+        # the opt-in still renders real markup (1784 & friends keep their <b>)
+        'el.innerHTML = ""; banner("self-mint <b>allowed</b> for this user", "", 0, true);\n'
+        't("opt-in-live", el.innerHTML.includes("<b>allowed</b>"));\n'
+        # ...but the opt-in never protects a RAW hostile payload: the opt-in
+        # contract is that the caller esc()s its fragments itself
+        'el.innerHTML = ""; banner("x" + "&lt;img src=x onerror=alert(1)&gt;", "", 0, true);\n'
+        't("opt-in-fragment-inert", !/<img/i.test(el.innerHTML));\n'
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(esc_fn.group(0) + "\n" + banner_fn.group(0) + "\n" + harness + calls)
+        path = f.name
+    r = subprocess.run(["node", path], capture_output=True, text=True)
+    assert r.returncode == 0, f"banner default-escape contract broken:\n{r.stdout}\n{r.stderr}"
+
+
+def test_budget_cell_is_one_worst_state_control_with_popup() -> None:
+    """w7 (owner 2026-11-02): the ALLOCATION cell used to stack ONE PILL PER
+    BUDGET — a key with 6 per-model budgets made its row ~400px tall. It is
+    now ONE compact control (count label, worst-state colour) whose click
+    opens EVERY budget in the existing #dlg, one line each. Colour = the
+    worst state across the row's budgets using the F9 burn-down thresholds:
+    >=95% is the state that REFUSES so it renders red (never hidden behind
+    yellow), >=80% warns, all <80% ok, no budgets → neutral dash. Same
+    single-line treatment for the enrollments caps cell (viewCaps).
+
+    Behavioral pin: extract the real esc + the budgetPct/budgetState/
+    viewBudgets/viewCaps block + the budgetCell builder verbatim from the
+    served page and run them under node with fake dlg/fmt helpers — the
+    pre-fix page has no viewBudgets/viewCaps and budgetCell is a stacked-
+    pills mapper, so extraction fails pre-fix."""
+    import re
+    import subprocess
+    import tempfile
+
+    html = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    esc_fn = re.search(r"function esc\(s\) \{.*?\n\}", html, re.DOTALL)
+    assert esc_fn, "esc() not extractable"
+    w7 = re.search(r"const budgetPct = b => \{.*?window\.viewCaps = btn => \{.*?\n\};", html, re.DOTALL)
+    assert w7, "the single-control budget lifecycle (budgetPct/viewBudgets/viewCaps) not extractable"
+    cell_fn = re.search(r"const budgetCell = k => \{.*?\n  \};", html, re.DOTALL)
+    assert cell_fn, "budgetCell is not a single-control builder (still the stacked-pills mapper?)"
+    assert 'onclick="viewCaps(this)"' in html, "the enrollments caps cell must use the same single control"
+    assert '<div class="capline" title="' not in html, "stacked capline divs must be gone from the caps cell"
+
+    harness = (
+        "const t = (n, c) => { if (!c) { console.error('FAIL ' + n); process.exit(1); } };\n"
+        "const window = {};\n"
+        "const dlgCalls = [];\n"
+        "const dlg = html => dlgCalls.push(html);\n"
+        "const fmtInt = v => (v == null || v === '' ? '0' : String(Math.round(+v || 0)));\n"
+        "const fmtUSD = v => (v == null ? '—' : '$' + Number(v).toFixed(4));\n"
+    )
+    calls = (
+        "const B6 = [\n"
+        "  { model: 'gpt-5.6', period: 'day', spent: 800, limit: 1000 },\n"
+        "  { model: 'gpt-5.6', period: 'month', spent: 10, limit: 10000 },\n"
+        "  { model: 'claude-sonnet-4-6', period: 'month', spent: 5, limit: 100 },\n"
+        "  { model: 'gemini-3.5', period: 'day', kind: 'usd', spent_usd: 2, limit_usd: 10 },\n"
+        "  { model: 'gpt-5.6', period: 'week', spent: 96, limit: 100 },\n"
+        "  { model: 'o4-mini', period: 'month', spent: 1, limit: 10 }\n"
+        "];\n"
+        # (a) exactly ONE control for a 6-budget key — no stacked pills
+        "const cell6 = budgetCell({ name: 'K1', budget_status: B6 });\n"
+        "t('a-one-button', (cell6.match(/<button/g) || []).length === 1);\n"
+        "t('a-one-pill', (cell6.match(/class=\"pill/g) || []).length === 1);\n"
+        "t('a-no-span-pills', cell6.indexOf('<span class=\"pill') === -1);\n"
+        "t('a-count-label', cell6.indexOf('6 budgets') !== -1);\n"
+        "t('a-fixed-height', cell6.indexOf('<div') === -1 && cell6.indexOf('<br') === -1);\n"
+        # (b) colour = worst state: <80 green, >=80 yellow, >=95 red, none neutral
+        "t('b-green', /class=\"pill on\"/.test(budgetCell({ name: 'g', budget_status: [{ model: 'm', period: 'd', spent: 1, limit: 100 }] })));\n"
+        "t('b-warn80', /class=\"pill warn\"/.test(budgetCell({ name: 'g', budget_status: [{ model: 'm', period: 'd', spent: 80, limit: 100 }] })));\n"
+        "t('b-warn85', /class=\"pill warn\"/.test(budgetCell({ name: 'g', budget_status: [{ model: 'm', period: 'd', spent: 85, limit: 100 }] })));\n"
+        "t('b-red96', /class=\"pill off\"/.test(budgetCell({ name: 'g', budget_status: [{ model: 'm', period: 'd', spent: 96, limit: 100 }] })));\n"
+        "t('b-worst-red', /class=\"pill off\"/.test(cell6));\n"
+        "const none = budgetCell({ name: 'n', budget_status: [] });\n"
+        "t('b-neutral', none.indexOf('<button') === -1 && none.indexOf('muted') !== -1);\n"
+        # (c) the popup: one line per budget, model + period + spent/limit, key name in the title
+        "window.viewBudgets({ dataset: { name: 'K1', b: JSON.stringify(B6) } });\n"
+        "const d = dlgCalls[dlgCalls.length - 1];\n"
+        "t('c-title', d.indexOf('<h2>Budgets — K1</h2>') !== -1);\n"
+        "t('c-rows', (d.match(/<span class=\"pill (on|warn|off)\"/g) || []).length === 6);\n"
+        "t('c-model-period', d.indexOf('gpt-5.6 day') !== -1 && d.indexOf('claude-sonnet-4-6 month') !== -1);\n"
+        "t('c-spent-limit', d.indexOf('800 / 1000 tok') !== -1 && d.indexOf('$2.0000 / $10.0000') !== -1);\n"
+        "t('c-detail', d.indexOf('800 tok spent of 1000 tok allocated') !== -1);\n"
+        # (d) hostile model/period stays inert in the cell AND in the popup
+        "const Q = String.fromCharCode(34);\n"
+        "const hostile = { name: 'H', budget_status: [{ model: Q + '>><img src=x onerror=alert(1)>' + Q, period: Q + '><script>window.pwned=1</script>' + Q, spent: 1, limit: 10 }] };\n"
+        "const ch = budgetCell(hostile);\n"
+        "t('d-cell-inert', ch.indexOf('<img') === -1 && ch.indexOf('&lt;img') !== -1 && ch.indexOf('<script>') === -1);\n"
+        "window.viewBudgets({ dataset: { name: 'H', b: JSON.stringify(hostile.budget_status) } });\n"
+        "const dh = dlgCalls[dlgCalls.length - 1];\n"
+        "t('d-dlg-inert', dh.indexOf('<img') === -1 && dh.indexOf('&lt;img') !== -1 && dh.indexOf('<script>') === -1 && dh.indexOf('pwned') !== -1);\n"
+        # (e) caps cell popup: worst-state over caps + one line per cap
+        "const C3 = [\n"
+        "  { model: 'gpt-5.6', period: 'month', limit_tokens: 1000, spent_tokens: 50 },\n"
+        "  { model: '*', period: 'day', limit_tokens: 100, spent_tokens: 96 },\n"
+        "  { model: 'claude-opus-4-7', period: 'month', limit_usd: 20, spent_usd: 3 }\n"
+        "];\n"
+        "t('caps-worst-red', capsWorst(C3) === 'off');\n"
+        "t('caps-worst-warn', capsWorst([{ model: '*', period: 'day', limit_tokens: 100, spent_tokens: 85 }]) === 'warn');\n"
+        "t('caps-no-spend-green', capsWorst([{ model: '*', period: 'month', limit_tokens: 100 }]) === 'on');\n"
+        "window.viewCaps({ dataset: { name: 'E1', b: JSON.stringify(C3) } });\n"
+        "const dc = dlgCalls[dlgCalls.length - 1];\n"
+        "t('caps-dlg-rows', (dc.match(/<tr>/g) || []).length === 4);\n"
+        "t('caps-dlg-pool', dc.indexOf('team pool = preset × mint allowance') !== -1);\n"
+        "t('caps-dlg-limit', dc.indexOf('1000 tok / month') !== -1 && dc.indexOf('$20.0000 / month') !== -1);\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(harness + esc_fn.group(0) + "\n" + w7.group(0) + "\n" + cell_fn.group(0) + "\n" + calls)
+        path = f.name
+    r = subprocess.run(["node", path], capture_output=True, text=True)
+    assert r.returncode == 0, f"single-control budget cell contract broken:\n{r.stdout}\n{r.stderr}"
+
+
+def test_subject_cell_drops_the_default_provenance_chip() -> None:
+    """w7 + 2026-11-02 (owner request): the DEFAULT provenance chips are GONE
+    from the subject cell, but the provenance DISTINCTION is not.
+
+    Two defaults are silent now: "self-asserted" (typed at redemption, the
+    normal case for enrolled keys) and "oauth2-proxy" (the fleet's SSO door —
+    every SSO subject already reads sso-<name>, so the chip repeated the same
+    fact on every row). The cell states the provenance in the TITLE on every
+    row and reserves the visible chip for a NON-default provider or an
+    authoritative binding — the case an operator actually needs to spot. This
+    pin guards both halves: the noise is gone AND the signal survives
+    (removing both would silently make a claimed identity look like a verified
+    one).
+
+    Behavioural: subjectCell + esc are extracted verbatim from the page and
+    run under node."""
+    import re
+    import subprocess
+    import tempfile
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    esc_fn = re.search(r"function esc\(s\) \{.*?\n\}", s, re.DOTALL)
+    cell_fn = re.search(r"const subjectCell = k => \{.*?\n  \};", s, re.DOTALL)
+    assert esc_fn and cell_fn, "esc/subjectCell not extractable from src/pcai_llm/ui/admin.html"
+    # the default must not render a chip at all
+    assert "self-asserted</span>" not in s, "the self-asserted chip is still rendered"
+
+    harness = (
+        esc_fn.group(0)
+        + "\n"
+        + cell_fn.group(0)
+        + "\n"
+        + "const t = (n, c) => { if (!c) { console.error('FAIL ' + n); process.exit(1); } };\n"
+    )
+    calls = (
+        # DEFAULT: no visible chip, provenance in the title
+        "const d = subjectCell({subject:'alice', subject_idp:'self-asserted', bound_via:'enrollment'});\n"
+        't("no-chip-on-default", !/<span class="pill/.test(d));\n'
+        't("no-self-asserted-text", !d.includes(">self-asserted<"));\n'
+        't("title-states-claim", d.includes("a claim, not a verified identity"));\n'
+        't("subject-rendered", d.includes(">alice<"));\n'
+        # oauth2-proxy is the fleet's DEFAULT SSO door: no chip (the sso-
+        # subject already says it), provenance still in the title
+        "const v = subjectCell({subject:'sso-bob', subject_idp:'oauth2-proxy', bound_via:'sso'});\n"
+        't("no-chip-on-default-sso", !/<span class="pill"/.test(v));\n'
+        't("sso-title-states-via", v.includes("bound via oauth2-proxy"));\n'
+        # NON-DEFAULT provider: the chip is back, and it names the provider
+        "const k = subjectCell({subject:'sso-dana', subject_idp:'keycloak', bound_via:'sso'});\n"
+        't("chip-on-other-idp", /<span class="pill"/.test(k));\n'
+        't("chip-names-other-idp", k.includes(">keycloak<"));\n'
+        't("chip-title-states-other-idp", k.includes("bound via keycloak"));\n'
+        # admin-asserted is also non-default
+        "const a = subjectCell({subject:'carol', subject_idp:'admin-asserted'});\n"
+        't("chip-on-admin-asserted", /<span class="pill"/.test(a));\n'
+        # unbound stays a dash
+        't("unbound-dash", subjectCell({subject:null}).includes("unbound"));\n'
+        # escaping intact on the hostile subject in BOTH cell and title
+        "const h = subjectCell({subject:'x\"><img src=x onerror=alert(1)>', subject_idp:'oauth2-proxy'});\n"
+        't("subject-escaped", !/<img/i.test(h) && h.includes("&lt;img"));\n'
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+        fh.write(harness + calls)
+        path = fh.name
+    r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"subjectCell contract broken:\n{r.stdout}\n{r.stderr}"
+
+
+def test_clear_button_uses_a_window_level_handler() -> None:
+    """w7 BUG (reported): the key-filter "clear" button threw
+    ReferenceError: $ is not defined and cleared nothing.
+
+    Cause: the button was an INLINE onclick calling `$('k-search')`. `$` is a
+    top-level `const`, which lives in the SCRIPT's lexical scope; an inline
+    handler is evaluated against WINDOW, so it could not see it. `filterKeys`
+    in the same attribute worked only because it is explicitly
+    `window.filterKeys`. Any helper an inline attribute touches must be on
+    window — that is the rule this pins.
+
+    Two halves: no inline attribute handler may reference a bare `$`, and the
+    window-level replacement really does clear the field and re-filter.
+    Behavioural: the real `$` and `window.clearKeySearch` are extracted from
+    the page and run under node against a fake document."""
+    import re
+    import subprocess
+    import tempfile
+
+    html = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # CLASS GUARD: an inline handler may not touch the script-scoped `$`.
+    offenders = re.findall(r'on[a-z]+="[^"]*\$\s*\(', html)
+    assert not offenders, f"inline handler references the script-scoped $: {offenders}"
+
+    dollar = re.search(r"const \$ = id => document\.getElementById\(id\);", html)
+    clear = re.search(r"window\.clearKeySearch = \(\) => \{.*?\n\};", html, re.DOTALL)
+    assert dollar and clear, "$/clearKeySearch not extractable from src/pcai_llm/ui/admin.html"
+    assert 'onclick="clearKeySearch()"' in html, "the clear button must call the window-level handler"
+
+    harness = (
+        "globalThis.window = globalThis;\n"
+        "let filtered = 0;\n"
+        "globalThis.filterKeys = () => { filtered++; };\n"
+        "const input = { value: 'needle' };\n"
+        "const document = { getElementById: id => (id === 'k-search' ? input : null) };\n"
+        "const t = (n, c) => { if (!c) { console.error('FAIL ' + n); process.exit(1); } };\n"
+        + dollar.group(0)
+        + "\n"
+        + clear.group(0)
+        + "\n"
+        + "window.clearKeySearch();\n"
+        't("field-cleared", input.value === "");\n'
+        't("refiltered", filtered === 1);\n'
+        # a missing input must not throw (the old handler guarded for it)
+        "globalThis.document = { getElementById: () => null };\n"
+        "window.clearKeySearch();\n"
+        't("tolerates-missing-input", true);\n'
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+        fh.write(harness)
+        path = fh.name
+    r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"clearKeySearch contract broken:\n{r.stdout}\n{r.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Form rows: ONE horizontal plane per line (2026-11-03, r2 feedback)
+# ---------------------------------------------------------------------------
+
+
+def test_form_rows_share_one_control_plane() -> None:
+    """Operator report: "move the show to the titled header instead of lifting
+    the box up. I want a horizontal plane of input in these cases, no bumps up
+    and down."
+
+    Pins the three moving parts of the fix, so a later edit cannot silently
+    reintroduce a bump:
+      1. .row aligns on the TOP of the control slot (align-items:start), so
+         anything hanging BELOW a control (a hint, a reveal toggle, a "+ new"
+         button) cannot lift that field's input;
+      2. each line's heights are MEASURED and published as CSS variables --
+         --fhead-h (title line), --hint-h (band under the control),
+         --ctl-top (non-field items), --chk-top (checkbox labels) -- by
+         layoutFormRowsNow(), and the CSS consumes every one of them;
+      3. a password reveal toggle rides the field's TITLE line (.fhead); the
+         "toggle after the input" shape survives only as the fallback for bare
+         controls such as the header admin key.
+    The old opt-in .row-hints hack (absolute hint + a hard-coded 26px) is
+    superseded by the measured band and must not come back.
+    """
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+
+    # 1. alignment contract
+    assert ".row { display: flex; gap: 10px; flex-wrap: wrap; align-items: start; }" in s
+    assert "row-hints" not in s, "the per-row opt-in hack is superseded by the measured band"
+
+    # 2. the CSS that consumes the measured variables
+    for rule in (
+        ".row > label { position: relative; padding-bottom: var(--hint-h, 0px); }",
+        ".row > *:not(label) { margin-top: var(--ctl-top, 0px); }",
+        '.row > label:has(input[type="checkbox"]) { margin-top: var(--chk-top, 0px); }',
+        ".row > label > .fhead, .ep-row > label > .fhead { min-height: var(--fhead-h, 0px); }",
+        ".fhead { display: flex; align-items: center; gap: 8px; justify-content: space-between; }",
+    ):
+        assert rule in s, f"missing plane rule: {rule}"
+    hint_rule = s[s.index(".row > label:not(.chk) > .hint {") :]
+    hint_rule = hint_rule[: hint_rule.index("}")]
+    assert "position: absolute" in hint_rule, "the hint must leave the flow"
+    assert "var(--hint-h, 0px)" in hint_rule, "the hint must be painted in the measured band"
+
+    # 3. structure + measurement
+    assert "function structureFormRows(root) {" in s
+    assert "function armPasswordToggles(root) {" in s
+    assert "function layoutFormRowsNow() {" in s
+    assert "function layoutFormRows() {" in s
+    assert "head.className = 'fhead';" in s
+    # the toggle goes to the title line FIRST; the bare-input shape is the fallback
+    assert "if (head) head.appendChild(btn);\n    else input.after(btn);" in s
+    # grouping per rendered line, captured before any variable is written
+    assert "const lines = new Map();" in s
+    assert "el.style.removeProperty('--ctl-top');" in s
+    for var in ("--hint-h", "--fhead-h", "--ctl-top", "--chk-top"):
+        assert f"el.style.setProperty('{var}'" in s, f"{var} never published"
+    # checkbox-bearing labels are row-shaped: they get the centring nudge
+    assert "if (el.querySelector('input[type=\"checkbox\"]')) {" in s
+
+    # 4. every render path re-measures (a hidden section measures as 0)
+    assert "armPasswordToggles($('dlg-body')); layoutFormRowsNow(); }" in s
+    assert "armPasswordToggles(div);\n  layoutFormRowsNow();" in s
+    assert "layoutFormRowsNow();\n  return true;" in s  # activateTab
+    assert "layoutFormRowsNow();\nwindow.addEventListener('resize', layoutFormRows);" in s
+    assert "new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });" in s
+
+
+def test_form_row_labels_carry_a_title_and_a_direct_hint() -> None:
+    """The structure/measurement contract is structural, so assert it on the
+    markup: (a) every password field inside a row label has TITLE text before
+    it (that text is what structureFormRows wraps into .fhead -- a password
+    field with no title would fall back to a toggle under the input and bump
+    the row again), and (b) every div.hint that lives inside a row hangs off a
+    label that is a DIRECT child of that row (the band is measured with
+    ':scope > .hint'; a hint nested one level deeper would silently escape the
+    plane)."""
+    from html.parser import HTMLParser
+
+    class Node:
+        def __init__(self, tag, attrs, parent=None):
+            self.tag, self.attrs, self.parent = tag, dict(attrs), parent
+            self.children = []
+            self.text = ""
+
+        def classes(self):
+            return self.attrs.get("class", "").split()
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.void = {"input", "br", "img", "meta", "link", "hr", "source", "col"}
+            self.root = Node("root", [])
+            self.stack = [self.root]
+
+        def handle_starttag(self, tag, attrs):
+            n = Node(tag, attrs, self.stack[-1])
+            self.stack[-1].children.append(n)
+            if tag not in self.void:
+                self.stack.append(n)
+
+        def handle_endtag(self, tag):
+            if tag in self.void:
+                return
+            for i in range(len(self.stack) - 1, 0, -1):
+                if self.stack[i].tag == tag:
+                    del self.stack[i:]
+                    break
+
+        def handle_data(self, data):
+            self.stack[-1].text += data
+            if data.strip():
+                # keep the text as a child node: the title of a field is a text
+                # node BEFORE its input, and that is exactly what gets wrapped
+                n = Node("#text", [])
+                n.text = data
+                self.stack[-1].children.append(n)
+
+    def walk(n):
+        yield n
+        for c in n.children:
+            yield from walk(c)
+
+    for path in ("src/pcai_llm/ui/admin.html", "src/pcai_llm/ui/team_leader.html"):
+        tree = P()
+        tree.feed(open(path, encoding="utf-8").read())
+        nodes = list(walk(tree.root))
+        rows = [n for n in nodes if n.tag in ("div", "form") and ("row" in n.classes() or "ep-row" in n.classes())]
+        pw_labels = 0
+        for row in rows:
+            for label in [c for c in row.children if c.tag == "label"]:
+                if not any(c.tag == "input" and c.attrs.get("type") == "password" for c in label.children):
+                    continue
+                pw_labels += 1
+                first_ctl = next(i for i, c in enumerate(label.children) if c.tag == "input")
+                before = "".join(c.text for c in label.children[:first_ctl])
+                assert before.strip(), f"{path}: a row password field has no title to wrap"
+        if path.endswith("admin.html"):
+            # the MCP API key and the model-pool endpoint API key are the two
+            # row password fields this contract exists for
+            assert pw_labels >= 2, f"{path}: expected the API-key password fields to be row labels"
+
+    # (b) hints inside rows are direct label children
+    tree = P()
+    tree.feed(open("src/pcai_llm/ui/admin.html", encoding="utf-8").read())
+    for n in walk(tree.root):
+        if n.tag != "div" or "hint" not in n.classes():
+            continue
+        a = n.parent
+        while a is not None and not (a.tag in ("div", "form") and ("row" in a.classes() or "ep-row" in a.classes())):
+            a = a.parent
+        if a is None:
+            continue
+        assert n.parent is not None and n.parent.tag == "label", "a row hint must sit on a label"
+        assert n.parent.parent is a, "a row hint must be a DIRECT child of a row label"
