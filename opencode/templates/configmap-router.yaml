@@ -150,11 +150,13 @@ data:
     // root and silently fails on forced-uid clusters). Also drops the unused
     // personal/logo.png, which the personal ConfigMap never rendered and the
     // init loop logged a cp error for on every start.
+    // r23: re-stamp bump — rolls every existing unit onto the current
+    // chart-rendered pod template on the next router reconcile.
     // RUNTIME_REV is part of the marker, same contract as the dsh and openwork
-    // charts: the shipped default is 22 and it is ALWAYS appended, so bumping
+    // charts: the shipped default is 23 and it is ALWAYS appended, so bumping
     // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
     // the next reconcile — no chart edit needed.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 22 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 23 }}'
     const userTemplateVersion = `terminal-tab-v24-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
@@ -3019,12 +3021,25 @@ data:
     function authPageHtml(identity) {
       const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
       const adminConfigured = !!(adminUsername && adminPassword)
+      // Signed-in launcher. The two sibling apps (ttyd terminal on 7683,
+      // data manager on 7682) are same-origin and reachable root-relative
+      // through the session passthrough, so a plain <a> is the whole
+      // integration — no JS, no CSP to satisfy (the page sets none). They
+      // open in a new tab so the launcher and its session survive, matching
+      // how the in-pod pages already cross-link (data_manager.html /
+      // terminal_manager.html use target="_blank" too). Root-relative hrefs
+      // are deliberately NOT slug-prefixed: /terminal and /data-manager are
+      // in slugReservedNames, so they always reach the app, never a user pod.
       const strip = identity
-        ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-            <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
-            <div style="display:flex;gap:14px;">
-              <a href="/__oc_start" style="color:var(--accent);">Open your environment</a>
-              <a href="/__oc_logout" style="color:var(--text-muted);">Log out</a>
+        ? `<div class="card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+              <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
+              <a href="/__oc_logout" style="color:var(--text-muted);font-size:13px;">Log out</a>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <a class="btn btn-primary" href="/__oc_start" style="text-decoration:none;">Open your environment</a>
+              <a class="btn btn-outline" href="/terminal" target="_blank" rel="noopener" style="text-decoration:none;">Terminal</a>
+              <a class="btn btn-outline" href="/data-manager" target="_blank" rel="noopener" style="text-decoration:none;">Data Manager</a>
             </div>
           </div>`
         : ''
