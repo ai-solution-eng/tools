@@ -3205,6 +3205,14 @@ data:
       document.getElementById('upload-dialog').showModal();
     }
 
+    // A proxy in front of the app answers with an HTML error page, which the
+    // SPA used to collapse into a bare "HTTP 500". Keep the first words of
+    // the body so the row says who failed and why.
+    function httpErrorText(status, text) {
+      const stripped = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      return 'HTTP ' + status + (stripped ? ' — ' + stripped.slice(0, 140) : '');
+    }
+
     function uploadOne(item, onProgress) {
       return new Promise(function (resolve, reject) {
         let url = API + '/upload-file?path=' + encodeURIComponent(currentPath) +
@@ -3225,7 +3233,7 @@ data:
           let data = {};
           try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
           if (xhr.status >= 200 && xhr.status < 300) { resolve(data); return; }
-          let msg = data && data.error ? data.error : 'HTTP ' + xhr.status;
+          let msg = data && data.error ? data.error : httpErrorText(xhr.status, xhr.responseText);
           if (xhr.status === 413) msg = data && data.error ? data.error : 'File is larger than the server limit';
           reject(new Error(msg));
         };
@@ -3256,7 +3264,7 @@ data:
           let data = {};
           try { data = JSON.parse(xhr.responseText); } catch (e) { /* nginx HTML error page */ }
           if (xhr.status >= 200 && xhr.status < 300 && data && data.ok) { resolve(data); return; }
-          reject(new Error((data && data.error) || ('HTTP ' + xhr.status)));
+          reject(new Error((data && data.error) || httpErrorText(xhr.status, xhr.responseText)));
         };
         xhr.onerror = function () { session.xhrs.delete(xhr); reject(new Error('Network error')); };
         xhr.onabort = function () { session.xhrs.delete(xhr); reject(new Error('Cancelled')); };
