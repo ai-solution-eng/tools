@@ -1,0 +1,9 @@
+apiVersion: v2
+name: otel-collector
+description: >-
+  OpenTelemetry Collector for the PCAI LLM gateway. Receives OTLP/HTTP traces
+  from in-cluster senders and exports them to Langfuse (and, later, to other
+  backends such as SigNoz) without the senders ever holding backend credentials.
+type: application
+version: 0.1.0
+appVersion: "0.165.0"
