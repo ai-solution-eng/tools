@@ -113,12 +113,21 @@ data:
     // picker/drop paths and inside archives alike.
     // v20: the Data Manager shows its build in the header and /api/healthz
     // reports it, so a stale unit is visible from the browser.
+    // v21: a failed upload reports the proxy's error text instead of a bare
+    // "HTTP 500".
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) and every user unit re-stamps on the next reconcile. The
     // default matches the value shipped in values.yaml, so an install that does
     // not set it keeps rendering the same marker.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 16 }}'
-    const userTemplateVersion = `terminal-tab-v20-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+    // r18 (RUNTIME_REV): drops the unused personal/logo.png — the personal
+    // ConfigMap never rendered it and the init loop logged "cp: cannot stat"
+    // on every start. Bumped so units re-stamp off the old init command.
+    // r23 (RUNTIME_REV): re-stamp bump (was r18) — rolls every existing unit
+    // onto the current chart-rendered pod template on the next reconcile.
+    // Jumps to 23 to match the opencode chart, which moves to 23 in the same
+    // release; the two counters are independent, this just keeps them aligned.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 23 }}'
+    const userTemplateVersion = `terminal-tab-v21-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -3001,12 +3010,27 @@ data:
       // With a pending OpenWork Cloud grant, "Open your environment" carries it
       // through /__oc_start so the pod UI can finish the sign-in.
       const startHref = pendingGrant ? `/__oc_start?grant=${encodeURIComponent(pendingGrant)}` : '/__oc_start'
+      // Signed-in launcher. The two sibling apps (ttyd terminal on 7683,
+      // data manager on 7682) are same-origin and reachable root-relative
+      // through the session passthrough, so a plain <a> is the whole
+      // integration — no JS, no CSP to satisfy (the page sets none). They
+      // open in a new tab so the launcher and its session survive, matching
+      // how the in-pod pages already cross-link (data_manager.html /
+      // terminal_manager.html use target="_blank" too). Root-relative hrefs
+      // are deliberately NOT slug-prefixed: /terminal and /data-manager are
+      // in slugReservedNames, so they always reach the app, never a user pod.
+      // NOTE: "Open your environment" keeps ${startHref}, not a literal
+      // /__oc_start — a pending OpenWork Cloud grant rides on that href.
       const strip = identity
-        ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-            <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
-            <div style="display:flex;gap:14px;">
-              <a href="${startHref}" style="color:var(--accent);">Open your environment</a>
-              <a href="/__oc_logout" style="color:var(--text-muted);">Log out</a>
+        ? `<div class="card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+              <div style="font-size:13px;">Signed in as <b>${esc(identity)}</b></div>
+              <a href="/__oc_logout" style="color:var(--text-muted);font-size:13px;">Log out</a>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <a class="btn btn-primary" href="${startHref}" style="text-decoration:none;">Open your environment</a>
+              <a class="btn btn-outline" href="/terminal" target="_blank" rel="noopener" style="text-decoration:none;">Terminal</a>
+              <a class="btn btn-outline" href="/data-manager" target="_blank" rel="noopener" style="text-decoration:none;">Data Manager</a>
             </div>
           </div>`
         : ''

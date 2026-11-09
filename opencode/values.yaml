@@ -85,10 +85,9 @@ dataManager:
 # probes, env) on the next router reconcile — no chart/template edit required.
 # Folded into the 'opencode-web-helm/user-template-version' annotation; when it
 # changes the router patches each Deployment and the unit rolls.
-# LEAVE UNSET unless you need a forced rollout: unset renders the historical
-# marker unchanged (no surprise rollout on upgrade). Any value you set here
-# becomes the '-r<value>' suffix.
-# RUNTIME_REV: 20
+# Always rendered into the marker as the '-r<value>' suffix (same contract as
+# the dsh and openwork charts). Bump it whenever the pod template changes.
+RUNTIME_REV: 23
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
