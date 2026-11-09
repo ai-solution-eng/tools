@@ -50,9 +50,16 @@ def test_every_dollar_lookup_has_a_matching_element_id() -> None:
 
     for name, path in (("team_leader", TEAM), ("admin", ADMIN)):
         s = _read(path)
-        script = re.search(r"<script>(.*)</script>", s, re.DOTALL)
-        assert script, f"{name}: no inline script block"
-        looked_up = set(re.findall(r"\$\('([^']+)'\)", script.group(1)))
+        # Every inline block, not the greedy first-to-last span: the theme wave's
+        # pre-paint <script> in <head> made the old greedy re.search swallow the
+        # markup between blocks. Union the lookups across all of them — a
+        # non-greedy re.search alone would only ever inspect the head script and
+        # the check would pass vacuously.
+        blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", s, re.DOTALL)
+        assert blocks, f"{name}: no inline script block"
+        looked_up = set()
+        for block in blocks:
+            looked_up |= set(re.findall(r"\$\('([^']+)'\)", block))
         present = set(re.findall(r'id="([^"]+)"', s))
         missing = sorted(looked_up - present)
         assert not missing, f"{name}: $() with no element in the markup: {missing}"

@@ -784,6 +784,7 @@ async def resolve_routed_model(
     routable_models: list[str] | None = None,
     incumbent: str | None = None,
     switch_margin: float = 0.0,
+    extra_candidates: list[str] | None = None,
 ) -> tuple[str, RouteDecision]:
     """Resolve one (pseudo-)model request to the model name to serve next.
 
@@ -895,6 +896,14 @@ async def resolve_routed_model(
         # available() is applied only to the ADDED models inside
         # expand_candidates -- the ladder keeps its own upstream walk semantics.
         cheap_first = expand_candidates(list(reversed(order)), routable_models, available)
+        # PER-KEY EXTRA TARGETS (2026-11-08): AGENTS are hard models but they
+        # are PER-KEY (the profile's agent menu), so they cannot live in the
+        # global allowlist. They join at the CHEAP end so they fall inside the
+        # floor..ceiling window the decision model is offered; an undeclared
+        # capability must not outrank a ladder the operator signed off.
+        if extra_candidates:
+            _extras = [m for m in extra_candidates if m not in cheap_first and (available is None or available(m))]
+            cheap_first = [*_extras, *cheap_first]
         # R2 (audit 2026-10-29): BOTH ceiling forms go through the operator
         # allowlist. The named form already checked allowed_models above, but
         # the BARE form used to take order[0] raw — so bare `routing` under an

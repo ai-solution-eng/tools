@@ -42,7 +42,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ..config import settings
-from ..core import enroll_memory, secretbox, teams
+from ..core import enroll_memory, identity, secretbox, teams
 from ..core.audit import audit_action
 from ..core.budgets import MAX_LIMIT_TOKENS, MAX_LIMIT_USD, split_preset_budgets
 from ..core.identity import (
@@ -61,6 +61,7 @@ from ..core.identity import (
 from ..core.keys import create_key, hash_key
 from ..db import db
 from ..routing.router import router as model_router
+from . import auth as auth_mod
 from .routes_admin import _NAME_PATTERN, AdminDep
 
 log = logging.getLogger(__name__)
@@ -710,7 +711,12 @@ LIMIT 1
 _FOR_ME_REVOKE_SQL = "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL"
 
 
-async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, Any] | None) -> None:
+async def _bind_user_profile(
+    conn: Any,
+    user_id: uuid.UUID,
+    profile: dict[str, Any] | None,
+    tenant_id: uuid.UUID | None = None,
+) -> None:
     """Bind an SSO-created user to the tenant default profile when it has none.
 
     WHY (2026-10-29): the tenant default profile used to land ONLY as stamped
@@ -721,9 +727,12 @@ async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, A
     mean the user ROW or the profile is only half applied: the key gets its
     budgets and grants while every profile-scoped feature silently ignores it.
 
-    ONLY WHEN NULL: an operator who assigned a profile by hand (Keys > Profile)
-    keeps it. The tenant setting is a DEFAULT, not an override — a mint must
-    never silently re-scope a user an operator already placed.
+    NULL OR AN SSO SLOT (2026-11-08, review F1-3): a NULL row is bound (the
+    first mint). A row already pointing at ONE OF THIS TENANT'S TWO SSO SLOTS
+    was assigned by the SSO flow, so it follows a tier change on rotate
+    (default -> admin, or admin -> default). A profile an operator assigned BY
+    HAND (Keys > Profile) is a different id and is never re-scoped — the
+    tenant setting is a DEFAULT, not an override.
 
     Runs INSIDE the mint transaction (same conn), so a failed stamp and a
     failed bind roll back together: no key is issued against a half-applied
@@ -731,39 +740,98 @@ async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, A
     """
     if profile is None:
         return
+    if tenant_id is None:
+        await conn.execute(
+            "UPDATE users SET profile_id = $2 WHERE id = $1 AND profile_id IS NULL",
+            user_id,
+            profile["id"],
+        )
+        return
+    # TIER RE-SCOPE ON ROTATE (review F1-3): a user row pointing at EITHER of
+    # this tenant's SSO slots was assigned by the SSO flow, so it follows the
+    # tier on a re-resolve (default -> admin, or admin -> default). A profile
+    # assigned by hand is a DIFFERENT id and is never re-scoped — the original
+    # "the tenant setting is a default, not an override" contract holds.
     await conn.execute(
-        "UPDATE users SET profile_id = $2 WHERE id = $1 AND profile_id IS NULL",
+        "UPDATE users SET profile_id = $2 WHERE id = $1 AND ("
+        "  profile_id IS NULL OR profile_id IN ("
+        "    SELECT sso_default_profile_id FROM tenants WHERE id = $3 AND sso_default_profile_id IS NOT NULL"
+        "    UNION"
+        "    SELECT sso_admin_profile_id FROM tenants WHERE id = $3 AND sso_admin_profile_id IS NOT NULL"
+        "  )"
+        ")",
         user_id,
         profile["id"],
+        tenant_id,
     )
 
 
-async def _sso_default_profile(conn: Any, tenant_id: uuid.UUID) -> dict[str, Any] | None:
-    """The tenant's configured SSO self-mint default profile (admin sets it
-    via PUT /admin/tenants/{id}/sso-default-profile), or None when unset /
-    the profile row vanished (profiles FK is ON DELETE SET NULL — a deleted
-    profile degrades to the bare grant, never blocks a mint). Shape mirrors
-    routes_admin's create-key preset resolution: budgets (model/period plus
-    exactly one of limit_tokens / limit_usd), mcp_grants ([server, tool]
-    pairs), limits (rpm/tpm/max_concurrent presets that OVERRIDE the
-    mint's bare defaults)."""
+async def _sso_profile(conn: Any, tenant_id: uuid.UUID, groups: list[str]) -> dict[str, Any] | None:
+    """The tenant's SSO self-mint profile for THIS caller's groups (SSO tier
+    profiles, 2026-11-08), or None when unset / the profile row vanished
+    (profiles FK is ON DELETE SET NULL — a deleted profile degrades to the
+    bare grant, never blocks a mint).
+
+    TIER SPLIT: when ``tenants.sso_admin_groups`` is non-empty AND any of
+    its entries (comma-separated, case-sensitive, whitespace-trimmed,
+    empties ignored) appears in ``groups``, the ADMIN profile
+    (``tenants.sso_admin_profile_id``) is chosen over the tenant default.
+    An empty ``sso_admin_groups`` (the column default) DISABLES the split:
+    resolution is byte-identical to the single-profile deployment, so an
+    upgrade never re-scopes an existing tenant. The admin profile is also
+    skipped when its row vanished (ON DELETE SET NULL left the id NULL) —
+    the default profile degrades in.
+
+    BOTH joins are LEFT (review fix, 2026-11-08): the two profile settings
+    are INDEPENDENT. A tenant may ship an admin tier with NO default
+    profile (members mint the bare grant, admins get the admin profile) —
+    an INNER default join would have returned None for EVERYONE there.
+    Admin wins on a group match with a live admin row; otherwise the
+    default profile applies when wired; otherwise None (the bare grant).
+
+    Shape mirrors routes_admin's create-key preset resolution: budgets
+    (model/period plus exactly one of limit_tokens / limit_usd), mcp_grants
+    ([server, tool] pairs), limits (rpm/tpm/max_concurrent presets that
+    OVERRIDE the mint's bare defaults). One row, one round-trip.
+    """
     row = await conn.fetchrow(
-        "SELECT p.id, p.name, p.defaults_json FROM tenants t "
-        "JOIN profiles p ON p.id = t.sso_default_profile_id WHERE t.id = $1",
+        "SELECT t.sso_admin_groups, p.id, p.name, p.defaults_json, "
+        "ap.id AS admin_id, ap.name AS admin_name, ap.defaults_json AS admin_json "
+        "FROM tenants t "
+        "LEFT JOIN profiles p ON p.id = t.sso_default_profile_id "
+        "LEFT JOIN profiles ap ON ap.id = t.sso_admin_profile_id "
+        "WHERE t.id = $1",
         tenant_id,
     )
     if row is None:
         return None
+    admin_cfg = str(row.get("sso_admin_groups") or "")
+    admin_entries = {g.strip() for g in admin_cfg.split(",") if g.strip()}
+    caller_groups = {g.strip() for g in groups}
+    # Admin wins when the tier split is on, the caller carries a matching
+    # group, AND the admin profile row is still there. Matching is SET
+    # intersection: case-sensitive, trimmed on both sides, empty entries
+    # ignored. Otherwise the default profile applies WHEN IT EXISTS (both
+    # joins are LEFT — an unset default with a live admin tier is a legal
+    # configuration and must not drop the admin branch); neither wired ->
+    # None (the bare grant).
+    use_admin = bool(admin_entries) and bool(admin_entries & caller_groups) and row.get("admin_id") is not None
+    if use_admin:
+        prof_id, prof_name, prof_json = row["admin_id"], row.get("admin_name", ""), row["admin_json"]
+    elif row.get("id") is not None:
+        prof_id, prof_name, prof_json = row["id"], row.get("name", ""), row["defaults_json"]
+    else:
+        return None
     try:
-        defaults = json.loads(row["defaults_json"] or "{}")
+        defaults = json.loads(prof_json or "{}")
     except (json.JSONDecodeError, TypeError):
         defaults = {}
     return {
-        "id": row["id"],
+        "id": prof_id,
         # name rides along so a stamp-time config failure can NAME the
         # profile in the 503 the self-mint returns (an operator cannot act
         # on "invalid budget preset" without knowing which profile).
-        "name": row.get("name", ""),
+        "name": prof_name,
         "budgets": defaults.get("budgets", []),
         "mcp_grants": defaults.get("mcp_grants", []),
         "limits": defaults.get("limits", {}) or {},
@@ -978,6 +1046,22 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     if browser is None:
         raise HTTPException(401, "no browser identity headers present")
     subject, groups = browser
+    # TOKEN GROUPS OVERRIDE (SSO tier profiles, 2026-11-08): behind the proxy
+    # chain the Bearer IS the caller's id_token, so when a JWKS-validated
+    # bearer rides the request its ``groups`` claim is the freshest IdP
+    # assertion and outranks the proxy-injected header. groups_from_
+    # validated_token NEVER raises and returns None on every failure shape
+    # (no token, validation unconfigured, bad token, JWKS blip) — the header
+    # groups stay the fallback and the mint cannot fail on an IdP blip.
+    # Applies to BOTH branches below (mint and rotate): the profile tier and
+    # the subject binding see the same groups.
+    bearer = auth_mod._bearer_of(request)
+    # SUBJECT-BOUND (review F1-1): token groups are adopted only when the token
+    # identifies the SAME person as the header subject — a valid token for a
+    # different subject must never stamp ITS groups (admin tier) onto this key.
+    token_groups = await identity.groups_from_validated_token(bearer, subject)
+    if token_groups is not None:
+        groups = token_groups
     tenant_setting = settings.token_shadow_tenant_id
     try:
         tenant_id = uuid.UUID(tenant_setting)
@@ -1043,7 +1127,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
         # attribution).
         rotate_user_id: uuid.UUID = existing["user_id"]
         async with db.acquire() as conn, conn.transaction():
-            profile = await _sso_default_profile(conn, tenant_id)
+            profile = await _sso_profile(conn, tenant_id, groups)
             rpm, tpm = _profile_limits(profile, FOR_ME_RATE_LIMIT_RPM, FOR_ME_RATE_LIMIT_TPM)
             plaintext, key_id = await create_key(
                 rotate_user_id,
@@ -1075,7 +1159,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                 # stamped presets — otherwise the cascade ordering, routing
                 # policy, off-peak fraction and agents menu all see "no profile"
                 # (see _bind_user_profile). Only when the user has none.
-                await _bind_user_profile(conn, rotate_user_id, profile)
+                await _bind_user_profile(conn, rotate_user_id, profile, tenant_id)
                 try:
                     await _stamp_profile_grants(conn, key_id, profile)
                 except ProfilePresetConfigError as exc:
@@ -1151,7 +1235,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     else:
         user = await _create_enroll_user(tenant_id, subject)
         async with db.acquire() as conn, conn.transaction():
-            profile = await _sso_default_profile(conn, tenant_id)
+            profile = await _sso_profile(conn, tenant_id, groups)
             rpm, tpm = _profile_limits(profile, FOR_ME_RATE_LIMIT_RPM, FOR_ME_RATE_LIMIT_TPM)
             plaintext, key_id = await create_key(
                 user["id"],
@@ -1179,7 +1263,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                 conn=conn,
             )
             if profile is not None:
-                await _bind_user_profile(conn, user["id"], profile)
+                await _bind_user_profile(conn, user["id"], profile, tenant_id)
                 try:
                     await _stamp_profile_grants(conn, key_id, profile)
                 except ProfilePresetConfigError as exc:

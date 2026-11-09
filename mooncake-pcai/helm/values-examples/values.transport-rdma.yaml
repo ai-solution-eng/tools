@@ -1,0 +1,31 @@
+# Transport profile: RDMA - zero-copy, one memcpy less per page.
+#
+#   helm install mooncake ./helm -n mooncake --create-namespace \
+#     -f helm/local/values.g2.yaml \
+#     -f helm/values-examples/values.transport-rdma.yaml
+#
+# Prerequisites, all of them - a transport change is a maintenance window
+# because it touches the store AND every client:
+#   1. every node the store or a client can land on must advertise the device
+#      resource below (NVIDIA RDMA shared-device plugin);
+#   2. /dev/infiniband must exist on those nodes. Whether the device plugin
+#      also injects the device nodes into the pod depends on how it is
+#      configured, so the store pods mount the host path explicitly
+#      (store.rdma.infinibandHostPath) rather than rely on it;
+#   3. every model client must be repatched to the same protocol:
+#      scripts/patch-model-mooncake.py --isvc <name> --protocol rdma
+#      (sets MOONCAKE_RDMA=true; the Kyverno policy in deploy/ then adds the
+#      device, IPC_LOCK and /dev/infiniband to the serving pod);
+#   4. verify, do not assume:
+#        kubectl -n mooncake exec <store-pod> -- ibv_devices      # an HCA, not empty
+#        kubectl -n <model-ns> logs <pod> -c kserve-container \
+#          | grep -iE "HCA|RDMA transport|TCP-only"
+#      The transfer engine falls back to TCP when it finds no HCA and reports
+#      that only in the log, so nothing alerts. Set MC_FORCE_HCA=true on the
+#      client while bringing RDMA up to turn the fallback into a startup error.
+
+store:
+  protocol: rdma
+  rdma:
+    deviceResource: "rdma/rdma_shared_device_a"
+    infinibandHostPath: "/dev/infiniband"

@@ -1,16 +1,31 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Chat</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<!-- Pre-paint theme resolver: read the saved choice BEFORE the stylesheet is
+     parsed so a pinned Light/Dark never flashes the dark default. Anything that
+     is not exactly "light"/"dark" — unset, corrupt, a legacy value — is Auto.
+     Storage can be BLOCKED (iframes / privacy mode) and then getItem throws;
+     the try/catch degrades to Auto instead of killing the page. -->
+<script>
+  (function () {
+    var t = "auto";
+    try { t = localStorage.getItem("pcai-llm-theme") || "auto"; } catch (e) {}
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <style>
-  /* HPE design language, dual theme.
-     Dark (default): HPE green #01a982 accent on near-black — the "Ezmeral/PCAI
-     console" look. Light: HPE green primary on white — the corporate-site look.
-     Theme resolution: saved preference > OS prefers-color-scheme, toggleable
-     via the header button and persisted in localStorage. */
+  /* HPE design language, Auto / Light / Dark theme.
+     Dark (the shipped default): HPE green #01a982 accent on near-black — the
+     "Ezmeral/PCAI console" look. Light: HPE green primary on white — the
+     corporate-site look. Auto is the default state: it follows the OS live via
+     prefers-color-scheme, while Light/Dark pin and are remembered in
+     localStorage under 'pcai-llm-theme' (the SAME key admin.html and
+     team_leader.html use, so one browser choice covers all three consoles). */
   :root {
     color-scheme: dark;
     --bg: #0f1117; --panel: #1a1d27; --border: #2a2e3d; --border-soft: #23273500;
@@ -22,6 +37,25 @@
     --ok: #01a982; --warn: #d9a036;
     --focus: #01a98266;
   }
+  /* Auto (the default state) follows the OS: the light ramp applies under
+     prefers-color-scheme, scoped to [data-theme="auto"] so an explicit Light or
+     Dark choice always wins even when the OS disagrees.
+     KEEP IN SYNC with the explicit :root[data-theme="light"] block below — the
+     two blocks must carry identical declarations. */
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="auto"] {
+      color-scheme: light;
+      --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4; --border-soft: #e8ebf0;
+      --text: #191919; --dim: #5f6773;
+      --accent: #00815f; --accent-contrast: #ffffff;
+      --accent2: #2c6a9e;
+      --user-bubble: #e3f2ee;
+      --err: #b42323; --err-bg: rgba(180, 35, 35, .06);
+      --ok: #00815f; --warn: #a8741a;
+      --focus: #00815f55;
+    }
+  }
+  /* KEEP IN SYNC with the Auto media block above — identical declarations. */
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4; --border-soft: #e8ebf0;
@@ -60,12 +94,22 @@
   header input:not([type="checkbox"]) { width: 170px; font-size: 12.5px; }
   header input[type="checkbox"] { accent-color: var(--accent); }
   header input:focus-visible, header select:focus-visible { outline: 2px solid var(--focus); }
-  #theme {
-    background: none; border: 1px solid var(--border); border-radius: 6px;
-    padding: 4px 9px; cursor: pointer; font-size: 14px; line-height: 1;
-    color: var(--text);
+  /* Theme control: a three-way Auto / Light / Dark segmented pill. The
+     container keeps the #theme id — tests/test_ui.py pins the header element
+     order off that anchor, so the id stays even though the styling is by class. */
+  .theme-seg {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
+    overflow: hidden;
   }
-  #theme:hover { border-color: var(--accent); }
+  .theme-seg button {
+    background: transparent; color: var(--dim); border: 0; padding: 4px 9px;
+    font: inherit; font-size: 12px; line-height: 1.4; cursor: pointer;
+  }
+  .theme-seg button:hover { color: var(--text); }
+  .theme-seg button.on {
+    background: var(--accent); color: var(--accent-contrast); font-weight: 600;
+  }
+  .theme-seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   /* Cap the picker so a long model id (e.g. RamManavalan/Qwen3-VL-Embedding-8B-FP8)
      can't stretch the header — truncated text, full name in the tooltip. */
   #model { max-width: 300px; text-overflow: ellipsis; }
@@ -330,7 +374,13 @@
     <a href="/admin" title="Admin console (admin key required)" style="color:var(--accent2);font-size:13px">Admin</a>
     <a href="/team_leader" title="Team leader console (enrollment leader key required)" style="color:var(--accent2);font-size:13px">Team leader</a>
   </div>
-  <button id="theme" type="button" title="Toggle dark/light theme" aria-label="Toggle theme">◐</button>
+  <!-- Auto follows the OS; Light/Dark pin and are remembered. The #theme id is
+       the header-order anchor tests/test_ui.py pins — keep it. -->
+  <div class="theme-seg" id="theme" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <div id="convback"></div>
 <div id="layout">
@@ -631,13 +681,39 @@
     renderRich(el, text);
   }
 
+  // ---- theme: Auto (default) / Light / Dark -------------------------------
+  // Auto follows the OS live through the CSS media query; Light and Dark pin.
+  // The choice is remembered in 'pcai-llm-theme' — the SAME key admin.html and
+  // team_leader.html read, so one browser setting covers all three consoles and
+  // a saved Light/Dark choice from the old two-state toggle keeps working.
   const THEME_KEY = 'pcai-llm-theme';
-  const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
-  applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
-  $('theme').addEventListener('click', () => {
-    const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-    store.set(THEME_KEY, next); applyTheme(next);
-  });
+  // Mark the active segment. Auto is a real state (not "no choice"), so the
+  // control always shows which of the three is in force.
+  function markThemeButtons(t) {
+    for (const b of document.querySelectorAll('[data-theme-btn]')) {
+      const on = b.getAttribute('data-theme-btn') === t;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  }
+  function applyTheme(t) {
+    if (t !== 'light' && t !== 'dark') t = 'auto';
+    document.documentElement.dataset.theme = t;
+    store.set(THEME_KEY, t);
+    markThemeButtons(t);
+  }
+  applyTheme(store.get(THEME_KEY) || 'auto');
+  for (const b of document.querySelectorAll('[data-theme-btn]')) {
+    b.addEventListener('click', () => applyTheme(b.getAttribute('data-theme-btn')));
+  }
+  // In Auto the palette follows the OS without JS; re-mark the control when the
+  // OS flips so it stays truthful if anything else rewrote the attribute.
+  try {
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if (document.documentElement.dataset.theme !== 'auto') return;
+      markThemeButtons('auto');
+    });
+  } catch (e) {}
 
   const chat = $('chat'), modelSel = $('model'), keyIn = $('apikey'),
         promptIn = $('prompt'), sendBtn = $('send'), conn = $('conn'),

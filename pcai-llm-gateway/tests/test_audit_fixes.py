@@ -517,19 +517,26 @@ def test_server_allows_policy() -> None:
 def test_ui_scripts_parse_clean() -> None:
     """P0 regression: a python-edit orphaned a `||` fallback in admin.html's
     script — SyntaxError killed the WHOLE console (page rendered, zero
-    behavior). Both UI scripts must parse under a real JS engine."""
+    behavior). EVERY inline UI script must parse under a real JS engine.
+
+    The extraction is non-greedy on purpose: the greedy `<script>(.*)</script>`
+    form this test used checked only the FIRST block (it swallowed the markup
+    between two blocks as if it were JS), so the theme wave's pre-paint
+    `<script>` in <head> made it report a phantom SyntaxError. Each block is
+    checked on its own now, and `<script src=...>` is excluded because an
+    external script has an empty body."""
     import re as _re
     import subprocess
 
     for ui in ("admin.html", "index.html"):
         src = open(f"src/pcai_llm/ui/{ui}", encoding="utf-8").read()
-        match = _re.search(r"<script>(.*)</script>", src, _re.DOTALL)
-        assert match is not None, f"{ui} has no inline <script> block"
-        script = match.group(1)
-        path = f"/tmp/ui-check-{ui.replace('.', '-')}.js"
-        open(path, "w").write(script)
-        r = subprocess.run(["node", "--check", path], capture_output=True, text=True)
-        assert r.returncode == 0, f"{ui} script has a syntax error:\n{r.stderr[:500]}"
+        blocks = _re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", src, _re.DOTALL)
+        assert blocks, f"{ui} has no inline <script> block"
+        for i, script in enumerate(blocks):
+            path = f"/tmp/ui-check-{ui.replace('.', '-')}-{i}.js"
+            open(path, "w").write(script)
+            r = subprocess.run(["node", "--check", path], capture_output=True, text=True)
+            assert r.returncode == 0, f"{ui} script block {i} has a syntax error:\n{r.stderr[:500]}"
 
 
 def test_registered_server_defaults_to_all_tools() -> None:

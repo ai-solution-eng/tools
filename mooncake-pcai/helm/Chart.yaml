@@ -1,0 +1,23 @@
+# mooncake — a shared KV-cache store for HPE Private Cloud AI (PCAI / Ezmeral
+# Unified Analytics), plus a read-only dashboard. Ported for PCAI: adds the
+# ezua block, an Istio VirtualService, and the hpe-ezua labels.
+apiVersion: v2
+name: mooncake
+description: >-
+  Mooncake Store — a cluster-wide KV-cache pool (master + a StatefulSet of
+  PVC-backed store pods) that SGLang model deployments use as a shared L3
+  HiCache tier, with a read-only dashboard showing pool and per-model cache
+  statistics.
+type: application
+version: 0.2.3
+appVersion: "0.2.3"
+keywords:
+  - kv-cache
+  - mooncake
+  - sglang
+  - hicache
+  - inference
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

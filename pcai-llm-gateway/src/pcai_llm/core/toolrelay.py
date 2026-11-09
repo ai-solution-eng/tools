@@ -165,6 +165,31 @@ def _relay_content(content: Any) -> str:
     return _cap_tool_content(_serialize_tool_content(content))
 
 
+def _compressible_text(content: Any) -> tuple[str, str]:
+    """(model_facing_serialized, text_to_compress) for one tool result.
+
+    WHY THERE ARE TWO (2026-11-05): the relay executes MCP tools and receives a
+    LIST of content blocks (routes_proxy.execute dumps `result.content`).
+    Serialized, a normal single-text-block result is a ONE-LINE, ONE-ITEM JSON
+    array — below every detector's floor (`json_array` wants >= 4 items,
+    `logs` wants >= 12 lines) — so the compressors never fired on the traffic
+    they were written for: every in-cluster MCP result fell through to the
+    blunt 32k head-truncation cap this feature exists to replace. The block's
+    own text IS what the model should read, so the compressor is handed it
+    directly.
+
+    The serialized envelope is still the PASS-THROUGH form: a result that does
+    not compress stays byte-for-byte the pre-fix behavior, and only a rewrite
+    the model actually receives drops the envelope.
+    """
+    serialized = _serialize_tool_content(content)
+    if isinstance(content, list) and len(content) == 1:
+        block = content[0]
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            return serialized, block["text"]
+    return serialized, serialized
+
+
 async def _prepare_tool_content(
     content: Any,
     *,
@@ -176,7 +201,8 @@ async def _prepare_tool_content(
     """Serialize, optionally compress, then cap one tool result.
 
     Order is load-bearing:
-      1. serialize (the compressors are pure text functions);
+      1. serialize — and, for the single-text-block MCP shape, unwrap the
+         block's text as the compression CANDIDATE (see _compressible_text);
       2. compress + STORE THE ORIGINAL — the store write must succeed BEFORE
          the rewrite is used, or the model would receive a marker pointing at
          a digest that was never persisted (lossy compression with extra
@@ -187,23 +213,25 @@ async def _prepare_tool_content(
     Returns (text_for_the_model, stats_or_None). `shadow` reports stats and
     rewrites nothing, which is how a site measures the ratio before enabling.
     """
-    text = _serialize_tool_content(content)
+    serialized, candidate = _compressible_text(content)
+    text = serialized
     stats: dict[str, Any] | None = None
-    if mode in ("on", "shadow") and text:
+    if mode in ("on", "shadow") and candidate:
         result = toolcompress.compress_tool_text(
-            text,
+            candidate,
             min_chars=settings.tool_compress_min_chars,
             ratio_floor=settings.tool_compress_ratio_floor,
         )
         if result is not None:
             stats = {**result.stats.as_dict(), "server": server, "tool": tool, "mode": mode}
+            outcome = "shadow"
             if mode == "on":
                 stored = False
-                if key_id is not None and len(text) <= settings.tool_compress_max_store_chars:
+                if key_id is not None and len(candidate) <= settings.tool_compress_max_store_chars:
                     try:
                         from . import toolcompress_store
 
-                        await toolcompress_store.save(key_id, result.stats.digest, text)
+                        await toolcompress_store.save(key_id, result.stats.digest, candidate)
                         stored = True
                     except Exception:
                         log.exception(
@@ -212,13 +240,24 @@ async def _prepare_tool_content(
                             tool,
                         )
                 if stored:
+                    # The rewrite REPLACES the serialized envelope: the model
+                    # reads the block's own text, and the digest resolves back
+                    # to that same text (not to a JSON wrapper around it).
                     text = result.text
+                    outcome = "compressed"
                 else:
                     # Two causes, one signal: the write failed, or the
                     # original is too large to retain. Either way the model
                     # gets the original — a marker must never point at a
                     # digest the store does not hold.
                     stats["stored"] = False
+                    outcome = "not_stored"
+            _metrics.observe_tool_compress(
+                mode=mode,
+                kind=result.stats.kind,
+                outcome=outcome,
+                saved=result.stats.chars_before - result.stats.chars_after,
+            )
     return _cap_tool_content(text), stats
 
 

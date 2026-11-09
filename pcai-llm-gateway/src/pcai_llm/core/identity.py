@@ -333,15 +333,23 @@ class TokenClaims:
     (NEVER-store rule; the object lives for one request).
     """
 
-    __slots__ = ("email", "groups", "subject")
+    __slots__ = ("email", "groups", "preferred_username", "subject")
 
-    def __init__(self, subject: str, email: str, groups: list[str]) -> None:
+    def __init__(self, subject: str, email: str, groups: list[str], preferred_username: str = "") -> None:
         self.subject = subject
         self.email = email
         self.groups = groups
+        # The OIDC preferred_username claim. Needed to BIND a token's groups to
+        # the browser-header subject: the proxy's header subject is
+        # preferred_username (X-Auth-Request-Preferred-Username), while sub is a
+        # UUID — comparing only sub would never match the header identity.
+        self.preferred_username = preferred_username
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"TokenClaims(subject={self.subject!r}, email={self.email!r}, groups={self.groups!r})"
+        return (
+            f"TokenClaims(subject={self.subject!r}, email={self.email!r}, "
+            f"preferred_username={self.preferred_username!r}, groups={self.groups!r})"
+        )
 
 
 def _fetch_jwks(jwks_url: str) -> dict[str, Any]:
@@ -542,7 +550,54 @@ async def validate_token(token: str, *, _refreshed: bool = False) -> TokenClaims
     if not isinstance(raw_groups, list):
         raw_groups = []
     groups = [str(g).strip() for g in raw_groups if str(g).strip()]
-    return TokenClaims(subject=sub, email=email, groups=groups)
+    preferred_username = str(decoded.get("preferred_username") or "").strip()
+    return TokenClaims(subject=sub, email=email, groups=groups, preferred_username=preferred_username)
+
+
+async def groups_from_validated_token(token: str, subject: str | None = None) -> list[str] | None:
+    """Groups from a JWKS-validated bearer, or None when the token is absent,
+    validation is not configured, or validation fails (caller falls back to
+    the trusted proxy headers). Never raises for a validation failure;
+    infrastructure failures (JWKS down) also return None here — the mint
+    surface already authenticated via the proxy headers and must not fail
+    closed on an IdP blip.
+
+    SUBJECT BINDING (2026-11-08, factual review F1-1): when a subject is
+    supplied, the token's groups are adopted ONLY if the token identifies the
+    SAME person as the browser-header subject. Without this check a caller who
+    can present ANY valid token for the issuer+audience (a leaked admin
+    id_token) would have its admin groups stamped onto a key bound to a
+    DIFFERENT subject — credential laundering that outlives the short-lived
+    token. The comparison accepts the token's sub, email, or preferred_username
+    because the header subject is preferred_username on the platform proxy
+    while sub is a UUID; a token matching none of them is not the header
+    caller. A mismatch returns None (header groups stay authoritative, the
+    pre-tier behavior)."""
+    if not token or not token_validation_configured():
+        return None
+    if not _JWT_SHAPE_RE.match(token):
+        return None
+    try:
+        claims = await validate_token(token)
+    except Exception as exc:
+        log.info(
+            "identity: token groups unavailable (%s: %s) — caller falls back to proxy headers",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if claims is None:
+        return None
+    if subject:
+        identities = {claims.subject, claims.email, claims.preferred_username}
+        identities.discard("")
+        if subject not in identities:
+            log.info(
+                "identity: token groups IGNORED — token identity does not match the "
+                "browser-header subject (refusing cross-subject group adoption)"
+            )
+            return None
+    return claims.groups
 
 
 _BINDING_SQL = """

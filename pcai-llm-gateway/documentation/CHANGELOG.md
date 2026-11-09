@@ -7,6 +7,248 @@ feature is listed under the LATER version.
 
 ## Unreleased
 
+- **Edit key applies a profile's budgets + grants (2026-11-09).** The
+  console's Edit-key dialog now carries a Profile picker and an "apply this
+  profile's budgets + grants to THIS key now" tick. Picking a profile used to
+  move `users.profile_id` only — budgets and MCP grants are CREATION presets,
+  so an existing key kept its old set. The new
+  `POST /admin/keys/{key_id}/apply-profile` assigns the profile and, in ONE
+  transaction, replaces the key's budget rows (token + USD) and its MCP grant
+  set with the profile's presets. Deny rows for pairs the profile does not
+  grant survive — the same per-key contract as
+  `PUT /admin/keys/{key_id}/mcp-grants`, and the reason a scope-mode key is
+  not widened by an apply. An empty preset list is refused (400), never a
+  silent clear; a `live_grants` profile skips the grant write
+  (the profile layer already decides every call) and reports
+  `live_grants: true`. Audit `key.profile.apply`.
+
+- **The off-peak ↻ is a true refresh (2026-11-09).** The reload button now
+  forces the shared `/admin/endpoint-metrics` read (`emFetch(15000, true)`)
+  instead of reusing the ≤15 s cache, so the per-model KV strips repaint from
+  a fresh Prometheus scrape. The 30 s auto-refresh keeps the shared cache —
+  one fetch still feeds the Metrics tab and the off-peak cards.
+
+- **The off-peak tab shows an ALL-MODELS cache utilization summary
+  (2026-11-09).** One card above the per-model evaluators aggregates every
+  endpoint row into POD MEMORY (the pod's container working set vs its memory
+  limit), RAM (cached) (the host HiCache L2 pool occupancy in tokens), and DISK
+  (GPU active usage stays on the per-model cards: vLLM reports a ratio with
+  no absolute pool size). POD MEMORY is the raw utilization
+  (`container_memory_working_set_bytes` / `kube_pod_container_resource_limits`),
+  summed over the cache-bearing pods — on G2 1.37 / 1.99 TiB ≈ 68.8%
+  (process memory, model weights included). RAM (cached) is the same
+  `kv_host_used_tokens` / `kv_host_total_tokens` the per-model strips read,
+  summed across pods (weighted percent, never a mean of ratios); on the G2
+  fleet that reads 54.93M / 62.74M ≈ 87.5% — the cache-specific number, not
+  a token-to-byte conversion.
+  The engine exports NO storage
+  occupancy gauge, so a real disk number is read from the L3 VOLUMES:
+  `settings.endpointMetricsDiskSelector` (env
+  `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR`, a PromQL label selector over
+  `kubelet_volume_stats_*`) names them — on G2 the Mooncake store's SSD
+  offload PVCs (`namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"`,
+  3 × 350 Gi) — and `GET /admin/endpoint-metrics` gains
+  `disk: {used_bytes, total_bytes, pct, selector}` (null when unset/unknown,
+  never a fabricated 0%). Without a volume number the summary falls back to
+  L3 activity/status; two extra PromQL calls run per snapshot only when the
+  selector is set.
+
+- **Model groups: named sets of equivalent chat models, load-balanced by
+  live queue depth (2026-11-08).** A group is a first-class route target —
+  a request model id, a fallback-chain entry, and an advertised
+  `GET /v1/models` entry (`owned_by: "group"`) — whose MEMBER is chosen
+  per request instead of by a fixed order: power-of-two over live queue
+  depth (two members sampled, the one with the lower MINIMUM queue across
+  its endpoints wins). A member with no load signal is neither herded
+  onto nor starved from — it draws a neutral rank over the OBSERVED score
+  range (a single observed value ties it; no data at all is uniform
+  [0,1]). The conversation is then pinned to the chosen member (`grp:`
+  stickiness scope); a pin whose member left the group or the key's ACL,
+  or whose WHOLE pool went
+  unhealthy, is dropped, and one failed call keeps it (re-picking would
+  cost a full re-prefill). With session affinity on, the conversation is
+  also pinned to one of the member's endpoints (`ep:`). Load comes from a
+  BACKGROUND Prometheus snapshot, refreshed every
+  `model_group_load_refresh_s` (5 s): the request path reads the in-memory
+  view and never queries Prometheus, and a snapshot older than
+  `model_group_load_stale_s` (30 s) degrades the pick to random — a
+  Prometheus outage must never stop model selection.
+  The SELECTED member bills and carries the ACL: a group never bypasses
+  `allowed_models` or budgets (a key that may use one member may use the
+  group; one that may use none gets 503 when no member qualifies). v1
+  limits, stated: chat members only, ONE level (a member may not be a
+  group), `load` policy only, no group-level budgets, and groups do not
+  enter profile ordering or the `auto` cascade. Admin surface:
+  `GET/PUT/DELETE /admin/model-groups` + `POST /admin/model-groups/{name}/preview`
+  (read-only "would pick now", with each member's score and pool health);
+  names are slugs validated at save time (a group may not shadow a
+  registered model, and a pool may not later be registered under a group's
+  name; `auto` / `auto-demand-aware` / `routing` / `routing__*` are
+  reserved). Off by default (`model_groups_enabled`): with it off a group
+  name is not
+  routable, the admin API still stores the rows, and routing is
+  byte-identical. See API.md § 4.3 and FEATURES.md § Model groups.
+
+- **Agents join the complexity router (2026-11-08).** With
+  `routing_agents_enabled` on, the key's OFFERED agents are routing
+  candidates alongside pools and groups: `routing__<agent>` is a legal
+  ceiling, the decision model gets an agent card (surface + pinned model +
+  servers), and a pick applies the agent's tool surface and system prompt
+  for the whole turn — safe because routing happens BEFORE the request is
+  prepared. The candidate set is the key's PROFILE agent menu (agents are
+  per-key, so they are not in the global routing allowlist), and an agent
+  with no pinned model rides the profile cascade. Default OFF
+  (`PCAI_LLM_ROUTING_AGENTS_ENABLED` / `settings.routingAgentsEnabled`):
+  it changes what the router may choose.
+
+- **SSO self-mint grows an admin tier: one tenant, two profiles
+  (2026-11-08).** A tenant's browser self-mint previously stamped ONE
+  profile (`tenants.sso_default_profile_id`) onto every minted key. It
+  can now hold a second, admin-tier profile
+  (`tenants.sso_admin_profile_id`) plus a comma-separated IdP group list
+  (`tenants.sso_admin_groups`): at mint AND rotate, when the caller's IdP
+  groups INTERSECT the list the admin profile is stamped instead of the
+  default, the default profile when the intersection is empty, and the
+  bare fixed grant when neither profile is configured. The PCAI admin
+  tier is the LITERAL group `admin` in the Keycloak `groups` claim —
+  there is no `member` string in that claim; a caller without a matching
+  group is simply not an admin. Group truth outranks proxy headers: when
+  token validation is configured, the groups are read from the
+  JWKS-VALIDATED id_token and a validated claim overrides the
+  proxy-injected `X-Auth-Request-Groups` — but ONLY when the token
+  identifies the SAME person as the header subject (sub / email /
+  preferred_username). A valid token for a DIFFERENT subject is ignored: a
+  leaked admin id_token must never stamp its groups onto another caller's
+  long-lived key. The header stays the fallback for an absent or
+  unverifiable token — deliberately, because the mint surface is already
+  authenticated by the chain and an IdP blip must not fail it closed.
+  Matching is case-sensitive, whitespace-trimmed, empty
+  entries dropped. Scopes, the bare grant and the eligibility gate are
+  untouched; an EMPTY `sso_admin_groups` (the column default) disables
+  the split, and a tenant with only the default profile stamps
+  byte-identically to before. Admin surface: `GET /admin/tenants`
+  returns the tier pair; `PUT /admin/tenants/{id}/sso-default-profile`
+  gains OPTIONAL `admin_profile_id` / `admin_groups` — EVERY field is
+  applied only when present (a `profile_id`-only body cannot clear the
+  tier, a tier-only body cannot clear the default profile, and an empty
+  body is 400), validated at wire time (404 unknown profile, 400 invalid
+  budget preset, 400 control-char or >64-char group entry). On ROTATE the
+  user row follows the tier when it points at one of the tenant's two SSO
+  slots; a hand-assigned profile is never re-scoped. No env: the tier is
+  tenant-scoped DB state set through the admin API.
+
+- **The off-peak model cards show KV cache usage: GPU %, host RAM %,
+  disk activity (2026-11-08).** `GET /admin/endpoint-metrics` rows gain
+  `kv_*` fields read from the inference servers' own gauges (SGLang
+  only — vLLM rows read null; the percentage itself is the existing
+  `kv_cache_pct`): the GPU KV pool — `kv_gpu_pct` (the ACTIVE usage
+  ratio: evictable radix-cache tokens are not holding it) plus absolute
+  `kv_gpu_used_tokens` / `kv_gpu_evictable_tokens` /
+  `kv_gpu_max_tokens`, because a percentage of a multi-million-token pool
+  reads "0.98%" whether that is 3 conversations or 300; the host HiCache
+  L2 — `kv_host_used_tokens` / `kv_host_total_tokens` / `kv_host_pct`
+  (total missing or 0 reads "unknown", never "0%"), where occupancy near
+  100% at write_through steady state is NORMAL, not a fault; and the
+  disk/storage tier, which has NO occupancy gauge — so the disk story is
+  `kv_disk_configured` (bool: an L3 backend is configured at all) plus
+  `kv_disk_hit_tps` (the storage-hit prefill token rate — activity, not
+  occupancy). The Off-peak tab renders the strip under each model card's
+  sparkline: only tiers with data render (a tier with no rows is omitted
+  entirely, never an error), replicas aggregate (sum used/total, weighted
+  percent) with the per-replica breakdown in the row tooltip, and every
+  server string is escaped. The tiers are LABELLED for what they are —
+  **GPU (active)** and **RAM (cached)** — because the two numbers answer
+  different questions: the GPU reading is active sequences (the evictable
+  prefix cache is excluded from the %), while the host KV cache tier is the
+  prefix-cache pool (cached sequences, not conversations). The GPU bar is
+  two-segment (active accent + evictable cached dim) and states the cached
+  token count, so a 4% active reading beside a full prefix cache no longer
+  looks like an empty pool. The same module gains `load_rows()` — a
+  3-query (running / waiting / kv_cache_pct) load snapshot that the model
+  group's background refresher consumes.
+
+- **Session affinity now works per conversation WITHOUT the client header
+  — behavior change (2026-11-08).** With `session_affinity_enabled` on
+  and NO `X-PCAI-Session` header, the affinity key is the CONVERSATION
+  FINGERPRINT (`canonical.thread_key` — the same thread id the canonical
+  store and the load-aware cascade head already use), so endpoint pins
+  (and, with `model_groups_enabled` on, group pins) key per conversation
+  with no client change. The fingerprint is computed whenever EITHER
+  feature is on; each pin scope keeps its own gate (`ep:` under session
+  affinity, `grp:` under model groups), and a request with neither a
+  header nor a fingerprint takes no pin. **Streaming responses now
+  REFRESH the pin on completion** — previously a streamed turn read a pin
+  but never refreshed it; a disconnected stream still leaves the pin
+  untouched. If you run session affinity with clients that do not send
+  the header, expect pin write/read activity on every conversation that
+  previously had none — that is the point, but it is a behavior change.
+
+- **Profile saves are idempotent when the agent selection is unchanged
+  (2026-11-06 incident).** `POST /admin/profiles` wrote the agent links with
+  one `WITH gone AS (DELETE …) INSERT …` statement, and PostgreSQL evaluates a
+  data-modifying CTE against the SAME snapshot as the outer statement — the
+  DELETE's rows stayed visible to the INSERT's uniqueness check, so every save
+  after the first raised `duplicate key value violates unique constraint
+  "profile_agents_pkey"` and 500'd. The profile ROW had already been committed
+  by the preceding upsert (separate statement), so a failed save could still
+  land the form's values while the response was an error — which read as the
+  profile "wiping itself" as the console was manipulated. The statement now
+  deletes ONLY the links no longer selected and re-inserts the wanted set with
+  `ON CONFLICT (profile_id, agent_id) DO NOTHING`. Both halves are
+  load-bearing: the scoped DELETE removes only what was removed (the kept rows
+  stay live), and DO NOTHING is then correct because the conflict is a REAL
+  live row. A blanket delete + DO NOTHING would have been worse than the 500 —
+  the delete commits, the skipped insert never re-adds, and the kept agent
+  silently disappears on the next save. Tests: a second identical save
+  succeeds and the executed SQL carries both the scoped delete and the
+  conflict clause.
+
+- **A Prometheus sweep agent ships as a built-in preset (2026-11-06).**
+  `prometheus-sweep` turns the current alert set into one prioritized JSON
+  report (P1/P2/P3, quoted evidence, decisions owed) and is an AGENT PROFILE —
+  no new route: it is installed through `POST /admin/agents` and selected by
+  naming it as the request `model`. Report-only is STRUCTURAL: its servers
+  are prometheus + k8s-ops + logsearch, each narrowed to read tools (no
+  applygate; no exec/kubectl/secrets; no logsearch export), so the strongest
+  mutation it could attempt is one its surface does not contain. Determinism
+  is the procedure, not the prose: one `prom_alerts` + one `prom_rules` + at
+  most two evidence calls per defect, fixed clustering rules, a fixed priority
+  ladder and sort keys, exactly one JSON object with a fixed schema, and
+  `prompt_version` echoed into every report. Alert hygiene is encoded (a
+  cache-tier plateau is P3 with a growth ladder, never a P1), and the report
+  is honest about the relay's per-turn tool budget: defects it did not reach
+  are marked `unverified`, never dropped. The definition lives in
+  `core/agent_presets` (code-reviewed, test-pinned); `scripts/seed_agents.py`
+  installs it — `--dry-run` validates server names against the live registry
+  and tool names against each server's live `list_tools`, and
+  `--offer-to-profile` appends it to a profile's selection. Tests: the preset
+  body is accepted by the admin request model; every named tool exists in the
+  pinned fleet catalog; no mutating tool appears in the surface; the prompt
+  carries the procedure/ladder/schema markers and its version; the seeder
+  refuses absent servers and an oversized prompt, and installs through the
+  real admin route.
+
+- **Tool-result compression now reaches the MCP result shape it was written
+  for (2026-11-05).** The relay hands `_prepare_tool_content` what
+  `routes_proxy.execute` returns — the MCP content-BLOCK list — and
+  serializing that produced a one-line, one-item JSON array. Every detector is
+  count-based (`json_array` needs >= 4 items, `logs` needs >= 12 lines), so
+  in-cluster MCP results never compressed at all: a 122 KB pod log passed
+  straight through to the 32,000-char head cap the feature exists to replace.
+  A single-text-block result is now unwrapped and the block's OWN text is both
+  the compression candidate and the digest's original, so retrieval hands back
+  the log rather than a JSON envelope around it. A result that does not clear
+  the floor still returns the serialized envelope byte-for-byte — the
+  model-facing shape only changes when a rewrite the model actually receives
+  replaces it — and the same 122 KB log now compresses 84%. New counters
+  `gateway_tool_compress_total{mode,kind,outcome}` and
+  `gateway_tool_compress_chars_saved_total{mode}` make a silent zero visible:
+  `outcome=not_stored` is a candidate whose original could not be retained
+  (over the store ceiling, no key, or a failed write) and therefore passed
+  through. Tests: the production block shape compresses and its digest
+  resolves to the unwrapped text; a sub-floor block keeps the envelope
+  unchanged.
+
 - **Distiller off-peak scheduling follows the summarizer model, not the
   fleet average (2026-11-05 operator report).** The Memory Distiller's
   `offpeak_only` gate read the GLOBAL evaluator, so a busy fleet average kept

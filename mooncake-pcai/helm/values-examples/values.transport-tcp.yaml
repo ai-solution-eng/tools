@@ -1,0 +1,19 @@
+# Transport profile: TCP - the chart default, and the bring-up setting.
+#
+#   helm install mooncake ./helm -n mooncake --create-namespace \
+#     -f helm/local/values.g2.yaml \
+#     -f helm/values-examples/values.transport-tcp.yaml
+#
+# The transport is ONE decision for the whole pool: the store and every model
+# client must run the same one, and a client on the other protocol cannot
+# transfer at all.
+#   store  -> store.protocol (this file)
+#   client -> MOONCAKE_PROTOCOL=tcp, and no MOONCAKE_RDMA env var
+#   script -> scripts/patch-model-mooncake.py --isvc <name> --protocol tcp
+#
+# What it costs: one memcpy per page and CPU on the transfer thread. What it
+# buys: no device, no capability, no per-node NIC, and no silent fallback -
+# there is nothing for TCP to fall back from.
+
+store:
+  protocol: tcp

@@ -59,7 +59,7 @@ image:
   #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
   # (the reference renders as repository:tag@sha256:...); for tag-only
   # sites the alternative is pullPolicy: Always (re-checks every pull).
-  tag: v3.9.2
+  tag: v3.10.4
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -320,6 +320,11 @@ settings:
   # silently changes what an existing client request does; the explicit routing /
   # routing__<model> names always route regardless of this flag.
   routeDefaultModel: false
+  # AGENTS AS ROUTING CANDIDATES: with this on, the key's OFFERED agents join the
+  # router's candidate window (an agent is a hard model: tool surface + pinned
+  # model/cascade), and a pick applies the agent's surface + prompt for the whole
+  # turn. Off by default; it changes what the router may choose.
+  routingAgentsEnabled: false
   # MCP federation (/mcp): tools/list returns the key's GRANTED tools as individual
   # `{server}__{tool}` tools; false = legacy two-tool surface.
   mcpFlatTools: true
@@ -495,6 +500,13 @@ settings:
   # model serves on. DCGM series carry NO pod label — scope by Hostname + device:
   #   GLM-5.3-Flash: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs04.hst.lab",device=~"nvidia[4-7]"}[5m]))'
   offpeakModelPromql: {}
+  # L3 cache volume occupancy for the Off-peak tab's all-models summary: a PromQL label
+  # selector over kubelet_volume_stats_* naming the volumes backing the L3 store. The
+  # inference engine exports NO storage-occupancy gauge (activity counters only), so this
+  # is how a real disk utilization number is read. Empty = no disk occupancy section.
+  # Example (Mooncake SSD offload PVCs):
+  #   endpointMetricsDiskSelector: 'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'
+  endpointMetricsDiskSelector: ""
   # Load-aware cascade head: the HEAD model is picked at conversation start by per-model
   # off-peak state, then stays sticky. Only reorders candidates.
   loadAwareCascade:
@@ -525,6 +537,18 @@ settings:
   # selection, so it is opted into per site).
   sessionAffinityEnabled: false
   sessionAffinityTtlS: 3600
+
+  # Model groups: named sets of EQUIVALENT chat models, selected by live load
+  # (power-of-two over queue depth, then KV%) instead of a fixed order. A group
+  # is a route target usable anywhere a model name is accepted (direct request,
+  # fallback chain, /v1/models); the chosen member's endpoint is then pinned
+  # per conversation. This is the load-balanced sibling of the ORDERED fallback
+  # chain. Off by default: groups are inert (not routable) until enabled.
+  # Load comes from a background Prometheus snapshot (never the request path);
+  # a stale/unavailable snapshot degrades to weighted random.
+  modelGroupsEnabled: false
+  modelGroupLoadRefreshS: 5
+  modelGroupLoadStaleS: 30
 
   # Audio passthrough billing heuristics. TTS/ASR report no token usage, and
   # a zero-token row would be a budget bypass, so the gateway bills an

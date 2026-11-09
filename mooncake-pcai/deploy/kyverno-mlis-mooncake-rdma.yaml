@@ -1,0 +1,133 @@
+# Attach the Mooncake client plumbing to MLIS/KServe pods that opt in.
+#
+# WHY THIS EXISTS
+#   A KServe Serverless predictor runs inside a Knative Revision, and Knative
+#   validates that revision template far more strictly than it validates a Pod:
+#
+#     hostPath volumes                never allowed
+#     env valueFrom.fieldRef          gated by kubernetes.podspec-fieldref
+#     securityContext.capabilities    gated by kubernetes.podspec-securitycontext
+#
+#   On this cluster all three gates are closed (knative-serving/config-features
+#   has neither podspec flag enabled), so an InferenceService cannot carry them
+#   at all: the patch is rejected by validation.webhook.serving.knative.dev and
+#   the ISVC stops reconciling. MLIS has no field for them either. Mutating the
+#   Pod is the only injection point downstream of Knative's validation.
+#
+# SCOPE
+#   Cluster-scoped, applied once by a cluster administrator. Per model the only
+#   change is two literal environment variables in the MLIS catalog:
+#
+#     MOONCAKE_MASTER = mooncake-master.mooncake.svc.cluster.local:50051
+#     MOONCAKE_RDMA   = true        # RDMA only; omit it for a TCP store
+#
+#   Rule 1 fires for any Mooncake client and adds the two per-pod values a
+#   catalog cannot express. Rule 2 fires only with MOONCAKE_RDMA=true and adds
+#   the device, the capability and the device mount.
+#
+# VERIFY BEFORE TRUSTING IT
+#   Server-side dry-run runs the admission chain (including this policy) and
+#   returns the mutated Pod without creating anything. deploy/README.md has the
+#   exact command. Do that once, before pointing a model at the store.
+#
+# CAVEAT
+#   Kyverno must be installed. failurePolicy Ignore keeps a policy outage from
+#   blocking deployments; the lab ran Fail.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: mlis-mooncake-rdma
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: none   # mutate Pods only, never Knative's Deployment
+    policies.kyverno.io/description: >-
+      MLIS pods that opt into Mooncake get the per-pod transfer endpoint, and
+      with MOONCAKE_RDMA=true the RDMA device, IPC_LOCK and /dev/infiniband -
+      none of which the MLIS interface or a Knative revision can express.
+spec:
+  background: false
+  rules:
+    # ---------------------------------------------------------------- rule 1
+    # Every Mooncake client needs its own transfer endpoint. A catalog entry
+    # holds literal strings only, so MOONCAKE_LOCAL_HOSTNAME cannot be a
+    # fieldRef there - and Knative rejects a fieldRef in a revision anyway.
+    - name: add-mooncake-fieldrefs
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: ezprojects.hpe.com/ezproject, operator: Exists}
+              selector:
+                matchExpressions:
+                  - {key: serving.kserve.io/inferenceservice, operator: Exists}
+      preconditions:
+        all:
+          # Flatten the container projection first: a nested filter
+          # (containers[?…].env[?…]) applies the inner predicate to the outer
+          # list and always yields [], so the rule would silently never fire.
+          - key: "{{ request.object.spec.containers[?name=='kserve-container'].env[] | [?name=='MOONCAKE_MASTER'].value | [0] || '' }}"
+            operator: NotEquals
+            value: ""
+      mutate:
+        patchStrategicMerge:
+          spec:
+            containers:
+              - (name): kserve-container
+                env:
+                  # env is a list with patchMergeKey "name": these merge in by
+                  # name and leave the model's own environment untouched.
+                  - name: MOONCAKE_LOCAL_HOSTNAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: MOONCAKE_HOST_ID
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.nodeName
+
+    # ---------------------------------------------------------------- rule 2
+    # RDMA only. Opt in from the catalog with the literal MOONCAKE_RDMA=true.
+    # The device plugin injects the device nodes into the container, so the
+    # hostPath mount below is belt-and-braces rather than strictly required -
+    # mooncake-store-0 runs RDMA with the device limit and no mount at all.
+    - name: add-mooncake-rdma
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: ezprojects.hpe.com/ezproject, operator: Exists}
+              selector:
+                matchExpressions:
+                  - {key: serving.kserve.io/inferenceservice, operator: Exists}
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.containers[?name=='kserve-container'].env[] | [?name=='MOONCAKE_RDMA'].value | [0] || '' }}"
+            operator: Equals
+            value: "true"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            containers:
+              - (name): kserve-container
+                # mlock of the registered segment; Kubernetes has no ulimit
+                # field, and CAP_IPC_LOCK is what lifts RLIMIT_MEMLOCK.
+                securityContext:
+                  capabilities:
+                    add: ["IPC_LOCK"]
+                resources:
+                  limits:
+                    # Device from the NVIDIA RDMA shared-device plugin. The node
+                    # must advertise it: kubectl get node -o json | grep rdma/
+                    rdma/rdma_shared_device_a: "1"
+                volumeMounts:
+                  - name: infiniband
+                    mountPath: /dev/infiniband
+            volumes:
+              - name: infiniband
+                hostPath:
+                  path: /dev/infiniband

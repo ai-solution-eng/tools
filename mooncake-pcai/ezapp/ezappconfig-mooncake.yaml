@@ -1,0 +1,91 @@
+apiVersion: ezconfig.hpe.ezaf.com/v1alpha1
+kind: EzAppConfig
+metadata:
+  labels:
+    hpe-ezua/imported-app: "true"
+  name: mooncake-0.2.2-1794237170853
+spec:
+  backoffLimit: 3
+  category: dataScience
+  chartVersion: "0.2.2"
+  description: "Shared KV-cache store for model deployments: one Mooncake pool, many replicas, with a live statistics dashboard."
+  install: true
+  label: "Mooncake"
+  logoImage: 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
+  name: "mooncake"
+  options:
+    create-namespace: "true"
+    namespace: "mooncake"
+    timeout: 45m
+    wait: "true"
+  values: |-
+    # G2 site values — OPERATOR FILE, not packaged (helm/.helmignore excludes local/).
+    #
+    #   helm install mooncake ./helm -n mooncake --create-namespace \
+    #     -f helm/local/values.g2.yaml
+    #
+    # Shape (DEMO sizing): 3 store pods x 350Gi = ~1.05 TiB of PVC-backed capacity,
+    # plus 3 x 16 GB of DRAM hot tier. This is a demo footprint, not a production
+    # sizing - grow persistence.size from measured write volume, not from a guess.
+    #
+    # The storage class is gl4f-filesystem (VAST CSI) — the only filesystem class this
+    # cluster exposes today; swap it for the X10000 class when one exists.
+    #
+    # Capacity context, measured 2026-11-05: the export holds 343.8 TiB with 336.3 TiB
+    # free, and ~298 TiB is already promised to PVC quotas (~46 TiB of unallocated
+    # headroom). The ~1 TiB below is ~2% of that headroom, and because the class is
+    # thin, nothing is reserved until pages are written.
+    #
+    # Sizing rules of thumb:
+    #   * PVC size is a hard quota per pod — writes past it fail with EDQUOT and the
+    #     store degrades to cache misses (not data loss).
+    #   * KV pages are high-entropy, so unlike model weights they do NOT dedup or
+    #     compress on the array: plan physical ~= logical.
+    #   * replicaCount buys resilience; one pod loss costs its share of the pool.
+
+    ezua:
+      virtualService:
+        # Replace ${DOMAIN_NAME} by hand for a plain helm install; PCAI substitutes
+        # it automatically when the chart is imported as an EzAppConfig.
+        endpoint: "mooncake.${DOMAIN_NAME}"
+
+    store:
+      replicaCount: 3
+      # TCP. The transport is ONE decision for the whole pool and every client must
+      # match it; TCP needs no device, no capability and has no silent-fallback
+      # mode. Switch with
+      #   -f helm/values-examples/values.transport-rdma.yaml
+      # once the pool is proven on TCP and the store pods have been checked for
+      # /dev/infiniband (that file lists the prerequisites).
+      protocol: tcp
+      # DRAM hot tier per pod. Not disk and not replaceable by the PVC: the store
+      # serves pages out of this at memory speed. Keep it modest — the PVC is the
+      # capacity tier.
+      segmentSize: "16gb"
+      # 16 GB segment + local buffer + python overhead must fit the request.
+      resources:
+        requests:
+          cpu: "1"
+          memory: 24Gi
+        limits:
+          cpu: "4"
+          memory: 32Gi
+      persistence:
+        enabled: true
+        # 3 x 350Gi = 1050 GiB ≈ 1.05 TiB total.
+        size: 350Gi
+        # The class this cluster actually exposes. Confirm with:
+        #   kubectl get storageclass
+        storageClassName: "gl4f-filesystem"
+        accessModes:
+          - ReadWriteOnce
+
+    ui:
+      # Backend re-read cadence. The page itself polls the cached snapshot every 30 s.
+      refreshIntervalSeconds: 1800
+      discovery:
+        # Namespaces the dashboard scans for Mooncake clients (pods carrying a
+        # MOONCAKE_MASTER env var).
+        namespaces:
+          - project-user-andrew-bydlon
+  version: ""

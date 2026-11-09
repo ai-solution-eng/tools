@@ -73,6 +73,19 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS self_mint_enabled BOOLEAN NOT NULL DE
 -- overridden (the mint's fixed least-privilege grant stays).
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_default_profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL;
 
+-- SSO TIER PROFILES (2026-11-08): the self-mint profile can differ by the
+-- caller's IdP groups. The PCAI admin tier is the literal string `admin` in
+-- the Keycloak `groups` claim (the platform's own Rego tests
+-- `"admin" in groups`); there is NO `member` string — member means "not
+-- admin". sso_admin_profile_id is stamped when ANY entry of
+-- sso_admin_groups (comma-separated, case-sensitive, whitespace-trimmed)
+-- is present in the caller's groups; otherwise sso_default_profile_id
+-- applies. Empty sso_admin_groups (the default) DISABLES the tier split:
+-- resolution is byte-identical to the single-profile deployment, so an
+-- upgrade never re-scopes an existing tenant.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_admin_profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_admin_groups TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1140,6 +1153,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_call_audit_prev
     ON mcp_call_audit(prev_hash) WHERE prev_hash <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_admin_audit_prev
     ON admin_audit(prev_hash) WHERE prev_hash <> '';
+
+-- ============================================================================
+-- Model groups (2026-11-08) — named sets of EQUIVALENT chat models.
+--
+-- WHY: a deployment can serve the same capability from several models
+-- (Deepseek / GLM / Qwen) and several replicas of each. A group is a
+-- first-class route target: members are chosen by LIVE LOAD (not a fixed
+-- order), then the conversation is pinned to the chosen member's endpoint.
+-- It is usable anywhere a model name is accepted (direct request, fallback
+-- chain, /v1/models). This is the load-balanced sibling of the ORDERED
+-- fallback chain: fallback is a failure path, a group is a selection path.
+--
+-- members is JSONB [{model, weight}] in registry model-name spelling. ONE
+-- LEVEL ONLY: a member may not itself be a group (validated at the write
+-- path, so a cycle can never be stored). policy 'load' today; 'weighted'
+-- is reserved. model_type keeps a group from serving chat with an
+-- embedding member (mirrors the pool type gate).
+--
+-- NOT a budget or ACL boundary: the SELECTED member bills and its
+-- allowed_models gate applies (a group never makes a model reachable that
+-- the key could not reach on its own).
+CREATE TABLE IF NOT EXISTS model_groups (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL UNIQUE,
+    model_type  TEXT NOT NULL DEFAULT 'chat',
+    policy      TEXT NOT NULL DEFAULT 'load',
+    members     JSONB NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ============================================================================
 -- Load-aware cascade stickiness (auto entry, off-peak-driven). ADDITIVE /

@@ -341,6 +341,25 @@ if _REAL:
         "the cache is worth it on this workload.",
         ["mode", "result"],  # shadow|active x hit|miss
     )
+    TOOL_COMPRESS = Counter(
+        "gateway_tool_compress_total",
+        "Deterministic tool-result compression outcomes in the relay. "
+        "compressed = the model saw the rewrite; not_stored = a candidate was "
+        "built but the original could not be retained (over the store ceiling, "
+        "no key, or a failed write), so the original passed through; shadow = "
+        "measured, nothing rewritten. A zero rate on a mode=on fleet means the "
+        "detectors are not matching the traffic — the failure this counter was "
+        "added to make visible.",
+        ["mode", "kind", "outcome"],
+    )
+    TOOL_COMPRESS_CHARS_SAVED = Counter(
+        "gateway_tool_compress_chars_saved_total",
+        "Characters removed by tool-result compression (before-after, marker "
+        "included), counted ONCE per rewritten result. The context saving is "
+        "larger than this number: a rewritten result is re-prefilled on every "
+        "later iteration of its turn.",
+        ["mode"],
+    )
     # set_function, not a periodic set(): prometheus_client calls these at
     # scrape time, so the reading is always current and the steady-state cost
     # is one attribute read per scrape rather than a background task.
@@ -356,6 +375,8 @@ else:
     DB_POOL_IDLE: Any = _NoopMetric()  # type: ignore[no-redef]
     DB_POOL_MAX: Any = _NoopMetric()  # type: ignore[no-redef]
     RESPONSE_CACHE: Any = _NoopMetric()  # type: ignore[no-redef]
+    TOOL_COMPRESS: Any = _NoopMetric()  # type: ignore[no-redef]
+    TOOL_COMPRESS_CHARS_SAVED: Any = _NoopMetric()  # type: ignore[no-redef]
     LATENCY: Any = _NoopMetric()  # type: ignore[no-redef]
     TTFT: Any = _NoopMetric()  # type: ignore[no-redef]
     BUDGET_REJECTIONS: Any = _NoopMetric()  # type: ignore[no-redef]
@@ -416,6 +437,19 @@ def observe_mcp_call(server: str, outcome: str, model: str = "") -> None:
     point of P2-1: you cannot act on a rare event you cannot attribute.
     """
     MCP_CALLS.labels(server=server, outcome=outcome, model=model or "unattributed").inc()
+
+
+def observe_tool_compress(*, mode: str, kind: str, outcome: str, saved: int) -> None:
+    """One deterministic tool-result compression decision.
+
+    outcome vocabulary: compressed | not_stored | shadow (bounded). Saved
+    chars are counted only for a rewrite the model actually received — a
+    shadow measurement is reported on the wire and in the log, never added to
+    a counter whose name promises a real saving.
+    """
+    TOOL_COMPRESS.labels(mode=mode, kind=kind, outcome=outcome).inc()
+    if outcome == "compressed":
+        TOOL_COMPRESS_CHARS_SAVED.labels(mode=mode).inc(max(0, saved))
 
 
 def observe_tpm_cache_refund(tokens: int, discarded: bool) -> None:

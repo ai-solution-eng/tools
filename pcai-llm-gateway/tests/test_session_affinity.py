@@ -31,9 +31,9 @@ from pcai_llm.api import routes_proxy
 from pcai_llm.api.auth import KeyRecord
 from pcai_llm.config import settings
 from pcai_llm.core import budgets as budgets_mod
+from pcai_llm.core import canonical, stickiness
 from pcai_llm.core import cascade as cascade_mod
 from pcai_llm.core import costs as costs_mod
-from pcai_llm.core import stickiness
 from pcai_llm.routing.router import Endpoint, Pool, Router
 
 MODEL = "test-model"
@@ -314,13 +314,41 @@ def test_header_ignored_when_flag_off(env) -> None:
         settings.session_affinity_enabled = False
 
 
-def test_no_session_header_no_pin_activity(env) -> None:
-    tc, fake_db, _, _, _ = env
+def test_no_header_uses_conversation_fingerprint_as_affinity_key(env) -> None:
+    """No X-PCAI-Session: the affinity key is the conversation fingerprint.
+
+    CONTRACT CHANGE (2026-11-08, model groups F3): the affinity key is the
+    client's session header OR the conversation's own fingerprint
+    (canonical.thread_key), so endpoint/group pins work with NO client
+    change, per conversation. Before this, a header-less request had no pin
+    identity at all.
+    """
+    tc, fake_db, _, _, key = env
     settings.session_affinity_enabled = True
     try:
         r = _chat(tc)  # no header
         assert r.status_code == 200, r.text
-        assert fake_db.sticky == {}, "no header, no pin machinery"
+        fp = canonical.thread_key([{"role": "user", "content": "hello"}], key.id)
+        assert fp, "the conversation must have a fingerprint"
+        assert fake_db.sticky == {(key.id, stickiness.SCOPE_ENDPOINT + fp): ("ep1", 0.0)}, (
+            "no header: the pin is keyed by the conversation fingerprint"
+        )
+    finally:
+        settings.session_affinity_enabled = False
+
+
+def test_no_header_and_no_seed_writes_no_pin(env) -> None:
+    """No session header AND no user-message seed: no fingerprint, no pin."""
+    tc, fake_db, _, _, _ = env
+    settings.session_affinity_enabled = True
+    try:
+        r = tc.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": [{"role": "assistant", "content": "hi"}]},
+            headers=dict(AUTH),
+        )
+        assert r.status_code == 200, r.text
+        assert fake_db.sticky == {}, "no user-message seed: no affinity key, no pin"
     finally:
         settings.session_affinity_enabled = False
 

@@ -1,16 +1,30 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Team Leader</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<!-- Pre-paint theme resolver: read the saved choice BEFORE the stylesheet is
+     parsed so a pinned Light/Dark never flashes the dark default. Anything that
+     is not exactly "light"/"dark" — unset, corrupt, a legacy value — is Auto.
+     Storage can be BLOCKED (iframes / privacy mode) and then getItem throws;
+     the try/catch degrades to Auto instead of killing the page. -->
+<script>
+  (function () {
+    var t = "auto";
+    try { t = localStorage.getItem("pcai-llm-theme") || "auto"; } catch (e) {}
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <style>
   /* The Team Leader console is a SMALLER SIBLING of admin.html — the same
      :root variables, the same control idioms (pill / card / row / ghost /
      banner / key-once), so a leader who has seen the admin console finds the
-     same hand on this one. Dark default + light theme via data-theme,
-     persisted in the SAME 'pcai-llm-theme' key so both consoles match. */
+     same hand on this one. Auto / Light / Dark theme: Auto (the default)
+     follows the OS live, Light/Dark pin, and the choice is persisted in the
+     SAME 'pcai-llm-theme' key so all three consoles match. */
   :root {
     color-scheme: dark;
     --bg: #0f1117; --panel: #1a1d27; --border: #2a2e3d;
@@ -25,6 +39,26 @@
     --ushade-2: rgba(255,255,255,.06); --ushade-3: rgba(255,255,255,.08);
     --ushade-4: rgba(255,255,255,.10); --ushade-5: rgba(255,255,255,.12);
   }
+  /* Auto (the default state) follows the OS: the light ramp applies under
+     prefers-color-scheme, scoped to [data-theme="auto"] so an explicit Light or
+     Dark choice always wins even when the OS disagrees.
+     KEEP IN SYNC with the explicit :root[data-theme="light"] block below — the
+     two blocks must carry identical declarations. */
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="auto"] {
+      color-scheme: light;
+      --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
+      --text: #191919; --dim: #5f6773;
+      --accent: #00815f; --accent-contrast: #ffffff;
+      --accent2: #2c6a9e; --user-bubble: #e3f2ee;
+      --err: #b42323; --err-bg: rgba(180,35,35,.06);
+      --focus: #00815f55;
+      --ushade-0: rgba(0,0,0,.03); --ushade-1: rgba(0,0,0,.05);
+      --ushade-2: rgba(0,0,0,.07); --ushade-3: rgba(0,0,0,.09);
+      --ushade-4: rgba(0,0,0,.11); --ushade-5: rgba(0,0,0,.13);
+    }
+  }
+  /* KEEP IN SYNC with the Auto media block above — identical declarations. */
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
@@ -54,8 +88,17 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
     font-size: 13px; width: 300px; }
   header .spacer { flex: 1; }
-  #theme { background: none; border: 1px solid var(--border); border-radius: 6px;
-           padding: 4px 9px; cursor: pointer; color: var(--text); }
+  /* Theme control: three-way Auto / Light / Dark segmented pill (the same shape
+     admin.html and index.html carry). */
+  .theme-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
+               overflow: hidden; }
+  .theme-seg button { background: transparent; color: var(--dim); border: 0;
+                      padding: 4px 9px; font: inherit; font-size: 12px; line-height: 1.4;
+                      cursor: pointer; }
+  .theme-seg button:hover { color: var(--text); }
+  .theme-seg button.on { background: var(--accent); color: var(--accent-contrast);
+                         font-weight: 600; }
+  .theme-seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   /* Sticky tab bar — same parking trick as admin.html: top is the measured
      header height, z-index below the header (5) and the error strip (9). */
   nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px 0; background: var(--panel);
@@ -192,7 +235,13 @@
   <input id="tlkey" type="password" placeholder="Team leader key" aria-label="Team leader key" autocomplete="off">
   <button id="connect" class="btn">Connect</button>
   <span id="conn" class="muted"></span>
-  <button id="theme" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  <!-- Auto follows the OS; Light/Dark pin and are remembered. The #theme id is
+       the shared anchor the other two consoles use — keep it. -->
+  <div class="theme-seg" id="theme" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <nav>
   <button data-tab="keys" class="active">Keys</button>
@@ -405,13 +454,39 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 
-// Same theme key as admin.html — a leader and an admin on one machine see
-// one consistent look across both consoles.
+// ---- theme: Auto (default) / Light / Dark -------------------------------
+// Auto follows the OS live through the CSS media query; Light and Dark pin. Same
+// theme key as admin.html and index.html — a leader and an admin on one machine
+// see one consistent look across all three consoles, and a saved Light/Dark
+// choice from the old two-state toggle keeps working.
 const THEME_KEY = 'pcai-llm-theme';
-const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
-applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
-$('theme').onclick = () => { const n = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  store.set(THEME_KEY, n); applyTheme(n); };
+// Auto is a real state (not "no choice"), so the control always shows which of
+// the three is in force.
+function markThemeButtons(t) {
+  for (const b of document.querySelectorAll('[data-theme-btn]')) {
+    const on = b.getAttribute('data-theme-btn') === t;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+function applyTheme(t) {
+  if (t !== 'light' && t !== 'dark') t = 'auto';
+  document.documentElement.dataset.theme = t;
+  store.set(THEME_KEY, t);
+  markThemeButtons(t);
+}
+applyTheme(store.get(THEME_KEY) || 'auto');
+for (const b of document.querySelectorAll('[data-theme-btn]')) {
+  b.addEventListener('click', () => applyTheme(b.getAttribute('data-theme-btn')));
+}
+// In Auto the palette follows the OS without JS; re-mark the control when the OS
+// flips so it stays truthful if anything else rewrote the attribute.
+try {
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (document.documentElement.dataset.theme !== 'auto') return;
+    markThemeButtons('auto');
+  });
+} catch (e) {}
 
 const KEY_STORE = 'pcai_team_leader_key';
 const key = () => $('tlkey').value.trim();

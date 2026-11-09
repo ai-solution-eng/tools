@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.deployment.name }}-store
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-store
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  # Stable pod identity: each replica keeps its own PVC across restarts and
+  # reschedules, which is the point of the capacity tier.
+  serviceName: {{ .Values.deployment.name }}-store-headless
+  replicas: {{ .Values.store.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.name }}-store
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.name }}-store
+        hpe-ezua/type: vendor-service
+        hpe-ezua/app: {{ .Chart.Name }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if eq .Values.store.podAntiAffinity "soft" }}
+      # Spread the pool across nodes without making a 3-replica pool unschedulable
+      # on a 2-node cluster.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: {{ .Values.deployment.name }}-store
+      {{- end }}
+      containers:
+        - name: store
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if eq .Values.store.protocol "rdma" }}
+          # The segment is mlocked and registered with the NIC. CAP_IPC_LOCK lifts
+          # RLIMIT_MEMLOCK, which Kubernetes cannot set per container.
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          {{- end }}
+          command: ["python", "-m", "mooncake.mooncake_store_service", "--port={{ .Values.master.metadataPort }}"]
+          {{- if .Values.store.persistence.enabled }}
+          # The store service reads its own config; SGLang's MOONCAKE_* env
+          # names do nothing here. -D is the only supported override for the
+          # SSD tier. Requires master.enableOffload=true.
+          args:
+            - "-Denable_ssd_offload=true"
+            - "-Dssd_offload_path={{ .Values.store.persistence.mountPath }}"
+          {{- end }}
+          env:
+            # Store pods are passive Mooncake clients: they hold a segment and
+            # never issue Get/Put of their own.
+            # Plain host:port, NOT a URL. The store service parses this as the
+            # master RPC address; anything with a scheme is read as an HA backend
+            # connstring and rejected ("Invalid HA backend entry") -> crash loop.
+            # Upstream RBG KEP-74 writes http://... here; it does not work on 0.3.14.
+            - name: MOONCAKE_MASTER
+              value: "{{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.master.rpcPort }}"
+            - name: MOONCAKE_TE_META_DATA_SERVER
+              value: "http://{{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.master.metadataPort }}/metadata"
+            - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+              value: "{{ .Values.store.segmentSize }}"
+            - name: MOONCAKE_LOCAL_BUFFER_SIZE
+              value: "{{ .Values.store.localBufferSize }}"
+            - name: MOONCAKE_PROTOCOL
+              value: "{{ .Values.store.protocol }}"
+            - name: MOONCAKE_LOCAL_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MOONCAKE_HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if .Values.master.metadata.existingSecret }}
+            - name: MC_METADATA_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.master.metadata.existingSecret }}
+                  key: {{ .Values.master.metadata.existingSecretKey }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.master.metadataPort }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          {{- $res := deepCopy .Values.store.resources }}
+          {{- if and (eq .Values.store.protocol "rdma") .Values.store.rdma.deviceResource }}
+          {{- $limits := default (dict) (index $res "limits") }}
+          {{- $_ := set $limits .Values.store.rdma.deviceResource "1" }}
+          {{- $_ := set $res "limits" $limits }}
+          {{- end }}
+          resources:
+            {{- toYaml $res | nindent 12 }}
+          {{- if or .Values.store.persistence.enabled (and (eq .Values.store.protocol "rdma") .Values.store.rdma.infinibandHostPath) }}
+          volumeMounts:
+            {{- if .Values.store.persistence.enabled }}
+            - name: ssd
+              mountPath: {{ .Values.store.persistence.mountPath }}
+            {{- end }}
+            {{- if and (eq .Values.store.protocol "rdma") .Values.store.rdma.infinibandHostPath }}
+            # The resource request only allocates a device; the character
+            # devices are what open the HCA. Without this the store has no
+            # RDMA and silently falls back to TCP.
+            - name: infiniband
+              mountPath: /dev/infiniband
+            {{- end }}
+          {{- end }}
+      {{- if and (eq .Values.store.protocol "rdma") .Values.store.rdma.infinibandHostPath }}
+      volumes:
+        - name: infiniband
+          hostPath:
+            path: {{ .Values.store.rdma.infinibandHostPath }}
+      {{- end }}
+  {{- if .Values.store.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: ssd
+        labels:
+          app: {{ .Values.deployment.name }}-store
+          hpe-ezua/type: vendor-service
+          hpe-ezua/app: {{ .Chart.Name }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.store.persistence.accessModes | nindent 10 }}
+        {{- if .Values.store.persistence.storageClassName }}
+        storageClassName: {{ .Values.store.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.store.persistence.size }}
+  {{- end }}

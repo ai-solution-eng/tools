@@ -1,0 +1,38 @@
+mooncake is deployed in namespace {{ .Release.Namespace }}.
+
+  master (control plane):  {{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local
+    RPC       : {{ .Values.master.rpcPort }}   <- clients set MOONCAKE_MASTER=...:{{ .Values.master.rpcPort }}
+    metadata  : {{ .Values.master.metadataPort }}   <- MOONCAKE_TE_META_DATA_SERVER=http://...:{{ .Values.master.metadataPort }}/metadata
+    metrics   : {{ .Values.master.metricsPort }}   <- /metrics/summary, /health, /get_all_segments
+
+  store pool: {{ .Values.store.replicaCount }} x {{ .Values.store.segmentSize }} (protocol {{ .Values.store.protocol }})
+
+{{- if .Values.ui.enabled }}
+  dashboard : http://{{ .Values.deployment.name }}-ui.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ui.service.port }}
+  {{- if .Values.ezua.enabled }}
+  public    : https://{{ .Values.ezua.virtualService.endpoint | replace "${DOMAIN_NAME}" .Values.ezua.domainName }}
+  {{- end }}
+{{- end }}
+
+Point a model deployment at the store (see DEPLOYMENT.md):
+
+  env:
+    - name: MOONCAKE_MASTER
+      value: "{{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.master.rpcPort }}"
+    - name: MOONCAKE_TE_META_DATA_SERVER
+      value: "http://{{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.master.metadataPort }}/metadata"
+    - name: MOONCAKE_PROTOCOL
+      value: "{{ .Values.store.protocol }}"
+    - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+      value: "0"
+    - name: MOONCAKE_CHECK_SERVER
+      value: "1"
+    - name: MOONCAKE_LOCAL_HOSTNAME
+      valueFrom: {fieldRef: {fieldPath: status.podIP}}
+    - name: MOONCAKE_HOST_ID
+      valueFrom: {fieldRef: {fieldPath: nodeName}}
+  args:
+    - --hicache-storage-backend
+    - mooncake
+    - --hicache-storage-prefetch-policy
+    - timeout

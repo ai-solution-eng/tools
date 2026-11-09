@@ -1,0 +1,45 @@
+{{- if and .Values.ui.enabled .Values.ui.rbac.create }}
+{{- $namespaces := uniq (concat (list .Release.Namespace) .Values.ui.discovery.namespaces) }}
+{{- $sa := .Values.ui.serviceAccount.name | default (printf "%s-ui" .Values.deployment.name) }}
+{{- range $namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $.Values.deployment.name }}-ui-reader
+  namespace: {{ . }}
+  labels:
+    app: {{ $.Values.deployment.name }}-ui
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ $.Chart.Name }}
+rules:
+  # Read-only pod discovery: the dashboard finds Mooncake clients by looking
+  # for pods that carry a MOONCAKE_MASTER env var, then scrapes their /metrics.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # PVC claims are the only honest denominator for the disk tier: the master
+  # reports its own figure (6.00 TB against three 350Gi claims). Read-only.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Values.deployment.name }}-ui-reader
+  namespace: {{ . }}
+  labels:
+    app: {{ $.Values.deployment.name }}-ui
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ $.Chart.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $.Values.deployment.name }}-ui-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
