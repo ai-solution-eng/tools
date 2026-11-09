@@ -191,6 +191,90 @@ def entry_hicache(entry: dict) -> bool:
     return False
 
 
+def entry_hicache_storage_backend(entry: dict) -> str:
+    """L3 (storage) backend named by --hicache-storage-backend, or "".
+
+    HiCache L2 lives in host memory and needs no L3 backend at all, so this is
+    deliberately separate from entry_hicache(): the backend is what tells two
+    otherwise identical HiCache configurations apart (kernel/CPU pool vs the
+    shared Mooncake store).
+    """
+    args = [str(arg).strip() for arg in entry.get("arguments") or []]
+    for i, arg in enumerate(args):
+        lowered = arg.lower()
+        if lowered == "--hicache-storage-backend" and i + 1 < len(args):
+            return args[i + 1].lower()
+        if lowered.startswith("--hicache-storage-backend="):
+            return arg.split("=", 1)[1].strip().lower()
+    return ""
+
+
+def entry_mooncake(entry: dict) -> bool:
+    """True when the HiCache L3 tier is the Mooncake store.
+
+    Either signal is enough: the storage-backend argument is what SGLang
+    actually reads, and the MOONCAKE_* client environment is what a hand-added
+    entry (or an entry copied from a live ISVC) is likely to carry.
+    """
+    if entry_hicache_storage_backend(entry) == "mooncake":
+        return True
+    # An env-only signal is trusted only when HiCache is actually enabled:
+    # MOONCAKE_* vars on an entry with no hierarchical cache are inert, and
+    # labelling that entry "Mooncake" (plus the RDMA caveat) would be a lie.
+    if not entry_hicache(entry):
+        return False
+    environment = entry.get("environment") or {}
+    return any(str(key).upper().startswith("MOONCAKE_") for key in environment)
+
+
+# Catalog-only caveat attached to Mooncake configurations.  DERIVED, never
+# stored: the seed merge only ADDS entries, so a caveat authored into
+# seed_catalog.json would never reach a catalog that already holds the entry --
+# and it would ride into the Push-to-MLIS payload.  Deriving it from the
+# arguments makes it appear for existing catalogs and keeps the pushed config
+# byte-identical to what the user authored.
+MOONCAKE_RDMA_CAVEAT: dict = {
+    "id": "mooncake-rdma",
+    "chip": "RDMA setup",
+    "title": "Mooncake needs a patch script for RDMA",
+    "body": (
+        "The catalog cannot express an RDMA client: the serving pod needs "
+        "/dev/infiniband, IPC_LOCK and its own MOONCAKE_LOCAL_HOSTNAME/HOST_ID. "
+        "Run scripts/patch-model-mooncake.sh against the deployed ISVC before "
+        "you rely on the L3 tier. Without it Mooncake runs over TCP "
+        "(MOONCAKE_PROTOCOL=tcp): functional, but not zero-copy -- and it "
+        "falls back silently."
+    ),
+    "commands": [
+        {
+            "label": "enable RDMA",
+            "command": "scripts/patch-model-mooncake.sh --isvc <isvc> --protocol rdma",
+        },
+        {
+            "label": "verify transport",
+            "command": ('kubectl -n mooncake logs mooncake-store-0 | grep -iE "tcp_transport|memcpy|infiniband"'),
+        },
+    ],
+}
+
+
+def entry_caveats(entry: dict) -> list[dict]:
+    """Operational caveats the UI shows for a configuration (never pushed).
+
+    A caveat is something the catalog cannot express in the config itself, so
+    the user has to do it by hand after deploy.  Returned as a copy so callers
+    cannot mutate the module constant.
+    """
+    if not entry_mooncake(entry):
+        return []
+    return [
+        dict(
+            MOONCAKE_RDMA_CAVEAT,
+            commands=[dict(command) for command in MOONCAKE_RDMA_CAVEAT["commands"]],
+        )
+    ]
+
+
 def entry_shared_gpu(entry: dict) -> bool:
     """True when the config is meant to share a GPU with other models."""
     tags = str((entry.get("metadata") or {}).get("tags") or "").lower()
@@ -236,8 +320,9 @@ def config_label(entry: dict, *, with_publisher: bool = False) -> str:
     """Compact one-line label for a configuration leaf.
 
     Carries the dimensions a user actually chooses between -- GPU class,
-    serving framework, quantization, GPU count, HiCache, shared-GPU -- so two
-    leaves under one model node are distinguishable without opening either.
+    serving framework, quantization, GPU count, HiCache, its L3 backend
+    (Mooncake), shared-GPU -- so two leaves under one model node are
+    distinguishable without opening either.
     """
     tier = str(entry.get("tier") or "")
     parts = [TIER_LABELS.get(tier, tier or "\u2014"), entry_framework(entry)]
@@ -247,6 +332,11 @@ def config_label(entry: dict, *, with_publisher: bool = False) -> str:
     parts.append(entry_gpus(entry) + " GPU")
     if entry_hicache(entry):
         parts.append("HiCache")
+    # L3 tier: without it a Mooncake config and the L2-only config it was
+    # cloned from render the same label, and the user cannot tell which one
+    # carries the RDMA caveat.
+    if entry_mooncake(entry):
+        parts.append("Mooncake")
     if entry_shared_gpu(entry):
         parts.append("Shared")
     if with_publisher:
@@ -435,6 +525,8 @@ class Catalog:
                     "framework": entry_framework(entry),
                     "quant": entry_quant(entry),
                     "hicache": entry_hicache(entry),
+                    "mooncake": entry_mooncake(entry),
+                    "caveats": entry_caveats(entry),
                     "shared_gpu": entry_shared_gpu(entry),
                     "gpus": entry_gpus(entry),
                     "publisher": entry_publisher(entry),

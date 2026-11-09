@@ -395,8 +395,10 @@ def test_default_project_is_applied_before_the_fingerprint():
     """
     svc = _db_service("project-user-x")
     effective = svc._with_default_project(_cfg())
-    assert effective["project"] == "project-user-x"
-    cur = FakeCursor({"Qwen3.8-27B-vllm-FP8": [_db_row(version=1, project="project-user-x")]})
+    # The default is a NAMESPACE; MLIS files by project name, so the project-
+    # prefix is stripped before it reaches the row or the fingerprint.
+    assert effective["project"] == "user-x"
+    cur = FakeCursor({"Qwen3.8-27B-vllm-FP8": [_db_row(version=1, project="user-x")]})
     res = svc._push_one(cur, effective)
     assert res["status"] == "skipped"
     assert cur.inserts == []
@@ -407,12 +409,12 @@ def test_default_project_is_what_reaches_the_insert():
     svc = _db_service("project-user-x")
     cur = FakeCursor({})
     svc._push_one(cur, svc._with_default_project(_cfg()))
-    assert cur.inserts[0][db.COLUMNS.index("project")] == "project-user-x"
+    assert cur.inserts[0][db.COLUMNS.index("project")] == "user-x"
 
 
 def test_default_project_does_not_override_an_explicit_project():
     svc = _db_service("project-user-x")
-    assert svc._with_default_project(_cfg(project="project-user-y"))["project"] == "project-user-y"
+    assert svc._with_default_project(_cfg(project="project-user-y"))["project"] == "user-y"
 
 
 def test_empty_default_project_leaves_the_config_alone():
@@ -440,16 +442,27 @@ def test_push_sync_applies_the_default_project_end_to_end(monkeypatch):
     results = svc._push_sync([_cfg()], "password")
 
     assert results[0]["status"] == "pushed"
-    assert cur.inserts[0][db.COLUMNS.index("project")] == "project-user-x"
+    assert cur.inserts[0][db.COLUMNS.index("project")] == "user-x"
     assert conn.closed is True
 
 
 # ---- the project field ----
 
 
-@pytest.mark.parametrize("value", ["", "   ", "project-user-andrew-bydlon", "default", "a1-b2"])
-def test_normalize_project_accepts_namespace_names(value):
-    assert normalize_project(value) == value.strip()
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("", ""),
+        ("   ", ""),
+        # A PCAI namespace is accepted, but MLIS stores the PROJECT name.
+        ("project-user-andrew-bydlon", "user-andrew-bydlon"),
+        ("user-andrew-bydlon", "user-andrew-bydlon"),
+        ("default", "default"),
+        ("a1-b2", "a1-b2"),
+    ],
+)
+def test_normalize_project_accepts_namespace_names(value, expected):
+    assert normalize_project(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -470,23 +483,32 @@ def test_resolve_project_precedence():
     assert resolve_project({"project": "   "}, "", "default") == "default"
 
 
+def test_resolve_project_strips_the_pcai_namespace_prefix_from_every_source():
+    """The namespace/project spelling must not change the stored value."""
+    assert resolve_project({"project": "project-user-x"}) == "user-x"
+    assert resolve_project({}, "project-user-x") == "user-x"
+    assert resolve_project({}, "", "project-user-x") == "user-x"
+    # Already-canonical values pass through untouched.
+    assert resolve_project({"project": "user-x"}, "project-user-y", "project-user-z") == "user-x"
+
+
 def test_push_one_inserts_the_project_picked_for_the_push():
     db = _import_db()
     svc = _db_service("")
     cur = FakeCursor({})
     svc._push_one(cur, svc._with_default_project(_cfg(), "project-user-x"))
-    assert cur.inserts[0][db.COLUMNS.index("project")] == "project-user-x"
+    assert cur.inserts[0][db.COLUMNS.index("project")] == "user-x"
 
 
 def test_per_push_project_wins_over_the_chart_default():
     svc = _db_service("project-user-default")
-    assert svc._with_default_project(_cfg(), "project-user-picked")["project"] == "project-user-picked"
+    assert svc._with_default_project(_cfg(), "project-user-picked")["project"] == "user-picked"
 
 
 def test_entry_project_wins_over_the_per_push_project():
     svc = _db_service("project-user-default")
     effective = svc._with_default_project(_cfg(project="project-user-entry"), "project-user-picked")
-    assert effective["project"] == "project-user-entry"
+    assert effective["project"] == "user-entry"
 
 
 def test_push_sync_threads_the_per_push_project(monkeypatch):
@@ -499,7 +521,7 @@ def test_push_sync_threads_the_per_push_project(monkeypatch):
     results = svc._push_sync([_cfg()], "password", "project-user-x")
 
     assert results[0]["status"] == "pushed"
-    assert cur.inserts[0][db.COLUMNS.index("project")] == "project-user-x"
+    assert cur.inserts[0][db.COLUMNS.index("project")] == "user-x"
 
 
 def test_push_one_rejects_a_config_without_a_name_or_image():

@@ -70,9 +70,9 @@ CATALOG_PATH = os.environ.get("CATALOG_PATH", "/mnt/catalog/catalog.json")
 # Project recorded on a pushed packaged model that names none (chart:
 # catalog.defaultProject).  Empty = leave it blank, the historical behaviour.
 # The target is MLIS's "project" filter: rows with an empty project only show
-# under "All projects".  PCAI projects are namespaces, so this is normally a
-# project-user-* namespace -- verify the exact string MLIS filters on with one
-# push before rolling it out.
+# under "All projects".  The value is a project NAME: a PCAI project-* namespace
+# is accepted and its project- prefix is stripped before the push (see
+# versioning.strip_project_prefix).
 CATALOG_DEFAULT_PROJECT = os.environ.get("CATALOG_DEFAULT_PROJECT", "").strip()
 # "Refresh from GitHub" button: raw URL of the catalog JSON on GitHub
 # (e.g. https://raw.githubusercontent.com/<org>/<repo>/<branch>/seed_catalog.json).
@@ -901,10 +901,11 @@ async def push_models(req: Request, project: str = ""):
     landed as and whether that version was bumped.
 
     The optional "project" query parameter files the pushed models under that
-    project (the UI sends the namespace picked next to the push button).  It
-    only fills in configs that name no project of their own; a config's own
-    project always wins, and the chart default (catalog.defaultProject) applies
-    when neither is set.
+    project (the UI sends the namespace picked next to the push button; the
+    PCAI "project-" namespace prefix is stripped, because MLIS files by project
+    name).  It only fills in configs that name no project of their own; a
+    config's own project always wins, and the chart default
+    (catalog.defaultProject) applies when neither is set.
     """
     try:
         project = normalize_project(project)
