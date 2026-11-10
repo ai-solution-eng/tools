@@ -535,3 +535,38 @@ async def test_no_event_loop_task_is_created_when_disabled(fake: FakeClient) -> 
     tracing.start_span("GET /health").end()
     assert tracing._PENDING == set()
     assert fake.calls == []
+
+
+async def test_mcp_call_tool_emits_a_span(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeClient
+) -> None:
+    """Every /mcp tools/call produces exactly one span — even when it fails.
+
+    /mcp is the surface the harnesses call DIRECTLY, and it carries far more
+    traffic than the relay path (488 tools/call requests vs 56 model calls in
+    one measured window). Without a span here the bulk of MCP usage is
+    invisible to any backend.
+
+    The failure path is deliberate: it exercises the finally block that has to
+    fire on errors and cancellation, and pins that the span records
+    tool.status="error" rather than being lost.
+    """
+    from pcai_llm.api import routes_mcp
+
+    _enable(monkeypatch)
+    server = routes_mcp._new_gateway_server()
+
+    with pytest.raises(Exception):
+        await server.call_tool("definitely-not-a-tool", {})
+
+    await tracing.flush()
+    assert len(fake.calls) == 1, "exactly one span per tools/call"
+    span = fake.span()
+    assert span["name"] == "definitely-not-a-tool", "named after the tool called"
+    by_key = {a["key"]: a["value"] for a in span["attributes"]}
+    assert by_key["mcp.tool"] == {"stringValue": "definitely-not-a-tool"}
+    assert by_key["mcp.surface"] == {"stringValue": "mcp"}
+    assert by_key["tool.status"] == {"stringValue": "error"}
+    assert by_key["langfuse.trace.name"] == {"stringValue": "tool"}
+    # No arguments and no result content may reach a backend.
+    assert not any(k.startswith("tool.arg") or k.startswith("tool.result") for k in by_key)
