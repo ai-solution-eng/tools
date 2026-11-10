@@ -524,6 +524,18 @@ settings:
 
   # OpenTelemetry tracing: one server span per HTTP request, exported as OTLP/HTTP
   # JSON to {otelEndpoint}/v1/traces. Off = no span object, no task, no client.
+  #
+  # ⚠️ THESE ARE CHART DEFAULTS, NOT SITE CONFIG. Leaving tracing off here is
+  # correct for a portable chart — most sites have no collector. But it means a
+  # site that WANTS tracing must set it in its own values document
+  # (helm/values-examples/values.<site>.yaml, pasted into PCAI Configure), not
+  # here. An install/upgrade that starts from chart defaults silently disables
+  # tracing: 2026-11-10, the v4.0.1 rollout reset otelEnabled to false and the
+  # fleet emitted nothing for an hour before anyone noticed.
+  #
+  # The placeholder endpoint below does NOT resolve — a real site must point at
+  # the full in-cluster name, e.g.
+  #   http://otel-collector.otel-traces.svc.cluster.local:4318
   otelEnabled: false
   otelEndpoint: http://otel-collector:4318
   otelServiceName: pcai-llm-gateway
