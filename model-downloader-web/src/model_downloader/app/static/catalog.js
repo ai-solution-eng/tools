@@ -86,8 +86,13 @@ function configMatches(cfg, q) {
   // notes carries the long-form operational detail that no longer fits in the
   // MLIS-facing description; it stays searchable so "mem-fraction", a flag name
   // or a bug number still finds the configuration it belongs to.
+  // A caveat is searchable too: "rdma" or "patch-model-mooncake" finds the
+  // configuration whose deployment needs the manual step.
+  const caveatBlob = (cfg.caveats || []).map(c => [
+    c.chip, c.title, c.body, (c.commands || []).map(cmd => cmd.command).join(' '),
+  ].join(' ')).join(' ');
   const blob = [
-    cfg.label, cfg.framework, cfg.quant, cfg.publisher, cfg.model_id,
+    cfg.label, cfg.framework, cfg.quant, cfg.publisher, cfg.model_id, caveatBlob,
     e.name, e.image, e.description, e.notes, e.tier, e.model_format,
     (e.metadata && e.metadata.tags) || '',
   ].join(' ').toLowerCase();
@@ -196,6 +201,9 @@ function configLabelHtml(cfg) {
     if (part === 'HiCache') {
       return '<span class="cfg-emph cfg-emph-cache" title="Hierarchical cache enabled in the serving args">' + esc(part) + '</span>';
     }
+    if (part === 'Mooncake') {
+      return '<span class="cfg-emph cfg-emph-mooncake" title="HiCache L3 tier on the shared Mooncake store -- RDMA needs the setup note on this row">Mooncake</span>';
+    }
     if (part === 'Shared') {
       return '<span class="cfg-emph cfg-emph-shared" title="Runs on a shared GPU">Shared GPU</span>';
     }
@@ -204,16 +212,29 @@ function configLabelHtml(cfg) {
 }
 
 // One configuration leaf: select box, label, and the actions that were
-// previously table-row buttons (details / download / delete).
+// previously table-row buttons (details / download / delete).  A configuration
+// whose deployment needs a manual step (Mooncake RDMA) carries a caveat chip
+// that expands the note inline -- the catalog cannot express the step, but the
+// user must not discover it only after deploying.
 function buildConfigRow(cfg) {
   const e = cfg.entry;
+  const caveats = cfg.caveats || [];
+
   const row = document.createElement('div');
   row.className = 'tree-config';
+
+  const caveatChip = caveats.length
+    ? '<button type="button" class="caveat-btn" aria-expanded="false"' +
+        ' title="Deployment caveat -- click for the manual step">' +
+        '\u26a0 ' + esc(caveats.length > 1 ? caveats.length + ' caveats' : caveats[0].chip) +
+      '</button>'
+    : '';
 
   row.innerHTML =
     '<label class="tree-config-select"><input type="checkbox" data-catalog-id="' + esc(e.catalog_id) +
       '" data-tier="' + esc(e.tier || '') + '"></label>' +
     '<span class="tree-config-label">' + configLabelHtml(cfg) + '</span>' +
+    caveatChip +
     '<span class="tree-config-id">' + esc(cfg.model_id || '') + '</span>' +
     '<span class="tree-config-actions">' +
       '<button type="button" class="action-btn details-btn" data-details="' + esc(e.catalog_id) + '">Config</button>' +
@@ -229,7 +250,37 @@ function buildConfigRow(cfg) {
   row.querySelector('[data-del]').addEventListener('click', () => deleteCatalogEntry(e.catalog_id, e.name));
   const box = row.querySelector('input[data-catalog-id]');
   box.addEventListener('change', updateSelectionCount);
-  return row;
+
+  if (caveats.length === 0) return row;
+
+  // The note sits under the whole row, so the row is WRAPPED rather than
+  // restyled: the flex row keeps its layout and the panel gets its own line.
+  const block = document.createElement('div');
+  block.className = 'tree-config-block';
+
+  const panel = document.createElement('div');
+  panel.className = 'tree-config-caveat';
+  panel.id = 'caveat-' + e.catalog_id;
+  panel.hidden = true;
+  panel.innerHTML = caveats.map(c => {
+    const commands = (c.commands || []).map(cmd =>
+      '<li><span class="caveat-cmd-label">' + esc(cmd.label) + '</span>' +
+      '<code>' + esc(cmd.command) + '</code></li>').join('');
+    return '<p class="caveat-title">' + esc(c.title) + '</p>' +
+      '<p class="caveat-body">' + esc(c.body) + '</p>' +
+      (commands ? '<ul class="caveat-commands">' + commands + '</ul>' : '');
+  }).join('');
+
+  const chipBtn = row.querySelector('.caveat-btn');
+  chipBtn.setAttribute('aria-controls', panel.id);
+  chipBtn.addEventListener('click', () => {
+    panel.hidden = !panel.hidden;
+    chipBtn.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
+  });
+
+  block.appendChild(row);
+  block.appendChild(panel);
+  return block;
 }
 
 // Lab-level "all" checkbox + per-node open/close bookkeeping.
@@ -411,6 +462,18 @@ function parseJsonSafe(text, fallback) {
 const projectInput = document.getElementById('push-project-input');
 const projectToggle = document.getElementById('push-project-toggle');
 const projectMenu = document.getElementById('push-project-menu');
+const projectEffective = document.getElementById('push-project-effective');
+
+// PCAI namespaces are project-<name>, but MLIS files a model by project NAME:
+// the server strips the prefix (versioning.strip_project_prefix).  Show the
+// value that will actually be pushed so the field cannot surprise anyone.
+function updateProjectEffective() {
+  if (!projectEffective) return;
+  const raw = ((projectInput && projectInput.value) || '').trim();
+  const stripped = raw.startsWith('project-') ? raw.slice('project-'.length) : '';
+  projectEffective.hidden = !stripped;
+  projectEffective.textContent = stripped ? '\u2192 pushes as ' + stripped : '';
+}
 let knownNamespaces = null;
 let namespacesPending = false;
 
@@ -453,6 +516,7 @@ async function showProjectMenu() {
       item.addEventListener('click', () => {
         projectInput.value = ns;
         projectMenu.hidden = true;
+        updateProjectEffective();
       });
       projectMenu.appendChild(item);
     }
@@ -467,6 +531,7 @@ if (projectInput && projectToggle && projectMenu) {
   });
   projectInput.addEventListener('focus', () => showProjectMenu());
   projectInput.addEventListener('input', () => {
+    updateProjectEffective();
     if (knownNamespaces !== null) showProjectMenu();
   });
   projectInput.addEventListener('keydown', (e) => {
@@ -475,6 +540,7 @@ if (projectInput && projectToggle && projectMenu) {
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.push-project')) projectMenu.hidden = true;
   });
+  updateProjectEffective();
 }
 
 // The project to send with this push ('' = leave it to the config/chart

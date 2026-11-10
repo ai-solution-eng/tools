@@ -216,6 +216,20 @@ class Settings(BaseSettings):
     session_affinity_enabled: bool = False
     session_affinity_ttl_s: int = 3600
 
+    # --- model groups (load-balanced sets of equivalent models) ------------
+    # A named group is a route target whose MEMBER is chosen by live load
+    # (power-of-two over queue depth, then KV%), then the conversation is
+    # pinned to that member (grp: scope) and to one of its endpoints (ep:
+    # scope). Off = groups are inert: a group name is not registered, the
+    # admin API still stores them, and routing is byte-identical.
+    model_groups_enabled: bool = False
+    # How often the background load snapshot refreshes from Prometheus.
+    # NEVER queried on the request path: the pick reads the in-memory view.
+    model_group_load_refresh_s: float = 5.0
+    # A snapshot older than this is treated as "no data" -> weighted random
+    # fallback (a Prometheus outage must never stop model selection).
+    model_group_load_stale_s: float = 30.0
+
     # --- audio passthrough billing heuristics ------------------------------
     # TTS/ASR report no token usage, but a route that settles zero tokens is a
     # budget bypass. Bill an ESTIMATE instead: TTS by characters (4 chars ~
@@ -615,6 +629,17 @@ class Settings(BaseSettings):
     # global average ~22%, enter threshold 20%).
     offpeak_model_promql: dict[str, str] = Field(default_factory=dict)
 
+    # Optional disk-occupancy source for the KV cache's L3 tier. The inference
+    # engine exports NO storage-occupancy gauge (activity counters only), so
+    # the admin console's all-models cache summary reads the VOLUME metrics
+    # instead: a PromQL label selector over kubelet_volume_stats_* naming the
+    # volumes backing the L3 store (e.g. the Mooncake SSD offload PVCs:
+    # 'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"').
+    # Empty = no disk occupancy section (the summary still shows L3
+    # activity/status). Two extra PromQL calls per snapshot ONLY when set; a
+    # failed/empty query reads "unknown", never 0%.
+    endpoint_metrics_disk_selector: str = ""
+
     # --- load-aware cascade head (auto entry, off-peak-driven) ---
     # The `auto` cascade entry picks its HEAD model by live off-peak state
     # at conversation START and the choice is STICKY for the conversation
@@ -718,6 +743,14 @@ class Settings(BaseSettings):
     # routing never silently changes what an existing client's request does.
     # The explicit routing / routing__X names always route regardless.
     route_default_model: bool = False
+    # AGENTS AS ROUTING CANDIDATES (2026-11-08). An agent is a hard model — a
+    # tool surface + a pinned model (or the profile cascade) — so the router
+    # may select one when this is ON: the key's OFFERED agents join the
+    # candidate window, and a pick applies the agent's tool surface + system
+    # prompt for the whole turn (safe because routing happens BEFORE the
+    # request is prepared). Default OFF — it changes what the router can
+    # choose; flip it per site.
+    routing_agents_enabled: bool = False
     # Complexity cut points, in estimated tokens, on the request score that
     # maps to a position on the profile's cheap-first ladder: score < tier1
     # serves the cheapest ladder model (>= routing_min_model floor), score

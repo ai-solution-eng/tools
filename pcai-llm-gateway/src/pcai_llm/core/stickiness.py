@@ -38,6 +38,10 @@ model name. Same discipline: the raw fingerprint is identical across features,
 so the prefix is the ONLY thing keeping the three from reading each other's
 rows; every ep: writer/reader goes through the endpoint helpers below, which
 apply the scope internally so callers can never mix it up with a model row.
+A FOURTH scope, grp: (model groups), pins a conversation to the MEMBER its
+group resolved to — the model column holds a MODEL NAME, so it must never
+share a row with the cascade head or the routing floor either. Same
+discipline: the group helpers below own the prefix.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ _PENDING_MAX = 1024
 # never read each other's rows. See the module docstring's NAMESPACING note.
 SCOPE_ROUTING = "routing:"
 SCOPE_ENDPOINT = "ep:"
+SCOPE_GROUP = "grp:"
 
 
 def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
@@ -234,6 +239,71 @@ async def drop_endpoint_pin(key_id: uuid.UUID, session: str | None) -> None:
     rejects it anyway.
     """
     await drop_sticky(key_id, scoped_thread_key(session, SCOPE_ENDPOINT))
+
+
+# ---------------------------------------------------------------------------
+# Group pins (model groups) — the grp: scope
+# ---------------------------------------------------------------------------
+#
+# A group request resolves to a MEMBER; the conversation stays on that member
+# so the next turn does not re-roll the load pick. Re-picking per turn would
+# defeat the point of a conversation: the member's KV cache would go cold on
+# every turn. The pin is ROUTING state, never policy: the caller re-validates
+# the stored member against the LIVE registry, the group's membership and the
+# key's ACL on every read, and drops it when it no longer qualifies — the
+# same discipline as the ep: pin.
+#
+# TTL: same contract as the ep: helper -- the CALLER owns the lease and the age
+# comes from the row's updated_at, so an idle conversation's pin expires on its
+# own. Both pins describe one conversation, so the routes layer passes the same
+# settings.session_affinity_ttl_s it passes the endpoint pin.
+
+
+async def get_group_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
+    """The conversation's pinned group MEMBER, or None.
+
+    ``session`` is the RAW affinity key (X-PCAI-Session or the conversation
+    fingerprint); the grp: scope is applied HERE, exactly like the ep:
+    helpers, so a caller can never address the cascade head's row by mistake.
+    The TTL rides the row's updated_at: a pin older than the lease is expired
+    — dropped, so it cannot outlive it — and reads as absent. ttl_s <= 0
+    disables the expiry (the housekeeping retention sweep still applies).
+
+    NEVER raises (module contract): any fault reads as "no pin", and the
+    group re-picks by load — a stickiness outage must never change the
+    response shape.
+    """
+    tk = scoped_thread_key(session, SCOPE_GROUP)
+    if not tk:
+        return None
+    row = await get_sticky_row(key_id, tk)
+    if row is None:
+        return None
+    pin, age = row
+    if ttl_s > 0 and age > ttl_s:
+        await drop_sticky(key_id, tk)
+        return None
+    return pin
+
+
+async def set_group_pin(key_id: uuid.UUID, session: str | None, member: str) -> None:
+    """Persist (or refresh) the conversation's group member pin.
+
+    Best-effort, never raises (set_sticky's contract): the call that produced
+    the pin already resolved, so a lost write costs one re-pick on the next
+    turn. A re-serve refreshes updated_at, which is also the TTL clock.
+    """
+    await set_sticky(key_id, scoped_thread_key(session, SCOPE_GROUP), member)
+
+
+async def drop_group_pin(key_id: uuid.UUID, session: str | None) -> None:
+    """Forget the group pin (member left the group, its pool is unhealthy).
+
+    Best-effort, never raises: the pin just proved stale, and leaving it in
+    place would only cost one ignored read before the caller's live
+    validation rejects it anyway.
+    """
+    await drop_sticky(key_id, scoped_thread_key(session, SCOPE_GROUP))
 
 
 def make_writer(key_id: uuid.UUID, thread_key: str | None, defer: bool = False) -> Callable[[str], Any] | None:

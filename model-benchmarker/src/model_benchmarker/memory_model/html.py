@@ -156,18 +156,42 @@ def collect_models(
 # ---------------------------------------------------------------------------
 
 TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
+<script>
+// Pre-paint theme resolver (invariant I2): saved choice > "auto" — auto follows
+// the OS live via the CSS prefers-color-scheme block. try/catch: blocked
+// storage throws in iframes/private mode.
+(function(){
+  var t = null;
+  try { t = localStorage.getItem('memcalc-theme'); } catch(e){}
+  if (t !== 'light' && t !== 'dark') t = 'auto';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <style>
-:root{
+:root,:root[data-theme="dark"]{
+  color-scheme:dark;
   --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#2d333b; --text:#e6edf3;
   --muted:#8b949e; --accent:#58a6ff; --good:#3fb950; --warn:#d29922; --bad:#f85149;
   --code:#0d1117; --chip:#21262d; --host:#a371f7;
 }
+/* Auto: follow the OS. Declarations are KEEP IN SYNC with the
+   html[data-theme="light"] block below (the contract checker compares them exactly). */
+@media (prefers-color-scheme: light){
+  html[data-theme="auto"]{
+    color-scheme:light;
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#f0f3f7; --border:#d0d7de; --text:#1f2328;
+    --muted:#59636e; --accent:#0969da; --good:#1a7f37; --warn:#9a6700; --bad:#cf222e;
+    --code:#f6f8fa; --chip:#eaeef2; --host:#8250df;
+  }
+}
+/* Explicit light: KEEP IN SYNC with the html[data-theme="auto"] block above. */
 html[data-theme="light"]{
+  color-scheme:light;
   --bg:#f6f8fa; --panel:#ffffff; --panel2:#f0f3f7; --border:#d0d7de; --text:#1f2328;
   --muted:#59636e; --accent:#0969da; --good:#1a7f37; --warn:#9a6700; --bad:#cf222e;
   --code:#f6f8fa; --chip:#eaeef2; --host:#8250df;
@@ -178,7 +202,11 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-syste
 header{padding:18px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
 header h1{margin:0;font-size:20px}
 header .sub{color:var(--muted);font-size:12px;margin-top:4px}
-button#btn-theme{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 12px;cursor:pointer}
+.theme-seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.theme-seg button{background:var(--panel);border:0;color:var(--muted);font:inherit;font-size:12.5px;padding:6px 12px;cursor:pointer}
+.theme-seg button+button{border-left:1px solid var(--border)}
+.theme-seg button:hover{color:var(--text)}
+.theme-seg button.on{background:var(--accent);color:var(--bg);font-weight:600}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-top:16px}
 .panel h2{margin:0 0 10px;font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
 .grid-ctrl{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
@@ -237,7 +265,11 @@ details.howto code{font-size:11px}
     <h1>__TITLE__</h1>
     <div class="sub">Generated __GENERATED__ &middot; validate a deployment before you submit it: does the model fit, how many KV tokens live in GPU memory and HiCache, how many concurrent requests does that support &middot; same math as <code>memory-estimate</code></div>
   </div>
-  <button id="btn-theme" title="Toggle light / dark mode">&#x2600;</button>
+  <div class="theme-seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <div class="wrap">
 
@@ -757,18 +789,27 @@ function wire(){
     f.text().then(t => { el('import-text').value = t; handleImport(); });
   });
 }
-// ---- light / dark ----
+// ---- theme: Auto (follows OS) / Light / Dark ----
 function applyTheme(t){
+  if (t!=='light' && t!=='dark') t = 'auto';
   document.documentElement.setAttribute('data-theme', t);
-  el('btn-theme').innerHTML = t==='light' ? '&#x1F319;' : '&#x2600;';
+  try { localStorage.setItem('memcalc-theme', t); } catch(e){}
+  document.querySelectorAll('[data-theme-btn]').forEach(b=>{
+    const on = b.getAttribute('data-theme-btn')===t;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 }
-function initTheme(){
-  let t; try { t = localStorage.getItem('memcalc-theme'); } catch(e){}
-  if (!t) t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-  applyTheme(t);
-  el('btn-theme').addEventListener('click', () => {
-    const next = document.documentElement.getAttribute('data-theme')==='light' ? 'dark' : 'light';
-    applyTheme(next); try { localStorage.setItem('memcalc-theme', next); } catch(e){}
+function initThemeControl(){
+  let saved;
+  try { saved = localStorage.getItem('memcalc-theme'); } catch(e){}
+  applyTheme(saved); // unset/other -> auto: the CSS media block follows the OS live
+  document.querySelectorAll('[data-theme-btn]').forEach(b=>{
+    b.addEventListener('click', () => {
+      const t = b.getAttribute('data-theme-btn');
+      if (t === document.documentElement.getAttribute('data-theme')) return;
+      applyTheme(t);
+    });
   });
 }
 
@@ -777,7 +818,7 @@ G.MemCalc = {GPU_DB, MODELS, resolveGpu, kvPerLayer, kvBytesPerToken, layerMix, 
 
 if (typeof document !== 'undefined' && document.getElementById) {
   fillStatic();
-  initTheme();
+  initThemeControl();
   syncModel();
   wire();
   render();

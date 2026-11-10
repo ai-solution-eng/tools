@@ -43,9 +43,9 @@ DEFAULT_WINDOW_S = 300
 MIN_WINDOW_S = 60
 MAX_WINDOW_S = 3600
 
-# Per-query timeout. The whole snapshot is 7 concurrent queries; a hung
-# prometheus must cost the panel, never a request (this route is read-only,
-# but it runs in the same process as the data plane).
+# Per-query timeout. The snapshot runs every QUERIES entry concurrently and
+# load_rows() runs 3; a hung prometheus must cost the panel, never a request
+# (this route is read-only, but it runs in the same process as the data plane).
 _QUERY_TIMEOUT_S = 10.0
 
 # {window} is substituted with e.g. "300s".
@@ -84,8 +84,16 @@ QUERIES: dict[str, str] = {
         'sum by (namespace, pod, instance, model_name) ({__name__=~"vllm:num_requests_waiting|sglang:num_queue_reqs"})'
     ),
     # Both are a 0..1 cache occupancy ratio: vLLM calls it kv_cache_usage_perc,
-    # SGLang calls it token_usage.
-    "kv_cache_pct": 'sum by (namespace, pod, instance) ({__name__=~"vllm:kv_cache_usage_perc|sglang:token_usage"}) * 100',
+    # SGLang calls it token_usage. max, not sum -- a gauge ratio must never be
+    # added across series. Grouped by model_name like the traffic queries, so
+    # a family that carries the label still lands in the pod's one row.
+    # "100 *" (and every selector below braced {__name__=...}): a PromQL that
+    # STARTS with "sglang:" is refused by the MCP arg policy as a URL scheme
+    # (verified live 2026-11-08); a leading function/number dodges the parser.
+    "kv_cache_pct": (
+        "100 * max by (namespace, pod, instance, model_name) "
+        '({__name__=~"vllm:kv_cache_usage_perc|sglang:token_usage"})'
+    ),
     # CACHE HIT RATE. This is what makes the prompt-token rate readable:
     # prompt_tokens_total counts EVERY prompt token submitted, INCLUDING
     # prefix-cache hits that never reach the GPU. Measured on this fleet
@@ -103,6 +111,38 @@ QUERIES: dict[str, str] = {
     # equivalent split, so those rows show "—" rather than a made-up ratio.
     "prefill_s": 'sum by (namespace, pod, instance) (rate({__name__="vllm:request_prefill_time_seconds_sum"}[{window}]))',
     "decode_s": 'sum by (namespace, pod, instance) (rate({__name__="vllm:request_decode_time_seconds_sum"}[{window}]))',
+    # --- KV cache detail (F2: the off-peak model cards' KV strip) ----------
+    #
+    # ABSOLUTE token gauges, SGLang only: a percentage of a multi-million-token
+    # pool reads "0.98%" whether that is 3 conversations or 300 (the same
+    # reason used_tokens exists; these split WHERE the tokens live).
+    #   kv_gpu_*: the GPU KV pool's used / evictable / max token gauges. The
+    #     percentage the cards show (kv_cache_pct, i.e. token_usage) is the
+    #     ACTIVE usage ratio: evictable radix-cache tokens are not holding it.
+    #   kv_host_*: HiCache's host-RAM tier (L2). At write_through steady state
+    #     it sits near 100% BY DESIGN -- occupancy there is not a fault.
+    #   kv_disk_*: the storage tier has NO occupancy gauge -- only activity
+    #     (the storage-hit prefill token rate) and a marker that the tier is
+    #     configured at all (a cache_source="storage" counter row existing).
+    # Gauges collapse with max (a gauge count/ratio must never be summed
+    # across series); every selector is braced {__name__=...} per the arg
+    # policy note on kv_cache_pct above.
+    "kv_gpu_used_tokens": ('max by (namespace, pod, instance, model_name) ({__name__="sglang:kv_used_tokens"})'),
+    "kv_gpu_evictable_tokens": (
+        'max by (namespace, pod, instance, model_name) ({__name__="sglang:kv_evictable_tokens"})'
+    ),
+    "kv_gpu_max_tokens": 'max by (namespace, pod, instance, model_name) ({__name__="sglang:max_total_num_tokens"})',
+    "kv_host_used_tokens": (
+        'max by (namespace, pod, instance, model_name) ({__name__="sglang:hicache_host_used_tokens"})'
+    ),
+    "kv_host_total_tokens": (
+        'max by (namespace, pod, instance, model_name) ({__name__="sglang:hicache_host_total_tokens"})'
+    ),
+    "kv_disk_activity": (
+        "sum by (namespace, pod, instance, model_name) "
+        '(rate({__name__="sglang:prefill_effective_tokens_total",mode="storage_hit"}[{window}]))'
+    ),
+    "kv_disk_configured": 'max by (namespace, pod, instance) ({__name__="sglang:cached_tokens_total",cache_source="storage"})',
 }
 
 # models--Qwen--Qwen3-VL-Reranker-8B/snapshots/<sha>  ->  Qwen/Qwen3-VL-Reranker-8B
@@ -258,6 +298,120 @@ def _attribute(row: dict[str, Any], pools: dict[str, list[str]] | None) -> str:
     return ""
 
 
+async def _disk_usage(url: str, headers: dict[str, str], selector: str) -> dict[str, Any] | None:
+    """Occupancy of the volumes backing the KV cache's L3 tier, or None.
+
+    SGLang exports NO storage-occupancy gauge (activity counters only -- see
+    the QUERIES note on kv_disk_*), so the disk number comes from the VOLUME
+    metrics instead: the operator names the L3 volumes with a PromQL label
+    selector (settings.endpoint_metrics_disk_selector, e.g. the Mooncake SSD
+    PVCs). Two queries (used, capacity), summed over the matched volumes.
+
+    NEVER raises and NEVER invents a number: a failed query, an empty result,
+    a missing used series or a zero capacity all read None -- "unknown", not
+    "0%" and not a ZeroDivisionError. The caller omits the disk section then.
+    """
+    from . import offpeak
+
+    async def one(expr: str) -> float | None:
+        try:
+            result = await asyncio.wait_for(
+                offpeak._call_tool(url, headers, settings.offpeak_tool, {"query": expr}, _QUERY_TIMEOUT_S),
+                timeout=_QUERY_TIMEOUT_S,
+            )
+        except Exception as exc:
+            log.warning("endpoint metrics: disk query failed (%s)", type(exc).__name__)
+            return None
+        values = prom_vector(result)
+        return sum(value for _labels, value in values) if values else None
+
+    try:
+        used, total = await asyncio.gather(
+            one(f"sum(kubelet_volume_stats_used_bytes{{{selector}}})"),
+            one(f"sum(kubelet_volume_stats_capacity_bytes{{{selector}}})"),
+        )
+    except Exception as exc:
+        # Belt-and-braces: snapshot() promises NEVER to raise, and the disk
+        # section is optional context -- lose it, never the panel.
+        log.warning("endpoint metrics: disk section failed (%s)", type(exc).__name__)
+        return None
+    if used is None or total is None or total <= 0:
+        return None
+    return {
+        "used_bytes": used,
+        "total_bytes": total,
+        "pct": round(used / total * 100, 3),
+        "selector": selector,
+    }
+
+
+async def _pod_memory(url: str, headers: dict[str, str], pods: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    """Per-pod RAM from the container metrics: (working set, memory limit).
+
+    NARROWED to the pods the engines already reported. The unfiltered
+    working-set query returns every pod in the cluster (~650 series) and the
+    Prometheus MCP tool truncates its answer at ~20 series -- which silently
+    dropped the model pods and left the page with no RAM line (observed live
+    2026-11-09). The selector keeps the answer to one series per model pod.
+
+    Keyed namespace/pod (the same identity _series_key builds), so the
+    snapshot attaches these to rows it ALREADY has and never invents a row for
+    a pod the inference engines do not report. Both queries are optional
+    context: absent/unparseable metrics return {} and the row fields stay None
+    (the page then omits the working-set line, never prints 0).
+
+    container!="" excludes cAdvisor's pod-level aggregate series -- summing it
+    together with the per-container series double-counts the whole pod
+    (verified live: 1.20 TB vs the real 600 GB on one predictor).
+
+    The working set is PROCESS memory (model weights + the HiCache host pool +
+    runtime), not the prefix-cache occupancy: the token-based kv_host_* fields
+    remain the cache-specific number.
+    """
+    from . import offpeak
+
+    if not pods:
+        return {}, {}
+
+    # Prometheus regexes are fully anchored; join the exact pod names (RE2
+    # metacharacters escaped) so only the rows the snapshot will use come back.
+    pod_selector = "|".join(re.escape(pod) for pod in pods)
+
+    async def one(expr: str) -> list[tuple[dict[str, Any], float]]:
+        try:
+            result = await asyncio.wait_for(
+                offpeak._call_tool(url, headers, settings.offpeak_tool, {"query": expr}, _QUERY_TIMEOUT_S),
+                timeout=_QUERY_TIMEOUT_S,
+            )
+        except Exception as exc:
+            log.warning("endpoint metrics: pod memory query failed (%s)", type(exc).__name__)
+            return []
+        return prom_vector(result)
+
+    used_rows, limit_rows = await asyncio.gather(
+        one(
+            f'sum by (namespace, pod) ({{__name__="container_memory_working_set_bytes",'
+            f'container!="",pod=~"{pod_selector}"}})'
+        ),
+        one(
+            f'sum by (namespace, pod) ({{__name__="kube_pod_container_resource_limits",'
+            f'resource="memory",pod=~"{pod_selector}"}})'
+        ),
+    )
+
+    def by_pod(rows: list[tuple[dict[str, Any], float]]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for labels, value in rows:
+            pod = str(labels.get("pod") or "")
+            if not pod:
+                continue
+            key = str(labels.get("namespace") or "") + "/" + pod
+            out[key] = out.get(key, 0.0) + value
+        return out
+
+    return by_pod(used_rows), by_pod(limit_rows)
+
+
 async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]] | None = None) -> dict[str, Any]:
     """One read of every endpoint's throughput/load. NEVER raises.
 
@@ -274,6 +428,7 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
         "source": f"mcp:{settings.offpeak_mcp_server}/{settings.offpeak_tool}",
         "window_s": window,
         "endpoints": [],
+        "disk": None,
         "error": "",
     }
     try:
@@ -292,10 +447,19 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
             return name, []
         return name, prom_vector(result)
 
-    results = await asyncio.gather(
-        *(one(name, q.replace("{window}", f"{window}s")) for name, q in QUERIES.items()),
-        return_exceptions=False,
-    )
+    tasks = [one(name, q.replace("{window}", f"{window}s")) for name, q in QUERIES.items()]
+    disk_selector = (settings.endpoint_metrics_disk_selector or "").strip()
+    disk: dict[str, Any] | None = None
+    if disk_selector:
+        # The volume queries run CONCURRENTLY with the engine queries (a slow
+        # kubelet must not serialize behind 20 SGLang queries), and only when
+        # the operator configured an L3 volume selector.
+        results, disk = await asyncio.gather(
+            asyncio.gather(*tasks, return_exceptions=False),
+            _disk_usage(url, headers, disk_selector),
+        )
+    else:
+        results = await asyncio.gather(*tasks, return_exceptions=False)
     by_query = dict(results)
 
     rows: dict[str, dict[str, Any]] = {}
@@ -317,6 +481,18 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
                     "running": None,
                     "waiting": None,
                     "kv_cache_pct": None,
+                    "kv_gpu_pct": None,
+                    "kv_gpu_used_tokens": None,
+                    "kv_gpu_evictable_tokens": None,
+                    "kv_gpu_max_tokens": None,
+                    "kv_host_used_tokens": None,
+                    "kv_host_total_tokens": None,
+                    "kv_host_pct": None,
+                    "kv_disk_configured": None,
+                    "kv_disk_hit_tps": None,
+                    "ram_used_bytes": None,
+                    "ram_limit_bytes": None,
+                    "ram_pct": None,
                     "cache_hit_pct": None,
                     "used_tokens": None,
                     "prefill_share": None,
@@ -329,8 +505,22 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
                 row["model_name"] = str(metric["model_name"])
             row[query] = value
 
+    # Pod memory is queried AFTER the engine queries, narrowed to the pods they
+    # reported: the unfiltered working-set query returns every pod in the
+    # cluster and the Prometheus MCP tool truncates the answer at ~20 series
+    # (the model pods fell off the list -- no RAM line on the page, 2026-11-09).
+    pod_names = sorted({str(row.get("pod") or "") for row in rows.values() if row.get("pod")})
+    mem_used, mem_limit = await _pod_memory(url, headers, pod_names)
+
     endpoints: list[dict[str, Any]] = []
-    for row in rows.values():
+    for key, row in rows.items():
+        # RAM context (working set vs the pod's memory limit). Keyed by the
+        # same namespace/pod identity the row carries; a pod with no container
+        # metrics keeps None and the page omits the line.
+        row["ram_used_bytes"] = mem_used.get(key)
+        row["ram_limit_bytes"] = mem_limit.get(key)
+        if row["ram_used_bytes"] is not None and row["ram_limit_bytes"]:
+            row["ram_pct"] = round(row["ram_used_bytes"] / row["ram_limit_bytes"] * 100, 3)
         prefill_s = row.get("prefill_s") or 0.0
         decode_s = row.get("decode_s") or 0.0
         total_s = prefill_s + decode_s
@@ -341,6 +531,22 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
         row["idle"] = (
             not (row.get("running") or 0) and not (row.get("waiting") or 0) and (row.get("decode_tps") or 0) < 0.01
         )
+        # F2 KV additions. kv_gpu_pct is kv_cache_pct under the name the cards
+        # read (same value; the old field stays for the existing panel). host
+        # pct is the HiCache L2 occupancy and only means something when the
+        # total gauge says the tier is actually sized -- total 0 or missing
+        # reads "unknown", never "0%" and never a ZeroDivisionError.
+        row["kv_gpu_pct"] = row.get("kv_cache_pct")
+        host_used = row.get("kv_host_used_tokens")
+        host_total = row.get("kv_host_total_tokens")
+        if host_used is not None and host_total:
+            row["kv_host_pct"] = round(host_used / host_total * 100, 3)
+        # The disk tier has no occupancy gauge: a row EXISTING is the signal
+        # (the query returns a counter's current total), so collapse to bool.
+        row["kv_disk_configured"] = row.get("kv_disk_configured") is not None
+        # the activity series lands under its query name; the row ships the
+        # consumer-facing field name
+        row["kv_disk_hit_tps"] = row.pop("kv_disk_activity", None)
         row["pool"] = _attribute(row, pools)
         endpoints.append(row)
 
@@ -351,5 +557,88 @@ async def snapshot(window_s: int = DEFAULT_WINDOW_S, pools: dict[str, list[str]]
         "source": f"mcp:{settings.offpeak_mcp_server}/{settings.offpeak_tool}",
         "window_s": window,
         "endpoints": endpoints,
+        "disk": disk,
         "error": "",
     }
+
+
+# The three series the model-group router needs (F3). Three queries on
+# purpose: load_rows runs on a timer INSIDE the data-plane process (every
+# model_group_load_refresh_s), so its prometheus bill is bounded by design --
+# the panel's full query set would multiply the scrape load for fields
+# routing never reads.
+_LOAD_QUERY_NAMES: tuple[str, ...] = ("running", "waiting", "kv_cache_pct")
+
+
+async def load_rows(pools: dict[str, list[str]] | None = None) -> list[dict[str, Any]]:
+    """Cheap 3-query load snapshot for routing: queue, running, kv_cache_pct per pod.
+
+    Same merge/attribution as snapshot(); NEVER raises ([] on failure). Each
+    row carries namespace, pod, instance, model_name, pool, running, queue,
+    kv_pct -- numbers float-or-None, where `queue` is the waiting queue
+    length and `kv_pct` is the same GPU KV reading snapshot() names
+    kv_cache_pct. Consumed by core.load_snapshot (model-group routing).
+    """
+    from . import offpeak
+
+    try:
+        url, headers = await offpeak.prometheus_target()
+    except Exception as exc:
+        log.warning("endpoint metrics: load_rows has no prometheus target (%s)", type(exc).__name__)
+        return []
+
+    async def one(name: str, promql: str) -> tuple[str, list[tuple[dict[str, Any], float]]]:
+        try:
+            result = await asyncio.wait_for(
+                offpeak._call_tool(url, headers, settings.offpeak_tool, {"query": promql}, _QUERY_TIMEOUT_S),
+                timeout=_QUERY_TIMEOUT_S,
+            )
+        except Exception as exc:
+            log.warning("endpoint metrics: %s query failed (%s)", name, type(exc).__name__)
+            return name, []
+        return name, prom_vector(result)
+
+    field_of = {"running": "running", "waiting": "queue", "kv_cache_pct": "kv_pct"}
+    rows: dict[str, dict[str, Any]] = {}
+    try:
+        results = await asyncio.gather(
+            *(one(name, QUERIES[name]) for name in _LOAD_QUERY_NAMES),
+            return_exceptions=False,
+        )
+        for query, series in results:
+            for metric, value in series:
+                key = _series_key(metric)
+                if key == "/":
+                    continue
+                row = rows.setdefault(
+                    key,
+                    {
+                        "namespace": str(metric.get("namespace") or ""),
+                        "pod": str(metric.get("pod") or ""),
+                        "instance": "",
+                        "model_name": "",
+                        "pool": "",
+                        "running": None,
+                        "queue": None,
+                        "kv_pct": None,
+                    },
+                )
+                if metric.get("instance") and not row["instance"]:
+                    row["instance"] = str(metric["instance"])
+                if metric.get("model_name") and not row["model_name"]:
+                    row["model_name"] = str(metric["model_name"])
+                row[field_of[query]] = value
+    except Exception as exc:
+        # one() and prom_vector are total, so this is belt-and-braces: the
+        # router's fallback (member_score -> None -> random pick) must stay
+        # reachable no matter what this module trips over.
+        log.warning("endpoint metrics: load_rows failed (%s)", type(exc).__name__)
+        return []
+
+    out = list(rows.values())
+    for row in out:
+        row["pool"] = _attribute(row, pools)
+    # Deterministic order: the router takes a MIN over rows, but a stable
+    # list keeps logs and tests readable.
+    out.sort(key=lambda r: (r.get("pod") or "", r.get("namespace") or ""))
+    return out

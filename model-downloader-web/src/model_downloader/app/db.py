@@ -141,12 +141,15 @@ class AioliDB:
         """Fill in the project a config names no project of its own.
 
         Resolution: explicit entry > the project picked for this push (the UI's
-        namespace field) > catalog.defaultProject.  Applied BEFORE the
-        fingerprint, not at INSERT time: the stored row and every later push of
-        the same configuration must agree, or each re-push would look like a new
-        configuration and mint a version every time.  With nothing set the
-        config is returned untouched (the historical behaviour: MLIS rows carry
-        project "" and only show under "All projects").
+        namespace field) > catalog.defaultProject.  The winner is canonicalised
+        by resolve_project(): a PCAI project-<name> namespace is accepted and
+        its prefix stripped, so the namespace and the MLIS project name are the
+        same configuration.  Applied BEFORE the fingerprint, not at INSERT
+        time: the stored row and every later push of the same configuration
+        must agree, or each re-push would look like a new configuration and
+        mint a version every time.  With nothing set the config is returned
+        untouched (the historical behaviour: MLIS rows carry project "" and
+        only show under "All projects").
         """
         resolved = resolve_project(cfg, project, self.default_project)
         if resolved == str(cfg.get("project") or "").strip():

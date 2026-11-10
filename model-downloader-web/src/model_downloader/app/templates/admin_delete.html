@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manual Deletion — HF Model Downloader</title>
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v={{ assets['favicon.jpg'] }}">
+  <link rel="stylesheet" href="/static/style.css?v={{ assets['style.css'] }}">
+  <script>
+    // Theme — Auto (default, follows the OS) / Light / Dark, remembered per browser.
+    // Same pre-paint resolver as index.html / catalog.html: this page shares the
+    // stylesheet, so it must share the theme switch, or dark mode would break here.
+    var THEME_KEY = 'md-theme';
+
+    // Pre-paint resolver: apply the saved choice before first paint.
+    (function () {
+      var t = 'auto';
+      try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+
+    function applyTheme(t) {
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+      try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-theme-btn') === t;
+        btns[i].classList.toggle('on', on);
+        btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+
+    // Auto resolves to the OS scheme — no consumer may treat data-theme as binary.
+    function effectiveTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (t === 'light' || t === 'dark') return t;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+
+    function initTheme() {
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () {
+          applyTheme(this.getAttribute('data-theme-btn'));
+        });
+      }
+      var saved = 'auto';
+      try { saved = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      applyTheme(saved);
+      // The palette is pure CSS, so an OS flip while in Auto needs no re-render;
+      // the listener stays as the hook for any follow-up added later.
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+          if (document.documentElement.getAttribute('data-theme') !== 'auto') return;
+          document.dispatchEvent(new CustomEvent('md-theme-change', { detail: { theme: effectiveTheme() } }));
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', initTheme);
+  </script>
+</head>
+<body>
+  <header class="brandbar">
+    <span class="wordmark"><span class="bar"></span>HPE</span>
+    <span class="app-title">Model Downloader</span>
+    <nav class="main-nav">
+      <a href="/" class="nav-link">Download</a>
+      <a href="/catalog" class="nav-link">Model Catalog</a>
+    </nav>
+    <span class="spacer"></span>
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
+    <span class="tag">Parallel models: {{ max_concurrency }}</span>
+  </header>
+  <main>
+    <h1>Manual deletion</h1>
+    <p class="hint">
+      The destructive counterpart to the <a href="/">Storage GC report</a>: pick exact model cache
+      directories from the live scan preview and delete them now. Each row is evaluated by the same
+      three-key rule as the GC report — a provenance manifest exists, no AIOLI
+      <code>packaged_models</code> row references it, and no live job pins it. <strong>Deletable</strong>
+      rows select freely; <strong>soft&nbsp;block</strong> rows are referenced by AIOLI and need the
+      explicit per-row override before they can be selected; <strong>block</strong> rows (protected
+      glob, live job pin, or a cross-check that could not run) can never be selected. The server
+      re-intersects every submitted path with a fresh scan and rejects anything it did not just
+      return, and the deletion Job re-validates each path in-pod before removing it.
+    </p>
+
+    <form id="md-key-form" autocomplete="off" data-auth-mode="{{ md_auth_mode }}">
+      {% if md_auth_mode == 'secret' %}
+      <label>
+        <span>Deletion key</span>
+        <input id="md-key" type="password" autocomplete="off" spellcheck="false"
+               autocapitalize="off" placeholder="deletion key (kept in memory only)">
+      </label>
+      {% endif %}
+      <button type="submit" id="md-load">Load preview</button>
+      {% if md_auth_mode == 'secret' %}
+      <small class="field-note">
+        The key is held in this page's memory only and sent as the <code>X-Delete-Key</code> header
+        on the preview and delete calls — never stored, never logged, never placed in a URL.
+      </small>
+      {% else %}
+      <small class="field-note">
+        Signed in through PCAI SSO — your admin rights come from your identity, so there is no key
+        to enter. If this deployment is not behind oauth2-proxy, set
+        <code>manualDelete.auth.mode=secret</code> instead.
+      </small>
+      {% endif %}
+    </form>
+    <div id="md-msg" class="msg" role="status" aria-live="polite"></div>
+
+    <h2>Candidate paths (live scan preview)</h2>
+    <table id="md-table">
+      <thead>
+        <tr>
+          <th class="md-col-select">
+            <input type="checkbox" id="md-select-all" aria-label="Select all selectable rows">
+          </th>
+          <th class="md-col-override" title="AIOLI-referenced rows delete only when their override box is ticked">Override</th>
+          <th>Model</th>
+          <th>Size</th>
+          <th>Age (days)</th>
+          <th class="md-col-manifest">Manifest</th>
+          <th class="md-col-scan">Scan</th>
+          <th>Verdict</th>
+          <th>Cache path (exact)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="md-actions">
+      <button type="button" id="md-delete" class="danger-btn" disabled>Delete selected…</button>
+      <span class="md-actions-note">
+        The deletion Job re-validates every path in-pod (absolute, not a symlink, basename
+        <code>models--*--*</code>, under the scan root) and aborts anything that fails; the server
+        also caps submissions at the configured maximum (default 20).
+      </span>
+    </div>
+
+    <div id="md-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="md-modal-title">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel md-modal-panel">
+        <div class="modal-header">
+          <span id="md-modal-title">Confirm deletion</span>
+          <button class="modal-close" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div id="md-modal-body" class="modal-body-scroll">
+          <p id="md-modal-error" class="md-modal-error" role="alert" hidden></p>
+          <p class="md-modal-summary">
+            This permanently deletes <strong id="md-count">0</strong> path(s) —
+            <strong id="md-bytes">0 B</strong> — from the model PVC:
+          </p>
+          <ul id="md-path-list" class="md-path-list"></ul>
+          <p id="md-modal-overrides" class="md-override-note" hidden></p>
+          <p class="hint">
+            Deletion is permanent. The server first re-intersects this list with a fresh scan and
+            rejects stale paths (HTTP 422); the Job then re-validates each path in-pod (absolute, not
+            a symlink, basename <code>models--*--*</code>, realpath under the scan root) and aborts
+            anything that fails.
+          </p>
+        </div>
+        <div class="md-modal-actions">
+          <input id="md-modal-confirm" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Type DELETE (exact) to enable"
+                 aria-label="Type DELETE to confirm deletion">
+          <button type="button" id="md-modal-cancel" class="secondary-btn">Cancel</button>
+          <button type="button" id="md-modal-go" class="danger-btn" disabled>Delete permanently</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script src="/static/admin_delete.js?v={{ assets['admin_delete.js'] }}"></script>
+</body>
+</html>

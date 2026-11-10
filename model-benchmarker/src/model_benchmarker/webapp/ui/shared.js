@@ -106,17 +106,23 @@
       '<div class="hpe-brand-title">Model <b>Benchmarker</b></div>' +
       "</div></div>" +
       "<nav>" + nav + "</nav>" +
-      '<div class="theme-toggle" onclick="MB.toggleTheme()" title="Toggle dark/light mode">' +
-      '<span id="theme-label">Light</span>' +
-      '<div class="theme-toggle-track"><div class="theme-toggle-thumb"></div></div>' +
+      '<div class="theme-seg" role="group" aria-label="Theme">' +
+      '<button type="button" data-theme-btn="auto">Auto</button>' +
+      '<button type="button" data-theme-btn="light">Light</button>' +
+      '<button type="button" data-theme-btn="dark">Dark</button>' +
       "</div>" +
       '<span class="chip" id="mb-status-chip" style="margin-left:12px">checking…</span>';
     document.body.insertBefore(el, document.body.firstChild);
-    var t = localStorage.getItem("theme") || "light";
-    if (t === "dark") {
-      document.documentElement.setAttribute("data-theme", "dark");
-      var lab = document.getElementById("theme-label");
-      if (lab) lab.textContent = "Dark";
+    // The pre-paint resolver in each page already set data-theme; this marks the
+    // active segment and wires the three buttons. Auto follows the OS live in CSS.
+    var saved = "auto";
+    try { saved = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+    applyTheme(saved);
+    var themeBtns = document.querySelectorAll("[data-theme-btn]");
+    for (var i = 0; i < themeBtns.length; i++) {
+      themeBtns[i].addEventListener("click", function () {
+        applyTheme(this.getAttribute("data-theme-btn"));
+      });
     }
     fetch("/api/status")
       .then(function (r) { return r.json(); })
@@ -135,14 +141,31 @@
       });
   }
 
-  function toggleTheme() {
-    var html = document.documentElement;
-    var isDark = html.getAttribute("data-theme") === "dark";
-    html.setAttribute("data-theme", isDark ? "light" : "dark");
-    var lab = document.getElementById("theme-label");
-    if (lab) lab.textContent = isDark ? "Light" : "Dark";
-    localStorage.setItem("theme", isDark ? "light" : "dark");
+  // Three-state theme: Auto (the default) follows the OS, Light/Dark pin. The key
+  // is the app's existing 'theme', so a Light/Dark choice saved by the old toggle
+  // still wins — nothing is migrated or cleared.
+  var THEME_KEY = "theme";
+
+  function applyTheme(t) {
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* private mode */ }
+    var btns = document.querySelectorAll("[data-theme-btn]");
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute("data-theme-btn") === t;
+      btns[i].classList.toggle("on", on);
+      btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
   }
+
+  // In Auto the palette follows the OS without JS; re-mark the control when the OS
+  // flips so it stays truthful if anything else rewrote the attribute.
+  try {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+      if (document.documentElement.getAttribute("data-theme") !== "auto") return;
+      applyTheme("auto");
+    });
+  } catch (e) { /* very old browser: the media query still themes the page */ }
 
   function fmtBytes(n) {
     if (n == null) return "-";
@@ -407,7 +430,7 @@
   window.MB = { recentRuns: recentRuns, recentResults: recentResults,
     combobox: combobox,
     api: api, esc: esc, header: header, getKey: getKey, setKey: setKey,
-    fmtBytes: fmtBytes, fmtNum: fmtNum, downloadArtifact: downloadArtifact, toggleTheme: toggleTheme,
+    fmtBytes: fmtBytes, fmtNum: fmtNum, downloadArtifact: downloadArtifact, applyTheme: applyTheme,
     logView: logView, setLogFull: setLogFull, wireLogFullscreen: wireLogFullscreen,
   };
 })();

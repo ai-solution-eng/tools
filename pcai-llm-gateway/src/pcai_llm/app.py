@@ -162,6 +162,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if hasattr(model_router, "start"):
         await model_router.start()
     await registry.refresh()
+    # Model groups (F3): load the group map once so the very first request can
+    # classify a group name, then start the load-snapshot loop that feeds the
+    # member pick (queue depth per member, refreshed off the request path).
+    # Both are best-effort and gated on the flag: a group feature must never
+    # block startup, and with the flag off (the default) this block is one
+    # boolean read.
+    if settings.model_groups_enabled:
+        try:
+            from .core import model_groups as _model_groups
+
+            await _model_groups.load(force=True)
+        except Exception:
+            log.warning("model groups: initial load failed — the TTL refresh will retry", exc_info=True)
+        try:
+            from .core import load_snapshot as _load_snapshot
+
+            _load_snapshot.start()
+        except Exception:
+            log.warning("model groups: load snapshot did not start — picks fall back to random", exc_info=True)
     # Active health probe (GOAL A): passive availability (breaker-not-cooling,
     # traffic-fed) leaves an idle-but-broken model reading healthy forever.
     # The probe gives Pool.healthy() a traffic-independent signal (GET
@@ -191,6 +210,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Before the pool closes: the watcher's watermark query needs a
         # connection, and a cancel mid-query must not outlive db.close().
         await registry.stop_watcher()
+        # Model groups: stop the load-snapshot loop during teardown so it
+        # cannot outlive the app (its refresh reads Prometheus through
+        # endpoint_metrics; stop() is a no-op when it never started).
+        if settings.model_groups_enabled:
+            try:
+                from .core import load_snapshot as _load_snapshot
+
+                await _load_snapshot.stop()
+            except Exception:
+                log.warning("model groups: load snapshot stop failed", exc_info=True)
         await health_probe.stop()
         await housekeeping.stop()
         if settings.offpeak_enabled:

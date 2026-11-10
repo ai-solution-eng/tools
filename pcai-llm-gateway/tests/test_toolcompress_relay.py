@@ -138,6 +138,26 @@ async def _execute_big(_server: str, _tool: str, _args: dict) -> tuple[bool, Any
     return True, BIG_JSON
 
 
+# The PRODUCTION shape: routes_proxy.execute returns the MCP content-block
+# LIST, not a bare string. A single-text-block result serializes to a
+# one-line, one-item JSON array — below every detector's item/line floor —
+# which is how the feature shipped unable to compress the traffic it was
+# written for. These fixtures exist so the shape can never silently regress.
+BIG_LOG = "\n".join(
+    [f"2026-11-05T09:00:{i:02d}Z INFO worker-{i} tick" for i in range(80)]
+    + ["2026-11-05T09:01:00Z ERROR upstream refused the connection"]
+    + [f"2026-11-05T09:01:{i:02d}Z INFO worker-{i} tick" for i in range(80)]
+)
+
+
+def _blocks(text: str) -> list[dict[str, Any]]:
+    return [{"type": "text", "text": text}]
+
+
+async def _execute_blocks(_server: str, _tool: str, _args: dict) -> tuple[bool, Any]:
+    return True, _blocks(BIG_LOG)
+
+
 def _tool_messages(seen: dict[str, Any], call_index: int) -> list[dict]:
     return [m for m in seen["msgs"][call_index] if m.get("role") == "tool"]
 
@@ -164,6 +184,53 @@ def test_on_rewrites_result_and_offers_retrieve(
     assert '"event": "compress"' in text
     names = [t["function"]["name"] for t in seen["tools"][0]]
     assert "pcai__retrieve" in names
+
+
+def test_mcp_content_block_result_is_compressed(
+    monkeypatch: pytest.MonkeyPatch, store: dict[tuple[uuid.UUID, str], str]
+) -> None:
+    """The production MCP shape must reach the compressor as TEXT.
+
+    Regression (2026-11-05): execute() returns [{"type": "text", "text": ...}],
+    and serialized that is a one-line, one-item JSON array. Every detector is
+    count-based, so every in-cluster MCP result passed through and was then
+    head-truncated at 32k — the blunt cap this feature exists to replace.
+    """
+    script = [[_tool_call("c1", "logsearch__search_logs", {"q": "refused"})], [{"content": "done"}]]
+    text, seen = _run(monkeypatch, script, _execute_blocks, mode="on")
+
+    content = _tool_messages(seen, 1)[0]["content"]
+    assert toolcompress.MARKER_SIG in content
+    assert "upstream refused the connection" in content  # the signal survives
+    assert content != json.dumps(_blocks(BIG_LOG))  # the envelope was unwrapped
+    assert len(content) < len(BIG_LOG)
+
+    # The digest addresses the UNWRAPPED original: retrieval hands back the
+    # log the model asked for, not a JSON envelope around it.
+    digest = toolcompress.digest_of(BIG_LOG)
+    assert store[(KEY, digest)] == BIG_LOG
+    assert '"event": "compress"' in text
+
+
+def test_single_text_block_below_the_floor_keeps_the_envelope(
+    monkeypatch: pytest.MonkeyPatch, store: dict[tuple[uuid.UUID, str], str]
+) -> None:
+    """Unwrapping is a compression DECISION, not a reformat.
+
+    A block result that does not clear the floor must stay byte-for-byte the
+    pre-fix serialized envelope — the model-facing shape only changes when a
+    rewrite the model actually receives replaces it.
+    """
+    small = _blocks("2026-11-05T09:00:00Z INFO tiny\n")
+
+    async def _execute_small(_server: str, _tool: str, _args: dict) -> tuple[bool, Any]:
+        return True, small
+
+    script = [[_tool_call("c1", "logsearch__search_logs", {"q": "x"})], [{"content": "done"}]]
+    _text, seen = _run(monkeypatch, script, _execute_small, mode="on")
+
+    assert _tool_messages(seen, 1)[0]["content"] == json.dumps(small)
+    assert store == {}
 
 
 def test_shadow_reports_but_rewrites_nothing(

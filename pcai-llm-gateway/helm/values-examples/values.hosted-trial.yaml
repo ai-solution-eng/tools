@@ -169,6 +169,9 @@ settings:
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
   routingTurnAdderTokens: 100
+  # Agents as routing candidates (off by default): the key's OFFERED agents join
+  # the router's window; a pick applies the agent's surface + prompt for the turn.
+  routingAgentsEnabled: false
   # MCP federation surface: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
   # two-tool surface (mcp_catalog + mcp_call only).
   mcpFlatTools: true

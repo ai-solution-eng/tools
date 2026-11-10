@@ -212,8 +212,9 @@ AdminDep = Annotated[None, Depends(require_admin)]
 # ---------------------------------------------------------------------------
 
 AUDIT_ACTIONS_DOC = (
-    "key.create key.patch key.revoke key.rotate budget.set costs.set costs.delete "
-    "model.upsert model.delete model.fallbacks.set mcp.server.upsert mcp.server.patch "
+    "key.create key.patch key.revoke key.rotate key.profile.apply budget.set costs.set costs.delete "
+    "model.upsert model.delete model.fallbacks.set "
+    "model_group.create model_group.update model_group.delete mcp.server.upsert mcp.server.patch "
     "mcp.acl.set mcp.acl.server.set mcp.acl.copy mcp.creds.set mcp.creds.delete profile.upsert "
     "profile.delete profile.limits.propagate user.profile.set tenant.create user.create "
     "guardrail.create guardrail.patch guardrail.delete guardrail.models.set offpeak.set "
@@ -832,6 +833,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "DELETE /admin/keys/{key_id}",
             "POST   /admin/keys/{key_id}/rotate",
             "POST   /admin/keys/{key_id}/budgets",
+            "POST   /admin/keys/{key_id}/apply-profile",
             "GET    /admin/keys/{key_id}/usage",
             "GET    /admin/audit/chain",
             "GET    /admin/keys/{key_id}/mcp-grants",
@@ -880,6 +882,10 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "POST   /admin/routing/prompt-preview",
             "GET    /admin/endpoint-metrics",
             "GET    /admin/presented-models",
+            "GET    /admin/model-groups",
+            "PUT    /admin/model-groups/{name}",
+            "DELETE /admin/model-groups/{name}",
+            "POST   /admin/model-groups/{name}/preview",
         ],
     }
 
@@ -900,22 +906,104 @@ async def create_tenant(body: TenantCreate, request: Request, _: AdminDep) -> di
 
 @router.get("/tenants")
 async def list_tenants(_: AdminDep) -> list[dict[str, Any]]:
-    """All tenants (console dropdown) + each tenant's SSO self-mint default
-    profile (the Enroll tab's dropdown writes it; the mint stamps it)."""
+    """All tenants (console dropdown) + each tenant's SSO self-mint profiles
+    (the Enroll tab's dropdowns write them; the mint stamps them).
+
+    The tier pair (2026-11-08) rides the SAME read: an operator has to see the
+    admin profile + its groups wherever the default profile is editable, or the
+    tier split is configurable-but-invisible. Both joins are LEFT — a tenant
+    with neither profile configured (the default) must still list.
+    """
     return [
         dict(r)
         for r in await db.fetch(
-            "SELECT t.id, t.name, t.created_at, t.sso_default_profile_id, p.name AS sso_default_profile_name "
-            "FROM tenants t LEFT JOIN profiles p ON p.id = t.sso_default_profile_id ORDER BY t.name"
+            "SELECT t.id, t.name, t.created_at, t.sso_default_profile_id, p.name AS sso_default_profile_name, "
+            "t.sso_admin_profile_id, ap.name AS sso_admin_profile_name, t.sso_admin_groups "
+            "FROM tenants t "
+            "LEFT JOIN profiles p ON p.id = t.sso_default_profile_id "
+            "LEFT JOIN profiles ap ON ap.id = t.sso_admin_profile_id "
+            "ORDER BY t.name"
         )
     ]
 
 
 class TenantSsoDefaultProfile(BaseModel):
-    """PUT body for the SSO self-mint default profile. profile_id null =
-    clear (mints fall back to the bare fixed grant)."""
+    """PUT body for the SSO self-mint profiles. profile_id null = clear
+    (mints fall back to the bare fixed grant).
+
+    EVERY FIELD (2026-11-08) is applied only when PRESENT in the body
+    (model_fields_set), never on the default None. A tier-only body such as
+    {"admin_groups": "admin"} must not clear the default profile, and a body
+    carrying only profile_id must not clear the admin tier. The console always
+    sends all three; an empty body is a 400 rather than a no-op UPDATE.
+
+    admin_groups is comma-separated, case-sensitive, whitespace-trimmed; ''
+    (the column default) DISABLES the split.
+    """
 
     profile_id: uuid.UUID | None = None
+    admin_profile_id: uuid.UUID | None = None
+    admin_groups: str | None = None
+
+
+async def _validated_sso_profile(profile_id: uuid.UUID, role: str) -> None:
+    """404 when the profile is absent; 400 when its budget presets are invalid.
+
+    WHY at WIRE time, not at first use: the profile is stamped onto every
+    self-mint and every rotation for the tenant, so a bad preset here would
+    brick both — surfacing as an opaque 500 long after the operator left this
+    screen. 'role' names the SLOT in the 400 ("default" / "admin profile")
+    so the message points at the field the operator must fix.
+    """
+    if not await _exists("profiles", profile_id):
+        raise HTTPException(404, f"profile {profile_id} not found")
+    prow = await db.fetchrow("SELECT name, defaults_json FROM profiles WHERE id = $1", profile_id)
+    try:
+        defaults = json.loads((prow["defaults_json"] if prow else None) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        defaults = {}
+    try:
+        split_preset_budgets(defaults.get("budgets") or [])
+    except ValueError as exc:
+        pname = prow["name"] if prow else str(profile_id)
+        raise HTTPException(
+            400,
+            f"profile {pname!r} cannot be the SSO {role}: it has an invalid budget preset ({exc})",
+        ) from None
+
+
+# One IdP group name: the claim is a group path, not a sentence. The cap keeps
+# the column (and the mint's per-request parse) bounded; the control-char
+# refusal keeps a newline/CR out of the comma-joined value the mint splits —
+# the same edge discipline every other name surface applies.
+_ADMIN_GROUP_MAX_LEN = 64
+
+
+def _normalize_admin_groups(raw: str | None) -> str:
+    """Normalize the tier-split group list: comma-separated, trimmed, empties
+    dropped, duplicates collapsed (order-preserving), rejoined with ','.
+
+    '' (the column default) is the documented "tier split OFF" sentinel, so a
+    cleared list is stored as the empty string — never as a string of commas,
+    which would leave the column out of its sentinel meaning without ever
+    matching a real IdP group.
+    """
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        group = part.strip()
+        if not group:
+            continue
+        if len(group) > _ADMIN_GROUP_MAX_LEN:
+            raise HTTPException(
+                400,
+                f"admin group {group[:_ADMIN_GROUP_MAX_LEN]!r}... exceeds {_ADMIN_GROUP_MAX_LEN} characters",
+            )
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in group):
+            raise HTTPException(400, f"admin group {group!r} contains a control character")
+        if group not in out:
+            out.append(group)
+    _check_list_len(out, "admin_groups")
+    return ",".join(out)
 
 
 @router.put("/tenants/{tenant_id}/sso-default-profile", status_code=200)
@@ -929,45 +1017,61 @@ async def set_sso_default_profile(
     profile's budgets, limit presets, and MCP grants onto the fresh key;
     scopes stay the mint's fixed least-privilege grant. Clearing (null)
     returns mints to the bare grant. Live immediately: the mint reads the
-    column per request.
+    columns per request.
+
+    THE TIER SPLIT: when sso_admin_groups is non-empty AND the caller's IdP
+    groups intersect it, the mint stamps sso_admin_profile_id instead of
+    sso_default_profile_id. Both slots are validated the same way here (404
+    unknown / 400 bad preset) so the operator cannot wire a profile that only
+    breaks for one tier.
     """
     if not await _exists("tenants", tenant_id):
         raise HTTPException(404, f"tenant {tenant_id} not found")
-    if body.profile_id is not None and not await _exists("profiles", body.profile_id):
-        raise HTTPException(404, f"profile {body.profile_id} not found")
-    if body.profile_id is not None:
-        # Validate the presets at WIRE time, not at first use. This profile
-        # is stamped onto every self-mint and every rotation for the tenant,
-        # so a bad preset here would brick both — surfacing as an opaque 500
-        # long after the operator left this screen. Refuse the wiring with
-        # the same 400 the profile save uses.
-        prow = await db.fetchrow("SELECT name, defaults_json FROM profiles WHERE id = $1", body.profile_id)
-        try:
-            defaults = json.loads((prow["defaults_json"] if prow else None) or "{}")
-        except (json.JSONDecodeError, TypeError):
-            defaults = {}
-        try:
-            split_preset_budgets(defaults.get("budgets") or [])
-        except ValueError as exc:
-            pname = prow["name"] if prow else str(body.profile_id)
-            raise HTTPException(
-                400,
-                f"profile {pname!r} cannot be the SSO default: it has an invalid budget preset ({exc})",
-            ) from None
+    fields = body.model_fields_set
+    if not fields:
+        raise HTTPException(400, "no SSO profile fields to update")
+    # ALL THREE FIELDS ARE APPLY-ONLY-WHEN-PRESENT (review F1-2): a tier-only
+    # body such as {"admin_groups": "admin"} must NOT silently NULL the
+    # tenant's default profile. profile_id's historical always-applied
+    # semantics changed here on purpose — the console always sends all three,
+    # and a partial script update is a data-loss footgun, not a compat case.
+    sets: list[str] = []
+    args: list[Any] = [tenant_id]
+    if "profile_id" in fields:
+        if body.profile_id is not None:
+            await _validated_sso_profile(body.profile_id, "default")
+        args.append(body.profile_id)
+        sets.append(f"sso_default_profile_id = ${len(args)}")
+    if "admin_profile_id" in fields:
+        if body.admin_profile_id is not None:
+            await _validated_sso_profile(body.admin_profile_id, "admin profile")
+        args.append(body.admin_profile_id)
+        sets.append(f"sso_admin_profile_id = ${len(args)}")
+    if "admin_groups" in fields:
+        args.append(_normalize_admin_groups(body.admin_groups))
+        sets.append(f"sso_admin_groups = ${len(args)}")
     row = await db.fetchrow(
-        "UPDATE tenants SET sso_default_profile_id = $2 WHERE id = $1 RETURNING id, name, sso_default_profile_id",
-        tenant_id,
-        body.profile_id,
+        f"UPDATE tenants SET {', '.join(sets)} WHERE id = $1 "
+        "RETURNING id, name, sso_default_profile_id, sso_admin_profile_id, sso_admin_groups",
+        *args,
     )
     assert row is not None
+    # dict(row): an asyncpg Record and the test fakes' plain dicts both answer
+    # .get(), and the details record the STORED state (what the mint will read)
+    # rather than the request — the audit trail's job is the resulting config.
+    stored = dict(row)
     await _audit(
         request,
         action="tenant.sso_default_profile.set",
         resource_type="tenant",
         resource_id=str(tenant_id),
-        details={"profile_id": str(body.profile_id) if body.profile_id else None},
+        details={
+            "profile_id": str(stored["sso_default_profile_id"]) if stored.get("sso_default_profile_id") else None,
+            "admin_profile_id": (str(stored["sso_admin_profile_id"]) if stored.get("sso_admin_profile_id") else None),
+            "admin_groups": stored.get("sso_admin_groups") or "",
+        },
     )
-    return dict(row)
+    return stored
 
 
 @router.post("/tenants/{tenant_id}/bind-sso-users")
@@ -2159,6 +2263,24 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
         body = body.model_copy(update={"model_type": detected_type})
         log.info("model_type not supplied for %r — %s (%s)", body.model_name, detected_type, detected_reason)
     await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
+    # MODEL-GROUP SHADOW GUARD (review F3-2): a group name is a callable model
+    # id, and the data plane resolves it as a group BEFORE any pool lookup. A
+    # pool registered under an existing group's name would therefore be
+    # silently unaddressable — refuse at the write path, the mirror of the
+    # group-create check that refuses a name equal to a registered model.
+    try:
+        from ..core import model_groups as _model_groups_mod
+
+        await _model_groups_mod.load()
+        if _model_groups_mod.group_for(body.model_name) is not None:
+            raise HTTPException(
+                400,
+                f"model {body.model_name!r} is already a model group — a pool may not shadow a group",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        log.warning("model upsert: model-group shadow check failed (fail-open)", exc_info=True)
     # Panel credentials: resolve each endpoint's api_key to ciphertext (or a
     # clear/set marker) BEFORE the write; plaintext never leaves this block.
     enc_rows = []
@@ -2577,12 +2699,28 @@ async def _validate_fallback_chain(model_name: str, fallbacks: list[str]) -> lis
     """
     _check_list_len(fallbacks, "fallbacks")
     known = {r["model_name"] for r in await db.fetch("SELECT DISTINCT model_name FROM model_endpoints")}
+    # MODEL GROUPS (2026-11-08): a chain entry may name a group — the data
+    # plane's fallback walker resolves it to an eligible member
+    # (routes_proxy._next_fallback_candidate). Accept it at save time too, or
+    # the feature is unreachable through the admin API. Chat groups only: the
+    # walker would skip a non-chat one, so saving it would be dead config.
+    try:
+        from ..core import model_groups as _model_groups_mod
+
+        await _model_groups_mod.load()
+        for _gname, _group in _model_groups_mod.snapshot().items():
+            if getattr(_group, "model_type", "chat") == "chat":
+                known.add(_gname)
+    except Exception:
+        log.warning("fallbacks: model-group names unavailable (fail-open to models only)", exc_info=True)
     if model_name not in known:
         raise HTTPException(404, f"model {model_name!r} is not registered")
     unknown = [n for n in fallbacks if n not in known]
     if unknown:
         raise HTTPException(
-            400, f"unknown fallback model name(s): {unknown} — register them under POST /admin/models first"
+            400,
+            f"unknown fallback name(s): {unknown} — register them under POST /admin/models "
+            "or create a chat model group under PUT /admin/model-groups/{name}",
         )
     deduped: list[str] = []
     for n in fallbacks:
@@ -3008,6 +3146,161 @@ async def copy_mcp_grants_from(
         "key_id": str(key_id),
         "source_key_id": str(body.source_key_id),
         "grants": copied,
+    }
+
+
+class KeyApplyProfile(BaseModel):
+    """Body for POST /keys/{key_id}/apply-profile.
+
+    `profile_id` is attached to the key's OWNER (profiles are user-scoped).
+    The two apply flags default TRUE so the console's one click — pick a
+    profile in Edit key, save — does what an operator means by "give this key
+    the admin profile's budgets and grants". Either can be turned off to
+    assign the profile without touching the key's current preset rows.
+    """
+
+    profile_id: uuid.UUID
+    apply_budgets: bool = True
+    apply_grants: bool = True
+
+
+@router.post("/keys/{key_id}/apply-profile")
+async def apply_profile_to_key(
+    key_id: uuid.UUID, body: KeyApplyProfile, request: Request, _: AdminDep
+) -> dict[str, Any]:
+    """Attach a user profile AND re-stamp its presets onto THIS key.
+
+    THE GAP THIS CLOSES (console Edit key): assigning a profile only moved
+    `users.profile_id`. Budgets and MCP grants are CREATION presets, so an
+    existing key kept whatever it was born with — "give Tanguy the admin
+    profile" silently changed his model ordering and nothing else. This is
+    the one-key bridge: assign the profile to the owner (user-scoped, exactly
+    like PUT /users/{user_id}/profile) and replace this key's budget rows and
+    MCP grant rows with the profile's presets.
+
+    ATOMIC: one transaction. A key can never end up with the new profile but
+    a half-applied preset set. Validation happens BEFORE the transaction, so
+    a refused apply (empty preset list, malformed stored preset) writes
+    nothing at all.
+
+    REFUSE-EMPTY (same posture as propagate-grants): a profile that declares
+    NO budgets (or no grants) is a 400, never a silent clear. Replacing a
+    live key's limits with nothing is the destructive-by-omission hazard the
+    propagate endpoints already refuse; clearing stays an explicit per-key
+    action.
+
+    LIVE GRANTS: when the profile runs `live_grants`, the profile layer
+    already decides every call (mcpf.federation.load_live_profile_grants), so
+    the grant write is skipped — materialising the pairs as key rows would
+    pin the preset to this key. The response reports `live_grants: true`
+    and `grants: 0`.
+
+    GRANT SEMANTICS: replace-all of the GRANT set — the same per-key contract
+    as PUT /keys/{key_id}/mcp-grants. The key's TRUE rows are deleted and the
+    profile's pairs inserted TRUE (ON CONFLICT flips a surviving deny row for
+    a granted pair). Deny rows for pairs the profile does NOT grant are left
+    in place: under the legacy scope grant mode those rows are the only thing
+    holding a policy-admitted pair back, so erasing them would WIDEN the key
+    instead of applying the profile.
+
+    Audit `key.profile.apply` carries the profile id + applied counts, never
+    the pair list (the profile's own upsert row already records it).
+    """
+    key_row = await db.fetchrow("SELECT user_id FROM api_keys WHERE id = $1", key_id)
+    if key_row is None:
+        raise HTTPException(404, f"key {key_id} not found")
+    if not await _exists("profiles", body.profile_id):
+        raise HTTPException(404, f"profile {body.profile_id} not found")
+    prow = await db.fetchrow("SELECT defaults_json FROM profiles WHERE id = $1", body.profile_id)
+    if prow is None:
+        raise HTTPException(404, f"profile {body.profile_id} not found")
+    try:
+        parsed = json.loads(prow["defaults_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    defaults: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
+
+    token_rows: list[tuple[str, str, int]] = []
+    usd_rows: list[tuple[str, str, float]] = []
+    if body.apply_budgets:
+        presets = defaults.get("budgets") or []
+        if not presets:
+            raise HTTPException(400, "profile has no budget presets to apply")
+        try:
+            token_rows, usd_rows = split_preset_budgets(presets)
+        except (ValueError, AttributeError, TypeError) as exc:
+            # A hand-edited/older defaults_json can carry a non-list or a
+            # non-mapping entry; the splitter raises on those shapes too. A
+            # 400 naming the preset beats a bare 500 from an admin action.
+            raise HTTPException(400, f"profile budget preset invalid: {exc}") from None
+
+    live_grants = bool(defaults.get("live_grants"))
+    grant_pairs: list[tuple[str, str]] = []
+    if body.apply_grants and not live_grants:
+        grant_pairs = sorted(
+            {
+                (str(g[0]), str(g[1]))
+                for g in (defaults.get("mcp_grants") or [])
+                if isinstance(g, (list, tuple)) and len(g) == 2
+            }
+        )
+        if not grant_pairs:
+            raise HTTPException(400, "profile has no mcp_grants to apply")
+
+    user_id = key_row["user_id"]
+    async with db.acquire() as conn, conn.transaction():
+        # Profile attach first: a later statement failing rolls this back with
+        # the rest, so the owner is never left pointing at a profile whose
+        # presets the key did not receive.
+        await conn.execute("UPDATE users SET profile_id = $2 WHERE id = $1", user_id, body.profile_id)
+        if body.apply_budgets:
+            # REPLACE-ALL across BOTH kinds: the key's budget state is the
+            # profile's list, not a merge with whatever it had before.
+            await conn.execute("DELETE FROM budgets WHERE key_id = $1", key_id)
+            await conn.execute("DELETE FROM cost_budgets WHERE key_id = $1", key_id)
+            if token_rows:
+                await conn.executemany(
+                    "INSERT INTO budgets (key_id, model, period, limit_tokens) VALUES ($1,$2,$3,$4)",
+                    [(key_id, m, p, lim) for m, p, lim in token_rows],
+                )
+            if usd_rows:
+                await conn.executemany(
+                    "INSERT INTO cost_budgets (key_id, model, period, limit_usd) VALUES ($1,$2,$3,$4)",
+                    [(key_id, m, p, lim) for m, p, lim in usd_rows],
+                )
+        if body.apply_grants and not live_grants:
+            # Replace the GRANT set only. Deny rows survive (they are
+            # load-bearing under the legacy scope grant mode); a deny for a
+            # pair the profile now grants is flipped TRUE by the upsert —
+            # exactly the PUT /mcp-grants contract.
+            await conn.execute("DELETE FROM mcp_tool_acls WHERE key_id = $1 AND allowed", key_id)
+            if grant_pairs:
+                await conn.executemany(
+                    "INSERT INTO mcp_tool_acls (key_id, server, tool, allowed) "
+                    "VALUES ($1,$2,$3,TRUE) ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = TRUE",
+                    [(key_id, s, t) for s, t in grant_pairs],
+                )
+    applied_budgets = len(token_rows) + len(usd_rows)
+    applied_grants = len(grant_pairs)
+    await _audit(
+        request,
+        action="key.profile.apply",
+        resource_type="key",
+        resource_id=str(key_id),
+        details={
+            "profile_id": str(body.profile_id),
+            "budgets": applied_budgets,
+            "grants": applied_grants,
+            "live_grants": live_grants,
+        },
+    )
+    return {
+        "key_id": str(key_id),
+        "user_id": str(user_id),
+        "profile_id": str(body.profile_id),
+        "budgets": applied_budgets,
+        "grants": applied_grants,
+        "live_grants": live_grants,
     }
 
 
@@ -3938,6 +4231,26 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # before endpoints, and a site draining its registry. The defect this
     # guards needs a registry to hide models FROM.
     registered_models = model_router.models()
+    # MODEL GROUPS (2026-11-08): a chat group is a valid LADDER entry — the
+    # routing capability order may name the group instead of listing its
+    # members (that is the whole point: one rung, not three). Chat groups only;
+    # a non-chat group would never be a chat rung. The loader is TTL-cached and
+    # never raises; a fault degrades to the pool-only check.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _mg
+
+            await _mg.load()
+            registered_models = [
+                *registered_models,
+                *[
+                    _g.name
+                    for _g in _mg.snapshot().values()
+                    if getattr(_g, "model_type", "chat") == "chat" and _g.name not in registered_models
+                ],
+            ]
+        except Exception:
+            log.debug("profile: model groups unavailable for the ordering check (fail-open)", exc_info=True)
     # Validate the EFFECTIVE ordering, but only when the caller actually sent
     # one: a partial save (say, agents only) must not be refused because a model
     # stored months ago has since left the registry — that would make an
@@ -4037,10 +4350,31 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
                     f"agents not defined: {missing} — create them under POST /admin/agents first",
                 )
         assert row is not None
+        # BOTH halves are load-bearing (2026-11-06 incident, and the review
+        # that followed it):
+        #   * PostgreSQL evaluates a data-modifying CTE against the SAME
+        #     snapshot as the outer statement, so a row the CTE deletes is
+        #     STILL VISIBLE to the INSERT's uniqueness check. A blanket
+        #     "DELETE every link, then INSERT every wanted agent" therefore
+        #     raises duplicate key on EVERY re-save — the 500 that started
+        #     this.
+        #   * Adding ON CONFLICT DO NOTHING to that blanket delete would be
+        #     WORSE than the 500: the delete commits while the conflicting
+        #     insert is skipped, silently REMOVING the agents that were meant
+        #     to stay. "Do nothing" is only correct when the conflicting row
+        #     is one we intend to keep.
+        # So the DELETE removes ONLY the links no longer selected. The kept
+        # links stay live and untouched, their re-insert conflicts for real,
+        # and DO NOTHING keeps them: final membership equals the requested
+        # set, idempotently. The mcp_tool_acls propagate below has the same
+        # delete+insert shape and the same guard for the same snapshot reason.
         await db.execute(
-            "WITH gone AS (DELETE FROM profile_agents WHERE profile_id = $1) "
+            "WITH gone AS ("
+            "  DELETE FROM profile_agents WHERE profile_id = $1"
+            "   AND agent_id NOT IN (SELECT id FROM agent_profiles WHERE name = ANY($2::text[]))) "
             "INSERT INTO profile_agents (profile_id, agent_id) "
-            "SELECT $1, a.id FROM agent_profiles a WHERE a.name = ANY($2::text[])",
+            "SELECT $1, a.id FROM agent_profiles a WHERE a.name = ANY($2::text[]) "
+            "ON CONFLICT (profile_id, agent_id) DO NOTHING",
             row["id"],
             wanted,
         )
@@ -5243,14 +5577,20 @@ def _routing_decision_models() -> list[str]:
     return out
 
 
-def _routing_chat_models() -> list[str]:
-    """Registered models whose pool serves CHAT.
+async def _routing_chat_models() -> list[str]:
+    """Registered models whose pool serves CHAT, plus chat MODEL GROUPS.
 
     The router's ladder is a chat concept: an embedding or reranker pool can
     never be a routing candidate, so the panel's checkboxes and the
     `routing__<model>` advertisement must not offer them. Same predicate as
     routes_proxy's /v1/models routing block — one definition, so the admin view
     and the data plane cannot disagree about what "a chat model" is.
+
+    MODEL GROUPS (2026-11-08): a group is a chat-capable routing target whose
+    MEMBER is picked at request time, so it belongs on this list exactly like a
+    pool. The loader is awaited (TTL-cached, never raises) so a group created a
+    moment ago is visible in the panel without waiting for a chat request to
+    warm the cache.
     """
     from ..core.cascade import pool_serves_chat  # local: keeps this module import-light
 
@@ -5264,7 +5604,17 @@ def _routing_chat_models() -> list[str]:
         # routing candidate at all, which is a different question from type.
         if pool is not None and pool.endpoints and pool_serves_chat(pool):
             out.append(m)
-    return out
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _mg
+
+            await _mg.load()
+            for _g in _mg.snapshot().values():
+                if getattr(_g, "model_type", "chat") == "chat" and _g.name not in out:
+                    out.append(_g.name)
+        except Exception:
+            log.debug("routing candidates: model groups unavailable (fail-open)", exc_info=True)
+    return sorted(out)
 
 
 @router.get("/routing/config")
@@ -5293,7 +5643,7 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         "defaults": routing_config.defaults(),
         "overridden": sorted(overridden),
         "registered": model_router.models(),
-        "chat_models": _routing_chat_models(),
+        "chat_models": await _routing_chat_models(),
         # The decision-model dropdown source: decision pools first (the
         # intended type), chat pools accepted for first-cut deployments.
         "decision_models": _routing_decision_models(),
@@ -5308,7 +5658,7 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         # "does every model the panel can offer carry a description", and the
         # panel counts the same set -- two different denominators for one
         # concept is how a "3/3 described" panel disagrees with its own API.
-        "card_coverage": routing_config.describe_coverage(cfg.get("model_cards"), _routing_chat_models()),
+        "card_coverage": routing_config.describe_coverage(cfg.get("model_cards"), await _routing_chat_models()),
         "gpu": await routing_config.gpu_load_snapshot(),
     }
 
@@ -5502,7 +5852,7 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
     # fallback and reports EVERY chat model eligible, the opposite of the
     # saved restriction. Refusing here keeps that fallback reserved for ids
     # that genuinely vanished from the registry.
-    chat_models = _routing_chat_models()
+    chat_models = await _routing_chat_models()
     decision_model = provided.get("decision_model")
     # The decision model is NOT a ladder candidate — it is the thing that
     # CHOOSES a ladder candidate, so it is validated against the decision/chat
@@ -5682,7 +6032,7 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
     # must not offer the decision model an embedding/reranker candidate it
     # could never serve. Same candidate set presented-models reports as
     # routing_eligible, so the preview and the panel cannot disagree.
-    models = await routing_config.routing_allowed_models(_routing_chat_models())
+    models = await routing_config.routing_allowed_models(await _routing_chat_models())
     snapshot = await routing_config.gpu_load_snapshot()
     # 'inject' is the DECISION being previewed (possibly overridden); the
     # snapshot's own 'available' is only the data question. Folding the
@@ -5739,7 +6089,7 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
         # allowlisted subset this preview happens to render. Otherwise a site
         # with a 2-of-3 allowlist sees "2/2 described" here and "2/3" in the
         # panel for the same config.
-        "card_coverage": routing_config.describe_coverage(cards, _routing_chat_models()),
+        "card_coverage": routing_config.describe_coverage(cards, await _routing_chat_models()),
     }
 
 
@@ -5811,7 +6161,7 @@ async def presented_models_payload() -> dict[str, Any]:
     snapshot = await routing_config.gpu_load_snapshot()
     raw_offpeak = snapshot.get("models")
     offpeak_models: dict[str, Any] = raw_offpeak if isinstance(raw_offpeak, dict) else {}
-    chat_models = _routing_chat_models()
+    chat_models = await _routing_chat_models()
     # DERIVED ordering (no profile on an admin key): the CHAT pools in the
     # registry's own (name-sorted) order. CHAT ONLY (2026-10-29): this used to
     # append every non-chat pool to the tail, so the panel rendered
@@ -5943,20 +6293,54 @@ async def presented_models_payload() -> dict[str, Any]:
     except Exception:
         log.warning("presented-models: agent listing failed (reporting none)", exc_info=True)
 
+    # --- MODEL GROUPS (F3, 2026-11-08) --------------------------------------
+    # A group is a model id /v1/models advertises (owned_by "group"), so this
+    # view must list them or it lies by omission — the agents section's rule.
+    # They are CONFIG truth (a DB row, not a registry pool), so they are their
+    # own section and never mixed into 'models'. 'present' is the fleet switch
+    # only: an admin key has no profile, so no ACL is knowable here.
+    # best-effort — the loader never raises, but this view must not 500 on a
+    # DB/loader fault either (the same degrade-first posture as agents above).
+    groups_out: list[dict[str, Any]] = []
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as model_groups_mod
+
+            loaded = await model_groups_mod.load()
+            for g in sorted(loaded.values(), key=lambda item: item.name):
+                groups_out.append(
+                    {
+                        "id": g.name,
+                        "type": "group",
+                        "owned_by": "group",
+                        "model_type": g.model_type,
+                        "policy": g.policy,
+                        "members": list(g.members),
+                        "description": g.description,
+                        "present": True,
+                        "reason": "fleet switch on — the data plane /v1/models lists groups too",
+                    }
+                )
+        except Exception:
+            log.warning("presented-models: model-group listing failed (reporting none)", exc_info=True)
+
     presented = (
         len(models_out)
         + sum(1 for a in aliases if a["present"])
         + sum(1 for r in routing_out if r["present"])
         + sum(1 for a in agents_out if a["present"])
+        + sum(1 for g in groups_out if g["present"])
     )
     return {
         "aliases": aliases,
         "models": models_out,
         "routing": routing_out,
         "agents": agents_out,
+        "groups": groups_out,
         "env": {
             "routing_enabled": bool(settings.routing_enabled),
             "load_aware_cascade": bool(settings.load_aware_cascade),
+            "model_groups_enabled": bool(settings.model_groups_enabled),
         },
         "counts": {"presented": presented, "registered": len(registered)},
     }
@@ -6197,3 +6581,300 @@ async def deny_topup_request(
         },
     )
     return dict(resolved)
+
+
+# ---------------------------------------------------------------------------
+# model groups (F3, 2026-11-08) — named sets of EQUIVALENT chat models.
+#
+# A group is a first-class ROUTE TARGET (direct request, fallback-chain entry,
+# advertised in /v1/models); the DATA PLANE resolves it (routes_proxy) and
+# core.model_groups owns the cache + the load pick. These endpoints only CURATE
+# the rows — the same split as guardrails/fallbacks, so the admin plane never
+# grows a dependency on the hot path: core.model_groups is imported LAZILY
+# inside each handler.
+#
+# Validation happens HERE, at save time, against the LIVE registry: a group
+# naming a dead model would be a silently-unroutable config (the guardrail
+# attachment lesson), so every reject reason is a 400 the operator can act on.
+# ---------------------------------------------------------------------------
+
+
+class ModelGroupUpsert(BaseModel):
+    """PUT body for one group — REPLACE semantics (the whole member set is the
+    desired state; a diff would leave stale members routing traffic).
+
+    model_type/policy default to the only v1 values, and the handlers REFUSE
+    any other value rather than storing a mode the data plane does not
+    implement: core.model_groups treats an unknown policy as 'load', so a typo
+    would otherwise look saved and behave differently from what was asked.
+    """
+
+    model_type: str = "chat"
+    policy: str = "load"
+    members: list[str]
+    description: str = Field("", max_length=1000)
+
+
+# A group name IS a model id: /v1/models advertises it, a request may name it,
+# and X-PCAI-Group echoes it. So it is closed at the edge like every other name
+# surface (no markup / control chars) and it is a SLUG — no whitespace, no '/'
+# — because it is a virtual id, not a namespaced registry model (and a slash
+# would make it unaddressable as a plain path parameter).
+_GROUP_NAME_BAD_CHARS = re.compile(r"""[<>"'&\x00-\x1f\x7f/\s]""")
+_GROUP_NAME_MAX_LEN = 200
+
+
+def _validate_model_group_name(name: str) -> str:
+    """Validate a group name (returns it unchanged, or raises a 400).
+
+    Refuses the cascade aliases too: 'auto' and the demand-aware alias are
+    model ids the data plane already resolves, so a group with one of those
+    names would shadow (or be shadowed by) the alias depending on resolution
+    order — an ambiguity with no correct answer, refused at the edge.
+    """
+    from ..core.cascade import DEMAND_AWARE_ALIAS
+
+    if name != name.strip():
+        raise HTTPException(400, "model group name must not have leading/trailing whitespace")
+    if not name:
+        raise HTTPException(400, "model group name must not be empty")
+    if len(name) > _GROUP_NAME_MAX_LEN:
+        raise HTTPException(400, f"model group name must be at most {_GROUP_NAME_MAX_LEN} characters")
+    if _GROUP_NAME_BAD_CHARS.search(name):
+        raise HTTPException(
+            400,
+            "model group name must not contain whitespace, '/', control characters or HTML metacharacters",
+        )
+    if name in {"auto", DEMAND_AWARE_ALIAS}:
+        raise HTTPException(400, f"model group name {name!r} is a reserved cascade alias")
+    # PSEUDO-MODELS (review F3-2): detect_pseudo_model claims 'routing' and
+    # 'routing__<model>' BEFORE any group lookup, so a group saved under one of
+    # those names would be stored and then unaddressable. Refuse at the edge.
+    if name == "routing" or name.startswith("routing__"):
+        raise HTTPException(400, f"model group name {name!r} is a reserved routing pseudo-model")
+    return name
+
+
+def _group_member_names(raw: Any) -> list[str]:
+    """Member names from a stored JSONB members value.
+
+    The documented shape is [{"model": name, "weight": w}] (db/schema.py); the
+    pool registers no JSONB codec, so the column arrives as a RAW STRING. A
+    bare [name, ...] is tolerated — a hand-edited row must degrade to a
+    readable list, not 500 the whole admin page. Order is preserved (the editor
+    shows the stored order), empties dropped, duplicates collapsed.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        member = item.get("model") if isinstance(item, dict) else item
+        if isinstance(member, str) and member and member not in out:
+            out.append(member)
+    return out
+
+
+def _model_group_out(row: Any) -> dict[str, Any]:
+    """One group in the admin API's wire shape.
+
+    members are NAMES, not the stored [{model, weight}] objects: weight is
+    reserved for the not-yet-implemented weighted policy and would be a number
+    the operator cannot set through this API, so exposing it would invite a
+    config that looks tunable and is not.
+    """
+    data = dict(row)
+    return {
+        "name": data.get("name"),
+        "model_type": data.get("model_type") or "chat",
+        "policy": data.get("policy") or "load",
+        "members": _group_member_names(data.get("members")),
+        "description": data.get("description") or "",
+        "created_at": data.get("created_at"),
+    }
+
+
+async def _invalidate_model_groups_best_effort() -> None:
+    """Drop the model-group cache AFTER a committed write.
+
+    Best effort, same posture as _refresh_registry_best_effort: the row is
+    already durable, so an invalidate fault must never 500 the request that
+    wrote it (the operator would retry and double-write). The stale window is
+    the loader's cache TTL at worst.
+    """
+    try:
+        from ..core import model_groups as model_groups_mod
+
+        await model_groups_mod.invalidate()
+    except Exception:
+        log.exception(
+            "model-group cache invalidation failed after a COMMITTED admin mutation — "
+            "routing keeps the previous group snapshot until the loader TTL expires"
+        )
+
+
+@router.get("/model-groups")
+async def list_model_groups(_: AdminDep) -> dict[str, Any]:
+    """Every group, straight from the table (the console's list + edit source).
+
+    DB truth, not the routing cache: an operator editing a group must see what
+    is STORED even while the loader still serves its previous snapshot.
+    """
+    rows = await db.fetch(
+        "SELECT name, model_type, policy, members, description, created_at FROM model_groups ORDER BY name"
+    )
+    return {"groups": [_model_group_out(r) for r in rows]}
+
+
+@router.put("/model-groups/{name}")
+async def upsert_model_group(name: str, body: ModelGroupUpsert, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Create or replace a group (upsert; a 409-on-duplicate is not attempted —
+    the console edits through the same verb, and a PUT is idempotent by
+    definition).
+
+    Rejects BEFORE the write: a bad name, a non-chat group type, an
+    unimplemented policy, a member set core.model_groups refuses (empty /
+    unknown / duplicate / a group / >32), plus the chat-only member rule the
+    member validator cannot see (it has no registry types).
+    """
+    from ..core import model_groups as model_groups_mod
+
+    group_name = _validate_model_group_name(name)
+    if body.model_type != "chat":
+        raise HTTPException(
+            400,
+            f"model_type {body.model_type!r} is not supported for a model group — v1 groups are chat-only",
+        )
+    if body.policy != "load":
+        raise HTTPException(400, f"policy {body.policy!r} is not implemented — must be 'load'")
+    _check_list_len(body.members, "members")
+    # Store the TRIMMED names: validate_members trims before it checks, so
+    # persisting the raw payload would let " glm " pass validation and then
+    # never match the registry — an unroutable member the validator believed
+    # was fine.
+    members = [str(m or "").strip() for m in body.members]
+    members = [m for m in members if m]
+    known = set(model_router.models())
+    existed = await db.fetchval("SELECT 1 FROM model_groups WHERE name = $1", group_name) is not None
+    if not existed and group_name in known:
+        raise HTTPException(
+            400,
+            f"model group name {group_name!r} is already a registered model — a group may not shadow a pool",
+        )
+    # snapshot() only knows what the loader has cached, and the ONE-LEVEL rule
+    # (a member may not itself be a group) is enforced against it — so warm the
+    # cache first, or a cold process could persist a cycle the schema comment
+    # promises cannot exist. load() is TTL-cached and never raises.
+    await model_groups_mod.load()
+    reason = model_groups_mod.validate_members(members, known, model_groups_mod.snapshot())
+    if reason:
+        raise HTTPException(400, reason)
+    non_chat = []
+    for member in members:
+        pool = model_router.pool(member)
+        endpoints = pool.endpoints if pool is not None else []
+        types = sorted({str(getattr(ep, "model_type", "") or "") for ep in endpoints} - {""})
+        # ANY chat endpoint makes the pool chat-servable: the data plane's
+        # serves_chat() is an any() predicate, so endpoints[0] would refuse a
+        # pool whose first registered endpoint happens to be non-chat (the
+        # exact order-dependence defect the proxy fixed — review F3-1).
+        if types and "chat" not in types:
+            non_chat.append(f"{member} ({', '.join(types)})")
+    if non_chat:
+        raise HTTPException(400, f"model group members must be chat models — refusing {non_chat}")
+    # The stored shape is [{model, weight}] (db/schema.py). weight is RESERVED
+    # for the not-yet-implemented weighted policy; 1.0 for every member keeps a
+    # future weighted pick equivalent to today's uniform one.
+    members_json = json.dumps([{"model": m, "weight": 1.0} for m in members])
+    row = await db.fetchrow(
+        "INSERT INTO model_groups (name, model_type, policy, members, description) "
+        "VALUES ($1, $2, $3, $4::jsonb, $5) "
+        "ON CONFLICT (name) DO UPDATE SET model_type = EXCLUDED.model_type, "
+        "policy = EXCLUDED.policy, members = EXCLUDED.members, description = EXCLUDED.description "
+        "RETURNING name, model_type, policy, members, description, created_at",
+        group_name,
+        body.model_type,
+        body.policy,
+        members_json,
+        body.description,
+    )
+    assert row is not None
+    await _invalidate_model_groups_best_effort()
+    out = _model_group_out(row)
+    await _audit(
+        request,
+        action="model_group.update" if existed else "model_group.create",
+        resource_type="model_group",
+        resource_id=group_name,
+        details={
+            "name": out["name"],
+            "model_type": out["model_type"],
+            "policy": out["policy"],
+            "members": out["members"],
+            "description": out["description"],
+        },
+    )
+    return out
+
+
+@router.delete("/model-groups/{name}")
+async def delete_model_group(name: str, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Remove a group. 404 when absent — a delete of nothing is not a success
+    (the console would otherwise report "deleted" for a typo). The cache is
+    invalidated after the commit so the data plane stops selecting the
+    members."""
+    group_name = _validate_model_group_name(name)
+    row = await db.fetchrow("DELETE FROM model_groups WHERE name = $1 RETURNING name", group_name)
+    if row is None:
+        raise HTTPException(404, f"model group {group_name!r} not found")
+    await _invalidate_model_groups_best_effort()
+    await _audit(
+        request,
+        action="model_group.delete",
+        resource_type="model_group",
+        resource_id=group_name,
+        details={"name": group_name},
+    )
+    return {"deleted": True, "name": group_name}
+
+
+@router.post("/model-groups/{name}/preview")
+async def preview_model_group(name: str, _: AdminDep) -> dict[str, Any]:
+    """What the LOAD PICK would choose right now — read-only.
+
+    Never pins and never writes: the data plane's grp: pin is per (key,
+    conversation) and only a real request may take one. This is the operator's
+    "would it go to GLM or Deepseek right now?" probe, so the per-member score
+    (min queue across the member's endpoints; null = no metrics) is returned
+    next to the pick, plus each member's pool health — a group whose members
+    are all unhealthy picks something that cannot serve, and the panel must say
+    so instead of showing a confident member.
+    """
+    from ..core import load_snapshot
+    from ..core import model_groups as model_groups_mod
+
+    group_name = _validate_model_group_name(name)
+    # load() is TTL-cached and never raises; calling it makes the preview work
+    # on a cold cache (first request after boot, before any /v1 call).
+    await model_groups_mod.load()
+    group = model_groups_mod.group_for(group_name)
+    if group is None:
+        raise HTTPException(404, f"model group {group_name!r} not found")
+    candidates = []
+    for member in group.members:
+        pool = model_router.pool(member)
+        candidates.append(
+            {
+                "model": member,
+                "score": load_snapshot.member_score(member),
+                "healthy": bool(pool.healthy()) if pool is not None else False,
+            }
+        )
+    return {
+        "member": model_groups_mod.pick_member(group, None, load_snapshot.member_score),
+        "candidates": candidates,
+    }

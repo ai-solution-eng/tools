@@ -85,6 +85,52 @@ def uri_matches_cache_dir(uri: str, cache_dir: str) -> bool:
     return re.search(r"/" + re.escape(org) + r"/" + re.escape(repo) + r"(/|\?|$)", uri) is not None
 
 
+_URI_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/[^?#]*)?")
+
+
+def uri_path(uri: str) -> str:
+    """The path component of a pvc:// or s3:// uri, without host or query."""
+    match = _URI_PATH_RE.match(uri or "")
+    if match:
+        return (match.group(1) or "").rstrip("/")
+    return (uri or "").split("?", 1)[0].rstrip("/")
+
+
+def uri_matches_cachepath(uri: str, cachepath: str) -> bool:
+    """Does the uri reference the model at the full on-disk cachepath?
+
+    Extends uri_matches_cache_dir with the CUSTOM CACHE ROOT shape, which the
+    name rules cannot see. A deployment registered from a custom download
+    location is stored as the directory that CONTAINS the cache dir:
+
+        pvc://models-pvc/large-models/Cohere202603?containerPath=/mnt/models
+
+    That uri contains neither the cache-dir name nor org/repo, so an actively
+    serving model was reported deletable -- the exact case that must be a soft
+    block. The rule: the uri's path must be a suffix of the cache dir's PARENT
+    path on a '/' boundary, and carry at least two segments so a bare
+    /large-models (the scan root) cannot protect everything underneath it.
+    """
+    if not cachepath:
+        return False
+    cachepath = cachepath.rstrip("/")
+    cache_dir = cachepath.rsplit("/", 1)[-1]
+    if uri_matches_cache_dir(uri, cache_dir):
+        return True
+    parent = cachepath.rsplit("/", 1)[0]
+    path = uri_path(uri)
+    if not path:
+        return False
+    if len([seg for seg in path.split("/") if seg]) < 2:
+        return False
+    return parent == path or parent.endswith(path)
+
+
+def aioli_protected_paths(uris: list[str], cachepaths: list[str]) -> set[str]:
+    """The subset of cachepaths any AIOLI uri references (path-aware)."""
+    return {cp for cp in cachepaths if cp and any(uri_matches_cachepath(uri, cp) for uri in uris)}
+
+
 def aioli_protected_dirs(uris: list[str], cache_dirs: list[str]) -> set[str]:
     """The subset of *cache_dirs* any AIOLI uri references."""
     protected: set[str] = set()
@@ -177,8 +223,8 @@ def build_gc_plan(
     in the GC Job; the app only ever reports.
     """
     now = now if now is not None else time.time()
-    cache_dirs = [e.get("cachepath", "").rsplit("/", 1)[-1] for e in entries]
-    aioli_hits = aioli_protected_dirs(aioli_uris, cache_dirs)
+    cachepaths = [e.get("cachepath", "") for e in entries]
+    aioli_hits = aioli_protected_paths(aioli_uris, cachepaths)
     protected_globs = list(protected_models or [])
 
     rows: list[dict] = []
@@ -189,7 +235,7 @@ def build_gc_plan(
         cachepath = e.get("cachepath") or ""
         cd = cachepath.rsplit("/", 1)[-1] if cachepath else ""
         manifest_present = e.get("manifest")
-        aioli_hit = cd in aioli_hits if cd else False
+        aioli_hit = cachepath in aioli_hits if cachepath else False
         job = live_job_protects(e, live_jobs)
         glob_hit = glob_protected(protected_globs, name) or (cd and glob_protected(protected_globs, cd))
         expired = is_expired(e, ttl_days=ttl_days, now=now)
@@ -287,3 +333,151 @@ def parse_aioli_rows(rows: list[tuple] | list[dict]) -> list[str]:
         if isinstance(uri, str) and uri.strip():
             uris.append(uri.strip())
     return uris
+
+
+# ---------------------------------------------------------------------------
+# Manual deletion (admin-initiated, per request)
+# ---------------------------------------------------------------------------
+
+# Verdict vocabulary. The split matters: "block" is a hard refusal the Job
+# re-checks and will not override, "soft_block" is a refusal an admin may
+# override per request with an explicit acknowledgement, and "deletable" needs
+# no acknowledgement.
+VERDICT_DELETABLE = "deletable"
+VERDICT_SOFT_BLOCK = "soft_block"
+VERDICT_BLOCK = "block"
+
+DELETE_MANAGED_BY = "model-downloader-delete"
+
+
+def drop_delete_jobs(jobs: list[dict], managed_by: str = DELETE_MANAGED_BY) -> list[dict]:
+    """Remove delete Jobs from a live-job list.
+
+    A delete Job is never evidence that a directory is IN USE: it runs once
+    (backoffLimit 0, restartPolicy Never), touches only the paths it was handed,
+    and protects nothing. Keeping them in the list caused a self-inflicted
+    deadlock — a delete Job annotated with its scan root pinned every directory
+    on the PVC, and because live_job_protects() deliberately ignores Job status,
+    one finished Job blocked the entire admin page until its TTL expired (a
+    day), or until someone deleted the Job object by hand.
+
+    Chart >= 1.9.6 no longer writes that annotation, but dropping delete Jobs
+    here makes any legacy Job self-healing instead of requiring kubectl.
+    """
+    return [job for job in jobs or [] if (job.get("managed_by") or "") != managed_by]
+
+
+def evaluate_manual_targets(
+    entries: list[dict],
+    *,
+    aioli_uris: list[str],
+    live_jobs: list[dict],
+    protected_models: list[str] | None = None,
+    aioli_available: bool = True,
+    jobs_available: bool = True,
+) -> list[dict]:
+    """Per-directory verdict for an admin's manual deletion request.
+
+    entries -- scanner rows: model_name, cachepath, bytes, mtime, manifest
+    (True/False/None), scanned.
+
+    Differs from build_gc_plan in three ways, all deliberate:
+
+    * the TTL line is not applied -- an admin selecting a model overrides age,
+      which is the whole point of a manual action (clear space now, not in
+      30 days);
+    * a missing manifest is a warning, not a block -- models fetched outside
+      this app have no provenance record and must stay deletable;
+    * an AIOLI hit is a soft block -- the operator may override it per
+      request, because MLIS rows go stale and a hard block would make those
+      weights undeletable forever. Everything else that refuses is hard.
+
+    Hard blocks, in the order they are reported: an unavailable AIOLI read, an
+    unavailable live-jobs read, a live job pinning the cache root, and a
+    protectedModels glob. A structural refusal (path outside the scan root,
+    symlink, wrong basename) is enforced by the caller and the Job, not here --
+    this function sees only scanner rows.
+
+    Unavailable cross-checks block everything rather than being skipped: the
+    report path in main._build_gc_report fails open on a jobs-listing error and
+    must not be imitated here. The GC CronJob fails closed; so does this.
+
+    This function never deletes anything and touches no I/O.
+    """
+    protected_globs = list(protected_models or [])
+    now = time.time()
+    rows: list[dict] = []
+
+    for e in entries:
+        name = e.get("model_name") or ""
+        cachepath = e.get("cachepath") or ""
+        cache_dir = cachepath.rsplit("/", 1)[-1] if cachepath else ""
+        mtime = e.get("mtime") or 0.0
+
+        hard: list[str] = []
+        soft: list[str] = []
+        warnings: list[str] = []
+
+        if not aioli_available:
+            hard.append("AIOLI cross-check unavailable — cannot prove this model is not registered")
+        if not jobs_available:
+            hard.append("live jobs cross-check unavailable — cannot prove no job is writing here")
+
+        # A live job is use: a debug shell on the root, a scanner, or a
+        # downloader still writing. Status is deliberately ignored (a Completed
+        # job's pod may still be flushing), matching live_job_protects.
+        job = live_job_protects(e, live_jobs)
+        if job:
+            hard.append(f"live job {job.get('namespace', '')}/{job.get('job_name', '')}")
+
+        if protected_globs and (
+            glob_protected(protected_globs, name)
+            or (cache_dir and glob_protected(protected_globs, cache_dir))
+        ):
+            hard.append("matches gc.protectedModels glob")
+
+        if aioli_available and cachepath:
+            for uri in aioli_uris:
+                if uri_matches_cachepath(uri, cachepath):
+                    soft.append(f"registered in AIOLI packaged_models: {uri}")
+                    break
+
+        manifest = e.get("manifest")
+        if manifest is False:
+            # Absence of a manifest is absence of EVIDENCE, not evidence of
+            # absence: provenance was only added in chart 1.6, so most models
+            # predating it were downloaded by this very app and still have no
+            # manifest. State what is known and let the operator conclude.
+            warnings.append(
+                "no provenance manifest — cannot confirm this app downloaded it "
+                "(predates provenance tracking, or fetched elsewhere)"
+            )
+        elif manifest is None:
+            warnings.append("provenance manifest unknown")
+
+        if hard:
+            verdict = VERDICT_BLOCK
+            blocks = hard + soft
+        elif soft:
+            verdict = VERDICT_SOFT_BLOCK
+            blocks = soft
+        else:
+            verdict = VERDICT_DELETABLE
+            blocks = []
+
+        rows.append(
+            {
+                "cachepath": cachepath,
+                "model_name": name,
+                "bytes": e.get("bytes"),
+                "age_days": round((now - mtime) / 86400.0, 1) if mtime else None,
+                "manifest": manifest,
+                "scanned": e.get("scanned") or "",
+                "verdict": verdict,
+                "blocks": blocks,
+                "warnings": warnings,
+            }
+        )
+
+    return rows
+

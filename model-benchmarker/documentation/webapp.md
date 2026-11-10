@@ -60,7 +60,7 @@ the hot decode pool — the page says so next to the total.
 ## Comparing runs on the results page
 
 /results lists every run on the PVC and supports **side-by-side
-comparison**: tick 2–4 runs (checkbox per row, or "add to compare" inside a
+comparison**: tick 2–6 runs (checkbox per row, or "add to compare" inside a
 run's detail view) and press Compare — or deep-link `/results?compare=<id1>,<id2>`.
 The comparison is backed by public GET /api/results/compare?ids=… (read-only,
 same posture as the rest of the results surface): rows are aligned across
@@ -77,6 +77,67 @@ it. Use it when the newest run is not the one you want to measure against
 — e.g. comparing a 4× H200 run on a 2-way-NVLink G2 medium against the same
 model on an 8-way box. Runs missing their machine-readable artifacts (interrupted runs)
 appear with a note rather than silently vanishing.
+
+### The comparison charts
+
+Above the tables, each section of the comparison renders the sweep as
+line charts — the PDF-style scaling curves: one chart per (task × context)
+group and headline metric (chat: TTFT turn-1 P50 and tokens/s P50 per
+group; endpoint: latency P50/P99, requests/s and tokens/s vs N), one
+series per run in the run's card colour, the reference series flagged
+"ref" in the legend. The x axis is logarithmic whenever the sweep spans
+enough orders of magnitude (1/4/32/64/128), and says so in its label. The task, context and sparse-series facets shrink
+the grid to the slice you asked for, and the section tabs switch the
+section body: **curves**, **summary** (per-level bars for the quick
+worst/best read) and **raw table**.
+
+- **Full screen, per chart.** Each chart card has a button in its
+  upper-right corner that expands that one chart to fill the window —
+  the browser Fullscreen API, with a CSS overlay fallback where it is
+  unavailable — so a scaling curve can be read at presentation size.
+  Escape or the same button returns, and the hover tooltips keep working
+  while full-screen.
+- **Smoothing (0–100%, default 50%).** The line is drawn as a
+  monotone-cubic interpolation blended with straight segments: it never
+  overshoots, never dips below a neighbouring point, and every measured
+  point stays on the curve — a reading aid, not a fit. 0% restores the
+  old straight polylines.
+- **Outliers (default: suppress spikes).** A scaling curve is monotone
+  in expectation — TTFT and latency rise with concurrency, throughput
+  falls — so an interior point that is a local extremum against BOTH
+  neighbours by more than 1.5× is treated as a measurement spike.
+  Suppressed spikes are removed from the line and from the y-axis scale;
+  the chart subtitle says how many were hidden and at which concurrency,
+  an off-scale spike leaves a small ▲ on the top edge, the hover tooltip
+  still reports the true value tagged "spike", and the raw table marks the
+  cell with a warning glyph (tooltip on hover). "Show all points" restores
+  them.
+- **Shared hover.** Hovering the plot raises one tooltip for that
+  concurrency level: every run's value at that x is listed, so
+  overlapping series are all reachable; the row nearest the cursor is
+  highlighted, a vertical guide line marks the level, and the tooltip is
+  clamped inside the viewport — it never runs off the right edge on a
+  narrow window.
+- **Gaps are drawn, not bridged.** Runs sweep different concurrency
+  levels (1/4/32/64 for one, 1/4/8/16/32/64 for another), so the shared x
+  axis has ticks a given run never measured. A solid line across such a
+  gap would read as measured data, so the curve breaks and the missing
+  span is drawn dashed; the points themselves are always real.
+- **Narrow windows.** Below about 420 px the grid wraps to a single
+  column instead of forcing a horizontal page scroll.
+
+The **raw table** tab renders the same data as raw numbers — the
+"what number exactly" question: one table per (task × context) group and
+metric, with **concurrency as rows and runs as columns** (endpoint
+sections: N as rows). Each cell carries the raw value, with the percent
+delta against the reference run in small type beneath it in every
+non-reference column; the reference column is tinted; suppressed spikes
+carry the warning glyph and a tooltip.
+
+Spike suppression is a display choice, not a data edit: the numbers stay
+in the hover tooltip, the raw table and the "copy as CSV" export.
+Smoothing, outlier mode and the tab choice persist per browser in
+localStorage (`mb.chartprefs`), so the view opens the way you left it.
 
 ### The list is grouped — and you can hide what you don't need
 

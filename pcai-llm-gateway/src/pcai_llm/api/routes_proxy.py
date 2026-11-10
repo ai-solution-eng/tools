@@ -28,7 +28,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
@@ -482,7 +482,11 @@ def _estimate_rerank_tokens(body: dict[str, Any]) -> int:
     return max(0, total // 4)
 
 
-def _routing_available(key: KeyRecord, capacity: dict[str, dict] | None = None) -> Callable[[str], bool]:
+def _routing_available(
+    key: KeyRecord,
+    capacity: dict[str, dict] | None = None,
+    agents: dict[str, Any] | None = None,
+) -> Callable[[str], bool]:
     """Availability predicate for the complexity-router's ladder walk.
 
     A ladder model is servable for THIS key when it is registered (a pool
@@ -516,6 +520,41 @@ def _routing_available(key: KeyRecord, capacity: dict[str, dict] | None = None) 
     cap = capacity or {}
 
     def _ok(name: str) -> bool:
+        # MODEL GROUP (2026-11-08): a group is available when the key may use
+        # it AND at least one member can serve right now — the same filters the
+        # data plane applies (group ACL bridge, healthy chat pool, per-member
+        # capacity). Naming the group grants its members; a member grant lets
+        # the key use the group; a group never widens the ACL.
+        group = _group_by_name(name)
+        if group is not None:
+            acl = _group_acl(group, key)
+            for member in group.members:
+                if acl is not None and member not in acl:
+                    continue
+                p = model_router.pool(member)
+                if p is None or not p.healthy():
+                    continue
+                if not any(e.model_type == "chat" for e in p.healthy()):
+                    continue
+                state = cap.get(member)
+                if state is not None and not state.get("ok", True):
+                    continue
+                return True
+            return False
+        # AGENT (2026-11-08): a hard model (surface + pinned model/cascade).
+        # Available when it is OFFERED and its pinned model is available; an
+        # agent with no pinned model rides the profile cascade, so it is usable
+        # while any chat pool is.
+        if agents and name in agents:
+            agent = agents[name]
+            if not getattr(agent, "offered", True):
+                return False
+            target = str(getattr(agent, "model", "") or "")
+            if not target:
+                return any(_ok(m) for m in model_router.models())
+            if target == name:
+                return False
+            return _ok(target)
         if key.allowed_models and name not in key.allowed_models:
             return False
         p = model_router.pool(name)
@@ -601,7 +640,11 @@ async def _routing_incumbent_state(key: Any, body: dict[str, Any]) -> tuple[str 
     return incumbent, floor, writer
 
 
-def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..., Any] | None:
+def _decision_caller(
+    decision_model: str,
+    policy: dict[str, Any],
+    agents: list[Any] | None = None,
+) -> Callable[..., Any] | None:
     """Build the System One caller for the configured decision model.
 
     Returns None when the model is not registered or has no usable endpoint --
@@ -658,6 +701,62 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
         # also what keeps the two channels from disagreeing about the load.
         cfg = await routing_config.get_config()
         gpu = {**await routing_config.gpu_load_snapshot(), "inject": bool(cfg.get("inject_gpu_load"))}
+        # MODEL GROUPS (2026-11-08): a group is a routing candidate like any
+        # other hard model, so BOTH decision channels need it: the criteria card
+        # describes the set (description + members), and the load row is the
+        # LEAST-LOADED member's — the group's own pick targets the idle member —
+        # with "active" true when any member is in low demand. A group with no
+        # member reading renders "no data", never a fabricated zero.
+        _cards = dict(policy.get("cards") or {})
+        try:
+            from ..core import model_groups as _mg
+
+            _gpu_raw = gpu.get("models")
+            _gpu_models: dict[str, Any] = _gpu_raw if isinstance(_gpu_raw, dict) else {}
+            for _cand in candidates:
+                _g = _mg.group_for(_cand)
+                if _g is None:
+                    continue
+                if _cand not in _cards:
+                    _desc = (_g.description or f"model group of {len(_g.members)} equivalent chat models").strip()
+                    _cards[_cand] = {
+                        "description": (
+                            f"{_desc} | members: {', '.join(_g.members)} | the gateway picks the "
+                            "least-loaded member and pins the conversation to it"
+                        )
+                    }
+                _rows = [
+                    _gpu_models[m]
+                    for m in _g.members
+                    if isinstance(_gpu_models.get(m), dict) and _gpu_models[m].get("value_pct") is not None
+                ]
+                if _rows:
+                    _gpu_models[_cand] = {
+                        "value_pct": min(float(r["value_pct"]) for r in _rows),
+                        "active": any(r.get("active") for r in _rows),
+                        "fraction": next((r.get("fraction") for r in _rows if r.get("fraction") is not None), None),
+                    }
+            # AGENTS (2026-11-08): a per-key agent is a hard model with a tool
+            # surface. Describe it (surface + pinned model) and borrow its
+            # pinned model's load row; a cascade agent (model='') has no single
+            # window/load, so it renders "no data" honestly.
+            for _agent in agents or []:
+                _an = str(getattr(_agent, "name", "") or "")
+                if not _an or _an not in candidates or _an in _cards:
+                    continue
+                _target = str(getattr(_agent, "model", "") or "")
+                _servers = ", ".join(getattr(_agent, "servers", ()) or ()) or "none"
+                _cards[_an] = {
+                    "description": (
+                        f"agent {_an}: {getattr(_agent, 'description', '') or 'narrow tool surface'}"
+                        f" | model: {_target or 'auto (profile cascade)'} | servers: {_servers}"
+                    )
+                }
+                if _target and isinstance(_gpu_models.get(_target), dict):
+                    _gpu_models[_an] = _gpu_models[_target]
+            gpu["models"] = _gpu_models
+        except Exception:
+            log.debug("decision model: group/agent criteria unavailable (fail-open)", exc_info=True)
         text = instructions
         if "{{" in text:
             # Honour the operator's inject_gpu_load flag, exactly as the panel
@@ -691,7 +790,7 @@ def _decision_caller(decision_model: str, policy: dict[str, Any]) -> Callable[..
         except Exception:  # never let pricing cost a decision
             prices = {}
         criteria = routing_config.render_criteria(
-            policy.get("cards") or {},
+            _cards,
             list(candidates),
             gpu=gpu,
             costs=prices,
@@ -874,6 +973,13 @@ def _pool_context_limit(model_name: str) -> int | None:
     a request for the biggest one sends it to whichever member has capacity —
     including one that cannot hold it.
     """
+    group = _group_by_name(model_name)
+    if group is not None:
+        # A GROUP is sized by its SMALLEST member: the pick may land on any
+        # member, so advertising (or context-gating on) the biggest would be
+        # the same 1M lie /v1/models refuses for an alias.
+        windows = [w for m in group.members if (w := _pool_context_limit(m)) is not None]
+        return min(windows) if windows else None
     pool = model_router.pool(model_name)
     if pool is None or not pool.endpoints:
         return None
@@ -881,7 +987,11 @@ def _pool_context_limit(model_name: str) -> int | None:
     return min(known) if known else None
 
 
-def _context_gated(base: Callable[[str], bool], body: dict[str, Any]) -> Callable[[str], bool]:
+def _context_gated(
+    base: Callable[[str], bool],
+    body: dict[str, Any],
+    agents: dict[str, Any] | None = None,
+) -> Callable[[str], bool]:
     """Wrap a ladder predicate with "this model's window can hold the prompt".
 
     WHY (2026-10-29): the ladder filtered candidates by ACL, health and budget
@@ -902,6 +1012,14 @@ def _context_gated(base: Callable[[str], bool], body: dict[str, Any]) -> Callabl
     def predicate(model_name: str) -> bool:
         if not base(model_name):
             return False
+        # AGENT (2026-11-08): the window is the pinned model's (a group's is
+        # its smallest member's); an agent on the cascade has no single window,
+        # so the base predicate's answer stands.
+        if agents and model_name in agents:
+            target = str(getattr(agents[model_name], "model", "") or "")
+            if not target:
+                return True
+            return context_window.fits(context_limit=_pool_context_limit(target), est_prompt=estimate)
         return context_window.fits(context_limit=_pool_context_limit(model_name), est_prompt=estimate)
 
     return predicate
@@ -1562,6 +1680,343 @@ def _finish_reason_of(payload: dict[str, Any]) -> str:
     return val if isinstance(val, str) else ""
 
 
+# --------------------------------------------------------------------------
+# model groups (F3): a named, load-balanced set of equivalent chat models
+# --------------------------------------------------------------------------
+#
+# A group is a SELECTION path, not a failure path (that is the ordered
+# fallback chain): a request naming a group picks a MEMBER by live load,
+# pins the conversation to it (grp: scope, core.stickiness) and to one of
+# its endpoints (ep: scope), then serves it exactly like a pinned model —
+# the MEMBER bills, the member's ACL and budgets apply, and a group never
+# makes a model reachable that the key could not reach on its own.
+#
+# Everything here is FAIL-OPEN and OFF BY DEFAULT. With
+# settings.model_groups_enabled false — or the core module absent/older
+# than this code — every helper answers 'not a group' and routing is
+# byte-identical to the pre-feature path. The core module is imported
+# INSIDE the helpers (never at module import time): an optional feature
+# must not be able to break the data plane's import.
+
+
+def _groups_module() -> Any | None:
+    """core.model_groups when the feature is enabled and importable, else None."""
+    if not settings.model_groups_enabled:
+        return None
+    try:
+        from ..core import model_groups
+    except Exception:
+        log.warning("model_groups: core module unavailable — groups inert for this request", exc_info=True)
+        return None
+    return model_groups
+
+
+def _groups_snapshot() -> dict[str, Any]:
+    """The last loaded group map (sync, no I/O); {} when groups are inert."""
+    mod = _groups_module()
+    if mod is None:
+        return {}
+    try:
+        return dict(mod.snapshot() or {})
+    except Exception:
+        log.warning("model_groups: snapshot read failed — groups inert for this request", exc_info=True)
+        return {}
+
+
+async def _groups_load() -> dict[str, Any]:
+    """Refresh (TTL-cached in core) and return the group map; {} when inert.
+
+    Never raises: a DB fault leaves the last good snapshot in place (the
+    core module's own contract) and an import fault leaves groups inert.
+    """
+    mod = _groups_module()
+    if mod is None:
+        return {}
+    try:
+        return dict(await mod.load() or {})
+    except Exception:
+        log.warning("model_groups: load failed — using the last snapshot", exc_info=True)
+        return _groups_snapshot()
+
+
+def _stick_module() -> Any | None:
+    """core.stickiness when it carries the grp: scope, else None (fail-open)."""
+    try:
+        from ..core import stickiness as _stick
+    except Exception:
+        return None
+    if not hasattr(_stick, "get_group_pin") or not hasattr(_stick, "set_group_pin"):
+        return None
+    return _stick
+
+
+def _member_score(member: str) -> float | None:
+    """Live load score for one member (None = no data); fail-open."""
+    try:
+        from ..core import load_snapshot
+    except Exception:
+        return None
+    try:
+        return load_snapshot.member_score(member)
+    except Exception:
+        log.warning("model_groups: load snapshot score failed for %r", member, exc_info=True)
+        return None
+
+
+def _group_by_name(name: str) -> Any | None:
+    """The ModelGroup for the name, or None (inert when groups are off)."""
+    mod = _groups_module()
+    if mod is None:
+        return None
+    try:
+        return mod.group_for(name)
+    except Exception:
+        log.warning("model_groups: group lookup failed for %r", name, exc_info=True)
+        return None
+
+
+def _group_acl(group: Any, key: KeyRecord) -> set[str] | None:
+    """The member ACL this key holds for the group: None = every member.
+
+    Naming the GROUP grants its members (the group is the ACL unit when the
+    key names it); otherwise each member's own allowed_models entry decides.
+    An allow-all key (empty allowed_models) grants everything, as everywhere
+    else in this module.
+    """
+    if not key.allowed_models:
+        return None
+    allowed = set(key.allowed_models)
+    if group.name in allowed:
+        return None
+    return allowed
+
+
+def _eligible_members(group: Any, key: KeyRecord) -> list[str]:
+    """The group members this key may use RIGHT NOW, in declared order.
+
+    The same four filters the fallback walker applies to a chain entry —
+    a live registered pool, the key's ACL, a chat pool, a healthy pool —
+    because a group must never widen what the key could already reach nor
+    hand a chat request an embedding pool.
+    """
+    acl = _group_acl(group, key)
+    out: list[str] = []
+    for member in group.members:
+        if acl is not None and member not in acl:
+            continue
+        pool = model_router.pool(member)
+        if pool is None or not pool.healthy():
+            continue
+        if not serves_chat(member):
+            continue
+        out.append(member)
+    return out
+
+
+def _pick_member(group: Any, eligible: list[str]) -> str | None:
+    """Power-of-two pick over the eligible members, or None when none qualify.
+
+    core.model_groups.pick_member owns the algorithm (pure); this wrapper
+    supplies the live score callback and the already-filtered candidate set,
+    and degrades to the first eligible member if the core call faults — a
+    selection bug must not turn a servable group into a 503.
+    """
+    if not eligible:
+        return None
+    mod = _groups_module()
+    if mod is not None:
+        try:
+            picked = mod.pick_member(group, set(eligible), _member_score)
+        except Exception:
+            log.warning("model_groups: pick failed for %r — first eligible member", group.name, exc_info=True)
+            picked = None
+        if picked in eligible:
+            return str(picked)
+    return eligible[0]
+
+
+def _group_candidates(group_name: str, provisional: str, key: KeyRecord) -> list[str]:
+    """Admission candidates for a group: the provisional member, then the
+    rest of the group in LOAD ORDER (lowest queue first, no-data last).
+
+    _admit_with_failover walks this list, so a rate/budget 429 on one
+    member fails over INSIDE the group instead of ending the turn or
+    escaping to a model the client never named.
+    """
+    group = _group_by_name(group_name)
+    if group is None:
+        return [provisional]
+    eligible = _eligible_members(group, key)
+    rest = [m for m in eligible if m != provisional]
+    scored = [(m, _member_score(m)) for m in rest]
+    scored.sort(key=lambda item: (item[1] is None, item[1] if item[1] is not None else 0.0))
+    return [provisional, *[m for m, _score in scored]]
+
+
+async def _group_target(
+    model: str,
+    key: KeyRecord,
+    affinity_session: str | None,
+    request_id: str = "",
+    reason: str = "load",
+    exclude: set[str] | None = None,
+) -> tuple[str, str | None]:
+    """(serving_model, group_name) for one request target.
+
+    Non-group -> (model, None) — the caller's path is untouched. Group ->
+    the conversation's pinned member when the pin still qualifies (the pin
+    rides settings.session_affinity_ttl_s, the conversation-pin lease, and
+    an expired pin reads as absent), else a power-of-two pick over the
+    members this key may use right now; the pick is written to the grp: pin
+    (best effort). Returns (model, group_name) when NO member qualifies —
+    the caller answers 503 rather than serving a name with no pool.
+
+    reason labels a non-pin pick in the decision log (load on the request
+    path, failover from the fallback walk). The log line is the audit trail
+    for why a group request went where it went.
+
+    exclude drops members a caller already knows cannot serve this request
+    (the fallback walk passes the model that just failed) — a hop must not
+    re-pick the same dead member.
+    """
+    group = _group_by_name(model)
+    if group is None:
+        return model, None
+    try:
+        eligible = [m for m in _eligible_members(group, key) if exclude is None or m not in exclude]
+        if not eligible:
+            return model, group.name
+        stick = _stick_module() if affinity_session else None
+        pinned: str | None = None
+        if stick is not None and affinity_session:
+            try:
+                pinned = await stick.get_group_pin(key.id, affinity_session, settings.session_affinity_ttl_s)
+            except Exception:
+                log.warning("model_groups: grp pin read failed — picking fresh", exc_info=True)
+                pinned = None
+        if pinned is not None and pinned in eligible:
+            member, why = pinned, "pin"
+        else:
+            if pinned is not None and stick is not None and affinity_session:
+                # The pin no longer qualifies (member left the group / the
+                # key's ACL / its pool is unhealthy): drop it and re-pick.
+                try:
+                    await stick.drop_group_pin(key.id, affinity_session)
+                except Exception:
+                    log.warning("model_groups: stale grp pin drop failed", exc_info=True)
+            picked = _pick_member(group, eligible)
+            if picked is None:
+                return model, group.name
+            member, why = picked, (reason or "load")
+        if stick is not None and affinity_session:
+            try:
+                await stick.set_group_pin(key.id, affinity_session, member)
+            except Exception:
+                log.warning("model_groups: grp pin write failed — the pick will not stick", exc_info=True)
+        log.info(
+            "group pick request_id=%s group=%s member=%s reason=%s",
+            request_id,
+            group.name,
+            member,
+            why,
+        )
+        return member, group.name
+    except Exception:
+        # The caller only reaches here when MODEL IS A GROUP (direct path) or a
+        # group chain entry, so report it as an unresolvable group: the caller
+        # answers 503 (capacity) instead of falling through to pool(group) ->
+        # 404 "not registered" (review F3-3).
+        log.warning("model_groups: resolution failed for %r (fail-open)", model, exc_info=True)
+        return model, model
+
+
+async def _group_pin_commit(
+    key: KeyRecord,
+    affinity_session: str | None,
+    group_name: str | None,
+    served_model: str,
+) -> None:
+    """Refresh the grp: pin to the member that ACTUALLY served (best effort).
+
+    The admission walk can fail over to a sibling member, so the pin written
+    at resolution time may name a model that never answered. Only a member
+    is ever pinned; a serve that ended outside the group leaves the
+    resolution-time pin alone (it is still a valid member preference, and
+    dropping it would cost the conversation its cache affinity for no
+    reason). Never raises.
+    """
+    if not group_name or not affinity_session:
+        return
+    stick = _stick_module()
+    if stick is None:
+        return
+    try:
+        group = _group_by_name(group_name)
+        if group is None:
+            await stick.drop_group_pin(key.id, affinity_session)
+            return
+        if served_model not in group.members:
+            return
+        await stick.set_group_pin(key.id, affinity_session, served_model)
+    except Exception:
+        log.warning("model_groups: grp pin commit failed (request already served)", exc_info=True)
+
+
+async def _group_pin_drop_if_dead(key: KeyRecord, affinity_session: str | None, member: str) -> None:
+    """Drop the grp: pin only when the member WHOLE pool is unhealthy.
+
+    That is the one failure the pin cannot recover from: every endpoint is
+    cooling/disabled, so the next turn must re-pick. A single transport
+    error or upstream 5xx is NOT enough — the member is still the
+    conversation's model and switching costs a full re-prefill. Never
+    raises.
+    """
+    if not affinity_session:
+        return
+    stick = _stick_module()
+    if stick is None:
+        return
+    pool = model_router.pool(member)
+    if pool is not None and pool.healthy():
+        return
+    try:
+        await stick.drop_group_pin(key.id, affinity_session)
+    except Exception:
+        log.warning("model_groups: grp pin drop failed", exc_info=True)
+
+
+async def _pins_after_serve(
+    key: KeyRecord,
+    affinity_session: str | None,
+    group_name: str | None,
+    *,
+    endpoint_id: str,
+    model: str,
+    fallback_from: str = "",
+) -> None:
+    """Refresh the conversation ep:/grp: pins after a SUCCESSFUL serve.
+
+    The streaming twin of the non-streaming commit block, same rules: the
+    endpoint pin is refreshed only when the endpoint that ANSWERED is the
+    one the pin names (a fallback hop means the pin no longer names the
+    endpoint that kept this conversation's cache warm, so it is dropped),
+    and the group pin follows the member that answered. Best-effort: any
+    fault is logged and forgotten — a pin store must never surface into a
+    stream that already delivered its content.
+    """
+    try:
+        stick = _stick_module()
+        if stick is not None and affinity_session and settings.session_affinity_enabled:
+            if fallback_from:
+                await stick.drop_endpoint_pin(key.id, affinity_session)
+            else:
+                await stick.set_endpoint_pin(key.id, affinity_session, endpoint_id)
+        if group_name is not None:
+            await _group_pin_commit(key, affinity_session, group_name, model)
+    except Exception:
+        log.warning("affinity: post-stream pin refresh failed", exc_info=True)
+
+
 async def _next_fallback_candidate(
     chain: list[str],
     served: str,
@@ -1570,6 +2025,7 @@ async def _next_fallback_candidate(
     est_tokens: int,
     request_id: str,
     started: float,
+    affinity_session: str | None = None,
 ) -> tuple[tuple[Pool, Endpoint, str, dict[str, str]] | None, list[str]]:
     """The next WALKABLE fallback candidate + the REMAINING chain, or
     (None, chain) when no candidate qualifies (review §4a).
@@ -1590,29 +2046,54 @@ async def _next_fallback_candidate(
     primary (`served`) is skipped. Bounded: the caller's chain is already
     sliced to settings.model_fallback_max, and each hop consumes its
     prefix — the walk cannot cycle or exceed the cap.
+
+    A chain entry may also name a MODEL GROUP (F3): it is resolved to one
+    eligible member here (same filters, via _group_target) and the walk
+    continues with that member's pool — the served model is the member, so
+    a group in a fallback chain is a usable hop rather than an
+    unregistered name. `affinity_session` is the conversation's affinity
+    key (None = no pin read/write), so a group hop can honour the
+    conversation's grp: pin instead of re-picking by load.
     """
     if endpoint != "chat":
         return None, chain
     registered = set(model_router.models())
+    groups = _groups_snapshot()
     for idx, cand in enumerate(chain):
         if cand == served:
             continue
-        if cand not in registered:
+        # MODEL GROUP (F3): a chain entry may name a group. Pick a member
+        # with the SAME filters the request path uses and walk on with ITS
+        # pool — the served model is the member (the caller names it from
+        # cand_ep.model_name, exactly like any other hop). No member
+        # qualifies -> the candidate is skipped, never served by name.
+        target, group_name = cand, None
+        if cand in groups:
+            target, group_name = await _group_target(
+                cand, key, affinity_session, request_id, reason="failover", exclude={served}
+            )
+            if group_name is None or target == group_name:
+                continue
+        if target == served:
             continue
-        if key.allowed_models and cand not in key.allowed_models:
+        if target not in registered:
             continue
-        cand_pool = model_router.pool(cand)
+        if group_name is None and key.allowed_models and target not in key.allowed_models:
+            # A group grants its members by name (the helper already applied
+            # that filter); any other candidate is gated on its own ACL.
+            continue
+        cand_pool = model_router.pool(target)
         if cand_pool is None or not cand_pool.healthy():
             continue
-        if not serves_chat(cand):
+        if not serves_chat(target):
             continue
         try:
-            budget = await check_budgets(key.id, cand, est_tokens)
+            budget = await check_budgets(key.id, target, est_tokens)
         except Exception:
-            log.warning("fallback: budget check failed for %r — skipping candidate", cand)
+            log.warning("fallback: budget check failed for %r — skipping candidate", target)
             continue
         if not budget.ok:
-            await settle(key.id, cand, endpoint, 0, 0, "budget_exceeded", _latency_ms(started), request_id)
+            await settle(key.id, target, endpoint, 0, 0, "budget_exceeded", _latency_ms(started), request_id)
             continue
         cand_ep = cand_pool.pick()
         if cand_ep is None:
@@ -1656,6 +2137,7 @@ class _StreamLedger:
         off_base: float = 1.0,
         pre_events: list[dict[str, Any]] | None = None,
         route: model_routing.RouteDecision | None = None,
+        on_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._key = key
         self._model = model
@@ -1681,6 +2163,11 @@ class _StreamLedger:
         self.extra_events: list[dict[str, Any]] = []
         self.defer_finish = False
         self.override_status: str | None = None
+        # Post-completion hook (session affinity / model groups): runs ONLY
+        # when the stream actually completed, so a pin is refreshed on a
+        # served turn and left alone on a client disconnect. Fire-and-forget
+        # by contract — a pin fault must never corrupt a delivered stream.
+        self._on_complete = on_complete
 
     def feed(self, line: bytes) -> None:
         """Inspect one complete SSE line for [DONE] / usage.
@@ -1770,6 +2257,14 @@ class _StreamLedger:
             latency,
             self._request_id,
         )
+        # A COMPLETED stream is a served turn: refresh the conversation's
+        # pins (the streaming half of the non-streaming commit block). A
+        # disconnect or an upstream error leaves them as they were.
+        if self.completed and self._on_complete is not None:
+            try:
+                await self._on_complete()
+            except Exception:
+                log.warning("affinity: post-stream pin refresh failed", exc_info=True)
 
 
 # Cross-request identical-call loop guard (per key). The relay's IN-LOOP
@@ -2784,6 +3279,8 @@ async def _stream_chat(
     route: model_routing.RouteDecision | None = None,
     fallback_from: str = "",
     fallback_chain: list[str] | None = None,
+    affinity_session: str | None = None,
+    group_name: str | None = None,
 ) -> Response:
     """Open an upstream SSE stream and wrap it for pass-through relay.
 
@@ -2821,6 +3318,14 @@ async def _stream_chat(
     semantics), so the gate RELIEVES queue pressure instead of feeding it.
     The peeked bytes are replayed as `_relay_sse(prefix=...)`, so the client
     sees the upstream stream byte-for-byte.
+
+    `affinity_session` / `group_name` (F3): the conversation's affinity key
+    and the model group this request named, if any. They arm the
+    COMPLETED-stream pin refresh — the streaming half of the non-streaming
+    commit block — so a pinned conversation no longer silently loses its
+    pin after the TTL just because its turns streamed. The refresh runs in
+    the ledger's finish (shielded, after settle), only when the stream
+    actually completed; a disconnect leaves the pins untouched.
     """
     off_base = offpeak.key_fraction(key)  # profile fraction ?? env default
     # Ask the upstream for REAL usage so the ledger settles facts, not
@@ -3007,8 +3512,33 @@ async def _stream_chat(
         )
 
     await cur_pool.report(cur_ep, True)
+
+    async def _refresh_pins() -> None:
+        """Pin refresh after a COMPLETED stream (see _pins_after_serve).
+
+        The closure reads the FINAL attempt's facts (cur_ep / cur_model /
+        fallback_from are the values of the attempt that is serving now),
+        so a mid-walk hop is reflected instead of the original pick.
+        """
+        await _pins_after_serve(
+            key,
+            affinity_session,
+            group_name,
+            endpoint_id=cur_ep.id,
+            model=cur_model,
+            fallback_from=fallback_from,
+        )
+
     ledger = _StreamLedger(
-        key, cur_model, est_tokens, request_id, started, off_base, pre_events=pre_events, route=route
+        key,
+        cur_model,
+        est_tokens,
+        request_id,
+        started,
+        off_base,
+        pre_events=pre_events,
+        route=route,
+        on_complete=_refresh_pins if (affinity_session or group_name is not None) else None,
     )
     stream_headers = _relay_headers(
         cur_headers,
@@ -3582,8 +4112,19 @@ async def chat_completions(
     # headroom when the key's profile has an ordering. Pinned requests to
     # available models never cascade.
     est_tokens = _estimate_tokens(body)
-    registered = set(model_router.models())
+    registered_models = set(model_router.models())
     requested_model = model
+    # --- model groups (F3): a group name is a REGISTERED, PINNED target ----
+    # A group is a selection path over equivalent chat models: it classifies
+    # and admits like a pinned model (never cascades), and the MEMBER chosen
+    # below is what bills and what the ACL/budget gates see. Group names are
+    # added to the CLASSIFICATION/ADMISSION set only — never to the
+    # budget-capacity maps or the routing ladder (a group has no budget of
+    # its own, and v1 keeps groups out of profile order/cascade).
+    groups = await _groups_load()
+    group_names = set(groups)
+    registered = registered_models | group_names
+    group_name: str | None = None
 
     # --- complexity routing (pseudo-models `routing` / `routing__X`) --------
     # Engages ONLY for those two name shapes, and even then only when the
@@ -3617,6 +4158,19 @@ async def chat_completions(
         _rdef = False
         _routable_models = None
     _routable = model_routing.is_routable_name(model, _rdef)
+    # AGENT CANDIDATES (2026-11-08): an agent is a hard model (tool surface +
+    # pinned model/cascade) but it is PER-KEY (the profile's agent menu), so it
+    # cannot live in the global allowlist. Fetch the key's OFFERED agents once,
+    # only when routing is armed AND the flag is on; a fault degrades to no
+    # agent candidates (fail-open — the router keeps its model ladder).
+    _routing_agents: list[Any] = []
+    if settings.routing_agents_enabled and _routable:
+        try:
+            _routing_agents = [a for a in await agents_mod.for_key(key.id) if a.offered]
+        except Exception:
+            log.warning("routing: agent candidates unavailable (fail-open)", exc_info=True)
+            _routing_agents = []
+    _agent_map = {a.name: a for a in _routing_agents}
     try:
         # The order is fetched here (not inside the router) so the no-ladder
         # special cases and the cascade reuse ONE lookup; resolve_cascade
@@ -3630,7 +4184,11 @@ async def chat_completions(
         # both consumers) rather than inside core.model_routing, which is pure
         # and takes the ladder as given.
         if order:
-            order = [m for m in order if serves_chat(m)]
+            # MODEL GROUPS (2026-11-08) are valid ladder entries: a group is a
+            # chat-capable target whose MEMBER is picked at request time, so
+            # serves_chat(group) is False (it is not a pool) but it must stay
+            # on the routing ladder. Pools still need the chat-type filter.
+            order = [m for m in order if serves_chat(m) or _group_by_name(m) is not None]
         # GLOBAL LADDER (2026-10-28): the profile order is a CASCADE ordering;
         # a profile that declares none used to make bare `routing` 404
         # ("routing requires a profile model ordering"), i.e. the feature
@@ -3681,7 +4239,7 @@ async def chat_completions(
 
             _policy = await _rc.decision_settings()
             if _policy["mode"] in ("shadow", "active") and _policy["model"]:
-                _caller = _decision_caller(_policy["model"], _policy)
+                _caller = _decision_caller(_policy["model"], _policy, agents=_routing_agents)
                 if _caller is not None:
                     from ..core import decision_routing as _dr
 
@@ -3766,7 +4324,7 @@ async def chat_completions(
                 # 100k-token request, which admission then 429'd: a needless
                 # routing hop, a 'budget_exceeded' ledger row and a walk the
                 # user never asked for.
-                _capacity = await _budgets.model_capacity(key.id, sorted(registered), est_tokens)
+                _capacity = await _budgets.model_capacity(key.id, sorted(registered_models), est_tokens)
             except Exception as exc:
                 log.warning("routing: capacity lookup failed (fail-open): %s", exc)
                 _capacity = {}
@@ -3775,14 +4333,18 @@ async def chat_completions(
         # context window cannot hold this prompt must not be offered to the
         # router at all (2026-10-29). Same seam, same fail-open posture as the
         # budget predicate it wraps.
-        _available = _routing_available(key, _capacity) if _routable else None
+        _available = _routing_available(key, _capacity, agents=_agent_map) if _routable else None
         if _available is not None:
-            _available = _context_gated(_available, body)
+            _available = _context_gated(_available, body, agents=_agent_map)
         model, route_ctx = await model_routing.resolve_routed_model(
             key,
             body,
             model,
-            registered,
+            # REAL models + GROUPS + AGENTS (2026-11-08): all three are hard
+            # routing targets. The union is used ONLY for the named ceiling
+            # check inside resolve_routed_model; candidate availability is the
+            # group/agent-aware predicate below.
+            registered_models | group_names | set(_agent_map),
             key.allowed_models,
             order,
             available=_available,
@@ -3793,6 +4355,9 @@ async def chat_completions(
             routable_models=_routable_models,
             incumbent=_incumbent,
             switch_margin=float(_policy.get("switch_margin") or 0.0) if _policy else 0.0,
+            # Per-key agents join the window at the cheap end (undeclared
+            # capability must not outrank the operator's ladder).
+            extra_candidates=[a.name for a in _routing_agents] or None,
         )
         # ACTIVE mode: the routed model IS the request's effective pinned
         # model — the admission failover below must classify it as pinned.
@@ -3827,6 +4392,17 @@ async def chat_completions(
     except Exception:
         log.warning("cascade: thread fingerprint failed — load-aware head disabled for this request", exc_info=True)
         _cascade_thread = None
+    # --- affinity key (session affinity / model groups) --------------------
+    # The conversation's pin identity: the client's X-PCAI-Session when it
+    # sends one, else the SAME thread fingerprint the canonical store and
+    # the load-aware head already use. Deriving it means endpoint and group
+    # pins work with NO client change, per conversation. Computed when
+    # EITHER feature is on; each pin SCOPE has its own gate at its own seam
+    # (ep: only under session_affinity_enabled, grp: only under
+    # model_groups_enabled), and None means no pin (no header, no seed).
+    affinity_session: str | None = None
+    if settings.session_affinity_enabled or settings.model_groups_enabled:
+        affinity_session = (request.headers.get("x-pcai-session") or "").strip() or _cascade_thread
     # --- three-state relay resolution, EARLY (audit L-2): the plain-chat
     # capture below must not run on a RELAYED request — the relay branch owns
     # that turn's store rows (the reconcile save + the loop's own terminal
@@ -3897,21 +4473,33 @@ async def chat_completions(
     #      distinguishable.
     #   2. an agent may pin a model, which turns the rest of this block into an
     #      ordinary pinned request (budgets, ACL, fallbacks all unchanged).
-    # SKIPPED for registered names (pinned), routing pseudo-models, and the two
-    # reserved aliases — so the dominant `auto` path pays nothing for this
-    # feature (no extra query).
+    # The lookup name is the POST-ROUTING model: in ACTIVE routing the router
+    # may have picked a per-key AGENT, and that pick must apply the agent's
+    # surface + prompt exactly like a client-named agent (safe: routing happens
+    # BEFORE the request is prepared). SKIPPED for registered pools, groups,
+    # the reserved aliases, and shadow/off routing (which keeps the pseudo
+    # name) — so the dominant `auto` path pays nothing for this feature.
     agent: agents_mod.Agent | None = None
-    if _pseudo is None and requested_model not in registered and requested_model not in agents_mod.RESERVED_NAMES:
+    _agent_lookup = model
+    if (
+        # A pseudo-model (shadow/off routing keeps the pseudo NAME) is never an
+        # agent; checking the POST-routing name keeps the dominant shadow path
+        # free of an agent-registry query.
+        model_routing.detect_pseudo_model(_agent_lookup) is None
+        and _group_by_name(_agent_lookup) is None
+        and _agent_lookup not in registered
+        and _agent_lookup not in agents_mod.RESERVED_NAMES
+    ):
         try:
-            _key_agents = await agents_mod.for_key(key.id)
-            agent = agents_mod.pick(_key_agents, requested_model)
+            _key_agents = _routing_agents or await agents_mod.for_key(key.id)
+            agent = agents_mod.pick(_key_agents, _agent_lookup)
             if agent is None:
                 # NEAR MISS (case-only): a model id is exact, so this is a
                 # typo, not an alias request. Refuse it BY NAME — falling
                 # through would serve the profile FULL surface for a caller who
                 # asked for a narrow agent, and a silent cascade is
                 # indistinguishable from success.
-                _near = agents_mod.near_miss(_key_agents, requested_model)
+                _near = agents_mod.near_miss(_key_agents, _agent_lookup)
                 if _near is not None:
                     raise fastapi.HTTPException(
                         404,
@@ -3919,7 +4507,7 @@ async def chat_completions(
                             "type": "agent_name_case",
                             "did_you_mean": _near.name,
                             "message": (
-                                f"{requested_model!r} is not a model id; agents are matched exactly"
+                                f"{_agent_lookup!r} is not a model id; agents are matched exactly"
                                 f" — did you mean {_near.name!r}?"
                             ),
                         },
@@ -3933,7 +4521,7 @@ async def chat_completions(
             # permission decision (the 403 below requires a successful read).
             log.warning(
                 "agents: registry unavailable — serving %r without agent scoping (profile surface applies)",
-                requested_model,
+                _agent_lookup,
             )
             agent = None
         if agent is not None:
@@ -3954,8 +4542,25 @@ async def chat_completions(
             # head, admission failover — nothing special-cased).
             model = agent.model or "auto"
 
+    # --- model group ACL bridge -------------------------------------------
+    # A group name classifies as a registered PINNED target (added to the
+    # classification set above), and resolve_cascade's ACL test is
+    # 'registered and inside allowed_models'. Naming a GROUP grants its
+    # members, so when the key's ACL lists a MEMBER rather than the group
+    # name, the group name is allowed for THIS resolution — the member-level
+    # filter in _group_target then decides which members are reachable. A
+    # group never widens the ACL: _eligible_members intersects the same
+    # allowed_models (or the group-name grant), never more.
+    _resolve_allowed = key.allowed_models
+    if (
+        model in group_names
+        and key.allowed_models
+        and model not in key.allowed_models
+        and _eligible_members(groups[model], key)
+    ):
+        _resolve_allowed = [*key.allowed_models, model]
     resolution = await resolve_cascade(
-        key.id, model, registered, key.allowed_models, est_tokens, thread_key=_cascade_thread
+        key.id, model, registered, _resolve_allowed, est_tokens, thread_key=_cascade_thread
     )
     if not resolution.ok:
         detail: dict[str, Any] = {"error": resolution.reason}
@@ -3975,6 +4580,19 @@ async def chat_completions(
             route_ctx.sticky_finish(model)
         except Exception:
             log.warning("routing: deferred sticky commit failed - floor not persisted", exc_info=True)
+    # --- model group -> provisional member (BEFORE the pool/type gate) -----
+    # resolve_cascade above resolved the NAME; a group still needs its
+    # MEMBER. Resolved here so the type gate, the guardrail lookup, the
+    # routing log line and every budget/rate gate below see the model that
+    # will actually serve. The grp: pin makes this stable per conversation;
+    # with no pin it is a power-of-two pick over the live load snapshot
+    # (core.load_snapshot). NO member qualifies -> 503: the group is real
+    # but nothing in it can serve right now, which is a capacity answer, not
+    # a 404.
+    if model in group_names:
+        model, group_name = await _group_target(model, key, affinity_session, request_id)
+        if group_name is not None and model == group_name:
+            raise fastapi.HTTPException(503, f"no member of model group {group_name!r} can serve right now")
     # Per-request routing decision (observability, 2026-10-17): the gateway
     # logged cascade EVENTS only, so "which model actually served this
     # request, and why" was unanswerable in production — a pinned request
@@ -4248,7 +4866,18 @@ async def chat_completions(
     # The cascade already failovers BUDGET headroom; this walk adds the RATE
     # axis. Alias/auto requests only — pinned requests never cascade (the
     # client asked for THAT model; documented cascade semantics).
-    candidates = [resolution.model]
+    #
+    # MODEL GROUP (F3): a group admits its MEMBERS. The provisional pick
+    # leads and the rest of the group follows in load order, so a
+    # rate/budget 429 on one member fails over INSIDE the group instead of
+    # ending the turn. resolution.gate is the GROUP NAME's gate (key-level
+    # only), so it is NOT handed to the walk as a precomputed member gate —
+    # each member gets its own budget check (a group must never bypass a
+    # member's budget).
+    if group_name is not None:
+        candidates = _group_candidates(group_name, model, key)
+    else:
+        candidates = [resolution.model]
     is_alias = classify_request(requested_model, registered, key.allowed_models) == "alias"
     if is_alias:
         # P1 (perf round 2026-10-16): resolution.order already carries the
@@ -4321,7 +4950,14 @@ async def chat_completions(
             )
 
     model, gate, admission_fallback_from = await _admit_with_failover(
-        key, candidates, est_tokens, request_id, started, resolution.gate
+        key,
+        candidates,
+        est_tokens,
+        request_id,
+        started,
+        # A group's gate belongs to the GROUP NAME, not to the member about
+        # to be admitted: re-check each member instead (no budget bypass).
+        None if group_name is not None else resolution.gate,
     )
     warn_level = gate.warn_level
     # The admission walk may have PROMOTED the request to a different model
@@ -4364,6 +5000,16 @@ async def chat_completions(
         # per-model budget bypass). Re-resolve for the model that will serve.
         # Inside the try: the gates have already taken the in-flight slot, so
         # every raise here must go through the release path below.
+        #
+        # MODEL GROUP (F3, defensive): every path above resolves a group to a
+        # MEMBER before admission, so this should be a no-op. Kept because a
+        # group name reaching the pool lookup would 404 a servable request —
+        # resolve it (and 503 when nothing qualifies) instead of serving a
+        # name that has no pool.
+        if model in group_names:
+            model, group_name = await _group_target(model, key, affinity_session, request_id, reason="failover")
+            if group_name is not None and model == group_name:
+                raise fastapi.HTTPException(503, f"no member of model group {group_name!r} can serve right now")
         pool = model_router.pool(model)
         if pool is None:
             raise fastapi.HTTPException(404, f"model {model!r} is not registered")
@@ -4375,27 +5021,33 @@ async def chat_completions(
         # Pin the conversation to an ENDPOINT so its prefix keeps hitting the
         # same server's KV cache. Three gates before a pin is even read:
         # the fleet flag, a non-relay request (the relay re-picks per
-        # iteration and would fight the pin), and a session id in the
-        # header. Routing STATE, never policy: the pin is validated against
+        # iteration and would fight the pin), and an affinity key (the
+        # client's session header, else the conversation fingerprint computed
+        # above). Routing STATE, never policy: the pin is validated against
         # the LIVE pool by pick() itself, and the store is refreshed on a
         # successful serve and dropped the moment the endpoint proves it
         # cannot serve (breaker trip / transport error / upstream error).
-        affinity_session: str | None = None
+        # ENDPOINT affinity only: the grp: pin has its OWN gate (model
+        # groups are independent of endpoint affinity), so the affinity key
+        # may exist for a group request while ep pins stay off.
+        ep_session: str | None = affinity_session if settings.session_affinity_enabled and not relay_requested else None
         preferred_ep: str | None = None
-        if settings.session_affinity_enabled and not relay_requested:
-            affinity_session = (request.headers.get("x-pcai-session") or "").strip() or None
-            if affinity_session:
-                from ..core import stickiness as _stick
+        if ep_session:
+            from ..core import stickiness as _stick
 
-                preferred_ep = await _stick.get_endpoint_pin(key.id, affinity_session, settings.session_affinity_ttl_s)
+            preferred_ep = await _stick.get_endpoint_pin(key.id, ep_session, settings.session_affinity_ttl_s)
         ep = pool.pick(preferred_ep)
         if ep is None:
             # No healthy endpoint at all: the pinned one (if any) is dead
             # with the rest — drop the pin so the next turn re-picks fresh.
-            if affinity_session:
+            if ep_session:
                 from ..core import stickiness as _stick
 
-                await _stick.drop_endpoint_pin(key.id, affinity_session)
+                await _stick.drop_endpoint_pin(key.id, ep_session)
+            # The group pin goes too: the member's WHOLE pool is unhealthy —
+            # the one failure a pin cannot recover from. A single transport
+            # error or upstream 5xx is NOT enough (see _group_pin_drop_if_dead).
+            await _group_pin_drop_if_dead(key, affinity_session, model)
             # Ledger-worthy error outcome: the request was admitted but served
             # by nobody, so budgets should still see that it happened.
             await settle(
@@ -4416,7 +5068,9 @@ async def chat_completions(
             # fresh budget headroom — the fallback is never a budget bypass).
             # Release still happens in the except below (one release path for
             # every post-gate outcome).
-            nxt, fb_rest = await _next_fallback_candidate(fb_chain, "", key, "chat", est_tokens, request_id, started)
+            nxt, fb_rest = await _next_fallback_candidate(
+                fb_chain, "", key, "chat", est_tokens, request_id, started, affinity_session
+            )
             if nxt is None:
                 raise fastapi.HTTPException(503, "no healthy upstream")
             fallback_from = model  # the chain hop answers; the primary failed
@@ -4901,6 +5555,10 @@ async def chat_completions(
             )
             stream_headers["Cache-Control"] = "no-cache"
             stream_headers["X-PCAI-Relay"] = "streaming"
+            if group_name is not None:
+                # The route was a GROUP: name it (the member rides
+                # X-PCAI-Served-Model, the endpoint X-PCAI-Endpoint).
+                stream_headers["X-PCAI-Group"] = group_name
             if compress_mode != "off":
                 stream_headers["X-PCAI-Compress-Tools"] = compress_mode
             if guardrail_post:
@@ -4953,7 +5611,7 @@ async def chat_completions(
         # Releasing here — at response-object construction — would free the
         # slot before a single chunk was consumed, voiding the cap for the
         # exact workload it exists to constrain.
-        return await _stream_chat(
+        stream_resp = await _stream_chat(
             pool,
             ep,
             url,
@@ -4970,7 +5628,14 @@ async def chat_completions(
             route=route_ctx,
             fallback_from=fallback_from,
             fallback_chain=fb_chain,
+            affinity_session=affinity_session,
+            group_name=group_name,
         )
+        if group_name is not None:
+            # Headers are still mutable here: the stream has not started
+            # (the first body chunk is what sends them).
+            stream_resp.headers["X-PCAI-Group"] = group_name
+        return stream_resp
     try:
         resp = await _proxy_json(
             pool,
@@ -4996,18 +5661,32 @@ async def chat_completions(
         # Transport failure / chain exhausted: the pinned endpoint just
         # proved dead — drop the pin so the next turn re-picks fresh, then
         # re-raise untouched (the slot-leak release below still runs).
-        if affinity_session:
+        if ep_session:
             from ..core import stickiness as _stick
 
-            await _stick.drop_endpoint_pin(key.id, affinity_session)
+            await _stick.drop_endpoint_pin(key.id, ep_session)
+        # The GROUP pin survives a single failure: the member is still the
+        # conversation's model, and re-picking would cost a full re-prefill.
+        # It is dropped only when the member's WHOLE pool is unhealthy.
+        await _group_pin_drop_if_dead(key, affinity_session, model)
         raise
     finally:
         _release_in_flight(key.id)
-    # --- session affinity commit (non-streaming surface only) ---------------
-    # The stream path cannot know success at response-construction time, so
-    # it benefits from READING a pin (pick above) without refreshing one —
-    # a deliberate best-effort gap, not a correctness one.
-    if affinity_session:
+    # --- group / session affinity commit (non-streaming surface) -----------
+    # The streaming surface refreshes the SAME pins, but at its own
+    # completion point: _stream_chat hands the ledger an on_complete hook
+    # (_pins_after_serve) that runs only when the stream actually finished,
+    # so a streamed turn is not a pin-refresh gap. This block is the
+    # non-streaming half of the same rule.
+    if group_name is not None:
+        # The route was a GROUP: name it on the response (the member rides
+        # X-PCAI-Served-Model, the endpoint X-PCAI-Endpoint).
+        resp.headers["X-PCAI-Group"] = group_name
+        if _is_2xx(resp.status_code):
+            # The admission walk may have failed over to a SIBLING member:
+            # pin what actually served, not the provisional pick.
+            await _group_pin_commit(key, affinity_session, group_name, model)
+    if ep_session:
         from ..core import stickiness as _stick
 
         if (
@@ -5018,13 +5697,13 @@ async def chat_completions(
             # The pinned endpoint served THIS turn: refresh the pin (and
             # its TTL clock) with what actually answered. Best-effort by
             # contract — a store fault never fails the request.
-            await _stick.set_endpoint_pin(key.id, affinity_session, ep.id)
+            await _stick.set_endpoint_pin(key.id, ep_session, ep.id)
         else:
             # Upstream error, or a fallback hop served instead of the pin:
             # the pin no longer names the endpoint that kept this
             # conversation's cache warm — drop it (same trigger that drops
             # it on a breaker trip: the endpoint proved it cannot serve).
-            await _stick.drop_endpoint_pin(key.id, affinity_session)
+            await _stick.drop_endpoint_pin(key.id, ep_session)
     return resp
 
 
@@ -5540,6 +6219,34 @@ async def list_models(
         }
         for m in registered
     ]
+    # --- MODEL GROUPS (F3) -------------------------------------------------
+    # A group is a callable model id, so it is advertised like one: one entry
+    # per group this key may use, owned_by 'group' (a client can tell a
+    # SELECTION SET from a real pool), sized by the SMALLEST member window —
+    # the same 'an alias is sized by its smallest candidate' rule the auto
+    # entry follows. A group the key's ACL reaches neither by name nor
+    # through a member is never listed: an entry that always 403s is a lie.
+    if settings.model_groups_enabled:
+        # AWAIT the load (10s TTL inside the core module): the group map is
+        # read from the cache below, and a cold cache would hide every group
+        # until the first admin write.
+        for _gname, _group in (await _groups_load()).items():
+            _gacl = _group_acl(_group, key)
+            _gmembers = [
+                m for m in _group.members if (_gacl is None or m in _gacl) and model_router.pool(m) is not None
+            ]
+            if not _gmembers:
+                continue
+            data.append(
+                {
+                    "id": _gname,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "group",
+                    **_advertised_caps(_gmembers),
+                    "pcai": {"type": "group", "members": _gmembers},
+                }
+            )
     # `auto` only when the ordering offers at least one callable candidate —
     # an auto with no resolvable model would just 404 at send time.
     # (order/registered_set computed above for the primary flag.)
@@ -5601,9 +6308,23 @@ async def list_models(
     # pseudo-models while the switch is OFF offered names that then behave as
     # plain aliases — a listing that contradicts the behaviour.
     if settings.routing_enabled and policy in ("shadow", "active") and await model_routing.global_enabled():
-        chat_registered = [
-            m for m in registered if (p := model_router.pool(m)) is not None and p.endpoints and pool_serves_chat(p)
-        ]
+        # MODEL GROUPS (2026-11-08): a group is a routing candidate like any
+        # chat model, so it is advertised as "routing__<group>" too. Loaded via
+        # the same TTL-cached helper the group listing above uses.
+        _routing_groups = await _groups_load()
+        # AGENTS (2026-11-08): per-key hard models, advertised as
+        # "routing__<agent>" only when the flag is on and the key is offered it.
+        _routing_agent_names: list[str] = []
+        if settings.routing_agents_enabled:
+            try:
+                _routing_agent_names = [a.name for a in await agents_mod.for_key(key.id) if a.offered]
+            except Exception:
+                _routing_agent_names = []  # fail-open: no agent entries
+        chat_registered = (
+            [m for m in registered if (p := model_router.pool(m)) is not None and p.endpoints and pool_serves_chat(p)]
+            + [g.name for g in _routing_groups.values() if getattr(g, "model_type", "chat") == "chat"]
+            + _routing_agent_names
+        )
         # WINDOWED CAPACITY (2026-11-03): a routing pseudo-model is usable only
         # while SOME rung of its floor..ceiling window has budget headroom, and
         # "about to run out" is the tightest rung's band. The window is built
@@ -5638,7 +6359,11 @@ async def list_models(
             else:
                 ceiling = rid.split("__", 1)[1]
             window = (
-                [m for m in model_routing._window(cheap_first, ceiling, _min_model) if m in registered_set]
+                [
+                    m
+                    for m in model_routing._window(cheap_first, ceiling, _min_model)
+                    if m in registered_set or m in _routing_groups or m in _routing_agent_names
+                ]
                 if ceiling
                 else []
             )

@@ -28,8 +28,8 @@ values.
 
 | File | Target | Highlights |
 |---|---|---|
-| [`values.g2.yaml`](values.g2.yaml) | Proxied corporate PCAI site (placeholder addresses) | `proxy:` dict wired (corporate egress proxy + `noProxy`), PVC + MinIO (`mlis-models` bucket), `project-user-*` namespaces, `downloader.hf.verifyTls: false` (MITM proxy with an untrusted cert — secure default is verify-on), `pcai.enabled: true` explicit. |
-| [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | Customer-hosted PCAI (hosted trial) | `${DOMAIN_NAME}` placeholders for EZUA ingress, direct egress (`proxy: {}`), storage backend choice, Kyverno gate called out in the header. |
+| [`values.g2.yaml`](values.g2.yaml) | Proxied corporate PCAI site (placeholder addresses) | `proxy:` dict wired (corporate egress proxy + `noProxy`), PVC + MinIO (`mlis-models` bucket), `project-user-*` namespaces, `downloader.hf.verifyTls: false` (MITM proxy with an untrusted cert — secure default is verify-on), `pcai.enabled: true` explicit, and the `oidc:` issuer/JWKS pair the admin deletion gate verifies tokens against. |
+| [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | Customer-hosted PCAI (hosted trial) | `${DOMAIN_NAME}` placeholders for EZUA ingress, direct egress (`proxy: {}`), storage backend choice, the `oidc:` issuer/JWKS pair for admin-gate token verification, Kyverno gate called out in the header. |
 
 ## Using a file on PCAI
 

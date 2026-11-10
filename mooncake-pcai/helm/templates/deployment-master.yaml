@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-master
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.master.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.name }}-master
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.name }}-master
+        hpe-ezua/type: vendor-service
+        hpe-ezua/app: {{ .Chart.Name }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: master
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["mooncake_master"]
+          args:
+            # $(POD_IP) is expanded by the kubelet from the env below.
+            - --rpc_address=$(POD_IP)
+            - --rpc_port={{ .Values.master.rpcPort }}
+            - --enable_http_metadata_server=true
+            - --http_metadata_server_host=$(POD_IP)
+            - --http_metadata_server_port={{ .Values.master.metadataPort }}
+            - --metrics_port={{ .Values.master.metricsPort }}
+            - --eviction_high_watermark_ratio={{ .Values.master.evictionHighWatermarkRatio }}
+            - --enable_metadata_cleanup_on_timeout=true
+            - --client_ttl={{ .Values.master.clientTtlSeconds }}
+            - --allocation_strategy={{ .Values.master.allocationStrategy }}
+            - --enable_offload={{ .Values.master.enableOffload }}
+            - --quota_bytes={{ .Values.master.quotaBytes }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- if .Values.master.metadata.existingSecret }}
+            - name: MC_METADATA_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.master.metadata.existingSecret }}
+                  key: {{ .Values.master.metadata.existingSecretKey }}
+            {{- else if .Values.master.metadata.allowInsecure }}
+            # The embedded metadata server refuses to bind a non-loopback
+            # address without a token. This is the documented escape hatch for
+            # a trusted cluster namespace. Replace with a token Secret for
+            # anything less trusted (see values.yaml).
+            - name: MC_METADATA_HTTP_ALLOW_INSECURE
+              value: "1"
+            {{- end }}
+          ports:
+            - name: rpc
+              containerPort: {{ .Values.master.rpcPort }}
+            - name: metadata
+              containerPort: {{ .Values.master.metadataPort }}
+            - name: metrics
+              containerPort: {{ .Values.master.metricsPort }}
+          readinessProbe:
+            tcpSocket:
+              port: metadata
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.master.resources | nindent 12 }}

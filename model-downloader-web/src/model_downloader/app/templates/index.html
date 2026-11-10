@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,23 +7,57 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v={{ assets['favicon.jpg'] }}">
   <link rel="stylesheet" href="/static/style.css?v={{ assets['style.css'] }}">
   <script>
+    // Theme — Auto (default, follows the OS) / Light / Dark, remembered per browser.
+    var THEME_KEY = 'md-theme';
+
+    // Pre-paint resolver: apply the saved choice before first paint.
     (function () {
-      var root = document.documentElement;
-      var saved = localStorage.getItem('md-theme');
-      var dark = saved === 'dark' || (saved !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
-      if (dark) root.setAttribute('data-theme', 'dark');
-      document.addEventListener('DOMContentLoaded', function () {
-        var btn = document.getElementById('theme-toggle');
-        if (!btn) return;
-        btn.textContent = dark ? 'Light' : 'Dark';
-        btn.addEventListener('click', function () {
-          dark = !dark;
-          root.setAttribute('data-theme', dark ? 'dark' : '');
-          localStorage.setItem('md-theme', dark ? 'dark' : 'light');
-          btn.textContent = dark ? 'Light' : 'Dark';
-        });
-      });
+      var t = 'auto';
+      try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
     })();
+
+    function applyTheme(t) {
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+      try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-theme-btn') === t;
+        btns[i].classList.toggle('on', on);
+        btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+
+    // Auto resolves to the OS scheme — no consumer may treat data-theme as binary.
+    function effectiveTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (t === 'light' || t === 'dark') return t;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+
+    function initTheme() {
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () {
+          applyTheme(this.getAttribute('data-theme-btn'));
+        });
+      }
+      var saved = 'auto';
+      try { saved = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      applyTheme(saved);
+      // The palette is pure CSS, so an OS flip while in Auto needs no re-render;
+      // the listener stays as the hook for any follow-up added later.
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+          if (document.documentElement.getAttribute('data-theme') !== 'auto') return;
+          document.dispatchEvent(new CustomEvent('md-theme-change', { detail: { theme: effectiveTheme() } }));
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', initTheme);
   </script>
 </head>
 <body>
@@ -35,7 +69,11 @@
       <a href="/catalog" class="nav-link">Model Catalog</a>
     </nav>
     <span class="spacer"></span>
-    <button id="theme-toggle" class="theme-toggle" type="button">Dark</button>
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
     <span class="tag">Parallel models: {{ max_concurrency }}</span>
   </header>
   <main>
@@ -48,7 +86,7 @@
         <div class="combo">
           <input name="namespace" id="ns-input" autocomplete="off"
                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
-                 value=""
+                 value="{{ default_namespace }}"
                  placeholder="project-user-{INSERT_YOUR_NAME}">
           <button type="button" id="ns-toggle" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
           <div id="ns-menu" class="combo-menu" hidden></div>
@@ -197,7 +235,7 @@
         <div class="combo">
           <input name="namespace" id="ns-input-debug" autocomplete="off"
                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
-                 value=""
+                 value="{{ default_namespace }}"
                  placeholder="project-user-{INSERT_YOUR_NAME}">
           <button type="button" id="ns-toggle-debug" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
           <div id="ns-menu-debug" class="combo-menu" hidden></div>

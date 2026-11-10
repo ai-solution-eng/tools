@@ -61,6 +61,7 @@ step 3).
 | `X-PCAI-Route` | The complexity-routing decision in effect for THIS chat response — on every response of a profile whose `routing_policy` is `shadow`/`active`: `shadow ceiling=<m> would=<m> reason=<cut>`, `active ceiling=<m> served=<m> reason=<cut>`, `off` (profile opted in, fleet switch down), or `... reason=direct` for non-pseudo models. Absent when the profile policy is `off` |
 | `X-PCAI-Served-Model` | The model that ACTUALLY answered (post-cascade/post-routing/post-fallback truth) — on every chat response |
 | `X-PCAI-Endpoint` | The endpoint id (a `model_endpoints` row) that served this response — on every chat response |
+| `X-PCAI-Group` | The model GROUP the route named (the served member rides `X-PCAI-Served-Model`, the endpoint `X-PCAI-Endpoint`) — set on chat responses whose `model` resolved through a group, INCLUDING the response's non-2xx (it names the route, not the outcome). A group reached via a fallback-CHAIN hop is named by `X-PCAI-Fallback` + `X-PCAI-Served-Model` instead (the header is decided at the route level, before the walk) |
 | `X-PCAI-Fallback` | The model this request was failed over FROM (the per-model fallback chain, an alias's profile-ordering tail, or an admission-time budget/rate promotion). Absent = the primary answered |
 
 Request header `X-PCAI-Stream-Events: 1|0` overrides the key's
@@ -165,6 +166,12 @@ profile ordering's best model) or `routing__X` (ceiling = X — 404 when
 unregistered, 403 when outside `allowed_models`); the gateway serves the
 cheapest profile-ladder model the request's complexity score fits — never
 above the ceiling, never below the profile's `routing_min_model` floor.
+With `PCAI_LLM_ROUTING_AGENTS_ENABLED` on, the key's OFFERED agents are
+candidates too (per-key: the profile's agent menu, not the global
+allowlist); `routing__<agent>` is a legal ceiling and a pick applies the
+agent's tool surface + prompt for the turn (routing runs before the
+request is prepared). Agents join the window at the cheap end because
+their capability is not declared on the ladder.
 `shadow` serves exactly as if routing were off but stamps the would-serve
 model on the ledger; `active` serves the routed model through the normal
 pinned/budget machinery (a 429 walk can never promote above the ceiling).
@@ -239,13 +246,22 @@ marker row). Every verdict — pass included — is recorded in
 `usage_ledger.guardrail_events`.
 
 **Session affinity** (`session_affinity_enabled`, default off). A chat request
-carrying `X-PCAI-Session: <id>` pins the conversation to the ENDPOINT that
-served it (not just the cascade head), so its prefix keeps hitting the same
-server's KV cache. The pin is routing state, never policy: it is validated
-against the live pool on every read, refreshed on a successful serve, and
-dropped on a breaker trip or transport error. Streaming responses read a pin
-but do not refresh it; relayed turns ignore it (the relay re-picks per
-iteration).
+pins its conversation to the ENDPOINT that served it (not just the cascade
+head), so its prefix keeps hitting the same server's KV cache. The pin KEY
+is the request's `X-PCAI-Session: <id>` when it sends one, else —
+2026-11-08, a BEHAVIOR CHANGE for flag-on deployments without client
+headers — the CONVERSATION FINGERPRINT (`canonical.thread_key`, the same
+thread id the canonical store and the load-aware cascade head use), so a
+conversation is pinned per conversation with NO client change. The key is
+computed whenever session affinity OR model groups is on; each pin scope
+keeps its own gate (`ep:` under session affinity, `grp:` under model
+groups — see § 4.3, Model groups), and a request with neither a header nor a
+fingerprint takes no pin. The pin is routing state, never policy: it is
+validated against the live pool on every read, refreshed on a successful
+serve — 2026-11-08, INCLUDING at stream completion (previously a streamed
+turn read a pin but never refreshed it) — and dropped on a breaker trip or
+transport error; a disconnected stream leaves the pin untouched. Relayed
+turns ignore the ENDPOINT pin (the relay re-picks per iteration).
 
 **Exact-match response cache** (`response_cache_mode` = `off|shadow|active`,
 default off). Only **deterministic, non-streaming, non-relay** requests are
@@ -298,6 +314,17 @@ conversation. An agent the profile does not offer is a **403**
 full surface. A case-only typo of an agent id is a **404**
 `{"type": "agent_name_case", "did_you_mean": "<name>"}` for the same reason: model
 ids are exact, so the typo would otherwise ride the ordinary alias path.
+
+**Model groups** (2026-11-08, `model_groups_enabled`, off by default) are
+advertised as model entries too: one entry per group this key may use —
+`{"id": "<group name>", "owned_by": "group", "pcai": {"type": "group",
+"members": [...]}}`, sized by the SMALLEST member window (the same
+"an alias is sized by its smallest candidate" rule the `auto` entry
+follows). A group is a callable model id: naming it picks a member by live
+load and pins the conversation to it (FEATURES.md § Model groups). A group
+the key's ACL reaches neither by name nor through any member is never
+listed — an entry that would always 403 is a lie. With the flag off the
+listing is byte-identical to before.
 
 **Silent truncation is now announced.** The response carries
 `X-PCAI-Models-Denied: <n>` — the number of registered models this key's
@@ -599,7 +626,8 @@ JSON discovery index.
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
 | POST | `/admin/tenants` | `{name}` | 201 `{id, name, created_at}` (409 duplicate) |
-| GET | `/admin/tenants` | — | `[{id, name, created_at}]` |
+| GET | `/admin/tenants` | — | `[{id, name, created_at, sso_default_profile_id, sso_default_profile_name, sso_admin_profile_id, sso_admin_profile_name, sso_admin_groups}]` — the SSO self-mint tier (2026-11-08): the profile every browser mint stamps by default, the profile stamped INSTEAD when the caller's IdP groups intersect `sso_admin_groups` (empty = tier split off → default profile or the bare grant), and the group list itself. Both profile names are LEFT JOINs — an unset slot reads `null` |
+| PUT | `/admin/tenants/{tenant_id}/sso-default-profile` | `{profile_id: <uuid\|null>, admin_profile_id?: <uuid\|null>, admin_groups?: <str>}` — the profile(s) every SSO self-mint AND rotate of this tenant stamps (budgets, limit presets, MCP grants; scopes stay the mint's fixed grant). EVERY field is applied only when PRESENT in the body (absent = unchanged; `null` clears that slot; an empty body is 400) — a `profile_id`-only body cannot clear the tier, and a tier-only body cannot clear the default profile. `admin_profile_id: null` clears the admin slot; `admin_groups` is comma-separated — normalized (trim, drop empties, dedupe preserving order), case-sensitive, one entry ≤64 chars, no control characters (400); `''` = tier split off. Both slots are validated at wire time: 404 unknown profile, 400 a profile whose budget preset is invalid ("cannot be the SSO default" / "cannot be the SSO admin profile"). A tenant with only the ADMIN slot set is legal (members bare-grant, admins tiered) | the updated row (`id, name` + all three profile fields — the STORED state the mint will read). Live immediately: the mint reads the columns per request. Audit `tenant.sso_default_profile.set` carries the stored ids + groups |
 | GET | `/admin/tenants/{tenant_id}/users` | — | `[{id, tenant_id, name, profile_id, created_at}]` |
 | POST | `/admin/tenants/{tenant_id}/users` | `{name}` | 201 (409 duplicate in tenant) |
 
@@ -618,6 +646,7 @@ JSON discovery index.
 | PUT | `/admin/keys/{key_id}/mcp-grants` | `{"grants": [{server, tool}], "denies": [{server, tool}]?}` — replace-all of the GRANT set in one transaction; `denies` (≤500) writes `allowed=FALSE` rows for unticked-but-offered pairs, and pre-existing denies survive a grants-only body. A pair in BOTH lists resolves to the grant. Re-granting a pair that holds a deny row upserts it TRUE (`ON CONFLICT … DO UPDATE SET allowed = TRUE`) — the console's per-tool re-enable gesture | `{key_id, grants: N, denies: N}` |
 | PATCH | `/admin/keys/{key_id}/mcp-grants/{server}` | `{"mode": "off"\|"on"\|"catalog"}` — one-press per-server deny op (audit `mcp.acl.server.set`). `off` writes FALSE rows for the key's held pairs (TRUE rows + profile presets) ∪ the server's live catalog, capped at 500 pairs; `on` deletes the server's FALSE rows (grants untouched); `catalog` restores the server's deny rows exactly as they stood (capture → delete → re-insert), never touching a TRUE row | `{key_id, server, mode, pairs_written[, catalog_ok]}` — `catalog_ok: false` marks an `off` whose live-catalog fetch failed (degraded to the held pairs; also in the audit row). 404 unknown key/server, 400 past the cap |
 | POST | `/admin/keys/{key_id}/mcp-grants/copy-from` | `{"source_key_id": "…"}` — replace-all refill from the DONOR key's rows in one INSERT..SELECT, so allow AND `allowed=FALSE` deny rows both survive (the plain PUT is upsert-safe: a re-granted pair flips its deny row TRUE, and a grants-only body leaves existing denies in place). Self-copy is a no-op (returns the current count); unknown target/source → 404 | `{key_id, source_key_id, grants: N}` |
+| POST | `/admin/keys/{key_id}/apply-profile` | `{profile_id, apply_budgets?, apply_grants?}` — attach the profile to the key's owner AND re-stamp its presets onto THIS key in one transaction (`apply_budgets`/`apply_grants` default true). A profile declaring NO budgets (or NO grants) is a 400 — never a silent clear; a `live_grants` profile skips the grant write (the profile layer already decides every call) and reports `live_grants: true`. Grants use the PUT /mcp-grants replace contract: TRUE rows are replaced, a deny for a granted pair flips TRUE, and deny rows for pairs the profile does not grant survive. Audit `key.profile.apply` | `{key_id, user_id, profile_id, budgets: N, grants: N, live_grants}` |
 | PUT | `/admin/keys/{key_id}/mcp-creds` | `{server, headers: {Name: value}}` — per-key MCP credential overrides; ≤16 headers, values ≤512 chars, names `[A-Za-z0-9-]+`; empty refused (clearing is DELETE); 503 without the master key | `{key_id, server, header_names}` — **values never return** |
 | GET | `/admin/keys/{key_id}/mcp-creds` | — | `[{server, header_names}]` |
 | DELETE | `/admin/keys/{key_id}/mcp-creds/{server}` | — | `{"deleted": true, "server"}` |
@@ -635,6 +664,24 @@ JSON discovery index.
 | GET | `/admin/models/{model_name}/fallbacks` | — | `{model, fallbacks: [names in walk order], max: PCAI_LLM_MODEL_FALLBACK_MAX}` |
 | PUT | `/admin/models/{model_name}/fallbacks` | `{fallbacks: [names in walk order]}` — replace-all; every name must be a registered model, self-fallback refused, duplicates collapsed, length capped at `PCAI_LLM_MODEL_FALLBACK_MAX`. The chain is walked when the model cannot pick or answers 5xx/transport-error; each hop re-checks registration, the key's ACL, a healthy chat pool, and budget headroom — a fallback is never a policy or budget bypass | `{model, fallbacks}` |
 | GET | `/admin/endpoints` | — | every endpoint row merged with live breaker state: `{id, model_name, base_url, priority, weight, model_type, enabled, state: healthy\|cooling\|disabled, consecutive_failures, cooldown_remaining_s, last_error, last_ok_at, last_fail_at}` |
+
+#### Model groups — `/admin/model-groups`
+
+Named sets of EQUIVALENT chat models a request can name as its `model`
+(§ 2.3 for the `/v1/models` entries, FEATURES.md § Model groups for the
+routing semantics). These endpoints only CURATE the rows — resolution
+happens in the data plane, and the routing cache is invalidated after each
+committed write (best effort: an invalidate fault keeps the previous
+snapshot until its TTL lapses, never a 500 on the write).
+
+| Method | Path | Body / notes | Response |
+|---|---|---|---|
+| GET | `/admin/model-groups` | — | `{groups: [{name, model_type, policy, members: [str], description, created_at}]}` — DB truth, not the routing cache: what is STORED, even while the loader still serves its previous snapshot. `members` are names (the stored `[{model, weight}]` weights are reserved for a future policy and deliberately not exposed) |
+| PUT | `/admin/model-groups/{name}` | `{model_type?, policy?, members: [str], description? (≤1000)}` — UPSERT (replace-all member set; no 409-on-duplicate in v1). `model_type`/`policy` default to the only v1 values (`chat`/`load`) and any other value is REFUSED (400), not coerced — the data plane would treat an unknown policy as `load`, so a typo must not look saved. Rejects BEFORE any write, each a 400 with the reason: name must be a SLUG (no whitespace, no `/`, no control/HTML-metacharacters, ≤200 chars; `auto` / `auto-demand-aware` reserved; a group may not shadow a REGISTERED model at create); members must be registered CHAT models — empty set, unknown name, duplicate, more than 32, a member that is itself a group (one level), and a non-chat pool are all refused | the stored group (same shape as GET). Audit `model_group.create` / `model_group.update`; cache invalidated |
+| DELETE | `/admin/model-groups/{name}` | — | 404 when absent (a delete of nothing is not a success). Audit `model_group.delete`; cache invalidated |
+| POST | `/admin/model-groups/{name}/preview` | — | read-only "would pick now": `{member: <str\|null>, candidates: [{model, score, healthy}]}` — `score` = the member's minimum queue across its endpoints (null = no load-snapshot data), `healthy` = its pool's breaker state. Never pins and never writes: the per-(key, conversation) `grp:` pin is one only a real request may take. 404 unknown group |
+
+All routes AdminDep-gated.
 
 ### 4.4 MCP registry
 
@@ -664,7 +711,7 @@ JSON discovery index.
 | GET | `/admin/offpeak` | — | read-only evaluator snapshot: `{enabled, active, fraction, enter_pct, exit_pct, check_s, promql, mcp_server, tool, last_value_pct, last_check, last_error, state_since}` |
 | PUT | `/admin/offpeak/models/{model_name}/fraction` | `{fraction: <0–1>}` or `{fraction: null}` (clear — falls back to profile fraction, then the gateway default). Precedence while the model's governing evaluator is ACTIVE: override → profile → default; inactive bills 1.0. `{model_name:path}` carries slash-containing names | the updated row |
 | GET | `/admin/presented-models` | — | the admin-side "what does `/v1/models` advertise" view: `{aliases: [{id, type, order, demand_aware, present, reason}], models: [{id, type, primary, endpoints, healthy, max_tokens_ceiling, offpeak{value_pct,active,fraction}, demand_aware_excluded, routing_eligible}], routing: [{id, type, present, reason}], agents: [{id, type, description, servers, model, enabled, profiles, present, reason}], env{routing_enabled, load_aware_cascade}, counts{presented,registered}}`. Registry truth + config truth — an admin key holds no profile, so `order` is derived (the CHAT pools, name-sorted — non-chat pools are never cascade steps) and each alias `reason` says so. `agents` lists every enabled agent with the profiles that offer it |
-| GET | `/admin/endpoint-metrics` | `?window_s=300` | live per-ENDPOINT throughput and load, read from the inference servers' own Prometheus metrics (vLLM): `{available, source, window_s, endpoints: [{namespace, pod, instance, model_name, pool, prefill_tps, decode_tps, running, waiting, kv_cache_pct, prefill_share, idle}], error}`. `prefill_tps`/`decode_tps` are `rate()` over the window; `prefill_share` is prefill request-time / (prefill+decode) request-time — vLLM runs CHUNKED prefill, so a single iteration carries both phases and this is a mix, not a state. `pool` is a best-effort join (endpoint address, then normalised model name); a pod that matches neither is still returned with `pool=""` rather than dropped. `idle` means no traffic in the window (not a fault). Read-only; NEVER raises — an unreachable Prometheus answers `available=false` plus `error` |
+| GET | `/admin/endpoint-metrics` | `?window_s=300` | live per-ENDPOINT throughput and load, read from the inference servers' own Prometheus metrics (vLLM): `{available, source, window_s, endpoints: [{namespace, pod, instance, model_name, pool, prefill_tps, decode_tps, running, waiting, kv_cache_pct, kv_gpu_pct, kv_gpu_used_tokens, kv_gpu_evictable_tokens, kv_gpu_max_tokens, kv_host_used_tokens, kv_host_total_tokens, kv_host_pct, kv_disk_configured, kv_disk_hit_tps, ram_used_bytes, ram_limit_bytes, ram_pct, prefill_share, idle}], disk: {used_bytes, total_bytes, pct, selector} | null, error}`. The KV detail fields (2026-11-08; SGLang-only gauges — vLLM rows read null): `kv_gpu_pct` is `kv_cache_pct` under the card-facing name (same value — the ACTIVE usage ratio, evictable radix-cache tokens are not holding it) with the absolute `kv_gpu_used_tokens` / `kv_gpu_evictable_tokens` / `kv_gpu_max_tokens` beside it, because a percentage of a multi-million-token pool cannot say whether it is 3 conversations or 300; `kv_host_used_tokens` / `kv_host_total_tokens` / `kv_host_pct` are the HiCache host-RAM tier (L2 — occupancy near 100% at write_through steady state is normal, not a fault; total missing or 0 reads null, never 0%); the storage tier has NO occupancy gauge, so the disk story is `kv_disk_configured` (bool — an L3 backend is configured at all) plus `kv_disk_hit_tps` (the storage-hit prefill token rate — activity, not occupancy). `disk` is the OPTIONAL all-models L3 volume occupancy: when `settings.endpointMetricsDiskSelector` (env `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR`) names the volumes backing the L3 store (a PromQL label selector over `kubelet_volume_stats_*`, e.g. the Mooncake SSD PVCs), two extra queries sum used/capacity across the matched volumes and the snapshot carries `{used_bytes, total_bytes, pct, selector}`; unset, empty or unknown reads `null` (the page then shows L3 activity/status, never a fabricated 0%). `ram_used_bytes` / `ram_limit_bytes` / `ram_pct` are the RAW per-pod RAM: the container working set (`container_memory_working_set_bytes`, cAdvisor's pod-level aggregate excluded) against the pod's summed memory limit (`kube_pod_container_resource_limits{resource="memory"}`) — PROCESS memory (model weights + host pool + runtime), NOT the prefix-cache pool the `kv_host_*` token gauges describe; absent container metrics read null, never 0. `prefill_tps`/`decode_tps` are `rate()` over the window; `prefill_share` is prefill request-time / (prefill+decode) request-time — vLLM runs CHUNKED prefill, so a single iteration carries both phases and this is a mix, not a state. `pool` is a best-effort join (endpoint address, then normalised model name); a pod that matches neither is still returned with `pool=""` rather than dropped. `idle` means no traffic in the window (not a fault). Read-only; NEVER raises — an unreachable Prometheus answers `available=false` plus `error` |
 
 #### Agents — `/admin/agents`
 
@@ -695,6 +742,57 @@ The profile side is `POST /admin/profiles` with `agents` (see §4.5); the
 selection lives in its own table (`profile_agents`) because `create_profile`
 rebuilds `defaults_json` from the request body, which would silently delete a
 binding stored there.
+
+#### Built-in presets — `prometheus-sweep`
+
+One curated agent definition ships in code (`core.agent_presets`) and is
+installed through the SAME `POST /admin/agents` endpoint an operator uses by
+hand — no preset-only code path, and no boot-time row:
+
+```bash
+export ADMIN_KEY=$(kubectl -n pcai-llm get secret pcai-llm-gateway-admin \
+    -o jsonpath='{.data.admin-api-keys}' | base64 -d)
+python3 scripts/seed_agents.py --dry-run       # validate servers + tool names
+python3 scripts/seed_agents.py                 # install/update every preset
+python3 scripts/seed_agents.py --only prometheus-sweep --offer-to-profile user
+```
+
+`prometheus-sweep` turns the current alert set into ONE prioritized JSON
+report. Its servers are `prometheus`, `k8s-ops` and `logsearch`, each
+narrowed to read-only tools: applygate is absent, k8s-ops loses
+exec/kubectl/secrets, logsearch loses its export writer. The report-only
+posture is therefore enforced by the grant intersection, not only by the
+prompt.
+
+Invoke it as a model id with the relay on (header, body `tools:[{"type":"mcp"}]`,
+or a key with `relay_default`):
+
+```bash
+curl -s "$GW/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+  -H "X-PCAI-Execute-Tools: 1" -H "Content-Type: application/json" \
+  -d '{"model":"prometheus-sweep","messages":[{"role":"user","content":"sweep"}]}'
+```
+
+The reply is exactly one JSON object (`schema_version: "sweep-1"`):
+`counts`, `defects[]` (priority, alertnames, namespace/workload,
+active-since, quoted rule `expr`, classification, evidence, cause,
+remediation, blocked_on), `noise[]`, `decisions_owed[]`,
+`limitations[]`. Ordering is fixed — priority, then alertname, then
+namespace — so two reports over the same alert set diff cleanly, and
+`prompt_version` is echoed in every report.
+
+**Budget.** The relay charges every tool call against the per-turn budget
+(`toolRelayMaxIterations` — chart default 32, the reference g2 site runs 16);
+a full sweep is ~20–30 calls. A profile offering this agent should raise
+`tool_relay_budget` (§4.5). Under the site default the agent investigates
+top-down, P1 first, and marks the rest `unverified` with cause "not
+investigated: tool budget" — every firing alert still appears in exactly one
+defect or in `noise`, and a relay that ends tool use for budget still gets a
+report.
+
+**Requirements.** The key needs `mcp` scope and grants for the three servers
+(the profile's `mcp_grants` presets or per-key grants); a profile that offers
+the agent still bounds it, and installing the preset grants nothing by itself.
 
 ### 4.6 Model routing (decision-model prep)
 

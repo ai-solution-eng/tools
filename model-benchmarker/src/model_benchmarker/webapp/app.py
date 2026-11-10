@@ -198,7 +198,7 @@ def create_app(work_dir: str | None = None) -> Any:
 
     @app.get("/api/results/compare")
     async def results_compare(request: Request) -> JSONResponse:
-        """Side-by-side comparison of 2..4 runs (public read-only, like the
+        """Side-by-side comparison of 2..6 runs (public read-only, like the
         rest of the /results surface). ids: comma-separated run ids, read
         from request.query_params so the route behaves identically through
         real HTTP and the ASGI test helper (which routes on the full URI);

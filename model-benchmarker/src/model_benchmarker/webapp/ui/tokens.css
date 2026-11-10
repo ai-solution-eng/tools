@@ -1,5 +1,6 @@
 /* ---- HPE fleet design tokens (MM RAG / SQLhandler standard) ---- */
 :root, [data-theme="light"] {
+  color-scheme: light;
   --bg: #f4f6f9;
   --panel: #ffffff;
   --panel2: #eef0f5;
@@ -16,7 +17,33 @@
   --radius: 6px;
   --shadow: rgba(15, 23, 42, 0.08);
 }
+/* Auto (the default state) follows the OS: the dark ramp applies under
+   prefers-color-scheme, scoped to [data-theme="auto"] so an explicit Light or
+   Dark choice always wins even when the OS disagrees.
+   KEEP IN SYNC with the explicit [data-theme="dark"] block below — the two
+   blocks must carry identical declarations. */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    color-scheme: dark;
+    --bg: #0b0e14;
+    --panel: #161a24;
+    --panel2: #1e2432;
+    --chip: #1e2432;
+    --border: #2a3142;
+    --text: #e0e4ed;
+    --muted: #8891a8;
+    --accent: #01a982;
+    --accent-hover: #02c99a;
+    --accent2: #01a982;
+    --ok: #34d399;
+    --bad: #f87171;
+    --warn: #fbbf24;
+    --shadow: rgba(0, 0, 0, 0.4);
+  }
+}
+/* KEEP IN SYNC with the Auto media block above — identical declarations. */
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0b0e14;
   --panel: #161a24;
   --panel2: #1e2432;
@@ -53,21 +80,17 @@
 .hpe-header nav a:hover { color: var(--text); text-decoration: none; background: var(--panel2); }
 .hpe-header nav a.active { color: var(--text); background: var(--panel2); }
 
-/* ---- theme toggle (fleet pattern) ---- */
-.theme-toggle {
-  display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
-  font-size: .75rem; color: var(--muted); margin-left: auto;
+/* ---- theme control: Auto / Light / Dark (fleet pattern) ---- */
+.theme-seg {
+  display: inline-flex; align-items: stretch; border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; margin-left: auto; flex-shrink: 0;
 }
-.theme-toggle-track {
-  position: relative; width: 36px; height: 20px; border-radius: 10px;
-  background: var(--border); transition: background .2s; flex-shrink: 0;
+.theme-seg button {
+  background: transparent; color: var(--muted); border: 0; padding: 5px 10px;
+  font: inherit; font-size: .75rem; line-height: 1.4; cursor: pointer;
 }
-.theme-toggle-thumb {
-  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
-  border-radius: 50%; background: var(--accent); transition: transform .2s;
-  box-shadow: 0 1px 3px rgba(0,0,0,.25);
-}
-[data-theme="dark"] .theme-toggle-thumb { transform: translateX(16px); }
+.theme-seg button:hover { color: var(--text); }
+.theme-seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
 
 /* ---- estimator form: sectioned list layout ---- */
 h2.sect {

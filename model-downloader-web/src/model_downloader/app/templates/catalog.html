@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,23 +7,57 @@
   <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v={{ assets['favicon.jpg'] }}">
   <link rel="stylesheet" href="/static/style.css?v={{ assets['style.css'] }}">
   <script>
+    // Theme — Auto (default, follows the OS) / Light / Dark, remembered per browser.
+    var THEME_KEY = 'md-theme';
+
+    // Pre-paint resolver: apply the saved choice before first paint.
     (function () {
-      var root = document.documentElement;
-      var saved = localStorage.getItem('md-theme');
-      var dark = saved === 'dark' || (saved !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
-      if (dark) root.setAttribute('data-theme', 'dark');
-      document.addEventListener('DOMContentLoaded', function () {
-        var btn = document.getElementById('theme-toggle');
-        if (!btn) return;
-        btn.textContent = dark ? 'Light' : 'Dark';
-        btn.addEventListener('click', function () {
-          dark = !dark;
-          root.setAttribute('data-theme', dark ? 'dark' : '');
-          localStorage.setItem('md-theme', dark ? 'dark' : 'light');
-          btn.textContent = dark ? 'Light' : 'Dark';
-        });
-      });
+      var t = 'auto';
+      try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
     })();
+
+    function applyTheme(t) {
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+      try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-theme-btn') === t;
+        btns[i].classList.toggle('on', on);
+        btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+
+    // Auto resolves to the OS scheme — no consumer may treat data-theme as binary.
+    function effectiveTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (t === 'light' || t === 'dark') return t;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+
+    function initTheme() {
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () {
+          applyTheme(this.getAttribute('data-theme-btn'));
+        });
+      }
+      var saved = 'auto';
+      try { saved = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      applyTheme(saved);
+      // The palette is pure CSS, so an OS flip while in Auto needs no re-render;
+      // the listener stays as the hook for any follow-up added later.
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+          if (document.documentElement.getAttribute('data-theme') !== 'auto') return;
+          document.dispatchEvent(new CustomEvent('md-theme-change', { detail: { theme: effectiveTheme() } }));
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', initTheme);
   </script>
 </head>
 <body>
@@ -35,12 +69,16 @@
       <a href="/catalog" class="nav-link active">Model Catalog</a>
     </nav>
     <span class="spacer"></span>
-    <button id="theme-toggle" class="theme-toggle" type="button">Dark</button>
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
     <span class="tag">Parallel models: {{ max_concurrency }}</span>
   </header>
   <main>
     <h1>Model Catalog</h1>
-    <p class="hint">Configurations grouped by model lab, then model, then the configuration itself. Expand a lab to see its models; expand a model to see every configuration it ships with (GPU class, serving framework, quantization, GPU count, HiCache, shared-GPU). Select configurations and push to MLIS, or add your own.</p>
+    <p class="hint">Configurations grouped by model lab, then model, then the configuration itself. Expand a lab to see its models; expand a model to see every configuration it ships with (GPU class, serving framework, quantization, GPU count, HiCache, Mooncake L3, shared-GPU). Select configurations and push to MLIS, or add your own.</p>
     <fieldset class="gpu-filter" id="gpu-filter">
       <legend class="gpu-filter-legend">GPU class</legend>
       <label class="gpu-option">
@@ -57,14 +95,14 @@
     </fieldset>
     <div class="catalog-search">
       <input id="catalog-search-input" type="search" autocomplete="off" spellcheck="false"
-             placeholder="Search models and configurations — e.g. deepseek, nvfp4, sglang, hicache, 8 gpu"
+             placeholder="Search models and configurations — e.g. deepseek, nvfp4, sglang, hicache, mooncake, 8 gpu"
              aria-label="Search the model catalog">
       <button id="catalog-search-clear" type="button" class="secondary-btn" hidden>Clear</button>
       <span id="catalog-search-summary" class="search-summary" role="status" aria-live="polite"></span>
     </div>
     <div class="catalog-controls">
       <button id="add-model-btn" type="button" class="secondary-btn">+ Add Model</button>
-      <label class="push-project" title="Optional: file the pushed models under this project. In PCAI a project is a namespace, so this offers the same project-user-* list as the download page. Empty = the config's own project, else the chart default, else unfiled (MLIS shows unfiled models only under All projects).">
+      <label class="push-project" title="Optional: file the pushed models under this project. In PCAI a project is a namespace, so this offers the same project-user-* list as the download page; the project- prefix is stripped before the push (MLIS files by project name, e.g. user-andrew-bydlon). Empty = the config's own project, else the chart default, else unfiled (MLIS shows unfiled models only under All projects).">
         <span>Project</span>
         <div class="combo">
           <input id="push-project-input" autocomplete="off" spellcheck="false"
@@ -73,6 +111,7 @@
           <button type="button" id="push-project-toggle" class="combo-toggle" aria-label="Project suggestions">&#9662;</button>
           <div id="push-project-menu" class="combo-menu" hidden></div>
         </div>
+        <span id="push-project-effective" class="push-project-effective" hidden></span>
       </label>
       <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
       {% if catalog_github_url %}
@@ -125,7 +164,8 @@
               </label>
               <label>
                 <span>Project (optional)</span>
-                <input name="project" placeholder="project-user-andrew-bydlon">
+                <input name="project" placeholder="user-andrew-bydlon (or its project- namespace)"
+                       title="The project- namespace prefix is stripped when the config is pushed to MLIS.">
               </label>
               <label class="full-width">
                 <span>URI</span>

@@ -194,6 +194,160 @@ def test_snapshot_never_raises_when_prometheus_is_unreachable(monkeypatch: pytes
     assert "not in the enabled registry" in snap["error"]
 
 
+def test_snapshot_disk_section_from_volume_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The all-models summary's disk number comes from the L3 VOLUME metrics
+    (SGLang exports no storage gauge): a configured selector runs two extra
+    queries and the snapshot carries their aggregate."""
+    pod = {"namespace": "ns", "pod": "p1", "model_name": ""}
+    per_query = {name: _vector((pod, 0.0)) for name in em.QUERIES}
+    seen: list[str] = []
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        q = args["query"]
+        seen.append(q)
+        if q.startswith("sum(kubelet_volume_stats_used_bytes"):
+            return _tool_result(_vector(({}, 1024.0)))
+        if q.startswith("sum(kubelet_volume_stats_capacity_bytes"):
+            return _tool_result(_vector(({}, 4096.0)))
+        name = next(n for n, qq in em.QUERIES.items() if qq.replace("{window}", "300s") == q)
+        return _tool_result(per_query[name])
+
+    import pcai_llm.core.offpeak as op
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+    monkeypatch.setattr(settings, "endpoint_metrics_disk_selector", 'namespace="mooncake"')
+
+    import asyncio
+
+    snap = asyncio.run(em.snapshot())
+    assert snap["disk"] == {
+        "used_bytes": 1024.0,
+        "total_bytes": 4096.0,
+        "pct": 25.0,
+        "selector": 'namespace="mooncake"',
+    }
+    assert any("kubelet_volume_stats_used_bytes" in q for q in seen)
+    assert any("kubelet_volume_stats_capacity_bytes" in q for q in seen)
+
+
+def test_snapshot_disk_section_absent_without_a_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default OFF: no selector, no extra Prometheus calls, disk null."""
+    pod = {"namespace": "ns", "pod": "p1", "model_name": ""}
+    per_query = {name: _vector((pod, 0.0)) for name in em.QUERIES}
+    seen: list[str] = []
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        q = args["query"]
+        seen.append(q)
+        name = next(n for n, qq in em.QUERIES.items() if qq.replace("{window}", "300s") == q)
+        return _tool_result(per_query[name])
+
+    import pcai_llm.core.offpeak as op
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+    monkeypatch.setattr(settings, "endpoint_metrics_disk_selector", "")
+
+    import asyncio
+
+    snap = asyncio.run(em.snapshot())
+    assert snap["disk"] is None
+    assert not any("kubelet_volume_stats" in q for q in seen)
+
+
+def test_snapshot_disk_section_is_unknown_not_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing capacity series is UNKNOWN, not 0%: the disk section is
+    omitted rather than rendered as an empty volume."""
+    pod = {"namespace": "ns", "pod": "p1", "model_name": ""}
+    per_query = {name: _vector((pod, 0.0)) for name in em.QUERIES}
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        q = args["query"]
+        if q.startswith("sum(kubelet_volume_stats_used_bytes"):
+            return _tool_result(_vector(({}, 1024.0)))
+        if q.startswith("sum(kubelet_volume_stats_capacity_bytes"):
+            return _tool_result(_vector())  # no capacity series
+        name = next(n for n, qq in em.QUERIES.items() if qq.replace("{window}", "300s") == q)
+        return _tool_result(per_query[name])
+
+    import pcai_llm.core.offpeak as op
+    from pcai_llm.config import settings
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+    monkeypatch.setattr(settings, "endpoint_metrics_disk_selector", 'namespace="mooncake"')
+
+    import asyncio
+
+    snap = asyncio.run(em.snapshot())
+    assert snap["available"] is True
+    assert snap["disk"] is None
+
+
+def test_snapshot_attaches_pod_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The summary's RAW RAM number: container working set + memory limit are
+    attached per pod, and only to rows the engines already reported."""
+    p1 = {"namespace": "ns", "pod": "p1", "model_name": ""}
+    p2 = {"namespace": "ns", "pod": "p2", "model_name": ""}
+    per_query = {name: _vector((p1, 0.0)) for name in em.QUERIES}
+    per_query["prefill_tps"] = _vector((p1, 1.0), (p2, 2.0))
+    seen: list[str] = []
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        q = args["query"]
+        seen.append(q)
+        if "container_memory_working_set_bytes" in q:
+            return _tool_result(
+                _vector(
+                    ({"namespace": "ns", "pod": "p1"}, 600.0),
+                    ({"namespace": "ns", "pod": "p2"}, 200.0),
+                )
+            )
+        if "kube_pod_container_resource_limits" in q:
+            return _tool_result(
+                _vector(
+                    ({"namespace": "ns", "pod": "p1"}, 1000.0),
+                    ({"namespace": "ns", "pod": "p2"}, 500.0),
+                )
+            )
+        name = next(n for n, qq in em.QUERIES.items() if qq.replace("{window}", "300s") == q)
+        return _tool_result(per_query[name])
+
+    import pcai_llm.core.offpeak as op
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+
+    import asyncio
+
+    snap = asyncio.run(em.snapshot())
+    by_pod = {r["pod"]: r for r in snap["endpoints"]}
+    assert by_pod["p1"]["ram_used_bytes"] == 600.0
+    assert by_pod["p1"]["ram_limit_bytes"] == 1000.0
+    assert by_pod["p1"]["ram_pct"] == 60.0
+    assert by_pod["p2"]["ram_used_bytes"] == 200.0
+    assert by_pod["p2"]["ram_limit_bytes"] == 500.0
+    assert by_pod["p2"]["ram_pct"] == 40.0
+    # NARROWED query: the unfiltered working-set query is truncated by the MCP
+    # tool (~20 series), which silently dropped the model pods (2026-11-09).
+    assert any('pod=~"p1|p2"' in q for q in seen), "pod memory must be filtered to the reported pods"
+
+
 def test_prom_vector_reads_the_RENDERED_TABLE() -> None:
     """The shape this fleet's prometheus MCP tool ACTUALLY returns.
 
@@ -396,3 +550,253 @@ def test_used_tokens_is_collected_for_the_kv_tooltip() -> None:
     conversations or three hundred, so the absolute rides alongside."""
     q = em.QUERIES["used_tokens"]
     assert "sglang:num_used_tokens" in q
+
+
+# --- F2: the KV fields -----------------------------------------------------
+
+
+def _snapshot_with(
+    monkeypatch: pytest.MonkeyPatch,
+    per_query: dict[str, Any],
+    pools: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """snapshot() against a fake prometheus: per_query maps a QUERIES name to
+    a tool result; every query NOT listed answers an empty vector (the "no
+    data" case), so a test only names the families it is about."""
+
+    class _Text:
+        def __init__(self, t: str) -> None:
+            self.text = t
+
+    class _Result:
+        def __init__(self, t: str) -> None:
+            self.content = [_Text(t)]
+            self.isError = False
+
+    import asyncio
+    import json as _json
+
+    import pcai_llm.core.offpeak as op
+
+    rendered = {name: q.replace("{window}", "300s") for name, q in em.QUERIES.items()}
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        for name, q in rendered.items():
+            if q == args["query"]:
+                return _Result(_json.dumps(per_query.get(name, _vector())))
+        return _Result(_json.dumps(_vector()))
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+    return asyncio.run(em.snapshot(pools=pools))
+
+
+def test_kv_queries_exist_in_the_braced_selector_form() -> None:
+    """The KV strip's queries exist, and NOTHING in QUERIES opens with a bare
+    sglang: metric name: the MCP arg policy refuses a PromQL starting with
+    "sglang:" as a URL scheme, which reads back as an empty vector -- the
+    silent "fleet is idle" failure again."""
+    for key in (
+        "kv_gpu_used_tokens",
+        "kv_gpu_evictable_tokens",
+        "kv_gpu_max_tokens",
+        "kv_host_used_tokens",
+        "kv_host_total_tokens",
+        "kv_disk_activity",
+        "kv_disk_configured",
+    ):
+        assert key in em.QUERIES, key
+    for key, q in em.QUERIES.items():
+        assert not q.lstrip().startswith("sglang:"), f"{key} would be refused by the arg policy"
+        assert not q.lstrip().startswith("vllm:"), key
+    # the disk activity rate needs the window; the gauges and the configured
+    # marker are instantaneous readings
+    assert "{window}" in em.QUERIES["kv_disk_activity"]
+    for key in ("kv_gpu_used_tokens", "kv_host_used_tokens", "kv_host_total_tokens", "kv_disk_configured"):
+        assert "{window}" not in em.QUERIES[key], key
+    # the ratio query groups by model_name so a family that carries the label
+    # still merges into the pod's one row
+    assert "namespace, pod, instance, model_name" in em.QUERIES["kv_cache_pct"]
+
+
+def test_snapshot_merges_the_kv_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The off-peak card's KV strip reads flat fields off the SAME row the
+    panel already served -- one merge, no second endpoint."""
+    pod = {"namespace": "ns", "pod": "p1", "model_name": "glm-5.3-flash"}
+    snap = _snapshot_with(
+        monkeypatch,
+        {
+            "running": _vector((pod, 2.0)),
+            "decode_tps": _vector((pod, 310.0)),
+            "kv_cache_pct": _vector((pod, 8.0)),
+            "kv_gpu_used_tokens": _vector((pod, 60_000.0)),
+            "kv_gpu_evictable_tokens": _vector((pod, 20_000.0)),
+            "kv_gpu_max_tokens": _vector((pod, 750_000.0)),
+            "kv_host_used_tokens": _vector((pod, 6_880_000.0)),
+            "kv_host_total_tokens": _vector((pod, 6_880_000.0)),
+            "kv_disk_activity": _vector((pod, 12.3)),
+            "kv_disk_configured": _vector((pod, 1.0)),
+        },
+        pools={"GLM-5.3-Flash": ["http://svc-b/v1"]},
+    )
+    assert snap["available"] is True
+    row = snap["endpoints"][0]
+    # compat: the existing panel's field keeps its name and value
+    assert row["kv_cache_pct"] == 8.0
+    assert row["kv_gpu_pct"] == 8.0
+    assert row["kv_gpu_used_tokens"] == 60_000.0
+    assert row["kv_gpu_evictable_tokens"] == 20_000.0
+    assert row["kv_gpu_max_tokens"] == 750_000.0
+    assert row["kv_host_used_tokens"] == 6_880_000.0
+    assert row["kv_host_total_tokens"] == 6_880_000.0
+    assert row["kv_host_pct"] == 100.0
+    assert row["kv_disk_configured"] is True
+    assert row["kv_disk_hit_tps"] == 12.3
+    assert row["pool"] == "GLM-5.3-Flash"
+
+
+def test_host_pct_is_used_over_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    pod = {"namespace": "ns", "pod": "p1", "model_name": "glm-5.3-flash"}
+    row = _snapshot_with(
+        monkeypatch,
+        {
+            "kv_host_used_tokens": _vector((pod, 3_440_000.0)),
+            "kv_host_total_tokens": _vector((pod, 6_880_000.0)),
+        },
+    )["endpoints"][0]
+    assert row["kv_host_pct"] == 50.0
+    # no disk-tier rows at all -> not configured, no activity claimed
+    assert row["kv_disk_configured"] is False
+    assert row["kv_disk_hit_tps"] is None
+
+
+def test_host_pct_is_none_when_the_total_is_missing_or_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 0/absent total gauge means the tier is UNSIZED: "unknown", never
+    "0%" (and never a ZeroDivisionError)."""
+    pod = {"namespace": "ns", "pod": "p1"}
+    row = _snapshot_with(monkeypatch, {"kv_host_used_tokens": _vector((pod, 1.0))})["endpoints"][0]
+    assert row["kv_host_pct"] is None
+    row = _snapshot_with(
+        monkeypatch,
+        {"kv_host_used_tokens": _vector((pod, 1.0)), "kv_host_total_tokens": _vector((pod, 0.0))},
+    )["endpoints"][0]
+    assert row["kv_host_pct"] is None
+
+
+def test_disk_configured_is_a_presence_bool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The marker query returns a counter's current total, not a flag: ANY row
+    (even a 0 total) means the storage tier exists; absent means it does not."""
+    pod = {"namespace": "ns", "pod": "p1"}
+    row = _snapshot_with(monkeypatch, {"kv_disk_configured": _vector((pod, 0.0))})["endpoints"][0]
+    assert row["kv_disk_configured"] is True
+    row = _snapshot_with(monkeypatch, {"running": _vector((pod, 0.0))})["endpoints"][0]
+    assert row["kv_disk_configured"] is False
+
+
+# --- load_rows (the model-group router's cheap snapshot) --------------------
+
+
+def _load_rows_with(
+    monkeypatch: pytest.MonkeyPatch,
+    per_query: dict[str, Any],
+    pools: dict[str, list[str]] | None = None,
+    fail_query: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """load_rows() against a fake prometheus. Returns (rows, tool calls made);
+    fail_query names one QUERIES entry whose call RAISES (the hung-MCP case)."""
+
+    class _Text:
+        def __init__(self, t: str) -> None:
+            self.text = t
+
+    class _Result:
+        def __init__(self, t: str) -> None:
+            self.content = [_Text(t)]
+            self.isError = False
+
+    import asyncio
+    import json as _json
+
+    import pcai_llm.core.offpeak as op
+
+    rendered = {name: q.replace("{window}", "300s") for name, q in em.QUERIES.items()}
+    calls = {"n": 0}
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        return "http://prom.test/mcp", {}
+
+    async def _call(url: str, headers: Any, tool: str, args: dict[str, Any], timeout: float) -> Any:
+        calls["n"] += 1
+        for name, q in rendered.items():
+            if q == args["query"]:
+                if name == fail_query:
+                    raise RuntimeError("hung MCP session")
+                return _Result(_json.dumps(per_query.get(name, _vector())))
+        return _Result(_json.dumps(_vector()))
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    monkeypatch.setattr(op, "_call_tool", _call)
+    return asyncio.run(em.load_rows(pools=pools)), calls["n"]
+
+
+def test_load_rows_merges_the_three_queries_per_pod(monkeypatch: pytest.MonkeyPatch) -> None:
+    pod1 = {"namespace": "ns", "pod": "p1", "model_name": "glm-5.3-flash"}
+    pod2 = {"namespace": "ns", "pod": "p2", "model_name": "glm-5.3-flash"}
+    rows, calls = _load_rows_with(
+        monkeypatch,
+        {
+            "running": _vector((pod1, 2.0), (pod2, 0.0)),
+            "waiting": _vector((pod1, 5.0), (pod2, 0.0)),
+            "kv_cache_pct": _vector((pod1, 8.0), (pod2, 0.0)),
+        },
+        pools={"GLM-5.3-Flash": ["http://svc-b/v1"]},
+    )
+    # cheap by contract: exactly the 3 load queries, nothing else
+    assert calls == 3
+    assert len(rows) == 2
+    by_pod = {r["pod"]: r for r in rows}
+    hot, cold = by_pod["p1"], by_pod["p2"]
+    assert hot["running"] == 2.0 and hot["queue"] == 5.0 and hot["kv_pct"] == 8.0
+    assert cold["running"] == 0.0 and cold["queue"] == 0.0 and cold["kv_pct"] == 0.0
+    for row in (hot, cold):
+        assert row["namespace"] == "ns"
+        assert row["model_name"] == "glm-5.3-flash"
+        assert row["pool"] == "GLM-5.3-Flash"
+        assert row["instance"] == ""
+        # the exact row contract core.load_snapshot consumes
+        assert set(row) == {"namespace", "pod", "instance", "model_name", "pool", "running", "queue", "kv_pct"}
+
+
+def test_load_rows_survives_a_hung_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One family failing leaves the others' rows intact -- routing still sees
+    a queue depth, with running unknown (None, not 0)."""
+    pod = {"namespace": "ns", "pod": "p1", "model_name": "glm-5.3-flash"}
+    rows, calls = _load_rows_with(
+        monkeypatch,
+        {
+            "waiting": _vector((pod, 5.0)),
+            "kv_cache_pct": _vector((pod, 8.0)),
+        },
+        fail_query="running",
+    )
+    assert calls == 3
+    assert len(rows) == 1
+    assert rows[0]["running"] is None
+    assert rows[0]["queue"] == 5.0 and rows[0]["kv_pct"] == 8.0
+
+
+def test_load_rows_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The router's fallback (no data -> random pick) must stay reachable no
+    matter what prometheus does: load_rows answers [] instead of raising."""
+    import asyncio
+
+    import pcai_llm.core.offpeak as op
+
+    async def _target() -> tuple[str, dict[str, str]]:
+        raise LookupError("MCP server 'prometheus' is not in the enabled registry")
+
+    monkeypatch.setattr(op, "prometheus_target", _target)
+    assert asyncio.run(em.load_rows()) == []

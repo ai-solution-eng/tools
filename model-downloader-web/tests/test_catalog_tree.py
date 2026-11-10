@@ -20,9 +20,12 @@ sys.path.insert(0, str(REPO / "src" / "model_downloader"))
 from app.catalog import (  # noqa: E402
     Catalog,
     config_label,
+    entry_caveats,
     entry_framework,
     entry_hicache,
+    entry_hicache_storage_backend,
     entry_lab,
+    entry_mooncake,
     entry_quant,
     entry_shared_gpu,
     extract_model_id,
@@ -292,6 +295,123 @@ def test_config_label_carries_the_distinguishing_dimensions():
     assert "FP8" in label
     assert "4 GPU" in label
     assert "HiCache" in label
+
+
+# ---- Mooncake L3 tier ----
+#
+# A Mooncake configuration is the same model + GPU + framework + HiCache flag as
+# the L2-only entry it was cloned from, so before the L3 tier was labelled the
+# two rendered an IDENTICAL leaf and the RDMA caveat had nowhere to live.
+
+
+def _mooncake_entry(**overrides):
+    """An SGLang HiCache config whose L3 tier is the Mooncake store."""
+    base = {
+        "arguments": [
+            "sglang",
+            "serve",
+            "--enable-hierarchical-cache",
+            "--hicache-ratio",
+            "3",
+            "--hicache-storage-backend",
+            "mooncake",
+        ],
+        "environment": {
+            "MOONCAKE_MASTER": "mooncake-master.mooncake.svc.cluster.local:50051",
+            "MOONCAKE_PROTOCOL": "tcp",
+        },
+    }
+    base.update(overrides)
+    return _entry(**base)
+
+
+def test_mooncake_from_storage_backend_argument():
+    """The arg SGLang reads, in both spellings, case-insensitively."""
+    assert entry_mooncake(_mooncake_entry()) is True
+    assert entry_mooncake(_entry(arguments=["--hicache-storage-backend=mooncake"])) is True
+    assert entry_mooncake(_entry(arguments=["--hicache-storage-backend", "Mooncake"])) is True
+    assert entry_hicache_storage_backend(_mooncake_entry()) == "mooncake"
+
+
+def test_mooncake_from_client_environment_without_the_arg():
+    """A hand-added entry may carry only the MOONCAKE_* client env."""
+    entry = _entry(
+        arguments=["--enable-hierarchical-cache", "--hicache-ratio", "3"],
+        environment={"MOONCAKE_MASTER": "mooncake-master:50051"},
+    )
+    assert entry_mooncake(entry) is True
+
+
+def test_mooncake_env_without_hicache_is_not_mooncake():
+    """MOONCAKE_* on an entry with no hierarchical cache is inert, not L3."""
+    entry = _entry(environment={"MOONCAKE_MASTER": "mooncake-master:50051"})
+    assert entry_mooncake(entry) is False
+    assert entry_caveats(entry) == []
+
+
+def test_plain_hicache_is_not_mooncake():
+    entry = _entry(arguments=["--enable-hierarchical-cache", "--hicache-ratio", "3"])
+    assert entry_mooncake(entry) is False
+    assert entry_caveats(entry) == []
+    assert entry_hicache_storage_backend(entry) == ""
+
+
+def test_mooncake_label_distinguishes_the_l3_tier():
+    """The regression: base HiCache and HiCache+Mooncake read identically."""
+    base = _entry(arguments=["--enable-hierarchical-cache", "--hicache-ratio", "3"])
+    moon = _mooncake_entry(catalog_id="t-2", name="Qwen3.8-27B-vllm-FP8-mooncake")
+    base_label, moon_label = config_label(base), config_label(moon)
+    assert base_label != moon_label
+    assert "HiCache" in moon_label and "Mooncake" in moon_label
+    assert "Mooncake" not in base_label
+
+
+def test_mooncake_caveat_names_the_patch_script_and_the_transport():
+    """The note must be actionable: which script, which protocol, how to verify."""
+    (caveat,) = entry_caveats(_mooncake_entry())
+    assert caveat["id"] == "mooncake-rdma"
+    assert "patch-model-mooncake.sh" in caveat["body"]
+    assert "RDMA" in caveat["body"] and "TCP" in caveat["body"]
+    commands = " ".join(cmd["command"] for cmd in caveat["commands"])
+    assert "--protocol rdma" in commands
+    assert "ibv_devices" in commands or "tcp_transport" in commands
+
+
+def test_mooncake_caveat_is_ui_only():
+    """The caveat is derived, never stored: the push payload stays unchanged."""
+    entry = _mooncake_entry()
+    (cfg,) = _catalog([entry]).tree()[0]["models"][0]["configs"]
+    assert cfg["caveats"] and cfg["mooncake"] is True
+    assert "caveats" not in cfg["entry"]
+    assert cfg["entry"] == entry
+
+
+def test_caveats_are_copies_not_the_module_constant():
+    """A caller mutating the returned note must not poison later requests."""
+    first = entry_caveats(_mooncake_entry())[0]
+    first["body"] = "mutated"
+    first["commands"][0]["command"] = "mutated"
+    second = entry_caveats(_mooncake_entry())[0]
+    assert second["body"] != "mutated"
+    assert second["commands"][0]["command"] != "mutated"
+
+
+def test_seed_mooncake_entries_are_labelled_and_caveated():
+    """Every seeded Mooncake config must be distinguishable and carry the note."""
+    mooncake_ids = {e["catalog_id"] for e in SEED if entry_mooncake(e)}
+    assert mooncake_ids, "seed carries no Mooncake configuration"
+    tree = _catalog(SEED).tree()
+    seen = set()
+    for lab in tree:
+        for model in lab["models"]:
+            for cfg in model["configs"]:
+                if cfg["entry"]["catalog_id"] not in mooncake_ids:
+                    assert cfg["caveats"] == []
+                    continue
+                seen.add(cfg["entry"]["catalog_id"])
+                assert "Mooncake" in cfg["label"], cfg["label"]
+                assert [c["id"] for c in cfg["caveats"]] == ["mooncake-rdma"]
+    assert seen == mooncake_ids
 
 
 # ---- collision handling ----

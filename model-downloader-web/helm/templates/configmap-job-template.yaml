@@ -810,7 +810,12 @@ data:
               # = not scanned). Read with python (the scanner image has no
               # jq) guarded to a single small read per dir.
               {{- end }}
-              find "$ROOT" -type d -name 'models--*--*' 2>/dev/null | while IFS= read -r d; do
+              # NOT under a .locks/ dir: huggingface_hub keeps per-repo locks at
+              # <cache_root>/.locks/<cache id>/, and that leaf is named
+              # models--<org>--<repo> like a real cache dir. Without this, deleting
+              # a model leaves its lock dir behind and the scanner reports the
+              # deleted model forever as a 0-byte phantom.
+              find "$ROOT" -type d -name 'models--*--*' ! -path '*/.locks/*' 2>/dev/null | while IFS= read -r d; do
                 cache="${d##*/}"
                 model="$(printf '%s' "${cache#models--}" | sed 's|--|/|')"
                 [ -n "$model" ] || continue
@@ -856,3 +861,95 @@ data:
           - name: model-storage
             persistentVolumeClaim:
               claimName: __PVC_NAME__
+{{- if .Values.manualDelete.enabled }}
+  # One-shot manual-delete Job (MD-D), created by the app after a human
+  # approves per-dir verdicts in the UI. The app substitutes the placeholders
+  # below and creates the Job via the k8s API; __TARGETS_B64__ is ALWAYS a
+  # base64-of-JSON env value — raw JSON is never spliced into the manifest.
+  #
+  # The pod's admission pattern is copied VERBATIM from the scanner/GC Jobs
+  # (hpe-ezua/app: mlis, hpe-ezua/disable-sc: "true",
+  # sidecar.istio.io/inject: "false", runAsUser/runAsGroup: 0) so the
+  # job-controller-created pod is admitted by the protect-models-pvc Kyverno
+  # policy. UNLIKE the GC CronJob, this pod spec sets serviceAccountName
+  # EXPLICITLY to the app ServiceAccount: the Job reads the AIOLI Secret and
+  # lists managed Jobs via the k8s API, and both are granted to the app SA
+  # (rbac.yaml) — never to the namespace default SA. The PVC mount is
+  # READ-WRITE: app.delete_targets writes tombstones and removes exactly the
+  # directories the server-side verdict resolved (no walking, no wildcards).
+  manual-delete-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value (like debug/scan Jobs) so the
+        # download-jobs reconciliation (selector
+        # app.kubernetes.io/managed-by=model-downloader) never picks delete
+        # Jobs into the Downloads table.
+        app.kubernetes.io/managed-by: model-downloader-delete
+        model-downloader/delete: "true"
+      # NO model-downloader/cache-root annotation, deliberately. The GC/live-job
+      # cross-check treats any managed Job whose cache-root covers an entry's
+      # parent as pinning that entry, and it ignores Job status — so annotating
+      # this Job with the scan root made it pin EVERY model on the PVC: the
+      # delete Job blocked its own targets, and a finished one kept every later
+      # preview fully blocked for the whole jobTtlSeconds. The Job needs no tree
+      # pin; it re-validates each path in-pod, and a concurrent GC removing a
+      # directory first just fails validation and aborts the run.
+    spec:
+      ttlSecondsAfterFinished: __JOB_TTL__
+      backoffLimit: 0
+      # A pod that never schedules stays Pending forever: Pending is not a
+      # failure, so backoffLimit never fires and the Job hangs with no signal.
+      # The deadline converts that into a visible Failed Job — but it must be
+      # generous: removing a 50 GiB model tree over network storage can take
+      # many minutes, and killing the process mid-rmtree is worse than waiting.
+      # (Deletion renames the dir to .deleting-<name> first, so a kill leaves
+      # junk rather than a half-deleted model in the listing.)
+      activeDeadlineSeconds: __JOB_DEADLINE__
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: "true"
+          labels:
+            hpe-ezua/app: mlis
+            app.kubernetes.io/managed-by: model-downloader-delete
+            model-downloader/delete: "true"
+        spec:
+          # NO serviceAccountName on purpose: this Job runs in the namespace
+          # that OWNS models-pvc (defaultNamespace), where the app's SA does not
+          # exist — a cross-namespace SA reference is impossible, and naming one
+          # that is absent leaves the pod Pending forever. It uses `default`,
+          # exactly like the download and scan Jobs, because it needs no cluster
+          # RBAC: the AIOLI and live-job checks run in the app at commit time,
+          # where that RBAC already lives.
+          restartPolicy: Never
+          containers:
+          - name: delete
+            image: __IMAGE__
+            command: ["python3", "-m", "app.delete_targets"]
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            env:
+            - name: MD_TARGETS_B64
+              value: "__TARGETS_B64__"
+            - name: MD_SCAN_ROOT
+              value: __SCAN_ROOT__
+            - name: MD_JOB_NAME
+              value: __JOB_NAME__
+            - name: MD_ACTOR
+              value: "__ACTOR__"
+            - name: POD_NAMESPACE
+              value: __NAMESPACE__
+            volumeMounts:
+            - name: model-storage
+              mountPath: __MOUNT_PATH__
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: __PVC_NAME__
+{{- end }}

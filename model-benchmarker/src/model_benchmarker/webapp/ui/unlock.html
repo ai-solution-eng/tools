@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HPE Model Benchmarker — Sign in</title>
 <link rel="stylesheet" href="/static/tokens.css">
 <link rel="stylesheet" href="/static/app.css">
-<script>(function(){var t=localStorage.getItem('theme')||'light';if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();</script>
+<script>(function(){var t='auto';try{t=localStorage.getItem('theme')||'auto';}catch(e){}if(t!=='light'&&t!=='dark')t='auto';document.documentElement.setAttribute('data-theme',t);})();</script>
 <style>
   main { max-width: 460px; margin: 8vh auto 0; padding: 0 20px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 24px; }
@@ -151,6 +151,13 @@
         <div class="hpe-brand-title">Model <b>Benchmarker</b></div>
       </div>
     </div>
+    <!-- Three-state theme control: this page does not load shared.js (it is the
+         pre-auth sign-in page), so the control and its applyTheme live here. -->
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
   </div>
   <div class="card">
     <h1>API key required</h1>
@@ -176,6 +183,40 @@
     if (n.charAt(0) === "/" && n.charAt(1) !== "/") location.replace(n);
   }
 })();
+
+// Theme: Auto (the default) follows the OS, Light/Dark pin. Same 'theme' key as
+// the rest of the webapp — shared.js carries the identical control on the pages
+// that load it; this sign-in page is self-contained and does not.
+function applyTheme(t) {
+  if (t !== "light" && t !== "dark") t = "auto";
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("theme", t); } catch (e) {}
+  var btns = document.querySelectorAll("[data-theme-btn]");
+  for (var i = 0; i < btns.length; i++) {
+    var on = btns[i].getAttribute("data-theme-btn") === t;
+    btns[i].classList.toggle("on", on);
+    btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+  }
+}
+(function () {
+  var saved = "auto";
+  try { saved = localStorage.getItem("theme") || "auto"; } catch (e) {}
+  applyTheme(saved);
+  var btns = document.querySelectorAll("[data-theme-btn]");
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].addEventListener("click", function () {
+      applyTheme(this.getAttribute("data-theme-btn"));
+    });
+  }
+})();
+// In Auto the palette follows the OS without JS; re-mark the control when the OS
+// flips so it stays truthful if anything else rewrote the attribute.
+try {
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+    if (document.documentElement.getAttribute("data-theme") !== "auto") return;
+    applyTheme("auto");
+  });
+} catch (e) { /* very old browser: the media query still themes the page */ }
 
 function nextTarget() {
   // the page the user originally clicked (server supplies ?next=). Only

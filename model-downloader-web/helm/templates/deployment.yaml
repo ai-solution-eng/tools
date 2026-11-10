@@ -132,6 +132,56 @@ spec:
           value: {{ join "," . | quote }}
         {{- end }}
         {{- end }}
+        {{- if .Values.manualDelete.enabled }}
+        # MD-D manual delete settings (values: manualDelete.*). The app reads
+        # the manual-delete-job.yaml template from JOB_TEMPLATE_CONFIGMAP,
+        # substitutes placeholders (targets as base64, never raw JSON) and
+        # creates the Job via the k8s API.
+        - name: MANUAL_DELETE_ENABLED
+          value: {{ .Values.manualDelete.enabled | quote }}
+        - name: MANUAL_DELETE_MAX_TARGETS
+          value: {{ .Values.manualDelete.maxTargets | quote }}
+        - name: MANUAL_DELETE_JOB_TTL
+          value: {{ .Values.manualDelete.jobTtlSeconds | quote }}
+        - name: MANUAL_DELETE_JOB_DEADLINE
+          value: {{ .Values.manualDelete.jobDeadlineSeconds | quote }}
+        - name: MANUAL_DELETE_VERDICT_TTL
+          value: {{ .Values.manualDelete.verdictTtlSeconds | quote }}
+        # Empty manualDelete.image falls back to the app image: the delete
+        # module lives in the app, and the scanner image has no kubernetes
+        # client for the AIOLI/job cross-checks.
+        - name: MANUAL_DELETE_IMAGE
+          value: {{ .Values.manualDelete.image | default (printf "%s:%s" .Values.image.repository .Values.image.tag) | quote }}
+        - name: MANUAL_DELETE_AUTH_MODE
+          value: {{ .Values.manualDelete.auth.mode | quote }}
+        - name: MANUAL_DELETE_ADMIN_GROUPS
+          value: {{ join "," .Values.manualDelete.auth.adminGroups | quote }}
+        - name: MANUAL_DELETE_ADMINS
+          value: {{ join "," .Values.manualDelete.auth.admins | quote }}
+        - name: MANUAL_DELETE_SECRET_NAME
+          value: {{ .Values.manualDelete.auth.secret.name | quote }}
+        # Empty namespace = the release namespace.
+        - name: MANUAL_DELETE_SECRET_NAMESPACE
+          value: {{ .Values.manualDelete.auth.secret.namespace | default .Release.Namespace | quote }}
+        - name: MANUAL_DELETE_SECRET_KEY
+          value: {{ .Values.manualDelete.auth.secret.key | quote }}
+        {{- end }}
+        # Canonical fleet names (OIDC_*). The chart is the adapter so values
+        # stay app-neutral and the vendored module stays byte-identical.
+        {{- if .Values.oidc.enabled }}
+        - name: OIDC_ENABLED
+          value: "true"
+        - name: OIDC_ISSUER
+          value: {{ .Values.oidc.issuer | quote }}
+        - name: OIDC_AUDIENCE
+          value: {{ .Values.oidc.audience | quote }}
+        {{- with .Values.oidc.jwksUrl }}
+        - name: OIDC_JWKS_URL
+          value: {{ . | quote }}
+        {{- end }}
+        - name: OIDC_IDENTITY_CLAIM
+          value: {{ .Values.oidc.identityClaim | quote }}
+        {{- end }}
         {{- if .Values.catalog.enabled }}
         - name: CATALOG_PATH
           value: "/mnt/catalog/catalog.json"

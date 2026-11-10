@@ -32,6 +32,7 @@ metrics (gpu_util_mean) never get deltas.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Final
 
 # Which way is "better" per metric. "higher"/"lower" flip the sign of the
@@ -52,7 +53,9 @@ DIRECTIONS: Final[dict[str, str]] = {
 # Metrics that may legitimately be absent per row (dash in the UI).
 DELTA_SKIP_DIRECTIONS: Final[frozenset[str]] = frozenset({"info"})
 
-MAX_COMPARE_RUNS: Final[int] = 4
+# Runs per comparison (2..MAX). Mirrors MAX_CMP in ui/results.html and the
+# six-colour series palette there: every compared run keeps its own colour.
+MAX_COMPARE_RUNS: Final[int] = 6
 
 
 def params_label(kind: str, params: dict) -> str:
@@ -95,15 +98,24 @@ def params_label(kind: str, params: dict) -> str:
 
 
 def _num(value: Any) -> float | None:
+    """Finite float or None.
+
+    Non-finite values (inf/nan) are dropped rather than passed through: a
+    benchmark artifact with a bad cell must render as a dash, never as a 500
+    from the JSON encoder (starlette's JSONResponse is allow_nan=False, so ONE
+    inf anywhere in the payload kills the whole compare route).
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        num = float(value)
+        return num if math.isfinite(num) else None
     if isinstance(value, str):
         try:
-            return float(value)
+            num = float(value)
         except ValueError:
             return None
+        return num if math.isfinite(num) else None
     return None
 
 
@@ -242,7 +254,10 @@ def build_comparison(runs_data: list[dict], reference: str | None = None) -> dic
             for rid in run_ids:
                 metrics = per_run.get(rid) or {}
                 for metric, value in metrics.items():
-                    cells.setdefault(metric, {})[rid] = value
+                    # _num at the boundary as well: a non-finite cell must
+                    # reach the page as a dash, never as a 500 from the JSON
+                    # encoder (JSONResponse is allow_nan=False)
+                    cells.setdefault(metric, {})[rid] = _num(value)
             # columns: union across runs for this label — computed at the
             # section level below; here only delta computation
             for metric in cells:

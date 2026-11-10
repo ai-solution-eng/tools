@@ -33,7 +33,7 @@ fullnameOverride: ""
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.8.0
+  tag: v2.0.2
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -161,6 +161,71 @@ gc:
   resources:
     requests: {cpu: "100m", memory: 128Mi}
     limits: {cpu: "500m", memory: 256Mi}
+
+# ============================================================================
+# Manual delete
+# ============================================================================
+
+# Operator-initiated deletion of individually picked model cache dirs from
+# the shared PVC (the GC's "a human decides per dir" path). The UI previews a
+# verdict per dir, then the app creates a one-shot Job from the
+# manual-delete-job.yaml template that removes exactly the picked dirs.
+manualDelete:
+  # Master switch: false = no job template, no app env, no delete surface.
+  enabled: false
+  # Hard cap on how many cache dirs one delete request may touch.
+  maxTargets: 20
+  # ttlSecondsAfterFinished for the delete Job (finished jobs self-clean).
+  jobTtlSeconds: 86400
+  # Hard cap on one delete Job. Must comfortably exceed the slowest rmtree —
+  # removing tens of GiB over network storage takes minutes, and killing it
+  # mid-delete is worse than waiting. It exists to catch a pod that never
+  # schedules, not to bound the deletion itself.
+  jobDeadlineSeconds: 3600
+  # Image for the delete Job; empty = the app's own image (it ships
+  # app.delete_targets and the kubernetes client the cross-checks need).
+  image: ""
+  # How long a resolved preview stays committable. Must exceed the scanner
+  # Job timeout (300s): the clock starts when the preview finishes, not when
+  # it starts, and a pin that expires under the operator's cursor is a 409.
+  verdictTtlSeconds: 900
+  auth:
+    # sso | secret — how the UI authenticates a delete request.
+    mode: sso
+    # SSO groups allowed to delete (auth.mode: sso).
+    adminGroups: []
+    # Named principals allowed to delete (auth.mode: sso).
+    admins: []
+    secret:
+      # Shared-secret auth (auth.mode: secret): name/namespace/key of an
+      # EXISTING Secret holding the delete key. Empty namespace = the
+      # release namespace.
+      name: model-delete-key
+      namespace: ""
+      key: token
+
+# ============================================================================
+# SSO token verification
+# ============================================================================
+
+# The admin gate verifies the OIDC bearer token oauth2-proxy injects, rather
+# than trusting the identity header (any pod that can reach the Service could
+# forge that header). The chart maps these onto the canonical OIDC_* env names
+# the fleet verifier reads, so the module stays byte-identical to the fleet copy.
+oidc:
+  # true => a verified token is REQUIRED for admin actions; a bare header is
+  # refused. Leave false only where no IdP is configured at all.
+  enabled: true
+  # Keycloak realm URL, e.g. https://<keycloak>/realms/UA — must equal the
+  # token's iss claim exactly.
+  issuer: ""
+  # Expected audience (the PCAI realm's client). The fleet default is "ua".
+  audience: "ua"
+  # Optional explicit JWKS URL; empty derives <issuer>/protocol/openid-connect/certs.
+  jwksUrl: ""
+  # Claim carrying the identity. preferred_username is the fleet convention and
+  # the string that suffixes project-user-<name>.
+  identityClaim: "preferred_username"
 
 # ============================================================================
 # Jobs

@@ -159,6 +159,10 @@ settings:
   # a pool has two. Routing state, never policy: an unhealthy pin is dropped.
   sessionAffinityEnabled: true
   sessionAffinityTtlS: 3600
+  # Model groups: named sets of equivalent chat models, load-balanced by a background Prometheus snapshot; LEFT OFF
+  modelGroupsEnabled: false
+  modelGroupLoadRefreshS: 5
+  modelGroupLoadStaleS: 30
   # --- audio passthrough billing (3.7.3) ----------------------------------
   # TTS/ASR report no token usage; the gateway bills an estimate so a voice
   # call cannot bypass a budget. Tune to your real rates if they differ.
@@ -234,6 +238,9 @@ settings:
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
   routingTurnAdderTokens: 100
+  # Agents as routing candidates (off by default): the key's OFFERED agents join
+  # the router's window; a pick applies the agent's surface + prompt for the turn.
+  routingAgentsEnabled: false
   # MCP federation: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
   # two-tool surface (mcp_catalog + mcp_call only).
   mcpFlatTools: true
@@ -259,6 +266,11 @@ settings:
   offpeakModelPromql:
     GLM-5.3-Flash: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs04.hst.lab",device=~"nvidia[4-7]"}[5m]))'
     Qwen3.8-27B: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs05.hst.lab",device=~"nvidia[4-7]"}[5m]))'
+  # L3 cache volume occupancy for the Off-peak tab's all-models summary: a PromQL
+  # label selector over kubelet_volume_stats_* naming the volumes backing the L3
+  # store (the engine exports no storage-occupancy gauge). Empty = no disk section.
+  # Site example (Mooncake SSD offload PVCs):
+  # endpointMetricsDiskSelector: 'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'
   # The load-aware cascade is OFF by fleet default (helm/values.yaml) and ON here —
   # the G2-only divergence. The cascade entry picks its head model at conversation START from the
   # per-model off-peak state above, then stays with it for the conversation.
@@ -267,10 +279,6 @@ settings:
   # TTFT failover budget (s): after a 2xx the stream waits up to this long for the upstream's
   # FIRST SSE data line (keepalives don't count). 0 disables.
   failoverTtftS: 45
-  # Per-model max_tokens ceiling: the auto entry sends 262144, which Qwen3.8-27B rejects with an
-  # API 400 when max_tokens+prompt exceeds its context. 192k leaves prompt headroom.
-  maxTokensCeiling:
-    Qwen3.8-27B: 196608
   # Upstream MCP caller attribution: stamps X-MCP-Caller on every upstream fleet MCP call.
   # Upstreams may RECORD it, never authorize off it.
   mcpCallerAttribution: true

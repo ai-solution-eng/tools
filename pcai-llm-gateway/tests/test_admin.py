@@ -451,6 +451,196 @@ def test_propagate_grants_refuses_an_empty_list(monkeypatch: pytest.MonkeyPatch)
 
 
 # ---------------------------------------------------------------------------
+# apply-profile (2026-11-09): the console Edit-key one-key re-stamp
+# ---------------------------------------------------------------------------
+
+
+class _ApplyProfileDB:
+    """Just enough for POST /admin/keys/{key_id}/apply-profile."""
+
+    def __init__(
+        self,
+        defaults: dict[str, Any] | None = None,
+        *,
+        key_exists: bool = True,
+        profile_exists: bool = True,
+    ) -> None:
+        self.defaults = (
+            defaults
+            if defaults is not None
+            else {
+                "budgets": [
+                    {"model": "*", "period": "month", "limit_tokens": 1000},
+                    {"model": "*", "period": "month", "limit_usd": 5},
+                ],
+                "mcp_grants": [["logsearch", "search_logs"], ["k8s-ops", "get_pods"]],
+            }
+        )
+        self.key_exists = key_exists
+        self.profile_exists = profile_exists
+        self.executed: list[tuple[str, Any]] = []
+
+    async def fetchval(self, sql: str, *a: Any):
+        if "FROM api_keys" in sql:
+            return 1 if self.key_exists else None
+        if "FROM profiles" in sql:
+            return 1 if self.profile_exists else None
+        return 1
+
+    async def fetchrow(self, sql: str, *a: Any):
+        if "SELECT user_id FROM api_keys" in sql:
+            return {"user_id": uuid.uuid4()} if self.key_exists else None
+        if "defaults_json" in sql:
+            return {"defaults_json": json.dumps(self.defaults)} if self.profile_exists else None
+        return None
+
+    def acquire(self):
+        return _ApplyProfileConn(self)
+
+    async def execute(self, sql: str, *a: Any):
+        self.executed.append((sql, a))
+        return "INSERT 0 1"
+
+
+class _ApplyProfileConn:
+    def __init__(self, db: _ApplyProfileDB) -> None:
+        self._db = db
+
+    def transaction(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc: object):
+        return False
+
+    async def execute(self, sql: str, *a: Any):
+        return await self._db.execute(sql, *a)
+
+    async def executemany(self, sql: str, args: Any):
+        self._db.executed.append((sql, list(args)))
+
+
+def _apply_env(monkeypatch: pytest.MonkeyPatch, db: _ApplyProfileDB):
+    monkeypatch.setattr(settings, "admin_api_keys", "admin-secret-123")
+    monkeypatch.setattr(routes_admin, "db", db)
+    app = FastAPI()
+    app.include_router(routes_admin.router)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_apply_profile_restamps_budgets_and_grants(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One call assigns the profile AND replaces this key's budget rows and
+    MCP grant rows — the gap the Edit-key dialog closes. The profile attach
+    and both preset writes ride the same transaction."""
+    db = _ApplyProfileDB()
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(
+        f"/admin/keys/{uuid.uuid4()}/apply-profile",
+        json={"profile_id": str(uuid.uuid4())},
+        headers=_h(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["budgets"] == 2 and body["grants"] == 2
+    assert body["live_grants"] is False
+    sqls = [s for s, _ in db.executed]
+    assert any("UPDATE users SET profile_id" in s for s in sqls)
+    assert any("DELETE FROM budgets" in s for s in sqls)
+    assert any("DELETE FROM cost_budgets" in s for s in sqls)
+    assert any("DELETE FROM mcp_tool_acls WHERE key_id = $1 AND allowed" in s for s in sqls)
+    assert any("INSERT INTO budgets" in s for s in sqls)
+    assert any("INSERT INTO cost_budgets" in s for s in sqls)
+    assert any("ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = TRUE" in s for s in sqls)
+
+
+def test_apply_profile_refuses_empty_grants(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A profile with no grants must never zero a live key's tool surface."""
+    db = _ApplyProfileDB(
+        defaults={
+            "budgets": [{"model": "*", "period": "month", "limit_tokens": 1}],
+            "mcp_grants": [],
+        }
+    )
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r.status_code == 400 and "no mcp_grants" in r.text
+    assert not db.executed, "a refused apply must not write anything"
+
+
+def test_apply_profile_refuses_empty_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ApplyProfileDB(defaults={"budgets": [], "mcp_grants": [["a", "b"]]})
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r.status_code == 400 and "no budget presets" in r.text
+    assert not db.executed
+
+
+def test_apply_profile_malformed_budget_preset_is_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hand-edited/older defaults_json row must be a named 400, not a 500
+    that leaves the operator with nothing to act on."""
+    db = _ApplyProfileDB(defaults={"budgets": ["not-a-dict"], "mcp_grants": [["a", "b"]]})
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r.status_code == 400 and "budget preset invalid" in r.text
+    assert not db.executed
+
+
+def test_apply_profile_live_grants_skips_the_grant_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live grants are already evaluated per call; materialising the pairs as
+    key rows would pin the preset. The budget preset still stamps."""
+    db = _ApplyProfileDB(
+        defaults={
+            "budgets": [{"model": "*", "period": "month", "limit_tokens": 1000}],
+            "mcp_grants": [["logsearch", "search_logs"]],
+            "live_grants": True,
+        }
+    )
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["live_grants"] is True and body["grants"] == 0 and body["budgets"] == 1
+    assert not any("mcp_tool_acls" in s for s, _ in db.executed), "live grants are profile-evaluated, never pinned"
+
+
+def test_apply_profile_assign_only_when_flags_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ApplyProfileDB()
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(
+        f"/admin/keys/{uuid.uuid4()}/apply-profile",
+        json={"profile_id": str(uuid.uuid4()), "apply_budgets": False, "apply_grants": False},
+        headers=_h(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["budgets"] == 0 and body["grants"] == 0
+    sqls = [s for s, _ in db.executed]
+    assert any("UPDATE users SET profile_id" in s for s in sqls)
+    assert not any("budgets" in s or "mcp_tool_acls" in s for s in sqls)
+
+
+def test_apply_profile_unknown_key_or_profile_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ApplyProfileDB(key_exists=False)
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r.status_code == 404
+    db2 = _ApplyProfileDB(profile_exists=False)
+    tc2 = _apply_env(monkeypatch, db2)
+    r2 = tc2.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())}, headers=_h())
+    assert r2.status_code == 404
+
+
+def test_apply_profile_requires_admin_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ApplyProfileDB()
+    tc = _apply_env(monkeypatch, db)
+    r = tc.post(f"/admin/keys/{uuid.uuid4()}/apply-profile", json={"profile_id": str(uuid.uuid4())})
+    assert r.status_code == 401
+    assert not db.executed
+
+
+# ---------------------------------------------------------------------------
 # POST /admin/profiles is a MERGE (2026-10-29)
 # ---------------------------------------------------------------------------
 # It used to rebuild every preset from the body, so a partial POST — the natural
@@ -1472,6 +1662,13 @@ def test_help_lists_mcp_grants_copy_from(client) -> None:
     tc, _ = client
     endpoints = tc.get("/admin/help", headers=_h()).json()["endpoints"]
     assert "POST   /admin/keys/{key_id}/mcp-grants/copy-from" in endpoints
+
+
+def test_help_lists_apply_profile(client) -> None:
+    """The one-key profile re-stamp is discoverable through /admin/help."""
+    tc, _ = client
+    endpoints = tc.get("/admin/help", headers=_h()).json()["endpoints"]
+    assert "POST   /admin/keys/{key_id}/apply-profile" in endpoints
 
 
 class _ProfileRoutingDB:

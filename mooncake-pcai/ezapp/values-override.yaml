@@ -1,0 +1,69 @@
+# G2 site values — OPERATOR FILE, not packaged (helm/.helmignore excludes local/).
+#
+#   helm install mooncake ./helm -n mooncake --create-namespace \
+#     -f helm/local/values.g2.yaml
+#
+# Shape (DEMO sizing): 3 store pods x 350Gi = ~1.05 TiB of PVC-backed capacity,
+# plus 3 x 16 GB of DRAM hot tier. This is a demo footprint, not a production
+# sizing - grow persistence.size from measured write volume, not from a guess.
+#
+# The storage class is gl4f-filesystem (VAST CSI) — the only filesystem class this
+# cluster exposes today; swap it for the X10000 class when one exists.
+#
+# Capacity context, measured 2026-11-05: the export holds 343.8 TiB with 336.3 TiB
+# free, and ~298 TiB is already promised to PVC quotas (~46 TiB of unallocated
+# headroom). The ~1 TiB below is ~2% of that headroom, and because the class is
+# thin, nothing is reserved until pages are written.
+#
+# Sizing rules of thumb:
+#   * PVC size is a hard quota per pod — writes past it fail with EDQUOT and the
+#     store degrades to cache misses (not data loss).
+#   * KV pages are high-entropy, so unlike model weights they do NOT dedup or
+#     compress on the array: plan physical ~= logical.
+#   * replicaCount buys resilience; one pod loss costs its share of the pool.
+
+ezua:
+  virtualService:
+    # Replace ${DOMAIN_NAME} by hand for a plain helm install; PCAI substitutes
+    # it automatically when the chart is imported as an EzAppConfig.
+    endpoint: "mooncake.${DOMAIN_NAME}"
+
+store:
+  replicaCount: 3
+  # TCP. The transport is ONE decision for the whole pool and every client must
+  # match it; TCP needs no device, no capability and has no silent-fallback
+  # mode. Switch with
+  #   -f helm/values-examples/values.transport-rdma.yaml
+  # once the pool is proven on TCP and the store pods have been checked for
+  # /dev/infiniband (that file lists the prerequisites).
+  protocol: tcp
+  # DRAM hot tier per pod. Not disk and not replaceable by the PVC: the store
+  # serves pages out of this at memory speed. Keep it modest — the PVC is the
+  # capacity tier.
+  segmentSize: "16gb"
+  # 16 GB segment + local buffer + python overhead must fit the request.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 24Gi
+    limits:
+      cpu: "4"
+      memory: 32Gi
+  persistence:
+    enabled: true
+    # 3 x 350Gi = 1050 GiB ≈ 1.05 TiB total.
+    size: 350Gi
+    # The class this cluster actually exposes. Confirm with:
+    #   kubectl get storageclass
+    storageClassName: "gl4f-filesystem"
+    accessModes:
+      - ReadWriteOnce
+
+ui:
+  # Backend re-read cadence. The page itself polls the cached snapshot every 30 s.
+  refreshIntervalSeconds: 1800
+  discovery:
+    # Namespaces the dashboard scans for Mooncake clients (pods carrying a
+    # MOONCAKE_MASTER env var).
+    namespaces:
+      - project-user-andrew-bydlon

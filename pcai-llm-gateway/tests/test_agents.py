@@ -33,9 +33,9 @@ from fastapi.testclient import TestClient
 from pcai_llm.api import routes_admin, routes_proxy
 from pcai_llm.api.auth import KeyRecord
 from pcai_llm.config import settings
+from pcai_llm.core import agent_presets, toolrelay
 from pcai_llm.core import agents as agents_mod
 from pcai_llm.core import budgets as budgets_mod
-from pcai_llm.core import toolrelay
 from pcai_llm.routing.router import Endpoint, Router
 
 MODEL = "test-model"
@@ -352,6 +352,34 @@ def test_agent_delete_404_for_unknown(admin_env) -> None:
     assert tc.delete("/admin/agents/Admin-Agent", headers=ADMIN_H).status_code == 204
 
 
+@pytest.fixture
+def preset_env(admin_env, monkeypatch: pytest.MonkeyPatch):
+    """The shipped sweep preset names logsearch; the shared fixture registers
+    three servers, so re-register with the preset's own fleet."""
+    tc, db = admin_env
+    monkeypatch.setattr(routes_admin, "registry", _Registry(["k8s-ops", "prometheus", "logsearch"]))
+    return tc, db
+
+
+def test_built_in_preset_installs_through_the_admin_route(preset_env) -> None:
+    """The shipped definition must be installable through the SAME endpoint an
+    operator uses by hand — there is no preset-only code path to drift."""
+    tc, db = preset_env
+    body = agent_presets.PROMETHEUS_SWEEP.upsert_body()
+    r = tc.post("/admin/agents", json=body, headers=ADMIN_H)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    assert out["name"] == "prometheus-sweep"
+    assert out["servers"] == body["servers"]
+    assert out["tools"] == body["tools"]
+    assert out["system_prompt"] == body["system_prompt"]
+    upsert = [args for sql, args in db.fetchrows if "INSERT INTO agent_profiles" in sql][-1]
+    # The stored column is deterministic JSON TEXT (sort_keys): two installs of
+    # the same preset differ by zero bytes, and the listing parses it back to
+    # the exact body the seeder sent.
+    assert json.loads(upsert[3]) == body["tools"]
+
+
 # ---------------------------------------------------------------------------
 # request path: selection, the 403, and the listing
 # ---------------------------------------------------------------------------
@@ -662,6 +690,34 @@ def test_profile_save_binds_agents(admin_env) -> None:
     assert r.status_code == 201, r.text
     assert r.json()["agents"] == ["Admin-Agent"]
     assert any("INSERT INTO profile_agents" in sql for sql, _ in db.executed)
+
+
+def test_profile_save_agent_link_replaces_membership_idempotently(admin_env) -> None:
+    """Re-saving a profile whose agent selection is UNCHANGED must not 500 —
+    and must not silently DROP the agent either.
+
+    2026-11-06: the delete+insert was one statement, and PostgreSQL evaluates a
+    data-modifying CTE against the outer statement's snapshot, so the DELETE's
+    rows stayed visible to the INSERT's uniqueness check and every save after
+    the first raised duplicate key on profile_agents_pkey. The first attempted
+    fix (blanket delete + ON CONFLICT DO NOTHING) would have been worse: the
+    delete commits, the conflicting insert is skipped, and the kept agent
+    disappears. The statement must therefore delete ONLY the removed ids and
+    keep the DO NOTHING guard for the live kept rows. The fake DB cannot
+    execute snapshot semantics, so this pins the two clauses that carry them.
+    """
+    tc, db = admin_env
+    for _ in range(2):
+        r = tc.post("/admin/profiles", json={"name": "user", "agents": ["Admin-Agent"]}, headers=ADMIN_H)
+        assert r.status_code == 201, r.text
+    links = [sql for sql, _ in db.executed if "INSERT INTO profile_agents" in sql]
+    assert links, "the agent link never reached the DB"
+    for sql in links:
+        flat = " ".join(sql.split())  # the statement is assembled from fragments
+        assert "ON CONFLICT (profile_id, agent_id) DO NOTHING" in flat
+        # The DELETE must be scoped to ids NOT in the new selection; a blanket
+        # delete is what makes DO NOTHING destroy the kept row.
+        assert "DELETE FROM profile_agents WHERE profile_id = $1 AND agent_id NOT IN" in flat
 
 
 def test_profile_save_refuses_an_undefined_agent(admin_env) -> None:
