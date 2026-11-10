@@ -65,6 +65,32 @@ config:
       check_interval: 1s
       limit_mib: 400
       spike_limit_mib: 100
+
+    # Drop the gateway's OWN health/metrics traffic before it is batched or
+    # exported. Measured on the live fleet: kubelet probes and Prometheus
+    # scrapes were 1,922 of 2,710 traces (71%), burying the ~56 real model
+    # calls while paying Langfuse ingestion and storage for pure noise.
+    #
+    # WHY HERE and not in the gateway: policy belongs in the pipeline. Adding
+    # a path is a values edit + restart — no image rebuild, no gateway code
+    # change, and the app stays ignorant of what a backend finds interesting.
+    # It also keeps the gateway's tracing tests untouched.
+    #
+    # error_mode ignore: one malformed expression must never stop the
+    # pipeline. Matching on http.target (the path attribute the gateway's
+    # middleware sets) rather than the span name keeps it method-agnostic.
+    filter/drop_probes:
+      error_mode: ignore
+      traces:
+        span:
+          - 'attributes["http.target"] == "/ready"'
+          - 'attributes["http.target"] == "/health"'
+          - 'attributes["http.target"] == "/healthz"'
+          - 'attributes["http.target"] == "/livez"'
+          - 'attributes["http.target"] == "/readyz"'
+          - 'attributes["http.target"] == "/metrics"'
+          - 'attributes["http.target"] == "/metrics/"'
+
     batch:
       send_batch_size: 200
       timeout: 5s
@@ -86,7 +112,9 @@ config:
     pipelines:
       traces:
         receivers: [otlp]
-        processors: [memory_limiter, batch]
+        # Order matters: bound memory first, drop the noise early (so the
+        # batcher never carries it), then batch what survives.
+        processors: [memory_limiter, filter/drop_probes, batch]
         exporters: [otlphttp/langfuse]
     telemetry:
       logs:
