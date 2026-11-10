@@ -169,12 +169,26 @@ settings:
   audioTtsCharsPerToken: 4         # ~4 characters of spoken text per token
   audioAsrTokensPerSecond: 3.0     # ~180 tokens/minute of audio (~150 words)
   # --- OpenTelemetry tracing (3.7.3) --------------------------------------
-  # LEFT OFF: G2 has Prometheus but no OTLP collector in this values file.
-  # The exporter is fail-open (a DNS failure is swallowed), but a collector
-  # that does not exist produces nothing. Point otelEndpoint at a real
-  # collector and flip this to true; spans carry path-only attributes.
-  otelEnabled: false
-  otelEndpoint: http://otel-collector:4318
+  # ON as of 2026-11-10: G2 now runs a collector in the otel-traces namespace,
+  # which forwards to Langfuse (langfuse-v4). Spans carry path-only attributes;
+  # the generation spans add model, token counts and latency but never prompt
+  # or completion text.
+  #
+  # KEEP THESE HERE, NOT ONLY IN THE PCAI CONFIGURE BOX. Chart defaults ship
+  # otelEnabled: false and a placeholder endpoint, so any install/upgrade that
+  # starts from chart values silently disables tracing — which is exactly what
+  # happened when v4.0.1 rolled out and traces stopped dead for an hour. The
+  # site values document is the layer that survives a redeploy.
+  #
+  # The endpoint MUST be the full in-cluster name. The bare
+  # "http://otel-collector:4318" placeholder does not resolve from this
+  # namespace (the collector lives in otel-traces, not here).
+  #
+  # The collector filters /ready, /health and /metrics itself, so leave
+  # otelSampleRatio at 1.0 — dropping spans here would only cost you the
+  # interesting ones.
+  otelEnabled: true
+  otelEndpoint: http://otel-collector.otel-traces.svc.cluster.local:4318
   otelServiceName: pcai-llm-gateway
   otelSampleRatio: 1.0
   toolRelayEnabled: true           # server-side model<->MCP loop (X-PCAI-Execute-Tools)

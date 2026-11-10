@@ -116,7 +116,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import settings
 from ..core import metrics as _metrics
-from ..core import registry, secretbox
+from ..core import registry, secretbox, tracing
 from ..core.budgets import check_rate_limit, settle
 from ..core.identity import (
     KIND_KEY_BOUND,
@@ -1548,12 +1548,45 @@ class _GatewayMCPServer(MCPServer):
         ToolManager as before. With the kill switch off, EVERY name takes
         the legacy path — flattened names then produce the same
         unknown-tool ToolError as before the flat surface existed."""
-        if settings.mcp_flat_tools and name not in _GATEWAY_TOOLS:
-            servers = await registry.mcp_servers()
-            server, tool = resolve_flat_name(name, [s["name"] for s in servers])
-            result = await _gated_mcp_call(server, tool, arguments, failover=True)
-            return CallToolResult(content=[TextContent(type="text", text=result)])
-        return await super().call_tool(name, arguments, context)
+        # OTLP span for ONE tools/call — the /mcp surface the harnesses call
+        # directly. Live measurement put this far ahead of the relay path for
+        # MCP traffic (488 tools/call requests vs 56 model calls in the same
+        # window), so without this the bulk of MCP usage is invisible.
+        #
+        # Metadata only: tool name, duration, outcome. Arguments and results
+        # can carry user data and are never exported.
+        #
+        # No-op when tracing is off (start_span returns the shared Noop), and
+        # never raises: end() swallows everything, so the finally cannot turn
+        # a tool error into a tracing error.
+        _span_started = time.monotonic()
+        _span_ok = True
+        try:
+            if settings.mcp_flat_tools and name not in _GATEWAY_TOOLS:
+                servers = await registry.mcp_servers()
+                server, tool = resolve_flat_name(name, [s["name"] for s in servers])
+                result = await _gated_mcp_call(server, tool, arguments, failover=True)
+                return CallToolResult(content=[TextContent(type="text", text=result)])
+            return await super().call_tool(name, arguments, context)
+        except BaseException:
+            # Cancellation and real errors propagate untouched; the flag only
+            # records the outcome for the span.
+            _span_ok = False
+            raise
+        finally:
+            _span_ms = int((time.monotonic() - _span_started) * 1000)
+            tracing.start_span(
+                name,
+                {
+                    "langfuse.observation.type": "span",
+                    "langfuse.trace.name": "tool",
+                    "mcp.tool": name,
+                    "mcp.surface": "mcp",
+                    "duration_ms": _span_ms,
+                    "tool.status": "ok" if _span_ok else "error",
+                },
+                start_ns=time.time_ns() - _span_ms * 1_000_000,
+            ).end()
 
     async def _with_server_directory(self, tools: list[MCPTool]) -> list[MCPTool]:
         """Append the live MCP server directory to the two gateway tools.
