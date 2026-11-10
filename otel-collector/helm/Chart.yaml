@@ -5,5 +5,5 @@ description: >-
   from in-cluster senders and exports them to Langfuse (and, later, to other
   backends such as SigNoz) without the senders ever holding backend credentials.
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "0.165.0"
