@@ -1524,6 +1524,12 @@ async def relay_stream(
             "duration_ms": elapsed,
             "tool.status": status,
         }
+        # Conversation grouping, same value the chat span carries. Langfuse
+        # aggregates on the trace, but its docs ask for the attribute on every
+        # span, and a tool span that starts its OWN trace (no sampled parent)
+        # would otherwise land in no session at all.
+        if thread_id:
+            attrs["langfuse.session.id"] = str(thread_id)
         linked = _last_span_ids[0] if _last_span_ids else None
         tracing.start_span(
             f"{server}{TOOLSEP}{tool}",
@@ -1661,6 +1667,14 @@ async def relay_stream(
         # unknown so no blank user rows are created.
         if user_id:
             _span_attrs["user.id"] = str(user_id)
+        # Conversation grouping. thread_id is the gateway's OWN fingerprint of
+        # the message history (canonical.thread_key), so every turn of one
+        # conversation groups into the same Langfuse session — no client change
+        # needed. This matters because clients do NOT send X-PCAI-Session: a
+        # month of traffic produced 5 pins, all stale, none in the last hour.
+        # Omitted when absent so no empty sessions are created.
+        if thread_id:
+            _span_attrs["langfuse.session.id"] = str(thread_id)
         _chat_span = tracing.start_span(
             "chat",
             _span_attrs,
