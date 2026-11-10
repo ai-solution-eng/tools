@@ -164,6 +164,26 @@ def test_aioli_match_is_by_name_not_path():
     assert row["verdict"] == VERDICT_SOFT_BLOCK
 
 
+def test_a_custom_cache_root_uri_protects_the_model():
+    # The deployment is registered as the DIRECTORY that contains the cache dir,
+    # not as <org>/<Repo>: pvc://models-pvc/large-models/Cohere202603. Neither
+    # the cache-dir name nor the repo id appears in that uri, so name matching
+    # alone reported an actively-serving model as deletable.
+    e = entry("CohereLabs/cohere-transcribe-03-2026", cachepath="/mnt/large-models/Cohere202603/models--CohereLabs--cohere-transcribe-03-2026")
+    uri = "pvc://models-pvc/large-models/Cohere202603?containerPath=/mnt/models"
+    (row,) = verdict_of([e], aioli_uris=[uri])
+    assert row["verdict"] == VERDICT_SOFT_BLOCK
+    assert any(uri in b for b in row["blocks"])
+
+
+def test_a_bare_scan_root_uri_protects_nothing():
+    # Guard against over-matching: an uri that names only the scan root must not
+    # soft-block every model underneath it.
+    e = entry("acme/M", cachepath="/mnt/large-models/acme/models--acme--M")
+    (row,) = verdict_of([e], aioli_uris=["pvc://models-pvc/large-models?containerPath=/mnt/models"])
+    assert row["verdict"] == VERDICT_DELETABLE
+
+
 def test_similar_name_does_not_match():
     # models--acme--M must not match a uri for acme/M-Extra
     e = entry("acme/M", cachepath="/mnt/large-models/models--acme--M")

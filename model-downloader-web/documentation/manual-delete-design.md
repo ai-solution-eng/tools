@@ -531,6 +531,11 @@ Job documents ([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L8-L9)).
 4. Write the tombstone (§10) — stdout is mandatory, the `_deleted/` copy is
    best-effort.
 5. `shutil.rmtree(<renamed path>)`.
+6. Best-effort: remove `<parent>/.locks/<cache id>/` (and the `.locks/` parent
+   when it ends up empty). `huggingface_hub` keeps per-repo locks there, and the
+   leaf carries the same `models--<org>--<repo>` name — left behind, it makes the
+   scanner report the deleted model as a 0-byte phantom forever. The scanner and
+   the GC walk also skip `.locks/` outright, so the two halves agree.
 
 The rename is what makes a killed run safe: the model leaves the listing the
 instant deletion starts, and an interrupted run leaves an obviously-junk

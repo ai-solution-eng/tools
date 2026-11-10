@@ -138,3 +138,30 @@ class TestMergeCarriesNewFields:
     def test_to_dict_carries_new_fields(self):
         d = DownloadedModel(model_name="m", bytes=1, scanned="clean", cachepath="/p").to_dict()
         assert d["bytes"] == 1 and d["scanned"] == "clean" and d["cachepath"] == "/p"
+
+
+# ---------------------------------------------------------------------------
+# HF hub lock dirs are not models
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_ignores_huggingface_lock_dirs():
+    # huggingface_hub keeps <cache_root>/.locks/models--org--Repo/, whose leaf
+    # matches the models--*--* glob. Without the exclusion, deleting a model
+    # leaves its lock dir behind and the scanner reports the deleted model as a
+    # 0-byte phantom forever.
+    script = _rendered_scan_script()
+    assert "! -path '*/.locks/*'" in script
+
+
+def test_gc_walk_skips_lock_dirs():
+    # The GC pass enumerates with os.walk + a cache-dir regex, so it would hand
+    # the same phantom to the deletion candidates without its own filter.
+    proc = subprocess.run(
+        ["helm", "template", "mdtest", ".", "-n", "project-user-x", "--set", "gc.enabled=true"],
+        cwd=HELM_DIR,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert 'if d != ".locks"' in proc.stdout

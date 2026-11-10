@@ -400,11 +400,20 @@ def _replica_from_metrics(pod_label, node, metrics_text):
     l1 = _sum("sglang:prefill_effective_tokens_total", mode="device_hit")
     l2 = _sum("sglang:prefill_effective_tokens_total", mode="host_hit")
     l3 = _sum("sglang:prefill_effective_tokens_total", mode="storage_hit")
+    # The four modes are disjoint: "input" is the part that had to be COMPUTED,
+    # the three *_hit modes are the parts served from each cache tier. Their sum
+    # is the total prompt tokens (it tracks sglang:prompt_tokens_total), so a
+    # tier's share is tier / total - SGLang's own documented formula. Dividing a
+    # tier by "input" alone gives hits-per-miss, which is unbounded: that is what
+    # made the GPU row read 525% instead of 84%.
+    prompt_tokens = input_tokens + l1 + l2 + l3
     entry["input_tokens"] = input_tokens or None
+    entry["prompt_tokens"] = prompt_tokens or None
     entry["l1_tokens"], entry["l2_tokens"], entry["l3_tokens"] = l1, l2, l3
-    entry["l1_pct"] = _pct(l1, input_tokens)
-    entry["l2_pct"] = _pct(l2, input_tokens)
-    entry["l3_pct"] = _pct(l3, input_tokens)
+    entry["l1_pct"] = _pct(l1, prompt_tokens)
+    entry["l2_pct"] = _pct(l2, prompt_tokens)
+    entry["l3_pct"] = _pct(l3, prompt_tokens)
+    entry["cached_pct"] = _pct(l1 + l2 + l3, prompt_tokens)
     entry["l3_write_tokens"] = _sum("sglang:backuped_tokens_total",
                                     storage_backend="mooncake")
     # The HiCache host pool (L2) - the tier that sits between GPU KV and the
@@ -907,14 +916,16 @@ function render(d){
         + tierRow("GPU KV", "L1",
                   (x.kv_evictable_tokens || 0) + (x.kv_used_tokens || 0),
                   x.kv_pool_tokens, "tokens", x.l1_pct,
+                  // The active slice is part of the residency, not an extra tail:
+                  // draw it first so it anchors the left edge of the bar.
                   {active: x.kv_used_tokens,
-                   parts: [{value: x.kv_evictable_tokens || 0, cls: ""},
-                           {value: x.kv_used_tokens || 0, cls: "active"}]})
+                   parts: [{value: x.kv_used_tokens || 0, cls: "active"},
+                           {value: x.kv_evictable_tokens || 0, cls: ""}]})
         + tierRow("Host RAM", "L2 \u00b7 pod memory", x.host_used_tokens, x.host_pool_tokens, "tokens", x.l2_pct)
         + tierRow("Mooncake", "L3 \u00b7 shared store, traffic not capacity", 0, 0, "traffic", x.l3_pct,
                   {traffic: {written: x.l3_write_tokens, read: x.l3_tokens}})
-        + '<div class="src">' + num(x.input_tokens) + ' prompt tokens \u00b7 <b>'
-        + pct((x.l1_pct || 0) + (x.l2_pct || 0) + (x.l3_pct || 0)) + ' served from cache</b></div>'
+        + '<div class="src">' + num(x.prompt_tokens) + ' prompt tokens \u00b7 <b>'
+        + pct(x.cached_pct) + ' served from cache</b></div>'
         + '</div>';
     }
     cards += '<div class="mcard">'
@@ -1065,8 +1076,9 @@ def selftest_data():
                     {"pod": "dsv41-a", "node": "scs04", "reachable": True, "error": None,
                      "kv_pool_tokens": 17060352, "kv_used_tokens": 120000, "token_usage": 0.17,
                      "cache_hit_rate": 0.993, "input_tokens": 434199,
+                     "prompt_tokens": 792951, "cached_pct": 0.452,
                      "l1_tokens": 346752, "l2_tokens": 0, "l3_tokens": 12000,
-                     "l1_pct": 0.799, "l2_pct": 0.0, "l3_pct": 0.028,
+                     "l1_pct": 0.437, "l2_pct": 0.0, "l3_pct": 0.015,
                      "l3_write_tokens": 447040,
                      "host_pool_tokens": 4090816, "host_used_tokens": 0, "cached_tokens": 346752,
                      "kv_evictable_tokens": 2780000,
@@ -1074,8 +1086,9 @@ def selftest_data():
                     {"pod": "dsv41-b", "node": "scs05", "reachable": True, "error": None,
                      "kv_pool_tokens": 17060352, "kv_used_tokens": 1200000, "token_usage": 0.07,
                      "cache_hit_rate": 0.911, "input_tokens": 980000,
+                     "prompt_tokens": 1880000, "cached_pct": 0.479,
                      "l1_tokens": 600000, "l2_tokens": 90000, "l3_tokens": 210000,
-                     "l1_pct": 0.612, "l2_pct": 0.092, "l3_pct": 0.214,
+                     "l1_pct": 0.319, "l2_pct": 0.048, "l3_pct": 0.112,
                      "l3_write_tokens": 1012000,
                      "host_pool_tokens": 4090816, "host_used_tokens": 1902336, "cached_tokens": 610400,
                      "kv_evictable_tokens": 900000,

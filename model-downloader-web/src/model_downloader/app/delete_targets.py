@@ -247,6 +247,33 @@ def rename_for_deletion(path: str) -> str:
     return pending
 
 
+def remove_model_locks(cache_dir: str) -> None:
+    """Best-effort removal of huggingface_hub's lock dir for a cache dir.
+
+    HF keeps per-repo locks at <cache_root>/.locks/<cache id>/. That leaf is
+    named models--<org>--<repo> exactly like a cache dir, so leaving it behind
+    makes the scanner report the deleted model as a 0-byte phantom forever (and
+    hands GC a bogus deletion candidate). The scanner filters .locks/ too, so
+    this is the other half: do not leave litter in the first place.
+
+    Only this model's lock subdir is removed, plus the shared .locks/ parent
+    when it ends up empty. A symlink is never followed.
+    """
+    parent = os.path.dirname(cache_dir.rstrip("/"))
+    cache_id = os.path.basename(cache_dir.rstrip("/"))
+    locks_root = os.path.join(parent, ".locks")
+    lock_dir = os.path.join(locks_root, cache_id)
+    try:
+        if os.path.islink(lock_dir):
+            os.unlink(lock_dir)
+        elif os.path.isdir(lock_dir):
+            shutil.rmtree(lock_dir)
+        if os.path.isdir(locks_root) and not os.listdir(locks_root):
+            os.rmdir(locks_root)
+    except Exception as e:  # pragma: no cover - best effort by design
+        _err(f"could not remove the lock dir for {cache_dir}: {e}")
+
+
 def run(
     *,
     targets: list[dict],
@@ -298,6 +325,7 @@ def run(
         except Exception as e:
             _err(f"{path}: delete failed ({e})")
             continue
+        remove_model_locks(path)
         deleted += 1
         _out(f"DELETED {path}")
 

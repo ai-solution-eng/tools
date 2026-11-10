@@ -9,8 +9,8 @@ description: >-
   HiCache tier, with a read-only dashboard showing pool and per-model cache
   statistics.
 type: application
-version: 0.2.3
-appVersion: "0.2.3"
+version: 0.2.4
+appVersion: "0.2.4"
 keywords:
   - kv-cache
   - mooncake

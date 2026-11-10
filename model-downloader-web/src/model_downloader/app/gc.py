@@ -85,6 +85,52 @@ def uri_matches_cache_dir(uri: str, cache_dir: str) -> bool:
     return re.search(r"/" + re.escape(org) + r"/" + re.escape(repo) + r"(/|\?|$)", uri) is not None
 
 
+_URI_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/[^?#]*)?")
+
+
+def uri_path(uri: str) -> str:
+    """The path component of a pvc:// or s3:// uri, without host or query."""
+    match = _URI_PATH_RE.match(uri or "")
+    if match:
+        return (match.group(1) or "").rstrip("/")
+    return (uri or "").split("?", 1)[0].rstrip("/")
+
+
+def uri_matches_cachepath(uri: str, cachepath: str) -> bool:
+    """Does the uri reference the model at the full on-disk cachepath?
+
+    Extends uri_matches_cache_dir with the CUSTOM CACHE ROOT shape, which the
+    name rules cannot see. A deployment registered from a custom download
+    location is stored as the directory that CONTAINS the cache dir:
+
+        pvc://models-pvc/large-models/Cohere202603?containerPath=/mnt/models
+
+    That uri contains neither the cache-dir name nor org/repo, so an actively
+    serving model was reported deletable -- the exact case that must be a soft
+    block. The rule: the uri's path must be a suffix of the cache dir's PARENT
+    path on a '/' boundary, and carry at least two segments so a bare
+    /large-models (the scan root) cannot protect everything underneath it.
+    """
+    if not cachepath:
+        return False
+    cachepath = cachepath.rstrip("/")
+    cache_dir = cachepath.rsplit("/", 1)[-1]
+    if uri_matches_cache_dir(uri, cache_dir):
+        return True
+    parent = cachepath.rsplit("/", 1)[0]
+    path = uri_path(uri)
+    if not path:
+        return False
+    if len([seg for seg in path.split("/") if seg]) < 2:
+        return False
+    return parent == path or parent.endswith(path)
+
+
+def aioli_protected_paths(uris: list[str], cachepaths: list[str]) -> set[str]:
+    """The subset of cachepaths any AIOLI uri references (path-aware)."""
+    return {cp for cp in cachepaths if cp and any(uri_matches_cachepath(uri, cp) for uri in uris)}
+
+
 def aioli_protected_dirs(uris: list[str], cache_dirs: list[str]) -> set[str]:
     """The subset of *cache_dirs* any AIOLI uri references."""
     protected: set[str] = set()
@@ -177,8 +223,8 @@ def build_gc_plan(
     in the GC Job; the app only ever reports.
     """
     now = now if now is not None else time.time()
-    cache_dirs = [e.get("cachepath", "").rsplit("/", 1)[-1] for e in entries]
-    aioli_hits = aioli_protected_dirs(aioli_uris, cache_dirs)
+    cachepaths = [e.get("cachepath", "") for e in entries]
+    aioli_hits = aioli_protected_paths(aioli_uris, cachepaths)
     protected_globs = list(protected_models or [])
 
     rows: list[dict] = []
@@ -189,7 +235,7 @@ def build_gc_plan(
         cachepath = e.get("cachepath") or ""
         cd = cachepath.rsplit("/", 1)[-1] if cachepath else ""
         manifest_present = e.get("manifest")
-        aioli_hit = cd in aioli_hits if cd else False
+        aioli_hit = cachepath in aioli_hits if cachepath else False
         job = live_job_protects(e, live_jobs)
         glob_hit = glob_protected(protected_globs, name) or (cd and glob_protected(protected_globs, cd))
         expired = is_expired(e, ttl_days=ttl_days, now=now)
@@ -390,9 +436,9 @@ def evaluate_manual_targets(
         ):
             hard.append("matches gc.protectedModels glob")
 
-        if aioli_available and cache_dir:
+        if aioli_available and cachepath:
             for uri in aioli_uris:
-                if uri_matches_cache_dir(uri, cache_dir):
+                if uri_matches_cachepath(uri, cachepath):
                     soft.append(f"registered in AIOLI packaged_models: {uri}")
                     break
 

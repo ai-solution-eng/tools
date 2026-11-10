@@ -810,7 +810,12 @@ data:
               # = not scanned). Read with python (the scanner image has no
               # jq) guarded to a single small read per dir.
               {{- end }}
-              find "$ROOT" -type d -name 'models--*--*' 2>/dev/null | while IFS= read -r d; do
+              # NOT under a .locks/ dir: huggingface_hub keeps per-repo locks at
+              # <cache_root>/.locks/<cache id>/, and that leaf is named
+              # models--<org>--<repo> like a real cache dir. Without this, deleting
+              # a model leaves its lock dir behind and the scanner reports the
+              # deleted model forever as a 0-byte phantom.
+              find "$ROOT" -type d -name 'models--*--*' ! -path '*/.locks/*' 2>/dev/null | while IFS= read -r d; do
                 cache="${d##*/}"
                 model="$(printf '%s' "${cache#models--}" | sed 's|--|/|')"
                 [ -n "$model" ] || continue

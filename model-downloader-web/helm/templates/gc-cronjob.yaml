@@ -238,6 +238,9 @@ spec:
               dirs = []
               for dirpath, dirnames, filenames in os.walk(root):
                   dirnames.sort()
+                  # HF hub lock dirs hold models--*--* leaves too; they are not
+                  # models and must never become GC candidates.
+                  dirnames[:] = [d for d in dirnames if d != ".locks"]
                   for d in list(dirnames):
                       if cache_dir_re.match(d):
                           full = os.path.join(dirpath, d)

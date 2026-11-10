@@ -189,6 +189,50 @@ def test_run_fails_when_a_delete_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# HF hub lock dirs
+# ---------------------------------------------------------------------------
+
+
+def test_deleting_a_model_also_clears_its_hub_lock(tmp_path):
+    # huggingface_hub keeps <cache_root>/.locks/models--org--Repo/, whose leaf
+    # name matches the scanner's models--*--* glob — leaving it behind makes the
+    # deleted model reappear as a 0-byte phantom.
+    root = tmp_path / "cache"
+    root.mkdir()
+    model = make_model(root, "models--acme--Alpha")
+    lock = root / ".locks" / "models--acme--Alpha"
+    lock.mkdir(parents=True)
+    (lock / "abc.lock").write_text("")
+
+    run(targets=[{"cachepath": model}], scan_root=str(root), actor="a", job="j", write_tombstone=False)
+
+    assert not os.path.exists(model)
+    assert not lock.exists()
+    # The now-empty .locks parent goes too, so nothing is left to trip over.
+    assert not (root / ".locks").exists()
+
+
+def test_lock_cleanup_leaves_other_models_locks_alone(tmp_path):
+    root = tmp_path / "cache"
+    root.mkdir()
+    model = make_model(root, "models--acme--Alpha")
+    keep = make_model(root, "models--acme--Beta")
+    (root / ".locks" / "models--acme--Alpha").mkdir(parents=True)
+    (root / ".locks" / "models--acme--Beta").mkdir(parents=True)
+
+    run(targets=[{"cachepath": model}], scan_root=str(root), actor="a", job="j", write_tombstone=False)
+
+    assert not (root / ".locks" / "models--acme--Alpha").exists()
+    assert (root / ".locks" / "models--acme--Beta").is_dir()
+    assert os.path.isdir(keep)
+
+
+def test_lock_cleanup_is_safe_when_no_locks_exist(tmp_path):
+    model = make_model(tmp_path)
+    assert run(targets=[{"cachepath": model}], scan_root=str(tmp_path), actor="a", job="j", write_tombstone=False) == 0
+
+
+# ---------------------------------------------------------------------------
 # tombstone
 # ---------------------------------------------------------------------------
 
