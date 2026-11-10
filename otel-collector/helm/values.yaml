@@ -96,7 +96,14 @@ config:
       timeout: 5s
 
   exporters:
-    otlphttp/langfuse:
+    # otlp_http (underscore) is the current component name; the old otlphttp
+    # alias logs a deprecation warning on 0.165.0 and will eventually be
+    # removed. The pipeline reference below MUST match this key exactly —
+    # the collector refuses to start on a mismatch ("references exporter
+    # ... which is not configured"), and PCAI's values merge can leave the
+    # two halves on different names: LISTS are replaced, MAPS are merged, so
+    # a renamed exporter key can survive while the pipeline list updates.
+    otlp_http/langfuse:
       # The collector appends /v1/traces to this endpoint.
       endpoint: http://langfuse-web.langfuse-v4.svc.cluster.local:3000/api/public/otel
       headers:
@@ -115,7 +122,7 @@ config:
         # Order matters: bound memory first, drop the noise early (so the
         # batcher never carries it), then batch what survives.
         processors: [memory_limiter, filter/drop_probes, batch]
-        exporters: [otlphttp/langfuse]
+        exporters: [otlp_http/langfuse]
     telemetry:
       logs:
         level: info
