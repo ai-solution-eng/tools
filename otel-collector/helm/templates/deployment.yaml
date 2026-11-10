@@ -33,6 +33,9 @@ spec:
             - name: otlp-grpc
               containerPort: 4317
               protocol: TCP
+            - name: otlp-http-llm
+              containerPort: 4320
+              protocol: TCP
             - name: health
               containerPort: 13133
               protocol: TCP
@@ -41,6 +44,13 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ default (printf "%s-langfuse" (include "otel-collector.fullname" .)) .Values.langfuse.existingSecret }}
+                  key: auth
+            # Second Langfuse project (LiteLLM). Rendered by secret.yaml unless
+            # litellm.existingSecret names a Secret you manage yourself.
+            - name: LANGFUSE_AUTH_LITELLM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-langfuse-litellm" (include "otel-collector.fullname" .)) .Values.litellm.existingSecret }}
                   key: auth
           livenessProbe:
             httpGet:

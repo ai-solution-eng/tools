@@ -37,6 +37,21 @@ langfuse:
   secretKey: "sk-lf-ee3ab4fd-38a5-4118-a20a-4d16fd426f75"
   # -- Use a pre-existing Secret instead of rendering one.
   # Must contain key `auth` = base64("<publicKey>:<secretKey>").
+
+# ================================================================
+# LiteLLM project credentials
+#
+# A SECOND Langfuse project, so LiteLLM traces do not mix with the
+# gateway's. Same contract as `langfuse` above: rendered into its own
+# Secret and injected as LANGFUSE_AUTH_LITELLM. Leave existingSecret
+# empty to render from these values, or point it at a Secret you own
+# (key `auth` = base64("<publicKey>:<secretKey>")).
+# ================================================================
+litellm:
+  # "PCAI Dev Team / LiteLLM"
+  publicKey: "pk-lf-4681bd0f-62f6-49ca-91d8-c30e24fcf091"
+  secretKey: "sk-lf-0330591d-c488-43bd-8d6a-2560d60b64aa"
+  existingSecret: ""
   existingSecret: ""
 
 # ================================================================
@@ -57,6 +72,13 @@ config:
           endpoint: 0.0.0.0:4318
         grpc:
           endpoint: 0.0.0.0:4317
+
+    # LiteLLM's door. A separate port keeps the two senders (and the two
+    # Langfuse projects) apart without attribute-based routing.
+    otlp/litellm:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4320
 
   processors:
     # Keep the collector's own footprint bounded; limit_mib must stay below
@@ -91,6 +113,29 @@ config:
           - 'attributes["http.target"] == "/metrics"'
           - 'attributes["http.target"] == "/metrics/"'
 
+    # LiteLLM's v1 "otel" callback emits one INTERNAL span per internal
+    # subsystem: auth, postgres (x5), router (x2), self, proxy_pre_call,
+    # batch_write_to_db. Those names are the ServiceTypes enum in
+    # litellm/types/services.py. They carry no gen_ai.* attributes and add
+    # ~12 observations per request to Langfuse, so drop them here. What
+    # survives is the real tree: the root span + raw_gen_ai_request.
+    #
+    # There is no LiteLLM env/config switch for this in v1 (upstream docs
+    # say so verbatim) — filtering belongs in the pipeline.
+    filter/drop_litellm_service_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'name == "postgres"'
+          - 'name == "auth"'
+          - 'name == "router"'
+          - 'name == "self"'
+          - 'name == "proxy_pre_call"'
+          - 'name == "batch_write_to_db"'
+          - 'name == "redis"'
+          - 'name == "reset_budget_job"'
+          - 'name == "pod_lock_manager"'
+
     batch:
       send_batch_size: 200
       timeout: 5s
@@ -110,6 +155,13 @@ config:
         Authorization: "Basic ${env:LANGFUSE_AUTH}"
         x-langfuse-ingestion-version: "4"
 
+    # Second Langfuse project — the LiteLLM pipeline's only destination.
+    otlp_http/langfuse_litellm:
+      endpoint: http://langfuse-web.langfuse-v4.svc.cluster.local:3000/api/public/otel
+      headers:
+        Authorization: "Basic ${env:LANGFUSE_AUTH_LITELLM}"
+        x-langfuse-ingestion-version: "4"
+
     # ---- Example: add SigNoz later, then list it under pipelines ----
     # otlphttp/signoz:
     #   endpoint: http://signoz-otel-collector.observability.svc.cluster.local:4318
@@ -123,6 +175,12 @@ config:
         # batcher never carries it), then batch what survives.
         processors: [memory_limiter, filter/drop_probes, batch]
         exporters: [otlp_http/langfuse]
+      # LiteLLM traffic: no probe filter (its spans carry no http.target),
+      # just the service-span drop, then batch, then its own project.
+      traces/litellm:
+        receivers: [otlp/litellm]
+        processors: [memory_limiter, filter/drop_litellm_service_spans, batch]
+        exporters: [otlp_http/langfuse_litellm]
     telemetry:
       logs:
         level: info

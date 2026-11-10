@@ -17,3 +17,7 @@ spec:
       port: 4317
       targetPort: otlp-grpc
       protocol: TCP
+    - name: otlp-http-llm
+      port: 4320
+      targetPort: otlp-http-llm
+      protocol: TCP
