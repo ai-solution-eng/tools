@@ -201,6 +201,13 @@ class Settings(BaseSettings):
     otel_endpoint: str = "http://otel-collector:4318"
     otel_service_name: str = "pcai-llm-gateway"
     otel_sample_ratio: float = 1.0
+    # Extra headers on every OTLP export, in the OpenTelemetry convention: a
+    # comma-separated list of Key=Value pairs (the same shape as
+    # OTEL_EXPORTER_OTLP_HEADERS). Backends that authenticate the exporter need
+    # this — Langfuse expects
+    #   Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4
+    # Empty (the default) sends content-type only.
+    otel_headers: str = ""
 
     # --- session affinity (provider + key pin) -----------------------------
     # A conversation may pin the ENDPOINT (not just the cascade head) so its

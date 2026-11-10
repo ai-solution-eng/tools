@@ -541,6 +541,8 @@ spec:
               value: {{ .Values.settings.otelServiceName | quote }}
             - name: PCAI_LLM_OTEL_SAMPLE_RATIO
               value: {{ .Values.settings.otelSampleRatio | quote }}
+            - name: PCAI_LLM_OTEL_HEADERS
+              value: {{ .Values.settings.otelHeaders | quote }}
             # Session affinity (endpoint pin) and audio billing heuristics.
             - name: PCAI_LLM_SESSION_AFFINITY_ENABLED
               value: {{ .Values.settings.sessionAffinityEnabled | quote }}
