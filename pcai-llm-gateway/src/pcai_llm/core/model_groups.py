@@ -60,6 +60,12 @@ _CACHE: dict[str, ModelGroup] | None = None
 # cached for the TTL too, so a database outage cannot turn every request into
 # a retry storm — the last good snapshot (or {}) is served instead.
 _LOADED_AT: float | None = None
+# Generation counter, bumped on every invalidate() (audit 2026-11-10): a
+# load() that STARTED before an invalidate() must not publish rows it fetched
+# PRE-commit back into the cache — that repopulated the old snapshot for a
+# full TTL right after an admin edit. load() captures the generation before
+# its fetch and only publishes a snapshot fetched under the SAME generation.
+_GEN: int = 0
 
 
 @dataclass(frozen=True)
@@ -154,17 +160,27 @@ async def load(force: bool = False) -> dict[str, ModelGroup]:
     global _CACHE, _LOADED_AT
     if not force and _is_fresh():
         return snapshot()
+    gen = _GEN
     try:
         rows = await db.fetch("SELECT name, model_type, policy, members, description FROM model_groups ORDER BY name")
     except Exception:
-        _LOADED_AT = time.monotonic()
+        if _GEN == gen:
+            # Only stamp the fault when no invalidate() superseded this
+            # attempt — a stale stamp would delay the post-edit reload too.
+            _LOADED_AT = time.monotonic()
         log.warning("model groups: load failed — serving the last good snapshot", exc_info=True)
         return snapshot()
     try:
         parsed = _parse(rows)
     except Exception:
-        _LOADED_AT = time.monotonic()
+        if _GEN == gen:
+            _LOADED_AT = time.monotonic()
         log.warning("model groups: unparseable rows — serving the last good snapshot", exc_info=True)
+        return snapshot()
+    if _GEN != gen:
+        # An invalidate() ran while this fetch was in flight: these rows are
+        # PRE-commit. Do not publish them — snapshot() is now empty and the
+        # next load() re-fetches the committed state.
         return snapshot()
     _CACHE = parsed
     _LOADED_AT = time.monotonic()
@@ -208,9 +224,12 @@ async def invalidate() -> None:
     Deliberately does NOT reload: the admin write path calls this right after
     its INSERT/DELETE, and an eager reload inside the same transaction would
     cache the PRE-commit row for a full TTL. Dropping is always correct; the
-    next request pays one SELECT.
+    next request pays one SELECT. The generation bump also neutralises a
+    load() already in flight (it fetched pre-commit rows and must not publish
+    them — audit 2026-11-10).
     """
-    global _CACHE, _LOADED_AT
+    global _CACHE, _LOADED_AT, _GEN
+    _GEN += 1
     _CACHE = None
     _LOADED_AT = None
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -223,6 +224,37 @@ def _assistant_message_text(payload: dict[str, Any]) -> str:
     return "\n".join(_assistant_message_texts(payload))
 
 
+def _mask_chat_body_choices(payload: dict[str, Any], guarded_text: str) -> bool:
+    """Rewrite every sampled answer in a chat body with the MASKED text.
+
+    ZC-3 shape, shared by the live forward path and the response-cache hit path
+    (audit 2026-11-10 P2-1) so a cached answer is masked exactly like a fresh
+    one: the answer becomes the masked text and the OTHER model-text channels
+    (the reasoning spellings, tool_calls) are DROPPED — a masked turn delivers a
+    clean answer, not executable calls. EVERY choice is rewritten (audit r5
+    #2b): the guard input is the join of all sampled answers, so a mask that
+    fired must land on all of them — rewriting only choices[0] shipped the
+    masked answer in choice 0 next to the UNMASKED sample in choice 1.
+
+    Returns False for an unusable body shape (the caller relays it unmodified
+    rather than corrupting it).
+    """
+    try:
+        for choice in payload["choices"]:
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            message["content"] = guarded_text
+            for _rk in toolrelay.REASONING_KEYS:
+                message.pop(_rk, None)
+            message.pop("tool_calls", None)
+            if choice.get("finish_reason") == "tool_calls":
+                choice["finish_reason"] = "stop"
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return False
+    return True
+
+
 def _sse_line_tokens(chunk: bytes) -> list[bytes]:
     """Every SSE line in one raw byte chunk, with the framing normalised.
 
@@ -411,13 +443,23 @@ def _message_text_tokens(message: Any) -> int:
     parts are ignored ENTIRELY (their URLs and base64 are not tokens). A
     plain-string content keeps the original len//4; None/missing/non-text
     content estimates 0 for the message. Never raises.
+
+    NON-ASCII (audit 2026-11-10 P2-21): the charge is core.context_window's
+    text_tokens, the SAME function the context-fit estimator uses — ASCII at
+    len//4 (byte-identical to the shipped estimator) but at least ONE token per
+    non-ASCII character. A bare len//4 here under-counted CJK/emoji ~4x, so the
+    admission charge and the billing estimate simply did not bind for that
+    traffic: the last audit fixed this defect class in context_window and left
+    its hot-path twin behind.
     """
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return len(content) // 4
+        return context_window.text_tokens(content)
     if isinstance(content, list):
         return sum(
-            len(part["text"]) // 4 for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
+            context_window.text_tokens(part["text"])
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     return 0
 
@@ -459,8 +501,16 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
 
 
 def _estimate_embedding_tokens(body: dict[str, Any]) -> int:
-    """Estimate tokens for an embeddings call from the raw input payload."""
-    return len(str(body.get("input") or "")) // 4
+    """Estimate tokens for an embeddings call from the raw input payload.
+
+    Charges through context_window.text_tokens (ascii//4 + one per non-ASCII
+    char) — the SAME estimator the admission path and the relay twin use, so
+    a CJK/emoji embedding input cannot be under-counted ~4x against the TPM
+    window while the chat path counts it correctly (audit 2026-11-10 P2-21
+    fixed the chat path; these two surfaces were the documented twin left
+    behind).
+    """
+    return context_window.text_tokens(str(body.get("input") or ""))
 
 
 def _estimate_rerank_tokens(body: dict[str, Any]) -> int:
@@ -472,14 +522,18 @@ def _estimate_rerank_tokens(body: dict[str, Any]) -> int:
     same fail-safe contract as _estimate_tokens.
     """
     query = body.get("query")
-    total = len(query) if isinstance(query, str) else len(str(query or ""))
+    total = (
+        context_window.text_tokens(query) if isinstance(query, str) else context_window.text_tokens(str(query or ""))
+    )
     documents = body.get("documents")
     if isinstance(documents, (list, tuple)):
         for doc in documents:
-            total += len(doc) if isinstance(doc, str) else len(str(doc or ""))
+            total += (
+                context_window.text_tokens(doc) if isinstance(doc, str) else context_window.text_tokens(str(doc or ""))
+            )
     elif isinstance(documents, str):
-        total += len(documents)
-    return max(0, total // 4)
+        total += context_window.text_tokens(documents)
+    return max(0, total)
 
 
 def _routing_available(
@@ -644,6 +698,8 @@ def _decision_caller(
     decision_model: str,
     policy: dict[str, Any],
     agents: list[Any] | None = None,
+    key_id: uuid.UUID | None = None,
+    request_id: str = "",
 ) -> Callable[..., Any] | None:
     """Build the System One caller for the configured decision model.
 
@@ -657,6 +713,16 @@ def _decision_caller(
     upstream uses, so credentials follow the one documented order (panel
     Fernet token, then by-ref Secret env var) and the decision model is just
     another pool to the operator.
+
+    P10 self-billing: when `key_id` (the CALLING key) is supplied, every
+    decision call that reaches the upstream settles its OWN ledger row under
+    that key with status='routing' — real upstream usage when the /systemone
+    response reports it, otherwise the token estimate over the decision
+    payload tagged unit_kind='token_estimate'. Gated by
+    settings.routing_charge_enabled (default True); 'routing' is priced by
+    settle() but kept OUT of _COSTED_STATUSES, so the row is chargeback-
+    visible without consuming the caller's token/completion budget. A settle
+    fault is non-fatal: billing the router must never cost the request.
     """
     from ..core import decision_routing
 
@@ -817,6 +883,7 @@ def _decision_caller(
             payload["images"] = list(images)
         headers = dict(_upstream_headers(ep, uuid.uuid4().hex[:12]))
         headers["Content-Type"] = "application/json"
+        _t0 = time.monotonic()
         try:
             resp = await model_router.client.post(url, json=payload, headers=headers, timeout=timeout_ms / 1000.0)
         except Exception as exc:
@@ -851,6 +918,43 @@ def _decision_caller(
             await pool.report(ep, False, error=f"upstream status {resp.status_code}")
         resp.raise_for_status()
         await pool.report(ep, True)
+        # P10 self-billing: the decision model's GPU time was previously
+        # INVISIBLE (no settle, no ledger row) — real spend by the calling
+        # key that no budget or chargeback line could see. Settle it here,
+        # after the upstream was paid, guarded like every other settle-adjacent
+        # nicety: a billing fault must never turn into a failed request.
+        if key_id is not None and settings.routing_charge_enabled:
+            try:
+                _dusage: dict[str, Any] = {}
+                try:
+                    _raw = resp.json()
+                    _raw_usage = _raw.get("usage") if isinstance(_raw, dict) else None
+                    if isinstance(_raw_usage, dict):
+                        _dusage = _raw_usage
+                except ValueError:
+                    pass  # non-JSON body: settle on the estimate
+                _in = int(_dusage.get("input_tokens") or 0)
+                _out = int(_dusage.get("output_tokens") or 0)
+                _tag: str | None = None
+                if not _in and not _out:
+                    # No upstream usage report: the len//4 estimate over the
+                    # DECISION payload (instructions + criteria + state).
+                    _in = len(json.dumps(payload)) // 4
+                    _tag = "token_estimate"
+                await settle(
+                    key_id,
+                    decision_model,
+                    "routing",
+                    _in,
+                    _out,
+                    "routing",
+                    int((time.monotonic() - _t0) * 1000),
+                    request_id or uuid.uuid4().hex,
+                    billable_units=float(_in) if _tag else None,
+                    unit_kind=_tag,
+                )
+            except Exception:
+                log.warning("decision model: routing self-settle failed (non-fatal)", exc_info=True)
         return resp.json()
 
     return _call
@@ -901,15 +1005,37 @@ def _is_2xx(status_code: int) -> bool:
 
 # Explicit (lowercased) body markers that make a 400 attributable to the
 # MODEL the upstream was asked for — not to the caller's request shape.
+# "does not exist" is NOT one of them (audit 2026-11-10 P2-20): on its own it
+# also matches ordinary field-validation errors ("the field 'temperature' does
+# not exist"), which EVERY endpoint of the deployment reproduces — see
+# _MODEL_ABSENT_RE, which requires a model noun beside it.
 _MODEL_400_MARKERS = (
     "model not found",
-    "does not exist",
     "unknown model",
     "context length",
     "maximum context",
     "message role",
     "unsupported role",
 )
+
+# A model NOUN adjacent to an absence marker. "does not exist" alone is not
+# evidence: a shape error naming a FIELD is a 400 on every endpoint, so
+# re-rolling it spends a second GPU call to reproduce the same refusal. The
+# gap is bounded and stops at a sentence break so the noun and the marker must
+# belong to the same clause.
+_MODEL_ABSENT_RE = re.compile(
+    r"\b(?:model|models|engine|deployment|checkpoint)\b[^.\n]{0,60}\bdoes\s+not\s+exist\b"
+    r"|\bdoes\s+not\s+exist\b[^.\n]{0,60}\b(?:model|models|engine|deployment|checkpoint)\b"
+)
+
+# How far into a 400 body the bare model NAME counts as attribution. An
+# upstream that echoes the request payload puts the name in every shape error,
+# so an unbounded substring test turned a client-shape 400 into a full
+# fallback-chain re-roll. The head of the body is where the error MESSAGE
+# lives; a single-QUOTED occurrence is exempt at any offset because prose
+# quoting the name is itself attribution (JSON double-quotes are deliberately
+# NOT exempt — a payload echo uses them).
+_MODEL_NAME_WINDOW = 200
 
 
 def _is_model_attributable_4xx(status: int, body: bytes, model: str) -> bool:
@@ -929,11 +1055,13 @@ def _is_model_attributable_4xx(status: int, body: bytes, model: str) -> bool:
         the gateway), so a 404 there is the upstream's "no such model", not
         a route miss.
       * 400 -> eligible ONLY when the lowercased body matches an explicit
-        marker (model not found / does not exist / unknown model / context
-        length / maximum context / message role / unsupported role), or when
-        it QUOTES the model name the gateway sent (a strict upstream's
-        rejection message names the model even when its phrasing misses
-        every marker). A generic validation 400 never matches.
+        marker (model not found / unknown model / context length / maximum
+        context / message role / unsupported role), or names the model
+        ABSENTLY ("model ... does not exist" — a bare "does not exist" is a
+        field-validation error, not a model one), or QUOTES the model name the
+        gateway sent near the top of the body (a strict upstream's rejection
+        message names the model even when its phrasing misses every marker).
+        A generic validation 400 never matches.
       * 401/403/429 and every other status -> NOT eligible: credentials,
         authorization and rate limits are identical on every endpoint of the
         same deployment, so a second attempt reproduces the same refusal.
@@ -946,7 +1074,12 @@ def _is_model_attributable_4xx(status: int, body: bytes, model: str) -> bool:
     text = body.decode("utf-8", errors="replace").lower()
     if any(marker in text for marker in _MODEL_400_MARKERS):
         return True
-    return bool(model) and model.lower() in text
+    if _MODEL_ABSENT_RE.search(text):
+        return True
+    if not model:
+        return False
+    name = model.lower()
+    return name in text[:_MODEL_NAME_WINDOW] or f"'{name}'" in text
 
 
 def _context_limit_for(ep: Endpoint | None) -> int | None:
@@ -1174,6 +1307,30 @@ def _release_in_flight(key_id: Any) -> None:
         _in_flight.pop(key_id, None)
 
 
+def _once(fn: Callable[[], None]) -> Callable[[], None]:
+    """Wrap a release callback so it runs AT MOST ONCE.
+
+    The concurrency slot has exactly ONE owner at a time but SEVERAL possible
+    release sites: the handler's error guard, _stream_chat's own 502 path, the
+    stream generator's finally, the post-call guard wrapper's replay tail. A
+    naive "add a release everywhere it can leak" is WRONG for this counter — it
+    is per-KEY, not per-request, so a second release decrements a CONCURRENT
+    request's slot and the cap silently stops binding. The once-wrapper is what
+    makes every one of those sites safe to guard, which is why the P1 slot-leak
+    fix is a pair (idempotent release + wrap the whole post-gate body).
+    """
+    done = False
+
+    def _release() -> None:
+        nonlocal done
+        if done:
+            return
+        done = True
+        fn()
+
+    return _release
+
+
 # --------------------------------------------------------------------------
 # non-streaming forwarding (shared by chat + embeddings)
 # --------------------------------------------------------------------------
@@ -1345,6 +1502,14 @@ async def _proxy_json(
             # server that omitted prompt_tokens would otherwise bill the
             # completion as prompt, so it keeps the estimate fallback.
             prompt_tokens = int(usage.get("total_tokens") or 0)
+        # P10 honesty tag: an embeddings/rerank row whose numbers came from
+        # the len//4 ESTIMATE (the upstream reported no usage at all) settles
+        # tagged unit_kind='token_estimate' — chargeback can then tell a
+        # measured row from a proxied one. Real upstream usage keeps the
+        # legacy untagged shape (NULL unit_kind = measured as always).
+        _usage_estimated = endpoint in ("embeddings", "rerank") and not (
+            usage.get("prompt_tokens") or usage.get("total_tokens") or usage.get("completion_tokens")
+        )
         prompt_tokens = prompt_tokens or est_tokens
         completion_tokens = int(usage.get("completion_tokens") or 0)
         # Usage-detail passthrough (the plain-path twin of toolrelay._cached_tokens):
@@ -1441,38 +1606,16 @@ async def _proxy_json(
                     },
                     headers={"X-Request-ID": request_id},
                 )
-            if guarded_text != text and embedding_json:
-                try:
-                    # ZC-3 on the non-streaming surface (xv round 2, finding 3),
-                    # shaped EXACTLY like the stream's masked path: the answer
-                    # becomes the masked text; the OTHER model-text channels
-                    # (reasoning spellings, tool_calls) are DROPPED — on the
-                    # stream they are text-bearing chunks the masked path
-                    # suppresses, and re-masking fragments (or judging tool
-                    # data as assistant speech) is the leak/false-block trap
-                    # the stream rework just removed. A masked turn delivers a
-                    # clean answer, not executable calls.
-                    # EVERY choice (audit r5 #2b): the guard input is the join
-                    # of all sampled answers, so a mask that fired must land on
-                    # all of them — rewriting only choices[0] shipped the masked
-                    # answer in choice 0 next to the UNMASKED sample in choice 1.
-                    for choice in embedding_json["choices"]:
-                        message = choice.get("message")
-                        if not isinstance(message, dict):
-                            continue
-                        message["content"] = guarded_text
-                        for _rk in toolrelay.REASONING_KEYS:
-                            message.pop(_rk, None)
-                        message.pop("tool_calls", None)
-                        if choice.get("finish_reason") == "tool_calls":
-                            choice["finish_reason"] = "stop"
-                except (KeyError, IndexError, TypeError, AttributeError):
-                    pass  # unusual shape: relay unmodified rather than corrupt
-                else:
-                    masked_by = sorted({d["guardrail"] for d in post_dicts if d.get("action") == "masked"})
-                    if masked_by:
-                        out_headers["X-PCAI-Guardrail-Modified"] = ",".join(masked_by)
-                    out_content = json.dumps(embedding_json).encode()
+            # ZC-3 on the non-streaming surface (xv round 2, finding 3), shaped
+            # EXACTLY like the stream's masked path — see
+            # _mask_chat_body_choices, which the response-cache hit path shares
+            # (audit 2026-11-10 P2-1) so a cached answer is masked identically
+            # to a fresh one.
+            if guarded_text != text and embedding_json and _mask_chat_body_choices(embedding_json, guarded_text):
+                masked_by = sorted({d["guardrail"] for d in post_dicts if d.get("action") == "masked"})
+                if masked_by:
+                    out_headers["X-PCAI-Guardrail-Modified"] = ",".join(masked_by)
+                out_content = json.dumps(embedding_json).encode()
 
         # --- zero-completion insurance (review §4c, flag-gated) ---------------
         # 2xx + EMPTY assistant text (both content shapes) + zero completion
@@ -1545,6 +1688,12 @@ async def _proxy_json(
             cached_tokens=cached_tokens,
             billing_fraction=offpeak.effective_for(cur_model, off_base),
             guardrail_events=guard_all or None,
+            # P10: the estimate tag (None when the upstream measured usage —
+            # the legacy shape) with the row's own token count as the
+            # provenance quantity. Never raised on the chat path: chat rows
+            # stay byte-identical.
+            billable_units=float(prompt_tokens + completion_tokens) if _usage_estimated else None,
+            unit_kind="token_estimate" if _usage_estimated else None,
             **model_routing.ledger_stamp(route if cur_model == model else None, cur_model),
         )
         if cache_input is not None:
@@ -1555,7 +1704,20 @@ async def _proxy_json(
         if want_metadata and embedding_json:
             from ..core import costs as _costs
 
-            cost = await _costs.compute(cur_model, prompt_tokens, completion_tokens, cached_tokens)
+            # GUARDED (audit 2026-11-10 P2-16 twin, cross-validation wave 1):
+            # this runs AFTER settle() wrote the ledger row and after the
+            # upstream was PAID, and costs._load() propagates DB faults — so an
+            # unguarded read 500'd a metadata-requesting response post-spend and
+            # the client's retry was a second GPU bill. The metadata block is
+            # OPTIONAL BY DESIGN (X-PCAI-Metadata is an opt-in nicety, never a
+            # gate), and _pcai_metadata_body already omits cost_usd when it is
+            # None — so a cost-read fault degrades to "cost not reported",
+            # exactly like an unpriced model.
+            try:
+                cost: Any = await _costs.compute(cur_model, prompt_tokens, completion_tokens, cached_tokens)
+            except Exception as exc:
+                log.warning("costs: metadata cost read failed for %r (cost omitted): %s", cur_model, exc)
+                cost = None
             mutated = _pcai_metadata_body(
                 embedding_json,
                 cur_model,
@@ -1600,6 +1762,86 @@ def _asr_model_from_multipart(body: bytes) -> str:
     return m.group(1).decode("utf-8", "replace").strip()
 
 
+def _positive_float(raw: str | None) -> float | None:
+    """The parsed value when `raw` is a finite number > 0, else None."""
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if (math.isfinite(val) and val > 0) else None
+
+
+# Response headers an upstream may use to REPORT the generated audio's real
+# duration (P10). There is no standard here — OpenAI-compatible TTS servers
+# return bare audio bytes — so the check is a best-effort scan over the
+# spellings a fleet upstream plausibly uses, plus a sample-count/sample-rate
+# pair (exact when both are present). Absent all of them the char/byte proxy
+# rides, tagged, exactly as before. Never raises: billing metadata is not a
+# client-facing failure.
+
+# Audio compression envelope (cross-validation wave 2, 2026-11-10): an
+# encoded upload (mp3/opus/m4a/flac/...) is never more than ~16x smaller in
+# bytes than the raw PCM the byte proxy assumes, and never larger — raw PCM
+# is the byte-densest honest shape. The DURATION a caller may honestly hint
+# is therefore bounded to ~16x on either side of the byte-proxy estimate:
+# outside that window the hint is not metadata, it is a price input the
+# caller picked (0.001 s = free ASR; 1e8 s = a 1500 USD bill on a 3.6 MB
+# upload — both reproduced on the real route), so it is CLAMPED into the
+# envelope with a WARNING naming the clamp instead of being trusted.
+_AUDIO_COMPRESSION_ENVELOPE = 16.0
+
+
+def _clamp_duration_hint(hint: float, byte_estimate_s: float) -> float:
+    """The caller's duration hint clamped into the upload's compression
+    envelope [byte_estimate/16, byte_estimate*16] (seconds; see the
+    _AUDIO_COMPRESSION_ENVELOPE comment). The byte proxy is the only quantity
+    the gateway measures itself, so it is the clamp's anchor — a hint within
+    the envelope rides unchanged. Logs one WARNING naming the clamp when it
+    fires: billing metadata that was rewritten must be visible, not silent.
+    """
+    if byte_estimate_s <= 0:
+        return hint
+    lo = byte_estimate_s / _AUDIO_COMPRESSION_ENVELOPE
+    hi = byte_estimate_s * _AUDIO_COMPRESSION_ENVELOPE
+    if lo <= hint <= hi:
+        return hint
+    clamped = min(max(hint, lo), hi)
+    log.warning(
+        "audio: duration hint %gs outside the upload's compression envelope"
+        " (%gs..%gs from the byte proxy) — clamped to %gs (send raw-PCM-sized"
+        " uploads or let the upstream report the duration)",
+        hint,
+        lo,
+        hi,
+        clamped,
+    )
+    return clamped
+
+
+_DURATION_HEADERS = (
+    "x-audio-duration",
+    "x-audio-duration-seconds",
+    "x-duration-seconds",
+    "x-pcai-duration",
+    "content-duration",
+)
+
+
+def _audio_duration_s(headers: Any) -> float | None:
+    """Real duration (seconds) reported by an upstream response, or None."""
+    for name in _DURATION_HEADERS:
+        val = _positive_float(headers.get(name))
+        if val is not None:
+            return val
+    samples = _positive_float(headers.get("x-samples")) or _positive_float(headers.get("x-sample-count"))
+    rate = _positive_float(headers.get("x-sample-rate")) or _positive_float(headers.get("x-sample-rate-hz"))
+    if samples and rate:
+        return samples / rate
+    return None
+
+
 async def _proxy_audio_raw(
     pool: Pool,
     ep: Endpoint,
@@ -1613,6 +1855,10 @@ async def _proxy_audio_raw(
     request_id: str,
     started: float,
     gate: _GateOutcome,
+    *,
+    estimate_units: float | None = None,
+    unit_kind_estimate: str | None = None,
+    duration_hint: float | None = None,
 ) -> Response:
     """Forward one audio call BYTES-UNCHANGED, relay status/type/bytes.
 
@@ -1626,6 +1872,17 @@ async def _proxy_audio_raw(
     back to the client untouched, same transparent-proxy stance as
     _proxy_json). The client's Content-Type rides upstream — a multipart
     transcription must arrive as multipart, a JSON speech body as JSON.
+
+    P10 billing: when a REAL duration is available — a duration/sample-count
+    header on the upstream RESPONSE first (the server measured it; it wins
+    over anything the caller supplied), then the caller's duration hint (ASR
+    only, already clamped into the upload's compression envelope by the
+    route) — the 2xx row settles per SECOND (unit_kind='second', cost from
+    costs.compute_units; a model priced per 'token' mismatches and ledgers
+    NULL with a guard WARNING, never a wrong-rate bill). Without one, the
+    legacy estimate settles exactly as before, tagged
+    unit_kind=unit_kind_estimate with billable_units = estimate_units (the
+    proxy's provenance quantity: chars for TTS, derived seconds for ASR).
     """
     headers = dict(_upstream_headers(ep, request_id))
     headers["Content-Type"] = content_type
@@ -1661,7 +1918,39 @@ async def _proxy_audio_raw(
             headers=out_headers,
         )
     await pool.report(ep, True)
-    await settle(key.id, model, label, est_tokens, 0, "ok", latency, request_id)
+    # P10 (hardened by cross-validation wave 2): the UPSTREAM-reported duration
+    # wins — the server that decoded the audio measured it, while the caller's
+    # hint is a price input the caller picked and (already clamped into the
+    # upload's compression envelope by the ASR route) is only the fallback.
+    # Either way the token columns keep the ADMISSION estimate (that is what
+    # the gates charged); only the cost and the unit columns change.
+    duration = _audio_duration_s(resp.headers) or duration_hint
+    if duration is not None:
+        await settle(
+            key.id,
+            model,
+            label,
+            est_tokens,
+            0,
+            "ok",
+            latency,
+            request_id,
+            billable_units=duration,
+            unit_kind="second",
+        )
+    else:
+        await settle(
+            key.id,
+            model,
+            label,
+            est_tokens,
+            0,
+            "ok",
+            latency,
+            request_id,
+            billable_units=estimate_units,
+            unit_kind=unit_kind_estimate,
+        )
     _log_request(key.key_prefix, model, ep, "ok", latency, request_id)
     return Response(
         content=resp.content,
@@ -2340,7 +2629,6 @@ def loop_guard_check(key_id: Any, server: str, tool: str, arguments: dict) -> st
             for f, _coldest in live_below[: len(_loop_guard) - target]:
                 _loop_guard.pop(f, None)
     return None
-    return None
 
 
 async def _admit_with_failover(
@@ -2926,6 +3214,47 @@ def _downgrade_tool_calls_terminal(chunk: bytes) -> bytes | None:
     return b"data: " + json.dumps(obj).encode() + b"\n\n"
 
 
+# Ceiling on the bytes a post_call-guarded stream may buffer before replay
+# (audit 2026-11-10 P2-25). The wrapper holds the WHOLE answer in memory to judge
+# it, so an upstream that never stops talking was an unbounded per-request
+# allocation on the event loop. 32 MiB is ~20x the largest answer a real
+# completion can produce (max_tokens is capped at 262144, i.e. low single-digit
+# MB of SSE), so it only ever fires on a pathological or hostile stream — and it
+# fires CLOSED: bytes that cannot be judged are never delivered unjudged.
+_GUARDED_SSE_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+
+
+class _SlotReleasingStreamingResponse(StreamingResponse):
+    """StreamingResponse that gives the concurrency slot back on EVERY exit.
+
+    WHY a subclass (cross-validation wave 1, P1-2 follow-up): the slot's normal
+    release points are the stream generator's own finally (stream ended, client
+    walked away) and the handler's error guard. NEITHER fires when the request
+    task is cancelled during Starlette's http.response.start — that send happens
+    BEFORE the body iterator's first __anext__ (starlette/responses.py
+    stream_response), and a NEVER-STARTED async generator executes no body, so
+    its finally never runs and the per-key counter stays incremented: the key is
+    429-bricked on its concurrency cap until the pod restarts.
+
+    This is the response-layer backstop. Whatever ends the send loop —
+    completion, client disconnect, or a cancellation at any point — the slot is
+    released. It uses the handler's once-wrapper, so it can never steal a
+    CONCURRENT request's slot and the generator's own release stays
+    authoritative.
+    """
+
+    def __init__(self, *args: Any, release_slot: Callable[[], None] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._release_slot = release_slot
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._release_slot is not None:
+                self._release_slot()
+
+
 async def _guarded_sse(
     inner: AsyncIterator[bytes],
     ledger: _StreamLedger | None,
@@ -2969,6 +3298,8 @@ async def _guarded_sse(
     impact on budget/token SUMs.
     """
     chunks: list[bytes] = []
+    buffered = 0
+    overflowed = False
     text_parts: list[str] = []
     # LINE CURSOR, not one parse per network read (audit r5 #2c): httpx2's
     # aiter_bytes() hands over whatever the socket returned, so an SSE event
@@ -2993,6 +3324,13 @@ async def _guarded_sse(
     tool_span: set[int] = set()
     handback_span: set[int] = set()
     finish_span: set[int] = set()
+    # Chunks that are part of a [DONE] line, recorded BY INDEX (audit
+    # 2026-11-10 P2-19). The masked replay used a b"data: [DONE]" SUBSTRING
+    # test, which two legal framings defeat — a [DONE] straddling two network
+    # reads ("data: [DO" + "NE]") and the space-less "data:[DONE]". Either one
+    # shipped the ORIGINAL terminal ahead of the synthetic masked final, so the
+    # client stopped reading at an answer it never received.
+    done_span: set[int] = set()
 
     def _classify(line: bytes, first: int, last: int) -> None:
         """Fold ONE complete SSE line into the guard input + the drop set.
@@ -3008,7 +3346,12 @@ async def _guarded_sse(
         if not stripped.startswith(b"data:"):
             return
         payload = stripped[len(b"data:") :].strip()
-        if not payload or payload == b"[DONE]":
+        if payload == b"[DONE]":
+            # The terminal frame: recorded by CHUNK INDEX (see done_span), and
+            # by the LINE's full span, so a straddled terminal is caught too.
+            done_span.update(range(first, last + 1))
+            return
+        if not payload:
             return
         try:
             obj = json.loads(payload)
@@ -3028,8 +3371,15 @@ async def _guarded_sse(
 
     try:
         async for chunk in inner:
+            if buffered >= _GUARDED_SSE_MAX_BUFFER_BYTES:
+                # BUFFER CAP (audit 2026-11-10 P2-25): stop buffering and stop
+                # pulling from the upstream — the answer cannot be judged, and
+                # an unjudged answer is never delivered (see the abort below).
+                overflowed = True
+                break
             idx = len(chunks)
             chunks.append(chunk)
+            buffered += len(chunk)
             # _sse_line_tokens is CR/LF/CRLF-aware (audit C-7); its LAST
             # element is the unterminated remainder, everything before it is
             # a complete line.
@@ -3056,6 +3406,43 @@ async def _guarded_sse(
         if release_slot is not None and not relay_mode:
             release_slot()
         raise
+
+    if overflowed:
+        # FAIL CLOSED (audit 2026-11-10 P2-25): the answer outgrew the buffer, so
+        # post_call guardrails cannot judge it. Delivering the bytes anyway would
+        # be a guardrail BYPASS on the one path an operator attached a post_call
+        # policy to; the terminal error envelope tells the client the turn was
+        # refused rather than silently truncating it.
+        aclose = getattr(inner, "aclose", None)
+        if aclose is not None:
+            # Close the abandoned upstream stream (and let the relay generator's
+            # own finally settle/release) before the shielded settle below.
+            with anyio.CancelScope(shield=True):
+                await aclose()
+        detail = (
+            f"response exceeded the {_GUARDED_SSE_MAX_BUFFER_BYTES}-byte post-call guardrail "
+            "buffer cap and was not delivered unjudged"
+        )
+        log.warning("guardrails: %s (request_id=%s)", detail, request_id)
+        if ledger is not None:
+            ledger.override_status = "guardrail_blocked"
+            if release_slot is not None:
+                release_slot()
+            with anyio.CancelScope(shield=True):
+                await ledger.finish()
+        else:
+            await settle(
+                key.id,
+                model,
+                "chat:guardrail",
+                0,
+                0,
+                "guardrail_blocked",
+                _latency_ms(started),
+                request_id,
+            )
+        yield _sse_guard_error(detail, code="guardrail_buffer_exceeded")
+        return
 
     text = "".join(text_parts)
     try:
@@ -3112,8 +3499,6 @@ async def _guarded_sse(
 
     if ledger is not None:
         ledger.extra_events = post_dicts
-        if release_slot is not None:
-            release_slot()
         with anyio.CancelScope(shield=True):
             await ledger.finish()
     elif all_events:
@@ -3130,50 +3515,63 @@ async def _guarded_sse(
             guardrail_events=all_events,
         )
 
-    if guarded_text == text:
-        # pass: byte-identical replay
-        for chunk in chunks:
+    # THE SLOT IS RELEASED AFTER THE REPLAY, NOT BEFORE (audit 2026-11-10
+    # P2-25). The release used to sit beside ledger.finish() — i.e. BEFORE the
+    # buffered bytes were handed to the client — so the concurrency cap stopped
+    # constraining a guarded stream at exactly the point its delivery began.
+    # The finally also covers a client disconnect DURING the replay
+    # (GeneratorExit is thrown at the yield, which is where a disconnect lands).
+    # Idempotent, so the earlier release on the blocked/overflow paths and this
+    # one never conflict.
+    try:
+        if guarded_text == text:
+            # pass: byte-identical replay
+            for chunk in chunks:
+                yield chunk
+            return
+        # masked: suppress EVERY text-carrying chunk (and the original [DONE]),
+        # replay the rest verbatim, then the consolidated masked answer.
+        # ZC-3 (audit 2026-10-29 + xv round 2): the LEAK is fixed by widening the
+        # drop predicate, not by re-masking fragments. A streaming delta is a
+        # FRAGMENT — a guard rule that fires on the assembled text ("your key is
+        # ACME-SECRET-1") can miss both halves of a split secret, so any
+        # per-fragment re-masking either leaks (fragment unchanged) or blocks
+        # clean answers (tool data judged as assistant speech), and re-running
+        # the engine per fragment amplifies one verdict into hundreds of engine
+        # calls. The reviewer-mandated shape: drop text-bearing chunks WHOLE —
+        # a chunk the classifier calls text-bearing is never replayed unmasked,
+        # fail-closed on the channel the mask owns — and ship exactly one
+        # consolidated final carrying the MASKED ANSWER ONLY (not reasoning, not
+        # tool JSON, not pcai text: those are not the assistant's reply and the
+        # old per-channel rewrite glued them into delta.content).
+        # The drop set comes from the LINE CURSOR above (audit r5 #2c), not from a
+        # per-chunk parse: a chunk that merely CARRIES HALF of a text-bearing
+        # event is in `dirty` too, so a straddled event can never be reassembled
+        # by the client from two "text-free" halves. The [DONE] drop is by INDEX
+        # for the same reason (audit 2026-11-10 P2-19).
+        # HANDBACK DOWNGRADE (audit w6, owner decision): a turn whose tool-call
+        # deltas the mask dropped can no longer be a handback — the client would be
+        # told to execute calls it never received. Drop the handback event and force
+        # the terminal to finish_reason "stop", so the masked stream is a clean,
+        # self-consistent completion. The arguments stay MASKED: never replay them.
+        downgrade_handback = bool(tool_span & dirty)
+        for i, chunk in enumerate(chunks):
+            if i in dirty or i in done_span:
+                continue
+            if downgrade_handback and i in handback_span:
+                continue
+            if downgrade_handback and i in finish_span:
+                rewritten = _downgrade_tool_calls_terminal(chunk)
+                if rewritten is not None:
+                    yield rewritten
+                # an unparseable (straddled) terminal is dropped: the synthetic
+                # masked final below supplies the one and only stop.
+                continue
             yield chunk
-        return
-    # masked: suppress EVERY text-carrying chunk (and the original [DONE]),
-    # replay the rest verbatim, then the consolidated masked answer.
-    # ZC-3 (audit 2026-10-29 + xv round 2): the LEAK is fixed by widening the
-    # drop predicate, not by re-masking fragments. A streaming delta is a
-    # FRAGMENT — a guard rule that fires on the assembled text ("your key is
-    # ACME-SECRET-1") can miss both halves of a split secret, so any
-    # per-fragment re-masking either leaks (fragment unchanged) or blocks
-    # clean answers (tool data judged as assistant speech), and re-running
-    # the engine per fragment amplifies one verdict into hundreds of engine
-    # calls. The reviewer-mandated shape: drop text-bearing chunks WHOLE —
-    # a chunk the classifier calls text-bearing is never replayed unmasked,
-    # fail-closed on the channel the mask owns — and ship exactly one
-    # consolidated final carrying the MASKED ANSWER ONLY (not reasoning, not
-    # tool JSON, not pcai text: those are not the assistant's reply and the
-    # old per-channel rewrite glued them into delta.content).
-    # The drop set comes from the LINE CURSOR above (audit r5 #2c), not from a
-    # per-chunk parse: a chunk that merely CARRIES HALF of a text-bearing
-    # event is in `dirty` too, so a straddled event can never be reassembled
-    # by the client from two "text-free" halves.
-    # HANDBACK DOWNGRADE (audit w6, owner decision): a turn whose tool-call
-    # deltas the mask dropped can no longer be a handback — the client would be
-    # told to execute calls it never received. Drop the handback event and force
-    # the terminal to finish_reason "stop", so the masked stream is a clean,
-    # self-consistent completion. The arguments stay MASKED: never replay them.
-    downgrade_handback = bool(tool_span & dirty)
-    for i, chunk in enumerate(chunks):
-        if i in dirty or b"data: [DONE]" in chunk:
-            continue
-        if downgrade_handback and i in handback_span:
-            continue
-        if downgrade_handback and i in finish_span:
-            rewritten = _downgrade_tool_calls_terminal(chunk)
-            if rewritten is not None:
-                yield rewritten
-            # an unparseable (straddled) terminal is dropped: the synthetic
-            # masked final below supplies the one and only stop.
-            continue
-        yield chunk
-    yield _sse_masked_final(model, request_id, guarded_text)
+        yield _sse_masked_final(model, request_id, guarded_text)
+    finally:
+        if release_slot is not None:
+            release_slot()
 
 
 async def _peek_first_data_line(
@@ -3493,6 +3891,14 @@ async def _stream_chat(
                     route=None,
                     fallback_from=fallback_from,
                     fallback_chain=chain,
+                    # PIN CONTEXT MUST SURVIVE THE HOP (audit 2026-11-10 P3):
+                    # the recursion used to drop both, so a failover turn
+                    # served by a chain candidate never refreshed the
+                    # conversation's endpoint/group pins — the streaming
+                    # pin-refresh silently stopped working for exactly the
+                    # turns that moved models. Threaded through unchanged.
+                    affinity_session=affinity_session,
+                    group_name=group_name,
                 )
         if release_slot is not None:
             release_slot()
@@ -3555,7 +3961,7 @@ async def _stream_chat(
         # AFTER judging the assembled text, so pre+post verdicts land on ONE
         # row and a blocked stream never delivers its content.
         ledger.defer_finish = True
-        return StreamingResponse(
+        return _SlotReleasingStreamingResponse(
             _guarded_sse(
                 _relay_sse(
                     resp,
@@ -3575,11 +3981,13 @@ async def _stream_chat(
             ),
             media_type="text/event-stream",
             headers=stream_headers,
+            release_slot=release_slot,
         )
-    return StreamingResponse(
+    return _SlotReleasingStreamingResponse(
         _relay_sse(resp, ledger, release_slot=release_slot, prefix=peeked, chunks=peek_chunks),
         media_type="text/event-stream",
         headers=stream_headers,
+        release_slot=release_slot,
     )
 
 
@@ -3967,7 +4375,10 @@ async def _reconcile_relay_messages(
         # computed here and consumed by BOTH reconcile (mode decision) and, on
         # the extend path, detect_continuation — previously each ran its own
         # full walk over the canonical prefix (two serialization passes on a
-        # 214k-token conversation).
+        # 214k-token conversation). This only works because prefix_hashes
+        # returns [] for a CLEAN prefix and reserves None for "not computed"
+        # (audit 2026-11-10 P1-7): while both meant None, every healthy extend
+        # turn re-walked the history three times.
         _prefix = canonical.prefix_hashes(stored, incoming) if stored else None
         messages, mode = canonical.reconcile(stored, incoming, prefix_verdict=_prefix)
         # Phase 2A: an "extend" whose new tail is only the handback's
@@ -4081,6 +4492,16 @@ async def _capture_chat_canonical(key: KeyRecord, body: dict[str, Any], raw_head
         # the merged result is smaller than what's stored, leave the stored
         # row alone (the fragment tells us nothing the row doesn't know).
         if stored and len(merged) < len(stored):
+            return
+        # NO-OP EXTEND (audit 2026-11-10 P2-30): the client re-sent exactly the
+        # stored history — a retry, a cache miss replayed, a client that simply
+        # re-asks. reconcile's prefix hash walk has already PROVED
+        # message-for-message equality (extend + equal length means every hash
+        # matched), so the UPSERT would re-serialise a whole conversation JSONB
+        # to write back the bytes already there. The iteration column is the
+        # only other field and it is written from the value just READ, so
+        # skipping the write loses nothing.
+        if stored and _mode == canonical.MODE_EXTEND and len(merged) == len(stored):
             return
         await canonical.save(db, key.id, thread_id, merged, iterations_prior)
     except Exception:
@@ -4239,7 +4660,16 @@ async def chat_completions(
 
             _policy = await _rc.decision_settings()
             if _policy["mode"] in ("shadow", "active") and _policy["model"]:
-                _caller = _decision_caller(_policy["model"], _policy, agents=_routing_agents)
+                # P10: the calling key + this request's id ride along so the
+                # decision call can settle its own status='routing' row under
+                # THIS key (see _decision_caller).
+                _caller = _decision_caller(
+                    _policy["model"],
+                    _policy,
+                    agents=_routing_agents,
+                    key_id=key.id,
+                    request_id=request_id,
+                )
                 if _caller is not None:
                     from ..core import decision_routing as _dr
 
@@ -4400,9 +4830,20 @@ async def chat_completions(
     # EITHER feature is on; each pin SCOPE has its own gate at its own seam
     # (ep: only under session_affinity_enabled, grp: only under
     # model_groups_enabled), and None means no pin (no header, no seed).
+    #
+    # The header is CANONICALISED, never stored raw (audit 2026-11-10 P2-2):
+    # this value becomes the thread_key half of a model_stickiness PRIMARY KEY
+    # (stickiness.set_endpoint_pin / set_group_pin), so an unbounded
+    # client-supplied string mints one row per distinct value up to the server's
+    # 1 MB header limit. stickiness.affinity_key applies the documented
+    # charset/length bound and hashes; a value outside it is DROPPED (routing
+    # state, not policy — the request is still served, it just falls back to the
+    # conversation fingerprint, exactly as if no header had been sent).
+    from ..core import stickiness as _stick_mod
+
     affinity_session: str | None = None
     if settings.session_affinity_enabled or settings.model_groups_enabled:
-        affinity_session = (request.headers.get("x-pcai-session") or "").strip() or _cascade_thread
+        affinity_session = _stick_mod.affinity_key(request.headers.get("x-pcai-session")) or _cascade_thread
     # --- three-state relay resolution, EARLY (audit L-2): the plain-chat
     # capture below must not run on a RELAYED request — the relay branch owns
     # that turn's store rows (the reconcile save + the loop's own terminal
@@ -4445,23 +4886,6 @@ async def chat_completions(
         # finding 10: an approval-always request on a relay-default key is
         # NOT relayed, so its plain-chat capture must run).
         relay_requested = False
-    # canonical capture for the plain chat path (fire-and-forget; the relay
-    # path captures its own): a NON-relayed agent using this key converges
-    # into the canonical store and gets automatic memories. A relayed request
-    # is skipped above — relay_requested is the guard.
-    try:
-        if not relay_requested and len(_capture_tasks) < _CAPTURE_TASKS_MAX:
-            # strong ref via the module set (a bare create_task can be GC'd
-            # mid-flight - the classic fire-and-forget footgun); the done
-            # callback discards AND logs (never a silent swallow)
-            _hdr = request.headers.get("x-pcai-conversation") or ""
-            # headers ride along so the capture can recognize an auxiliary
-            # session-title call (X-PCAI-Purpose) without re-deriving it
-            _t = asyncio.create_task(_capture_chat_canonical(key, body, _hdr, request.headers))
-            _capture_tasks.add(_t)
-            _t.add_done_callback(_capture_tasks.discard)
-    except Exception:
-        log.warning("canonical: plain-chat capture could not be scheduled", exc_info=True)
     # --- agent profiles (2026-10-29): a MODEL NAME that names an agent ------
     # An agent is advertised in /v1/models as a model entry (pcai.type="agent"),
     # so selecting one is just naming it. Resolution happens HERE — before the
@@ -4820,11 +5244,15 @@ async def chat_completions(
         from ..mcpf.federation import load_denies, load_grants
 
         relay_grants = await load_grants(key.id)
-        # Deny rows subtract EVERYWHERE (audit D-F1): under the default
-        # scope grant mode the policy-admitted catalog is re-added below
-        # AFTER this filter, so denies must be removed from the FINAL set —
-        # subtracting them from load_grants alone would not survive the
-        # scope merge. load_denies is fail-open-isolated (federation.py:96).
+        # Deny rows subtract EVERYWHERE (audit D-F1): under
+        # tool_relay_grant_mode="scope" (the LEGACY opt-in — the default is
+        # "explicit", config.tool_relay_grant_mode) the policy-admitted catalog
+        # is re-added below AFTER this filter, so denies must be removed from
+        # the FINAL set — subtracting them from load_grants alone would not
+        # survive the scope merge. load_denies FAILS CLOSED since audit
+        # 2026-11-10 P2-11: a DB fault serves the key's last known snapshot, and
+        # with no snapshot it propagates so the turn is refused rather than
+        # silently un-denied.
         denies = await load_denies(key.id)
         relay_grants = relay_grants - denies
         scope_granted = settings.tool_relay_grant_mode == "scope" and "mcp" in key.scopes
@@ -4922,11 +5350,83 @@ async def chat_completions(
         and response_cache.eligible(body)
         and model_router.pool(model) is not None
     ):
-        _cache_hash = response_cache.request_hash(body)
+        # The METADATA variant is part of the key (audit 2026-11-10 P2-1): the
+        # stored bytes are the FINAL response body, so one key for both variants
+        # served a caller who never opted in a "pcai" block naming the ORIGINAL
+        # request's endpoint and cost. Two variants, two keys.
+        _cache_hash = response_cache.request_hash(body, want_metadata=want_metadata)
         _cached = await response_cache.lookup(key.id, model, _cache_hash)
         _metrics.RESPONSE_CACHE.labels(mode=_cache_mode, result="hit" if _cached is not None else "miss").inc()
         if _cache_mode == "active" and _cached is not None:
             _cache_latency = _latency_ms(started)
+            _hit_body: bytes = _cached
+            _hit_headers: dict[str, str] = {
+                "X-Request-ID": request_id,
+                "X-Cache": "HIT",
+                "X-PCAI-Served-Model": model,
+            }
+            _hit_blocked = ""
+            # POST-CALL GUARDRAILS ON A HIT (audit 2026-11-10 P2-1). The cached
+            # bytes were judged by whatever post_call set was attached when they
+            # were STORED, and a hit used to replay them verbatim: a masked
+            # answer came back UNMASKED (and X-PCAI-Guardrail-Modified was
+            # dropped), and a guardrail added since the store never saw the
+            # answer at all. Re-running the current set costs one policy
+            # evaluation and makes a hit behave exactly like a fresh serve on
+            # the policy axis — no cache invalidation to get wrong.
+            if guardrail_post:
+                _hit_json: Any = None
+                try:
+                    _hit_json = json.loads(_cached)
+                except (TypeError, ValueError):
+                    _hit_json = None
+                if isinstance(_hit_json, dict):
+                    _hit_text = _assistant_message_text(_hit_json)
+                    try:
+                        _gtext, _pev, _blocked = await guardrails.run_post_call(
+                            guardrail_post, _hit_text, model_router.client
+                        )
+                    except Exception as exc:
+                        # fail-open with visibility (the forward path's posture)
+                        log.warning("guardrails: post_call evaluation on cache hit failed: %s", exc)
+                        _gtext, _pev, _blocked = _hit_text, [], False
+                    if _blocked:
+                        _first = _pev[0] if _pev else None
+                        _hit_blocked = f"blocked by guardrail '{_first.guardrail if _first else 'post_call'}'"
+                        if _first is not None and _first.detail:
+                            _hit_blocked += f": {_first.detail}"
+                    elif _gtext != _hit_text and _mask_chat_body_choices(_hit_json, _gtext):
+                        _masked_by = sorted(
+                            {d["guardrail"] for d in (e.as_dict() for e in _pev) if d.get("action") == "masked"}
+                        )
+                        if _masked_by:
+                            _hit_headers["X-PCAI-Guardrail-Modified"] = ",".join(_masked_by)
+                        _hit_body = json.dumps(_hit_json).encode()
+            if _hit_blocked:
+                await settle(
+                    key.id,
+                    model,
+                    "chat",
+                    est_tokens,
+                    0,
+                    "guardrail_blocked",
+                    _cache_latency,
+                    request_id,
+                    cached_tokens=est_tokens,
+                )
+                _log_request(key.key_prefix, model, None, "guardrail_blocked", _cache_latency, request_id)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": _hit_blocked,
+                            "type": "guardrail_blocked",
+                            "param": "",
+                            "code": "guardrail_blocked",
+                        }
+                    },
+                    headers={"X-Request-ID": request_id},
+                )
             await settle(
                 key.id,
                 model,
@@ -4940,13 +5440,9 @@ async def chat_completions(
             )
             _log_request(key.key_prefix, model, None, "cache_hit", _cache_latency, request_id)
             return fastapi.responses.Response(
-                content=_cached,
+                content=_hit_body,
                 media_type="application/json",
-                headers={
-                    "X-Request-ID": request_id,
-                    "X-Cache": "HIT",
-                    "X-PCAI-Served-Model": model,
-                },
+                headers=_hit_headers,
             )
 
     model, gate, admission_fallback_from = await _admit_with_failover(
@@ -4959,34 +5455,79 @@ async def chat_completions(
         # to be admitted: re-check each member instead (no budget bypass).
         None if group_name is not None else resolution.gate,
     )
+    # ONE release path per request (audit 2026-11-10 P1-2). _run_gates took the
+    # concurrency slot above, and from here on SEVERAL exits may give it back:
+    # the relay generator's finally, _stream_chat's own 502 path, the plain
+    # streaming guard below, the non-streaming finally. Every one of them calls
+    # this once-wrapper, so "add a release wherever it can leak" can never
+    # decrement a CONCURRENT request's slot — the per-key counter's only
+    # invariant is that ONE admitted request releases exactly once.
+    release_slot = _once(lambda: _release_in_flight(key.id))
     warn_level = gate.warn_level
+    # --- canonical capture for the PLAIN chat path (fire-and-forget; the relay
+    # path captures its own): a NON-relayed agent using this key converges into
+    # the canonical store and gets automatic memories. A relayed request is
+    # skipped — relay_requested is the guard (resolved early, above).
+    #
+    # SCHEDULED HERE, AFTER ADMISSION (audit 2026-11-10 P2-30). Pre-fix this ran
+    # BEFORE resolve_cascade/_admit_with_failover, so every rejected request —
+    # 403 ACL, 404 unregistered, 429 rate/budget, the 503 no-healthy-upstream —
+    # still paid a full SELECT plus an UPSERT that re-serialised the WHOLE
+    # conversation JSONB, and the cache-hit path (which returns above) paid it
+    # twice. Nothing about a rejected or cached turn belongs in the store.
+    # It also removes a race: the task closes over the LIVE body dict, so
+    # scheduling it before the guardrails meant the pre-call mask/reasoning
+    # strip could land underneath the capture mid-write.
+    try:
+        if not relay_requested and len(_capture_tasks) < _CAPTURE_TASKS_MAX:
+            # strong ref via the module set (a bare create_task can be GC'd
+            # mid-flight - the classic fire-and-forget footgun); the done
+            # callback discards AND logs (never a silent swallow)
+            _hdr = request.headers.get("x-pcai-conversation") or ""
+            # headers ride along so the capture can recognize an auxiliary
+            # session-title call (X-PCAI-Purpose) without re-deriving it
+            _t = asyncio.create_task(_capture_chat_canonical(key, body, _hdr, request.headers))
+            _capture_tasks.add(_t)
+            _t.add_done_callback(_capture_tasks.discard)
+    except Exception:
+        log.warning("canonical: plain-chat capture could not be scheduled", exc_info=True)
     # The admission walk may have PROMOTED the request to a different model
     # (rate/budget 429 down the profile ordering): the per-model chain must
     # be the CHAIN OF THE MODEL THAT WILL ACTUALLY SERVE, not the name that
     # arrived. A fresh read; a chain read failure is fail-safe (empty —
     # the fallback feature never breaks a request).
-    fb_chain = await model_fallbacks.chain_for(model)
-    # Runtime cascade continuation (ALIAS requests only). The profile ordering
-    # AFTER the serving model is appended as the FINAL segment of the walk
-    # chain: an `auto` request whose admitted model then cannot serve
-    # (pool.pick()==None, transport error, upstream 5xx) fails over DOWN THE
-    # ADMIN'S OWN ORDERING instead of ending answerless when no per-model
-    # chain was curated. The per-model chain stays FIRST — an explicit
-    # per-model sign-off outranks the ordering — and the combined walk is
-    # still sliced to settings.model_fallback_max, so the documented bound
-    # (and its 0 kill switch) is unchanged. Every appended candidate is
-    # re-gated at walk time exactly like a chain entry (registered +
-    # key-allowed + healthy chat pool + fresh check_budgets): the ordering
-    # tail is a preference list, never a budget or ACL bypass.
     #
-    # NOT for pinned requests: a pin never cascades (the client asked for
-    # THAT model — documented cascade semantics), so its runtime net stays
-    # the per-model chain. For an alias the ordering IS the routing policy,
-    # so it keeps applying after admission.
-    if is_alias and settings.model_fallback_max > 0:
-        seen = {model, *fb_chain}
-        tail = _relay_fallback_tail(model, resolution.order or [], registered, key.allowed_models)
-        fb_chain = [*fb_chain, *[c for c in tail if c not in seen]][: settings.model_fallback_max]
+    # The whole block sits in the release guard (audit 2026-11-10 P1-2): this
+    # is the ONE await between the gates taking the slot and the big post-gate
+    # try below, and its own fail-safe catches Exception only — a client
+    # disconnect here is a BaseException and used to leak the slot.
+    try:
+        fb_chain = await model_fallbacks.chain_for(model)
+        # Runtime cascade continuation (ALIAS requests only). The profile
+        # ordering AFTER the serving model is appended as the FINAL segment of
+        # the walk chain: an `auto` request whose admitted model then cannot
+        # serve (pool.pick()==None, transport error, upstream 5xx) fails over
+        # DOWN THE ADMIN'S OWN ORDERING instead of ending answerless when no
+        # per-model chain was curated. The per-model chain stays FIRST — an
+        # explicit per-model sign-off outranks the ordering — and the combined
+        # walk is still sliced to settings.model_fallback_max, so the
+        # documented bound (and its 0 kill switch) is unchanged. Every appended
+        # candidate is re-gated at walk time exactly like a chain entry
+        # (registered + key-allowed + healthy chat pool + fresh
+        # check_budgets): the ordering tail is a preference list, never a
+        # budget or ACL bypass.
+        #
+        # NOT for pinned requests: a pin never cascades (the client asked for
+        # THAT model — documented cascade semantics), so its runtime net stays
+        # the per-model chain. For an alias the ordering IS the routing policy,
+        # so it keeps applying after admission.
+        if is_alias and settings.model_fallback_max > 0:
+            seen = {model, *fb_chain}
+            tail = _relay_fallback_tail(model, resolution.order or [], registered, key.allowed_models)
+            fb_chain = [*fb_chain, *[c for c in tail if c not in seen]][: settings.model_fallback_max]
+    except BaseException:
+        release_slot()
+        raise
     fallback_from = admission_fallback_from
 
     try:
@@ -5236,7 +5777,33 @@ async def chat_completions(
                 `pool_for` overrides the request's pool — the relay's mid-loop
                 model failover re-points iterations at the fallback pool."""
                 p = pool_for or pool
-                ep2 = p.pick() or (p.endpoints[0] if p.endpoints else ep)
+                # NO `or p.endpoints[0]` FALLBACK (audit 2026-11-10 P1-3):
+                # Pool.pick() returns None PRECISELY when every endpoint is
+                # breaker-cooling or probe-failed (routing/router.py:147-149), so
+                # the old fallback served a COOLING endpoint anyway — ignoring
+                # the breaker, the priority tiers and weight==0 standby. That is
+                # the exact construct _decision_caller documents as the bug it
+                # removed, and the relay is the dominant agent path (one
+                # stream_once per iteration), so a tripped breaker bought
+                # nothing.
+                #
+                # RAISE, do not synthesise events (cross-validation wave 1). The
+                # first fix yielded ("error", ...) + ("content", ...), but
+                # relay_stream's failover walk fires ONLY on a transport
+                # exception (call_failed) or budget exhaustion — an ("error", …)
+                # event merely stamps the settle status. So a breaker-cooled
+                # primary with healthy fallbacks configured streamed
+                # "(model error: no healthy endpoint)" as the ASSISTANT ANSWER and
+                # ended the turn, leaving every fallback unused. ConnectError is a
+                # TransportError (hence an httpx2.HTTPError), which is exactly the
+                # class _bounded_call's caller maps to call_failed — so the walk
+                # now takes the hop, and with no fallback configured the relay
+                # still closes cleanly with its own visible error chunk.
+                ep2 = p.pick()
+                if ep2 is None:
+                    raise httpx2.ConnectError(
+                        "no healthy endpoint in the pool (every endpoint is breaker-cooling or probe-failed)"
+                    )
                 url2 = f"{ep2.base_url}/chat/completions"
                 h2 = _upstream_headers(ep2, request_id)
                 b2 = {
@@ -5542,7 +6109,7 @@ async def chat_completions(
                                 len(shadowed),
                                 request_id,
                             )
-                    _release_in_flight(key.id)
+                    release_slot()
 
             stream_headers = _relay_headers(
                 headers,
@@ -5565,7 +6132,7 @@ async def chat_completions(
                 # Post-call guardrails on the relayed stream: buffer, judge
                 # the FINAL answer, replay (verbatim / masked / blocked).
                 # Pre-call verdicts ride the marker row with the post ones.
-                return StreamingResponse(
+                return _SlotReleasingStreamingResponse(
                     _guarded_sse(
                         relay_gen(),
                         None,
@@ -5579,17 +6146,22 @@ async def chat_completions(
                     ),
                     media_type="text/event-stream",
                     headers=stream_headers,
+                    release_slot=release_slot,
                 )
-            return StreamingResponse(
+            return _SlotReleasingStreamingResponse(
                 relay_gen(),
                 media_type="text/event-stream",
                 headers=stream_headers,
+                release_slot=release_slot,
             )
     except BaseException:
         # Slot-leak fix (security audit): EVERY post-gate raise must give back
         # the concurrency slot _run_gates took — relay catalog failures,
         # unexpected DB errors, the 503 above. Re-raised untouched.
-        _release_in_flight(key.id)
+        # Idempotent (audit 2026-11-10 P1-2): the same slot is also released by
+        # the relay generator's finally / _stream_chat's own 502 path, and the
+        # once-wrapper makes the overlap harmless.
+        release_slot()
         raise
 
     # --- agent system prompt on the PLAIN path (no relay) -------------------
@@ -5600,42 +6172,63 @@ async def chat_completions(
     # the guardrails ran (an operator's own prose is not what a PII guardrail
     # should be scanning). Both plain dispatches below (_stream_chat and
     # _proxy_json) read this body.
-    if agent is not None and agent.system_prompt:
-        body = {
-            **body,
-            "messages": toolrelay.with_system_prefix(list(body.get("messages") or []), agent.system_prompt),
-        }
-    if bool(body.get("stream")):
-        # Streaming: slot ownership TRANSFERS to the stream generator
-        # (released in _relay_sse's finally, when the stream actually ends).
-        # Releasing here — at response-object construction — would free the
-        # slot before a single chunk was consumed, voiding the cap for the
-        # exact workload it exists to constrain.
-        stream_resp = await _stream_chat(
-            pool,
-            ep,
-            url,
-            body,
-            headers,
-            key,
-            model,
-            est_tokens,
-            request_id,
-            started,
-            release_slot=lambda: _release_in_flight(key.id),
-            post_guards=guardrail_post or None,
-            pre_events=guard_events or None,
-            route=route_ctx,
-            fallback_from=fallback_from,
-            fallback_chain=fb_chain,
-            affinity_session=affinity_session,
-            group_name=group_name,
-        )
-        if group_name is not None:
-            # Headers are still mutable here: the stream has not started
-            # (the first body chunk is what sends them).
-            stream_resp.headers["X-PCAI-Group"] = group_name
-        return stream_resp
+    # The prompt rewrite and the streaming dispatch are INSIDE the release
+    # guard (audit 2026-11-10 P1-2). Pre-fix the plain streaming branch sat
+    # outside BOTH release paths — the relay's except above and the
+    # non-streaming finally further down — so any raise between the gates and
+    # response construction leaked the concurrency slot: a client disconnect
+    # during the up-to-45s TTFT peek (_peek_first_data_line re-raises
+    # cancellation and the call site only handles httpx2.HTTPError), an
+    # unguarded resp.aclose(), or a with_system_prefix fault. The leaked
+    # counter never decrements, so the key is 429-bricked on its concurrency
+    # cap until the pod restarts (see the P1 note at _StreamLedger). The
+    # release is idempotent, so the generator's own release stays authoritative
+    # once the stream is handed off.
+    try:
+        if agent is not None and agent.system_prompt:
+            body = {
+                **body,
+                "messages": toolrelay.with_system_prefix(list(body.get("messages") or []), agent.system_prompt),
+            }
+        if bool(body.get("stream")):
+            # Streaming: slot ownership TRANSFERS to the stream generator
+            # (released in _relay_sse's finally, when the stream actually ends).
+            # Releasing here — at response-object construction — would free the
+            # slot before a single chunk was consumed, voiding the cap for the
+            # exact workload it exists to constrain. _stream_chat wraps the
+            # response in _SlotReleasingStreamingResponse, which is the backstop
+            # for the one exit the generator cannot cover: a cancellation during
+            # http.response.start, before its first __anext__.
+            stream_resp = await _stream_chat(
+                pool,
+                ep,
+                url,
+                body,
+                headers,
+                key,
+                model,
+                est_tokens,
+                request_id,
+                started,
+                release_slot=release_slot,
+                post_guards=guardrail_post or None,
+                pre_events=guard_events or None,
+                route=route_ctx,
+                fallback_from=fallback_from,
+                fallback_chain=fb_chain,
+                affinity_session=affinity_session,
+                group_name=group_name,
+            )
+            if group_name is not None:
+                # Headers are still mutable here: the stream has not started
+                # (the first body chunk is what sends them).
+                stream_resp.headers["X-PCAI-Group"] = group_name
+            return stream_resp
+    except BaseException:
+        # Nothing was handed to a generator, so this request still owns the
+        # slot: give it back and re-raise untouched.
+        release_slot()
+        raise
     try:
         resp = await _proxy_json(
             pool,
@@ -5671,7 +6264,7 @@ async def chat_completions(
         await _group_pin_drop_if_dead(key, affinity_session, model)
         raise
     finally:
-        _release_in_flight(key.id)
+        release_slot()
     # --- group / session affinity commit (non-streaming surface) -----------
     # The streaming surface refreshes the SAME pins, but at its own
     # completion point: _stream_chat hands the ledger an on_complete hook
@@ -5744,8 +6337,21 @@ async def embeddings(
     if cached is not None:
         latency = _latency_ms(started)
         est = _estimate_embedding_tokens(body)
-        # visible + free: a ledger row the budgets SUM ignores
-        await settle(key.id, model, "embeddings", est, 0, "cache_hit", latency, request_id, cached_tokens=est)
+        # visible + free: a ledger row the budgets SUM ignores. P10: the count
+        # is the len//4 ESTIMATE — tagged so chargeback reads it honestly.
+        await settle(
+            key.id,
+            model,
+            "embeddings",
+            est,
+            0,
+            "cache_hit",
+            latency,
+            request_id,
+            cached_tokens=est,
+            billable_units=float(est),
+            unit_kind="token_estimate",
+        )
         _log_request(key.key_prefix, model, None, "cache_hit", latency, request_id)
         return fastapi.responses.JSONResponse(
             {
@@ -5960,6 +6566,11 @@ async def audio_speech(
     # TTS estimate: characters of the spoken text (4 chars ~ 1 token). A
     # non-string input (list of strings) is summed the same way; anything
     # else estimates 0 — the gates still run on the request axis.
+    # P10: this char count is ALSO the row's provenance quantity — when the
+    # upstream reports no real duration, the settle tags unit_kind
+    # 'char_estimate' with billable_units = chars, so the ledger says exactly
+    # what was measured ("we billed a token proxy over N chars") instead of
+    # passing the proxy off as a token measurement.
     text = payload.get("input")
     if isinstance(text, str):
         chars = len(text)
@@ -5993,6 +6604,10 @@ async def audio_speech(
             request_id,
             started,
             gate,
+            # P10: real duration (upstream response headers) bills per SECOND;
+            # otherwise the char proxy rides, tagged, exactly as before.
+            estimate_units=float(chars),
+            unit_kind_estimate="char_estimate",
         )
     finally:
         _release_in_flight(key.id)
@@ -6011,9 +6626,28 @@ async def audio_transcriptions(
     model field scanned out of the raw body — and a loud 400 when none
     yields a name. The body BYTES are forwarded unchanged (multipart stays
     multipart; the audio is never parsed). Token estimate: audio duration
-    at the fleet's assumed 16 kHz 16-bit mono rate (~32 kB/s) times
-    audio_asr_tokens_per_second (~3/s ≈ 150 spoken words/min), floored at
-    one second so a tiny upload still bills the request it carried.
+    at the fleet's assumed 16 kHz 16-bit mono rate (audio_asr_bytes_per_second,
+    default ~32 kB/s) times audio_asr_tokens_per_second (~3/s ≈ 150 spoken
+    words/min), floored at one second so a tiny upload still bills the
+    request it carried.
+
+    P10 duration (hardened by cross-validation wave 2) — precedence, unit,
+    bound: the row bills in SECONDS from the first REAL duration available,
+    in this order (1) an upstream-reported duration response header — the
+    server that decoded the audio measured it, so it beats anything the
+    caller says; (2) the ?duration= query param in SECONDS; (3) the
+    X-PCAI-Duration header (same, seconds). The caller hint is a PRICE INPUT,
+    not trusted metadata: it is clamped into the upload's compression
+    envelope [byte_proxy/16, byte_proxy*16] seconds (a compressed upload is
+    never more than ~16x smaller than raw PCM and never larger — outside
+    that window the hint would let a caller bill 0.001 s of ASR as free or
+    1e8 s as a 1500 USD row) with a WARNING naming the clamp. With no
+    duration at all, the byte proxy rides tagged unit_kind='second_estimate'
+    with billable_units = the derived seconds. All three paths price through
+    model_costs.unit='second' (a token-priced model ledgers NULL + a
+    WARNING — never a wrong-rate conversion). Clients SHOULD send the hint
+    for compressed uploads (mp3/opus/m4a are 2-8x smaller than raw PCM in
+    bytes — the byte proxy under-bills them).
     """
     request_id = uuid.uuid4().hex
     started = time.monotonic()
@@ -6037,10 +6671,31 @@ async def audio_transcriptions(
     if not pool_has_type(pool, "voice"):
         raise fastapi.HTTPException(400, f"model {model!r} is a {pool.endpoints[0].model_type} endpoint, not voice")
 
-    # ASR estimate: raw body bytes / 32000 (16 kHz 16-bit mono ≈ 32 kB/s),
-    # floored at 1 second — a multipart envelope around a tiny clip still
-    # carried a real transcription request.
-    est_tokens = max(1, int(max(1, len(body) / 32000) * settings.audio_asr_tokens_per_second))
+    # P10 duration hint: ?duration= (seconds) first, X-PCAI-Duration header
+    # second — explicit beats ambient, the SAME precedence the model name
+    # uses above. A junk/negative hint is ignored, not a 400: billing
+    # metadata must never be a client-facing failure (the byte proxy is
+    # always available as the fallback). It is also CLAMPED into the
+    # upload's compression envelope once the byte-proxy estimate exists
+    # below — the hint is a price input, and an unbounded one billed
+    # 0.001 s as free ASR and 1e8 s as a 1500 USD row (both reproduced).
+    duration_hint = _positive_float(request.query_params.get("duration"))
+    if duration_hint is None:
+        duration_hint = _positive_float(request.headers.get("x-pcai-duration"))
+
+    # ASR estimate: raw body bytes / audio_asr_bytes_per_second (the default
+    # 32000 assumes RAW 16 kHz 16-bit mono ≈ 32 kB/s; compressed formats are
+    # 2-8x denser — send the duration hint instead), floored at 1 second — a
+    # multipart envelope around a tiny clip still carried a real
+    # transcription request.
+    est_seconds = max(1.0, len(body) / settings.audio_asr_bytes_per_second)
+    est_tokens = max(1, int(est_seconds * settings.audio_asr_tokens_per_second))
+    # The envelope anchor is the byte proxy (the only quantity the gateway
+    # measures itself): clamp the caller hint INTO it, both ways, WARNING on
+    # the rewrite. The upstream-reported duration (which wins over the hint)
+    # is NOT clamped — a measurement is not a claim.
+    if duration_hint is not None:
+        duration_hint = _clamp_duration_hint(duration_hint, est_seconds)
 
     gate = await _run_gates(key, model, est_tokens, "audio.transcriptions", request_id, started)
 
@@ -6066,6 +6721,11 @@ async def audio_transcriptions(
             request_id,
             started,
             gate,
+            # P10: a real duration (hint, then upstream header) bills per
+            # SECOND; otherwise the byte proxy rides, tagged, exactly as before.
+            estimate_units=est_seconds,
+            unit_kind_estimate="second_estimate",
+            duration_hint=duration_hint,
         )
     finally:
         _release_in_flight(key.id)
@@ -6174,8 +6834,19 @@ async def list_models(
     primary = next((m for m in order if m in registered_set and serves_chat(m)), "")
 
     def _pool_type(m: str) -> str:
+        # any(), not endpoints[0] (audit 2026-11-10 P3): registration order is
+        # not a policy, so a pool whose FIRST endpoint happens to be another
+        # type used to advertise the wrong pcai.type for a model that does
+        # serve chat — the same defect cascade.pool_has_type was introduced to
+        # replace on the request paths. The vocabulary is the one this listing
+        # documents (chat|embedding|reranker|voice); "chat" first because it is
+        # the surface a mixed pool is overwhelmingly reached for, and because
+        # an unknown/empty pool keeps the old fail-open default.
         p = model_router.pool(m)
-        return p.endpoints[0].model_type if p is not None and p.endpoints else "chat"
+        for _t in ("chat", "embedding", "reranker", "voice"):
+            if pool_has_type(p, _t):
+                return _t
+        return "chat"
 
     # CAPACITY (operator requirement, 2026-10-28): model_list should show, for
     # a given api key, what models still have token capacity at that moment.

@@ -25,7 +25,9 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -87,6 +89,31 @@ _COSTED_STATUSES: tuple[str, ...] = ("ok", "error", "guardrail_blocked")
 # because a list cannot bind into IN (...); the values are this module
 # constant, never request data.
 _COSTED_SQL = ", ".join(f"'{s}'" for s in _COSTED_STATUSES)
+
+# P10: an estimate tag maps to the unit its number is a PROXY for. The settle
+# path prices a tagged row over this EFFECTIVE unit (never through the
+# per-1M-TOKEN arithmetic unless the STORED model unit is 'token'), so a
+# per-1M-SECOND rate can never ride the token arithmetic (the silent 3x
+# over-bill) and chars are never billed as seconds. Unknown tags stay on the
+# legacy path (never invent a unit — and thus a rate — of their own).
+_EFFECTIVE_UNIT_BY_TAG: dict[str, str] = {
+    "char_estimate": "char",
+    "second_estimate": "second",
+    "token_estimate": "token",
+}
+# A real CHECK-vocabulary unit rides as its own effective unit verbatim.
+for _u in ("token", "char", "second", "image", "request"):
+    _EFFECTIVE_UNIT_BY_TAG.setdefault(_u, _u)
+
+# billable_units column ceiling: NUMERIC(18,6) == 12 integer digits + 6
+# decimals (db/schema.py). Validating HERE — before the INSERT — is what keeps
+# an oversized quantity from raising NumericValueOutOfRangeError and losing
+# the immutable billing row for spend the upstream already served.
+_BILLABLE_UNITS_MAX = 999_999_999_999.999999
+
+# cost_usd column ceiling: NUMERIC(12,6) == 6 integer digits + 6 decimals
+# (db/schema.py). Same row-loss cliff as the quantity bound above, cost side.
+_COST_USD_MAX = 999_999.999999
 
 # Column bounds, mirrored from db/schema.py. These are NOT cosmetic: a
 # limit above them passes every shape check and then raises
@@ -231,6 +258,86 @@ async def _budget_rows_exist(key_id: uuid.UUID, model: str | None) -> bool:
     return False
 
 
+async def _spend_ancestors(key_id: uuid.UUID) -> list[uuid.UUID]:
+    """The key's rotation lineage (api_keys.spend_ancestors), read ONCE.
+
+    Perf (audit P2-31): this read used to live INSIDE _budget_sums, so a
+    budgeted admission paid the SAME PK round trip twice — the token family
+    and the cost family each called _budget_sums. It is now taken once per
+    check, through the _SpendLineage memo _shared_lineage scopes.
+
+    fetchrow preferred (the row shape carries the column name); fetchval
+    fallback (older seams/fakes expose only scalars). Defensive shape check (a
+    fake/other DB seam returning a scalar must not 500 the gate): anything but
+    a list/tuple is treated as no lineage.
+    """
+    _anc_val = None
+    if hasattr(db, "fetchrow"):
+        _anc_row = await db.fetchrow("SELECT spend_ancestors FROM api_keys WHERE id = $1", key_id)
+        try:
+            _anc_val = _anc_row["spend_ancestors"] if _anc_row is not None else None
+        except (KeyError, IndexError):
+            _anc_val = None  # row shape without the column (test seams) = no lineage
+    else:
+        # fetchval seam (older fakes): the scalar IS the lineage value
+        _anc_val = await db.fetchval("SELECT spend_ancestors FROM api_keys WHERE id = $1", key_id)
+    return list(_anc_val) if isinstance(_anc_val, (list, tuple)) else []
+
+
+class _SpendLineage:
+    """The key's rotation lineage, read AT MOST ONCE per gate check.
+
+    Perf (audit P2-31): _budget_sums read spend_ancestors itself, so a budgeted
+    admission paid the SAME api_keys PK lookup twice — once for the token
+    family, once for the cost family. ONE memo is scoped around both calls by
+    _shared_lineage.
+
+    The read is LAZY on purpose: a caller that overrides the aggregate (a test
+    seam, or a future batched implementation) must not be forced into an
+    api_keys round trip it never asked for. It stays FAIL-CLOSED — a read fault
+    propagates, because treating an unreadable lineage as "no ancestors" would
+    silently reset a rotated key's period budget (the bypass the lineage
+    exists to close).
+    """
+
+    __slots__ = ("_value", "key_id")
+
+    def __init__(self, key_id: uuid.UUID) -> None:
+        self.key_id = key_id
+        self._value: list[uuid.UUID] | None = None
+
+    async def get(self) -> list[uuid.UUID]:
+        if self._value is None:
+            self._value = await _spend_ancestors(self.key_id)
+        return self._value
+
+
+# The task-local lineage memo (see _shared_lineage): set by a check that runs
+# BOTH budget families, read by _budget_sums.
+_lineage_scope: ContextVar[_SpendLineage | None] = ContextVar("pcai_budget_lineage", default=None)
+
+
+@contextmanager
+def _shared_lineage(key_id: uuid.UUID) -> Iterator[None]:
+    """Scope ONE lineage read across every _budget_sums call in this gate check.
+
+    Perf (audit P2-31): the token family and the cost family each call
+    _budget_sums, which read the same api_keys row — two identical PK round
+    trips for one admission (and one /v1/models listing, via model_capacity).
+
+    WHY a task-local scope instead of a sixth parameter: _budget_sums is a SEAM
+    the suite stubs with its production signature (tests/test_budget_capacity.py
+    SumsStub: "a call-site drift fails loudly here"), so the shared-lineage
+    optimisation must not change its call shape. A ContextVar is per-task, so
+    concurrent admissions never share a lineage.
+    """
+    token = _lineage_scope.set(_SpendLineage(key_id))
+    try:
+        yield
+    finally:
+        _lineage_scope.reset(token)
+
+
 async def _budget_sums(
     table: str,
     limit_col: str,
@@ -255,9 +362,11 @@ async def _budget_sums(
     budget-reset bypass, fixed 2026-10-09). The window predicate is NOT
     carried: calendars reset normally, only the in-window counter survives.
     A key with an empty ancestors array sums ONLY its own rows —
-    byte-identical to the pre-lineage behavior. The lineage read rides the
-    same aggregate query (a scalar subselect against the PK-indexed
-    api_keys row), so no extra round-trip is added.
+    byte-identical to the pre-lineage behavior. The lineage read is ONE extra
+    PK-indexed lookup (api_keys.id), taken ONCE per gate check through the
+    `lineage` memo the caller supplies: reading it here cost a SECOND identical
+    round trip on every budgeted admission (audit P2-31 — the old "rides the
+    same aggregate query" claim was false).
 
     Perf audit (critical): the gate used to run one serial SUM per budget
     row (N+1 round-trips — ~14 sequential round-trips for a pinned request
@@ -272,22 +381,12 @@ async def _budget_sums(
     # parameter. The old join built it via a correlated subselect INSIDE the
     # join predicate; the ANY(array) shape already blocks an equality probe
     # on idx_ledger_key_ts, and per-budget-row PK lookups made that strictly
-    # worse. One fetch here keeps the helper self-contained.
-    # fetchrow preferred (the row shape carries the column name); fetchval
-    # fallback (older seams/fakes expose only scalars).
-    _anc_val = None
-    if hasattr(db, "fetchrow"):
-        _anc_row = await db.fetchrow("SELECT spend_ancestors FROM api_keys WHERE id = $1", key_id)
-        try:
-            _anc_val = _anc_row["spend_ancestors"] if _anc_row is not None else None
-        except (KeyError, IndexError):
-            _anc_val = None  # row shape without the column (test seams) = no lineage
-    else:
-        # fetchval seam (older fakes): the scalar IS the lineage value
-        _anc_val = await db.fetchval("SELECT spend_ancestors FROM api_keys WHERE id = $1", key_id)
-    # Defensive shape check (a fake/other DB seam returning a scalar must
-    # not 500 the gate): anything but a list/tuple is treated as no lineage.
-    ancestors: list[uuid.UUID] = list(_anc_val) if isinstance(_anc_val, (list, tuple)) else []
+    # worse.
+    # Callers that run BOTH budget families open a _shared_lineage scope (audit
+    # P2-31): otherwise this helper re-reads the same api_keys row per family.
+    # Outside such a scope the read is local to this call, unchanged.
+    _memo = _lineage_scope.get()
+    ancestors = await (_memo.get() if _memo is not None else _spend_ancestors(key_id))
     args: list[Any] = [key_id]
     if model is not None:
         args.append(model)
@@ -301,13 +400,13 @@ async def _budget_sums(
     # the CASE below (that SQL and this numbering must move together).
     n_win = len(args)
     args.append(ancestors + [key_id])
-    lineage = "$" + str(len(args)) + "::uuid[]"
+    lineage_sql = "$" + str(len(args)) + "::uuid[]"
     # Placeholder-collision guard (real-PG lesson from this wave): each
     # numbered placeholder must map to exactly ONE argument — a number
     # reused with two casts (uuid[] + timestamptz) fails only at real
     # prepare(), which no fake seam can catch.
     # Unconditional (not `assert` — stripped under python -O; S101 class):
-    _lineage_num = int(lineage[1:].split("::")[0])
+    _lineage_num = int(lineage_sql[1:].split("::")[0])
     _win_nums = tuple(range(n_win - len(_WINDOW_PERIODS) + 1, n_win + 1))
     if _lineage_num != len(args) or _lineage_num <= n_win or len(set(_win_nums)) != len(_WINDOW_PERIODS):
         raise RuntimeError(
@@ -326,7 +425,7 @@ async def _budget_sums(
                COALESCE({_expr}, 0)::float AS spent
         FROM {table} b
         LEFT JOIN usage_ledger l
-          ON l.key_id = ANY({lineage})
+          ON l.key_id = ANY({lineage_sql})
          AND l.status IN ({_COSTED_SQL})   -- cache_hit rows are FREE
          AND (l.model = b.model OR b.model = '*')
          AND l.ts >= CASE b.period
@@ -571,21 +670,27 @@ async def _check_own_budgets(key_id: uuid.UUID, model: str, est_tokens: int = 0)
     if any_rows is False:
         return GateResult(True, warn=0)
 
-    token_refusal, token_warn = _eval_token_rows(
-        await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, model), est_tokens
-    )
-    if token_refusal is not None:
-        # WHICH budget family refused — the metric label (tokens|usd) lets an
-        # operator tell "tenant hit its token cap" from "tenant hit its dollar
-        # cap" without joining the ledger. Bumped HERE, not in the pure
-        # evaluator: model_capacity runs the same math for VISIBILITY and must
-        # never move a counter that describes refused traffic.
-        _metrics.BUDGET_REJECTIONS.labels(kind="tokens").inc()
-        return token_refusal
-    # SEQUENTIAL SEMANTICS (pinned by tests/test_budget_gate_cache.py): the
-    # cost-family aggregate is fetched ONLY when the token family did not
-    # refuse — a token refusal returns before the second SUM ever runs.
-    usd_refusal, usd_warn = _eval_usd_rows(await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, model))
+    # ONE lineage read for BOTH budget families (audit P2-31): each
+    # _budget_sums call used to re-read the same api_keys row, so a budgeted
+    # admission paid two identical PK round trips for it.
+    with _shared_lineage(key_id):
+        token_refusal, token_warn = _eval_token_rows(
+            await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, model), est_tokens
+        )
+        if token_refusal is not None:
+            # WHICH budget family refused — the metric label (tokens|usd) lets an
+            # operator tell "tenant hit its token cap" from "tenant hit its dollar
+            # cap" without joining the ledger. Bumped HERE, not in the pure
+            # evaluator: model_capacity runs the same math for VISIBILITY and must
+            # never move a counter that describes refused traffic.
+            _metrics.BUDGET_REJECTIONS.labels(kind="tokens").inc()
+            return token_refusal
+        # SEQUENTIAL SEMANTICS (pinned by tests/test_budget_gate_cache.py): the
+        # cost-family aggregate is fetched ONLY when the token family did not
+        # refuse — a token refusal returns before the second SUM ever runs.
+        usd_refusal, usd_warn = _eval_usd_rows(
+            await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, model)
+        )
     if usd_refusal is not None:
         _metrics.BUDGET_REJECTIONS.labels(kind="usd").inc()
         return usd_refusal
@@ -953,6 +1058,18 @@ async def check_rate_limit(
     # by the key's chat traffic. Without the flag (or without a model) this
     # is exactly est_tokens (byte-identical legacy).
     charge = await predicted_charge(key_id, model, est_tokens)
+    # REMEMBER THE CHARGE FOR EVERY ADMITTED REQUEST (audit P1-4, 2026-11-10):
+    # settle's cache refund must be bounded by what THIS request actually
+    # charged the window. The admission estimate is TEXT-ONLY (the tools
+    # catalog and image parts contribute 0 — _estimate_tokens), while
+    # cached_tokens is the upstream's REAL prompt size, so on agent traffic a
+    # repeated request charges ~1k and would refund ~50k. Recorded regardless
+    # of the prediction flag: prediction decides WHETHER the charge is
+    # discounted, never whether it is remembered.
+    # predicted= (charge != est_tokens) is EXACTLY the condition under which
+    # _remember_charge records a predicted charge — carried on the admission
+    # record so settle's mechanism choice survives the pop that entry gets.
+    _remember_admission_charge(request_id, charge, predicted=charge != est_tokens)
     if charge != est_tokens:
         _remember_charge(request_id, charge)
     row = await db.fetchrow(
@@ -1116,6 +1233,90 @@ def _remember_charge(request_id: str, est_tokens: int) -> None:
             _predict_charges.pop(k, None)
 
 
+@dataclass
+class _AdmissionCharge:
+    """One request's admission accounting, kept for its whole settle lifetime.
+
+    WHY it SURVIVES the settle that uses it (cross-validation, 2026-11-10): a
+    relay request settles ONCE PER ITERATION with the SAME request_id
+    (toolrelay's per-iteration settle). Popping the record at the first settle
+    made iterations 2..N fall into the "no recorded charge" branch and refund
+    their FULL cached_tokens, unbounded — measured 1_000 charged against
+    [1_000, 59_000, 69_000] refunded (129x), which drains the minute window and
+    stops TPM enforcing for the rest of the minute. So the record lives until
+    its TTL and ACCUMULATES what it has already given back.
+
+    Fields:
+      charge     the tokens this request added to the window at admission.
+      refunded   how much of that charge has already been given back (the
+                 cumulative bound, across every settle of this request_id).
+      expires_at monotonic TTL — the ONLY reclaim mechanism, so a lost settle
+                 can never leak the entry.
+      predicted  whether the admission charge was cache-PREDICTED. Carried here
+                 because the mechanism decision must stay stable across the
+                 relay's per-iteration settles: _predict_charges is popped by
+                 the first reconcile (the C3 memory contract, pinned by
+                 tests/test_budgets.py), and a popped entry made later
+                 iterations look unpredicted and take the refund branch — i.e.
+                 BOTH mechanisms ran for one request, the double-count the
+                 settle comment forbids.
+    """
+
+    charge: int
+    refunded: int = 0
+    expires_at: float = 0.0
+    predicted: bool = False
+
+
+# The charge ACTUALLY applied to the window per in-flight request, recorded for
+# EVERY admitted call (prediction on or off). It exists so the settle-time cache
+# refund can be clamped by the request's OWN admission charge (audit P1-4): the
+# refund used to be bounded only by the WINDOW balance, so one agent request
+# that charged ~1k and refunded ~50k drained the minute window to 0 and TPM
+# stopped enforcing for the rest of the minute. Deliberately SEPARATE from
+# _predict_charges, which answers a different question — "did prediction
+# discount this request?" — see _AdmissionCharge.predicted.
+_admission_charges: dict[str, _AdmissionCharge] = {}
+
+
+def _remember_admission_charge(request_id: str, charge: int, *, predicted: bool = False) -> None:
+    if not request_id:
+        return
+    now = time.monotonic()
+    _admission_charges[request_id] = _AdmissionCharge(
+        charge=int(charge),
+        expires_at=now + 3600.0,
+        predicted=predicted,
+    )
+    if len(_admission_charges) > 8192:
+        for k in [k for k, v in _admission_charges.items() if v.expires_at <= now]:
+            _admission_charges.pop(k, None)
+
+
+def _claim_refund(request_id: str, wanted: int) -> int:
+    """How much of the requested refund this settle may actually apply.
+
+    THE CUMULATIVE BOUND (audit P1-4 + cross-validation 2026-11-10): across
+    every settle of ONE request_id, the total refunded can never exceed the
+    tokens that request charged the window. The argument is this iteration's
+    cached_tokens; the answer is min(cached_tokens, charge - already refunded).
+
+    A settle with no recorded charge (no request_id, or a path that never ran
+    check_rate_limit) has nothing to bound it by and keeps the legacy
+    unclamped refund. The allowance is consumed even when the window UPDATE
+    later fails or is discarded (a rolled-over window) — conservative in the
+    direction that cannot over-refund.
+    """
+    if wanted <= 0:
+        return 0
+    record = _admission_charges.get(request_id) if request_id else None
+    if record is None:
+        return int(wanted)
+    allowed = min(int(wanted), max(0, record.charge - record.refunded))
+    record.refunded += allowed
+    return allowed
+
+
 async def _reconcile_predicted_charge(
     key_id: uuid.UUID, request_id: str, prompt_tokens: int, cached_tokens: int
 ) -> None:
@@ -1138,6 +1339,15 @@ async def _reconcile_predicted_charge(
     # watermark reclaimed it), and a later request reusing that request_id
     # reconciled against ANOTHER request's charge. The pop is unconditional;
     # a zero-prompt settle has nothing to reconcile but must still release.
+    #
+    # The pop makes this mechanism SINGLE-SHOT, which is what keeps it safe
+    # under the relay's per-iteration settles (cross-validation 2026-11-10):
+    # the first settle brings the charge to its true billable, later ones find
+    # no charge and adjust nothing (they must NOT refund — settle's mechanism
+    # choice is carried on the surviving _AdmissionCharge.predicted flag, so a
+    # predicted request never falls into the cache-refund branch). The refund
+    # side is inherently bounded by the charge: it is charged - true_billable,
+    # and true_billable >= 0.
     remembered = _predict_charges.pop(request_id, None) if request_id else None
     if not _predict_enabled() or not bool(getattr(settings, "rate_limit_predict_reconcile", True)):
         return
@@ -1220,7 +1430,12 @@ async def _refund_window_tokens(key_id: uuid.UUID, tokens: int) -> None:
 
     HOW: a single atomic decrement, CLAMPED to the window's balance. The
     refund actually applied is min(tokens, balance) - a window holding less
-    than the reported cache hit gives back what it has and no more. Never an
+    than the reported cache hit gives back what it has and no more. The
+    CALLER additionally passes min(cached_tokens, this request's admission
+    charge) (audit P1-4): a refund larger than the request's own charge
+    refunds tokens the key never spent in this window, which is how one
+    agent turn could drain the minute counter to 0 and stop TPM enforcing.
+    Never an
     UPSERT: an INSERT here would mint window rows for calls that were never
     admitted against this window (a refund must not create counter state),
     and crediting tokens INTO a future window would re-open the
@@ -1339,6 +1554,8 @@ async def settle(
     routing_served: str = "",
     routing_reason: str = "",
     routing_probabilities: str = "",
+    billable_units: float | None = None,
+    unit_kind: str | None = None,
 ) -> None:
     """Write the immutable usage row. Called for every request outcome.
 
@@ -1348,9 +1565,10 @@ async def settle(
     visible for the cache-hits reporting). Cost: computed from model_costs
     AT REQUEST TIME and stored on the row (repricing never rewrites
     history); NULL only when the row was never real upstream spend — an
-    unpriced model, or a status outside _COSTED_STATUSES (a request that
-    never reached an upstream). A post-call 'guardrail_blocked' row IS
-    priced: the GPU time was spent (audit r5 #9).
+    unpriced model, a status outside _COSTED_STATUSES (a request that never
+    reached an upstream), or a model_costs READ FAULT (the row is written
+    unpriced rather than lost — audit P2-16). A post-call
+    'guardrail_blocked' row IS priced: the GPU time was spent (audit r5 #9).
 
     billing_fraction: the off-peak evaluator's CURRENT fraction at the
     settle moment (core.offpeak.fraction(); 1.0 when the feature is off or
@@ -1373,22 +1591,158 @@ async def settle(
     billing_fraction/guardrail_events must be passed BY NAME, and the new
     INSERT parameters append AFTER the existing positional order (tests and
     tools index the INSERT args tuple positionally).
+
+    billable_units / unit_kind (KEYWORD-ONLY, P10 unit-aware billing; both
+    default None = the row prices exactly as always and both columns ledger
+    NULL): unit_kind names the row's unit — a CHECK-vocabulary unit
+    ('second', ...) prices by costs.compute_units over billable_units, and an
+    '*_estimate' suffix ('char_estimate'/'second_estimate'/'token_estimate')
+    is the PROXY provenance tag; its EFFECTIVE unit (the base unit without
+    the suffix) decides the arithmetic. The gate reads the STORED
+    model_costs.unit, never the tag (cross-validation wave 2): stored
+    'token' keeps the legacy token estimate arithmetic (every pre-P10 row
+    and plain chat is untouched), any other stored unit prices over the
+    effective unit and LEDGERS cost NULL + a WARNING on a mismatch — a
+    per-1M-SECOND rate is never applied per-1M-TOKEN, and chars are never
+    converted to seconds. A quantity out of NUMERIC(18,6) range ledgers the
+    whole row unpriced (quantity and cost NULL) rather than aborting the
+    INSERT — the upstream has already been paid, so the row itself is never
+    lost. 'routing' rows are priced like _COSTED_STATUSES (real GPU spend)
+    but deliberately stay OUT of that tuple: the budget SUMs must not
+    consume the caller's token/completion envelope for the routing turn.
     """
     cost = None
+    # Unit-aware rows (P10, hardened by cross-validation wave 2): the EFFECTIVE
+    # unit comes from the row's unit_kind tag — a real CHECK-vocabulary unit
+    # ('second', ...) prices over billable_units via costs.compute_units, and an
+    # '*_estimate' tag maps to its base unit ('char_estimate'->'char',
+    # 'second_estimate'->'second', 'token_estimate'->'token'). The LEGACY token
+    # arithmetic is gated on the STORED model_costs unit — never on the tag: a
+    # model stored per 'token' (every pre-P10 row, plain chat) keeps billing
+    # through compute() exactly as always, while any other stored unit prices
+    # over the effective unit and LEDGERS NULL + a WARNING when it does not
+    # match (a per-1M-SECOND rate must never ride the per-1M-TOKEN arithmetic —
+    # that was a silent 3x over-bill on ASR estimates; nor may chars be billed
+    # as seconds — a conversion we cannot make is never fabricated).
+    # status='routing' prices like a COSTED status — the decision model burned
+    # real GPU time — while remaining OUTSIDE the _COSTED_STATUSES budget-SUM
+    # tuple (see its comment above).
+    from . import costs as _costs
+
+    effective_unit: str | None = None
+    if unit_kind is not None:
+        if unit_kind in _costs.UNITS:
+            # A REAL unit ('second', ...) ALWAYS prices through compute_units —
+            # its mismatch guard (NULL + WARNING, never a converted number) is
+            # the standing contract, whatever the stored unit is.
+            effective_unit = unit_kind
+        else:
+            candidate = _EFFECTIVE_UNIT_BY_TAG.get(unit_kind)
+            if candidate is None:
+                # An unrecognised tag stays on the legacy path (the pre-P10
+                # shape): an unknown tag must never invent a unit — and thus a
+                # rate — of its own.
+                log.warning(
+                    "settle: unknown unit_kind %r on %r — priced through the legacy token arithmetic",
+                    unit_kind,
+                    model,
+                )
+            else:
+                # ESTIMATE tags are gated on the STORED unit, never on the tag:
+                # stored 'token' (every pre-P10 row, plain chat, and any voice
+                # model not yet repriced) keeps the legacy token arithmetic
+                # exactly — the rate IS per-1M-token, so billing the row's token
+                # proxy through it is dimensionally honest and pre-P10 rows never
+                # change. Any OTHER stored unit prices over the effective unit
+                # via compute_units (a per-1M-SECOND rate must never ride the
+                # token arithmetic — the silent 3x ASR over-bill the wave-2
+                # review measured), and its mismatch guard ledgers NULL + a
+                # WARNING rather than converting (a char estimate on a
+                # second-priced model ledgers NULL — chars are never billed as
+                # seconds, no conversion is fabricated). An UNPRICED model
+                # (stored None) also takes the unit path: honest NULL, never the
+                # per-1M-TOKEN fallback applied to a non-token quantity.
+                stored = await _costs.stored_unit(model)
+                if stored != "token":
+                    effective_unit = candidate
+    # The quantity the row will actually STORE, validated against the column
+    # BEFORE anything prices from it (NUMERIC(18,6) ceiling; see the comment
+    # below). None = ledger NULL — either the row never carried a quantity, or
+    # the one it carried could not be stored and must not be priced from either.
+    units_to_store: float | None = None
+    if billable_units is not None:
+        try:
+            bu = float(billable_units)
+        except (TypeError, ValueError):
+            bu = float("nan")
+        if not math.isfinite(bu) or abs(bu) > _BILLABLE_UNITS_MAX:
+            # An oversized (or non-finite) quantity must never abort the INSERT:
+            # asyncpg would raise NumericValueOutOfRangeError and the immutable
+            # billing row for upstream spend already served would be LOST — the
+            # exact outcome the P2-16 guard exists to prevent. Quantity and cost
+            # (which would overflow NUMERIC(12,6) on the same request) both
+            # ledger NULL with a WARNING, row intact.
+            log.warning(
+                "settle: billable_units %r out of NUMERIC(18,6) range for %r — row ledgers NULL (unpriced), never lost",
+                billable_units,
+                model,
+            )
+        else:
+            units_to_store = bu
     if status == "cache_hit":
         # served from OUR cache — no upstream spend, even if the model is priced
         from decimal import Decimal
 
         cost = Decimal("0.000000")
-    elif status in _COSTED_STATUSES:
+    elif status == "routing" or status in _COSTED_STATUSES or effective_unit is not None:
         # Real upstream spend is priced whatever the OUTCOME was: a post-call
         # guardrail block ('guardrail_blocked') burned the same prefill, and
         # leaving it unpriced stored the tokens with cost_usd NULL (audit r5
         # #9 — the ledger then claimed "real upstream spend" for tokens it
         # never priced).
-        from . import costs as _costs
-
-        cost = await _costs.compute(model, prompt_tokens, completion_tokens, cached_tokens)
+        # NEVER let the price lookup abort the LEDGER WRITE (audit P2-16): the
+        # upstream has already been paid, so losing this immutable billing row
+        # to a model_costs read fault is the one outcome worse than an unpriced
+        # row — and the cost_usd column already models "unpriced" as NULL.
+        # costs.price_hints guards the same call for the same reason.
+        try:
+            if effective_unit is not None:
+                # P10 unit row (measured seconds, or a tagged estimate whose unit
+                # matches the stored one): priced over the QUANTITY, never through
+                # the token arithmetic. compute_units returns None (and the guard
+                # reports it) when the stored unit mismatches — the row ledgers
+                # unpriced rather than silently converting through the wrong rate.
+                # A unit-tagged row with NO quantity is unpriceable by definition:
+                # 0.0 units would forge a 0.000000 bill, so it ledgers NULL.
+                cost = (
+                    await _costs.compute_units(model, units_to_store, effective_unit)
+                    if units_to_store is not None
+                    else None
+                )
+                if units_to_store is None and billable_units is None:
+                    log.warning(
+                        "settle: unit_kind %r row for %r carries no billable_units — ledgered unpriced",
+                        unit_kind,
+                        model,
+                    )
+            else:
+                cost = await _costs.compute(model, prompt_tokens, completion_tokens, cached_tokens)
+            # Same cliff, cost side (cross-validation wave 2): cost_usd is
+            # NUMERIC(12,6) — a price past 999999.999999 (a huge but IN-RANGE
+            # quantity times any real rate) would raise
+            # NumericValueOutOfRangeError from the same INSERT and lose the row
+            # the same way. Honest NULL beats both a lost row and a clamped
+            # (fabricated) number.
+            if cost is not None and abs(cost) > _COST_USD_MAX:
+                log.warning(
+                    "settle: computed cost %s exceeds NUMERIC(12,6) for %r — cost ledgers NULL, row intact",
+                    cost,
+                    model,
+                )
+                cost = None
+        except Exception:
+            log.warning("settle: cost lookup failed for %r - ledger row unpriced (non-fatal)", model, exc_info=True)
+            cost = None
     events_json = json.dumps(guardrail_events[:50], default=str) if guardrail_events else None
     # Prometheus counter/histogram ride THE SAME row write (metrics rule 4):
     # bumped before the INSERT so a metrics outage can never desync — and
@@ -1401,9 +1755,9 @@ async def settle(
              total_tokens, cached_tokens, cost_usd, status, latency_ms,
              request_id, billing_fraction, guardrail_events,
              routing_policy, routing_ceiling, routing_served, routing_reason,
-             routing_probabilities)
+             routing_probabilities, billable_units, unit_kind)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18)
+                $18, $19, $20)
         """,
         key_id,
         model,
@@ -1423,6 +1777,10 @@ async def settle(
         routing_served,
         routing_reason,
         routing_probabilities,
+        # P10: None/None on every legacy row (unchanged shape); a tagged row
+        # carries the provenance quantity and its unit name.
+        units_to_store,
+        unit_kind,
     )
     # Cache-aware TPM (rate_limit_exclude_cached_tokens): give the key's
     # minute window back the tokens the upstream prefix cache served.
@@ -1436,14 +1794,26 @@ async def settle(
     # decided by whether THIS request's admission was already cache-discounted:
     #
     #   prediction OFF -> the charge was the full estimate, so the post-hoc
-    #     REFUND below is the only correction (legacy behaviour, unchanged).
+    #     REFUND below is the only correction — and it is clamped by that
+    #     charge (audit P1-4), CUMULATIVELY across every settle of the request
+    #     (the relay settles once per iteration), so a request can never give
+    #     back more than it took.
     #   prediction ON  -> the charge was ALREADY discounted by the measured
     #     ratio, so a refund would discount a second time. RECONCILIATION
     #     alone settles it: charged + (true_billable - charged) == true
     #     billable exactly, whatever the predicted ratio was.
     #
     # status='cache_hit' never ran a gate, so neither applies.
-    predicted = request_id in _predict_charges
+    #
+    # MULTIPLICITY (cross-validation 2026-11-10): the relay settles once PER
+    # ITERATION with the same request_id. The record is therefore NOT consumed
+    # here — it survives to bound every iteration cumulatively (see
+    # _claim_refund) — and the mechanism choice is read from it, because
+    # _predict_charges is popped by the first reconcile: without the surviving
+    # flag, iterations 2..N looked unpredicted and took the REFUND branch too,
+    # running both mechanisms for one request.
+    record = _admission_charges.get(request_id) if request_id else None
+    predicted = record.predicted if record is not None else (request_id in _predict_charges)
     if status != "cache_hit":
         if predicted:
             try:
@@ -1451,8 +1821,16 @@ async def settle(
             except Exception:
                 log.warning("settle: predicted-charge reconciliation failed (non-fatal)", exc_info=True)
         elif settings.rate_limit_exclude_cached_tokens:
+            # The charge this request actually made at admission BOUNDS the
+            # refund (audit P1-4): refunding more than was charged drains the
+            # window below what the key really spent, and TPM then stops
+            # enforcing for the rest of the minute. A settle whose admission
+            # was never recorded (no request_id, or a path that never ran
+            # check_rate_limit) keeps the legacy unclamped refund — there is
+            # nothing to bound it by.
+            refund = _claim_refund(request_id, int(cached_tokens))
             try:
-                await _refund_window_tokens(key_id, cached_tokens)
+                await _refund_window_tokens(key_id, refund)
             except Exception:
                 log.warning("settle: TPM cache refund failed (non-fatal)", exc_info=True)
 
@@ -1546,7 +1924,7 @@ async def model_capacity(key_id: uuid.UUID, models: list[str], est_tokens: int =
     team_budget = team is not None and team.has_budget
 
     # FAST PATH (perf): the overwhelming majority of keys carry NO budget rows
-    # at all, and the aggregates below would pay BOTH lineage fetchrows plus
+    # at all, and the aggregates below would pay the lineage fetchrow plus
     # BOTH ledger SUMs to discover that. Probe the tiny indexed catalog first —
     # the same short-circuit check_budgets uses (see its REMEDIATION P4 note) —
     # so the common case costs one cheap probe instead of four round-trips on
@@ -1570,8 +1948,13 @@ async def model_capacity(key_id: uuid.UUID, models: list[str], est_tokens: int =
         # whole model list — the naive shape (check_budgets per model) would be
         # 2*len(models) ledger SUMs on the pool the data plane shares.
         try:
-            token_rows = list(await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, None))
-            usd_rows = list(await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, None))
+            # ONE shared lineage memo (audit P2-31, cross-validation): without
+            # it each family re-reads the same api_keys row — the double PK
+            # lookup the gate stopped paying. This runs per /v1/models listing
+            # AND per routing decision, so it is a hot path too.
+            with _shared_lineage(key_id):
+                token_rows = list(await _budget_sums("budgets", "limit_tokens", "total_tokens", key_id, None))
+                usd_rows = list(await _budget_sums("cost_budgets", "limit_usd", "cost_usd", key_id, None))
         except Exception:
             log.warning("model_capacity: budget lookup failed; reporting all models as unlimited", exc_info=True)
             return unlimited

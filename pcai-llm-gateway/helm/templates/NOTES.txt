@@ -31,12 +31,15 @@ pcai-llm-gateway {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to 
     ({{ .Values.ezua.authorizationPolicy.ingressNamespace }}) to every path:
     any workload in that namespace can deliver spoofed X-Auth-Request-*
     headers to the trusted-header surfaces (identity reads on /v1/identity,
-    key mints on POST /v1/keys/for-me, enrollment redemption on /v1/enroll)
+    key mints on POST /v1/keys/for-me, enrollment redemption on /v1/enroll,
+    the admin API on /admin and /admin/*)
     and bind them to arbitrary subjects.
-    FIX: set ezua.authorizationPolicy.ingressGatewayPrincipals to the
-    ezaf-gateway ServiceAccount's SPIFFE ID, e.g.
-    cluster.local/ns/istio-system/sa/<sa> — discover the SA with:
-      kubectl -n istio-system get pod -l 'app=ezaf-gateway' \
+    FIX: set ezua.authorizationPolicy.ingressGatewayPrincipals to the VERIFIED
+    ingress-gateway principal (G2, verified 2026-11-02):
+      - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+    Discover the SA live with (do NOT select on app=ezaf-gateway — no pod on
+    G2 carries that label, the query returns nothing):
+      kubectl -n istio-system get pod -l 'istio=ingressgateway' \
         -o jsonpath='{.items[0].spec.serviceAccountName}'
     (deliberately non-fatal — this must not block a live deploy; tighten
     the knob, then re-apply).

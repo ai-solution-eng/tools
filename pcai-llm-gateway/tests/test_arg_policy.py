@@ -307,10 +307,17 @@ def test_raw_whitespace_exemption_does_not_reach_non_url_shapes(monkeypatch: pyt
         ("searxng", "fetch_content", {"url": "https://example.com/a b"}),
         ("workbench", "write_file", {"content": "C:\\Program Files\\x"}),
         ("sqlhandler", "run_sql", {"sql": "note: foo bar"}),
-        ("workbench", "run_command", {"command": "curl http://169.254.169.254/x"}),
         ("workbench", "write_file", {"content": "http://169.254.169.254/a b"}),
     ):
         assert ap.check_arguments(server, tool, arguments) == "", f"{server}.{tool} must not be refused"
+
+    # MOVED OUT of the allow list (audit 2026-11-10 P2-4): "command" is no
+    # longer a payload key. A granted exec tool runs the string inside a pod on
+    # the cluster network, so it is the fleet's strongest egress vector and the
+    # destination scan now classifies address-shaped tokens in it.
+    assert ap.check_arguments("workbench", "run_command", {"command": "curl http://169.254.169.254/x"}) != "", (
+        "an exec argument reaching the metadata IP must be refused"
+    )
 
 
 def test_protocol_relative_reference_leaves_paths_and_payloads_alone(monkeypatch: pytest.MonkeyPatch) -> None:

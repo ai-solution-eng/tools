@@ -47,7 +47,9 @@ discipline: the group helpers below own the prefix.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -82,6 +84,42 @@ def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
     if not thread_key:
         return None
     return scope + thread_key
+
+
+# X-PCAI-Session is CLIENT-SUPPLIED and becomes the thread_key half of a
+# model_stickiness PRIMARY KEY, so it must be bounded before it is stored: the
+# header is up to the server's 1 MB limit, and every distinct value would mint
+# its own row (audit 2026-11-10 P2-2). The charset is the documented one; the
+# length is generous enough for any real session id (a UUID, a request id, a
+# conversation slug) and small enough that a row key is always cheap.
+AFFINITY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+AFFINITY_KEY_MAX = 128
+
+
+def affinity_key(raw: str | None) -> str | None:
+    """Canonical, bounded affinity key for a raw X-PCAI-Session value. PURE.
+
+    Returns sha256(value) hex, or None when the value is absent or does not
+    match the documented charset/length bound.
+
+    WHY hash and not store the value: the session id is a routing handle, never
+    something an operator reads back out of the table, and hashing makes the
+    stored key a FIXED 64 characters whatever the client sends — so a caller
+    cannot grow a row key (or the index entry) no matter what it puts in the
+    header, and cannot collide with another scope's row.
+
+    WHY an invalid value is DROPPED rather than refused: affinity is ROUTING
+    state, not policy. A client that sends a junk session id must still be
+    served; it simply does not get a pin, and the caller falls back to the
+    conversation fingerprint exactly as if no header had been sent. Returning a
+    400 here would turn a cosmetic header into an outage.
+    """
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value or not AFFINITY_KEY_RE.fullmatch(value):
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 async def get_sticky(key_id: uuid.UUID, thread_key: str | None) -> str | None:
@@ -196,9 +234,12 @@ async def get_sticky_row(key_id: uuid.UUID, thread_key: str | None) -> tuple[str
 async def get_endpoint_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
     """The conversation's pinned ENDPOINT id, or None.
 
-    `session` is the RAW X-PCAI-Session value; the ep: scope is applied HERE
-    (callers never see or write the namespaced key, so the three scopes can
-    never collide at the call site). TTL rides the row's own updated_at: a
+    `session` is the CANONICAL affinity key — affinity_key(raw X-PCAI-Session)
+    or the conversation fingerprint, never the raw header (audit 2026-11-10
+    P2-2: the raw value is client-controlled and unbounded); the ep: scope is
+    applied HERE (callers never see or write the namespaced key, so the three
+    scopes can never collide at the call site). TTL rides the row's own
+    updated_at: a
     pin older than ttl_s is expired — dropped, so it cannot outlive its
     lease — and reported as absent. ttl_s <= 0 disables the expiry (the
     housekeeping retention sweep still applies).
@@ -262,8 +303,9 @@ async def drop_endpoint_pin(key_id: uuid.UUID, session: str | None) -> None:
 async def get_group_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
     """The conversation's pinned group MEMBER, or None.
 
-    ``session`` is the RAW affinity key (X-PCAI-Session or the conversation
-    fingerprint); the grp: scope is applied HERE, exactly like the ep:
+    ``session`` is the CANONICAL affinity key (affinity_key(X-PCAI-Session) or
+    the conversation fingerprint — never the raw header); the grp: scope is
+    applied HERE, exactly like the ep:
     helpers, so a caller can never address the cascade head's row by mistake.
     The TTL rides the row's updated_at: a pin older than the lease is expired
     — dropped, so it cannot outlive it — and reads as absent. ttl_s <= 0

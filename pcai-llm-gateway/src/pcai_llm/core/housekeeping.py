@@ -26,7 +26,7 @@ import time
 from ..config import settings
 from ..db import db
 from ..routing.router import router as model_router
-from . import context_window, response_cache, toolcompress_store, upstream_auth
+from . import context_window, embedcache, response_cache, toolcompress_store, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +61,19 @@ async def _sweep_once() -> None:
     #     Not an operator retention knob — the TTL is the policy.
     await response_cache.purge_expired()
 
-    # 1c) compressed tool-result originals (X-PCAI-Compress-Tools): pure
+    # 1c) embedding cache (audit P2-28, 2026-11-10): the one cache table
+    #     with no TTL and no prune — unbounded growth on RAG-heavy fleets.
+    #     Vectors never go stale, so this is pure storage reclamation and
+    #     ships OFF (0 = keep forever, the retention-knob convention).
+    try:
+        if settings.embedding_cache_ttl_s > 0:
+            reclaimed = await embedcache.prune(settings.embedding_cache_ttl_s)
+            if reclaimed:
+                log.info("housekeeping: pruned %d embedding cache rows", reclaimed)
+    except Exception:
+        log.debug("housekeeping: embedding_cache prune skipped", exc_info=True)
+
+    # 1d) compressed tool-result originals (X-PCAI-Compress-Tools): pure
     #     retrieval data, TTL-bound. A pruned row only means a later
     #     pcai__retrieve answers "expired" — the turn that compressed it
     #     already used the text. Error-swallowed like every other sweep.

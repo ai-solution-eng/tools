@@ -110,6 +110,7 @@ async def _send(message):
 
 # ------------------------------------------------------- mock-compare mode --
 
+
 async def _measure_asgi(app: Any, concurrency: int, duration: float) -> dict[str, Any]:
     """Run the load loop against one ASGI app; return latency stats.
 
@@ -167,19 +168,22 @@ async def _measure_asgi(app: Any, concurrency: int, duration: float) -> dict[str
 
 def build_stacks() -> list[tuple[str, Any]]:
     """Build the four ASGI callables. Import pcai_llm LAST (env contract)."""
+
     # (a) raw-asgi: the floor. One JSON write, zero framework.
     async def raw_asgi(scope, receive, send):
         if scope["type"] != "http":
             return
         body = b'{"ok":true}'
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
     import starlette.applications
@@ -241,10 +245,7 @@ async def run_mock_compare(args: argparse.Namespace) -> int:
         results[name] = await _measure_asgi(app, args.concurrency, args.duration)
 
     print()
-    header = (
-        f"{'stack':<16}{'reqs':>10}{'req/s':>11}{'p50 us':>10}{'p90 us':>10}"
-        f"{'p99 us':>10}{'max us':>10}"
-    )
+    header = f"{'stack':<16}{'reqs':>10}{'req/s':>11}{'p50 us':>10}{'p90 us':>10}{'p99 us':>10}{'max us':>10}"
     print(header)
     print("-" * len(header))
     for name in STACKS:
@@ -256,14 +257,12 @@ async def run_mock_compare(args: argparse.Namespace) -> int:
     print()
 
     gw, raw = results["gateway"], results["raw-asgi"]
-    print(
-        f"gateway overhead vs raw-asgi: {gw['p50'] / raw['p50']:.1f}x (p50) / "
-        f"{gw['p99'] / raw['p99']:.1f}x (p99)"
-    )
+    print(f"gateway overhead vs raw-asgi: {gw['p50'] / raw['p50']:.1f}x (p50) / {gw['p99'] / raw['p99']:.1f}x (p99)")
     return 0
 
 
 # ------------------------------------------------------------ gateway mode --
+
 
 def _load_gateway_app():
     from pcai_llm.app import create_app
@@ -334,9 +333,7 @@ async def run_gateway_mode(args: argparse.Namespace) -> int:
     import uvicorn
 
     app_instance = _load_gateway_app()
-    config = uvicorn.Config(
-        app_instance, host="127.0.0.1", port=args.port, log_level="warning"
-    )
+    config = uvicorn.Config(app_instance, host="127.0.0.1", port=args.port, log_level="warning")
     server = uvicorn.Server(config)
 
     async def _serve() -> int:
@@ -381,34 +378,18 @@ async def run_gateway_mode(args: argparse.Namespace) -> int:
         )
         return 3
 
-    print(
-        f"gateway mode: uvicorn serving create_app() on 127.0.0.1:{args.port} "
-        f"(lifespan ran: DB connected)"
-    )
+    print(f"gateway mode: uvicorn serving create_app() on 127.0.0.1:{args.port} (lifespan ran: DB connected)")
 
     latencies_ms: list[float] = []
     conns: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
     try:
-        conns = [
-            await asyncio.open_connection("127.0.0.1", args.port)
-            for _ in range(args.concurrency)
-        ]
+        conns = [await asyncio.open_connection("127.0.0.1", args.port) for _ in range(args.concurrency)]
         # Warmup over the SAME worker path so the first request's lazy
         # middleware-stack build and asyncio caching never pollute the
         # timed window; warm samples are discarded (perf-audit hygiene).
         warm: list[float] = []
-        await asyncio.gather(
-            *(
-                _http_worker(r, w, min(0.5, args.duration), warm)
-                for (r, w) in conns
-            )
-        )
-        await asyncio.gather(
-            *(
-                _http_worker(r, w, args.duration, latencies_ms)
-                for (r, w) in conns
-            )
-        )
+        await asyncio.gather(*(_http_worker(r, w, min(0.5, args.duration), warm) for (r, w) in conns))
+        await asyncio.gather(*(_http_worker(r, w, args.duration, latencies_ms) for (r, w) in conns))
     except (ConnectionError, OSError) as exc:
         print(f"gateway mode: connection to 127.0.0.1:{args.port} failed: {exc}")
         return 4
@@ -433,15 +414,14 @@ async def run_gateway_mode(args: argparse.Namespace) -> int:
 
     rps = reqs / args.duration
     print(f"requests={reqs} req/s={rps:.0f} (raw sockets, keep-alive, {args.concurrency} conns)")
-    print(
-        f"p50={pct(50):.2f}ms p90={pct(90):.2f}ms p99={pct(99):.2f}ms max={ms[-1]:.2f}ms"
-    )
+    print(f"p50={pct(50):.2f}ms p90={pct(90):.2f}ms p99={pct(99):.2f}ms max={ms[-1]:.2f}ms")
     print("note: these numbers INCLUDE the socket hop and keep-alive framing;")
     print("      compare against mock-compare's gateway row to see transport share.")
     return 0
 
 
 # ------------------------------------------------------------------- main --
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(

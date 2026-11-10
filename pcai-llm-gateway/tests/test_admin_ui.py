@@ -1825,7 +1825,15 @@ def test_form_rows_share_one_control_plane() -> None:
     assert "armPasswordToggles(div);\n  layoutFormRowsNow();" in s
     assert "layoutFormRowsNow();\n  return true;" in s  # activateTab
     assert "layoutFormRowsNow();\nwindow.addEventListener('resize', layoutFormRows);" in s
-    assert "new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });" in s
+    # audit 2026-11-10 P3: the observer is SCOPED, not body-wide. A
+    # document-wide observer ran a forced layout pass (getBoundingClientRect
+    # per .row) after every innerHTML table rebuild, none of which can change
+    # a row's flex lines. It now watches the row containers plus the dialog.
+    assert "const rowObs = new MutationObserver(layoutFormRows);" in s
+    assert "rowObs.observe(r, { childList: true, subtree: true });" in s
+    assert "observe(document.body, { childList: true, subtree: true })" not in s, (
+        "a body-wide observer re-introduces the forced-reflow-on-every-mutation cliff"
+    )
 
 
 def test_form_row_labels_carry_a_title_and_a_direct_hint() -> None:

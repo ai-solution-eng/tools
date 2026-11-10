@@ -19,6 +19,7 @@ Usage:
     python scripts/secret_scan.py            # scan, exit 0/1
     python scripts/secret_scan.py --quiet    # only output on failure
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -73,9 +74,9 @@ def main() -> int:
         rel_dir = os.path.relpath(dirpath, ROOT)
         # prune ignored directories early (don't descend)
         dirnames[:] = [
-            d for d in dirnames
-            if not _ignored(os.path.normpath(os.path.join(rel_dir, d)))
-            and d not in (".git", ".venv", "__pycache__")
+            d
+            for d in dirnames
+            if not _ignored(os.path.normpath(os.path.join(rel_dir, d))) and d not in (".git", ".venv", "__pycache__")
         ]
         for name in filenames:
             rel = os.path.normpath(os.path.join(rel_dir, name))
@@ -94,7 +95,7 @@ def main() -> int:
             for kind, pattern in PATTERNS.items():
                 for m in pattern.finditer(text):
                     # skip matches that sit inside a sanitized placeholder
-                    window = text[max(0, m.start() - 20):m.end() + 20]
+                    window = text[max(0, m.start() - 20) : m.end() + 20]
                     if _PLACEHOLDER_RE.search(window):
                         continue
                     line_no = text.count("\n", 0, m.start()) + 1

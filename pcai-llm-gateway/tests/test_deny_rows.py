@@ -799,12 +799,36 @@ async def test_load_denies_empty_when_no_false_rows(monkeypatch: pytest.MonkeyPa
     assert await federation.load_denies(uuid.uuid4()) == set()
 
 
-async def test_load_denies_isolates_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The ACL gate must never 500 because of this read: a DB fault degrades
-    to an empty deny set (same fail-visibility posture as load_grants'
-    live-profile guard)."""
+async def test_load_denies_fails_closed_without_a_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DB fault must NOT re-open denied tools.
+
+    The old posture degraded to an EMPTY deny set, i.e. "this key has no
+    denies" — so a blip silently re-enabled every tool the key had
+    explicitly disabled, while every sibling ACL predicate in this module
+    fails closed (audit 2026-11-10 P2-11, the bug this test used to pin).
+    With no snapshot on file the fault now PROPAGATES so the caller refuses
+    the request."""
+    kid = uuid.uuid4()
+    federation._deny_snapshots.pop(kid, None)
     monkeypatch.setattr(federation, "db", _DenyRowDB([], raises=RuntimeError("pool busted")))
-    assert await federation.load_denies(uuid.uuid4()) == set()
+    with pytest.raises(RuntimeError, match="pool busted"):
+        await federation.load_denies(kid)
+
+
+async def test_load_denies_serves_the_last_known_snapshot_on_a_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault AFTER a good read serves the key's last known denies.
+
+    The snapshot is the fallback, never the primary: a successful read
+    replaces it, so a new deny row takes effect on the very next call."""
+    kid = uuid.uuid4()
+    federation._deny_snapshots.pop(kid, None)
+    monkeypatch.setattr(federation, "db", _DenyRowDB([{"server": "s", "tool": "t"}]))
+    assert await federation.load_denies(kid) == {("s", "t")}
+    monkeypatch.setattr(federation, "db", _DenyRowDB([], raises=RuntimeError("pool busted")))
+    assert await federation.load_denies(kid) == {("s", "t")}
+    federation._deny_snapshots.pop(kid, None)
 
 
 async def test_load_denies_signature_for_scope_merge_seam() -> None:

@@ -837,11 +837,20 @@
     <table id="usage-by-key"><thead>
       <tr><th style="width:1.4em"></th><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted) — per KEY, so a key that leans on a cacheable model shows its own rate">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
     </thead><tbody></tbody></table>
-    <h2 style="margin-top:18px">Pricing (USD per 1M tokens) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time</span></h2>
+    <h2 style="margin-top:18px">Pricing (USD per 1M units) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time. Unit (P10): what a “1M” of the rates is — voice models bill per second, others per token; a unit that cannot match the model's route is refused (ledger NULL) and reported, never billed at the wrong rate</span></h2>
     <div class="card">
       <div class="row">
         <label>Model
           <select id="c-model"></select>
+        </label>
+        <label title="token | char | second | image | request — what the per-1M rates are denominated in. Voice models bill per second of audio; the default 'token' matches every pre-existing row.">Unit
+          <select id="c-unit">
+            <option value="token" selected>token</option>
+            <option value="char">char</option>
+            <option value="second">second</option>
+            <option value="image">image</option>
+            <option value="request">request</option>
+          </select>
         </label>
         <label>Input $/1M <input id="c-in" type="number" step="0.000001" value="0" style="width:110px"></label>
         <label>Output $/1M <input id="c-out" type="number" step="0.000001" value="0" style="width:110px"></label>
@@ -849,8 +858,9 @@
         <button class="btn" id="c-save">Save price</button>
       </div>
     </div>
+    <p id="costs-unpriced" style="margin:8px 0 2px;font-size:12.5px;color:var(--warn,#e6aa28)" hidden></p>
     <table id="costs-table"><thead>
-      <tr><th>Model</th><th>Input $/1M</th><th>Output $/1M</th><th>Cached $/1M</th><th>Updated</th><th></th></tr>
+      <tr><th>Model</th><th>Unit</th><th>Input $/1M</th><th>Output $/1M</th><th>Cached $/1M</th><th>Updated</th><th></th></tr>
     </thead><tbody></tbody></table>
     <h2 style="margin-top:18px">Recent usage (ledger)</h2>
     <div class="row" style="margin-bottom:8px">
@@ -902,7 +912,14 @@
         <label>Limit <input id="a-limit" type="number" value="100" min="1" max="500" style="width:80px"></label>
         <button class="btn" id="a-reload">Refresh</button>
         <a class="ghost" id="a-csv" href="#" download="admin-audit.csv" style="padding:6px 12px;border:1px solid var(--border);border-radius:7px;font-size:13px;color:var(--text);text-decoration:none">export CSV</a>
+        <button class="btn" id="a-verify" title="Walk both hash-chained trails and check the tail anchor">verify chain</button>
       </div>
+      <!-- Tamper evidence (2026-11-10): the trails are hash-chained AND the
+           tail is HMAC-anchored outside the chain. Without a consumer here the
+           whole signal was invisible — an operator could only see ok:true from
+           the API. anchor_status distinguishes a healthy chain from an
+           UNANCHORED one, which is NOT the same as verified. -->
+      <p class="hint" id="a-chain" style="margin:8px 0 2px" hidden></p>
     </div>
     <table id="audit-table"><thead>
       <tr><th>Time</th><th>Actor</th><th>Source</th><th>Action</th><th>Resource</th><th>Details</th><th>Request</th><th>IP</th></tr>
@@ -1476,7 +1493,7 @@ async function api(path, opts = {}) {
              // header that survives with the console's key in it (require_admin
              // still reads Authorization; on a skip-auth-classified /admin path
              // the chain leaves our Bearer intact and this header is inert).
-             ...(opts.body ? {} : {}), ...(opts.headers || {}) },
+             ...(opts.headers || {}) },
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
   } catch (e) {
@@ -1506,14 +1523,14 @@ async function api(path, opts = {}) {
 // ---------- keys ----------
 async function loadTenants() {
   state.tenants = await api('/tenants');
-  $('k-tenant').innerHTML = state.tenants.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
+  $('k-tenant').innerHTML = state.tenants.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
   $('k-tenant').onchange = loadUsers;
   await loadUsers();
 }
 async function loadUsers() {
   const tid = $('k-tenant').value;
   state.users = tid ? await api(`/tenants/${tid}/users`) : [];
-  $('k-user').innerHTML = state.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
+  $('k-user').innerHTML = state.users.map(u => `<option value="${esc(u.id)}">${esc(u.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
 }
 window.newTenant = async btn => withBtn(btn, async () => {
   const name = prompt('New tenant name:'); if (!name) return;
@@ -1538,7 +1555,7 @@ async function loadProfiles() {
     catch (e) { state.agents = []; state.agentsLoaded = false; }
   }
   $('k-profile').innerHTML = '<option value="">— none —</option>' +
-    state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   renderProfilesTable();
   renderProfileEditorSelects();
 }
@@ -2225,7 +2242,8 @@ window.viewCaps = btn => {
 //      controls, so all controls on a line share ONE horizontal plane instead
 //      of floating by whatever their hint measured.
 // Both are idempotent (marked on the label) and cheap; the boot block runs
-// them once and a MutationObserver re-runs the layout after any render.
+// them once and a scoped MutationObserver re-runs the layout after any
+// render that changes a row container (see the boot block).
 function structureFormRows(root) {
   for (const label of (root || document).querySelectorAll('.row > label, .ep-row > label')) {
     if (label.dataset.headed) continue;
@@ -2699,7 +2717,7 @@ async function fetchGrantCatalogs() {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 12000);
     try {
-      const r = await fetch(`/admin/mcp-servers/${sv.name}/tools`, {
+      const r = await fetch(`/admin/mcp-servers/${encodeURIComponent(sv.name)}/tools`, {
         headers: { 'Authorization': 'Bearer ' + key() }, signal: ctrl.signal });
       const j = await r.json();
       if (!r.ok) throw new Error(j.detail || r.status);
@@ -3081,14 +3099,14 @@ async function loadMcpServers() {
   // instant-apply: toggles + policy dropdown PATCH the server inline
   document.querySelectorAll('#mcp-table .m-enable-chk').forEach(c =>
     c.addEventListener('change', async () => {
-      try { await api(`/mcp-servers/${c.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(c.dataset.server)}`, { method: 'PATCH',
             body: { enabled: c.checked } });
         banner(`${c.dataset.server} ${c.checked ? 'enabled' : 'disabled'}`, '', 2500);
       } catch (e) { banner(e.message, 'error', 5000); c.checked = !c.checked; }
     }));
   document.querySelectorAll('#mcp-table .m-policy-sel').forEach(sel =>
     sel.addEventListener('change', async () => {
-      try { await api(`/mcp-servers/${sel.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(sel.dataset.server)}`, { method: 'PATCH',
             body: { tool_policy: sel.value } });
         banner(`${sel.dataset.server} policy: ${sel.value}`, '', 2500);
         await loadMcpServers();
@@ -3098,7 +3116,7 @@ async function loadMcpServers() {
   document.querySelectorAll('#mcp-table .m-priority-in').forEach(inp =>
     inp.addEventListener('change', async () => {
       const v = parseInt(inp.value, 10) || 0;
-      try { await api(`/mcp-servers/${inp.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(inp.dataset.server)}`, { method: 'PATCH',
             body: { priority: v } });
         banner(`${inp.dataset.server} priority: ${v}`, '', 2500);
         await loadMcpServers();
@@ -3185,7 +3203,7 @@ window.viewTools = async el => {
   const name = typeof el === 'string' ? el : (el && el.dataset ? el.dataset.name : '');
   if (!name) return;
   try {
-    const j = await api(`/mcp-servers/${name}/tools`);
+    const j = await api(`/mcp-servers/${encodeURIComponent(name)}/tools`);
     const editable = j.policy === 'allowlist';
     const rows = j.tools.map(t =>
       `<tr><td class="mono">${esc(t.tool)}</td>
@@ -3205,7 +3223,7 @@ window.viewTools = async el => {
       $('tl-save').onclick = guarded('tl-save', async () => {
         const allowed = [...document.querySelectorAll('#dlg-body input[data-tool]:checked')]
           .map(c => c.dataset.tool);
-        await api(`/mcp-servers/${name}`, { method: 'PATCH', body: { allowed_tools: allowed } });
+        await api(`/mcp-servers/${encodeURIComponent(name)}`, { method: 'PATCH', body: { allowed_tools: allowed } });
         $('dlg').close();
         banner(`allowlist saved (${allowed.length} tools)`, '', 3000);
         await loadMcpServers();
@@ -3440,6 +3458,33 @@ function refreshFilterSelects() {
     if (cur && keys.some(k => k.id === cur)) tk.value = cur;
   }
 }
+// The pricing table renders identically in both places it appears (the
+// Usage-tab rollups and the Costs editor) — one renderer; the empty-state
+// row is caller-specific (the Usage-tab variant explains WHY an unpriced
+// ledger row costs nothing).
+// GET /admin/costs returns {costs, unpriced, unit_mismatch} (2026-11-10):
+// the rows ride in costs, and unpriced names every registered model with no
+// price row. An unpriced model ledgers $0 and consumes ZERO of every USD
+// budget, so the list is surfaced right above the pricing table instead of
+// staying buried in the response body.
+function paintUnpricedModels(cresp) {
+  const el = $('costs-unpriced');
+  if (!el) return;
+  const unpriced = cresp && Array.isArray(cresp.unpriced) ? cresp.unpriced : [];
+  if (!unpriced.length) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  // esc() EVERY model name before innerHTML (the page's esc-everything
+  // discipline) — a hostile name cannot inject markup.
+  el.innerHTML = 'unpriced — ledger no cost, consume no USD budget: ' + unpriced.map(esc).join(', ');
+}
+function renderCostsTable(costs, empty) {
+  return (costs || []).map(c =>
+    `<tr><td class="mono">${esc(c.model_name)}</td><td class="mono">${esc(c.unit || 'token')}</td><td>${fmtPrice(c.input_per_m)}</td>
+     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
+     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
+     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
+    || empty;
+}
 async function loadUsage() {
   // WINDOW (2026-10-26): the endpoint is bounded to the last 30 days by
   // default, which made a growing lifetime total look like it was DROPPING --
@@ -3615,13 +3660,19 @@ async function loadUsage() {
     const caret = byKeyBody.querySelector('.ukey-caret[data-kidx="' + idx + '"]');
     if (caret) caret.textContent = open ? '▸' : '▾';
   };
+  // {costs, unpriced, unit_mismatch} — 2026-11-10 shape; rows ride in costs
   const costs = await api('/costs');
-  $('costs-table').querySelector('tbody').innerHTML = (costs || []).map(c =>
-    `<tr><td class="mono">${esc(c.model_name)}</td><td>${fmtPrice(c.input_per_m)}</td>
-     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
-     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
-     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">no prices configured — ledger rows carry no cost</td></tr>';
+  // SHAPE FALLBACK (rolling upgrade): GET /admin/costs became an OBJECT
+  // {costs, unpriced, unit_mismatch} on 2026-11-10, but a new admin.html can be
+  // served by a pod while the API answers from a not-yet-upgraded one that
+  // still returns a bare ARRAY. Without this, costs.costs is undefined, the
+  // renderer returns its empty state, and the operator is told "no prices
+  // configured" while prices exist and are billing.
+  const costRows = Array.isArray(costs) ? costs : (costs && costs.costs) || [];
+  state.lastCostRows = costRows;
+  $('costs-table').querySelector('tbody').innerHTML = renderCostsTable(costRows,
+    '<tr><td colspan="7" class="muted">no prices configured — ledger rows carry no cost</td></tr>');
+  paintUnpricedModels(costs);
   // E: the ledger explorer reloads scoped to the selected user (?user_id=).
   // Seed the pending filter straight from the session store when the select
   // hasn't been populated yet (the restored-tab loadUsage races ahead of
@@ -3641,25 +3692,42 @@ async function loadUsage() {
       <td class="muted">${r2.subject ? esc(r2.subject) + (r2.subject_idp === 'self-asserted' ? ' <span title="self-asserted">~</span>' : '') : '—'}</td>
       <td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
       <td>${fmtInt(r2.prompt_tokens)}</td><td>${fmtInt(r2.completion_tokens)}</td><td>${fmtInt(r2.cached_tokens)}</td>
-      <td>${fmtInt(r2.total_tokens)}</td><td>${fmtUSD(r2.cost_usd)}</td><td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('')
+      <td>${fmtInt(r2.total_tokens)}${r2.unit_kind && r2.unit_kind !== 'token'
+        // P10: the row billed in a non-token unit — say WHICH and how much
+        // (billable_units), esc()ed like everything else on this page.
+        ? ` <span class="muted" title="billed in a non-token unit">(${esc(String(r2.billable_units))} ${esc(r2.unit_kind)})</span>` : ''}</td>
+      <td>${fmtUSD(r2.cost_usd)}</td><td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">no requests recorded yet</td></tr>';
   refreshFilterSelects();
 }
 async function loadCostsEditor() {
   await loadModels();
   $('c-model').innerHTML = state.models.map(m => `<option>${esc(m)}</option>`).join('');
+  // {costs, unpriced, unit_mismatch} — 2026-11-10 shape; rows ride in costs
   const costs = await api('/costs');
-  $('costs-table').querySelector('tbody').innerHTML = (costs || []).map(c =>
-    `<tr><td class="mono">${esc(c.model_name)}</td><td>${fmtPrice(c.input_per_m)}</td>
-     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
-     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
-     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">no prices configured</td></tr>';
+  // SHAPE FALLBACK — see loadUsage: a bare array is the pre-2026-11-10 shape.
+  const costRows = Array.isArray(costs) ? costs : (costs && costs.costs) || [];
+  state.lastCostRows = costRows;
+  $('costs-table').querySelector('tbody').innerHTML = renderCostsTable(costRows,
+    '<tr><td colspan="7" class="muted">no prices configured</td></tr>');
+  paintUnpricedModels(costs);
+  // P10: preselect the selected model's CURRENT unit (default 'token' — the
+  // vocabulary every pre-existing row carries) so an edit cannot silently
+  // flip a 'second'-priced voice model back to tokens.
+  const sel = $('c-model').value;
+  const curRow = costRows.find(c => c.model_name === sel);
+  $('c-unit').value = (curRow && curRow.unit) || 'token';
 }
+$('c-model').addEventListener('change', () => {
+  // Follow the model switch with its stored unit, same rule as loadCostsEditor.
+  const name = $('c-model').value;
+  const row = (state.lastCostRows || []).find(c => c.model_name === name);
+  $('c-unit').value = (row && row.unit) || 'token';
+});
 $('c-save').onclick = guarded('c-save', async () => {
   try {
     await api('/costs', { method: 'POST', body: {
-      model_name: $('c-model').value, input_per_m: +$('c-in').value,
+      model_name: $('c-model').value, unit: $('c-unit').value, input_per_m: +$('c-in').value,
       output_per_m: +$('c-out').value, cached_per_m: +$('c-cached').value } });
     banner('price saved', '', 2500);
     await loadCostsEditor();
@@ -3783,7 +3851,10 @@ function traceThread(group) {
     ? `${esc(new Date(first.started_ts).toLocaleTimeString())} → ${esc(new Date(last.started_ts || last.started_ts).toLocaleTimeString())}`
     : '';
   const who = reqs[0] || {};
-  return `<details class="trace-thread" open>
+  // Collapsed by default: one thread can hold up to 200 requests — expanding
+  // every thread at once laid out all of those rows on first paint instead
+  // of letting the operator scan the summaries and open what they need.
+  return `<details class="trace-thread">
     <summary><b>conversation</b>
       <b>${esc(who.user_name || 'unknown user')}</b><span class="muted">· ${esc(who.key_name || 'unknown key')}</span>
       <span class="pill">${esc(models.join(' → '))}</span>
@@ -3890,7 +3961,7 @@ const AUDIT_ACTIONS = [
   'profile.limits.propagate', 'user.profile.set', 'tenant.create', 'user.create',
   'guardrail.create', 'guardrail.patch', 'guardrail.delete', 'guardrail.models.set',
   'offpeak.set', 'distiller.config', 'routing.config',
-  'enroll.code.mint', 'enroll.code.revoke', 'enroll.redeem',
+  'enroll.code.mint', 'enroll.code.revoke', 'enroll.redeem', 'enroll.sso_mint',
   'enroll.envelope.patch', 'enroll.delete',
 ];
 // 'system' (routing wave): system-scoped config PUTs (routing.config) audit
@@ -3923,9 +3994,14 @@ async function loadAudit() {
   params.set('limit', String(Math.min(500, Math.max(1, limit))));
   const qs = params.toString();
   // CSV export rides the SAME filters (the /admin/usage export pattern) —
-  // rebuilt per load so the link never lags the visible filter state.
+  // rebuilt per load so the link never lags the visible filter state. The
+  // anchor carries the query string only (dataset.qs): the click handler
+  // below FETCHES it with the admin key. A bare navigation would 401 on
+  // bearer-key deployments (require_admin is header-only) and the browser
+  // would save the JSON error body as admin-audit.csv — the same fix the
+  // team_leader console's u-csv already carries.
   const csv = $('a-csv');
-  if (csv) csv.href = '/admin/audit' + (qs ? '?' + qs + '&' : '?') + 'format=csv';
+  if (csv) csv.dataset.qs = qs + (qs ? '&' : '') + 'format=csv';
   const rows = await api('/audit' + (qs ? '?' + qs : ''));
   $('audit-table').querySelector('tbody').innerHTML = (rows || []).map(r => {
     const det = r.details && Object.keys(r.details).length
@@ -4031,10 +4107,10 @@ window.deleteEnrollment = (btn, id, keyCount) => withBtn(btn, async () => {
 async function loadEnrollTab() {
   if (!$('e-tenant') || !$('enroll-table')) return;
   if (!state.tenants.length) { try { await loadTenants(); } catch {} }
-  $('e-tenant').innerHTML = state.tenants.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')
+  $('e-tenant').innerHTML = state.tenants.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('')
     || '<option value="">(no tenants — create one under Keys)</option>';
   $('e-profile').innerHTML = '<option value="">— none —</option>' +
-    state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   // SSO self-mint default profile card: tenant select + the configured
   // values rendered from the tenants payload (sso_default_profile_id, plus
   // the admin-tier pair sso_admin_profile_id / sso_admin_groups), profiles
@@ -4042,16 +4118,16 @@ async function loadEnrollTab() {
   const st = $('sso-tenant'), sp = $('sso-profile');
   if (st && sp) {
     st.innerHTML = state.tenants.map(t =>
-      `<option value="${t.id}">${esc(t.name)}${t.sso_default_profile_name ? ' · ' + esc(t.sso_default_profile_name) : ''}</option>`).join('')
+      `<option value="${esc(t.id)}">${esc(t.name)}${t.sso_default_profile_name ? ' · ' + esc(t.sso_default_profile_name) : ''}</option>`).join('')
       || '<option value="">(no tenants)</option>';
     sp.innerHTML = '<option value="">— none (bare mint grant) —</option>' +
-      state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+      state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
     // Admin tier (2026-11-08): the second profile + the group list that
     // selects it. Both blank = tier split OFF (every mint takes the default).
     const sap = $('sso-admin-profile'), sag = $('sso-admin-groups');
     if (sap) {
       sap.innerHTML = '<option value="">— none (no tier split) —</option>' +
-        state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+        state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
     }
     const syncProf = () => {
       const t = state.tenants.find(x => x.id === st.value);
@@ -6409,6 +6485,49 @@ $('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(e.m
 $('a-action').addEventListener('change', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
 $('a-type').addEventListener('change', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
 $('a-reload').addEventListener('click', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
+// Authenticated CSV download: fetch with the Bearer header, stream to a
+// blob, click a transient anchor (a bare navigation would lose the key).
+// Same two-envelope rule as api(): the SSO chain overwrites Authorization.
+// Verify the hash-chained audit trails (2026-11-10). Read-only and NOT cheap
+// (the verifier walks each never-pruned trail), so it is a button, never a poll.
+$('a-verify').addEventListener('click', guarded('a-verify', async () => {
+  const el = $('a-chain');
+  el.hidden = false;
+  el.textContent = 'verifying…';
+  try {
+    const j = await api('/audit/chain');
+    const st = (j && j.anchor_status) || 'unknown';
+    // anchor-mismatch / anchor-invalid / trail-wiped are FAILURES even if a
+    // bare ok:true came back — the anchor is what proves the tail is real.
+    const bad = st === 'anchor-mismatch' || st === 'anchor-invalid' || st === 'trail-wiped';
+    const ok = j && j.ok && !bad;
+    el.innerHTML = (ok ? '✓ chains verified' : '✗ chain check FAILED')
+      + ' — anchor: ' + esc(st)
+      + (j && j.checked !== undefined ? ' (' + esc(String(j.checked)) + ' rows walked)' : '')
+      + (j && j.first_bad_id ? ' — first bad row id ' + esc(String(j.first_bad_id)) : '');
+    el.style.color = ok ? 'var(--ok, #3fb950)' : 'var(--err, #f85149)';
+  } catch (e) {
+    el.innerHTML = 'chain check unavailable: ' + esc(e.message);
+    el.style.color = 'var(--err, #f85149)';
+  }
+}));
+$('a-csv').addEventListener('click', async ev => {
+  ev.preventDefault();
+  const qs = $('a-csv').dataset.qs;
+  if (!qs) return;
+  try {
+    if (!key()) throw new Error('enter the admin key first');
+    const r = await fetch('/admin/audit?' + qs, {
+      headers: { 'Authorization': 'Bearer ' + key(), 'X-API-Key': key() } });
+    if (!r.ok) throw new Error(r.status + ' — CSV export refused');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'admin-audit.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { banner(e.message, 'error', 6000); }
+});
 $('op-reload').addEventListener('click', () => loadOffpeak(true).catch(() => {}));   // a manual ↻ forces past the 15s shared cache
 async function refreshAll() {
   await loadTenants(); await loadProfiles(); await loadModels(); await loadMcpServers(); await loadKeys();
@@ -6449,13 +6568,27 @@ Object.assign(window, {
 // F4: boot read uses the SAME store the write above uses (sessionStorage via
 // the iframe-safe sessionStore wrapper — never a bare, unguarded access).
 armPasswordToggles(document);
-// The one-plane contract: measure now, re-measure on resize and after ANY
-// render (dialogs, endpoint rows, tables). The observer watches childList
-// only — layoutFormRows writes STYLE attributes, never children — so it
-// cannot re-trigger itself.
+// The one-plane contract: measure now, re-measure on resize and after any
+// render that can change a form row's shape. The observer is scoped to the
+// roots that hold rows — each static .row/.ep-row, the dialog body (dialog
+// rows are rebuilt per open) and the endpoint-row container — instead of
+// document.body: the body-wide watch forced a full pass (getBoundingClientRect
+// per .row item) on EVERY DOM mutation, banners and table renders included,
+// none of which can change a row's flex lines. Dynamic rows get an explicit
+// layoutFormRowsNow() at their render site (dlg(), addEndpointRow); the
+// observer backstops structural edits inside a live row (selects, the agent
+// picker). The observer watches childList only — layoutFormRows writes STYLE
+// attributes, never children — so it cannot re-trigger itself.
 layoutFormRowsNow();
 window.addEventListener('resize', layoutFormRows);
-new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });
+{
+  const rowObs = new MutationObserver(layoutFormRows);
+  for (const r of document.querySelectorAll('.row, .ep-row'))
+    rowObs.observe(r, { childList: true, subtree: true });
+  rowObs.observe($('dlg-body'), { childList: true, subtree: true });
+  const moEps = $('mo-eps');
+  if (moEps) rowObs.observe(moEps, { childList: true, subtree: true });
+}
 const storedKey = sessionStore.get('pcai-admin-key');
 if (storedKey) {
   $('adminkey').value = storedKey;

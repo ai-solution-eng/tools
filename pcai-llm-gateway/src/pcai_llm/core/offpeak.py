@@ -184,7 +184,13 @@ def effective_for(model: str, base: float) -> float:
 # blip must never silently reset commercial terms.
 _OVERRIDES_TTL = 60.0
 _overrides: dict[str, float] = {}
-_overrides_loaded_at = 0.0
+# NEGATIVE INFINITY, not 0.0 (audit 2026-11-10 P3 — the fourth instance of the
+# class core/costs.py:22-26 documents as fixed): time.monotonic() is
+# uptime-based, so on a host whose uptime is below the TTL the comparison
+# "monotonic() - 0.0 > 60" is FALSE at startup and the ratio cache NEVER loads
+# — every model then bills at its base fraction until the host crosses 60s of
+# uptime, silently ignoring the console's commercial terms.
+_overrides_loaded_at = float("-inf")
 
 
 async def load_overrides(force: bool = False) -> None:
@@ -677,7 +683,7 @@ def reset() -> None:
     _task = None
     state = _State()
     _overrides = {}
-    _overrides_loaded_at = 0.0
+    _overrides_loaded_at = float("-inf")  # -inf, never 0.0 — see _OVERRIDES_TTL
     _band_valid = True
     for _promql, mst in _model_evals.values():
         mst.enabled = False

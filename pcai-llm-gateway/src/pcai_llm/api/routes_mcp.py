@@ -97,6 +97,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 import fastapi
 import httpx2
@@ -127,6 +128,7 @@ from ..core.identity import (
     subject_for_key,
 )
 from ..core.keys import KeyRecord, authenticate
+from ..core.toolrelay import UNKNOWN_SERVER_LABEL
 from ..db import db
 from ..mcpf import arg_policy
 from ..mcpf.federation import is_allowed, load_grants, server_allows
@@ -381,6 +383,21 @@ def build_mcp_headers(
 # ---------------------------------------------------------------------------
 
 
+def _header_value_safe(value: str) -> bool:
+    """True when a credential-override VALUE is printable ASCII (plus tab).
+
+    Audit 2026-11-10 P2-3, READ side: the write path bounds LENGTH but not
+    charset (routes_enroll owns the write-side validation — a separate fix in
+    another zone), so a stored row can carry CR/LF/NUL or non-ASCII:
+    header-splitting-shaped bytes that httpx2 either rejects (failing the whole
+    call) or, against a lenient in-cluster upstream, splits. The read side is
+    the last place that can refuse them, so an unsafe value is DROPPED (logged
+    by NAME, never by value — the degrade-not-fail contract above: a bad
+    override must never take down an otherwise-authorized call).
+    """
+    return all(ch == "\t" or " " <= ch <= "~" for ch in value)
+
+
 async def key_override_headers(key_id: uuid.UUID, server_name: str) -> dict[str, str]:
     """Decrypt one key's stored header overrides (mcp_server_creds) for one
     server — the per-tenant identity headers (e.g. X-Memory-Dataset /
@@ -415,7 +432,19 @@ async def key_override_headers(key_id: uuid.UUID, server_name: str) -> dict[str,
         return {}
     if not isinstance(parsed, dict):
         return {}
-    return {str(name): str(value) for name, value in parsed.items()}
+    headers: dict[str, str] = {}
+    for name, value in parsed.items():
+        text = str(value)
+        if not _header_value_safe(text):
+            log.warning(
+                "mcp creds for key %s/%r: dropping override %r — value is outside printable ASCII",
+                key_id,
+                server_name,
+                str(name),
+            )
+            continue
+        headers[str(name)] = text
+    return headers
 
 
 async def resolve_mcp_headers(
@@ -606,6 +635,19 @@ _CATALOG_FETCH_CONCURRENCY = 4
 
 _tools_listing_cache: dict[tuple[str, ...], tuple[float, list[dict[str, Any]]]] = {}
 
+# Single-flight leaders (audit P2-33): cache key -> the in-flight fetch's
+# future. A COLD cache under concurrency used to open one upstream session per
+# concurrent request per server, and every admin registry edit clears the cache
+# fleet-wide — so a cache clear during a burst multiplied the fan-out. Followers
+# await the leader's future instead of starting a second fetch. The future is
+# shielded on await (a cancelled FOLLOWER must not cancel the leader's fetch)
+# and removed in the leader's finally, so a failed fetch is retried by the next
+# request rather than pinned.
+_tools_listing_inflight: dict[tuple[str, ...], asyncio.Future[list[dict[str, Any]]]] = {}
+# Bumped by listing_cache_clear(): a fetch that started before a registry edit
+# must not publish its pre-edit snapshot after the edit (2026-11-10).
+_listing_generation = 0
+
 
 def _listing_cache_key(server: dict[str, Any]) -> tuple[str, ...]:
     """Identity of everything a listing REQUEST depends on (name/url/headers/
@@ -622,14 +664,22 @@ def _listing_cache_key(server: dict[str, Any]) -> tuple[str, ...]:
 
 
 def listing_cache_clear() -> None:
-    """Drop the whole listing cache.
+    """Drop the whole listing cache AND any in-flight fetch futures.
 
     Registered as a registry-change hook (core.registry.on_mcp_registry_
     change): every admin mutation of the MCP registry funnels through
     registry.refresh(), which fires the hook — the cache is DERIVED state of
     the registry snapshot and must never outlive it. routes_admin never
     reaches into this module's cache directly.
+
+    GENERATION (2026-11-10): the bump also invalidates any fetch already in
+    flight. Without it a listing fetch started BEFORE a registry edit could
+    complete afterwards and repopulate the cache with a pre-edit snapshot for
+    a full TTL — the single-flight future is per-key, not per-generation, so
+    clearing the dict alone does not cover it.
     """
+    global _listing_generation
+    _listing_generation += 1
     _tools_listing_cache.clear()
 
 
@@ -658,26 +708,65 @@ async def _cached_upstream_tools(server: dict[str, Any]) -> list[dict[str, Any]]
       entry present, serve the STALE listing (logged) — discovery
       availability beats freshness; without an entry the error propagates
       and the caller skips the server with an error entry.
+    - SINGLE-FLIGHT (audit P2-33): concurrent callers for the same cache key
+      share ONE upstream fetch. The leader publishes its outcome (listing or
+      exception, stale-on-error already applied) through a future; followers
+      await it shielded, so a cancelled follower never cancels the fetch.
     """
     cache_key = _listing_cache_key(server)
     now = time.monotonic()
     entry = _tools_listing_cache.get(cache_key)
     if entry is not None and entry[0] > now:
         return entry[1]
+    pending = _tools_listing_inflight.get(cache_key)
+    if pending is not None and pending.get_loop() is asyncio.get_running_loop():
+        # Shield: cancelling THIS request must not cancel the shared fetch the
+        # other followers are waiting on. The loop check keeps a future from a
+        # DIFFERENT loop (tests drive this function with one asyncio.run per
+        # call) out of this await — it would raise RuntimeError instead of
+        # sharing, so that caller simply fetches for itself.
+        return await asyncio.shield(pending)
+    # Capture the generation BEFORE the await: a registry edit that lands while
+    # this fetch is in flight bumps it, and the result must then be DISCARDED
+    # rather than cached (see listing_cache_clear).
+    gen = _listing_generation
+    fut: asyncio.Future[list[dict[str, Any]]] = asyncio.get_running_loop().create_future()
+    _tools_listing_inflight[cache_key] = fut
     headers = build_mcp_headers(
         server.get("headers") or {},
         server.get("auth_secret"),
         server.get("auth_token_enc"),
     )
     try:
-        tools = await _fetch_tools(str(server["url"]), headers, timeout_s=_LISTING_TIMEOUT_S)
-    except Exception:
-        if entry is not None:
-            log.warning("mcp listing cache: upstream %r failed — serving stale listing", server.get("name"))
-            return entry[1]
+        try:
+            tools = await _fetch_tools(str(server["url"]), headers, timeout_s=_LISTING_TIMEOUT_S)
+        except Exception as exc:
+            if entry is not None:
+                log.warning("mcp listing cache: upstream %r failed — serving stale listing", server.get("name"))
+                fut.set_result(entry[1])
+                return entry[1]
+            fut.set_exception(exc)
+            # Mark the exception as retrieved: with no follower waiting, the
+            # future would otherwise log "exception was never retrieved" at GC.
+            fut.exception()
+            raise
+        if gen == _listing_generation:
+            _tools_listing_cache[cache_key] = (now + settings.mcp_catalog_cache_s, tools)
+        else:
+            # A registry edit superseded this fetch. Serve the caller (its
+            # answer is still a valid listing for the server it asked about)
+            # but do not publish it: the next caller re-fetches the new shape.
+            log.debug("mcp listing cache: discarding a pre-edit snapshot for %r", server.get("name"))
+        fut.set_result(tools)
+        return tools
+    except asyncio.CancelledError:
+        # The leader was cancelled: release the followers with the same
+        # outcome instead of leaving them parked on a future nothing resolves.
+        if not fut.done():
+            fut.cancel()
         raise
-    _tools_listing_cache[cache_key] = (now + settings.mcp_catalog_cache_s, tools)
-    return tools
+    finally:
+        _tools_listing_inflight.pop(cache_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +873,33 @@ def _catalog_summary(text: Any, cap: int = _CATALOG_SUMMARY_CHARS) -> str:
     if len(s) <= cap:
         return s
     return s[: cap - 1].rstrip() + "\u2026"
+
+
+def _catalog_url(url: Any) -> str:
+    """The upstream URL as the tenant-visible catalog may render it.
+
+    Audit 2026-11-10 P3: the catalog discloses in-cluster upstream URLs to any
+    key holding one grant on that server. The address itself stays (operators
+    debug with it, and the shape is test-pinned), but USERINFO never renders: a
+    registry URL that ever carries credentials must not hand them to a tenant.
+    An unparseable or relative value renders as "" — the caller then emits no
+    url key at all, exactly as for a blank one.
+    """
+    text = str(url or "")
+    if "@" not in text:
+        return text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    try:
+        netloc = f"{host}:{parsed.port}" if parsed.port else host
+    except ValueError:
+        return ""
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 async def _mcp_catalog(server: str | None = None) -> str:
@@ -924,8 +1040,12 @@ async def _mcp_catalog(server: str | None = None) -> str:
         entry: dict[str, Any] = {"server": sv["server"]}
         if sv.get("url"):
             # url only when there is one, and never as "" (which would read
-            # as "configured but blank").
-            entry["url"] = sv["url"]
+            # as "configured but blank"). _catalog_url strips any USERINFO
+            # (audit P3) — the address is for operator debugging, a credential
+            # embedded in it is not the tenant's to see.
+            redacted = _catalog_url(sv["url"])
+            if redacted:
+                entry["url"] = redacted
         entry["tools"] = [
             {"tool": t["tool"], "description": _catalog_summary(t.get("description"))} for t in sv.get("tools") or []
         ]
@@ -943,6 +1063,7 @@ async def _settle_quiet(
     arguments: dict[str, Any] | None = None,
     detail: str = "",
     model: str = "",
+    metric_server: str | None = None,
 ) -> None:
     """Best-effort ledger settle for one gated call attempt (ledger truth:
     refusals and errors are recorded like real calls, but a settle failure
@@ -965,7 +1086,16 @@ async def _settle_quiet(
 
     model is "" on the /mcp surface (an off-cluster MCP client is a program,
     not a model turn) and the SERVED MODEL on the relay path once the
-    executor passes it - the honest split, not a guess."""
+    executor passes it - the honest split, not a guess.
+
+    metric_server is the RESOLVED registry name for the gateway_mcp_calls_total
+    label, or None when no registry lookup has happened (the unknown-server
+    path, a discovery endpoint). The label is NEVER the caller's string: a
+    None ticks the fixed UNKNOWN_SERVER_LABEL bucket, because metrics.py states
+    the invariant "server - bounded by the MCP registry" and the caller's
+    server argument would otherwise mint one Prometheus series per RPM unit
+    (audit P1-5). The endpoint-derived _server below still feeds the ledger and
+    the chained audit row, which are access-controlled."""
     _server, _, _rest = endpoint.partition(":")[2].partition(":")
     try:
         await settle(
@@ -983,7 +1113,7 @@ async def _settle_quiet(
     # "denied" is a distinct outcome, not an error: an operator alerting on the
     # error rate must not fire on policy activity (P2-2 fidelity, wave-2 review).
     if status in ("ok", "error", "denied"):
-        _metrics.observe_mcp_call(_server, status, model)
+        _metrics.observe_mcp_call(metric_server or UNKNOWN_SERVER_LABEL, status, model)
     from ..core.chain_audit import write_mcp_call
 
     await write_mcp_call(
@@ -1108,7 +1238,7 @@ async def _gated_mcp_call(
     grants = await load_grants(key.id)
     if not is_allowed(grants, server, tool):
         _metrics.observe_acl_denial(server)
-        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments)
+        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments, metric_server=server)
         raise ToolError(f"denied: key is not granted tool {tool!r} on server {server!r}")
 
     # --- argument/grant-level policy stage (hardening P0-1, SPEC 3.2) ---
@@ -1131,7 +1261,7 @@ async def _gated_mcp_call(
     # --- server tool-policy gate (defense-in-depth over the key ACL) ---
     if not server_allows(target, tool):
         _metrics.observe_acl_denial(server)
-        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments)
+        await _settle_quiet(key.id, endpoint, "denied", started, request_id, arguments=arguments, metric_server=server)
         raise ToolError(
             f"denied: {server!r} policy is '{target.get('tool_policy')}' and tool {tool!r} is not in its allowlist"
         )
@@ -1183,14 +1313,30 @@ async def _gated_mcp_call(
             # as error and — on flattened calls — hand off to the next
             # candidate. Never an HTTP error; reported INSIDE the result.
             log.warning("mcp call: upstream %r/%r failed: %s", candidate_name, tool, exc)
-            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id, arguments=arguments)
+            await _settle_quiet(
+                key.id,
+                candidate_endpoint,
+                "error",
+                started,
+                request_id,
+                arguments=arguments,
+                metric_server=candidate_name,
+            )
             transport_errors.append(f"{candidate_name}: {type(exc).__name__}")
             continue
 
         if result.is_error:
             # Upstream tool-error results are REAL ANSWERS (the tool ran and
             # refused/failed) — never a failover trigger.
-            await _settle_quiet(key.id, candidate_endpoint, "error", started, request_id, arguments=arguments)
+            await _settle_quiet(
+                key.id,
+                candidate_endpoint,
+                "error",
+                started,
+                request_id,
+                arguments=arguments,
+                metric_server=candidate_name,
+            )
             return json.dumps(
                 {
                     "ok": False,
@@ -1200,7 +1346,9 @@ async def _gated_mcp_call(
                 },
                 indent=2,
             )
-        await _settle_quiet(key.id, candidate_endpoint, "ok", started, request_id, arguments=arguments)
+        await _settle_quiet(
+            key.id, candidate_endpoint, "ok", started, request_id, arguments=arguments, metric_server=candidate_name
+        )
         return json.dumps(
             {
                 "ok": True,
@@ -1463,7 +1611,15 @@ class _GatewayMCPServer(MCPServer):
         Per-key ACL filter applied AFTER the cached per-server listing is
         fetched; a server with ZERO grants for this key contributes NO tools
         and NO URL anywhere (it is not even fetched). Same default-deny
-        discipline as the catalog's granted_servers filter."""
+        discipline as the catalog's granted_servers filter.
+
+        The fan-out is the CATALOG's bounded concurrent gather (audit P1-8).
+        It used to be serial at the 15 s listing bound, so a cold cache with N
+        servers cost up to N x 15 s — past most clients' 30-60 s timeout — and
+        this IS the default discovery surface (mcp_flat_tools defaults True).
+        _CATALOG_FETCH_CONCURRENCY caps the per-request amplification exactly
+        as it does for the catalog, and gather preserves the registry priority
+        order the output has always had."""
         key = _current_key()
         grants = await load_grants(key.id)
         if not grants:
@@ -1473,19 +1629,23 @@ class _GatewayMCPServer(MCPServer):
         granted_servers = {s for s, _ in grants}
         mapping: dict[str, tuple[str, str]] = {}
         out: list[MCPTool] = []
-        for server in await registry.mcp_servers():  # priority-ordered
-            if server["name"] not in granted_servers:
-                continue
-            try:
-                tools = await _cached_upstream_tools(server)
-            except Exception as exc:
+        servers = [sv for sv in await registry.mcp_servers() if sv["name"] in granted_servers]  # priority-ordered
+        sem = asyncio.Semaphore(_CATALOG_FETCH_CONCURRENCY)
+
+        async def _bounded_fetch(srv: dict[str, Any]) -> list[dict[str, Any]]:
+            async with sem:
+                return await _cached_upstream_tools(srv)
+
+        listings = await asyncio.gather(*(_bounded_fetch(sv) for sv in servers), return_exceptions=True)
+        for server, listing in zip(servers, listings):
+            if isinstance(listing, BaseException):
                 # skip-with-error, same discipline as _mcp_catalog: a dead
                 # upstream must not break discovery. (The catalog JSON's
                 # error entry has no tools/list equivalent — the skip is
                 # silent to the client, loud in the logs.)
-                log.warning("flat tools/list: server %r unavailable: %s", server["name"], exc)
+                log.warning("flat tools/list: server %r unavailable: %s", server["name"], listing)
                 continue
-            for entry in tools:
+            for entry in listing:
                 tool_name = entry["tool"]
                 if (server["name"], tool_name) not in grants:
                     continue  # per-tool ACL filter, after the cached fetch

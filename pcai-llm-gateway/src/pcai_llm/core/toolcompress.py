@@ -88,6 +88,19 @@ _DIFF_HUNK_RE = re.compile(r"^@@")
 # suite pins the headroom. A candidate that cannot fit passes through.
 DEFAULT_BUDGET_CHARS = 24_000
 
+# INPUT ceiling (audit 2026-11-10 P2-35). Compression runs SYNCHRONOUSLY on the
+# event loop, and the json.loads/json.dumps of the candidate is the one
+# unbounded cost in it: a multi-MB tool result must never be parsed at all.
+# ABSOLUTE, not a multiple of budget_chars: budget_chars is a caller knob (a
+# caller may ask for an 8,000-char result out of a 700 KB payload — that
+# compression is exactly what this module is for), while the ceiling has to
+# bound the PARSE. 1 MB matches the store's own default retention cap
+# (config.tool_compress_max_store_chars): an original bigger than that can
+# never be retained, so a rewrite would be discarded as "not_stored" anyway
+# and the parse would be pure waste. A candidate over the ceiling PASSES
+# THROUGH — the pre-feature behaviour, never a worse outcome.
+MAX_INPUT_CHARS = 1_000_000
+
 # Detection floors. Below these a payload is small enough that the marker
 # costs more attention than the omission saves.
 _MIN_JSON_ITEMS = 4
@@ -252,6 +265,7 @@ def compress_tool_text(
     min_chars: int = 4096,
     ratio_floor: float = 0.15,
     budget_chars: int = DEFAULT_BUDGET_CHARS,
+    max_input_chars: int = 0,
 ) -> CompressResult | None:
     """Compress one model-facing tool result, or return None to pass through.
 
@@ -265,8 +279,14 @@ def compress_tool_text(
     (and any late error record) exactly the way this module exists to avoid.
     A candidate that cannot fit the budget returns None (pass through), so
     the outcome is never worse than the pre-feature cap.
+
+    `max_input_chars` is the INPUT ceiling (0 = MAX_INPUT_CHARS): a candidate
+    above it is never parsed. The relay passes its store cap, because a
+    rewrite it cannot retain is discarded.
     """
     if not isinstance(text, str) or len(text) < max(64, min_chars):
+        return None
+    if len(text) > (max_input_chars if max_input_chars > 0 else MAX_INPUT_CHARS):
         return None
     if MARKER_SIG in text:
         return None
@@ -445,7 +465,14 @@ def _compress_search(text: str, _digest: str, _budget_chars: int) -> str | None:
         path = match.group("path")
         count = per_path.get(path, 0)
         is_signal = bool(_ERROR_RE.search(match.group("text")))
-        if kept < 60 and (count < 2 or is_signal):
+        # An ERROR/FATAL/DENIED match is kept UNCONDITIONALLY, even past the
+        # 60-match cap (audit P3): the cap exists to bound the tail of ordinary
+        # matches, and dropping the one line that says "permission denied" --
+        # the reason the search is being read at all -- is the failure mode
+        # this module exists to prevent. (A very noisy result can therefore
+        # exceed the caller's budget and pass through uncompressed, which is
+        # the documented fail-open.)
+        if is_signal or (kept < 60 and count < 2):
             per_path[path] = count + 1
             out.append(line)
             kept += 1
@@ -466,7 +493,15 @@ def _compress_search(text: str, _digest: str, _budget_chars: int) -> str | None:
 def _compress_diff(text: str, _digest: str, _budget_chars: int) -> str | None:
     lines = text.splitlines()
     out: list[str] = []
+    # omitted = the CURRENT run of context lines (flushed as a sentinel);
+    # total_omitted = everything dropped, which is what decides whether this
+    # diff was compressed at all. They must be separate counters (audit
+    # P2-23): the flush resets `omitted` to 0, so the old `omitted == 0`
+    # test asked "was the LAST line omitted?" -- a diff ending on "+new"
+    # (the normal case) returned None and was never compressed, while the
+    # same diff ending on a context line compressed.
     omitted = 0
+    total_omitted = 0
     for line in lines:
         if _DIFF_HDR_RE.match(line) or _DIFF_HUNK_RE.match(line) or line.startswith(("+", "-")):
             if omitted:
@@ -475,9 +510,10 @@ def _compress_diff(text: str, _digest: str, _budget_chars: int) -> str | None:
             out.append(line)
         else:
             omitted += 1
+            total_omitted += 1
     if omitted:
         out.append(f"[... {omitted} context lines omitted ...]")
-    if not out or omitted == 0:
+    if not out or total_omitted == 0:
         return None
     return "\n".join(out)
 

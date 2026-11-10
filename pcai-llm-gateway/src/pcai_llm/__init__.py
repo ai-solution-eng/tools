@@ -1,3 +1,3 @@
 """PCAI LLM Gateway — multi-tenant LLM + MCP gateway for HPE PCAI."""
 
-__version__ = "3.10.4"
+__version__ = "4.0.0"

@@ -85,6 +85,28 @@ async def store(model: str, input_str: str, embedding: list[float]) -> None:
         log.exception("embedding cache store failed; continuing without cache")
 
 
+async def prune(ttl_seconds: int) -> int:
+    """Delete rows older than the TTL; returns the number reclaimed.
+
+    0 (or negative) disables reclamation — the operator contract shared with
+    the other retention knobs (audit P2-28, 2026-11-10: embedding_cache was
+    the one cache table with no TTL and no housekeeping prune). Stored
+    vectors do not go stale (same model + input, same vector), so expiry is
+    pure space reclamation: a row that outlives its TTL is still CORRECT to
+    serve, exactly the tool_compress_store posture. Called by housekeeping.
+    """
+    if ttl_seconds <= 0:
+        return 0
+    tag = await db.execute(
+        "DELETE FROM embedding_cache WHERE created_at < now() - make_interval(secs => $1)",
+        float(ttl_seconds),
+    )
+    try:
+        return int(str(tag).split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 def extract_embedding(response_json: dict) -> list[float] | None:
     """Pull the first vector out of an OpenAI-format embeddings response."""
     data = response_json.get("data")

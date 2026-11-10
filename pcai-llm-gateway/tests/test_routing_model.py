@@ -431,7 +431,9 @@ async def test_settle_existing_signature_writes_empty_routing_columns(monkeypatc
     monkeypatch.setattr(costs_mod, "db", fake)  # settle -> costs.compute reads model_costs
     await budgets_mod.settle(uuid.uuid4(), "m", "chat", 10, 5, "ok", 5, "r-1")
     sql, args = fake.inserts[-1]
-    assert "routing_policy" in sql and len(args) == 18
+    # 20 since zone P10 appended billable_units + unit_kind to the positional
+    # INSERT tail (the settle docstring documents the append-only contract).
+    assert "routing_policy" in sql and len(args) == 20
     # the four routing_* columns plus routing_probabilities all default to ''
     assert args[13] == "" and args[14] == "" and args[15] == "" and args[16] == ""
     assert args[17] == "", "routing_probabilities defaults empty (no decision ran)"

@@ -191,6 +191,24 @@ def env(monkeypatch: pytest.MonkeyPatch):
         # team helpers at the module boundary, so this one rides along
         return {(model, period): (0, 0.0) for model, period in scopes}
 
+    # BATCH twins (audit 2026-11-10 P2-34): the listing no longer calls the
+    # per-row helpers — it answers the whole page in a constant number of
+    # statements. The fakes return the same numbers so the assertions keep
+    # pinning the projection, not the call shape.
+    async def fake_totals_bulk(by_period: dict[str, list[uuid.UUID]]):
+        out: dict[uuid.UUID, tuple[int, float, int, float]] = {}
+        for eids in by_period.values():
+            for eid in eids:
+                out[eid] = (11, 0.5, 7, 0.0)  # spend_t, spend_usd, alloc_t, alloc_usd
+        return out
+
+    async def fake_cap_spend_bulk(
+        scopes_by_enrollment: dict[uuid.UUID, list[tuple[str, str]]],
+    ):
+        return {
+            eid: {(model, period): (0, 0.0) for model, period in scopes} for eid, scopes in scopes_by_enrollment.items()
+        }
+
     def fake_invalidate(eid: Any = None) -> None:
         teams_state["invalidated"].append(eid)
 
@@ -199,6 +217,8 @@ def env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(teams_mod, "team_spend", fake_spend)
     monkeypatch.setattr(teams_mod, "team_allocated", fake_alloc)
     monkeypatch.setattr(teams_mod, "team_cap_spend", fake_cap_spend)
+    monkeypatch.setattr(teams_mod, "team_totals_bulk", fake_totals_bulk)
+    monkeypatch.setattr(teams_mod, "team_cap_spend_bulk", fake_cap_spend_bulk)
     monkeypatch.setattr(teams_mod, "invalidate", fake_invalidate)
     monkeypatch.setattr(routes_admin, "db", fake)
     app = FastAPI()

@@ -139,6 +139,11 @@ async def run_once(client: httpx2.AsyncClient | None = None, router=None) -> Non
         async with sem:
             prev_ok = ep.probe_ok
             prev_error = ep.probe_error
+            # _classify returns bool | None (None = "our probe was rejected,
+            # which says nothing about the model"), so the variable must carry
+            # that union — the except arm alone would narrow it to bool.
+            ok: bool | None
+            error: str
             try:
                 resp = await client.get(
                     ep.base_url.rstrip("/") + "/models",
