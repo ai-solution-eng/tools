@@ -29,7 +29,52 @@ All of the following are implemented in `src/model_downloader/` and wired by `he
 - **ModelScan provenance gate**: every PVC download is scanned in-job for unsafe serialization formats before it can block (warn by default, `gate.mode: block` to fail the Job); the verdict rides `manifest.json` and the Downloaded-models/GC views.
 - **PVC preflight + per-namespace quota**: submissions are checked for disk fit and namespace quota BEFORE a Job is created; refusals (422) name the exact bytes-needed vs bytes-free / used-vs-quota math in the submit error path.
 - **TTL/GC eviction** (opt-in): a dry-run-first GC report in the UI (three-key AND deletion rule enforced in the GC CronJob — manifest AND no-AIOLI-row AND no-live-job, with fail-safe keeps when any cross-check is unavailable).
+- **Admin manual deletion** (opt-in, default off): an SSO-gated page that lists the model cache dirs on the PVC with their verdicts and deletes the ones an admin selects — the on-demand counterpart to the TTL/GC pass. The gate requires a **verified** OIDC token (see **Vendored fleet code**). Live jobs and `gc.protectedModels` globs are hard blocks; an AIOLI-registered model is a soft block an admin may override per request. Deletion is limited to exactly the directories the preview resolved (see **Manual deletion** below).
 - **PCAI integration**: Istio VirtualService on `istio-system/ezaf-gateway` at `model-downloader.${DOMAIN_NAME}`, an oauth2-proxy `AuthorizationPolicy` in `istio-system`, a pre-install Kyverno ClusterPolicy stamping EZUA vendor labels (see below), and RBAC for cross-namespace Job/Secret creation, pod-log reads and namespace listing (plus read-only PVC `get`/`list` when preflight is on).
+
+## Python version
+
+The app image runs **Python 3.14** (`python:3.14-slim`), matching the rest of
+the fleet (MultimodalRAG, Speech2Speech and the mcp_servers are all on
+`python:3.14-slim`). The app code is 3.14-clean — no `asyncio.get_event_loop`,
+`utcnow()`, `distutils` or `imp` — and the full test suite runs on 3.14.
+
+Dependency evidence for the base-image bump:
+
+| Requirement | 3.14 status |
+|---|---|
+| `fastapi`, `uvicorn[standard]`, `jinja2`, `pydantic` | proven — already installed by the fleet's 3.14 images at the same floors |
+| `pyyaml`, `boto3` | proven — MultimodalRAG installs both on 3.14 |
+| `kubernetes` | pure-Python client |
+| `psycopg2-binary` | **the one item to confirm** — it needs a `cp314` wheel or a source build (the slim base has no compiler). Pre-flight: `docker run --rm python:3.14-slim pip download --only-binary=:all: --dest /tmp/p psycopg2-binary` |
+
+If that pre-flight fails, the image needs `libpq-dev` + `gcc` in a builder
+stage, or a move to `psycopg` 3 (`db.py` uses the psycopg2 API, so that is a
+code change, not a dependency swap).
+
+## Vendored fleet code
+
+`src/model_downloader/app/oidc_identity.py` is a **verbatim copy** of
+`pcai_utils/oidc_identity.py`, the fleet's shared OIDC verifier (RS256/JWKS,
+fail-closed, no token material logged). It is vendored rather than hardlinked
+because this repo is not a `pcai_utils` mesh consumer.
+
+Do not patch it here — improvements go upstream and are backported, and
+`tests/test_oidc_vendored.py` fails if the copy is edited without re-syncing.
+To update: re-copy from `pcai_utils`, then bump `VENDORED_SHA256` in that test.
+
+The env names are the fleet's canonical `OIDC_*` (`OIDC_ENABLED`,
+`OIDC_ISSUER`, ...); the pre-rename `RAG_OIDC_*` names are still read as a
+deprecated alias. A backport added `PCAI_OIDC_ENV_PREFIX` to the shared module
+so an app can namespace its own variables instead of forking the file — this
+app uses the canonical names and needs no prefix.
+
+The admin deletion gate requires a **verified** token when `oidc.enabled` is
+true: oauth2-proxy injects `Authorization: Bearer <id_token>`, and a bare
+identity header is refused. The chart maps `oidc.*` onto the canonical
+`OIDC_*` env names, so the module stays byte-identical to the fleet copy.
+With `oidc.issuer` empty the verifier is inert and the gate falls back to the
+header — weaker by construction, so set the issuer on any shared cluster.
 
 ## Deploying on PCAI
 
@@ -111,6 +156,20 @@ Every key in [helm/values.yaml](helm/values.yaml), with the default from the cha
 | `gc.concurrencyPolicy` | `Forbid` | Keeps two GC pods from ever running at once. |
 | `gc.resources` | `100m`/`128Mi` req, `500m`/`256Mi` lim | Resources of the GC CronJob pod. |
 | `downloader.image.repository` / `downloader.image.tag` | `ghcr.io/ai-solution-eng/hf-downloader` / `v1.0` | The downloader Job's image (both PVC and S3 paths). |
+| `manualDelete.enabled` | `false` | Renders the `/admin/delete` page and the delete-Job template. Off = the route does not exist and `/api/admin/*` return 400. |
+| `manualDelete.auth.mode` | `sso` | `sso` reads the identity oauth2-proxy injects; `secret` is an opt-in fallback for installs with no SSO gate (shared key, so no per-person attribution). |
+| `manualDelete.auth.adminGroups` | `[]` | Keycloak groups that confer admin (union with `admins`). Both empty = nobody is an admin. |
+| `manualDelete.auth.admins` | `[]` | Explicit usernames that confer admin. |
+| `manualDelete.auth.secret` | `{name: model-delete-key, namespace: "", key: token}` | `mode=secret` only: an EXISTING Secret the chart never creates (same convention as `aioli.dbPasswordSecret`). |
+| `manualDelete.maxTargets` | `20` | Hard cap on directories in one request. |
+| `manualDelete.jobTtlSeconds` | `86400` | How long the delete Job and its logs are kept — the audit surface. |
+| `manualDelete.jobDeadlineSeconds` | `3600` | Hard cap on one delete Job. Deliberately generous: removing tens of GiB over network storage takes minutes, and killing it mid-delete is worse than waiting. It exists to catch a pod that never schedules, not to bound the deletion. |
+| `manualDelete.image` | `""` | Delete-Job image; empty = the app image, which ships `app.delete_targets`. Never the scanner image — it has no such module. |
+| `oidc.enabled` | `true` | Verify the OIDC bearer token oauth2-proxy injects instead of trusting the identity header. With `oidc.issuer` empty the verifier is inert and the gate falls back to the header (weaker — see **Vendored fleet code**). |
+| `oidc.issuer` | `""` | Keycloak realm URL. **Claim-compared only, never fetched** — it must equal the token's `iss`. |
+| `oidc.audience` | `ua` | Expected `aud`/`azp` on the token. |
+| `oidc.jwksUrl` | `""` | The URL that **is** fetched. Empty derives `<issuer>/protocol/openid-connect/certs`; on PCAI point it at the in-cluster Keycloak headless service over plain HTTP so the fetch bypasses the egress proxy and the platform-CA TLS gap. |
+| `oidc.identityClaim` | `preferred_username` | Claim carrying the identity — the same string that suffixes `project-user-<name>`. |
 | `downloader.pvcName` | `models-pvc` | PVC mounted at `/mnt` for the model cache (pvc backend) — also what the GC CronJob mounts. |
 | `downloader.nodeSelector` | `{}` | Node selector for downloader Jobs (empty = scheduler chooses). Debug pods follow it too — there is no separate `debugPod.nodeSelector`. |
 | `downloader.s3WorkPvcName` / `downloader.s3WorkSize` / `downloader.s3WorkPath` | `""` / `20Gi` / `/mnt/s3work` | S3-backend scratch: an existing PVC, else an `emptyDir` sized by `s3WorkSize`; cache root under the `/mnt` mount. |
@@ -242,6 +301,7 @@ A customer-hosted PCAI system:
 - **Jobs table**: status, output URL (`pvc://models-pvc/...?containerPath=/mnt/models` or `s3://bucket/prefix/org/Model/`), submitted/finished timestamps, live logs and progress (parsed from pod logs), and delete for finished jobs. A gate-mode-block scan failure surfaces here verbatim in the Error column.
 - **Downloaded models**: one row per model found on any backend (job history + S3 listing + PVC scanner), most recent first, with the overall on-disk size of the checkpoint (from the PVC scanner's `du -sb`; `—` when unknown, e.g. job-history/S3-only rows); **Rescan storage** forces a fresh scan; the status line states which automatic scans are enabled.
 - **Storage GC (dry-run report)** (when `gc.enabled: true`): one row per model cache dir on the PVC scan root with size, age, manifest presence, ModelScan verdict, and the three-key verdict (`delete`/`keep` + reason). Read-only — the actual deletion runs in the GC CronJob and stays off until `gc.dryRun` is flipped. **Rebuild GC report** forces a fresh evaluation (scan Job + read-only AIOLI SELECT + live-job cross-check).
+- **Manual deletion** (`/admin/delete`, when `manualDelete.enabled: true`): one row per model cache dir on the PVC scan root with size, age, and its verdict. An admin selects directories and confirms; the confirmation lists the **exact absolute paths** and requires typing `DELETE`. Hard blocks (a live job pinning the cache root, a `gc.protectedModels` glob, a path outside the scan root) cannot be overridden; an AIOLI `packaged_models` row is a soft block that needs an explicit per-target override, recorded in the audit trail. The protections are re-checked in the **app at commit time**, immediately before the Job is created, against a fresh scan, a fresh AIOLI read and a fresh live-Job list; anything that became blocked or vanished is dropped and reported. The Job itself is deliberately as simple as a download Job: it runs in the namespace that owns `models-pvc` with the default ServiceAccount and **no cluster RBAC**, mounts the volume read-write, validates each path structurally (absolute, not a symlink, a directory, `models--<org>--<repo>`, `realpath` under the scan root), and removes only the paths it was handed — it never walks, globs, or expands a path. Each directory is renamed to `.deleting-<name>` before removal, so the model leaves the listing the moment deletion starts and a killed run leaves obvious junk rather than a half-deleted model. Every deletion writes a tombstone (stdout JSON + `_deleted/` on the PVC) carrying the actor, the verdict, and a copy of the model's `manifest.json`.
 - **Debug pod**: launch a long-running shell in any `project-user-*` namespace that mounts the model PVC at `/mnt` (optionally with an HF token for `hf download` inside it), then connect with the displayed `kubectl exec -it $(kubectl get pods -n <ns> -l job-name=<job> -o jsonpath='{.items[0].metadata.name}') -- bash`. Delete it from the table when done — that removes its token Secret too.
 - **Model catalog** (`/catalog`): browse the lab → model → configuration tree (searchable, collapsible, remembers what you had open), view a configuration's full JSON via **Config**, add/edit/delete via the form, **Refresh from GitHub**, paste JSON (object or array) to **Push to MLIS** directly or **Add to Catalog**, and tick individual configurations — or a whole lab's **all** box — to **Push Selected to MLIS** (identical configurations are skipped; a changed configuration of a known name lands as the next version, and the result table shows the version MLIS assigned). Configurations on the Mooncake L3 tier are labelled **Mooncake** and carry an **RDMA setup** chip that expands the patch-script caveat inline. An optional **Project** field next to the push button files the pushed models under a project — the same `project-user-*` namespace combobox the download form uses (`/api/namespaces`), degrading to free text if the list is RBAC-denied; the PCAI `project-` namespace prefix is stripped before the push (the field shows `→ pushes as <name>` when that happens), because MLIS files by project name. A model pushed before this canonicalisation stored the namespace spelling, so its first re-push lands as one new version (project is part of the configuration fingerprint); empty falls back to the entry's own project, then to `catalog.defaultProject`, then to unfiled.
 

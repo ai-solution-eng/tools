@@ -30,7 +30,7 @@ fullnameOverride: ""
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v1.8.3
+  tag: v2.0.1
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -178,6 +178,34 @@ gc:
 
 # Long-running shell on the same PVC at /mnt for cache inspection, rendered as
 # a Job so job-controller creates the Pod; scheduling follows downloader.
+# Admin-initiated deletion of model cache dirs on the PVC — the on-demand
+# counterpart to the scheduled GC pass. Needs a rebuilt app image (it ships the
+# delete module) AND the re-packaged chart (it carries the Job template), so
+# values alone cannot deliver it. Flip enabled only after both are in place.
+manualDelete:
+  enabled: false
+  maxTargets: 20
+  jobTtlSeconds: 86400
+  image: ""
+  auth:
+    mode: sso
+    admins: [<USERNAME>]
+    adminGroups: []
+
+# Admin-gate token verification. The deletion page requires a VERIFIED OIDC
+# bearer token instead of the proxy identity header (any pod in the cluster
+# could forge that header). The issuer is claim-compared only and never
+# fetched; the JWKS URL IS fetched, so it points at the in-cluster Keycloak
+# headless service over plain HTTP — no egress proxy, no platform-CA TLS gap.
+# Leaving issuer empty makes the verifier inert and the gate falls back to the
+# header: fill this in on any shared cluster.
+oidc:
+  enabled: true
+  issuer: "https://keycloak.${DOMAIN_NAME}/realms/UA"
+  audience: "ua"
+  jwksUrl: "http://keycloak-headless.keycloak.svc.cluster.local:8080/realms/UA/protocol/openid-connect/certs"
+  identityClaim: "preferred_username"
+
 debugPod:
   enabled: true
 

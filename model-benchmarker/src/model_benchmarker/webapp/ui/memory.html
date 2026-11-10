@@ -1,11 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HPE Model Benchmarker — LLM Memory Estimator</title>
 <link rel="stylesheet" href="/static/tokens.css">
 <link rel="stylesheet" href="/static/app.css">
+<script>(function(){var t='auto';try{t=localStorage.getItem('theme')||'auto';}catch(e){}if(t!=='light'&&t!=='dark')t='auto';document.documentElement.setAttribute('data-theme',t);})();</script>
 <script type="text/html" id="hpe-logo-template"><svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 432 288" style="flex-shrink:0">
       <path fill="#01a982" d="M126.617,109.327v15.861h55.218v-15.861H126.617z M178.384,121.737h-48.316v-8.959h48.316V121.737z"/>
       <path fill="var(--text)" d="M136.668,158.173v1.93h-7.843v4.849h7.132v1.878h-7.132v5.279h7.843v1.929h-10.051v-15.864H136.668z
@@ -68,7 +69,6 @@
     </svg></script>
 </head>
 <body>
-<script>(function(){var t=localStorage.getItem('theme')||'light';if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();</script>
 <main>
   <h1>LLM memory estimator</h1>
   <p class="sub">

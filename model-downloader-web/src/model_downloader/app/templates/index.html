@@ -86,7 +86,7 @@
         <div class="combo">
           <input name="namespace" id="ns-input" autocomplete="off"
                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
-                 value=""
+                 value="{{ default_namespace }}"
                  placeholder="project-user-{INSERT_YOUR_NAME}">
           <button type="button" id="ns-toggle" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
           <div id="ns-menu" class="combo-menu" hidden></div>
@@ -235,7 +235,7 @@
         <div class="combo">
           <input name="namespace" id="ns-input-debug" autocomplete="off"
                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
-                 value=""
+                 value="{{ default_namespace }}"
                  placeholder="project-user-{INSERT_YOUR_NAME}">
           <button type="button" id="ns-toggle-debug" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
           <div id="ns-menu-debug" class="combo-menu" hidden></div>

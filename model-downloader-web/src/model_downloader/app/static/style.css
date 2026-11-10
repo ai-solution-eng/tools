@@ -987,3 +987,130 @@ details[open] > .tree-model-summary::before { transform: rotate(90deg); }
   .catalog-search { flex-wrap: wrap; }
   .search-summary { width: 100%; }
 }
+
+/* ---- Manual deletion (admin) ---- */
+/* Solid red primary: the page's only destructive submit. The tinted
+   .delete-btn stays for inline row actions; a page-level "delete N paths"
+   needs the full-strength treatment so it cannot read as a routine button.
+   Solid red + white text is theme-agnostic, and hover follows the existing
+   .action-btn filter pattern instead of a second hardcoded colour. */
+.danger-btn {
+  background: var(--hpe-critical);
+  border: 1px solid var(--hpe-critical);
+  color: #fff;
+}
+.danger-btn:hover { filter: brightness(0.9); }
+.danger-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* Verdict badges: the shared .backend-badge shape, tinted per verdict. The
+   colours mirror the GC report (green = fine, warning tint = caution, red =
+   blocked) via the same CSS variables, so dark/light both hold. */
+.verdict-badge-deletable {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.verdict-badge-soft {
+  background: var(--hpe-skip-tint);
+  border-color: var(--hpe-warning);
+  color: var(--hpe-text);
+}
+.verdict-badge-block {
+  background: var(--hpe-critical-tint);
+  border-color: var(--hpe-critical);
+  color: var(--hpe-critical);
+}
+
+/* Exact cache path cell: wraps (unlike .pvc-url) because the user must be
+   able to read every character of the path they are deleting. */
+.md-path {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--hpe-text);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.md-col-manifest, .md-col-scan { white-space: nowrap; }
+/* The jobs/GC tables bold their 4th (status) column via the global
+   td:nth-child(4) rule; this table's 4th column is Size, so neutralise it. */
+#md-table td:nth-child(4) { font-weight: 400; color: inherit; }
+#md-table .checkbox-label { margin: 0; }
+#md-table input[type="checkbox"] { width: 16px; height: 16px; }
+.md-row-note {
+  margin-top: 3px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+}
+.md-verdict-reason {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--hpe-text-soft);
+}
+.md-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.md-actions-note { font-size: 12px; color: var(--hpe-text-soft); }
+
+/* Confirm modal: same .modal shell as the logs/details dialogs, red-topped
+   so the destructive panel cannot be mistaken for a read-only one. */
+.md-modal-panel { max-width: 760px; border-top-color: var(--hpe-critical); }
+.md-modal-summary { margin: 0 0 10px; font-size: 14px; }
+.md-path-list {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  list-style: none;
+  max-height: 34vh;
+  overflow: auto;
+  background: var(--hpe-code-bg);
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 4px;
+}
+.md-path-list li {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--hpe-border-soft);
+}
+.md-path-list li:last-child { border-bottom: 0; }
+.md-path-list code {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--hpe-text);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.md-override-note {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-warning);
+  background: var(--hpe-skip-tint);
+  font-size: 12.5px;
+  color: var(--hpe-text);
+}
+.md-modal-error {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-critical);
+  background: var(--hpe-critical-tint);
+  font-size: 12.5px;
+  color: var(--hpe-critical);
+}
+.md-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--hpe-border-soft);
+}
+.md-modal-actions #md-modal-confirm { flex: 1; min-width: 0; }
+@media (max-width: 720px) {
+  .md-modal-actions { flex-wrap: wrap; }
+  .md-modal-actions #md-modal-confirm { flex: 1 1 100%; }
+}

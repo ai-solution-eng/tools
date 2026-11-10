@@ -8,18 +8,42 @@ import html
 import json
 
 HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
+<script>
+// Pre-paint theme resolver (invariant I2): saved choice > "auto" — auto follows
+// the OS live via the CSS prefers-color-scheme block. try/catch: blocked
+// storage throws in iframes/private mode.
+(function(){
+  var t = null;
+  try { t = localStorage.getItem('bench-theme'); } catch(e){}
+  if (t !== 'light' && t !== 'dark') t = 'auto';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <style>
-:root{
+:root,:root[data-theme="dark"]{
+  color-scheme:dark;
   --bg:#0f1420; --panel:#171e2e; --panel2:#1d2638; --ink:#e6ecf5; --muted:#93a1b8;
   --accent:#4da3ff; --accent2:#7ce08e; --warn:#ffd166; --bad:#ff6b6b; --border:#2a3550;
   --header1:#141c2e; --header2:#0f1420; --args:#bfd6f5; --shadow:0 6px 18px rgba(0,0,0,.35);
 }
+/* Auto: follow the OS. Declarations are KEEP IN SYNC with the
+   html[data-theme="light"] block below (the contract checker compares them exactly). */
+@media (prefers-color-scheme: light){
+  html[data-theme="auto"]{
+    color-scheme:light;
+    --bg:#f5f7fc; --panel:#ffffff; --panel2:#eef2f8; --ink:#1b2436; --muted:#5b6b82;
+    --accent:#1d63d8; --accent2:#12803b; --warn:#9a6400; --bad:#cf2a2a; --border:#d4dbe8;
+    --header1:#eef3fb; --header2:#ffffff; --args:#33415c; --shadow:0 6px 18px rgba(30,50,90,.10);
+  }
+}
+/* Explicit light: KEEP IN SYNC with the html[data-theme="auto"] block above. */
 html[data-theme="light"]{
+  color-scheme:light;
   --bg:#f5f7fc; --panel:#ffffff; --panel2:#eef2f8; --ink:#1b2436; --muted:#5b6b82;
   --accent:#1d63d8; --accent2:#12803b; --warn:#9a6400; --bad:#cf2a2a; --border:#d4dbe8;
   --header1:#eef3fb; --header2:#ffffff; --args:#33415c; --shadow:0 6px 18px rgba(30,50,90,.10);
@@ -36,7 +60,11 @@ header .sub{color:var(--muted);font-size:13px}
 .controls select,.controls input[type=text]{background:var(--panel2);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px}
 .controls input[type=text]{min-width:200px}
 .controls button{background:var(--accent);border:0;color:#fff;font-weight:600;padding:7px 14px;border-radius:6px;cursor:pointer}
-#btn-theme{background:var(--panel2);border:1px solid var(--border);color:var(--ink);font-size:16px;line-height:1;padding:8px 12px;border-radius:8px;cursor:pointer}
+.theme-seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.theme-seg button{background:var(--panel2);border:0;color:var(--muted);font:inherit;font-size:12.5px;padding:8px 12px;cursor:pointer}
+.theme-seg button+button{border-left:1px solid var(--border)}
+.theme-seg button:hover{color:var(--ink)}
+.theme-seg button.on{background:var(--accent);color:var(--bg);font-weight:600}
 .controls label.inline{flex-direction:row;align-items:center;gap:6px}
 .hint{color:var(--muted);font-size:12px;margin-left:auto;max-width:340px}
 .model-block{margin-bottom:30px}
@@ -98,7 +126,11 @@ code.args{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;col
     <h1>__TITLE__</h1>
     <div class="sub">Generated __GENERATED__ &middot; results from <b>__RESULTS_DIR__</b> &middot; deployment catalog: <b>__CATALOG__</b> &middot; __MODELS__ model(s) / __SETUPS__ setup(s)<br>__RAG__ RAG scale-benchmark(s) in the RAG tab &middot; __MEMORY__ memory estimate(s) in the Memory tab</div>
   </div>
-  <button id="btn-theme" title="Toggle light / dark mode" aria-label="Toggle theme">&#x2600;</button>
+  <div class="theme-seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <div class="wrap">
   <div class="controls">
@@ -505,23 +537,30 @@ function wire(){
     }
   });
 }
-// ---- light / dark mode ----
+// ---- theme: Auto (follows OS) / Light / Dark ----
 function applyTheme(t){
+  if (t!=='light' && t!=='dark') t = 'auto';
   document.documentElement.setAttribute('data-theme', t);
-  document.getElementById('btn-theme').innerHTML = t==='light' ? '&#x1F319;' : '&#x2600;';
-}
-function initTheme(){
-  let t;
-  try { t = localStorage.getItem('bench-theme'); } catch(e){}
-  if (!t) t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-  applyTheme(t);
-  document.getElementById('btn-theme').addEventListener('click', ()=>{
-    const next = document.documentElement.getAttribute('data-theme')==='light' ? 'dark' : 'light';
-    applyTheme(next);
-    try { localStorage.setItem('bench-theme', next); } catch(e){}
+  try { localStorage.setItem('bench-theme', t); } catch(e){}
+  document.querySelectorAll('[data-theme-btn]').forEach(b=>{
+    const on = b.getAttribute('data-theme-btn')===t;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
 }
-initTheme();
+function initThemeControl(){
+  let saved;
+  try { saved = localStorage.getItem('bench-theme'); } catch(e){}
+  applyTheme(saved); // unset/other -> auto: the CSS media block follows the OS live
+  document.querySelectorAll('[data-theme-btn]').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      const t = b.getAttribute('data-theme-btn');
+      if (t === document.documentElement.getAttribute('data-theme')) return;
+      applyTheme(t);
+    });
+  });
+}
+initThemeControl();
 initSelects();
 wire();
 renderReport();

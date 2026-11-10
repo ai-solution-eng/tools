@@ -403,6 +403,18 @@ class DownloadedModelsCache:
         """True if enough time has passed since the last scan to honour a force."""
         return (time.time() - self._last_pvc_scan) > self._FORCE_MIN_INTERVAL
 
+    @property
+    def pvc_scan_age(self) -> float | None:
+        """Seconds since the last PVC scan, or None when none has run yet.
+
+        Lets a second surface (the admin deletion page) report that it reused
+        the scan the Downloaded-models page already paid for, instead of
+        silently looking slow.
+        """
+        if not self._last_pvc_scan:
+            return None
+        return max(0.0, time.time() - self._last_pvc_scan)
+
     def _s3_force_allowed(self) -> bool:
         return (time.time() - self._last_s3_scan) > self._FORCE_MIN_INTERVAL
 
