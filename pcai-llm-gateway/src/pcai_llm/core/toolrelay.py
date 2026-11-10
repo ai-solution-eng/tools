@@ -35,7 +35,7 @@ import anyio
 import httpx2
 
 from ..config import clamp_max_tokens, settings
-from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces
+from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces, tracing
 from . import metrics as _metrics
 from .budgets import check_budgets, settle
 from .canonical import thread_key
@@ -1600,6 +1600,36 @@ async def relay_stream(
             # effective-prompt capture (additive, best-effort, strictly AFTER
             # the upstream call completed — observation never blocks the wire)
             await _capture_prompt(msgs, _last_offered_tools[0], call_attempt)
+        # --- OTLP: one generation span per relay model call -------------------
+        # This is the ONLY point every relay iteration passes through, and it
+        # already holds the model, the observed usage and the latency — so an
+        # agent turn that calls the model five times yields five spans here,
+        # instead of the one-per-request shape the plain paths produce.
+        # Without this the tool-relay path emitted NOTHING: agent traffic (the
+        # bulk of it) never reached a backend, which read as "tracing is broken"
+        # while the HTTP middleware span was the only thing arriving.
+        # Metadata only — model, token counts, latency, status. Never the
+        # prompt or the completion. No-op when tracing is off (the default).
+        _span_attrs: dict[str, Any] = {
+            "langfuse.observation.type": "generation",
+            "langfuse.trace.name": "chat",
+            "langfuse.observation.model.name": model,
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": model,
+            "gen_ai.usage.input_tokens": prompt,
+            "gen_ai.usage.output_tokens": completion,
+            "gen_ai.response.id": request_id,
+            "duration_ms": latency,
+        }
+        # Pseudonymous ledger owner (a UUID, not a name or email); omitted when
+        # unknown so no blank user rows are created.
+        if user_id:
+            _span_attrs["user.id"] = str(user_id)
+        tracing.start_span(
+            "chat",
+            _span_attrs,
+            start_ns=time.time_ns() - latency * 1_000_000,
+        ).end()
         if iterations_out is not None:
             # C-8: publish the completed-call count at the ONE point every
             # model call passes through, so EVERY terminal (plain finish,
