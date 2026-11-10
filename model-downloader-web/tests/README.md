@@ -53,6 +53,21 @@ Run with the repo's app sources importable (no package install needed):
   structural refusal (relative, symlink, non-directory, bad basename, outside
   root, traversal), rename-before-delete, vanished-target accounting, tombstone
   contents, and exit codes. Uses the real filesystem, not mocks.
+- `test_nim_wiring.py` — NIM profile mirroring, app side: request validation
+  (NIM requires enable+bucket+image+NGC key; forces S3 and clears HF fields;
+  profile normalization/dedupe), `_render_nim` substitutions + `--profiles`
+  append + Job annotations, `create_nim_job` (NGC key Secret + nvcr.io pull
+  Secret, rollback on admission denial), the queue path (NIM bypasses the PVC
+  preflight and records `s3://<bucket>`), reconciliation from annotations, and
+  Secret cleanup on watch/remove. No cluster.
+- `test_nim_render.py` — `helm template` for the NIM feature: `job-nim.yaml`
+  present/absent with `nim.enabled`, mirror args and bucket fallback,
+  deployment `NIM_*` env (and its absence on a PVC-only backend), no GPU
+  request, MinIO env + cache volume (emptyDir vs PVC), and chart-level pull
+  secrets.
+- `test_nim_ui.py` — the source selector / NIM fields / NIM mirrors table
+  contract in `index.html`, `app.js` and `style.css`; renders the real page
+  and checks the target bucket when `psycopg2` is available.
 - `test_job_templates.py` — regression guards for two shipped bugs: every
   optional template key must be mapped in `K8sClient.start()` (a missing one
   made every commit die with "template is missing"), and the delete Job must

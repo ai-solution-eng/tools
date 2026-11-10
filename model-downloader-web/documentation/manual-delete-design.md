@@ -130,7 +130,13 @@ manualDelete:
     # is an admin and the page is therefore unusable. Group names match
     # case-sensitively after whitespace trimming, mirroring the gateway's
     # sso_admin_groups semantics (PCAI_LLM routes_enroll.py).
-    adminGroups: []
+    #
+    # `admin` is PCAI's own admin group: the EzUA policy server grants admin
+    # on "admin" in input.groups (ezuser-system/ez-policy-server-rego-cm), and
+    # oauth2-proxy forwards the Keycloak `groups` claim as
+    # X-Auth-Request-Groups — so shipping it as the default makes every AIE
+    # Admin an admin here without a per-person edit.
+    adminGroups: [admin]
     admins: []
 
     # mode=secret ONLY, and not recommended: a shared key cannot distinguish
@@ -282,6 +288,17 @@ identity" — that is about *registry* identity. Conferring an admin *tier* from
 SSO groups is what the gateway already does for self-mint profiles
 (`tenants.sso_admin_groups`), so this is consistent, but it is a fleet-level
 decision and should be recorded as one rather than invented locally here.
+
+**The group name on this platform is `admin`.** PCAI's own authorization
+encodes the admin tier as membership in that group: the EzUA policy server's
+Rego grants admin on `"admin" in input.groups` for model-catalog, S3,
+solution-accelerator and Presto resources
+(`ezuser-system/ez-policy-server-rego-cm`, read 2026-11-10), and oauth2-proxy
+forwards the Keycloak `groups` claim as `X-Auth-Request-Groups`/`kubeflow-groups`.
+So the chart ships `adminGroups: [admin]`: "AIE Admin" and "may delete PVC
+directories" are the same predicate, with no per-person values edit. That is
+also the weaker path described above (the group is an unvalidated header) —
+which is why `admins` remains a union alongside it.
 
 ---
 
@@ -828,10 +845,14 @@ tombstone file surviving on the PVC (the stdout record is what was confirmed).
 
 ```bash
 helm upgrade <release> helm --set manualDelete.enabled=true \
-  --set 'manualDelete.auth.admins={andrew-bydlon}' \
   --set oidc.issuer='https://keycloak.${DOMAIN_NAME}/realms/UA' \
   --set oidc.jwksUrl='http://keycloak-headless.keycloak.svc.cluster.local:8080/realms/UA/protocol/openid-connect/certs'
 ```
+
+`manualDelete.auth.adminGroups` defaults to `[admin]` — PCAI's own admin group
+(§6.5) — so every AIE Admin can use the page with no per-person `--set`. Add
+`--set 'manualDelete.auth.admins={name}'` only for someone who is *not* in that
+group.
 
 `manualDelete.auth.mode=secret` (+ a `model-delete-key` Secret) is the fallback
 for installs with no SSO gate. Then `/admin/delete` — there is no nav link to it

@@ -1114,3 +1114,76 @@ details[open] > .tree-model-summary::before { transform: rotate(90deg); }
   .md-modal-actions { flex-wrap: wrap; }
   .md-modal-actions #md-modal-confirm { flex: 1 1 100%; }
 }
+
+/* ---- NIM source switch (HuggingFace | NVIDIA NIM) ---- */
+/* Segmented control: same pill shape as the header .theme-seg, sized for the
+   form column. The global button reset gives every button the solid green
+   primary look, so paddings and colours are overridden at this scope. */
+.source-seg {
+  display: inline-flex;
+  justify-self: start;   /* grid item: hug the buttons instead of stretching */
+  border: 1px solid var(--hpe-border);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--hpe-surface);
+}
+.source-seg button {
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  border: 0;
+  background: var(--hpe-surface);
+  color: var(--hpe-text-soft);
+  cursor: pointer;
+}
+.source-seg button.active { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.source-seg button:not(.active):hover { background: var(--hpe-green-tint); }
+.source-seg button:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+
+/* Source pill in the jobs table Model cell: the shared .backend-badge shape,
+   green for HF and the L3 blue (kept distinct from every storage badge) for
+   NIM, so dark/light both hold via the same variables. */
+.src-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-left: 6px;
+  border: 1px solid var(--hpe-border);
+  vertical-align: middle;
+}
+.src-hf {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.src-nim {
+  background: var(--hpe-l3-tint);
+  border-color: var(--hpe-l3-text);
+  color: var(--hpe-l3-text);
+}
+
+/* The NIM target note under the NIM fields: the caveat/override note shape
+   (left rule + tinted panel) in the brand green — it points at the serving
+   deployment's config, so it is guidance, not a warning. */
+.nim-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-green);
+  background: var(--hpe-green-tint);
+  border-radius: 0 3px 3px 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.nim-note code {
+  padding: 1px 5px;
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 3px;
+  background: var(--hpe-surface);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}

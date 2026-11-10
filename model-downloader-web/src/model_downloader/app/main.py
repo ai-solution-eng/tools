@@ -64,6 +64,13 @@ S3_PREFIX = os.environ.get("S3_PREFIX", "")
 # ride along on every PVC-backend submit and be rejected by the s3_path
 # validator, which demands a bucket after the scheme.
 S3_DEFAULT_PATH = (f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")) if S3_BUCKET else ""
+# ---- NVIDIA NIM profile mirroring ------------------------------------------
+# The chart wires these only when nim.enabled and the storage backend includes
+# s3. NIM_AVAILABLE is the single gate the API and the page context both use.
+NIM_ENABLED = os.environ.get("NIM_ENABLED", "false").strip().lower() == "true"
+NIM_BUCKET = os.environ.get("NIM_BUCKET", "").strip()
+NIM_REGION = os.environ.get("NIM_REGION", "us-east-1").strip()
+NIM_AVAILABLE = NIM_ENABLED and bool(NIM_BUCKET) and STORAGE_BACKEND != "pvc"
 # Debug pod ("Launch debug pod" in the UI). Requires chart >= 1.2.0, which
 # renders the debug-pod.yaml template into the job-template ConfigMap.
 DEBUG_POD_ENABLED = os.environ.get("DEBUG_POD_ENABLED", "true").strip().lower() == "true"
@@ -156,9 +163,7 @@ MANUAL_DELETE_JOB_DEADLINE = int(os.environ.get("MANUAL_DELETE_JOB_DEADLINE", "3
 # misconfiguration the commit endpoint refuses rather than guesses at.
 MANUAL_DELETE_IMAGE = os.environ.get("MANUAL_DELETE_IMAGE", "")
 MANUAL_DELETE_AUTH_MODE = (os.environ.get("MANUAL_DELETE_AUTH_MODE", "sso") or "sso").strip().lower()
-MANUAL_DELETE_ADMIN_GROUPS = [
-    g for g in os.environ.get("MANUAL_DELETE_ADMIN_GROUPS", "").split(",") if g.strip()
-]
+MANUAL_DELETE_ADMIN_GROUPS = [g for g in os.environ.get("MANUAL_DELETE_ADMIN_GROUPS", "").split(",") if g.strip()]
 MANUAL_DELETE_ADMINS = [a for a in os.environ.get("MANUAL_DELETE_ADMINS", "").split(",") if a.strip()]
 MANUAL_DELETE_SECRET_NAME = os.environ.get("MANUAL_DELETE_SECRET_NAME", "model-delete-key")
 MANUAL_DELETE_SECRET_NAMESPACE = os.environ.get("MANUAL_DELETE_SECRET_NAMESPACE", APP_NAMESPACE)
@@ -211,6 +216,7 @@ queue = JobQueue(
     pvc_subpath=PVC_SUBPATH,
     s3_bucket=S3_BUCKET,
     s3_prefix=S3_PREFIX,
+    nim_bucket=NIM_BUCKET,
 )
 catalog = Catalog(CATALOG_PATH)
 aioli_db = AioliDB(
@@ -297,13 +303,17 @@ app = FastAPI(title="HF Model Downloader", lifespan=lifespan)
 
 class SubmitRequest(BaseModel):
     namespace: str
-    model_name: str
-    hf_token: str
+    source: str = "hf"  # hf | nim
+    model_name: str = ""  # required for hf
+    hf_token: str = ""  # required for hf
     storage: str = "pvc"
     s3_path: str = ""
     chat_template_path: str = ""
     chat_template_contents: str = ""
     cache_root: str = ""
+    nim_image: str = ""  # NIM 2.x image ref, e.g. nvcr.io/nim/meta/...:tag
+    nim_profiles: str = ""  # space/comma separated profile ids; empty = default
+    ngc_api_key: str = ""  # per-submission NGC key
 
     @field_validator("namespace")
     @classmethod
@@ -312,11 +322,53 @@ class SubmitRequest(BaseModel):
             raise ValueError("invalid namespace")
         return v
 
+    @field_validator("source")
+    @classmethod
+    def _valid_source(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ("hf", "nim"):
+            raise ValueError("source must be 'hf' or 'nim'")
+        return v
+
     @field_validator("model_name")
     @classmethod
     def _valid_model(cls, v: str) -> str:
-        if not re.match(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$", v):
+        # Empty is legal for a NIM submission; the model validator requires it
+        # for hf and fills it from nim_image for nim.
+        if v and not re.match(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$", v):
             raise ValueError("model_name must be 'org/Repo-Name'")
+        return v
+
+    @field_validator("nim_image")
+    @classmethod
+    def _valid_nim_image(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            return v
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._\-/:@]*$", v):
+            raise ValueError("nim_image must look like [registry/]repo[:tag|@digest]")
+        if ":" not in v and "@" not in v:
+            raise ValueError("nim_image must pin a tag or digest")
+        return v
+
+    @field_validator("nim_profiles")
+    @classmethod
+    def _valid_nim_profiles(cls, v: str) -> str:
+        parts = [p for p in re.split(r"[,\s]+", v.strip()) if p]
+        if len(parts) > 50:
+            raise ValueError("nim_profiles accepts at most 50 profile ids")
+        for p in parts:
+            if not re.match(r"^[A-Za-z0-9._\-]+$", p):
+                raise ValueError(f"invalid NIM profile id: {p!r}")
+        # Dedupe preserving order; the job receives them as one --profiles list.
+        return " ".join(dict.fromkeys(parts))
+
+    @field_validator("ngc_api_key")
+    @classmethod
+    def _valid_ngc_key(cls, v: str) -> str:
+        v = v.strip()
+        if re.search(r"\s", v):
+            raise ValueError("ngc_api_key must not contain whitespace")
         return v
 
     @field_validator("storage")
@@ -351,13 +403,41 @@ class SubmitRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def _check_source(self):
+        if self.source == "hf":
+            if not self.model_name:
+                raise ValueError("model_name must be 'org/Repo-Name'")
+            if not self.hf_token.strip():
+                raise ValueError("hf_token is required")
+            return self
+        if not NIM_AVAILABLE:
+            raise ValueError("NIM downloads are not enabled on this deployment")
+        if not self.nim_image:
+            raise ValueError("nim_image is required")
+        if not self.ngc_api_key:
+            raise ValueError("ngc_api_key is required")
+        # A NIM mirror is S3-only and has no HF cache/chat-template semantics.
+        self.model_name = self.nim_image
+        self.hf_token = ""
+        self.storage = "s3"
+        self.s3_path = ""
+        self.cache_root = ""
+        self.chat_template_path = ""
+        self.chat_template_contents = ""
+        return self
+
+    @model_validator(mode="after")
     def _check_s3_path(self):
+        if self.source == "nim":
+            return self
         if self.storage == "s3" and not self.s3_path:
             raise ValueError("s3_path is required when storage is 's3'")
         return self
 
     @model_validator(mode="after")
     def _check_chat_template(self):
+        if self.source == "nim":
+            return self
         if bool(self.chat_template_path) != bool(self.chat_template_contents):
             raise ValueError("chat template path and contents must be provided together")
         return self
@@ -432,6 +512,12 @@ async def _page_context(request: Request | None = None) -> dict:
         "s3_bucket": S3_BUCKET,
         "s3_prefix": S3_PREFIX,
         "s3_default_path": S3_DEFAULT_PATH,
+        # NIM profile mirroring (S3-only). Empty when the deployment has no S3
+        # backend or nim.enabled is off; the template hides the whole source.
+        "nim_enabled": NIM_AVAILABLE,
+        "nim_bucket": NIM_BUCKET,
+        "nim_region": NIM_REGION,
+        "nim_override": f"s3://{NIM_BUCKET}" if NIM_AVAILABLE else "",
         # Job history always populates the table, so the section only depends
         # on the master switch; PVC/S3 scans enrich it when enabled/configured.
         "download_list_enabled": DOWNLOAD_LIST_ENABLED,
@@ -475,12 +561,22 @@ async def submit_job(req: SubmitRequest):
             chat_template_contents=req.chat_template_contents,
             cache_root=req.cache_root,
             preflight=preflight_service,
+            source=req.source,
+            nim_image=req.nim_image,
+            nim_profiles=req.nim_profiles,
+            ngc_api_key=req.ngc_api_key,
         )
     except PreflightError as e:
         # QuotaExceededError subclasses PreflightError; both carry the exact
         # human-readable refusal (bytes-needed vs bytes-free / used vs quota).
         raise HTTPException(422, e.detail) from e
-    return {"id": record.id, "status": record.status, "storage": record.storage}
+    return {
+        "id": record.id,
+        "status": record.status,
+        "storage": record.storage,
+        "source": record.source,
+        "output_url": record.output_url,
+    }
 
 
 @app.get("/api/jobs")
@@ -783,7 +879,12 @@ async def _expected_delete_key() -> str:
             value = (data.get(MANUAL_DELETE_SECRET_KEY) or "").strip()
         except ApiException as e:
             if e.status != 404:
-                log.warning("manual delete: could not read Secret %s/%s: %s", MANUAL_DELETE_SECRET_NAMESPACE, MANUAL_DELETE_SECRET_NAME, e)
+                log.warning(
+                    "manual delete: could not read Secret %s/%s: %s",
+                    MANUAL_DELETE_SECRET_NAMESPACE,
+                    MANUAL_DELETE_SECRET_NAME,
+                    e,
+                )
             value = ""
         except Exception as e:  # pragma: no cover - defensive
             log.warning("manual delete: Secret read failed: %s", e)
@@ -960,7 +1061,9 @@ async def _delete_actor(request: Request) -> str:
             raise HTTPException(401, "missing X-Delete-Key header")
         expected = await _expected_delete_key()
         if not expected:
-            raise HTTPException(403, "deletion is not configured on this deployment (delete key Secret missing or empty)")
+            raise HTTPException(
+                403, "deletion is not configured on this deployment (delete key Secret missing or empty)"
+            )
         # compare_digest on bytes: the "" == "" case above is already excluded
         # by the empty check, and a constant-time compare avoids a timing oracle.
         if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
@@ -1104,8 +1207,7 @@ async def preview_deletions(req: DeletionPreviewRequest, request: Request):
         # named. A path we did not scan is refused, never repaired.
         raise HTTPException(
             422,
-            f"{len(unknown)} target(s) are not in the current scan: {unknown[:3]}"
-            + (" …" if len(unknown) > 3 else ""),
+            f"{len(unknown)} target(s) are not in the current scan: {unknown[:3]}" + (" …" if len(unknown) > 3 else ""),
         )
 
     selected = list(by_path.values()) if list_mode else [by_path[t] for t in req.targets]

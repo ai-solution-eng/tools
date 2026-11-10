@@ -225,3 +225,14 @@ class TestManualDeleteEnabled:
             _render_docs("manualDelete.enabled=true", "manualDelete.auth.secret.namespace=mlis")
         )
         assert env["MANUAL_DELETE_SECRET_NAMESPACE"] == "mlis"
+
+    def test_admin_group_defaults_to_pcai_admin(self):
+        # PCAI's admin tier IS membership in the Keycloak group "admin": the
+        # EzUA policy server grants admin on `"admin" in input.groups`
+        # (ezuser-system/ez-policy-server-rego-cm), and oauth2-proxy forwards
+        # the `groups` claim as X-Auth-Request-Groups. Shipping it as the
+        # default means every AIE Admin can use the page with no per-person
+        # values edit — and `admins` stays a union with it, not a replacement.
+        env = _deployment_env(_render_docs("manualDelete.enabled=true"))
+        assert env["MANUAL_DELETE_ADMIN_GROUPS"] == "admin"
+        assert env["MANUAL_DELETE_ADMINS"] == ""

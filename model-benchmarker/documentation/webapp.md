@@ -43,6 +43,21 @@ target suggestions, it is ADVICE ONLY: any HF repo id or local path stays
 typeable, and pasting a config.json still works offline. Config fetches are
 cached on the work dir (.hf-cache on the PVC).
 
+## The model dropdown (chat benchmark)
+
+The chat page's **Model** field is a searchable combobox fed by
+POST /api/models: as soon as a target URL is entered, the page asks that
+endpoint for `GET {target}/v1/models` and lists the ids it advertises. This is
+the same probe the engine runs when the field is left empty (auto-discovery),
+so it costs nothing extra; the API-key field is used exactly as it is for a
+launch, and the probe follows the chat engine's own URL resolution --
+benchmark_chat is launched without `--remote`, so `.serving.` targets are
+always resolved to their in-cluster form (the LOCAL/REMOTE toggle still
+governs endpoint runs and the run record's target identity). It is ADVICE ONLY -- free text always
+wins, an endpoint that lists nothing (or is unreachable) just leaves a hint
+with a retry link, and leaving the field empty still means auto-discover. The
+list is capped at 500 ids; the ⟳ button re-probes without changing the target.
+
 ### HiCache tiers on the memory page
 
 The KV-cache section has a **HiCache L2 (host RAM)** selector plus an
@@ -179,7 +194,7 @@ explicit-but-absent value disables the library).
 
 **1. The web-app API key** (your Secret, BENCH_API_KEYS) protects the
 benchmark surface: /benchmark/chat, /benchmark/endpoint, /api/runs*,
-/api/endpoints. The fleet mcp_auth middleware enforces it (constant-time
+/api/targets, /api/models. The fleet mcp_auth middleware enforces it (constant-time
 compare, X-API-Key or Authorization: Bearer), and keys are re-read **per
 request**, so rotating the Secret takes effect without a restart. A browser
 without the key gets a 401; the page asks for the key once and keeps it in

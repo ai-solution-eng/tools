@@ -74,6 +74,18 @@ spec:
         - name: S3_SECRET_ACCESS_KEY
           value: {{ .Values.s3.secretAccessKey | quote }}
         {{- end }}
+        # NIM profile mirroring (values: nim.*). Same S3 gate as the block
+        # above: a pvc-only site has no bucket to mirror into, so the app must
+        # see NIM as unavailable there. NIM_BUCKET empty = nim.bucket unset, so
+        # fall back to the downloader's bucket (NIM serves from the same one).
+        {{- if and .Values.nim.enabled (ne .Values.storage.backend "pvc") }}
+        - name: NIM_ENABLED
+          value: "true"
+        - name: NIM_BUCKET
+          value: {{ .Values.nim.bucket | default .Values.s3.bucket | quote }}
+        - name: NIM_REGION
+          value: {{ .Values.nim.region | quote }}
+        {{- end }}
         - name: DOWNLOAD_LIST_ENABLED
           value: {{ .Values.downloadList.enabled | quote }}
         - name: PVC_SCAN_IMAGE

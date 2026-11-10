@@ -30,7 +30,7 @@ fullnameOverride: ""
 # Tags are packaged with the chart — change only if you build your own images.
 image:
   repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v2.0.2
+  tag: v2.1.0
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -189,7 +189,9 @@ manualDelete:
   auth:
     mode: sso
     admins: [<USERNAME>]
-    adminGroups: []
+    # PCAI's own admin group (EzUA policy server: "admin" in input.groups);
+    # oauth2-proxy forwards the Keycloak `groups` claim. Union with `admins`.
+    adminGroups: [admin]
 
 # Admin-gate token verification. The deletion page requires a VERIFIED OIDC
 # bearer token instead of the proxy identity header (any pod in the cluster

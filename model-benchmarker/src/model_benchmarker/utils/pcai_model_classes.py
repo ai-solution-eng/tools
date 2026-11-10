@@ -246,6 +246,33 @@ _MODEL_CARD_FAILURE_TTL_S = 60.0
 _model_card_failures: dict[str, float] = {}
 
 
+def _fetch_model_ids(
+    base_url: str, api_key: str = "", remote: bool = True, timeout: float = 10.0
+) -> tuple[list[str], str]:
+    """One ``GET {base_url}/models`` probe: (model ids, error reason).
+
+    ``base_url`` is the OpenAI base URL (root + ``"/v1"``). Never raises: a
+    down endpoint or a non-200 answer comes back as an empty list plus a
+    human-readable reason; a reachable endpoint that lists no models returns
+    ``([], "")`` (an empty answer is not a failure). Auto-discovery (which
+    wants the first id, and caches it) and the webapp's model dropdown (which
+    wants the whole list, uncached) share this one probe so both always see
+    exactly the same models.
+    """
+    url = f"{base_url}/models"
+    client = _shared_remote_http_client() if remote else _SHARED_HTTP_CLIENT
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        resp = client.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        models = data.get("data", []) if isinstance(data, dict) else []
+        ids = [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
+        return ids, ""
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
 def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -> str:
     """Best-effort lookup of the served model id via ``GET {base_url}/models``.
 
@@ -264,40 +291,47 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
         last_failure = _discovery_failures.get(url)
     if last_failure is not None and (time.monotonic() - last_failure) < _DISCOVERY_FAILURE_TTL_S:
         return ""
-    client = _shared_remote_http_client() if remote else _SHARED_HTTP_CLIENT
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        resp = client.get(url, headers=headers, timeout=10.0)
-        resp.raise_for_status()
-        data = resp.json()
-        models = data.get("data", []) if isinstance(data, dict) else []
-        ids = [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
-        if ids:
-            logger.info(
-                "Auto-discovered model name '%s' from %s (available: %s)",
-                ids[0],
-                url,
-                ids,
-            )
-            with _discovered_model_lock:
-                _discovered_model_names[url] = ids[0]
-                _discovery_failures.pop(url, None)
-                if len(_discovered_model_names) > _MAX_DISCOVERED_MODEL_NAMES:
-                    _discovered_model_names.pop(next(iter(_discovered_model_names)))
-            return ids[0]
-        logger.warning("No models listed at %s; leaving model_name empty.", url)
-        with _discovered_model_lock:
-            _discovery_failures[url] = time.monotonic()
-    except Exception as e:
+    ids, error = _fetch_model_ids(base_url, api_key, remote=remote)
+    if error:
         logger.warning(
             "Could not auto-discover model name from %s: %s. "
             "Set model_name explicitly if the endpoint lacks /v1/models.",
             url,
-            e,
+            error,
         )
         with _discovered_model_lock:
             _discovery_failures[url] = time.monotonic()
-    return ""
+        return ""
+    if not ids:
+        logger.warning("No models listed at %s; leaving model_name empty.", url)
+        with _discovered_model_lock:
+            _discovery_failures[url] = time.monotonic()
+        return ""
+    logger.info(
+        "Auto-discovered model name '%s' from %s (available: %s)",
+        ids[0],
+        url,
+        ids,
+    )
+    with _discovered_model_lock:
+        _discovered_model_names[url] = ids[0]
+        _discovery_failures.pop(url, None)
+        if len(_discovered_model_names) > _MAX_DISCOVERED_MODEL_NAMES:
+            _discovered_model_names.pop(next(iter(_discovered_model_names)))
+    return ids[0]
+
+
+def discover_model_ids(
+    base_url: str, api_key: str = "", remote: bool = True, timeout: float = 10.0
+) -> tuple[list[str], str]:
+    """Every model id advertised by ``GET {base_url}/models``: (ids, error).
+
+    The uncached full-list counterpart of :func:`discover_model_name` -- for
+    callers that present a CHOICE (the webapp's chat-page model dropdown)
+    rather than resolving the one served model. Same client, TLS posture and
+    auth header as auto-discovery, so the list matches what a run would see.
+    """
+    return _fetch_model_ids(base_url, api_key, remote=remote, timeout=timeout)
 
 
 def _get_async_client(remote: bool = False) -> httpx2.AsyncClient:
@@ -636,14 +670,17 @@ class BaseModel:
         """Rewrite a remote PCAI serving URL to its in-cluster form.
 
         Only URLs containing the ``.serving.`` marker (PCAI serving hostnames)
-        are rewritten; any other URL (e.g. a localhost test endpoint passed via
-        ``--url``) is returned unchanged instead of being mangled.
+        are rewritten (https->http plus the .svc.cluster.local suffix); any
+        other URL (e.g. a localhost test endpoint, or a public https API passed
+        via ``--url``) is returned unchanged instead of being mangled.
         """
-        new_path = path.replace("https", "http")
-        marker = new_path.find(".serving.")
+        marker = path.find(".serving.")
         if marker == -1:
-            return new_path
-        return new_path[:marker] + ".svc.cluster.local"
+            return path
+        head = path[:marker]
+        if head.startswith("https://"):
+            head = "http://" + head[len("https://") :]
+        return head + ".svc.cluster.local"
 
     def _openai_client_kwargs(self, client_cls: Callable, http_client: Any) -> dict[str, Any]:
         """Keyword args shared by the sync/async OpenAI client constructors.

@@ -98,7 +98,13 @@
       </div>
       <div>
         <label for="c-model">Model (optional) — for endpoints serving multiple models</label>
-        <input id="c-model" autocomplete="off" placeholder="e.g. qwen3-32b — empty = auto-discover" spellcheck="false">
+        <div class="combo combo-2btn">
+          <input id="c-model" autocomplete="off" placeholder="e.g. qwen3-32b — empty = auto-discover" spellcheck="false">
+          <button type="button" id="c-model-toggle" class="combo-toggle" aria-label="Models advertised by the endpoint">▾</button>
+          <button type="button" id="c-model-refresh" class="combo-toggle" title="Re-list models from the endpoint" aria-label="Refresh model list">⟳</button>
+          <div id="c-model-menu" class="combo-menu" hidden></div>
+        </div>
+        <div id="c-model-hint" class="muted" aria-live="polite" style="font-size:12px;margin-top:4px;min-height:16px"></div>
       </div>
     </div>
     <div class="grid g3" style="margin-top:12px">
@@ -205,6 +211,129 @@
     chatTargets = (d.targets || []).filter(function (t) { return t.kind === "chat" || t.kind === "any"; });
   }).catch(function () { /* suggestions are optional */ });
   MB.combobox("c-target", function () { return chatTargets; });
+
+  // --- model dropdown (POST /api/models) -------------------------------------
+  // The engine auto-discovers the served id from GET {target}/v1/models when
+  // the field is empty, so listing the same ids up front costs nothing and
+  // makes multi-model gateways (and vLLM aliases) pickable. ADVICE ONLY: free
+  // text always wins, and an unreachable endpoint just leaves the hint --
+  // empty still means auto-discover.
+  var endpointModels = [];   // [{name, url}] for the combobox
+  var modelsKey = "";        // target|usage|key the list belongs to
+  var modelsAt = 0;          // when it was fetched (30s reopen TTL)
+  var modelsSeq = 0;         // stale-response guard
+  var modelsTimer = null;    // debounce for target/key edits
+  var modelsLoading = false;
+  var modelsError = "";
+  var modelCombo = null;
+
+  function modelsCacheKey() {
+    return [$("c-target").value.trim(), $("c-local").checked ? "local" : "remote", $("c-apikey").value].join("\u0000");
+  }
+
+  function setModelHint(html) {
+    var box = $("c-model-hint");
+    if (box) box.innerHTML = html;
+  }
+
+  function renderModelHint() {
+    var target = $("c-target").value.trim();
+    if (!target) { setModelHint(""); return; }
+    if (modelsLoading) { setModelHint("listing models…"); return; }
+    if (modelsError) {
+      setModelHint("could not list models (" + MB.esc(modelsError) +
+        ') — type the id manually or <a href="#" data-model-retry>retry</a>');
+      return;
+    }
+    if (!endpointModels.length) {
+      setModelHint("the endpoint advertises no models — type the id manually (empty = auto-discover)");
+      return;
+    }
+    var n = endpointModels.length;
+    var html = n + " model" + (n === 1 ? "" : "s") + " advertised — open the ▾ list to pick one";
+    var picked = $("c-model").value.trim();
+    if (picked && !endpointModels.some(function (m) { return m.url === picked; })) {
+      html += " · " + MB.esc(picked) + " is not in this endpoint's list";
+    }
+    setModelHint(html);
+  }
+
+  function loadModels(force) {
+    var target = $("c-target").value.trim();
+    if (!target) {
+      endpointModels = []; modelsKey = ""; modelsError = ""; modelsLoading = false;
+      modelsSeq++;  // a cleared target must invalidate any in-flight probe
+      renderModelHint();
+      return;
+    }
+    var key = modelsCacheKey();
+    if (!force && key === modelsKey && (Date.now() - modelsAt) < 30000) {
+      // cached answer wins: invalidate an in-flight probe for another target,
+      // or its late response would replace this list under the wrong target
+      modelsSeq++;
+      modelsLoading = false;
+      renderModelHint();
+      return;
+    }
+    var seq = ++modelsSeq;
+    modelsLoading = true;
+    modelsError = "";
+    renderModelHint();
+    var body = { target: target, target_usage: $("c-local").checked ? "local" : "remote" };
+    if ($("c-apikey").value.trim()) body.api_key = $("c-apikey").value.trim();
+    MB.api("/api/models", { method: "POST", body: JSON.stringify(body) })
+      .then(function (d) {
+        if (seq !== modelsSeq) return;  // a newer target superseded this probe
+        endpointModels = (d.models || []).map(function (id) { return { name: id, url: id }; });
+        modelsKey = key;
+        modelsAt = Date.now();
+        modelsError = d.error || "";
+        modelsLoading = false;
+        renderModelHint();
+        if (modelCombo) modelCombo.refresh();
+      })
+      .catch(function (e) {
+        if (seq !== modelsSeq) return;
+        endpointModels = [];
+        modelsKey = "";  // a failed probe is not cached: the next open retries
+        modelsError = e.message || "request failed";
+        modelsLoading = false;
+        renderModelHint();
+      });
+  }
+
+  function scheduleModelLoad() {
+    if (modelsTimer) clearTimeout(modelsTimer);
+    modelsTimer = setTimeout(function () { loadModels(false); }, 500);
+  }
+
+  modelCombo = MB.combobox(
+    "c-model",
+    function () { return endpointModels; },
+    null,
+    {
+      emptyText: function () {
+        if (modelsLoading) return "listing models…";
+        if (!$("c-target").value.trim()) return "type the endpoint first — its models will appear here";
+        if (modelsError) return "could not list models — type the id manually";
+        if (!endpointModels.length) return "the endpoint advertises no models — type the id manually";
+        return "no model id matches — free text is allowed";
+      },
+    }
+  );
+  $("c-model").addEventListener("focus", function () { loadModels(false); });
+  $("c-model").addEventListener("input", renderModelHint);
+  $("c-model-toggle").addEventListener("click", function () { loadModels(false); });
+  $("c-model-refresh").addEventListener("click", function () { loadModels(true); });
+  $("c-target").addEventListener("change", scheduleModelLoad);
+  $("c-target").addEventListener("blur", scheduleModelLoad);
+  $("c-apikey").addEventListener("change", scheduleModelLoad);
+  $("c-local").addEventListener("change", scheduleModelLoad);
+  $("c-model-hint").addEventListener("click", function (ev) {
+    if (!ev.target.closest("a[data-model-retry]")) return;
+    ev.preventDefault();
+    loadModels(true);
+  });
 
   function collect() {
     var tasks = Array.prototype.slice.call($("c-tasks").selectedOptions).map(function (o) { return o.value; });

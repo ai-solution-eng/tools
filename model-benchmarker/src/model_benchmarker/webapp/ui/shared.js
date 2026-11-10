@@ -207,9 +207,13 @@
 
   // Searchable combobox (ModelDownloader-style): input + toggle + menu of
   // matches; free text ALWAYS wins -- an unmatched term just stays typed.
-  function combobox(inputId, getSuggestions, renderMeta) {
+  // opts.emptyText (string or function) replaces the target-centric empty
+  // message; the returned handle lets a caller refresh an open menu in place
+  // after suggestions arrive asynchronously (e.g. the chat page's model list).
+  function combobox(inputId, getSuggestions, renderMeta, opts) {
     var input = document.getElementById(inputId);
     if (!input) return;
+    opts = opts || {};
     var wrap = input.closest(".combo");
     if (!wrap) return;
     var menu = wrap.querySelector(".combo-menu");
@@ -228,7 +232,9 @@
       if (!matches.length) {
         var empty = document.createElement("div");
         empty.className = "combo-empty";
-        empty.textContent = "No suggested targets match \u2014 you can still type any URL manually.";
+        var emptyText = opts.emptyText;
+        if (typeof emptyText === "function") emptyText = emptyText();
+        empty.textContent = emptyText || "No suggested targets match \u2014 you can still type any URL manually.";
         menu.appendChild(empty);
       } else {
         matches.forEach(function (t) {
@@ -236,7 +242,8 @@
           item.type = "button";
           item.className = "combo-item";
           item.innerHTML = '<span class="combo-item-id">' + esc(t.name) + "</span>" +
-            '<span class="combo-item-name">' + esc(t.url) + "</span>";
+            // a model id is both fields: print it once, not twice
+            (t.name === t.url ? "" : '<span class="combo-item-name">' + esc(t.url) + "</span>");
           item.addEventListener("click", function () {
             input.value = t.url;
             hideMenu();
@@ -297,6 +304,13 @@
       menu.style.position = menu.style.left = menu.style.top = menu.style.bottom = "";
       menu.style.width = menu.style.maxHeight = menu.style.right = "";
     }
+    return {
+      show: function () { show(input.value); },
+      // re-render only when open: an async suggestion fetch must not pop the
+      // menu open (or steal focus) after the user closed it
+      refresh: function () { if (!menu.hidden) show(input.value); },
+      hide: hideMenu,
+    };
   }
 
   // Recent-runs restore: the run panel was tab-local, so leaving the page

@@ -9,6 +9,17 @@ const chatTemplateContentsField = document.getElementById('chat-template-content
 const chatTemplateCheckbox = chatTemplateField.querySelector('input[type="checkbox"]');
 const templateSelectField = document.getElementById('template-select-field');
 const templateSelect = document.getElementById('template-select');
+// Download source (HuggingFace | NVIDIA NIM). The segmented control and the
+// NIM fields only exist when the deployment enables NIM mirroring; every
+// lookup is null-safe so a NIM-disabled page behaves exactly as before and
+// its POST body carries no source key at all.
+const sourceSeg = document.getElementById('source-seg');
+const sourceInput = document.getElementById('source-input');
+const hfFields = sourceInput ? Array.from(form.querySelectorAll('.hf-field')) : [];
+const nimFields = sourceInput ? Array.from(form.querySelectorAll('.nim-field, .nim-note')) : [];
+const submitBtn = form.querySelector('button[type="submit"]');
+const nimImageInput = form.querySelector('input[name="nim_image"]');
+const ngcKeyInput = form.querySelector('input[name="ngc_api_key"]');
 
 function syncTemplateFields() {
   const s3Selected = storageSelect ? storageSelect.value === 's3' : false;
@@ -19,6 +30,9 @@ function syncTemplateFields() {
   chatTemplateContentsField.hidden = !enabled;
 }
 function syncStorageFields() {
+  // While the NIM source is active the HF-only fields are hidden as a group;
+  // storage-driven visibility must not un-hide any of them behind our back.
+  if (sourceInput && sourceInput.value === 'nim') return;
   if (storageSelect) s3PathField.hidden = storageSelect.value !== 's3';
   if (cacheRootField) cacheRootField.hidden = storageSelect ? storageSelect.value === 's3' : false;
   syncTemplateFields();
@@ -29,9 +43,79 @@ if (storageSelect) {
 }
 chatTemplateCheckbox.addEventListener('change', syncTemplateFields);
 
+// ---- Source switch (HuggingFace | NVIDIA NIM) ----
+
+function syncSourceFields() {
+  if (!sourceInput) return;
+  const isNim = sourceInput.value === 'nim';
+  for (const f of hfFields) f.hidden = isNim;
+  for (const f of nimFields) f.hidden = !isNim;
+  // A required attribute on a display:none input still hard-blocks form
+  // submission, so the two sources swap the burden explicitly instead of
+  // letting the browser trip over invisible fields.
+  const modelNameInput = form.querySelector('input[name="model_name"]');
+  const hfTokenInput = form.querySelector('input[name="hf_token"]');
+  if (modelNameInput) modelNameInput.required = !isNim;
+  if (hfTokenInput) hfTokenInput.required = !isNim;
+  if (nimImageInput) nimImageInput.required = isNim;
+  if (ngcKeyInput) ngcKeyInput.required = isNim;
+  if (submitBtn) submitBtn.textContent = isNim ? 'Mirror NIM profiles' : 'Submit download';
+  syncStorageFields();
+}
+if (sourceSeg) {
+  for (const btn of sourceSeg.querySelectorAll('button[data-source]')) {
+    btn.addEventListener('click', () => {
+      sourceInput.value = btn.dataset.source;
+      for (const b of sourceSeg.querySelectorAll('button[data-source]')) {
+        b.classList.toggle('active', b === btn);
+      }
+      syncSourceFields();
+    });
+  }
+  syncSourceFields();
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = Object.fromEntries(new FormData(form));
+  // Only sent when the segmented control exists (NIM-enabled page); a
+  // NIM-disabled page keeps the exact pre-NIM payload. Absent = server
+  // default "hf".
+  if (sourceInput) body.source = sourceInput.value;
+
+  if (body.source === 'nim') {
+    // NIM mirror submission: HF-only fields are cleared, storage is forced to
+    // the S3 mirror target, and the two required NIM inputs are checked here
+    // so the user gets a readable message instead of a raw 422.
+    body.model_name = '';
+    body.hf_token = '';
+    body.storage = 's3';
+    body.s3_path = '';
+    body.cache_root = '';
+    body.chat_template_enabled = '';
+    body.chat_template_path = '';
+    body.chat_template_contents = '';
+    if (body.nim_image) body.nim_image = body.nim_image.trim();
+    if (!body.namespace) body.namespace = form.dataset.defaultNs || '';
+    if (!body.namespace) {
+      msg.className = 'msg error';
+      msg.textContent = 'Namespace is required.';
+      return;
+    }
+    if (!body.nim_image) {
+      msg.className = 'msg error';
+      msg.textContent = 'NIM image is required (e.g. nvcr.io/nim/meta/llama-3.1-8b-instruct:1.0.0).';
+      return;
+    }
+    if (!body.ngc_api_key) {
+      msg.className = 'msg error';
+      msg.textContent = 'NGC API key is required.';
+      return;
+    }
+    await postJob(body);
+    return;
+  }
+
   // HuggingFace repo ids never contain whitespace; a paste from prose or a
   // trailing autofill space otherwise reaches the server intact and comes back
   // as "model_name must be 'org/Repo-Name'". Strip all whitespace up front.
@@ -67,6 +151,12 @@ form.addEventListener('submit', async (e) => {
     body.chat_template_path = '';
     body.chat_template_contents = '';
   }
+  await postJob(body);
+});
+
+// Shared POST for both sources: the wire body is decided by the caller, this
+// only handles the response, the success wording and the post-reset state.
+async function postJob(body) {
   msg.className = 'msg';
   msg.textContent = 'Submitting...';
   try {
@@ -86,16 +176,25 @@ form.addEventListener('submit', async (e) => {
       return;
     }
     msg.className = 'msg ok';
-    msg.textContent = 'Submitted as ' + data.id + ' (' + data.status + ')' +
+    msg.textContent = 'Submitted as ' + data.id + ' (' + data.status + ') — ' +
+      (data.source === 'nim' ? 'NIM mirror' : 'download') +
+      (data.output_url ? ' → ' + data.output_url : '') +
       (data.warnings && data.warnings.length ? ' — warning: ' + data.warnings.join(' · ') : '');
     form.reset();
-    syncStorageFields();
+    if (sourceInput) {
+      // reset() restores the hidden source input to its value="hf" default;
+      // keep the segment the user actually submitted with.
+      sourceInput.value = body.source === 'nim' ? 'nim' : 'hf';
+      syncSourceFields();
+    } else {
+      syncStorageFields();
+    }
     refresh();
   } catch (e) {
     msg.className = 'msg error';
     msg.textContent = 'Error: ' + e;
   }
-});
+}
 
 // ---- Model name search (known models + templates from the catalog) ----
 
@@ -355,18 +454,89 @@ async function refresh() {
     for (const j of jobs) {
       tbody.appendChild(buildRow(j));
     }
+    if (document.getElementById('nim-mirrors')) renderNimMirrors(jobs);
   } catch (e) {
     console.error('refresh failed', e);
   }
+}
+
+// ---- NIM profile mirrors (source=nim job history) ----
+
+function renderNimMirrors(jobs) {
+  const tbody = document.querySelector('#nim-mirrors tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const rows = (jobs || []).filter(j => j.source === 'nim');
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 7;
+    td.className = 'tier-empty';
+    td.textContent = 'No NIM profiles mirrored yet.';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const j of rows) tbody.appendChild(buildNimMirrorRow(j));
+}
+
+function buildNimMirrorRow(j) {
+  const tr = document.createElement('tr');
+  tr.className = 'status-' + j.status;
+
+  // Image (record.model_name holds the NIM image for nim rows)
+  const tdImage = document.createElement('td');
+  const imgCode = document.createElement('code');
+  imgCode.className = 'pvc-url';
+  imgCode.textContent = j.nim_image || j.model_name || '';
+  tdImage.appendChild(imgCode);
+  tr.appendChild(tdImage);
+
+  // Profiles — "default" reads better than an empty cell
+  const tdProfiles = document.createElement('td');
+  tdProfiles.textContent = j.nim_profiles || 'default';
+  tr.appendChild(tdProfiles);
+
+  // Bucket (nim_bucket, falling back to the override URI)
+  const tdBucket = document.createElement('td');
+  tdBucket.textContent = j.nim_bucket || String(j.nim_override || '').replace(/^s3:\/\//, '');
+  tr.appendChild(tdBucket);
+
+  // Status — same tinting hooks as the jobs table (tr.status-* rules)
+  const tdStatus = document.createElement('td');
+  tdStatus.className = 'status-cell';
+  tdStatus.textContent = j.status;
+  tr.appendChild(tdStatus);
+
+  const tdSub = document.createElement('td');
+  tdSub.textContent = j.created_at ? new Date(j.created_at * 1000).toLocaleString() : '';
+  tr.appendChild(tdSub);
+
+  const tdFin = document.createElement('td');
+  tdFin.textContent = j.finished_at ? new Date(j.finished_at * 1000).toLocaleString() : '';
+  tr.appendChild(tdFin);
+
+  const tdErr = document.createElement('td');
+  tdErr.textContent = j.error || '';
+  tr.appendChild(tdErr);
+
+  return tr;
 }
 
 function buildRow(j) {
   const tr = document.createElement('tr');
   tr.className = 'status-' + j.status;
 
-  // Model
+  // Model + source badge (rows from before the feature carry no source and
+  // read as HF, matching the server-side default).
   const tdModel = document.createElement('td');
   tdModel.textContent = j.model_name;
+  const src = j.source === 'nim' ? 'nim' : 'hf';
+  const srcBadge = document.createElement('span');
+  srcBadge.className = 'src-badge src-' + src;
+  srcBadge.textContent = src === 'nim' ? 'NIM' : 'HF';
+  tdModel.appendChild(document.createTextNode(' '));
+  tdModel.appendChild(srcBadge);
   tr.appendChild(tdModel);
 
   // Namespace
@@ -380,9 +550,10 @@ function buildRow(j) {
   tdStatus.textContent = j.status;
   tr.appendChild(tdStatus);
 
-  // Output URL (PVC or S3) shown for succeeded jobs
+  // Output URL (PVC path, or the S3 mirror target for NIM jobs) shown for
+  // succeeded jobs
   const tdOutput = document.createElement('td');
-  const outUrl = j.pvc_url;
+  const outUrl = j.output_url || j.pvc_url;
   if (j.status === 'succeeded' && outUrl) {
     const code = document.createElement('code');
     code.textContent = outUrl;

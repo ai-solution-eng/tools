@@ -662,6 +662,125 @@ data:
             emptyDir:
               sizeLimit: {{ .Values.downloader.s3WorkSize | quote }}
             {{- end }}
+  # NIM profile mirror (MD-NIM). The app substitutes the __PLACEHOLDER__ names
+  # below, then appends "--profiles <id> [<id> ...]" to the args list. Gated on
+  # nim.enabled: a missing key maps to None in the app, which then refuses NIM
+  # submissions with a "upgrade the chart" error instead of failing at Job
+  # creation. No nvidia.com/gpu: `mirror s3` only downloads and uploads.
+  {{- if .Values.nim.enabled }}
+  job-nim.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+        model-downloader/source: "nim"
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.nim.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.nim.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.nim.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+            model-downloader/source: "nim"
+        spec:
+          {{- with .Values.nim.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.nim.imagePullSecrets }}
+          imagePullSecrets:
+          {{- range . }}
+          - name: {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: nim-mirror
+            image: "__NIM_IMAGE__"
+            imagePullPolicy: IfNotPresent
+            securityContext:
+            {{- with .Values.nim.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            # mirror downloads each profile into the local NIM cache, then
+            # uploads it to the bucket ROOT with the percent-encoded keys
+            # NIM_REPOSITORY_OVERRIDE=s3://<bucket> expects. The app appends
+            # --profiles <id> ... when the user names profiles (empty = the
+            # image's default profile).
+            args:
+            - "mirror"
+            - "s3"
+            - "-b"
+            - "__NIM_BUCKET__"
+            - "--manifest-file"
+            - {{ .Values.nim.manifestPath | quote }}
+            - "--model-cache-path"
+            - "/opt/nim/.cache"
+            env:
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: __NGC_SECRET__
+                  key: NGC_API_KEY
+            {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.s3.secretAccessKey | quote }}
+            {{- end }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.s3.endpointUrl | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.nim.region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.nim.region | quote }}
+            - name: AWS_S3_USE_PATH_STYLE
+              value: {{ .Values.nim.pathStyle | quote }}
+            - name: NIM_CACHE_PATH
+              value: "/opt/nim/.cache"
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
+            - name: no_proxy
+              value: {{ . | quote }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
+            - name: https_proxy
+              value: {{ . | quote }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
+            - name: http_proxy
+              value: {{ . | quote }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            volumeMounts:
+            - name: nim-cache
+              mountPath: /opt/nim/.cache
+            resources:
+            {{- toYaml .Values.nim.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: nim-cache
+            {{- if .Values.nim.workPvcName }}
+            persistentVolumeClaim:
+              claimName: {{ .Values.nim.workPvcName }}
+            {{- else }}
+            emptyDir:
+              sizeLimit: {{ .Values.nim.workSize | quote }}
+            {{- end }}
+  {{- end }}
   # Debug shell launched from the UI ("Launch debug pod"). Deliberately a Job,
   # not a bare Pod: the Job's Pod is then created by the kube-system
   # job-controller — the exact same admission path as the downloader Jobs —

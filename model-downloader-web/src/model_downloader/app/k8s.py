@@ -9,6 +9,7 @@ calls are pushed to a thread so the FastAPI event loop is not blocked.
 
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
@@ -42,6 +43,17 @@ MODEL_NAME_ANNOTATION = "model-downloader/model-name"
 STORAGE_ANNOTATION = "model-downloader/storage"
 S3_PATH_ANNOTATION = "model-downloader/s3-path"
 CACHE_ROOT_ANNOTATION = "model-downloader/cache-root"
+# Source discriminator: hf (default when absent, for pre-NIM jobs) | nim.
+SOURCE_ANNOTATION = "model-downloader/source"
+NIM_IMAGE_ANNOTATION = "model-downloader/nim-image"
+NIM_PROFILES_ANNOTATION = "model-downloader/nim-profiles"
+NIM_BUCKET_ANNOTATION = "model-downloader/nim-bucket"
+NIM_OVERRIDE_ANNOTATION = "model-downloader/nim-override"
+# These three values are Kubernetes annotation NAMES, not credentials; the
+# fleet scanner's ASSIGN pass flags the Secret-suffixed identifiers.
+NGC_SECRET_ANNOTATION = "model-downloader/ngc-secret"  # secret-scan:allow (k8s annotation NAME)
+NIM_PULL_SECRET_ANNOTATION = "model-downloader/nim-pull-secret"  # secret-scan:allow (k8s annotation NAME)
+HF_SECRET_ANNOTATION = "model-downloader/hf-secret"  # secret-scan:allow (k8s annotation NAME)
 DEBUG_JOB_NAME_ANNOTATION = "model-downloader/debug-job-name"
 MANAGED_LABEL_SELECTOR = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
 DEBUG_LABEL_SELECTOR = f"{MANAGED_BY_LABEL}={DEBUG_MANAGED_BY_VALUE}"
@@ -82,6 +94,7 @@ def parse_job_templates(data: dict) -> dict:
         "debug-job": data.get("debug-job.yaml") or None,
         "scan-job": data.get("scan-job.yaml") or None,
         "manual-delete-job": data.get("manual-delete-job.yaml") or None,
+        "nim": data.get("job-nim.yaml") or None,
     }
 
 
@@ -129,6 +142,7 @@ class K8sClient:
         self.debug_pod_available = False
         self.scan_job_available = False
         self.manual_delete_job_available = False
+        self.nim_job_available = False
         if not self.template_cm:
             return
         cm = await asyncio.to_thread(
@@ -143,6 +157,7 @@ class K8sClient:
         self.debug_pod_available = self._templates["debug-job"] is not None
         self.scan_job_available = self._templates["scan-job"] is not None
         self.manual_delete_job_available = self._templates["manual-delete-job"] is not None
+        self.nim_job_available = self._templates["nim"] is not None
 
     def _render(
         self,
@@ -205,6 +220,63 @@ class K8sClient:
             meta.setdefault("annotations", {})[CACHE_ROOT_ANNOTATION] = cache_root
         if norm_s3:
             meta.setdefault("annotations", {})[S3_PATH_ANNOTATION] = norm_s3
+        # Source discriminator + the token Secret name, so a reconciled job can
+        # clean up its own Secret after an app restart (old jobs have neither
+        # annotation; they default to hf and leak exactly as they did before).
+        meta.setdefault("annotations", {})[SOURCE_ANNOTATION] = "hf"
+        meta.setdefault("annotations", {})[HF_SECRET_ANNOTATION] = secret_name
+        return manifest
+
+    def _render_nim(
+        self,
+        namespace: str,
+        image: str,
+        job_name: str,
+        ngc_secret: str,
+        bucket: str,
+        profiles: str = "",
+        job_id: str = "",
+    ) -> dict:
+        """Render the NIM profile-mirror Job.
+
+        The template ships the fixed mirror-s3 args; profile ids are appended
+        here so the template stays a static YAML document.
+        """
+        text = self._templates.get("nim")
+        if not text:
+            raise RuntimeError(
+                "nim job template is missing from the job-template ConfigMap; "
+                "upgrade the chart (helm upgrade) to get NIM profile mirroring"
+            )
+        text = text.replace("__NAMESPACE__", namespace)
+        text = text.replace("__NIM_IMAGE__", image)
+        text = text.replace("__JOB_NAME__", job_name)
+        text = text.replace("__NGC_SECRET__", ngc_secret)
+        text = text.replace("__NIM_BUCKET__", bucket)
+        docs = [d for d in yaml.safe_load_all(text) if d is not None]
+        if len(docs) != 1:
+            raise RuntimeError(f"nim job template rendered to {len(docs)} docs, expected exactly 1")
+        manifest = docs[0]
+        if profiles:
+            try:
+                args = manifest["spec"]["template"]["spec"]["containers"][0]["args"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError("nim job template has no container args list") from exc
+            args += ["--profiles", *profiles.split()]
+        meta = manifest.setdefault("metadata", {})
+        meta.setdefault("labels", {})[MANAGED_BY_LABEL] = MANAGED_BY_VALUE
+        meta.setdefault("labels", {})[SOURCE_ANNOTATION] = "nim"
+        annotations = meta.setdefault("annotations", {})
+        annotations[MODEL_NAME_ANNOTATION] = image
+        annotations[SOURCE_ANNOTATION] = "nim"
+        annotations[NIM_IMAGE_ANNOTATION] = image
+        if profiles:
+            annotations[NIM_PROFILES_ANNOTATION] = profiles
+        annotations[NIM_BUCKET_ANNOTATION] = bucket
+        annotations[NIM_OVERRIDE_ANNOTATION] = f"s3://{bucket}"
+        annotations[NGC_SECRET_ANNOTATION] = ngc_secret
+        if job_id:
+            meta.setdefault("labels", {})[JOB_ID_LABEL] = job_id
         return manifest
 
     async def create_job(
@@ -262,6 +334,86 @@ class K8sClient:
         meta.setdefault("annotations", {})[MODEL_NAME_ANNOTATION] = model_name
         await asyncio.to_thread(self.batch.create_namespaced_job, namespace=namespace, body=manifest)
         return secret_name, job_name
+
+    async def create_nim_job(
+        self,
+        namespace: str,
+        image: str,
+        profiles: str,
+        job_id: str,
+        ngc_api_key: str,
+        bucket: str,
+    ) -> tuple[str, str, str]:
+        """Create the NGC key Secret (+ nvcr.io pull Secret) and the mirror Job.
+
+        Returns (ngc_secret_name, pull_secret_name, job_name). pull_secret_name
+        is "" when the image is not pulled from nvcr.io; the chart's own
+        nim.imagePullSecrets cover private/local registries.
+        """
+        base = _sanitize(image)[:40].rstrip("-") or "nim"
+        suffix = uuid.uuid4().hex[:6]
+        ngc_secret = f"ngc-api-{base}-{suffix}"[:63].rstrip("-")
+        job_name = f"md-nim-{base}-{suffix}"[:63].rstrip("-")
+        pull_secret = ""
+        if image.startswith("nvcr.io/"):
+            pull_secret = f"ngc-pull-{base}-{suffix}"[:63].rstrip("-")
+
+        ngc = client.V1Secret(
+            metadata=client.V1ObjectMeta(
+                name=ngc_secret,
+                namespace=namespace,
+                labels={MANAGED_BY_LABEL: MANAGED_BY_VALUE, JOB_ID_LABEL: job_id},
+            ),
+            string_data={"NGC_API_KEY": ngc_api_key},
+            type="Opaque",
+        )
+        try:
+            await asyncio.to_thread(self.core.create_namespaced_secret, namespace=namespace, body=ngc)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+        if pull_secret:
+            auth = base64.b64encode(f"$oauthtoken:{ngc_api_key}".encode()).decode("ascii")
+            dockerconfig = json.dumps(
+                {"auths": {"nvcr.io": {"username": "$oauthtoken", "password": ngc_api_key, "auth": auth}}}
+            )
+            pull = client.V1Secret(
+                metadata=client.V1ObjectMeta(
+                    name=pull_secret,
+                    namespace=namespace,
+                    labels={MANAGED_BY_LABEL: MANAGED_BY_VALUE, JOB_ID_LABEL: job_id},
+                ),
+                string_data={".dockerconfigjson": dockerconfig},
+                type="kubernetes.io/dockerconfigjson",
+            )
+            try:
+                await asyncio.to_thread(self.core.create_namespaced_secret, namespace=namespace, body=pull)
+            except ApiException as e:
+                if e.status != 409:
+                    await self._delete_secret_quiet(namespace, ngc_secret)
+                    raise
+
+        try:
+            manifest = self._render_nim(
+                namespace, image, job_name, ngc_secret, bucket, profiles=profiles, job_id=job_id
+            )
+            if pull_secret:
+                pod_spec = manifest["spec"]["template"]["spec"]
+                pod_spec.setdefault("imagePullSecrets", []).append({"name": pull_secret})
+                # Annotate it too: after an app restart the reconciler cleans
+                # Secrets from annotations, and a leaked pull Secret carries
+                # the NGC key.
+                manifest["metadata"].setdefault("annotations", {})[NIM_PULL_SECRET_ANNOTATION] = pull_secret
+            await asyncio.to_thread(self.batch.create_namespaced_job, namespace=namespace, body=manifest)
+        except Exception:
+            # Template render errors and admission denials must not leave the
+            # NGC key (or the pull credential) behind.
+            await self._delete_secret_quiet(namespace, ngc_secret)
+            if pull_secret:
+                await self._delete_secret_quiet(namespace, pull_secret)
+            raise
+        return ngc_secret, pull_secret, job_name
 
     # ---- Debug shell (UI "Launch debug pod") — implemented as a Job ----
 
@@ -417,6 +569,17 @@ class K8sClient:
                     "storage": annotations.get(STORAGE_ANNOTATION, "pvc"),
                     "s3_path": annotations.get(S3_PATH_ANNOTATION, ""),
                     "cache_root": annotations.get(CACHE_ROOT_ANNOTATION, ""),
+                    # NIM profile mirrors carry source="nim" plus their own
+                    # attribution; pre-NIM jobs have no source annotation and
+                    # must keep reconciling as hf.
+                    "source": annotations.get(SOURCE_ANNOTATION, "hf"),
+                    "nim_image": annotations.get(NIM_IMAGE_ANNOTATION, ""),
+                    "nim_profiles": annotations.get(NIM_PROFILES_ANNOTATION, ""),
+                    "nim_bucket": annotations.get(NIM_BUCKET_ANNOTATION, ""),
+                    "nim_override": annotations.get(NIM_OVERRIDE_ANNOTATION, ""),
+                    "ngc_secret_name": annotations.get(NGC_SECRET_ANNOTATION, ""),
+                    "nim_pull_secret_name": annotations.get(NIM_PULL_SECRET_ANNOTATION, ""),
+                    "hf_secret_name": annotations.get(HF_SECRET_ANNOTATION, ""),
                     "status": status,
                     "error": error,
                     "created_at": created,
@@ -512,6 +675,13 @@ class K8sClient:
         except ApiException as e:
             if e.status != 404:
                 raise
+
+    async def _delete_secret_quiet(self, namespace: str, name: str) -> None:
+        """Best-effort Secret deletion for rollback paths (never masks the cause)."""
+        try:
+            await self.delete_secret(namespace, name)
+        except Exception:
+            pass
 
     async def delete_job(self, namespace: str, job_name: str) -> None:
         try:

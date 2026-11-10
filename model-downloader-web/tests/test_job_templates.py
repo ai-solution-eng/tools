@@ -52,6 +52,7 @@ def cm_data(**over):
         "debug-job.yaml": "debug",
         "scan-job.yaml": "scan",
         "manual-delete-job.yaml": MIN_JOB,
+        "job-nim.yaml": "nim",
     }
     data.update(over)
     return data
@@ -70,12 +71,19 @@ def test_manual_delete_template_is_mapped():
 def test_every_optional_template_is_mapped():
     # The regression was "a caller reads a slot nothing fills". Pin all slots.
     templates = parse_job_templates(cm_data())
-    assert set(templates) == {"pvc", "s3", "debug-job", "scan-job", "manual-delete-job"}
+    assert set(templates) == {"pvc", "s3", "debug-job", "scan-job", "manual-delete-job", "nim"}
 
 
 def test_missing_optional_template_maps_to_none():
     templates = parse_job_templates(cm_data(**{"manual-delete-job.yaml": ""}))
     assert templates["manual-delete-job"] is None
+
+
+def test_missing_nim_template_maps_to_none():
+    # A chart older than the NIM feature simply has no job-nim.yaml; the app
+    # must map it to None (and refuse at submit time), not crash on start.
+    templates = parse_job_templates(cm_data(**{"job-nim.yaml": ""}))
+    assert templates["nim"] is None
 
 
 def test_job_yaml_is_required():
@@ -164,6 +172,7 @@ def test_missing_template_raises_a_clear_error():
                 job_ttl=1,
             )
         )
+
 
 # ---------------------------------------------------------------------------
 # bug 3: a client with no template ConfigMap must still start

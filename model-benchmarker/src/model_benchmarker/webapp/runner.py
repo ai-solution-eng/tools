@@ -53,6 +53,7 @@ MAX_USERS = 512
 MAX_QUERIES = 500
 MAX_HEADERS = 16
 MAX_NOTES = 5
+MAX_MODELS = 500  # /api/models answer cap (a gateway may advertise thousands)
 DEFAULT_RUN_TIMEOUT_S = 7200.0
 DEFAULT_MAX_CONCURRENT = 2
 
@@ -71,6 +72,9 @@ _HEADER_RE = re.compile(r"^[A-Za-z0-9-]+$")
 _PCT_RE = re.compile(r"^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$")
 _GOODPUT_RE = re.compile(r"^[A-Za-z0-9<>=,._ \-]{0,200}$")
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9_=\"',.(){}~|!<>=+\- ]{1,300}$")
+# The served-model id the chat builder accepts (and the dropdown may offer):
+# gateway ids can be HF-style (org/name) or contain @,+,~ -- no spaces/quotes.
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9_.:@+~/-]{1,200}")
 
 CHAT_TASKS = ("coding", "creative", "mixed", "custom")
 
@@ -204,25 +208,41 @@ def load_target_suggestions() -> list[TargetSuggestion]:
 
 def convert_remote_url_to_local(path: str) -> str:
     """Rewrite a remote PCAI serving URL to its in-cluster form -- the exact
-    rule of utils/pcai_model_classes.ChatModel._convert_remote_url_to_local:
-    https->http, and only URLs containing the '.serving.' marker are
-    rewritten (anything else passes through unchanged, never mangled)."""
-    new_path = path.replace("https", "http")
-    marker = new_path.find(".serving.")
+    rule of utils/pcai_model_classes.BaseModel._convert_remote_url_to_local:
+    only URLs containing the '.serving.' marker are rewritten (https->http
+    plus the .svc.cluster.local suffix); anything else passes through
+    unchanged, never mangled. A non-serving https endpoint (a public
+    OpenAI-compatible API, say) must keep its TLS scheme -- downgrading it
+    would break the run."""
+    marker = path.find(".serving.")
     if marker == -1:
-        return new_path
-    return new_path[:marker] + ".svc.cluster.local"
+        return path
+    head = path[:marker]
+    if head.startswith("https://"):
+        head = "http://" + head[len("https://") :]
+    return head + ".svc.cluster.local"
+
+
+def _usage_is_local(params: dict) -> bool:
+    """The LOCAL/REMOTE toggle's state: true only for an explicit 'local'."""
+    usage = str(params.get("target_usage") or params.get("model_usage") or "remote").strip().lower()
+    return usage == "local"
 
 
 def apply_target_usage(url: str, params: dict) -> str:
     """Resolve the LOCAL/REMOTE toggle (the pcai-model-classes behavior, one
     press in the UI): usage=local rewrites '.serving.' URLs to their
     in-cluster .svc.cluster.local form; usage=remote (default) keeps the
-    URL the user gave. Non-serving URLs are returned unchanged either way."""
-    usage = str(params.get("target_usage") or params.get("model_usage") or "remote").strip().lower()
-    if usage == "local":
-        return convert_remote_url_to_local(url)
-    return url
+    URL the user gave. Non-serving URLs are returned unchanged either way.
+
+    Trailing slashes are stripped: the engines append '/v1' (chat) or path
+    templates (endpoint) to the URL, so a pasted 'http://host:8000/' would
+    otherwise become '//v1' and 404. One normalised form also lets the model
+    probe hit exactly the URL a run will.
+    """
+    if _usage_is_local(params):
+        url = convert_remote_url_to_local(url)
+    return url.rstrip("/")
 
 
 def target_aliases(url: str) -> list[str]:
@@ -236,6 +256,12 @@ def target_aliases(url: str) -> list[str]:
     local = convert_remote_url_to_local(url)
     if local != url:
         forms.append(local)
+    # LEGACY (matching only): before the non-serving-URL fix, a local-usage
+    # launch downgraded every https URL to http, so records from then store
+    # that form. Keep it as an alias -- never as a launch/probe target -- so
+    # their resume suggestion still fires.
+    if url.startswith("https://"):
+        forms.append("http://" + url[len("https://") :])
     out: list[str] = []
     for f in forms:
         try:
@@ -277,6 +303,56 @@ def endpoint_api_keys() -> dict[str, str]:
         )
         return {}
     return {str(k).rstrip("/"): str(v) for k, v in data.items()}
+
+
+def list_models_for_target(target_url: str, params: dict, api_key: str = "") -> dict:
+    """Model ids an OpenAI-compatible endpoint advertises -- the chat page's
+    Model dropdown (POST /api/models).
+
+    The target is resolved EXACTLY like a chat run: validated, the toggle
+    applied, then the engine's in-cluster rewrite (.serving. ->
+    .svc.cluster.local) -- benchmark_chat is launched without --remote, so
+    even a "remote" toggle ends up on the in-cluster form. The probe then
+    calls ``GET {resolved}/v1/models`` with the run's auth precedence
+    (client-supplied key, else the operator map for the typed URL) and the
+    run's plain client. That matters because the dropdown must list what the
+    benchmark will see -- probing the typed serving URL (or the wrong TLS
+    posture) could list the wrong models, or none, while the run succeeds.
+
+    Fails SOFT, like auto-discovery: an unreachable endpoint returns
+    ``models=[]`` plus ``error`` instead of raising, because typing the id by
+    hand (or leaving the field empty) must keep working. Only an invalid
+    target raises :class:`BenchError` (HTTP 400), matching /api/runs.
+    """
+    target = validate_target(target_url)
+    # Chat runs are launched WITHOUT --remote, so benchmark_chat's ChatModel
+    # always takes the in-cluster form of the URL (its url_local rewrite) and
+    # the plain (system-TLS) client -- even when the page's toggle is remote.
+    # Probe the same form with the same client, or the dropdown could fail on
+    # the ingress URL while the run itself succeeds in-cluster.
+    resolved = convert_remote_url_to_local(apply_target_usage(target, params))
+    base = resolved + "/v1"
+    key = api_key or endpoint_api_keys().get(target.rstrip("/"), "")
+    # The discovery probe is shared with the bench engines (same client, TLS
+    # posture and auth header); imported lazily so webapp startup does not
+    # pull the PCAI model stack in.
+    from ..utils.pcai_model_classes import discover_model_ids
+
+    ids, error = discover_model_ids(base, key, remote=False)
+    # one bounded line: the UI hint is small and httpx errors carry a docs URL
+    error = " ".join((error or "").split())
+    if len(key) >= 8:
+        error = error.replace(key, "***")  # a malformed header error can echo it
+    error = error[:300]
+    # offer only ids the launch would accept (and bound a hostile endpoint's ids)
+    unique = [i for i in dict.fromkeys(ids) if _MODEL_ID_RE.fullmatch(i)]
+    return {
+        "models": unique[:MAX_MODELS],
+        "source": base + "/models",
+        "target_url": resolved,
+        "truncated": len(unique) > MAX_MODELS,
+        "error": error or None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +655,7 @@ def build_chat_argv(
     if model_id:
         # wider than _TOKEN_RE: gateway ids may be HF-style (org/name) or
         # contain @,+,~ — anything but whitespace/control chars and quotes
-        if not re.fullmatch(r"[A-Za-z0-9_.:@+~/-]{1,200}", model_id):
+        if not _MODEL_ID_RE.fullmatch(model_id):
             raise BenchError("model: use the model id as the endpoint serves it (e.g. qwen3-32b)")
         argv += ["--model", model_id]
 

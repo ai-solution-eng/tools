@@ -1208,6 +1208,17 @@ def test_target_aliases_bridge_serving_and_origin():
     assert target_aliases("not a url") == []
 
 
+def test_target_aliases_keep_the_legacy_https_downgrade_for_matching():
+    """Records written before the non-serving-URL fix stored http:// for an
+    https target; the resume suggester must still find them (matching only --
+    the launch/probe URL is never downgraded)."""
+    from model_benchmarker.webapp.runner import target_aliases
+
+    typed = target_aliases("https://api.example.com")
+    legacy_record = target_aliases("http://api.example.com")
+    assert {a.rstrip("/").lower() for a in typed} & {a.rstrip("/").lower() for a in legacy_record}
+
+
 def test_public_index_carries_target_aliases(compare_app):
     _status, body = _call(compare_app, "GET", "/api/results")
     data = json.loads(body)
@@ -1960,3 +1971,88 @@ def test_measured_benchmarks_qwen_finds_its_runs():
     assert hits[0]["rows"][0]["tokens_p50"] == 136.4
     # a different model in the same tree is still not matched
     assert find_measured("Qwen/Qwen3-8B", "NVIDIA H200 SXM", 4, library=lib) == []
+
+
+# ---------------------------------------------------------------------------
+# chat page model dropdown: POST /api/models (gated, fail-soft)
+# ---------------------------------------------------------------------------
+
+
+def test_models_api_gated(gated_app):
+    status, _ = _call(gated_app, "POST", "/api/models", headers={"Content-Type": "application/json"}, body=b"{}")
+    assert status == 401
+
+
+def test_models_api_validates_the_body(gated_app):
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    for body in (
+        b"",
+        b"[]",
+        json.dumps({}).encode(),
+        json.dumps({"target": "ftp://x"}).encode(),
+        json.dumps({"target": "http://h:8000", "target_usage": "sideways"}).encode(),
+    ):
+        status, _ = _call(gated_app, "POST", "/api/models", headers=headers, body=body)
+        assert status == 400, body
+
+
+def test_models_api_delegates_with_usage_and_key(gated_app, monkeypatch):
+    calls = {}
+
+    def fake(target, params, api_key=""):
+        calls.update(target=target, params=params, api_key=api_key)
+        return {
+            "models": ["qwen3-32b"],
+            "source": "http://h:8000/v1/models",
+            "target_url": "http://h:8000",
+            "truncated": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(R, "list_models_for_target", fake)
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    status, body = _call(
+        gated_app,
+        "POST",
+        "/api/models",
+        headers=headers,
+        body=json.dumps({"target": "http://h:8000", "target_usage": "local", "api_key": "sk-1"}).encode(),
+    )
+    assert status == 200
+    assert json.loads(body)["models"] == ["qwen3-32b"]
+    assert "sk-1" not in body.decode()  # the key is request-only, never echoed
+    assert calls == {"target": "http://h:8000", "params": {"target_usage": "local"}, "api_key": "sk-1"}
+
+
+def test_models_api_fails_soft_payload(gated_app, monkeypatch):
+    """An unreachable endpoint is a 200 with models=[] + reason, not an error:
+    typing the id by hand must keep working."""
+    monkeypatch.setattr(
+        R,
+        "list_models_for_target",
+        lambda *a, **k: {
+            "models": [],
+            "source": "http://h:8000/v1/models",
+            "target_url": "http://h:8000",
+            "truncated": False,
+            "error": "ConnectError: refused",
+        },
+    )
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    status, body = _call(
+        gated_app, "POST", "/api/models", headers=headers, body=json.dumps({"target": "http://h:8000"}).encode()
+    )
+    assert status == 200
+    data = json.loads(body)
+    assert data["models"] == [] and data["error"] == "ConnectError: refused"
+
+
+def test_chat_page_wires_the_model_dropdown(gated_app):
+    status, body = _call(gated_app, "GET", "/benchmark/chat", headers={"X-API-Key": "test-key-1"})
+    assert status == 200
+    html = body.decode("utf-8")
+    assert 'id="c-model-menu"' in html
+    assert 'id="c-model-hint"' in html
+    assert 'id="c-model-refresh"' in html
+    assert "MB.combobox(" in html and '"c-model"' in html
+    assert '"/api/models"' in html
