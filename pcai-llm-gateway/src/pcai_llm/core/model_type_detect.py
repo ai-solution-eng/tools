@@ -51,6 +51,7 @@ registry refresh.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -151,14 +152,33 @@ async def detect(card: dict[str, Any], probe: ProbeFn, *, surfaces: tuple[str, .
 
     A probe failure is recorded as an error string for that surface and
     treated as "not served" — a detection run must not fail because one
-    surface timed out, and the evidence column makes the gap visible.
+    surface timed out, and the evidence column makes the gap visible. A
+    surface with NO probe payload (a custom surfaces tuple — audit P3,
+    2026-11-10: PROBE_PAYLOADS[surface] used to KeyError straight through the
+    "NEVER raises" contract) is recorded the same way, never raised.
+
+    The probes run CONCURRENTLY under a semaphore (same audit): five serial
+    upstream probes stretched every detection run by their summed latency;
+    the semaphore bounds the concurrent GPU work to one probe per surface —
+    detection is an explicit admin action, but it still must not burst.
+    Evidence order stays the surfaces tuple's order (gather preserves it),
+    so the report is deterministic.
     """
-    evidence: dict[str, Any] = {}
-    for surface in surfaces:
-        path, payload = PROBE_PAYLOADS[surface]
-        try:
-            evidence[surface] = await probe(path, payload)
-        except Exception as exc:
-            evidence[surface] = f"error:{type(exc).__name__}"
-            log.info("type-detect: %s probe failed (%s)", surface, type(exc).__name__)
+    sem = asyncio.Semaphore(len(SURFACES))
+
+    async def run(surface: str) -> tuple[str, Any]:
+        spec = PROBE_PAYLOADS.get(surface)
+        if spec is None:
+            # Unknown surface: recorded, not raised (see the docstring).
+            log.info("type-detect: %s has no probe payload — recorded as unserved", surface)
+            return surface, "error:no-probe-payload"
+        path, payload = spec
+        async with sem:
+            try:
+                return surface, await probe(path, payload)
+            except Exception as exc:
+                log.info("type-detect: %s probe failed (%s)", surface, type(exc).__name__)
+                return surface, f"error:{type(exc).__name__}"
+
+    evidence: dict[str, Any] = dict(await asyncio.gather(*(run(s) for s in surfaces)))
     return classify(card, evidence)

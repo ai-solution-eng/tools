@@ -492,9 +492,14 @@ const KEY_STORE = 'pcai_team_leader_key';
 const key = () => $('tlkey').value.trim();
 const state = { overview: null, keys: [] };
 
-function banner(msg, cls = '', timeout) {
+function banner(msg, cls = '', timeout, html = false) {
+  // Same default-escape contract as the admin console (2026-11-02 stored-XSS
+  // fix, w6 F1): every dynamic string reaching innerHTML goes through esc()
+  // UNLESS the caller composes markup itself (html=true) — so a new call
+  // site cannot reopen the footgun the default exists to close. cls is
+  // escaped too (admin parity).
   const b = $('banner');
-  b.innerHTML = `<div class="banner ${cls}">${msg}</div>`;
+  b.innerHTML = `<div class="banner ${esc(cls)}">${html ? msg : esc(msg)}</div>`;
   if (timeout) setTimeout(() => { b.innerHTML = ''; }, timeout);
 }
 // Security: esc must be safe inside double-quoted attributes (the admin
@@ -803,7 +808,7 @@ $('ovr-overflow-tog').onchange = async () => {
     await loadOverview();   // re-read: the pill, the help line, and the pool truth all refresh
   } catch (e) {
     tog.checked = !desired;   // never leave the toggle lying
-    banner(esc(e.message), 'error', 9000);
+    banner(e.message, 'error', 9000);
   } finally { overflowBusy = false; }
 };
 
@@ -832,7 +837,7 @@ async function loadTopups() {
   try { reqs = await api('/topup-requests'); }
   catch (e) {
     if (String(e.message).startsWith('401')) return;   // loseAuth already fired + prompted
-    banner(esc(e.message), 'error', 7000);
+    banner(e.message, 'error', 7000);
     return;
   }
   state.topups = reqs || [];
@@ -877,7 +882,7 @@ $('ovr-topup').addEventListener('click', () => {
       $('dlg').close();
       banner('top-up request sent to your admin', '', 4000);
       await loadTopups();
-    } catch (e) { banner(esc(e.message), 'error', 9000); }   // 409 "one open ask at a time" — verbatim
+    } catch (e) { banner(e.message, 'error', 9000); }   // 409 "one open ask at a time" — verbatim
   });
 });
 
@@ -919,7 +924,7 @@ $('k-create').onclick = guarded('k-create', async () => {
     $('k-name').value = ''; $('k-subject').value = '';
     $('k-budget-tokens').value = ''; $('k-budget-usd').value = '';
     await loadKeys(); await loadOverview();
-  } catch (e) { banner(esc(e.message), 'error', 7000); }
+  } catch (e) { banner(e.message, 'error', 7000); }
 });
 
 async function loadKeys() {
@@ -1073,9 +1078,9 @@ window.tlEditKey = (btn, id) => withBtn(btn, async () => {
     try {
       await api(`/keys/${id}`, { method: 'PATCH', body });
       $('dlg').close();
-      banner(`key updated — limits live immediately (${esc(nm || name)})`, '', 3500);
+      banner(`key updated — limits live immediately (${nm || name})`, '', 3500);
       await loadKeys();
-    } catch (e) { banner(esc(e.message), 'error', 7000); }
+    } catch (e) { banner(e.message, 'error', 7000); }
   });
 });
 
@@ -1108,7 +1113,7 @@ window.tlBudgets = (btn, id) => withBtn(btn, async () => {
   const k = (state.keys || []).find(x => x.id === id) || {};
   let u;
   try { u = await api(`/keys/${id}/usage`); }
-  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  catch (e) { banner(e.message, 'error', 7000); return; }
   // Working rows: the budget_status projection mapped to the PUT shape.
   const rows = (u.budgets || []).map(b => b.kind === 'usd'
     ? { model: b.model, period: b.period, limit_usd: b.limit_usd }
@@ -1157,7 +1162,7 @@ window.tlBudgets = (btn, id) => withBtn(btn, async () => {
       $('dlg').close();
       banner('budgets saved', '', 3000);
       await loadKeys(); await loadOverview();
-    } catch (e) { banner(esc(e.message), 'error', 9000); }
+    } catch (e) { banner(e.message, 'error', 9000); }
   });
 });
 
@@ -1167,7 +1172,7 @@ window.tlUsage = (btn, id) => withBtn(btn, async () => {
   const k = (state.keys || []).find(x => x.id === id) || {};
   let u;
   try { u = await api(`/keys/${id}/usage`); }
-  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  catch (e) { banner(e.message, 'error', 7000); return; }
   const rows = (u.recent || []).map(r2 =>
     `<tr><td>${new Date(r2.ts).toLocaleString()}</td><td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
      <td>${r2.prompt_tokens}</td><td>${r2.completion_tokens}</td><td>${r2.total_tokens}</td>
@@ -1187,7 +1192,7 @@ window.tlRevoke = (btn, id) => withBtn(btn, async () => {
     await api(`/keys/${id}`, { method: 'DELETE' });
     banner('key revoked', '', 3000);
     await loadKeys(); await loadOverview();
-  } catch (e) { banner(esc(e.message), 'error', 7000); }
+  } catch (e) { banner(e.message, 'error', 7000); }
 });
 
 // ---------- advertised (full registry view) ----------
@@ -1282,7 +1287,7 @@ async function loadPresentedModels() {
     '<tbody>' + (modelRows || '<tr><td colspan="7" class="muted">none registered</td></tr>') + '</tbody></table>';
 }
 $('pe-reload').addEventListener('click', () =>
-  loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadPresentedModels().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- usage (scoped rollups + ledger) ----------
 // The SAME three tables the admin console shows (totals / by model / by key),
@@ -1292,7 +1297,7 @@ async function loadUsage() {
   const winSel = $('usage-window');
   if (winSel && !winSel.dataset.bound) {
     winSel.dataset.bound = '1';
-    winSel.addEventListener('change', () => loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+    winSel.addEventListener('change', () => loadUsage().catch(e => banner(e.message, 'error', 5000)));
   }
   const winDays = winSel ? winSel.value : '366';
   const winSince = new Date(Date.now() - Number(winDays) * 86400000).toISOString();
@@ -1401,17 +1406,17 @@ $('u-csv').addEventListener('click', async ev => {
     a.href = url; a.download = 'team-usage.csv';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-  } catch (e) { banner(esc(e.message), 'error', 6000); }
+  } catch (e) { banner(e.message, 'error', 6000); }
 });
 $('u-reload').addEventListener('click', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 // (the rollup-by selector is gone: the tab now renders the admin's three
 // tables — totals, by model, by key — and the window selector binds inside
 // loadUsage() on first call.)
 $('u-key').addEventListener('change', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 $('u-since').addEventListener('change', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- traces (request-grouped cards, admin.html's rendering) ----------
 function traceStatusCell(status) {
@@ -1515,8 +1520,8 @@ async function loadTraces() {
   list.innerHTML = groups.map(g => g.reqs.length > 1 ? traceThread(g) : traceCard(g.reqs[0])).join('')
     || '<p class="muted">no traces yet</p>';
 }
-$('t-key').addEventListener('change', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
-$('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
+$('t-key').addEventListener('change', () => loadTraces().catch(e => banner(e.message, 'error', 5000)));
+$('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- form plane: structure + measurement (admin.html's contract) ----
 // Kept BYTE-FOR-BYTE equivalent to admin.html so the two consoles cannot drift.
@@ -1653,17 +1658,17 @@ function activateTab(name) {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
   btn.classList.add('active'); $(`tab-${name}`).classList.add('active');
-  if (name === 'keys') loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
-  if (name === 'advertised') loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'keys') loadKeys().catch(e => banner(e.message, 'error', 5000));
+  if (name === 'advertised') loadPresentedModels().catch(e => banner(e.message, 'error', 5000));
   if (name === 'usage') {
     // The envelope card lives on THIS tab now (2026-10-30: it was pinned above
     // every tab, where three of the four pages had no use for it), so opening
     // the tab re-reads it — the numbers here are spend-aware and stale the
     // moment a key is minted or a request settles.
-    loadOverview().catch(e => banner(esc(e.message), 'error', 5000));
-    loadUsage().catch(e => banner(esc(e.message), 'error', 5000));
+    loadOverview().catch(e => banner(e.message, 'error', 5000));
+    loadUsage().catch(e => banner(e.message, 'error', 5000));
   }
-  if (name === 'traces') loadTraces().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'traces') loadTraces().catch(e => banner(e.message, 'error', 5000));
   // The plane variables are measured per VISIBLE row — a section that was
   // display:none measured as 0, so every activation re-measures (synchronously).
   layoutFormRowsNow();
@@ -1684,9 +1689,9 @@ function restoreSavedTab() {
 
 $('ovr-reload').addEventListener('click', () =>
   loadOverview().then(() => loadKeys()).then(() => loadTopups())
-    .catch(e => banner(esc(e.message), 'error', 6000)));
+    .catch(e => banner(e.message, 'error', 6000)));
 $('show-revoked').addEventListener('change', () =>
-  loadKeys().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadKeys().catch(e => banner(e.message, 'error', 5000)));
 
 async function connect() {
   const btn = $('connect');
@@ -1697,12 +1702,12 @@ async function connect() {
     setConn(true);
     $('tl-connect').classList.add('hidden');
     restoreSavedTab();      // a restored tab's loader needs the overview loaded first
-    loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
-    loadTopups().catch(e => banner(esc(e.message), 'error', 5000));   // the queue is overview-adjacent
+    loadKeys().catch(e => banner(e.message, 'error', 5000));
+    loadTopups().catch(e => banner(e.message, 'error', 5000));   // the queue is overview-adjacent
     btn.textContent = 'Connected ✓';
   } catch (e) {
     setConn(false); btn.textContent = 'Connect';
-    banner(esc(e.message), 'error', 6000);
+    banner(e.message, 'error', 6000);
   }
   btn.disabled = false;
 }

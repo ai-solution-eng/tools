@@ -120,7 +120,7 @@ IDP_KEYCLOAK = "keycloak"
 # platform oauth2-proxy pod config — it does NOT inject X-Forwarded-Groups):
 # - SUBJECT: X-Auth-Request-Preferred-Username (the OIDC preferred_username
 #   claim shape — the admin console's subject convention, MM RAG's
-#   RAG_OIDC_IDENTITY_CLAIM=preferred_username) is preferred when present;
+#   OIDC_IDENTITY_CLAIM=preferred_username) is preferred when present;
 #   X-Auth-Request-User and X-Email stay as fallbacks in order. All three
 #   assert the SAME person behind the proxy chain; the preferred form just
 #   matches the subject string the console/ledger already anchors on.
@@ -286,6 +286,15 @@ _JWT_SHAPE_RE = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$
 """A JWT-shaped bearer (three dot-separated base64url segments; the
 signature may be empty for unsecured JWS which validation then refuses).
 Anything else (an hllm- key, garbage, empty) never reaches PyJWT."""
+
+
+def is_jwt_shaped(token: str) -> bool:
+    """PUBLIC JWT-shape gate (audit P3, 2026-11-10): True when the token has
+    the three dot-separated base64url segments of a JWT. ONE gate for every
+    surface — auth.py used to reach into the private _JWT_SHAPE_RE from three
+    sites; import THIS instead of the regex."""
+    return bool(_JWT_SHAPE_RE.match(token))
+
 
 # JWKS cache: (fetched_at_monotonic, {kid: signing key}). Module-level
 # BY DESIGN — one fetch per TTL per PROCESS, not per request (the review's
@@ -814,10 +823,14 @@ _SHADOW_KEY_SQL = """
 -- bearer door (which selects it), so a rotated shadow key could never see the
 -- history the token door wrote. Column parity with keys.authenticate's SELECT
 -- is the contract; the mapper's fallbacks are silent.
+-- p.tool_relay_budget is REQUIRED here (audit P2-8, 2026-11-10): it was missing
+-- from exactly this list, so the token door silently inherited the site default
+-- relay budget while the bearer door honored the profile's — the parity the
+-- comment promised is now real, not just stated.
 SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.allowed_models,
        k.rate_limit_rpm, k.rate_limit_tpm, k.max_concurrent,
        k.expires_at, k.revoked_at, k.relay_default, k.stream_pcai_events,
-       k.mcp_admin, k.key_group, p.offpeak_fraction
+       k.mcp_admin, k.key_group, p.offpeak_fraction, p.tool_relay_budget
 FROM api_keys k
 JOIN users u ON u.id = k.user_id
 LEFT JOIN profiles p ON p.id = u.profile_id
@@ -910,13 +923,25 @@ async def _provision_shadow_key(subject: str, claims: TokenClaims | None) -> Key
     try:
         display_name = (claims.email if claims and claims.email else subject)[:64] or subject[:64]
         groups = list(claims.groups) if claims else []
+        # USER NAME: the SUBJECT, never the email (audit P2-12, 2026-11-10).
+        # The user row used to be keyed by display_name = claims.email, so two
+        # DISTINCT subjects sharing one email landed on ONE users row and
+        # inherited each other's profile. The user row is the tenancy/policy
+        # holder; the subject row stays the identity anchor; the email survives
+        # only as display metadata (subjects.display_name above). No email
+        # fallback lookup: re-provisioning never revisits an existing subject
+        # (audit r5 #5 — ANY prior shadow row, even revoked/expired, is
+        # TERMINAL), so pre-fix rows named by email are reachable only through
+        # their own subject's key, and re-homing a shared legacy row is a data
+        # decision, not a code one (recorded residual in the remediation
+        # report).
+        user_name = subject[:64] or display_name
         # USER ROW: REUSE BEFORE INSERT (audit F2, 2026-10-29). users carries
-        # UNIQUE (tenant_id, name) and a blind INSERT hit it on the SECOND
-        # provisioning of the same human — at F2 time the post-revoke
-        # re-provision (audit r5 #5 has since made a refused row TERMINAL,
-        # so that trigger is gone) and still today two subjects sharing an
-        # email (display_name) or a retried provision after a partial
-        # failure. The unique violation raised, the best-effort handler
+        # UNIQUE (tenant_id, name) and a blind INSERT hit it on a retried
+        # provision after a partial failure (at F2 time also the post-revoke
+        # re-provision, which audit r5 #5 has since made TERMINAL — and
+        # subject-keyed names above no longer collide across subjects sharing
+        # an email). The unique violation raised, the best-effort handler
         # below swallowed it into None, and that subject 401'd FOREVER on
         # valid tokens. The user row is the
         # tenancy/policy holder, NOT an identity assertion — the subject row
@@ -925,13 +950,13 @@ async def _provision_shadow_key(subject: str, claims: TokenClaims | None) -> Key
         user_row = await db.fetchrow(
             "SELECT id FROM users WHERE tenant_id = $1 AND name = $2",
             tenant_id,
-            display_name,
+            user_name,
         )
         if user_row is None:
             user_row = await db.fetchrow(
                 "INSERT INTO users (tenant_id, name) VALUES ($1, $2) RETURNING id",
                 tenant_id,
-                display_name,
+                user_name,
             )
         if user_row is None:  # pragma: no cover - RETURNING always yields a row
             return None

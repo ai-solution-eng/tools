@@ -93,24 +93,41 @@ async def load_grants(key_id: UUID) -> set[tuple[str, str]]:
     return (profile_pairs - key_denies) | grants
 
 
+# Last-known-good deny snapshot per key (audit 2026-11-10 P2-11). load_denies
+# used to fail OPEN on a DB fault — it returned an EMPTY set, i.e. "this key
+# has no denies" — so a blip re-opened every tool the key had explicitly
+# disabled, while every sibling ACL predicate in this module fails closed. The
+# posture now: a fault serves the key's LAST KNOWN snapshot (the denies it had
+# on the last successful read); with NO snapshot the fault PROPAGATES so the
+# caller refuses the request instead of silently un-denying. The snapshot is a
+# fallback, never the primary — every successful read replaces it, so a new
+# deny row takes effect on the next call that reads successfully. (A deny
+# written JUST BEFORE a fault is therefore not enforced during that fault: the
+# stale snapshot is served until the first successful read after it — the
+# documented price of not failing open in the other direction.)
+_DENY_SNAPSHOT_MAX_KEYS = 4096
+_deny_snapshots: dict[UUID, set[tuple[str, str]]] = {}
+
+
 async def load_denies(key_id: UUID) -> set[tuple[str, str]]:
     """Denied (server, tool) pairs for one key: the key's allowed=FALSE
     mcp_tool_acls rows, verbatim.
 
-    The subtract side of the relay scope-merge (routes_proxy): under the
-    DEFAULT tool_relay_grant_mode="scope" the merge re-adds the whole
+    The subtract side of the relay scope-merge (routes_proxy): under
+    tool_relay_grant_mode="scope" the merge re-adds the whole
     policy-admitted catalog AFTER the grant filter, so a documented deny
     row is the ONLY thing that can hold a pair back — without this read
-    the console's "disable" for an mcp-scoped key is a silent no-op.
-    Under live grants load_grants already folds the same rows in as
-    profile exceptions; this read is for the scope path, where FALSE rows
-    are load-bearing policy rather than bookkeeping.
+    the console's "disable" for an mcp-scoped key is a silent no-op. (The
+    DEFAULT mode is "explicit" — config.tool_relay_grant_mode — under which
+    the grant set alone already bounds what is callable; scope mode is the
+    legacy opt-in that needs this subtract.) Under live grants load_grants
+    already folds the same rows in as profile exceptions; this read is for
+    the scope path, where FALSE rows are load-bearing policy rather than
+    bookkeeping.
 
-    Error-isolation mirrors load_grants: the ACL gate must never 500
-    because of this layer — any fault here degrades to "no denies"
-    (fail-OPEN for visibility, the same posture as the live-profile
-    guard: the relay still grants nothing the key lacks a TRUE row or
-    scope for).
+    Error posture (audit 2026-11-10 P2-11): FAIL CLOSED, unlike the old
+    "degrade to no denies". A fault serves the key's last known snapshot;
+    with no snapshot it propagates so the caller refuses the request.
     """
     try:
         rows = await db.fetch(
@@ -118,9 +135,27 @@ async def load_denies(key_id: UUID) -> set[tuple[str, str]]:
             key_id,
         )
     except Exception:
-        log.exception("federation: deny-rows lookup failed (key %s) — treating as no denies", key_id)
-        return set()
-    return {(row["server"], row["tool"]) for row in rows}
+        snapshot = _deny_snapshots.get(key_id)
+        if snapshot is None:
+            log.exception(
+                "federation: deny-rows lookup failed (key %s) and no snapshot is on file — propagating (fail closed)",
+                key_id,
+            )
+            raise
+        log.exception(
+            "federation: deny-rows lookup failed (key %s) — serving the last known deny snapshot (%d pairs)",
+            key_id,
+            len(snapshot),
+        )
+        return set(snapshot)
+    denies = {(row["server"], row["tool"]) for row in rows}
+    if len(_deny_snapshots) >= _DENY_SNAPSHOT_MAX_KEYS and key_id not in _deny_snapshots:
+        # Bounded: this map is per-key derived state, not a tenant registry.
+        # Dropping it wholesale only costs the FALLBACK (a fault then
+        # propagates = fail closed), never the primary read.
+        _deny_snapshots.clear()
+    _deny_snapshots[key_id] = denies
+    return set(denies)
 
 
 async def load_live_profile_grants(key_id: UUID) -> tuple[set[tuple[str, str]], set[tuple[str, str]]] | None:
@@ -484,11 +519,15 @@ def preset_pairs(
     tool) catalog: the catalog pairs whose server carries one of the
     preset's classes, with two corrective rules applied AFTER the class
     match so the taxonomy's edge cannot leak:
-      1. an admin_* tool never enters a NON-admin preset (a read-class
+      1. an admin-ONLY tool never enters a NON-admin preset (a read-class
          server that also carries admin verbs — sqlhandler — must not hand
          them to an observe key via a stamp);
-      2. an admin preset admits ONLY admin_* verbs (never the plain read
+      2. an admin preset admits ONLY admin-only verbs (never the plain read
          tools of the admin-class server);
+    Both admin rules go through is_admin_only_tool — the SAME case-insensitive
+    predicate the call-time gate uses (audit P3: the prefix test here was
+    case-sensitive, so a tool named "Admin_Grants" joined an observe stamp
+    while admin_tool_refusal would have refused it).
       3. a WRITE verb (is_write_tool) never enters a preset that does not
          admit the mutate class — class is not proof of read-only-ness, the
          tool name is (wave-1 review P1-2: the observe stamp previously
@@ -504,9 +543,10 @@ def preset_pairs(
     out: set[tuple[str, str]] = set()
     for server, tool in catalog:
         if MCP_SERVER_CLASSES.get(server, frozenset()) & classes:
-            if "admin" not in classes and tool.startswith(MCP_ADMIN_ONLY_TOOL_PREFIXES):
+            admin_only = is_admin_only_tool(server, tool)
+            if "admin" not in classes and admin_only:
                 continue  # rule 1: admin verbs stay out of every non-admin stamp
-            if "admin" in classes and not tool.startswith(MCP_ADMIN_ONLY_TOOL_PREFIXES):
+            if "admin" in classes and not admin_only:
                 continue  # rule 2: the admin stamp is admin verbs ONLY
             if "mutate" not in classes and is_write_tool(tool) and (server, tool) not in READ_ONLY_RUN_TOOLS:
                 # rule 3: a non-mutate stamp never carries a write verb —

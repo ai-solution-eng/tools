@@ -202,14 +202,21 @@ async def due_conversations(limit: int = 20) -> list[dict[str, Any]]:
               ON cred.key_id = k.id AND cred.server_name = $1
             LEFT JOIN conversation_distills d ON d.conversation_id = c.id
             WHERE c.updated_at < now() - make_interval(mins => $2)
-              AND (d.conversation_id IS NULL OR (
-                    SELECT count(*) FROM conversation_messages m2
-                    WHERE m2.conversation_id = c.id) > d.distilled_seq)
               AND (d.gate_failed_at IS NULL
                    OR d.gate_failed_at < now() - make_interval(secs => $4))
               AND (d.conversation_id IS NULL OR d.lease_until IS NULL
                    OR d.lease_until < now())
-            GROUP BY c.id, k.id, c.title, d.gate_failed_at
+            GROUP BY c.id, k.id, c.title, d.gate_failed_at, d.distilled_seq
+            -- CONTINUED-SINCE predicate in HAVING (audit 2026-11-10 P3): this
+            -- used to re-count the conversation's messages in a correlated
+            -- subquery, a SECOND scan of conversation_messages per candidate
+            -- row — while the outer aggregate below already counts exactly
+            -- those rows (one m row per message: the lateral key join yields
+            -- one row and mcp_server_creds is unique per (key, server)).
+            -- distilled_seq is NOT NULL, so NULL here means "never distilled",
+            -- which is the d.conversation_id IS NULL case the old predicate
+            -- spelled out.
+            HAVING d.distilled_seq IS NULL OR count(m.id) > d.distilled_seq
             ORDER BY c.updated_at ASC
             LIMIT $3
             """,

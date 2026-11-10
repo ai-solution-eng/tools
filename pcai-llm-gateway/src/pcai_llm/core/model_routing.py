@@ -898,12 +898,26 @@ async def resolve_routed_model(
         cheap_first = expand_candidates(list(reversed(order)), routable_models, available)
         # PER-KEY EXTRA TARGETS (2026-11-08): AGENTS are hard models but they
         # are PER-KEY (the profile's agent menu), so they cannot live in the
-        # global allowlist. They join at the CHEAP end so they fall inside the
-        # floor..ceiling window the decision model is offered; an undeclared
-        # capability must not outrank a ladder the operator signed off.
+        # global allowlist. They join at the CHEAP end OF THE ALLOWED WINDOW so
+        # they fall inside the floor..ceiling window the decision model is
+        # offered; an undeclared capability must not outrank a ladder the
+        # operator signed off.
+        #
+        # INSERTION POINT (audit P2-15): "the cheap end" is NOT index 0 once a
+        # floor is configured. pick_serving_model and _window both derive
+        # floor_pos from the FLOOR MODEL's index, so a prepend pushed the floor
+        # up by len(extras) and left every extra BELOW it — with a floor set,
+        # the per-key agents were unreachable by BOTH channels (the heuristic's
+        # walk and the decision window), the opposite of this comment. The
+        # extras therefore go immediately AFTER the floor rung, which keeps the
+        # floor at its own index and puts them at the cheap end of the window.
+        # With no usable floor the old prepend is unchanged (floor_pos is 0
+        # there, i.e. the whole ladder is the window).
         if extra_candidates:
             _extras = [m for m in extra_candidates if m not in cheap_first and (available is None or available(m))]
-            cheap_first = [*_extras, *cheap_first]
+            if _extras:
+                _at = cheap_first.index(min_model) + 1 if min_model and min_model in cheap_first else 0
+                cheap_first = [*cheap_first[:_at], *_extras, *cheap_first[_at:]]
         # R2 (audit 2026-10-29): BOTH ceiling forms go through the operator
         # allowlist. The named form already checked allowed_models above, but
         # the BARE form used to take order[0] raw — so bare `routing` under an
@@ -1302,7 +1316,7 @@ def route_header(route: RouteDecision | None, actual_model: str = "") -> str | N
 
     Shapes (precedent: X-PCAI-Billing — the response announces the billing/
     routing state in effect for THIS response):
-      shadow ceiling=<c> would=<w> reason=<r>
+      shadow ceiling=<c> would=<w> reason=<r>   (would="-" = the router made no pick)
       active ceiling=<c> served=<s> reason=<r>
       off                                  (opted-in profile, routing switched off:
                                             settings.routing_enabled or the panel's
@@ -1316,5 +1330,10 @@ def route_header(route: RouteDecision | None, actual_model: str = "") -> str | N
     if not route.engaged:
         return "off"
     if route.policy == "shadow":
-        return f"shadow ceiling={route.ceiling} would={route.would or actual_model} reason={route.reason}"
+        # would='' is the DOCUMENTED honest "no pick" (the all-unavailable
+        # sentinel sets it deliberately — see the shadow branch of
+        # resolve_routed_model). Falling back to actual_model announced a model
+        # the router never chose as a would-serve, i.e. a shadow claim that was
+        # never made (audit 2026-11-10 P3). "-" says "no pick" out loud.
+        return f"shadow ceiling={route.ceiling} would={route.would or '-'} reason={route.reason}"
     return f"active ceiling={route.ceiling} served={actual_model or route.served} reason={route.reason}"

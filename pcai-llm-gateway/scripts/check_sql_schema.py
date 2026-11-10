@@ -40,11 +40,49 @@ SCHEMA_FILE = SRC / "db" / "schema.py"
 
 # SQL keywords that must never be mistaken for a table alias.
 _NON_ALIAS = {
-    "on", "where", "and", "or", "set", "values", "select", "from", "join",
-    "left", "right", "inner", "outer", "full", "cross", "group", "order",
-    "limit", "offset", "returning", "conflict", "do", "update", "as", "using",
-    "union", "having", "into", "delete", "insert", "with", "case", "when",
-    "then", "else", "end", "not", "null", "is", "in", "exists", "for", "by",
+    "on",
+    "where",
+    "and",
+    "or",
+    "set",
+    "values",
+    "select",
+    "from",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "outer",
+    "full",
+    "cross",
+    "group",
+    "order",
+    "limit",
+    "offset",
+    "returning",
+    "conflict",
+    "do",
+    "update",
+    "as",
+    "using",
+    "union",
+    "having",
+    "into",
+    "delete",
+    "insert",
+    "with",
+    "case",
+    "when",
+    "then",
+    "else",
+    "end",
+    "not",
+    "null",
+    "is",
+    "in",
+    "exists",
+    "for",
+    "by",
 }
 
 
@@ -77,9 +115,7 @@ def sql_literals(path: Path) -> list[tuple[int, str]]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             s = node.value
         elif isinstance(node, ast.JoinedStr):  # f-string: keep the literal parts
-            s = "".join(
-                v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str)
-            )
+            s = "".join(v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
         else:
             continue
         if re.search(r"\b(SELECT|INSERT INTO|UPDATE|DELETE FROM)\b", s, re.IGNORECASE):
@@ -164,9 +200,7 @@ def check_inserts(sql: str, tables: dict[str, set[str]]) -> list[str]:
         col_list = [c.strip() for c in cols.split(",") if c.strip()]
         n_cols, n_vals = len(col_list), len([v for v in vals.split(",") if v.strip()])
         if n_cols != n_vals:
-            problems.append(
-                f"INSERT INTO {table} names {n_cols} column(s) but supplies {n_vals} expression(s)"
-            )
+            problems.append(f"INSERT INTO {table} names {n_cols} column(s) but supplies {n_vals} expression(s)")
         # EXISTENCE: a column the schema never creates is fatal at runtime even
         # when the arity happens to match.
         if table in tables:
@@ -175,9 +209,7 @@ def check_inserts(sql: str, tables: dict[str, set[str]]) -> list[str]:
                 if not re.fullmatch(r"[a-z_][a-z0-9_]*", name, re.IGNORECASE):
                     continue
                 if name not in tables[table]:
-                    problems.append(
-                        f"INSERT INTO {table} names column '{name}' which SCHEMA_SQL never creates"
-                    )
+                    problems.append(f"INSERT INTO {table} names column '{name}' which SCHEMA_SQL never creates")
     return problems
 
 
@@ -212,10 +244,12 @@ def check_unaliased_columns(sql: str, tables: dict[str, set[str]]) -> list[str]:
             continue
         # only flag tokens that sit in a column-ish position (after SELECT/WHERE/
         # AND/OR/comma or before = / < / >), so aliases and CTE names are safe
-        if re.search(r"(?:SELECT|WHERE|AND|OR|SET|BY|,|\()\s*" + re.escape(tok) + r"\s*(?:,|=|<|>|\bIS\b|\bAS\b|\)|$)", scrubbed, re.IGNORECASE):
-            problems.append(
-                f"statement on '{table}' references column '{tok}' which SCHEMA_SQL never creates"
-            )
+        if re.search(
+            r"(?:SELECT|WHERE|AND|OR|SET|BY|,|\()\s*" + re.escape(tok) + r"\s*(?:,|=|<|>|\bIS\b|\bAS\b|\)|$)",
+            scrubbed,
+            re.IGNORECASE,
+        ):
+            problems.append(f"statement on '{table}' references column '{tok}' which SCHEMA_SQL never creates")
     return problems
 
 
@@ -224,23 +258,109 @@ _INVALID_FN = {"infinity": "'-infinity'::timestamptz (infinity is a literal, not
 
 # SQL keywords that must never be mistaken for a column name.
 _SQL_KEYWORDS = {
-    "select", "from", "where", "and", "or", "not", "null", "is", "in", "as",
-    "join", "left", "right", "inner", "outer", "full", "cross", "on", "using",
-    "group", "order", "by", "limit", "offset", "having", "union", "all",
-    "insert", "into", "values", "update", "set", "delete", "returning",
-    "conflict", "do", "nothing", "case", "when", "then", "else", "end", "asc",
-    "desc", "distinct", "exists", "between", "like", "ilike", "interval",
-    "cast", "true", "false", "with", "unnest", "array", "any", "some", "each",
-    "count", "sum", "max", "min", "avg", "coalesce", "greatest", "least",
+    "select",
+    "from",
+    "where",
+    "and",
+    "or",
+    "not",
+    "null",
+    "is",
+    "in",
+    "as",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "outer",
+    "full",
+    "cross",
+    "on",
+    "using",
+    "group",
+    "order",
+    "by",
+    "limit",
+    "offset",
+    "having",
+    "union",
+    "all",
+    "insert",
+    "into",
+    "values",
+    "update",
+    "set",
+    "delete",
+    "returning",
+    "conflict",
+    "do",
+    "nothing",
+    "case",
+    "when",
+    "then",
+    "else",
+    "end",
+    "asc",
+    "desc",
+    "distinct",
+    "exists",
+    "between",
+    "like",
+    "ilike",
+    "interval",
+    "cast",
+    "true",
+    "false",
+    "with",
+    "unnest",
+    "array",
+    "any",
+    "some",
+    "each",
+    "count",
+    "sum",
+    "max",
+    "min",
+    "avg",
+    "coalesce",
+    "greatest",
+    "least",
 }
 
 # Built-in SQL functions/constructs (never columns).
 _SQL_FUNCS = {
-    "now", "make_interval", "interval", "coalesce", "greatest", "least",
-    "count", "sum", "max", "min", "avg", "lower", "upper", "length", "trim",
-    "date_trunc", "extract", "to_char", "lpad", "rpad", "concat", "nullif",
-    "abs", "round", "floor", "ceil", "jsonb_build_object", "to_jsonb",
-    "jsonb_array_elements", "generate_series", "unnest", "array_agg",
+    "now",
+    "make_interval",
+    "interval",
+    "coalesce",
+    "greatest",
+    "least",
+    "count",
+    "sum",
+    "max",
+    "min",
+    "avg",
+    "lower",
+    "upper",
+    "length",
+    "trim",
+    "date_trunc",
+    "extract",
+    "to_char",
+    "lpad",
+    "rpad",
+    "concat",
+    "nullif",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "jsonb_build_object",
+    "to_jsonb",
+    "jsonb_array_elements",
+    "generate_series",
+    "unnest",
+    "array_agg",
 }
 
 

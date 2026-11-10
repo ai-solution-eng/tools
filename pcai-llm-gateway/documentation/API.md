@@ -537,11 +537,30 @@ way. Model resolution: the JSON `model` field for speech; for transcriptions
 request naming none is a **400**. The pool must be `voice`-typed (**400**
 otherwise) and the key's `allowed_models` still applies.
 
-Audio endpoints report no token usage, so each call settles ONE ledger row
-with an ESTIMATE (a zero-token row would be a budget bypass): TTS =
-`len(input) // audio_tts_chars_per_token`, ASR = audio duration at ~32 kB/s
-× `audio_asr_tokens_per_second`, floored at one second. The row carries
-`endpoint = audio.speech` / `audio.transcriptions`.
+Audio endpoints report no token usage, so each call settles ONE ledger row.
+Since 2026-11-10 the row prefers a REAL measured quantity and falls back to
+an estimate, recording which it used in `unit_kind`:
+
+| | measured (preferred) | fallback |
+|---|---|---|
+| TTS | duration from the upstream response (`X-Audio-Duration`, or a sample-count/sample-rate pair) → `unit_kind='second'` | `len(input) // audio_tts_chars_per_token` → `'char_estimate'` |
+| ASR | duration, in this precedence: `?duration=` (seconds) > `X-PCAI-Duration` > the upstream response header → `'second'` | `audio_bytes / audio_asr_bytes_per_second` (default 32000, i.e. raw 16 kHz 16-bit mono) → `'second_estimate'` |
+
+**`?duration=` / `X-PCAI-Duration`** let an ASR client state the clip length
+in seconds when the upstream does not report it. The hint is **bounded
+against the byte-proxy estimate** (audio is never more than ~16× smaller than
+raw PCM, nor larger) and a clamped hint is logged; an unbounded hint would
+let a caller zero its own bill with `?duration=0.001` or write a four-figure
+row with `?duration=99999999`. A junk hint (non-finite, ≤ 0) is ignored, not
+a 400. **Compressed uploads (mp3/m4a/opus) are 2-8× smaller than raw PCM, so
+without a hint the byte proxy UNDER-bills them — send the hint.**
+
+Pricing follows `model_costs.unit`: a voice model priced `unit='second'`
+bills `billable_units` seconds at the per-1M-second rate. If the model is
+priced `token` (the legacy default) the row keeps the legacy token
+arithmetic and is merely tagged, so upgrading the gateway never changes an
+existing site's bill. The row carries `endpoint = audio.speech` /
+`audio.transcriptions`.
 
 ### 2.9 `POST /v1/rerank` — rerankers behind the key
 
@@ -697,8 +716,9 @@ All routes AdminDep-gated.
 
 | Method | Path | Body / notes | Response |
 |---|---|---|---|
-| POST | `/admin/costs` | `{model_name, input_per_m, output_per_m, cached_per_m}` (USD per 1M tokens) | `{model_name, priced: true}` |
-| GET | `/admin/costs` | — | all configured prices |
+| POST | `/admin/costs` | `{model_name, input_per_m, output_per_m, cached_per_m, unit?}` — USD per 1M **units**, where `unit` defaults to `token` and may be `token\|char\|second\|image\|request` (out-of-vocabulary is a 422). A voice model billed by duration is `unit: "second"`. | `{model_name, priced: true}` |
+| GET | `/admin/costs` | — | `{costs: [...all configured prices...], unpriced: [model names with NO price row], unit_mismatch: [...]}` — an OBJECT since 2026-11-10 (it was a bare array; the console accepts both shapes during a rolling upgrade). `unpriced` is the spend-control warning: a model with no `model_costs` row ledgers `cost_usd` NULL, and `SUM(cost_usd * billing_fraction)` ignores NULL — so an unpriced model consumes ZERO of every USD budget. `unit_mismatch` is empty until the unit column exists (see below). |
+| — | `model_costs.unit` | `token\|char\|second\|image\|request` (default `token`) | **Landed 2026-11-10.** `input_per_m`/`output_per_m`/cached_per_m read as USD per 1M **units**, so a TTS model priced per second is `unit='second'`. `token` keeps the legacy per-1M-token arithmetic byte-identical, so every existing row is unaffected. A row whose `unit` does not match the unit its route bills ledgers `cost_usd` **NULL** and is reported (never billed at the wrong rate). `usage_ledger.billable_units`/`unit_kind` record the measured quantity and its provenance (`second`, `char_estimate`, `second_estimate`, `token_estimate`). The routing/decision model now settles its own row with `status='routing'` — priced and visible in chargeback, but deliberately **outside** every token/completion budget SUM. |
 | DELETE | `/admin/costs/{model_name}` | — | `{deleted: bool}` (404 when not priced) — removes the price row; ledger history stays put (costs were computed AND stored per row at request time; removal affects future requests only, which ledger NULL = unpriced). `{model_name:path}` carries slash-containing names ("Qwen/Qwen3.8-27B-FP8") |
 | POST | `/admin/profiles` | `{name, model_order?, budgets? [{model, period, limit_tokens\|limit_usd}], mcp_grants? [{server, tool}], offpeak_fraction? (0–1, null = inherit), routing_policy? (off\|shadow\|active, default off — anything else 422), routing_min_model? (default "" = no downgrade; must be "" or name a model IN `model_order`, else 400), memory? ({provision: bool} — the enrollment-memory preset; null = undeclared), agents? ([agent names] — THREE-STATE: omitted = leave the selection untouched, [] = clear, [names] = replace; an unknown name is a 400)}` — upsert by name, and a **MERGE**: a field the caller OMITS keeps its stored value (this used to rebuild every preset from the body, so a partial POST silently wiped the model order, budgets and grants). Sending an explicit `[]` or `null` still REPLACES or CLEARS that field, and unknown keys already in `defaults_json` survive; each `budgets` entry carries exactly ONE limit kind (`limit_tokens` = token budget → `budgets`, `limit_usd` = dollar budget → `cost_budgets`), period `day\|week\|month`, positive | profile incl. expanded presets (both budget kinds round-trip) + both routing fields + the memory preset |
 | GET | `/admin/profiles` | — | all profiles (cascade + presets + fraction + `routing_policy`/`routing_min_model`); `budgets` round-trips both limit kinds (`limit_tokens` and `limit_usd`) exactly as POST accepted them |

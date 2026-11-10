@@ -27,6 +27,12 @@ log = logging.getLogger(__name__)
 
 _fernet = None
 _warned = False
+_undecryptable_logged = False
+"""Once-per-process stamp (audit P3, 2026-11-10): decrypt() used to log ERROR
+on EVERY failed call, so one undecryptable endpoint swept every 30 s produced
+one ERROR per sweep for the life of the deployment — the spam
+upstream_auth(quiet=True) was written to prevent. The first failure logs
+ERROR; the rest log at DEBUG."""
 
 
 def _get():
@@ -60,15 +66,25 @@ def encrypt(plaintext: str) -> str:
     return f.encrypt(plaintext.encode()).decode()
 
 
-def decrypt(token: str) -> str | None:
+def decrypt(token: str, *, quiet: bool = False) -> str | None:
     """Decrypt a stored credential; None on any failure (missing master key,
     wrong key after rotation, corrupt row). Callers degrade to unauthenticated
-    — the upstream 401 keeps the failure visible."""
+    — the upstream 401 keeps the failure visible.
+
+    `quiet=True` (audit P3, 2026-11-10) suppresses even the once-per-process
+    ERROR — for background sweepers (core.health_probe) that retry every 30 s
+    and whose CALLER already gates its own diagnostics. Otherwise the failure
+    logs ERROR exactly ONCE per process, then at DEBUG."""
+    global _undecryptable_logged
     f = _get()
     if f is None:
         return None
     try:
         return f.decrypt(token.encode()).decode()
     except Exception:
-        log.error("stored credential undecryptable (master key rotated?) — re-save it from the admin panel")
+        if quiet or _undecryptable_logged:
+            log.debug("stored credential undecryptable (master key rotated?) — re-save it from the admin panel")
+        else:
+            _undecryptable_logged = True
+            log.error("stored credential undecryptable (master key rotated?) — re-save it from the admin panel")
         return None

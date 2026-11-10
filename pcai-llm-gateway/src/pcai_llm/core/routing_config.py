@@ -55,6 +55,7 @@ _CACHE_TTL_S = 60.0
 _cache: dict[str, Any] = {}
 _cache_at = 0.0
 
+
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "decision_model": "",
@@ -293,7 +294,21 @@ def _decode(raw: Any) -> Any:
 
 async def _config() -> dict[str, Any]:
     """The merged runtime config (DEFAULTS <- DB overrides), TTL-cached,
-    degrade-not-fail."""
+    degrade-not-fail.
+
+    DEGRADED is never CACHED as the policy (audit P2-17). The module header
+    promises a DB blip "keeps the last known policy, never resets the router to
+    defaults"; the fault path used to fall through to _cache = merged, i.e. it
+    CACHED the defaults-only merge for a full TTL — exactly the reset it
+    promised not to make. Now:
+      * warm cache -> the last known policy is returned AND _cache_at is
+        stamped, so the outage costs one DB query per TTL instead of one per
+        request (the same path used to return the cache without stamping, so
+        every get_config() retried the DB);
+      * cold cache (boot) -> there is no last known policy to protect, so the
+        defaults+env merge is returned WITHOUT being cached: the DB is retried
+        rather than the degraded policy being pinned for a TTL.
+    """
     global _cache, _cache_at
     now = time.monotonic()
     if _cache and now - _cache_at < _CACHE_TTL_S:
@@ -318,7 +333,15 @@ async def _config() -> dict[str, Any]:
     except Exception as exc:
         log.warning("routing config refresh failed (%s) - keeping last known policy", type(exc).__name__)
         if _cache:
+            # KEEP the last known policy — never the degraded merge — and
+            # stamp the refresh so an outage is one query per TTL, not one per
+            # request (audit P2-17). A successful admin write calls
+            # invalidate(), which clears the stamp and re-reads immediately.
+            _cache_at = now
             return _cache
+        # BOOT: no last known policy exists. Return the defaults+env merge
+        # WITHOUT caching it — pinning it for a TTL is the defect this fixes.
+        return merged
     _cache = merged
     _cache_at = now
     return merged

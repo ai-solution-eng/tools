@@ -120,7 +120,12 @@ def test_schema_subjects_reapply_idempotent(monkeypatch: pytest.MonkeyPatch) -> 
         line.split("--", 1)[0]
         for line in SCHEMA_SQL.split("\n")
     )
-    stmts = [s.strip() for s in no_comments.split(";") if s.strip()]
+    # DO $$ ... $$ blocks are gated INSIDE the block (their own
+    # information_schema / row probes) — a naive ";" split shreds them at
+    # their inner semicolons and miscounts. Strip them before splitting;
+    # their idempotency is pinned by tests/test_audit_20261110_ops.py.
+    no_do = re.sub(r"DO \$\$.*?\$\$;", "", no_comments, flags=re.DOTALL)
+    stmts = [s.strip() for s in no_do.split(";") if s.strip()]
     identity_stmts = [
         s for s in stmts if "subjects" in s or "idx_api_keys_subject" in s or "bound_via" in s or "bound_at" in s
     ]

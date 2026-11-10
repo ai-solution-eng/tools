@@ -160,6 +160,31 @@ _probe_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _PROBE_CACHE_MAX = 512  # monotonic-growth bound (DeepSeek-V4.1 P2): prune-to-TTL on write beyond this
 
 
+def _probe_flag(value: Any) -> bool | None:
+    """Strict boolean read for one memory-probe field.
+
+    WHY (audit 2026-11-10 P3): this probe is a FAIL-SAFE gate — its answer
+    decides whether a key is treated as memory-attached — and the old
+    adopt-whatever-JSON-came-back update let a backend that answered the
+    STRING "false" read TRUTHY (bool("false") is True), inverting "not
+    available" into "available". Plain bool() does not fix that, so: a real
+    boolean passes, a number is its zero-test, a string must be a recognisable
+    spelling, and anything else returns None — "no opinion", which leaves the
+    caller's fail-safe default in place.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off", ""):
+            return False
+    return None
+
+
 async def memory_status_for_key(key: KeyRecord, request_id: str) -> dict[str, Any]:
     """The memory-write capability probe for ONE key: call the memory
     server's probe tool (settings.distiller_memory_probe_tool, default
@@ -217,7 +242,20 @@ async def memory_status_for_key(key: KeyRecord, request_id: str) -> dict[str, An
                 break
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            out.update({k: parsed.get(k, out[k]) for k in out})
+            # TYPED ADOPTION (audit 2026-11-10 P3): a field is adopted only
+            # when it has the type the probe contract promises. The gate flags
+            # go through _probe_flag (a "false" STRING must not read truthy);
+            # the free-form fields must be strings, and an unrecognisable value
+            # keeps the fail-safe default instead of leaking into the cache.
+            for flag in ("memory_available", "writable", "unlocked"):
+                if flag in parsed:
+                    coerced = _probe_flag(parsed[flag])
+                    if coerced is not None:
+                        out[flag] = coerced
+            if "dataset" in parsed and (parsed["dataset"] is None or isinstance(parsed["dataset"], str)):
+                out["dataset"] = parsed["dataset"]
+            if isinstance(parsed.get("detail"), str):
+                out["detail"] = parsed["detail"]
     except Exception as exc:
         out["detail"] = "memory probe failed: " + type(exc).__name__
     _probe_cache[cache_key] = (

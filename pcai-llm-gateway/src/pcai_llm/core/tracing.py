@@ -1,9 +1,10 @@
-"""Dependency-free OTLP/HTTP tracing: one server span per HTTP request.
+"""Dependency-free OTLP/HTTP tracing: request, model-call and tool spans.
 
 WHY hand-rolled: the OpenTelemetry SDK is NOT a dependency of this gateway and
 must not become one (the fleet builds images without network access, and the
 SDK drags a large transitive tree for what this deployment actually needs — a
-server span per HTTP request, exported as OTLP/HTTP JSON). The wire format is
+server span per HTTP request plus generation/tool spans, exported as
+OTLP/HTTP JSON). The wire format is
 therefore built HERE, on top of the httpx2 client the gateway already ships.
 The constraints that shaped it:
 
@@ -50,6 +51,7 @@ import secrets
 import time
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlparse
 
 from ..config import settings
 
@@ -288,9 +290,7 @@ def _payload(
         "kind": _SPAN_KIND_SERVER,
         "startTimeUnixNano": str(start_ns),
         "endTimeUnixNano": str(end_ns),
-        "attributes": [
-            {"key": str(key), "value": _attr_value(value)} for key, value in attributes.items()
-        ],
+        "attributes": [{"key": str(key), "value": _attr_value(value)} for key, value in attributes.items()],
         "status": {"code": _STATUS_ERROR if error else _STATUS_OK},
     }
     if parent_span_id:
@@ -299,9 +299,7 @@ def _payload(
         "resourceSpans": [
             {
                 "resource": {
-                    "attributes": [
-                        {"key": "service.name", "value": {"stringValue": str(settings.otel_service_name)}}
-                    ]
+                    "attributes": [{"key": "service.name", "value": {"stringValue": str(settings.otel_service_name)}}]
                 },
                 "scopeSpans": [{"scope": {"name": _SCOPE_NAME}, "spans": [span]}],
             }
@@ -395,7 +393,16 @@ async def _export(payload: dict[str, Any]) -> None:
             timeout=_HTTP_TIMEOUT_S,
         )
     except Exception:
-        log.debug("tracing: OTLP export to %s failed", url, exc_info=True)
+        # host:port, never the resolved URL (audit P3, 2026-11-10): an
+        # otel_endpoint can embed basic-auth credentials
+        # (http://user:secret@collector:4318) and a log line must never
+        # carry them. urlparse().netloc still CONTAINS the userinfo, so the
+        # hostname is re-derived from the parsed parts.
+        parsed = urlparse(url)
+        safe_host = parsed.hostname or ""
+        if parsed.port:
+            safe_host = f"{safe_host}:{parsed.port}"
+        log.debug("tracing: OTLP export to %s failed", safe_host, exc_info=True)
 
 
 async def flush(timeout: float = _HTTP_TIMEOUT_S + 1.0) -> None:

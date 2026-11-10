@@ -5,7 +5,94 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
-## Unreleased
+## 4.0.0 — 2026-11-10
+
+- **Audit 2026-11-10 remediation wave: 8 P1, 36 P2, 47 P3 closed, plus a
+  unit-aware pricing model.** Full evidence in
+  [Audits/AUDIT-2026-11-10.md](Audits/AUDIT-2026-11-10.md) and
+  [Audits/REMEDIATION-2026-11-10.md](Audits/REMEDIATION-2026-11-10.md).
+  Nine model-pinned implementers on disjoint zones, then **two
+  direction-matched cross-validation waves that found 13 further defects in
+  already-green code — 8 of them P1, and several inside the fixes themselves.**
+  That second finding is the important one: every schema and SQL defect in
+  this release was invisible to a suite that pins DDL by substring and runs
+  routes against DB fakes.
+
+  **P1, each reproduced before being fixed:**
+  * `GET /admin/usage` returned 500 for `group_by=key|tenant|day|subject` —
+    the SELECT list and `GROUP BY` shared one string, and PostgreSQL's
+    `group_by_item` accepts only `a_expr` (`AS` is legal only in a target
+    list). The same bug shipped in the team-leader rollup.
+  * The per-key concurrency slot leaked on the plain streaming path: the
+    dispatch sat outside the `except BaseException` that releases it, so a
+    client disconnect during the TTFT peek 429-bricked the key until restart.
+    Now an idempotent once-wrapper plus a response-layer backstop.
+  * The relay re-picked a breaker-cooled endpoint (`pick() or endpoints[0]`),
+    so a tripped breaker bought nothing on the dominant agent path.
+  * The TPM cache refund was unbounded by the request's own admission charge,
+    draining the minute window to zero and switching TPM off for the rest of
+    the minute. Now clamped cumulatively — the relay settles once per
+    iteration under one `request_id`, and the first fix was defeated by
+    exactly that (measured 129x over-refund before the second pass).
+  * `gateway_mcp_calls_total{server}` carried the **caller's** string on the
+    unknown-server and ACL-denied paths — an unbounded Prometheus cardinality
+    bomb, while the metric's own comment claimed the label was
+    registry-bounded. Now a fixed `unknown` bucket.
+  * The credit-card PII mask missed dot/NBSP/zero-width-separated PANs; the
+    first fix then masked at *cleaned* offsets against the *original* string,
+    leaking the entire PAN while reporting "masked".
+  * `conversations.key_group SET NOT NULL` had no DEFAULT, so a row inserted
+    between the backfill and the ALTER (a rolling-upgrade pod) aborted the
+    whole implicit schema transaction — a boot crash-loop, re-armed per pod.
+  * The exec-argument destination scan was fail-open: ~96 characters of
+    padding pushed the metadata URL past a 64-token slice, and
+    percent-encoded hosts were never decoded.
+
+- **Unit-aware pricing (the audit's §7 finding).** `model_costs.unit`
+  (`token|char|second|image|request`, default `token`) plus
+  `usage_ledger.billable_units`/`unit_kind`. A voice model priced per
+  SECOND now bills measured audio duration instead of a token estimate —
+  ASR prefers `?duration=` > `X-PCAI-Duration` > the upstream's reported
+  duration, clamped into a documented compression envelope; TTS uses the
+  upstream's duration when present. `token` keeps the legacy per-1M-token
+  arithmetic byte-identically, so upgrading never changes an existing site's
+  bill. The routing/decision model now settles its own rows
+  (`status='routing'`, gated by `routing_charge_enabled`) — priced and
+  visible in chargeback, deliberately outside every budget SUM.
+
+- **`tests/test_postgres_schema.py` — the missing real-Postgres layer.**
+  Starts a throwaway cluster and asserts schema idempotency (three applies), a
+  stale out-of-vocabulary row not aborting the boot, and that **every
+  `group_by` mode's generated SQL actually prepares**. On its first run it
+  caught a live regression the green suite could not see: a dropped comma had
+  re-broken the very endpoint the P1 above had just repaired.
+
+- **Breaking changes (why this is 4.0.0):**
+  * `GET /admin/costs` returns an **object** `{costs, unpriced,
+    unit_mismatch}`, not a bare array. The console accepts both shapes during
+    a rolling upgrade; API clients must read `.costs`.
+  * `usage_ledger` gains `billable_units`/`unit_kind`; `model_costs` gains
+    `unit`. Both additive with defaults, so existing rows are unaffected.
+  * The SSO mint/rotate audit action is `enroll.sso_mint` (was a reuse of
+    `enroll.redeem`), so an action-string query over the trail separates the
+    two event classes.
+  * `X-PCAI-Session` is validated (≤128 chars, `[A-Za-z0-9._:-]`) and stored
+    **hashed**; an invalid value is dropped, never refused.
+  * The console CSP defaults to `frame-ancestors 'self'`; sites that embed
+    the consoles must list their origins via `cspFrameAncestors`.
+
+- **OTLP/Langfuse spans for model and tool calls (2026-11-10).** Tracing now
+  emits a `generation` span per real model call on all three paths (plain
+  proxy, streamed proxy, tool relay) and a `span` per executed MCP tool call,
+  nested under the model call that requested it; numeric attributes ride as
+  OTLP `intValue`/`doubleValue` so Langfuse reads token counts as usage
+  instead of metadata. Conversation grouping uses `langfuse.session.id` (the
+  gateway's own thread fingerprint — no client change needed), and the new
+  `settings.otelHeaders` / `PCAI_LLM_OTEL_HEADERS` knob (comma-separated
+  `Key=Value` pairs) supplies exporter auth, e.g. Langfuse's
+  `Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4`.
+  Metadata only — prompts, completions, tool arguments and results are never
+  exported; tracing stays off by default. Upstream: `ai-solution-eng/tools@280f5ce`.
 
 - **Edit key applies a profile's budgets + grants (2026-11-09).** The
   console's Edit-key dialog now carries a Profile picker and an "apply this

@@ -232,8 +232,12 @@ async def write_memory(
         except Exception as exc:
             log.warning("memory fallback write failed (key=%s)", key_id, exc_info=True)
             detail = detail + "; fallback failed: " + type(exc).__name__
-    _verdict(VERDICT_WRITTEN if ok else VERDICT_FAILED)
-    return ok, detail
+    # `ok` is ALWAYS False here: the success arm returned above, and the except
+    # arm set it. The old `VERDICT_WRITTEN if ok else VERDICT_FAILED` read as if
+    # a write that fell through could still be reported WRITTEN — a dead branch
+    # that invited exactly that misreading (audit 2026-11-10 P3).
+    _verdict(VERDICT_FAILED)
+    return False, detail
 
 
 async def _near_duplicate_verdict(

@@ -641,7 +641,16 @@ token, even in-cluster. Three modes, first hit wins:
    `pcai-llm-gateway-secrets`, key `master-key` — create it:
    `kubectl -n <namespace> create secret generic pcai-llm-gateway-secrets --from-literal=master-key="$(openssl rand -hex 32)"`).
    Rotation = paste the new key + Save — **no pod restart**. Per-endpoint
-   keys are the normal case: every model can have its own. The same panel
+   keys are the normal case: every model can have its own.
+
+   **Rotating the MASTER key also invalidates the audit-chain tail anchors.**
+   The chains themselves stay valid (their hashes are keyless), but each
+   trail's HMAC anchor is keyed from the master key, so after a rotation
+   `GET /admin/audit/chain` reports `anchor_status: "no-master-key"` /
+   `"unanchored"` until the next chained write re-anchors it (bounded by the
+   60 s anchor-refresh interval). Treat "unanchored" as *not verified* rather
+   than as a failure — a genuinely tampered chain reports
+   `anchor-mismatch`/`anchor-invalid`, which the console renders in red. The same panel
    path stores per-KEY MCP header overrides (Admin ▸ Keys ▸ `creds`) —
    e.g. the memory-MCP `X-API-Key` that gives each tenant its own identity
    (the legacy `X-Memory-Dataset` / `X-Dataset-Password` pair also works).

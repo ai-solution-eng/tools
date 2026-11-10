@@ -193,7 +193,14 @@ if _REAL:
     #   model  - bounded by the endpoint registry; "" normalises to
     #            "unattributed" (the relay path settles with model="*" today -
     #            see the P1-1 note in routes_proxy).
-    #   server - bounded by the MCP registry.
+    #   server - bounded ONLY BY THE CALLER'S DISCIPLINE, not by anything
+    #            this counter does: each call site must pass a
+    #            registry-resolved server name (or the fixed "unknown"
+    #            bucket), never a caller-supplied string — an unverified
+    #            argument here is an unbounded label cardinality bomb
+    #            (audit P1-5, 2026-11-10; the old "bounded by the MCP
+    #            registry" comment described the registry, not the call
+    #            sites).
     # Per-KEY attribution stays in usage_ledger / mcp_call_audit, which are
     # access-controlled and now hash-chained.
     MCP_CALLS = Counter(
@@ -240,6 +247,17 @@ if _REAL:
         "reported separately so refunds + discards reconcile against the "
         "ledger cached_tokens column.",
         ["outcome"],  # refunded | discarded
+    )
+    # URL-guard resolver saturation (cross-validation 2026-11-10): the SSRF
+    # destination check resolves model-supplied hostnames through a bounded
+    # pool of per-call daemon threads (core.url_guard); exhaustion is a
+    # DISTINCT fail-closed outcome (ResolverSaturated) that a log line alone
+    # does not put on a dashboard. NO labels on purpose: saturation is a
+    # POD-level condition, not a per-server/tool/key one.
+    URL_GUARD_RESOLVER_SATURATED = Counter(
+        "gateway_url_guard_resolver_saturated_total",
+        "Destination checks refused fail-closed because the bounded DNS "
+        "resolver pool was saturated (core.url_guard.ResolverSaturated).",
     )
     # --- session-memory distiller (2026-10-14) -----------------------------
     # Added after a TOTAL feed outage that nothing could detect: the sweep
@@ -393,6 +411,7 @@ else:
     UPSTREAM_AUTH_DEGRADED: Any = _NoopMetric()  # type: ignore[no-redef]
     CASCADE_HEAD_PICKS: Any = _NoopMetric()  # type: ignore[no-redef]
     TPM_CACHE_REFUND: Any = _NoopMetric()  # type: ignore[no-redef]
+    URL_GUARD_RESOLVER_SATURATED: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_DUE_ROWS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_LAST_WRITE_TS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_WRITES: Any = _NoopMetric()  # type: ignore[no-redef]
@@ -450,6 +469,13 @@ def observe_tool_compress(*, mode: str, kind: str, outcome: str, saved: int) -> 
     TOOL_COMPRESS.labels(mode=mode, kind=kind, outcome=outcome).inc()
     if outcome == "compressed":
         TOOL_COMPRESS_CHARS_SAVED.labels(mode=mode).inc(max(0, saved))
+
+
+def observe_url_guard_resolver_saturated() -> None:
+    """One destination check refused because the bounded resolver pool was
+    exhausted (core.url_guard.ResolverSaturated — the fail-CLOSED outcome,
+    distinct from the fail-open gaierror). Global condition: no labels."""
+    URL_GUARD_RESOLVER_SATURATED.inc()
 
 
 def observe_tpm_cache_refund(tokens: int, discarded: bool) -> None:

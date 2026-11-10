@@ -31,15 +31,15 @@ spec:
           # the alert, not decoration.
           expr: |
             (
-              sum(rate(gateway_requests_total{status!="ok",status!="cache_hit"}[5m]))
-                / clamp_min(sum(rate(gateway_requests_total[5m])), 0.001)
+              sum(rate(gateway_requests_total{status!="ok",status!="cache_hit",status!="routing"}[5m]))
+                / clamp_min(sum(rate(gateway_requests_total{status!="routing"}[5m])), 0.001)
             ) > 0.10
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: "gateway error/refusal ratio above 10% for 10m"
-            description: "Refusals = error + budget_exceeded + rate_limited (cache_hit excluded — free, not a failure). Tenant-visible failures, ledger vocabulary identical."
+            description: "Refusals = error + budget_exceeded + rate_limited (cache_hit excluded — free, not a failure). routing excluded from BOTH sides (2026-11-10 P10): it is the gateway's own decision-model bookkeeping row, emitted once per routed request alongside the request's own 'ok' row — counting it put a permanently-routing deployment at a ~50% 'error ratio' that never cleared. Tenant-visible failures, ledger vocabulary identical."
         - alert: GatewayBreakerOpen
           expr: max(gateway_breaker_open) by (endpoint) == 1
           for: 5m

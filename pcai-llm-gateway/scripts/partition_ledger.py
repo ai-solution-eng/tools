@@ -41,6 +41,15 @@ PROCEDURE (single transaction where it matters)
 -----------------------------------------------
 1. pre-check: refuse when the ledger is missing. An ALREADY-PARTITIONED ledger
    takes the MAINTENANCE path instead (see RE-RUN below) — never a no-op.
+0. PRECONDITION (2026-11-10): boot the release that owns the CURRENT column
+   set at least once BEFORE running this. The copy below is "INSERT INTO
+   usage_ledger SELECT * FROM usage_ledger_legacy", which is positional: on a
+   pre-migration flat table the two newest columns (billable_units, unit_kind —
+   added 2026-11-10) are absent, so the SELECT yields fewer expressions than the
+   target has columns. PG 18 tolerates that (the trailing columns land NULL);
+   older servers reject it with "INSERT has more target columns than
+   expressions". Either way it fails INSIDE the transaction and rolls back
+   cleanly, but booting first avoids the confusing abort.
 2. BEGIN; LOCK usage_ledger IN ACCESS EXCLUSIVE mode (blocks new writes
    for the copy duration — run in the quiet window);
    rename live -> usage_ledger_legacy; create the partitioned parent with
@@ -115,7 +124,12 @@ COLUMNS = """
     routing_ceiling  TEXT NOT NULL DEFAULT '',
     routing_served   TEXT NOT NULL DEFAULT '',
     routing_reason   TEXT NOT NULL DEFAULT '',
-    routing_probabilities TEXT NOT NULL DEFAULT ''
+    routing_probabilities TEXT NOT NULL DEFAULT '',
+    -- P10 unit-aware billing (schema.py appends these AFTER
+    -- routing_probabilities; the positional INSERT..SELECT * copy below
+    -- depends on this physical order — pinned by tests/test_deploy_contract.py)
+    billable_units   NUMERIC(18,6),
+    unit_kind        TEXT
 """
 
 # Months: 6 back covers any realistic pre-migration history window being
@@ -320,7 +334,7 @@ async def _migrate(conn, keep_legacy: bool) -> None:
     -- (cross-val on audit #13; pinned by tests/test_deploy_contract.py).
     ALTER TABLE usage_ledger DROP CONSTRAINT IF EXISTS ck_ledger_status;
     ALTER TABLE usage_ledger ADD CONSTRAINT ck_ledger_status
-        CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked','policy_blocked','denied')) NOT VALID;
+        CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked','policy_blocked','denied','routing')) NOT VALID;
     """
     if keep_legacy:
         # The legacy table keeps owning the sequence in this mode — the parent

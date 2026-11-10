@@ -195,8 +195,14 @@ class Settings(BaseSettings):
     # Off by default: the SDK is an optional import (like prometheus_client),
     # so a deployment with no collector pays nothing. OTLP/HTTP (4318) is the
     # default exporter - fewer moving parts than gRPC and it survives a
-    # corporate proxy better. The span tree is one parent per request with a
-    # child per relay hop (model call / tool call).
+    # corporate proxy better. The span tree: ONE server span per HTTP request
+    # from the ASGI middleware, plus a generation span per model call on the
+    # proxy and tool-relay paths and a tool span per MCP call nested under the
+    # model call that requested it. Inbound traceparent propagation does not
+    # exist, so those child spans do not nest under the request span (audit
+    # P3, 2026-11-10: the earlier wording here promised a tree that was never
+    # built; the child spans landed with the Langfuse/OTLP work later that
+    # day — propagation remains the follow-up, do not rely on it).
     otel_enabled: bool = False
     otel_endpoint: str = "http://otel-collector:4318"
     otel_service_name: str = "pcai-llm-gateway"
@@ -208,6 +214,17 @@ class Settings(BaseSettings):
     #   Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4
     # Empty (the default) sends content-type only.
     otel_headers: str = ""
+
+    # --- CSP frame-ancestors allow-list (admin/leader consoles) -----------
+    # The consoles' CSP used to allow frame-ancestors 'self' https: — ANY
+    # https origin could frame them, a clickjacking surface on destructive
+    # admin actions (audit P3, 2026-11-10). Default empty = 'self' only.
+    # Sites that genuinely embed the console in another origin's iframe list
+    # those EXACT origins here, comma-separated (e.g.
+    # "https://portal.example.com,https://ops.example.net"). Each entry is
+    # validated (scheme://host[:port][/path] shape, no quotes/semicolons)
+    # before it reaches the header; anything else is dropped.
+    csp_frame_ancestors: str = ""
 
     # --- session affinity (provider + key pin) -----------------------------
     # A conversation may pin the ENDPOINT (not just the cascade head) so its
@@ -237,6 +254,25 @@ class Settings(BaseSettings):
     # (~3 tokens/second ~ 180/minute, roughly 150 spoken words).
     audio_tts_chars_per_token: int = 4
     audio_asr_tokens_per_second: float = 3.0
+    # The ASR byte proxy's divisor: BODY BYTES per SECOND of audio. The default
+    # assumes RAW 16 kHz 16-bit mono PCM (~2 bytes x 16000 samples = 32 kB/s).
+    # A COMPRESSED upload (mp3/opus/m4a ≈ 4-16 kB/s) is 2-8x SHORTER in bytes
+    # for the same speech, so the byte proxy then UNDER-bills 2-8x — the client
+    # should send a real duration instead (?duration= or X-PCAI-Duration, P10);
+    # this knob exists for deployments whose fleet format differs from the
+    # raw-PCM assumption.
+    audio_asr_bytes_per_second: float = 32000.0
+
+    # --- routing (decision-model) self-billing (P10) ------------------------
+    # The decision model's own call is real GPU spend the gateway used to make
+    # invisibly (no settle, no ledger row). Default ON: each decision call
+    # settles a status='routing' row under the CALLING key with the upstream's
+    # reported usage (token estimate, tagged 'token_estimate', when none).
+    # 'routing' is deliberately NOT in budgets._COSTED_STATUSES: the row is
+    # priced and visible for chargeback, but it does not consume the user's
+    # token/completion budget — the relay's estimate was already charged for
+    # the turn that asked for the routing decision.
+    routing_charge_enabled: bool = True
 
     # --- period-budget cached exemption (budget_cached_exempt_fraction) ---
     # The SAME problem the TPM refund fixes, on the slower axis: period token
@@ -255,6 +291,18 @@ class Settings(BaseSettings):
     #   gate already accepts. TRUE tokens stay on the ledger row for audit
     #   and the usage-summary rollups; only the budget CONSUMPTION changes.
     budget_cached_exempt_fraction: float = 0.9
+
+    # --- unpriced-model cost fallback (cost_fallback_per_m) ---------------
+    # A model with NO model_costs row ledgers cost NULL, and every USD
+    # budget gate's SUM ignores NULL — so a tenant with only a USD budget
+    # can burn unbounded GPU time on any newly registered model (audit
+    # 2026-11-10 feature theme). This knob bills such models a FLAT fallback
+    # rate (USD per 1M tokens, the industry convention) so the USD gate
+    # cannot be silently inert; core.costs.compute() applies it only when no
+    # priced row exists, and the boot-time WARNING (app lifespan ->
+    # costs.warn_unpriced) names every model it covers. 0.0 = off — the
+    # historical NULL/unpriced behaviour.
+    cost_fallback_per_m: float = 0.0
 
     # --- tool-use relay (server-side model<->MCP loop) ---
     # Client opts in with header X-PCAI-Execute-Tools. The loop runs
@@ -568,6 +616,15 @@ class Settings(BaseSettings):
     # Inputs larger than this (bytes) are never cached — giant payloads
     # buy nothing and bloat the table.
     embedding_cache_max_input_bytes: int = 64 * 1024
+    # Retention for stored vectors, in seconds. 0 = keep forever (the
+    # retention-knob convention: nothing is deleted until the operator opts
+    # in — audit P2-28 found embedding_cache as the one cache table with no
+    # TTL and no housekeeping prune). The cache is semantically immortal —
+    # the same (model, input) always yields the same vector — so the TTL is
+    # pure storage reclamation on RAG-heavy fleets, not a freshness policy;
+    # housekeeping prunes by created_at once a policy exists, and a row that
+    # outlives its TTL is still correct to serve.
+    embedding_cache_ttl_s: int = 0
 
     # --- retention (ROADMAP §5: operational tables are NOT the ledger) ---
     # The usage ledger is the audit artifact and is NEVER pruned (the budget

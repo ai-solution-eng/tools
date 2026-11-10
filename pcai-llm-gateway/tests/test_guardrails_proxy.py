@@ -499,6 +499,12 @@ def _patch_mcp(monkeypatch: pytest.MonkeyPatch, grants: set, servers: list[dict]
     async def fake_load_grants(key_id):
         return grants
 
+    # load_denies fails CLOSED since audit 2026-11-10 P2-11 (no snapshot +
+    # DB fault => propagate), so this seam must be stubbed too or every MCP
+    # test here 500s on the un-stubbed read.
+    async def fake_load_denies(key_id):
+        return set()
+
     async def fake_mcp_servers():
         return servers
 
@@ -509,6 +515,7 @@ def _patch_mcp(monkeypatch: pytest.MonkeyPatch, grants: set, servers: list[dict]
         return {}
 
     monkeypatch.setattr(fed, "load_grants", fake_load_grants)
+    monkeypatch.setattr(fed, "load_denies", fake_load_denies)
     monkeypatch.setattr(rp.registry, "mcp_servers", fake_mcp_servers)
     monkeypatch.setattr(rm, "_fetch_tools", fake_fetch_tools)
     monkeypatch.setattr(rm, "build_mcp_headers", fake_build_headers)

@@ -319,8 +319,13 @@
   <input id="apikey" type="password" placeholder="API key (hllm-…)" aria-label="API key" autocomplete="off">
   <!-- w6 F1: the bearer key defaults to sessionStorage (same ruling as the
        admin / team_leader consoles). This box is the ONLY path to
-       localStorage — unchecked by default; unchecking it (or signing out)
-       purges any previously persisted localStorage copy. -->
+       localStorage, and it stays UNCHECKED BY DEFAULT for a pasted key —
+       unchecking it (or signing out) purges any previously persisted
+       localStorage copy. One deliberate exception: the SSO mint/rotate flow
+       (ssoRevealKey) AUTO-CHECKS it — an SSO key is this browser's DEVICE
+       credential, and remembering it on this device is what keeps the
+       signed-in association alive across tab closes (see the 2026-11-03
+       comment on ssoRevealKey). -->
   <label class="conn" for="remember-key" style="cursor:pointer;display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--dim)"
          title="Unchecked: the key lives in this tab’s session only (gone when the tab closes). Checked: the key also persists in this browser and survives restarts.">
     <input type="checkbox" id="remember-key" style="width:auto;margin:0">
@@ -1709,15 +1714,24 @@
   // browser identity is an SSO credential — minted here OR pasted from another
   // device — so it gets the SSO treatment (green, 'oidc', no local Sign out).
   // An admin/CLI key has no subject binding and stays a non-SSO credential
-  // (Sign out allowed). A fault keeps the optimistic flag set by connectKey.
+  // (Sign out allowed). This probe is the ONLY authoritative SSO check, so a
+  // refusal or a fault CANNOT confirm a binding: the optimistic flag
+  // connectKey set falls back to false (the non-SSO state keeps Sign out
+  // available) instead of letting an unverified key wear the SSO treatment.
   async function probeKeyIdentity() {
     if (!ready() || !ssoSubject) { keySsoBound = false; return; }
     try {
       const r = await fetch('/v1/identity', { headers: auth() });
-      if (!r.ok) return;
+      if (!r.ok) { keySsoBound = false; return; }   // 401/500: unverified, not verified
       const j = await r.json();
       keySsoBound = !!(j && j.authenticated && j.subject && String(j.subject) === ssoSubject);
-    } catch { /* keep the optimistic value */ }
+    } catch (e) {
+      // Gateway fault: fall back to false and surface it in the conn status
+      // (this page's fault reporter — the consoles' reportError/errstrip has
+      // no equivalent here) instead of swallowing it.
+      keySsoBound = false;
+      setConn(false, 'identity check failed');
+    }
   }
 
   // One reveal flow for both 201 (fresh mint) and 409→confirmed rotate:

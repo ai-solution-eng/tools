@@ -766,11 +766,16 @@ async def test_routing_candidates_include_chat_groups_only(groups_core: Any, mon
 # ---------------------------------------------------------------------------
 
 
-def test_fallback_chain_accepts_a_chat_model_group(client, groups_core: Any) -> None:
+def test_fallback_chain_accepts_a_chat_model_group(client, groups_core: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """A per-model fallback chain can name a group: the data plane's walker
     resolves it to a member (routes_proxy._next_fallback_candidate), so the
     save path must accept it too — otherwise the composability is unreachable
-    through the admin API."""
+    through the admin API.
+
+    The validator is gated on settings.model_groups_enabled (audit 2026-11-10
+    P2-10), so the flag is on here — with it off, group names are correctly
+    rejected as unknown."""
+    monkeypatch.setattr(settings, "model_groups_enabled", True)
     tc, db = client
     db.models = {"alpha"}
     groups_core.snapshot = lambda: {"grp-chat": types.SimpleNamespace(model_type="chat")}
@@ -855,6 +860,10 @@ def test_model_upsert_refuses_a_group_name(
     """F3-2: a pool registered under an existing group's name would be
     silently unaddressable — the write path refuses it."""
     tc, _db = client
+    # audit 2026-11-10 P2-10: the write-path group guards are gated on
+    # settings.model_groups_enabled (default False), like every data-plane
+    # consumer — enable it so the guard is actually exercised.
+    monkeypatch.setattr(settings, "model_groups_enabled", True)
     groups_core.group_for = lambda name: object() if name == "grp" else None
 
     async def _noop_check(urls: list[str], what: str) -> None:

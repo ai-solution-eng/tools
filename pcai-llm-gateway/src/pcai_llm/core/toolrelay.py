@@ -39,10 +39,19 @@ from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcom
 from . import metrics as _metrics
 from .budgets import check_budgets, settle
 from .canonical import thread_key
+from .context_window import text_tokens
 
 log = logging.getLogger(__name__)
 
 TOOLSEP = "__"
+
+# The bounded fallback for the gateway_mcp_calls_total{server} label (audit
+# 2026-11-10 P1-5). metrics.py states the invariant "server - bounded by the MCP
+# registry"; any tick whose server string is CALLER- or MODEL-supplied (an
+# unknown server argument, a hallucinated "<random>__x" tool name) uses this
+# fixed bucket instead, so one MCP-scoped key cannot mint one Prometheus series
+# per RPM unit. The real string still lands in the chained mcp_call_audit row.
+UNKNOWN_SERVER_LABEL = "unknown"
 
 # Per-turn ceiling on tool-surface discovery calls. High enough for a real
 # agent turn (list, a few server lists, a couple of describes), low enough
@@ -221,6 +230,11 @@ async def _prepare_tool_content(
             candidate,
             min_chars=settings.tool_compress_min_chars,
             ratio_floor=settings.tool_compress_ratio_floor,
+            # Input ceiling (audit P2-35): the compressors parse the candidate
+            # SYNCHRONOUSLY on the event loop, and an original above the
+            # store's retention cap can never be retained — the rewrite would
+            # be discarded as "not_stored" below, so the parse is pure waste.
+            max_input_chars=settings.tool_compress_max_store_chars,
         )
         if result is not None:
             stats = {**result.stats.as_dict(), "server": server, "tool": tool, "mode": mode}
@@ -228,11 +242,21 @@ async def _prepare_tool_content(
             if mode == "on":
                 stored = False
                 if key_id is not None and len(candidate) <= settings.tool_compress_max_store_chars:
-                    try:
-                        from . import toolcompress_store
+                    from . import toolcompress_store
 
+                    try:
                         await toolcompress_store.save(key_id, result.stats.digest, candidate)
                         stored = True
+                    except toolcompress_store.StoreQuotaExceeded:
+                        # A POLICY outcome, not a fault (audit P3): the key's
+                        # retention quota is full, so this original passes
+                        # through. The store already logged the numbers at
+                        # WARNING; no traceback for a bounded, expected state.
+                        log.info(
+                            "relay: tool_compress_store quota reached (%s/%s) — passing the original through",
+                            server,
+                            tool,
+                        )
                     except Exception:
                         log.exception(
                             "relay: tool_compress_store save failed (%s/%s) — passing the original through",
@@ -249,8 +273,13 @@ async def _prepare_tool_content(
                     # Two causes, one signal: the write failed, or the
                     # original is too large to retain. Either way the model
                     # gets the original — a marker must never point at a
-                    # digest the store does not hold.
+                    # digest the store does not hold. The stats therefore
+                    # BLANK the digest (audit P3): this dict is published on
+                    # the wire and in the logs, and a digest nothing was
+                    # stored under is a dead end the model could be told to
+                    # retrieve.
                     stats["stored"] = False
+                    stats["digest"] = ""
                     outcome = "not_stored"
             _metrics.observe_tool_compress(
                 mode=mode,
@@ -542,8 +571,13 @@ class RelayGuard:
     neutral 1.0, so units == CALLS). That is NOT the old round count: the
     removed check charged one unit per MODEL ROUND, this charges one per tool
     CALL, so a round emitting k parallel calls costs k here and 1 there —
-    identical for single-call rounds, STRICTER for parallel batches (the new
-    bound can only fire EARLIER than the old one, never later).
+    identical for single-call rounds, STRICTER for parallel batches: for
+    GATEWAY-EXECUTED rounds the new bound can only fire EARLIER than the old
+    one, never later. THE ONE EXCEPTION IS A HANDBACK ROUND: calls the CLIENT's
+    own loop executes are deliberately NOT charged (see check()'s charge_calls
+    — charging them would abort the mixed batch that handback exists for), so a
+    handback-only turn spends no units and the unit bound never fires where the
+    old per-round count would have.
 
     The constructor parameter keeps its old NAME (max_iterations) because many
     call sites and tests construct the guard positionally — it is READ as a
@@ -1038,10 +1072,11 @@ def _message_text_tokens(message: Any) -> int:
     """Text-only token estimate for ONE chat message (len//4 heuristic).
 
     SOURCE OF TRUTH: ``pcai_llm.api.routes_proxy._message_text_tokens``.
-    Replicated here because routes_proxy imports THIS module at import time
-    (``from ..core import ... toolrelay``) — a module-level import back into
-    the API layer would be circular. Keep the two byte-identical; the parity
-    test in tests/test_perf_wins.py pins them together.
+    Both now charge through ``core.context_window.text_tokens`` — ONE
+    estimator, so the audit 2026-11-10 P2-21 non-ASCII fix (ascii//4 +
+    non_ascii) cannot drift between the admission path and this twin again.
+    context_window imports only routing.router, so importing it here adds no
+    cycle. The parity test in tests/test_perf_wins.py still pins the two.
 
     Only the "text" field of dict parts is counted; image_url / input_audio /
     file parts are ignored ENTIRELY (their URLs and base64 are not tokens).
@@ -1049,10 +1084,12 @@ def _message_text_tokens(message: Any) -> int:
     """
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return len(content) // 4
+        return text_tokens(content)
     if isinstance(content, list):
         return sum(
-            len(part["text"]) // 4 for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
+            text_tokens(part["text"])
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     return 0
 
@@ -3202,7 +3239,18 @@ async def relay_stream(
                         await settle(key_id, "*", f"mcp:{server}:{tool}", 0, 0, "denied", 0, request_id)
                     except Exception:
                         log.exception("relay: settle failed (denied %s/%s)", server, tool)
-                    _metrics.observe_mcp_call(server, "denied", "")
+                    # P1-5 (audit): the label must stay REGISTRY-BOUNDED.
+                    # `server` here comes from parse_tool_name of MODEL text
+                    # (the same string the ACL just refused), so ticking it
+                    # verbatim lets any MCP-scoped key mint series at one per
+                    # RPM unit. Tick the name only when it is one this key
+                    # could address at all (its grant set is registry-derived),
+                    # else the fixed bucket; the real string stays in the
+                    # chained mcp_call_audit row written just below.
+                    _granted_servers = {g_server for g_server, _ in grants}
+                    _metrics.observe_mcp_call(
+                        server if server in _granted_servers else UNKNOWN_SERVER_LABEL, "denied", ""
+                    )
                     try:
                         from .chain_audit import write_mcp_call
 

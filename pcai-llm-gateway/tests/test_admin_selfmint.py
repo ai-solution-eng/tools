@@ -584,7 +584,7 @@ def test_for_me_mint_audit_actor_is_proxy_identity(mint_env, monkeypatch: pytest
     r = tc.post("/v1/keys/for-me", json=None, headers=sso_h)
     assert r.status_code == 201, r.text
     args = rows[-1]
-    assert args[3] == "enroll.redeem"
+    assert args[3] == "enroll.sso_mint"
     assert args[2] == "proxy-identity", rows[-1]  # pre-fix: 'admin-key' (clobbered)
     assert args[1] == "alice"
 

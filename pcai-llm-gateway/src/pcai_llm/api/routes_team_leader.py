@@ -427,8 +427,9 @@ async def overview(ctx: TeamDep) -> dict[str, Any]:
     spend_tokens, spend_usd = await teams.team_spend(e.id, e.budget_period)
     alloc_tokens, alloc_usd = await teams.team_allocated(e.id, e.budget_period)
     # the wave-2 pool numbers: committed sums the per-key remainder
-    # (max(0, alloc - spent)) over ALL keys; available is the helper's own
-    # answer (None = no cap of that kind). DO NOT "optimize" the second
+    # (max(0, alloc - spent)) over the team's LIVE seats — a revoked or
+    # expired seat promises nothing (audit 2026-11-10 P2-18); available is the
+    # helper's own answer (None = no cap of that kind). DO NOT "optimize" the second
     # statement away by inverting team_available (cap - spend - available):
     # the helper CLAMPS at 0, so the inversion reports a wrong committed
     # exactly when the pool is over-committed — the state an operator is
@@ -1044,19 +1045,31 @@ async def team_usage(
 
     if group_by is not None:
         # the admin explorer's dimensions, verbatim (same joins, same
-        # projections — the team console renders the same columns)
-        dims = {
-            "key": "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
-            "model": "l.model",
-            "tenant": "t.id AS tenant_id, t.name AS tenant_name",
-            "day": "date_trunc('day', l.ts) AS day",
-            "subject": "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
+        # projections — the team console renders the same columns).
+        # SELECT and GROUP BY take DIFFERENT strings (audit 2026-11-10 P1-1,
+        # the twin of the admin 500): the projection carries "expr AS alias"
+        # items, and PostgreSQL's GROUP BY accepts only an a_expr — "GROUP BY
+        # t.id AS tenant_id" is a syntax error, so feeding one string to both
+        # slots 500'd four of the five modes on a real server (the fake DB
+        # never parses SQL). group_dims is the same expressions, bare.
+        select_dims, group_dims = {
+            "key": (
+                "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
+                "l.key_id, k.name, k.key_prefix",
+            ),
+            "model": ("l.model", "l.model"),
+            "tenant": ("t.id AS tenant_id, t.name AS tenant_name", "t.id, t.name"),
+            "day": ("date_trunc('day', l.ts) AS day", "date_trunc('day', l.ts)"),
+            "subject": (
+                "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
+                "k.subject_id, s.subject, s.idp, s.kind",
+            ),
         }[group_by]
         args.append(capped)
         lim = f"${len(args)}"
         rows = await db.fetch(
             f"""
-            SELECT {dims},
+            SELECT {select_dims},
                    count(*)                                      AS requests,
                    COALESCE(SUM(l.prompt_tokens), 0)             AS input_tokens,
                    COALESCE(SUM(l.completion_tokens), 0)         AS output_tokens,
@@ -1069,7 +1082,7 @@ async def team_usage(
             LEFT JOIN tenants t ON t.id = u.tenant_id
             LEFT JOIN subjects s ON s.id = k.subject_id
             {where}
-            GROUP BY {dims}
+            GROUP BY {group_dims}
             ORDER BY requests DESC
             LIMIT {lim}
             """,

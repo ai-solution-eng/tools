@@ -34,9 +34,9 @@ X-API-Key is the caller's own long-lived ledger key identifying the SAME
 subject. The fall-through rule stays scoped to INVALID TOKENS (the proxy
 envelope) and never rescues a failed EXPLICIT key: an X-API-Key that
 fails authenticate() is a hard 401 regardless of the co-forwarded
-Bearer — except the one shape below where the Bearer itself
-authenticates as a virtual key, and even there key-vs-key with one dead
-key REFUSES (two keys presented, one dead = refuse; fail-closed).
+Bearer — the Bearer is never even looked up on that path (audit P3,
+2026-11-10: the old rescue lookup raised the same 401 in every branch
+and so could not change the outcome; it only burned a round-trip).
 
 With NO X-API-Key header present the resolution is byte-for-byte
 unchanged (the existing suite is the proof).
@@ -141,7 +141,7 @@ async def _token_ladder(
     # it wins the ATTRIBUTION slot exactly as resolve_caller's own precedence
     # says. The authorization anchor below is untouched by it.
     caller = await _browser_caller(headers)
-    if identity._JWT_SHAPE_RE.match(plaintext) and identity.token_validation_configured():
+    if identity.is_jwt_shaped(plaintext) and identity.token_validation_configured():
         try:
             token_caller = await identity.resolve_caller(None, token=plaintext)
         except Exception:
@@ -156,9 +156,15 @@ async def _token_ladder(
             # provisioning when the flag is on). DB failures propagate —
             # same posture as authenticate (never a silent open door).
             key = await identity.resolve_shadow_key(token_caller.subject)
-    if key is None:
-        # Fall-through (invalid-token and no-token paths land here): the
-        # credential may still be a virtual key.
+    # Fall-through (invalid-token and no-token paths land here): the
+    # credential may still be a virtual key. SKIPPED when the bearer is
+    # JWT-shaped AND validation is configured (audit P3, 2026-11-10):
+    # virtual keys are always 'hllm-...' (keys.generate_key) and never
+    # JWT-shaped, so the lookup is a guaranteed miss on every
+    # expired/unknown-token request. With validation UNCONFIGURED the
+    # gate above never ran, so the fall-through stays — byte-identity
+    # with the flag-off oracle.
+    if key is None and not (identity.is_jwt_shaped(plaintext) and identity.token_validation_configured()):
         key = await authenticate(plaintext)
     return key, caller
 
@@ -180,11 +186,11 @@ async def resolve_bearer_key(
     Credential order (fleet convention D19, de-escalation-only):
 
     1. ``X-API-Key`` present → it is THE explicit credential: authenticate
-       it. Success → that key. Failure → 401 unless the co-forwarded
-       Bearer itself authenticates as a virtual key (a normal key
-       presented twice — the historical shape) — and even then REFUSE:
-       two keys presented with one dead is a fail-closed refusal, never a
-       silent rescue. A dead X-API-Key is never laundered through the
+       it. Success → that key. Failure → 401, UNCONDITIONALLY — the
+       co-forwarded Bearer is NOT consulted (audit P3, 2026-11-10: the
+       old rescue lookup raised the same 401 in every branch, so two keys
+       presented with one dead refused fail-closed either way; the lookup
+       is gone). A dead X-API-Key is never laundered through the
        proxy Bearer's IdP identity (a dead user key must not escalate to
        the token rung on the Bearer's behalf).
     2. No X-API-Key → the bearer exactly as before this envelope existed:
@@ -205,16 +211,17 @@ async def resolve_bearer_key(
     caller = None
     if envelope:
         # The explicit envelope outranks the co-forwarded proxy Bearer
-        # (D19). A dead X-API-Key is a 401 on its own — EXCEPT when the
-        # Bearer is itself virtual-key-shaped-and-live (both headers
-        # carried the same user key), and even there one dead key of two
-        # presented = refuse (fail-closed posture, brief §Z1 final word).
+        # (D19). A dead X-API-Key is a 401, UNCONDITIONALLY — no rescue
+        # lookup of the co-forwarded Bearer: (audit P3, 2026-11-10) this
+        # used to run authenticate(plaintext) first, but every branch of
+        # it raised the SAME 401, so the doomed call could not change the
+        # outcome — it only burned a round-trip and let a DB failure
+        # surface as 503 on a path that must be a plain credential
+        # refusal. Two keys presented with one dead refuse (fail-closed,
+        # brief §Z1 final word); the refusal just no longer pretends the
+        # Bearer was consulted.
         key = await authenticate(envelope)
         if key is None:
-            if plaintext and not identity._JWT_SHAPE_RE.match(plaintext):
-                bearer_key = await authenticate(plaintext)
-                if bearer_key is not None:
-                    raise fastapi.HTTPException(401, "invalid, revoked, or expired key") from None
             raise fastapi.HTTPException(401, "invalid, revoked, or expired key") from None
         # Attribution with the co-forwarded Bearer: NON-FATAL by design —
         # the envelope already authorized the request; a token resolution
@@ -225,7 +232,7 @@ async def resolve_bearer_key(
         if (
             caller is None
             and plaintext
-            and identity._JWT_SHAPE_RE.match(plaintext)
+            and identity.is_jwt_shaped(plaintext)
             and identity.token_validation_configured()
         ):
             try:

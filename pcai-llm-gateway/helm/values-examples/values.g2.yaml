@@ -565,8 +565,13 @@ ezua:
                                     # WITH trustProxyIdentity/ssoKeyCreateEnabled ON, EMPTY IS
                                     # INSECURE — the whole istio-system namespace may then
                                     # deliver spoofed X-Auth-Request-* headers (NOTES.txt
-                                    # warns at deploy time). Set the ezaf-gateway SA's
-                                    # SPIFFE ID, e.g.:
-                                    #   - cluster.local/ns/istio-system/sa/ezaf-gateway
+                                    # warns at deploy time). Set the ingress-gateway SA's
+                                    # VERIFIED SPIFFE ID (G2, verified 2026-11-02) — do NOT
+                                    # use sa/ezaf-gateway, that ServiceAccount does not exist:
+                                    #   - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+                                    # Discover the SA live with (both lines; the
+                                    # jsonpath half must survive the copy-paste):
+                                    #   kubectl -n istio-system get pod -l 'istio=ingressgateway' \
+                                    #     -o jsonpath='{.items[0].spec.serviceAccountName}'
     excludeInboundPorts: []         # KEEP EMPTY — an excluded port bypasses ALL policy rules
     rules: []                       # non-empty REPLACES the baseline ALLOW rules

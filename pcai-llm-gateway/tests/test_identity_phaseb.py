@@ -766,7 +766,12 @@ def test_f2_user_row_reuse_on_repeat_provisioning(monkeypatch: pytest.MonkeyPatc
         )
     )
     assert other is not None and other.id != first.id
-    assert len(fake.users) == 1, "the per-display-name user row is REUSED, never re-inserted"
+    # audit 2026-11-10 P2-12: the user row is keyed by SUBJECT, not by email.
+    # Two subjects sharing an email therefore get TWO rows (they used to
+    # collide on ONE row and inherit each other's profile — the bug). The
+    # same-subject reuse this test is named for is pinned separately by
+    # tests/test_audit_20261110_identity.py.
+    assert len(fake.users) == 2, "distinct subjects must never share a user row"
 
 
 # 4. require_key: the token rung live on /v1 (fall-through at the surface)
@@ -851,15 +856,26 @@ def test_require_key_invalid_token_still_reaches_key_auth(
     r = tc.get("/probe", headers={"Authorization": f"Bearer {expired}"})
     assert r.status_code == 401
 
-    # 2) the SAME invalid token, but authenticate resolves the bearer as a
-    #    key (a stale-JWT-in-front-of-a-key shape) → the KEY wins: 200
+    # 1b) audit 2026-11-10 P3: a JWT-SHAPED bearer no longer reaches
+    #     authenticate() when validation is configured. Virtual keys are
+    #     always "hllm-…" (core/keys.py generate_key) and never JWT-shaped,
+    #     so that lookup was a guaranteed miss on every expired-token request.
     import pcai_llm.api.auth as auth_mod
 
     monkeypatch.setattr(auth_mod, "authenticate", make_auth(expired))
     got.clear()
-    r2 = tc.get("/probe", headers={"Authorization": f"Bearer {expired}"})
+    r_jwt = tc.get("/probe", headers={"Authorization": f"Bearer {expired}"})
+    assert r_jwt.status_code == 401
+    assert got == [], "a JWT-shaped bearer must not reach the virtual-key lookup"
+
+    # 2) a NON-JWT bearer that authenticate resolves as a key still falls
+    #    through — the shape that actually exists in production.
+    virtual = "hllm-plainvirtualkey"
+    monkeypatch.setattr(auth_mod, "authenticate", make_auth(virtual))
+    got.clear()
+    r2 = tc.get("/probe", headers={"Authorization": f"Bearer {virtual}"})
     assert r2.status_code == 200, r2.text
-    assert got == [expired]  # the invalid token REACHED authenticate (fall-through)
+    assert got == [virtual]  # the bearer REACHED authenticate (fall-through)
 
 
 def test_require_key_token_with_shadow_key_authorizes(
@@ -1000,11 +1016,14 @@ def test_mcp_wrapper_invalid_token_still_falls_through_to_key_auth(
 
     monkeypatch.setattr(routes_mcp, "authenticate", fake_auth)
     monkeypatch.setattr(identity, "db", PlainDB())
-    expired = _sign(_claims(exp=int((datetime.now(UTC) - timedelta(minutes=1)).timestamp())))
+    # audit 2026-11-10 P3: a JWT-SHAPED bearer is skipped when validation is
+    # configured (virtual keys are always "hllm-…"), so exercise the fall-through
+    # with the shape that exists: a virtual key on the token-accepted surface.
+    virtual = "hllm-mcpvirtualkey"
     with _mcp_client(monkeypatch) as tc:
-        r = tc.post("/mcp", json=_rpc(), headers=_rpc_headers(expired))
+        r = tc.post("/mcp", json=_rpc(), headers=_rpc_headers(virtual))
     assert r.status_code == 200, r.text  # the KEY authenticated the request
-    assert got == [expired]  # the SAME credential reached authenticate
+    assert got == [virtual]  # the SAME credential reached authenticate
 
 
 def test_mcp_wrapper_token_with_shadow_key_reaches_tools(monkeypatch: pytest.MonkeyPatch) -> None:

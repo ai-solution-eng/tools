@@ -686,6 +686,91 @@ async def team_cap_spend(
     }
 
 
+async def team_cap_spend_bulk(
+    scopes_by_enrollment: dict[uuid.UUID, list[tuple[str, str]]],
+) -> dict[uuid.UUID, dict[tuple[str, str], tuple[int, float]]]:
+    """Per-cap ledger spend for MANY enrollments — ONE statement.
+
+    The console LISTING's batch twin of team_cap_spend (audit 2026-11-10
+    P2-34): the admin table renders one line per cap for every
+    derived-envelope row, and the per-row helper cost one aggregate round trip
+    PER ROW. This answers the whole page at once.
+
+    The statement groups the ledger by (enrollment, model) with one FILTER pair
+    per DISTINCT period, so:
+      * a model scope reads its own (enrollment, model) row's period column;
+      * a '*' scope (the any-model pool) sums every model's row for that
+        enrollment — exactly what the per-row helper's model-less FILTER sums.
+
+    The token expression, the costed-status set and the fraction weighting are
+    the SAME ones team_cap_spend uses (imported, never re-spelled), so the two
+    can never tell different stories about one cap. Every requested scope is
+    present in the result with (0, 0.0) when the ledger has nothing for it.
+    """
+    from .budgets import _COSTED_SQL, _budget_token_value, _window_start
+
+    # Normalize/dedupe the period vocabulary FIRST: one FILTER per distinct
+    # period, in a stable order so the column names line up with the args.
+    periods: list[str] = []
+    wanted: dict[uuid.UUID, list[tuple[str, str]]] = {}
+    for enrollment_id, scopes in scopes_by_enrollment.items():
+        if not scopes:
+            continue
+        normalized: list[tuple[str, str]] = []
+        for model, period in scopes:
+            norm = _normalize_period(period)
+            if norm not in periods:
+                periods.append(norm)
+            normalized.append((model, norm))
+        wanted[enrollment_id] = normalized
+    if not wanted:
+        return {}
+
+    now = datetime.now(UTC)
+    starts = {period: _window_start(now, period) for period in periods}
+    earliest = min(starts.values())
+    tok = _budget_token_value("l")
+    selects: list[str] = []
+    args: list[Any] = [list(wanted)]
+    for i, period in enumerate(periods):
+        args.append(starts[period])
+        idx = len(args)
+        selects.append(f"SUM({tok}) FILTER (WHERE l.ts >= ${idx}::timestamptz) AS s{i}_tokens")
+        selects.append(f"SUM(l.cost_usd * l.billing_fraction) FILTER (WHERE l.ts >= ${idx}::timestamptz) AS s{i}_usd")
+    args.append(earliest)
+    rows = await db.fetch(
+        f"""
+        SELECT k.enrollment_id, l.model, {", ".join(selects)}
+        FROM usage_ledger l
+        JOIN api_keys k ON k.id = l.key_id
+        WHERE k.enrollment_id = ANY($1::uuid[])
+          AND l.status IN ({_COSTED_SQL})
+          AND l.ts >= ${len(args)}::timestamptz
+        GROUP BY k.enrollment_id, l.model
+        """,
+        *args,
+    )
+    out: dict[uuid.UUID, dict[tuple[str, str], tuple[int, float]]] = {
+        enrollment_id: {scope: (0, 0.0) for scope in scopes} for enrollment_id, scopes in wanted.items()
+    }
+    for r in rows:
+        row_scopes = wanted.get(r["enrollment_id"])
+        if row_scopes is None:
+            continue
+        for i, period in enumerate(periods):
+            tokens = int(r[f"s{i}_tokens"] or 0)
+            usd = float(r[f"s{i}_usd"] or 0.0)
+            for scope in row_scopes:
+                model, scope_period = scope
+                if scope_period != period:
+                    continue
+                if model != "*" and str(r["model"]) != model:
+                    continue
+                prev_t, prev_u = out[r["enrollment_id"]][scope]
+                out[r["enrollment_id"]][scope] = (prev_t + tokens, prev_u + usd)
+    return out
+
+
 async def team_scope_available(
     enrollment_id: uuid.UUID,
     model: str,
@@ -714,15 +799,26 @@ async def team_scope_available(
     None for a kind the cap does not bound. Clamps at 0 (over-committed is
     reported as 0, never negative) — the same lossy-by-design contract as
     team_available.
+
+    THE PROMISE SET IS THE LIVE SEATS (audit 2026-11-10 P2-18/P2-22): a
+    revoked or expired seat promises nothing — its unspent allocation is
+    released at revocation/expiry, not at period rollover — while its SPEND
+    still counts toward the pool. That is exactly the split its twin
+    team_available makes between team_allocation_state (live keys only) and
+    team_spend (every key), so the two pools cannot disagree about a departed
+    or lapsed teammate.
     """
     from .budgets import _COSTED_SQL, _budget_token_value, _window_start
 
+    now = datetime.now(UTC)
     window = _normalize_period(period)
-    start = _window_start(datetime.now(UTC), window)
+    start = _window_start(now, window)
     tok = _budget_token_value("l")
     rows = await db.fetch(
         f"""
         SELECT k.id AS key_id,
+               k.revoked_at AS revoked_at,
+               k.expires_at AS expires_at,
                COALESCE(b.alloc_tokens, 0)::float AS alloc_tokens,
                COALESCE(c.alloc_usd, 0)::float AS alloc_usd,
                COALESCE(s.spent_tokens, 0)::float AS spent_tokens,
@@ -751,11 +847,17 @@ async def team_scope_available(
                       AND l.key_id IN (SELECT id FROM api_keys WHERE enrollment_id = $1)
                     GROUP BY l.key_id) s ON s.key_id = k.id
         WHERE k.enrollment_id = $1
-          -- A REVOKED SEAT PROMISES NOTHING (owner decision, audit W6 P2-7):
-          -- the promise is released at revocation, not at period rollover, or a
-          -- departed teammate's unspent allocation blocks the replacement seat
-          -- forever. Same "live key" predicate the rest of the module uses.
-          AND k.revoked_at IS NULL
+          -- NO key-state predicate HERE (audit 2026-11-10 P2-22). This row set
+          -- feeds BOTH the promise sum and the scope SPEND, so the old
+          -- "AND k.revoked_at IS NULL" also dropped a revoked seat's ledger
+          -- rows out of the spend — while its twin team_available counts spend
+          -- from EVERY key (team_spend carries no key-state predicate). Every
+          -- rotation revokes the old key, so a rotated team systematically
+          -- OVERSTATED its per-model headroom. The promise set is applied
+          -- below, on these same rows: a REVOKED or EXPIRED seat promises
+          -- nothing (owner decision audit W6 P2-7; expiry audit P2-18 — an
+          -- expired key is refused at admission, so its unspent allocation can
+          -- never be spent yet still counted as committed until rollover).
         """,
         enrollment_id,
         window,
@@ -771,10 +873,20 @@ async def team_scope_available(
         alloc_u = float(r["alloc_usd"] or 0.0)
         spent_t = float(r["spent_tokens"] or 0.0)
         spent_u = float(r["spent_usd"] or 0.0)
-        committed_tokens += max(0.0, alloc_t - spent_t)
-        committed_usd += max(0.0, alloc_u - spent_u)
+        # SPEND FROM EVERY KEY (audit 2026-11-10 P2-22): a revoked or expired
+        # seat's ledger rows are real team spend — team_spend counts them, and
+        # dropping them here understated the pool by exactly what every
+        # rotation left behind.
         scope_tokens += spent_t
         scope_usd += spent_u
+        # THE PROMISE SET (audit P2-18/P2-22): only a LIVE seat holds a promise.
+        # .get, not [], so a row/fake predating these columns reads as live
+        # (the control default), never a KeyError.
+        expires = r.get("expires_at")
+        if r.get("revoked_at") is not None or (expires is not None and expires <= now):
+            continue
+        committed_tokens += max(0.0, alloc_t - spent_t)
+        committed_usd += max(0.0, alloc_u - spent_u)
     available_tokens: int | None = None
     if cap_tokens is not None:
         available_tokens = max(0, int(cap_tokens) - int(scope_tokens) - int(committed_tokens))
@@ -795,6 +907,12 @@ async def team_allocated(enrollment_id: uuid.UUID, period: str) -> tuple[int, fl
 
     Advisory only: allocations are what the gate applies per key, and a
     teammate key may legitimately carry no allocation at all.
+
+    The promise set is the LIVE seats (audit 2026-11-10 P2-18): a revoked seat
+    is released at revocation, and an EXPIRED seat is released at expiry —
+    admission refuses an expired key (core.keys.key_record_from_row), so its
+    unspent allocation can never be spent yet still counted as promised until
+    the period rolled over. Same predicate team_allocation_state applies.
     """
     row = await db.fetchrow(
         """
@@ -802,11 +920,13 @@ async def team_allocated(enrollment_id: uuid.UUID, period: str) -> tuple[int, fl
                            FROM budgets b
                            JOIN api_keys k ON k.id = b.key_id
                           WHERE k.enrollment_id = $1 AND k.revoked_at IS NULL
+                            AND (k.expires_at IS NULL OR k.expires_at > now())
                             AND b.period = $2), 0)::float AS tokens,
                COALESCE((SELECT SUM(c.limit_usd)
                            FROM cost_budgets c
                            JOIN api_keys k ON k.id = c.key_id
                           WHERE k.enrollment_id = $1 AND k.revoked_at IS NULL
+                            AND (k.expires_at IS NULL OR k.expires_at > now())
                             AND c.period = $3), 0)::float AS usd
         """,
         enrollment_id,
@@ -816,6 +936,101 @@ async def team_allocated(enrollment_id: uuid.UUID, period: str) -> tuple[int, fl
     if row is None:
         return 0, 0.0
     return int(row["tokens"] or 0), float(row["usd"] or 0.0)
+
+
+async def team_totals_bulk(
+    by_period: dict[str, list[uuid.UUID]],
+) -> dict[uuid.UUID, tuple[int, float, int, float]]:
+    """Spend AND allocation for MANY enrollments — ONE statement per period.
+
+    The console LISTING's batch twin of team_spend + team_allocated (audit
+    2026-11-10 P2-34). The admin enrollment table used to pay BOTH helpers for
+    EVERY row — two aggregate round trips, serially, on the console's hottest
+    read — plus one more per derived-envelope row for its caps. This answers
+    the whole page with one statement per DISTINCT period (normally one: an
+    enrollment's window is a deployment-wide choice).
+
+    by_period maps a stored (raw) enrollments.budget_period to the ids to price
+    in that window. Periods are normalized through _normalize_period and
+    merged, so two spellings of one window share a statement instead of paying
+    twice.
+
+    Returns (spent_tokens, spent_usd, allocated_tokens, allocated_usd) per
+    enrollment, with the SAME predicates the per-row helpers apply:
+      * spend = every key of the enrollment (team_spend carries no key-state
+        predicate), costed statuses only, the cache-discounted token value
+        expression and the fraction-weighted USD;
+      * allocation = the LIVE seats' budget rows for that period (a revoked or
+        expired seat promises nothing — audit 2026-11-10 P2-18), exactly
+        team_allocated's predicate.
+    An enrollment the statement does not answer is absent from the result;
+    callers degrade it to zeros (the listing's existing contract).
+    """
+    from .budgets import _COSTED_SQL, _budget_token_value, _window_start
+
+    groups: dict[str, list[uuid.UUID]] = {}
+    for raw_period, ids in by_period.items():
+        if ids:
+            groups.setdefault(_normalize_period(raw_period), []).extend(ids)
+    if not groups:
+        return {}
+    now = datetime.now(UTC)
+    tok = _budget_token_value("l")
+    out: dict[uuid.UUID, tuple[int, float, int, float]] = {}
+    for period, ids in groups.items():
+        rows = await db.fetch(
+            f"""
+            SELECT e.id AS enrollment_id,
+                   COALESCE(sp.spent_tokens, 0)::float AS spent_tokens,
+                   COALESCE(sp.spent_usd, 0)::float    AS spent_usd,
+                   COALESCE(al.alloc_tokens, 0)::float AS alloc_tokens,
+                   COALESCE(au.alloc_usd, 0)::float    AS alloc_usd
+            FROM enrollments e
+            LEFT JOIN (
+                SELECT k.enrollment_id,
+                       SUM({tok}) AS spent_tokens,
+                       SUM(l.cost_usd * l.billing_fraction) AS spent_usd
+                  FROM usage_ledger l
+                  JOIN api_keys k ON k.id = l.key_id
+                 WHERE k.enrollment_id = ANY($1::uuid[])
+                   AND l.status IN ({_COSTED_SQL})
+                   AND l.ts >= $2::timestamptz
+                 GROUP BY k.enrollment_id
+            ) sp ON sp.enrollment_id = e.id
+            LEFT JOIN (
+                SELECT k.enrollment_id, SUM(b.limit_tokens) AS alloc_tokens
+                  FROM budgets b
+                  JOIN api_keys k ON k.id = b.key_id
+                 WHERE k.enrollment_id = ANY($1::uuid[])
+                   AND b.period = $3
+                   AND k.revoked_at IS NULL
+                   AND (k.expires_at IS NULL OR k.expires_at > now())
+                 GROUP BY k.enrollment_id
+            ) al ON al.enrollment_id = e.id
+            LEFT JOIN (
+                SELECT k.enrollment_id, SUM(c.limit_usd) AS alloc_usd
+                  FROM cost_budgets c
+                  JOIN api_keys k ON k.id = c.key_id
+                 WHERE k.enrollment_id = ANY($1::uuid[])
+                   AND c.period = $3
+                   AND k.revoked_at IS NULL
+                   AND (k.expires_at IS NULL OR k.expires_at > now())
+                 GROUP BY k.enrollment_id
+            ) au ON au.enrollment_id = e.id
+            WHERE e.id = ANY($1::uuid[])
+            """,
+            list(ids),
+            _window_start(now, period),
+            period,
+        )
+        for r in rows:
+            out[r["enrollment_id"]] = (
+                int(r["spent_tokens"] or 0),
+                float(r["spent_usd"] or 0.0),
+                int(r["alloc_tokens"] or 0),
+                float(r["alloc_usd"] or 0.0),
+            )
+    return out
 
 
 @dataclass
@@ -914,8 +1129,13 @@ async def team_allocation_state(enrollment_id: uuid.UUID, period: str) -> dict[u
              GROUP BY l.key_id
         ) sp ON sp.key_id = k.id
         WHERE k.enrollment_id = $1
-          -- live keys only (owner decision, audit W6 P2-7): see team_scope_available
+          -- live keys only (owner decision, audit W6 P2-7; expiry audit
+          -- 2026-11-10 P2-18): a revoked seat is released at revocation and an
+          -- EXPIRED seat at expiry — admission refuses an expired key, so its
+          -- unspent allocation could never be spent yet stayed committed until
+          -- rollover. See team_scope_available for the same promise set.
           AND k.revoked_at IS NULL
+          AND (k.expires_at IS NULL OR k.expires_at > now())
         ORDER BY k.created_at, k.id
         """,
         enrollment_id,

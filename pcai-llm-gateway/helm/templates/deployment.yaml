@@ -594,12 +594,17 @@ spec:
                   key: {{ .secretKey | required "mcpKeySecrets[].secretKey is required" }}
             {{- end }}
             # Fernet master key for panel-stored credentials (by-ref; absent
-            # env = credential storage disabled, by-ref Secret names still work)
+            # env = credential storage disabled, by-ref Secret names still work).
+            # Rendered ONLY when a Secret name is set (audit 2026-11-10): an
+            # unconditional secretKeyRef failed CreateContainerConfigError on
+            # every site that had not created the optional Secret.
+            {{- if ne .Values.secretsMasterKey.existingSecret "" }}
             - name: PCAI_LLM_SECRETS_MASTER_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secretsMasterKey.existingSecret }}
                   key: {{ .Values.secretsMasterKey.existingSecretKey }}
+            {{- end }}
             # Admin API keys for /admin — always from an operator-created
             # Secret (existingSecret-only, the K8S-MCP invariant): the chart
             # never creates or inlines a key, and the pod fails loud

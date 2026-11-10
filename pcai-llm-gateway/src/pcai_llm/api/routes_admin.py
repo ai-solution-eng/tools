@@ -47,9 +47,11 @@ from ..core import costs, mcp_weights, registry, secretbox, teams, url_guard
 from ..core import metrics as _metrics
 from ..core.audit import audit_action, stable_actor_label
 from ..core.budgets import (
+    _COSTED_SQL,
     MAX_LIMIT_TOKENS,
     MAX_LIMIT_USD,
     _budget_token_expr,
+    _budget_token_value,
     budget_status,
     budget_status_many,
     split_preset_budgets,
@@ -211,14 +213,28 @@ AdminDep = Annotated[None, Depends(require_admin)]
 # admin audit trail — actor/context resolution + the instrumented-write helper
 # ---------------------------------------------------------------------------
 
+# The admin-plane audit vocabulary (regenerated 2026-11-10 against the actual
+# _audit(...) call sites in routes_admin.py + routes_enroll.py's admin_router,
+# after the doc drifted from the emitted actions — 9 actions were undocumented:
+# tenant.sso_default_profile.set, tenant.sso_users.bind, key.self_mint_eligibility,
+# agent.upsert, agent.delete, profile.grants.propagate, distiller.config,
+# routing.config, enroll.delete). tests/test_audit_20261110_admin.py asserts the
+# doc stays a superset of the emitted literals. NOT listed here: the self-service
+# vocabulary (mcp.creds.self, mcp.creds.self.delete, mcp.grants.self —
+# routes_mcp_self.py, the /v1/self surface, never an admin actor).
 AUDIT_ACTIONS_DOC = (
-    "key.create key.patch key.revoke key.rotate key.profile.apply budget.set costs.set costs.delete "
+    "key.create key.patch key.revoke key.rotate key.self_mint_eligibility key.profile.apply "
+    "budget.set costs.set costs.delete "
     "model.upsert model.delete model.fallbacks.set "
-    "model_group.create model_group.update model_group.delete mcp.server.upsert mcp.server.patch "
-    "mcp.acl.set mcp.acl.server.set mcp.acl.copy mcp.creds.set mcp.creds.delete profile.upsert "
-    "profile.delete profile.limits.propagate user.profile.set tenant.create user.create "
+    "model_group.create model_group.update model_group.delete "
+    "mcp.server.upsert mcp.server.patch mcp.acl.set mcp.acl.server.set mcp.acl.copy "
+    "mcp.creds.set mcp.creds.delete "
+    "profile.upsert profile.delete profile.limits.propagate profile.grants.propagate "
+    "user.profile.set tenant.create tenant.sso_default_profile.set tenant.sso_users.bind "
+    "user.create agent.upsert agent.delete "
     "guardrail.create guardrail.patch guardrail.delete guardrail.models.set offpeak.set "
-    "enroll.code.mint enroll.code.revoke enroll.redeem enroll.envelope.patch "
+    "distiller.config routing.config "
+    "enroll.code.mint enroll.code.revoke enroll.redeem enroll.sso_mint enroll.delete enroll.envelope.patch "
     "team.key.create team.key.patch team.key.revoke team.key.rotate team.budget.set "
     "team.settings.set team.topup.request "
     "enroll.topup.approve enroll.topup.deny"
@@ -1324,6 +1340,17 @@ async def revoke_key_endpoint(key_id: uuid.UUID, request: Request, _: AdminDep) 
     return {"revoked": revoked}
 
 
+def _like_literal_escape(needle: str) -> str:
+    """Escape the LIKE/ILIKE metacharacters so the enrollment filter matches
+    the needle LITERALLY (audit 2026-11-10 P3). The query is parameterised
+    (core.keys.list_keys), but a needle carrying % or _ still silently
+    broadened the match — searching "100%" matched every label containing
+    "100". Postgres's default LIKE escape character is the backslash, so the
+    pattern side needs no ESCAPE clause; the backslash itself is escaped
+    first so an existing one is never read as an escape."""
+    return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/keys")
 async def list_keys_endpoint(
     _: AdminDep,
@@ -1346,13 +1373,20 @@ async def list_keys_endpoint(
     `enrollment` is a case-insensitive SUBSTRING match on the enrollment
     label ("show me everything minted from the *station* codes"). Forwarded
     to core.keys.list_keys — the JOIN and the ILIKE live there; this route
-    only trims the needle so an all-whitespace search is a no-filter call.
+    trims the needle so an all-whitespace search is a no-filter call, and
+    escapes the LIKE wildcards so a label metacharacter in the needle is
+    matched literally (audit 2026-11-10 P3), not read as a pattern.
     """
     needle = enrollment.strip() if enrollment else ""
+    # Wildcards escaped (audit 2026-11-10 P3) and trimmed to 50 BEFORE the
+    # escape: each metacharacter at most doubles when escaped, so the escaped
+    # needle stays within the 100-char cap core.keys.list_keys re-applies —
+    # trimming AFTER escaping could cut a "\%" pair in half and leave a lone
+    # trailing backslash that eats the pattern's closing "%".
     rows = await list_keys(
         include_revoked=include_revoked,
         enrollment_id=enrollment_id,
-        enrollment_search=needle[:100] or None,
+        enrollment_search=_like_literal_escape(needle[:50]) or None,
     )
     statuses = await budget_status_many([r["id"] for r in rows])
     for row in rows:
@@ -1912,9 +1946,12 @@ async def key_usage(key_id: uuid.UUID, _: AdminDep) -> dict[str, Any]:
     """Per-key view: current budget windows plus the 50 most recent ledger rows."""
     if not await _exists("api_keys", key_id):
         raise HTTPException(404, f"key {key_id} not found")
+    # P10 unit-aware billing: billable_units/unit_kind ride the projection —
+    # the quantity the row billed and its unit name (NULL on legacy token
+    # rows: 'measured as always').
     recent = await db.fetch(
         "SELECT id, model, endpoint, prompt_tokens, completion_tokens, total_tokens, "
-        "status, latency_ms, request_id, ts FROM usage_ledger "
+        "status, latency_ms, request_id, ts, billable_units, unit_kind FROM usage_ledger "
         "WHERE key_id = $1 ORDER BY ts DESC LIMIT 50",
         key_id,
     )
@@ -1986,35 +2023,53 @@ async def usage(
     where = f"WHERE {' AND '.join(conds)}" if conds else ""
 
     if group_by is not None:
-        dims = {
-            "key": "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
-            "model": "l.model",
-            "tenant": "t.id AS tenant_id, t.name AS tenant_name",
-            "day": "date_trunc('day', l.ts) AS day",
+        # SELECT and GROUP BY carry SEPARATE expressions (audit 2026-11-10
+        # P1-1): four of the five dimensions alias in the projection
+        # ("expr AS alias"), and PostgreSQL's group_by_item accepts only
+        # a_expr — GROUP BY "x AS y" is a syntax error, which made 4 of the
+        # 5 group_by modes 500. One dict of (select_dims, group_dims) pairs;
+        # the bare group expressions are exactly the aliased ones.
+        dims_by_group: dict[str, tuple[str, str]] = {
+            "key": (
+                "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
+                "l.key_id, k.name, k.key_prefix",
+            ),
+            "model": ("l.model", "l.model"),
+            "tenant": ("t.id AS tenant_id, t.name AS tenant_name", "t.id, t.name"),
+            "day": ("date_trunc('day', l.ts) AS day", "date_trunc('day', l.ts)"),
             # Phase A identity: subject projection via the key→subject FK
             # (read-time LEFT JOIN — the binding is immutable after
             # issuance, so the join is faithful; unbound keys group under a
             # NULL subject — "no subject" is an honest bucket, not an error).
-            "subject": "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
-        }[group_by]
+            "subject": (
+                "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
+                "k.subject_id, s.subject, s.idp, s.kind",
+            ),
+        }
+        select_dims, group_dims = dims_by_group[group_by]
         args.append(capped)
         lim = f"${len(args)}"
         rows = await db.fetch(
             f"""
-            SELECT {dims},
+            SELECT {select_dims},
                    count(*)                                      AS requests,
                    COALESCE(SUM(l.prompt_tokens), 0)             AS input_tokens,
                    COALESCE(SUM(l.completion_tokens), 0)         AS output_tokens,
                    COALESCE(SUM(l.cached_tokens), 0)             AS cached_tokens,
                    count(*) FILTER (WHERE l.status = 'cache_hit') AS cache_hits,
-                   COALESCE(SUM(l.cost_usd), 0)::float           AS cost_usd
+                   COALESCE(SUM(l.cost_usd), 0)::float           AS cost_usd,
+                   -- P10 unit-aware billing: summed units + the distinct unit
+                   -- kinds behind them (all-NULL kinds aggregate to NULL — the
+                   -- legacy measured-token shape, shown as such).
+                   COALESCE(SUM(l.billable_units), 0)::float     AS billable_units,
+                   string_agg(DISTINCT l.unit_kind, ',')         AS unit_kinds
             FROM usage_ledger l
             LEFT JOIN api_keys k ON k.id = l.key_id
             LEFT JOIN users u ON u.id = k.user_id
             LEFT JOIN tenants t ON t.id = u.tenant_id
             LEFT JOIN subjects s ON s.id = k.subject_id
             {where}
-            GROUP BY {dims}
+            GROUP BY {group_dims}
             ORDER BY requests DESC
             LIMIT {lim}
             """,
@@ -2040,6 +2095,10 @@ async def usage(
                -- the per-row view dropped them, so the two halves of the same tab
                -- disagreed with each other.
                l.cached_tokens, l.cost_usd, l.billing_fraction,
+               -- P10: the unit the row billed in (NULL on legacy measured-
+               -- token rows) and the quantity, so a 'second'/'char_estimate'
+               -- row reads as what it is instead of as a token count.
+               l.billable_units, l.unit_kind,
                k.name AS key_name, k.key_prefix AS key_prefix,
                u.name AS user_name, t.name AS tenant_name,
                k.bound_via AS bound_via, s.subject AS subject, s.idp AS subject_idp
@@ -2118,17 +2177,37 @@ async def audit_chain_status(_: AdminDep) -> dict[str, Any]:
                                             written before chaining existed.
       * first_bad_id names the first offending row, so an auditor can page
         straight to it with GET /admin/audit.
+      * anchored=false + anchor_status="anchor-mismatch" -> the HMAC tail
+        anchor does not vouch for the walked tail: a full-recompute tamper
+        (an edit that re-derives every row_hash consistently) is INVISIBLE
+        to the hash walk alone — the anchor is what catches it.
 
-    Read-only and cheap enough to poll: both trails are control-plane/tool-call
-    volume, not chat volume. Registered ABOVE /audit so the literal path is
-    not shadowed by the /audit handler's sibling routes.
+    Read-only; NOT cheap — the verifier walks each never-pruned trail (now
+    keyset-paged, but still a FULL pass) on the pool the data plane shares,
+    so do not poll this on a loop; call it once per incident or after a
+    tamper suspicion (audit 2026-11-10 P2-29). It reports the anchor status
+    so a full-recompute tamper is visible, not just a chain break. The
+    top-level anchored/anchor_status are the WORST of the two trails; the
+    per-trail detail stays in admin_audit / mcp_call_audit. Registered
+    ABOVE /audit so the literal path is not shadowed by the /audit
+    handler's sibling routes.
     """
     from ..core.chain_audit import verify_admin_audit_chain, verify_mcp_call_chain
 
     admin_chain = await verify_admin_audit_chain()
     mcp_chain = await verify_mcp_call_chain()
+    # Anchor roll-up (worst-of): a mismatch anywhere is a mismatch; an
+    # unavailable verifier must not read as a verified anchor. The ordering
+    # mirrors core.chain_audit's own severity (a mismatch can flip ok, the
+    # rest only report) — "stale" (rows appended after the last anchor) is
+    # the LEAST alarming state that still says not-fully-anchored.
+    _ANCHOR_SEVERITY = ("anchor-mismatch", "unavailable", "unanchored", "no-master-key", "stale", "anchored")
+    statuses = [str(c.get("anchor_status") or "unanchored") for c in (admin_chain, mcp_chain)]
+    anchor_status = min(statuses, key=_ANCHOR_SEVERITY.index) if statuses else "unanchored"
     return {
         "ok": bool(admin_chain.get("ok")) and bool(mcp_chain.get("ok")),
+        "anchored": bool(admin_chain.get("anchored")) and bool(mcp_chain.get("anchored")),
+        "anchor_status": anchor_status,
         "admin_audit": admin_chain,
         "mcp_call_audit": mcp_chain,
     }
@@ -2242,6 +2321,12 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
             400,
             f"model_type {body.model_type!r} is invalid — must be one of {sorted(MODEL_TYPES)}",
         )
+    # SSRF GATE FIRST (audit 2026-11-10 P2-9): _check_url_async must refuse
+    # loopback/link-local/metadata targets BEFORE any outbound request —
+    # _probe_endpoint_type below issues a real GET /models plus up to four
+    # POST probes with a 20 s timeout, and the old order let it fire at a
+    # not-yet-validated URL.
+    await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
     if body.model_type is None:
         # DETECT (2026-10-26): probe the pool's first endpoint and use the
         # verdict. Detection is best-effort by design — an unreachable endpoint
@@ -2262,25 +2347,29 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
             log.exception("model_type detection failed for %r — defaulting to chat", body.model_name)
         body = body.model_copy(update={"model_type": detected_type})
         log.info("model_type not supplied for %r — %s (%s)", body.model_name, detected_type, detected_reason)
-    await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
     # MODEL-GROUP SHADOW GUARD (review F3-2): a group name is a callable model
     # id, and the data plane resolves it as a group BEFORE any pool lookup. A
     # pool registered under an existing group's name would therefore be
     # silently unaddressable — refuse at the write path, the mirror of the
     # group-create check that refuses a name equal to a registered model.
-    try:
-        from ..core import model_groups as _model_groups_mod
+    # GATED on settings.model_groups_enabled (audit 2026-11-10 P2-10): with
+    # the flag off (the default) the data plane never resolves a group, so
+    # consulting the table here would refuse config for a feature that is
+    # inert — the same gate the profile-ordering check below applies.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _model_groups_mod
 
-        await _model_groups_mod.load()
-        if _model_groups_mod.group_for(body.model_name) is not None:
-            raise HTTPException(
-                400,
-                f"model {body.model_name!r} is already a model group — a pool may not shadow a group",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        log.warning("model upsert: model-group shadow check failed (fail-open)", exc_info=True)
+            await _model_groups_mod.load()
+            if _model_groups_mod.group_for(body.model_name) is not None:
+                raise HTTPException(
+                    400,
+                    f"model {body.model_name!r} is already a model group — a pool may not shadow a group",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            log.warning("model upsert: model-group shadow check failed (fail-open)", exc_info=True)
     # Panel credentials: resolve each endpoint's api_key to ciphertext (or a
     # clear/set marker) BEFORE the write; plaintext never leaves this block.
     enc_rows = []
@@ -2704,15 +2793,20 @@ async def _validate_fallback_chain(model_name: str, fallbacks: list[str]) -> lis
     # (routes_proxy._next_fallback_candidate). Accept it at save time too, or
     # the feature is unreachable through the admin API. Chat groups only: the
     # walker would skip a non-chat one, so saving it would be dead config.
-    try:
-        from ..core import model_groups as _model_groups_mod
+    # GATED on settings.model_groups_enabled (audit 2026-11-10 P2-10), the
+    # sibling of the profile-ordering gate: with the flag off the walker
+    # never resolves a group, so accepting a group name would save inert
+    # config and a group-named entry must read as the unknown name it is.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _model_groups_mod
 
-        await _model_groups_mod.load()
-        for _gname, _group in _model_groups_mod.snapshot().items():
-            if getattr(_group, "model_type", "chat") == "chat":
-                known.add(_gname)
-    except Exception:
-        log.warning("fallbacks: model-group names unavailable (fail-open to models only)", exc_info=True)
+            await _model_groups_mod.load()
+            for _gname, _group in _model_groups_mod.snapshot().items():
+                if getattr(_group, "model_type", "chat") == "chat":
+                    known.add(_gname)
+        except Exception:
+            log.warning("fallbacks: model-group names unavailable (fail-open to models only)", exc_info=True)
     if model_name not in known:
         raise HTTPException(404, f"model {model_name!r} is not registered")
     unknown = [n for n in fallbacks if n not in known]
@@ -2919,7 +3013,8 @@ async def patch_mcp_grants_server(
                   key currently holds on this server (TRUE rows + the
                   profile's live-grant presets) and the server's live
                   catalog. This is what makes "disable all" actually hold
-                  under the default tool_relay_grant_mode="scope": the
+                  under tool_relay_grant_mode="scope" (the legacy opt-in — the
+                  default is "explicit"): the
                   scope merge re-adds the whole policy-admitted catalog
                   AFTER the grant filter, so a deny row per offered tool is
                   the only thing that holds it back. Bounded: the write set
@@ -3542,33 +3637,123 @@ class ModelCost(BaseModel):
     input_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
     output_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
     cached_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
+    # P10 billing unit — the CHECK vocabulary model_costs carries. Default
+    # 'token': a client that never heard of units writes exactly what every
+    # pre-P10 row stores, so existing console/API callers are byte-compatible.
+    # Literal (not a free str) makes an out-of-vocabulary unit a 422, never a
+    # Postgres CHECK violation 500.
+    unit: Literal["token", "char", "second", "image", "request"] = "token"
 
 
 @router.post("/costs")
 async def set_model_cost(body: ModelCost, request: Request, _: AdminDep) -> dict[str, Any]:
-    """Price a model: USD per 1M tokens (input / output / cached).
+    """Price a model: USD per 1M UNITS (input / output / cached).
 
     Costs are computed AND STORED on each ledger row at request time —
     repricing later never rewrites history. Unpriced models ledger NULL.
+    P10: `unit` names what a "1M" of the rates IS — 'token' (default, every
+    pre-P10 row), or 'char' | 'second' | 'image' | 'request' for the
+    unit-aware routes. The routes that bill a REAL unit price through
+    costs.compute_units and REFUSE a mismatched row (guard-reported), so a
+    wrong unit here is a named misconfiguration, not a wrong-rate bill.
     """
     for v in (body.input_per_m, body.output_per_m, body.cached_per_m):
         if v < 0:
             raise HTTPException(400, "rates must be >= 0")
-    await costs.set_cost(body.model_name, body.input_per_m, body.output_per_m, body.cached_per_m)
+    await costs.set_cost(body.model_name, body.input_per_m, body.output_per_m, body.cached_per_m, unit=body.unit)
     await _audit(
         request,
         action="costs.set",
         resource_type="model",
         resource_id=body.model_name,
-        details={"input_per_m": body.input_per_m, "output_per_m": body.output_per_m, "cached_per_m": body.cached_per_m},
+        details={
+            "input_per_m": body.input_per_m,
+            "output_per_m": body.output_per_m,
+            "cached_per_m": body.cached_per_m,
+            "unit": body.unit,
+        },
     )
-    return {"model_name": body.model_name, "priced": True}
+    return {"model_name": body.model_name, "priced": True, "unit": body.unit}
 
 
 @router.get("/costs")
-async def list_model_costs(_: AdminDep) -> list[dict[str, Any]]:
-    """All configured model prices."""
-    return await costs.list_costs()
+async def list_model_costs(_: AdminDep) -> dict[str, Any]:
+    """All configured model prices, plus the pricing-COVERAGE blind spot
+    (audit 2026-11-10 §7): an unpriced model ledgers cost_usd NULL and the
+    USD-budget SUM ignores NULL, so a tenant with only a USD budget can burn
+    unbounded GPU time on it — this read surface NAMES the gap instead of
+    leaving it invisible.
+
+    Shape: {"costs": [<price rows, exactly the projection this endpoint
+    always returned>], "unpriced": [<registered model names with no
+    model_costs row, sorted>], "unit_mismatch": [{model, unit, expected,
+    model_type}]}.
+
+    unpriced uses costs.unpriced (NOT warn_unpriced): the console refreshes
+    this endpoint on every Costs-tab visit, and the WARNING line belongs to
+    startup/the operator, not to a per-refresh log. The model list is the
+    registered POOLS (model_router.models()), deliberately not
+    _routing_chat_models(): a MODEL GROUP never needs a price row (the
+    selected member bills its own price), so groups would be permanent false
+    positives there — and chat-only scoping would hide the same blind spot
+    on embedding/voice pools, which bill just as real.
+
+    unit_mismatch (P10): a PRICED model whose model_costs.unit cannot match
+    what its route bills is reported here instead of silently billing at the
+    wrong rate. The expected units keep the provisional PLURAL spellings the
+    2026-11-10 read shape pinned ('tokens'/'seconds'); model_costs.unit stores
+    the CHECK vocabulary's singular ('token'/'second'), so a singular stored
+    unit is normalized onto its plural expected form for the COMPARISON only —
+    a correctly configured token row must not read as a false mismatch.
+    """
+    rows = await costs.list_costs()
+    models = model_router.models()
+    unpriced_models = await costs.unpriced(models)
+    # The check reads the LIST_COSTS rows (not the _load cache): the rows are
+    # this endpoint's own projection and the only place a pre-P10-shaped row
+    # (unit absent -> legacy token behaviour, never a mismatch) is visible.
+    # Expected-unit map by registry model_type — the provisional plural wire
+    # vocabulary (chat/embedding/reranker/decision bill per TOKEN; voice per
+    # SECOND of audio). Unknown types are skipped, not guessed.
+    _EXPECTED_UNIT = {
+        "chat": "tokens",
+        "embedding": "tokens",
+        "reranker": "tokens",
+        "decision": "tokens",
+        "voice": "seconds",
+    }
+    _SINGULAR_TO_PLURAL = {
+        "token": "tokens",
+        "char": "chars",
+        "second": "seconds",
+        "image": "images",
+        "request": "requests",
+    }
+    unit_mismatch: list[dict[str, str]] = []
+    priced = {str(r.get("model_name")): r for r in rows}
+    for name in models:
+        row = priced.get(name)
+        if row is None:
+            continue  # unpriced — already reported above
+        unit = row.get("unit")
+        if not isinstance(unit, str) or not unit:
+            continue  # a pre-P10 row (column absent/empty) — legacy, not a mismatch
+        pool = model_router.pool(name)
+        types = {str(ep.model_type) for ep in pool.endpoints} if pool is not None and pool.endpoints else set()
+        # A MIXED pool may bill more than one unit (per-endpoint routes); the
+        # stored unit must match at least one of them.
+        expected_units = {_EXPECTED_UNIT[t] for t in types if t in _EXPECTED_UNIT}
+        stored = _SINGULAR_TO_PLURAL.get(unit, unit)  # singular CHECK vocab -> provisional plural
+        if expected_units and stored not in expected_units:
+            unit_mismatch.append(
+                {
+                    "model": name,
+                    "unit": unit,
+                    "expected": "/".join(sorted(expected_units)),
+                    "model_type": ",".join(sorted(types)),
+                }
+            )
+    return {"costs": rows, "unpriced": unpriced_models, "unit_mismatch": unit_mismatch}
 
 
 @router.delete("/costs/{model_name:path}")
@@ -3708,7 +3893,11 @@ class MemoryPreset(BaseModel):
 
 
 class ProfileCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit 2026-11-10): profile names render in the console
+    # dropdowns and the CSV exports — the INVARIANT's own comment requires the
+    # same rule every other name surface enforces (tenants/users/keys above,
+    # the team-leader mint, the enroll door).
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
     model_order: list[str] = Field(default_factory=list, max_length=100)
     # Key-creation presets: budgets + MCP tool grants stamped onto every key
     # created with this profile ("profiles as defaults").
@@ -3850,7 +4039,10 @@ async def _preset_stamp_catalogs() -> tuple[dict[str, list[dict[str, Any]]], lis
 
 
 class AgentUpsert(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit 2026-11-10): an agent name IS a callable model id
+    # (/v1/models advertises it; it renders in the console and the CSV exports)
+    # — the same rule every other name surface enforces, per the invariant.
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
     description: str = Field("", max_length=400)
     servers: list[str] = Field(default_factory=list, max_length=100)
     # Per-server TOOL narrowing: {server: [tool, ...]}. A server OMITTED here is
@@ -4678,6 +4870,36 @@ async def assign_profile(user_id: uuid.UUID, body: UserAssignProfile, request: R
     return dict(row)
 
 
+def _fold_unit_rows(rows: list[Any], group_cols: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Fold GROUPING SETS per-unit subrows into their group's total row.
+
+    The unit-aware rollups (P10) group by (group, unit_kind) AS WELL AS the
+    group itself — one SUM(billable_units) across kinds adds CHARS to SECONDS,
+    which is not a number (cross-validation wave 2, 2026-11-10). The group
+    total row (unit_kind IS NULL) keeps every shared aggregate EXACTLY as the
+    pre-GROUPING-SETS query computed it; each per-unit subrow contributes one
+    key to the total row's `billable_units_by_unit` object ({unit: units}).
+    The fold runs AFTER the whole pass (subrows and totals interleave in the
+    SQL ordering) and the folded list is re-sorted by cost, the display
+    order the query used to deliver.
+    """
+    folded: list[dict[str, Any]] = []
+    by_unit: dict[tuple[Any, ...], dict[str, float]] = {}
+    for r in rows:
+        d = dict(r)
+        unit_kind = d.pop("unit_kind", None)
+        unit_units = d.pop("unit_units", None)
+        key = tuple(d.get(c) for c in group_cols)
+        if unit_kind is None:
+            folded.append(d)
+        else:
+            by_unit.setdefault(key, {})[str(unit_kind)] = float(unit_units or 0.0)
+    for d in folded:
+        d["billable_units_by_unit"] = by_unit.get(tuple(d.get(c) for c in group_cols), {})
+    folded.sort(key=lambda d: d.get("cost_usd") or 0.0, reverse=True)
+    return folded
+
+
 @router.get("/usage/summary")
 async def usage_summary(_: AdminDep, since: str | None = None, until: str | None = None) -> dict[str, Any]:
     """Ledger rollup: requests, tokens (in/out/cached split), cache hits,
@@ -4688,6 +4910,20 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     console received "4427047307" (a string) and its String.toLocaleString
     rendered it comma-less. bigint decodes as a plain int, so the wire
     carries real JSON numbers (exact well past any plausible token count).
+
+    Status scope (cross-validation wave 2, 2026-11-10): the totals row is
+    the number the USD budget GATE can be compared against, so its
+    requests/billed_tokens projections carry the gate's OWN predicate —
+    status IN _COSTED_SQL for billed tokens (cache_hit rows are free) and
+    routing rows excluded from requests — instead of counting the
+    gateway's own routing turns as if the tenant made them. The routing
+    spend stays VISIBLE as its own routing_requests/routing_cost_usd line
+    so chargeback still sees the decision model's real GPU time.
+
+    Unit-aware rows (P10): by_model/by_key carry billable_units_by_unit —
+    an object keyed by unit kind ({"second": 30.0, "char_estimate": 1000.0})
+    — instead of one SUM across kinds (adding chars to seconds is not a
+    number, it is a typo with a decimal point).
 
     Bounded (audit P1-4): defaults to the last 30 days; the ledger is never
     pruned and an unbounded aggregate on the pool the data plane shares
@@ -4704,7 +4940,13 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     row = await db.fetchrow(
         f"""
         SELECT
-          count(*)                                                    AS requests,
+          -- The tenant made this many requests (cross-validation wave 2):
+          -- routing rows are the gateway's OWN decision turn, settled under
+          -- the caller's key — counting them here reported 2 requests where
+          -- the tenant made 1. The routing spend stays visible as its own
+          -- line below.
+          count(*) FILTER (WHERE status <> 'routing')                AS requests,
+          count(*) FILTER (WHERE status = 'routing')                 AS routing_requests,
           COALESCE(SUM(total_tokens), 0)::bigint                      AS total_tokens,
           COALESCE(SUM(prompt_tokens), 0)::bigint                     AS input_tokens,
           COALESCE(SUM(completion_tokens), 0)::bigint                 AS output_tokens,
@@ -4724,13 +4966,20 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                THEN ROUND(100.0 * SUM(cached_tokens) FILTER (WHERE status <> 'cache_hit') / SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 1)
                ELSE NULL END                                          AS cache_hit_rate_pct,
           COALESCE(SUM(cost_usd), 0)::float                           AS cost_usd,
-          COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billed_tokens,
+          COALESCE(SUM(cost_usd) FILTER (WHERE status = 'routing'), 0)::float AS routing_cost_usd,
+          -- The GATE's own number (2026-10-30) WITH the gate's own money
+          -- predicate: the budget SUM adds AND status IN (_COSTED_SQL), so the
+          -- console MUST too — comparing the gate's spend against a summary
+          -- that also summed the gateway's own routing rows showed +26.7%
+          -- phantom spend (cross-validation wave 2, measured).
+          COALESCE(SUM({_budget_token_value("usage_ledger")})
+                   FILTER (WHERE usage_ledger.status IN ({_COSTED_SQL})), 0)::float AS billed_tokens,
           COALESCE(SUM(cost_usd * billing_fraction), 0)::float        AS billed_cost_usd
         FROM usage_ledger{_cond}
         """,
         *_win,
     )
-    by_model = await db.fetch(
+    raw_by_model = await db.fetch(
         f"""
         SELECT model,
                count(*)                                            AS requests,
@@ -4744,11 +4993,21 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                COALESCE(SUM(cost_usd), 0)::float                   AS cost_usd,
                COALESCE(SUM(total_tokens * billing_fraction), 0)::float AS billed_tokens,
                COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billable_tokens,
-               COALESCE(SUM(cost_usd * billing_fraction), 0)::float     AS billed_cost_usd
-        FROM usage_ledger{_cond} GROUP BY model ORDER BY cost_usd DESC
+               COALESCE(SUM(cost_usd * billing_fraction), 0)::float     AS billed_cost_usd,
+               unit_kind,
+               -- P10 unit-aware billing (see the /usage explorer note):
+               -- summed PER UNIT KIND only — one SUM across kinds adds chars
+               -- to seconds (cross-validation wave 2, 2026-11-10); the
+               -- per-unit GROUPING SETS subrows are folded into the model
+               -- total row's billable_units_by_unit object in Python.
+               COALESCE(SUM(billable_units), 0)::float             AS unit_units
+        FROM usage_ledger{_cond}
+        GROUP BY GROUPING SETS ((model), (model, unit_kind))
+        ORDER BY model, unit_kind NULLS FIRST
         """,
         *_win,
     )
+    by_model = _fold_unit_rows(raw_by_model, ("model",))
     # CHARGEBACK ROLLUP (2026-10-20): grouped by (key NAME, user), NOT by
     # key_id. `POST /keys/{id}/rotate` mints a NEW key row with the SAME name
     # and user and revokes the old one, so grouping by id split one logical
@@ -4763,7 +5022,7 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     # only ever REVOKED (never deleted), so every ledger row resolves to a name.
     # `generations` counts the distinct key rows behind a row, so a rotated
     # credential stays visible as rotated instead of masquerading as one key.
-    by_key = await db.fetch(
+    raw_by_key = await db.fetch(
         f"""
         SELECT k.name AS key_name, u.name AS user_name,
                count(DISTINCT l.key_id)                            AS generations,
@@ -4778,15 +5037,22 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                COALESCE(SUM(l.cost_usd), 0)::float                 AS cost_usd,
                COALESCE(SUM(l.total_tokens * l.billing_fraction), 0)::float AS billed_tokens,
                COALESCE({_billable_tokens_sql("l")}, 0)::float             AS billable_tokens,
-               COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd
+               COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd,
+               l.unit_kind,
+               -- P10 unit-aware billing (see the /usage explorer note):
+               -- per-unit-kind sums only, folded into billable_units_by_unit
+               -- in Python (one SUM across kinds adds chars to seconds).
+               COALESCE(SUM(l.billable_units), 0)::float           AS unit_units
         FROM usage_ledger l
         LEFT JOIN api_keys k ON k.id = l.key_id
         LEFT JOIN users u ON u.id = k.user_id
         {_cond_l}
-        GROUP BY k.name, u.name ORDER BY cost_usd DESC
+        GROUP BY GROUPING SETS ((k.name, u.name), (k.name, u.name, l.unit_kind))
+        ORDER BY k.name, u.name, l.unit_kind NULLS FIRST
         """,
         *_win,
     )
+    by_key = _fold_unit_rows(raw_by_key, ("key_name", "user_name"))
     # PER-KEY / PER-MODEL breakdown, for the console's expandable rows.
     # Same (key NAME, user) grouping as by_key so a rotated credential stays
     # one logical row; adding model splits it further without changing the
