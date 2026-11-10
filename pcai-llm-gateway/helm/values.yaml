@@ -529,6 +529,12 @@ settings:
   otelServiceName: pcai-llm-gateway
   # Deterministic per-trace hash ratio: 0 = none, 1 = all.
   otelSampleRatio: 1.0
+  # Extra headers on every OTLP export, in the OpenTelemetry convention: a
+  # comma-separated list of Key=Value pairs. Needed when the backend
+  # authenticates the exporter — Langfuse wants
+  #   Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4
+  # Empty (default) = content-type only, i.e. an unauthenticated collector.
+  otelHeaders: ""
 
   # Session affinity: a chat conversation that sends X-PCAI-Session pins the
   # ENDPOINT (not just the cascade head) so its prefix keeps hitting the same

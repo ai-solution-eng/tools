@@ -140,7 +140,15 @@ class Span:
     duration are only known when the work finishes.
     """
 
-    __slots__ = ("attributes", "ended", "name", "span_id", "start_ns", "trace_id")
+    __slots__ = (
+        "attributes",
+        "ended",
+        "name",
+        "parent_span_id",
+        "span_id",
+        "start_ns",
+        "trace_id",
+    )
 
     def __init__(
         self,
@@ -149,12 +157,14 @@ class Span:
         span_id: str,
         start_ns: int,
         attributes: Mapping[str, Any] | None = None,
+        parent_span_id: str | None = None,
     ) -> None:
         self.name = name
         self.trace_id = trace_id
         self.span_id = span_id
         self.start_ns = start_ns
         self.attributes: dict[str, Any] = dict(attributes or {})
+        self.parent_span_id = parent_span_id
         self.ended = False
 
     def end(self, extra_attrs: Mapping[str, Any] | None = None, *, error: bool = False) -> None:
@@ -173,6 +183,7 @@ class Span:
             end_ns=time.time_ns(),
             attributes=attrs,
             error=error,
+            parent_span_id=self.parent_span_id,
         )
         try:
             _submit(payload)
@@ -204,18 +215,29 @@ def start_span(
     attributes: Mapping[str, Any] | None = None,
     *,
     trace_id: str | None = None,
+    parent_span_id: str | None = None,
+    start_ns: int | None = None,
 ) -> Span:
     """Start a span, or return the shared NoopSpan when tracing is off/unsampled.
 
     trace_id is optional: pass a parent span's trace id to make this a CHILD of
     the same trace (and inherit the parent's deterministic sampling decision).
+    parent_span_id records the parent so the backend can NEST the child under
+    it; it does not influence sampling — the trace id decides that.
     """
     if not settings.otel_enabled:
         return _NOOP
     tid = trace_id or new_trace_id()
     if not should_sample(tid):
         return _NOOP
-    return Span(name, tid, new_span_id(), time.time_ns(), attributes)
+    return Span(
+        name,
+        tid,
+        new_span_id(),
+        start_ns if start_ns is not None else time.time_ns(),
+        attributes,
+        parent_span_id=parent_span_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,20 +245,24 @@ def start_span(
 # ---------------------------------------------------------------------------
 
 
-def _attr_value(value: Any) -> str:
-    """Stringify one attribute value for the wire (stringValue only).
+def _attr_value(value: Any) -> dict[str, Any]:
+    """Map one attribute value to its OTLP/JSON value object.
 
-    Booleans become JSON's "true"/"false" rather than Python's "True"/"False":
-    a collector displaying span attributes should read like the rest of the
-    OTLP ecosystem.
+    Numeric attributes go on the wire as NUMBERS, not strings: Langfuse reads
+    token counts from `intValue` and files a stringified count into its
+    metadata catch-all instead of the usage column. bool is tested BEFORE int
+    because bool is a subclass of int in Python. Everything else stays
+    stringValue — the shape this exporter has always emitted, so existing
+    collectors see no change.
     """
     if isinstance(value, bool):
-        text = "true" if value else "false"
-    elif isinstance(value, str):
-        text = value
-    else:
-        text = str(value)
-    return text[:_ATTR_VALUE_LIMIT]
+        return {"stringValue": "true" if value else "false"}
+    if isinstance(value, int):
+        # OTLP/JSON encodes int64 as a string.
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)[:_ATTR_VALUE_LIMIT]}
 
 
 def _payload(
@@ -248,34 +274,36 @@ def _payload(
     end_ns: int,
     attributes: Mapping[str, Any],
     error: bool,
+    parent_span_id: str | None = None,
 ) -> dict[str, Any]:
-    """The documented OTLP/HTTP JSON body for ONE span."""
+    """The documented OTLP/HTTP JSON body for ONE span.
+
+    parentSpanId is omitted (not null) when absent: an absent parent makes the
+    span the root of its trace, and an explicit null is not valid OTLP.
+    """
+    span: dict[str, Any] = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": _SPAN_KIND_SERVER,
+        "startTimeUnixNano": str(start_ns),
+        "endTimeUnixNano": str(end_ns),
+        "attributes": [
+            {"key": str(key), "value": _attr_value(value)} for key, value in attributes.items()
+        ],
+        "status": {"code": _STATUS_ERROR if error else _STATUS_OK},
+    }
+    if parent_span_id:
+        span["parentSpanId"] = parent_span_id
     return {
         "resourceSpans": [
             {
                 "resource": {
-                    "attributes": [{"key": "service.name", "value": {"stringValue": str(settings.otel_service_name)}}]
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": str(settings.otel_service_name)}}
+                    ]
                 },
-                "scopeSpans": [
-                    {
-                        "scope": {"name": _SCOPE_NAME},
-                        "spans": [
-                            {
-                                "traceId": trace_id,
-                                "spanId": span_id,
-                                "name": name,
-                                "kind": _SPAN_KIND_SERVER,
-                                "startTimeUnixNano": str(start_ns),
-                                "endTimeUnixNano": str(end_ns),
-                                "attributes": [
-                                    {"key": str(key), "value": {"stringValue": _attr_value(value)}}
-                                    for key, value in attributes.items()
-                                ],
-                                "status": {"code": _STATUS_ERROR if error else _STATUS_OK},
-                            }
-                        ],
-                    }
-                ],
+                "scopeSpans": [{"scope": {"name": _SCOPE_NAME}, "spans": [span]}],
             }
         ]
     }
@@ -324,6 +352,31 @@ def _submit(payload: dict[str, Any]) -> None:
     task.add_done_callback(_PENDING.discard)
 
 
+def _export_headers() -> dict[str, str]:
+    """Request headers for the OTLP POST: content-type plus configured extras.
+
+    settings.otel_headers follows the OpenTelemetry convention — a
+    comma-separated list of Key=Value pairs, the same shape as
+    OTEL_EXPORTER_OTLP_HEADERS, e.g.
+
+        Authorization=Basic <base64>,x-langfuse-ingestion-version=4
+
+    Parsed here rather than stored as a dict so the deployment knob stays a
+    single env var. An empty setting returns content-type alone, which is
+    exactly today's behaviour.
+    """
+    headers = {"content-type": "application/json"}
+    for pair in (settings.otel_headers or "").split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if key:
+            headers[key] = value.strip()
+    return headers
+
+
 async def _export(payload: dict[str, Any]) -> None:
     """POST one OTLP/JSON batch. EVERY failure is swallowed to debug.
 
@@ -338,7 +391,7 @@ async def _export(payload: dict[str, Any]) -> None:
         await client.post(
             url,
             content=body,
-            headers={"content-type": "application/json"},
+            headers=_export_headers(),
             timeout=_HTTP_TIMEOUT_S,
         )
     except Exception:

@@ -57,6 +57,7 @@ from ..core import (
     title_requests,
     toolcompress,
     toolrelay,
+    tracing,
     upstream_auth,
     wire_compat,
 )
@@ -96,6 +97,18 @@ _RETRY_AFTER_RATE_LIMITED = "5"  # seconds; client should back off briefly
 def _latency_ms(started: float) -> int:
     """Wall-clock latency in whole ms since `started` (a monotonic stamp)."""
     return int((time.monotonic() - started) * 1000)
+
+
+def _span_user_id(key: Any) -> str:
+    """The ledger owner's id, for the span's user.id attribute.
+
+    str() because KeyRecord.user_id is a UUID and OTLP attributes are text;
+    getattr keeps span building safe against the key stubs used in tests.
+    Empty string when unknown — the attribute is then simply not emitted,
+    rather than recording a misleading blank.
+    """
+    uid = getattr(key, "user_id", None)
+    return str(uid) if uid else ""
 
 
 def _relay_wants(header_value: str | None, key_default: bool, enabled: bool) -> bool:
@@ -1341,6 +1354,36 @@ async def _proxy_json(
         # prefilled from cache. Anything absent/odd is 0 (no fabricated facts).
         _details = usage.get("prompt_tokens_details")
         cached_tokens = int(_details.get("cached_tokens") or 0) if isinstance(_details, dict) else 0
+
+        # --- OTLP: one generation span per real model call -------------------
+        # Emitted AFTER usage is known and BEFORE the guardrail branches, so a
+        # blocked or masked answer still records the tokens it actually spent.
+        # Metadata only — model, token counts, latency, status; never the prompt
+        # or the completion. No-op when tracing is off (the default).
+        # start_ns is backdated so the span carries the real call duration
+        # rather than the instant the payload was built.
+        _span_attrs: dict[str, Any] = {
+            "langfuse.observation.type": "generation",
+            "langfuse.trace.name": endpoint,
+            "langfuse.observation.model.name": cur_model,
+            "gen_ai.operation.name": endpoint,
+            "gen_ai.request.model": cur_model,
+            "gen_ai.usage.input_tokens": prompt_tokens,
+            "gen_ai.usage.output_tokens": completion_tokens,
+            "gen_ai.response.id": request_id,
+            "duration_ms": latency,
+        }
+        # user.id is the ledger owner, not a name or email: a pseudonymous UUID
+        # that lets Langfuse aggregate cost per user. Omitted entirely when
+        # unknown so no blank user rows are created.
+        _uid = _span_user_id(key)
+        if _uid:
+            _span_attrs["user.id"] = _uid
+        tracing.start_span(
+            "chat",
+            _span_attrs,
+            start_ns=time.time_ns() - latency * 1_000_000,
+        ).end()
 
         # --- post-call guardrails (chat only): judge the assistant text -------
         guard_all: list[dict[str, Any]] = list(pre_events or [])
@@ -2694,6 +2737,26 @@ async def _relay_sse(
         if _started is not None:
             _metrics.observe_ttft(getattr(ledger, "_model", ""), time.monotonic() - _started)
 
+    # --- OTLP: one generation span per streamed model call -------------------
+    # Opened here and closed in the finally below, so it covers the WHOLE
+    # stream — including a client disconnect, which is why it shares the
+    # finally that settles the ledger. Metadata only: model, token counts,
+    # latency, completion status; never the prompt or the streamed text.
+    # No-op when tracing is off (the default).
+    _span_attrs: dict[str, Any] = {
+        "langfuse.observation.type": "generation",
+        "langfuse.trace.name": "chat",
+        "langfuse.observation.model.name": getattr(ledger, "_model", ""),
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": getattr(ledger, "_model", ""),
+        "gen_ai.response.id": getattr(ledger, "_request_id", ""),
+    }
+    # Same pseudonymous UUID as the non-streaming path; omitted when unknown.
+    _uid = _span_user_id(getattr(ledger, "_key", None))
+    if _uid:
+        _span_attrs["user.id"] = _uid
+    span = tracing.start_span("chat", _span_attrs)
+
     try:
         if prefix:
             # TTFT-peek replay (`_peek_first_data_line`): these bytes were
@@ -2730,6 +2793,25 @@ async def _relay_sse(
             await resp.aclose()
             if not defer_finish:
                 await ledger.finish()
+            # Span close belongs INSIDE the shield, and is a plain (never
+            # awaited) call. After the shield exits, any pending cancellation
+            # is delivered at the next checkpoint — so a post-shield end()
+            # would be skipped precisely on client disconnect, which is the
+            # case this has to record. Sync + shielded = always emitted.
+            # Read usage off the ledger's public attribute rather than the
+            # private _tokens() helper: a completed stream carries the upstream
+            # usage object, an abandoned one carries None (recorded as 0 tokens,
+            # which the error status marks as "unknown" rather than "free").
+            _usage = getattr(ledger, "usage", None) or {}
+            span.end(
+                {
+                    "gen_ai.usage.input_tokens": int(_usage.get("prompt_tokens") or 0),
+                    "gen_ai.usage.output_tokens": int(_usage.get("completion_tokens") or 0),
+                    "duration_ms": _latency_ms(getattr(ledger, "_started", time.monotonic())),
+                    "stream.completed": ledger.completed,
+                },
+                error=not ledger.completed,
+            )
 
 
 def _sse_guard_error(message: str, code: str = "guardrail_blocked") -> bytes:

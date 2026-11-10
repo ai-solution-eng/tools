@@ -35,7 +35,7 @@ import anyio
 import httpx2
 
 from ..config import clamp_max_tokens, settings
-from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces
+from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces, tracing
 from . import metrics as _metrics
 from .budgets import check_budgets, settle
 from .canonical import thread_key
@@ -1461,6 +1461,12 @@ async def relay_stream(
     # settle path — same coroutine, so the slot is always current).
     _last_offered_tools: list[list[dict] | None] = [None]
 
+    # OTLP trace linkage: (trace_id, span_id) of the most recent model-call
+    # span. Single-slot cell, same convention as _last_offered_tools above.
+    # Empty until a call settles — a tool span then starts its own trace
+    # rather than nesting, which is degraded but never wrong.
+    _last_span_ids: list[tuple[str, str]] = []
+
     async def _trace_step(
         step_iteration: int,
         phase: str,
@@ -1496,6 +1502,42 @@ async def relay_stream(
             thread_id=thread_id,
             cached_tokens=cached_tokens,
         )
+
+    def _emit_tool_span(server: str, tool: str, ms: int | None, status: str) -> None:
+        """OTLP span for ONE executed tool call. Metadata only, never raises.
+
+        Named '<server>__<tool>' so a backend reads the tool the model actually
+        asked for. Arguments and results are deliberately NOT exported — both
+        can carry user data, and the gateway already stores a bounded preview
+        in its own effective_prompts/agent_traces tables for that need.
+
+        Nests under the model call that requested it via parentSpanId when that
+        span was sampled (trace_id+parent_span_id); otherwise it starts its own
+        trace. No-op when tracing is off — start_span returns the shared Noop.
+        """
+        elapsed = ms or 0
+        attrs: dict[str, Any] = {
+            "langfuse.observation.type": "span",
+            "langfuse.trace.name": "tool",
+            "mcp.server": server,
+            "mcp.tool": tool,
+            "duration_ms": elapsed,
+            "tool.status": status,
+        }
+        # Conversation grouping, same value the chat span carries. Langfuse
+        # aggregates on the trace, but its docs ask for the attribute on every
+        # span, and a tool span that starts its OWN trace (no sampled parent)
+        # would otherwise land in no session at all.
+        if thread_id:
+            attrs["langfuse.session.id"] = str(thread_id)
+        linked = _last_span_ids[0] if _last_span_ids else None
+        tracing.start_span(
+            f"{server}{TOOLSEP}{tool}",
+            attrs,
+            trace_id=linked[0] if linked else None,
+            parent_span_id=linked[1] if linked else None,
+            start_ns=time.time_ns() - elapsed * 1_000_000,
+        ).end()
 
     async def _capture_prompt(
         msgs: list[dict],
@@ -1600,6 +1642,52 @@ async def relay_stream(
             # effective-prompt capture (additive, best-effort, strictly AFTER
             # the upstream call completed — observation never blocks the wire)
             await _capture_prompt(msgs, _last_offered_tools[0], call_attempt)
+        # --- OTLP: one generation span per relay model call -------------------
+        # This is the ONLY point every relay iteration passes through, and it
+        # already holds the model, the observed usage and the latency — so an
+        # agent turn that calls the model five times yields five spans here,
+        # instead of the one-per-request shape the plain paths produce.
+        # Without this the tool-relay path emitted NOTHING: agent traffic (the
+        # bulk of it) never reached a backend, which read as "tracing is broken"
+        # while the HTTP middleware span was the only thing arriving.
+        # Metadata only — model, token counts, latency, status. Never the
+        # prompt or the completion. No-op when tracing is off (the default).
+        _span_attrs: dict[str, Any] = {
+            "langfuse.observation.type": "generation",
+            "langfuse.trace.name": "chat",
+            "langfuse.observation.model.name": model,
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": model,
+            "gen_ai.usage.input_tokens": prompt,
+            "gen_ai.usage.output_tokens": completion,
+            "gen_ai.response.id": request_id,
+            "duration_ms": latency,
+        }
+        # Pseudonymous ledger owner (a UUID, not a name or email); omitted when
+        # unknown so no blank user rows are created.
+        if user_id:
+            _span_attrs["user.id"] = str(user_id)
+        # Conversation grouping. thread_id is the gateway's OWN fingerprint of
+        # the message history (canonical.thread_key), so every turn of one
+        # conversation groups into the same Langfuse session — no client change
+        # needed. This matters because clients do NOT send X-PCAI-Session: a
+        # month of traffic produced 5 pins, all stale, none in the last hour.
+        # Omitted when absent so no empty sessions are created.
+        if thread_id:
+            _span_attrs["langfuse.session.id"] = str(thread_id)
+        _chat_span = tracing.start_span(
+            "chat",
+            _span_attrs,
+            start_ns=time.time_ns() - latency * 1_000_000,
+        )
+        _chat_span.end()
+        # Publish the ids so a tool span that follows can nest under THIS call
+        # (parentSpanId). getattr: a disabled/unsampled span is a NoopSpan and
+        # carries no ids, so the cell simply stays empty.
+        _tid = getattr(_chat_span, "trace_id", "")
+        _sid = getattr(_chat_span, "span_id", "")
+        if _tid and _sid:
+            _last_span_ids[:] = [(_tid, _sid)]
         if iterations_out is not None:
             # C-8: publish the completed-call count at the ONE point every
             # model call passes through, so EVERY terminal (plain finish,
@@ -3128,14 +3216,16 @@ async def relay_stream(
                         )
                     except Exception:
                         log.exception("relay: mcp_call_audit write failed (denied %s/%s)", server, tool)
+                _denied_ms = int((time.monotonic() - started) * 1000)
                 await _trace_step(
                     iteration,
                     "tool",
                     server=server,
                     tool=tool,
-                    ms=int((time.monotonic() - started) * 1000),
+                    ms=_denied_ms,
                     status="denied",
                 )
+                _emit_tool_span(server, tool, _denied_ms, "denied")
                 mcp_summaries.append(f"[tool result] {server}__{tool} → denied by ACL\n")
                 continue
             try:
@@ -3188,9 +3278,9 @@ async def relay_stream(
                 }
             )
             yield _reasoning_trace(server, tool, args, "ok" if ok else "error", ms=ms, content=content)
-            await _trace_step(
-                iteration, "tool", server=server, tool=tool, ms=ms, status=_tool_trace_status(ok, content)
-            )
+            _tool_status = _tool_trace_status(ok, content)
+            await _trace_step(iteration, "tool", server=server, tool=tool, ms=ms, status=_tool_status)
+            _emit_tool_span(server, tool, ms, _tool_status)
             mcp_summaries.append(
                 f"[tool result] {server}__{tool} → {'ok' if ok else 'error'} ({ms}ms)\n{_preview(content)}\n"
             )

@@ -71,7 +71,17 @@ class FakeClient:
         return self.body(index)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
 
     def attrs(self, index: int = 0) -> dict[str, str]:
-        return {a["key"]: a["value"]["stringValue"] for a in self.span(index)["attributes"]}
+        """Attribute map flattened to text.
+
+        intValue/doubleValue are stringified so the existing assertions read
+        the same as before; the WIRE type is asserted separately in
+        test_int_attributes_use_int_value.
+        """
+        out: dict[str, str] = {}
+        for a in self.span(index)["attributes"]:
+            _kind, raw = next(iter(a["value"].items()))
+            out[a["key"]] = str(raw)
+        return out
 
 
 @pytest.fixture(autouse=True)
@@ -252,9 +262,28 @@ async def test_enabled_posts_one_span_with_the_documented_shape(
         "http.status_code": "200",
         "duration_ms": "12.500",
     }
-    # every attribute value is a stringValue on the wire
-    for attr in span_doc["attributes"]:
-        assert set(attr["value"]) == {"stringValue"}
+    # Attribute VALUES are TYPED on the wire: an int rides as intValue so a
+    # backend reads it as a number (Langfuse's usage columns), a string stays
+    # stringValue. Nothing else is emitted.
+    by_key = {attr["key"]: attr["value"] for attr in span_doc["attributes"]}
+    assert by_key["http.status_code"] == {"intValue": "200"}, "int -> intValue"
+    assert by_key["http.method"] == {"stringValue": "GET"}, "str -> stringValue"
+    assert by_key["duration_ms"] == {"stringValue": "12.500"}, "str -> stringValue"
+
+
+async def test_int_attributes_use_int_value(monkeypatch: pytest.MonkeyPatch, fake: FakeClient) -> None:
+    """Token counts must be numbers, not strings, or Langfuse files them in
+    metadata instead of the usage column."""
+    _enable(monkeypatch)
+    tracing.start_span(
+        "chat",
+        {"gen_ai.usage.input_tokens": 123, "gen_ai.usage.output_tokens": 0, "langfuse.trace.name": "chat"},
+    ).end()
+    await tracing.flush()
+    by_key = {a["key"]: a["value"] for a in fake.span()["attributes"]}
+    assert by_key["gen_ai.usage.input_tokens"] == {"intValue": "123"}
+    assert by_key["gen_ai.usage.output_tokens"] == {"intValue": "0"}
+    assert by_key["langfuse.trace.name"] == {"stringValue": "chat"}
 
 
 async def test_error_flag_sets_status_code_2(monkeypatch: pytest.MonkeyPatch, fake: FakeClient) -> None:
