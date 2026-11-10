@@ -33,8 +33,8 @@ fullnameOverride: ""
 # ================================================================
 langfuse:
   # The project the gateway's traces land in.
-  publicKey: "pk-lf-4a3838c4-d9ab-4bcb-a974-23cc14eb121b"
-  secretKey: "sk-lf-ee3ab4fd-38a5-4118-a20a-4d16fd426f75"
+  publicKey: ""
+  secretKey: ""
   # -- Use a pre-existing Secret instead of rendering one.
   # Must contain key `auth` = base64("<publicKey>:<secretKey>").
 
@@ -49,8 +49,8 @@ langfuse:
 # ================================================================
 litellm:
   # "PCAI Dev Team / LiteLLM"
-  publicKey: "pk-lf-4681bd0f-62f6-49ca-91d8-c30e24fcf091"
-  secretKey: "sk-lf-0330591d-c488-43bd-8d6a-2560d60b64aa"
+  publicKey: ""
+  secretKey: ""
   existingSecret: ""
   existingSecret: ""
 
