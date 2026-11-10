@@ -89,7 +89,7 @@ making it public. This is useful for internal images you don't want publicly vis
 
    ```yaml
    imagePullSecrets:
-     - ghcr-pull
+     - name: ghcr-pull
    ```
 
    Please ensure the Deployment attaches this `imagePullSecret`, so the kubelet uses those credentials when
