@@ -6,14 +6,20 @@ every start, seed entries not yet present (and not explicitly removed)
 are merged in, so new seed entries ship with an image upgrade without
 overwriting user edits or resurrecting removed entries.  Each entry is a
 full packaged_models config plus a catalog_id (uuid or seed-* name) and
-a tier (h200 | rtx-pro-6000 | l40s).
+a tier (h200 | rtx-pro-6000 | l40s).  An entry may also carry an optional
+catalog-only ``eval`` block recording the measured quality of a quantised
+variant (see the EVAL section below): it is validated when the entry enters
+the catalog, surfaced as an "unvalidated" badge when absent on a quantised
+entry, and never pushed to MLIS.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 SEED_FILE = Path(__file__).parent / "seed_catalog.json"
@@ -275,6 +281,132 @@ def entry_caveats(entry: dict) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Optional quality evaluation (eval) block
+# ---------------------------------------------------------------------------
+#
+# Catalog entries carry deployment facts (uri, image, args, env, resources,
+# format, tier) — nothing in them says whether a quantised variant
+# (FP8/NVFP4/...) is actually as good as the bf16 original, so an entry
+# without a score is silently treated as equivalent.  The optional ``eval``
+# object closes that gap:
+#
+#     "eval": {
+#         "suite": "mmlu",                # required: which benchmark
+#         "score": 84.2,                  # required: finite number, 0..100
+#         "baseline_bf16": 86.0,          # optional: bf16 reference on the suite
+#         "run_id": "20261028T120000Z",   # optional: the run that measured it
+#         "date": "2026-10-28"            # optional: ISO date of the measurement
+#     }
+#
+# The block is stored verbatim and is CATALOG-ONLY: it never rides into the
+# Push-to-MLIS payload (db.COLUMNS has no "eval" column) and is not part of
+# the configuration fingerprint (versioning.FINGERPRINT_COLUMNS), so adding
+# one to an entry changes neither its MLIS identity nor its version.
+#
+# Full-precision entries (BF16/FP16) ARE the reference a quantised variant is
+# judged against — they need no eval — so only a QUANTISED entry without one
+# is "unvalidated" (badge in the UI, warning on push).
+
+
+def _eval_score_ok(value, label: str, name: str) -> None:
+    """Sanity-check one score-shaped eval field: a finite number in 0..100
+    (both the 0-1 fraction and the 0-100 percent conventions are legal
+    scores).  Raises ValueError naming the entry and the field."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(  # noqa: TRY004 - the catalog's validation idiom is ValueError (see validate_eval)
+            f"{name!r}: eval.{label} must be a number, got {value!r}"
+        )
+    if not math.isfinite(value):
+        raise ValueError(f"{name!r}: eval.{label} must be a finite number, got {value!r}")
+    if not 0 <= value <= 100:
+        raise ValueError(f"{name!r}: eval.{label} must be in 0..100, got {value!r}")
+
+
+def validate_eval(eval_block, name: str = "") -> None:
+    """Validate an entry's optional eval block, raising ValueError (naming the
+    entry and the offending field) when malformed.  Absent/None is always
+    valid — the field is optional.
+
+    This is the catalog's validation idiom: a plain ValueError that the API
+    layer turns into a 4xx/502 with a clear message (catalog add/batch and
+    the GitHub refresh both surface it).  Unknown extra keys are allowed
+    (forward compatibility with future eval sub-fields); the known keys are
+    enforced.
+    """
+    if eval_block is None:
+        return
+    if not isinstance(eval_block, dict):
+        raise ValueError(f"{name!r}: eval must be an object, got {eval_block!r}")  # noqa: TRY004
+    suite = eval_block.get("suite")
+    if not isinstance(suite, str) or not suite.strip():
+        raise ValueError(f"{name!r}: eval.suite is required (non-empty string)")
+    score = eval_block.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ValueError(f"{name!r}: eval.score is required (finite number in 0..100)")  # noqa: TRY004
+    _eval_score_ok(score, "score", name)
+    # baseline_bf16 is OPTIONAL (the documented shape is float|None): only
+    # validate it when the entry actually carries one. Passing the absent
+    # key's None through the score check rejected every entry that omitted
+    # the baseline — which is most of them.
+    baseline = eval_block.get("baseline_bf16")
+    if baseline is not None:
+        _eval_score_ok(baseline, "baseline_bf16", name)
+    run_id = eval_block.get("run_id")
+    if run_id is not None and not isinstance(run_id, str):
+        raise ValueError(f"{name!r}: eval.run_id must be a string when present, got {run_id!r}")
+    date = eval_block.get("date")
+    if date is not None:
+        if not isinstance(date, str):
+            raise ValueError(f"{name!r}: eval.date must be an ISO date (YYYY-MM-DD) string, got {date!r}")
+        try:
+            # Format validation only: a date literal has no timezone, so
+            # there is nothing to localise (DTZ007 is about aware instants).
+            datetime.strptime(date, "%Y-%m-%d")  # noqa: DTZ007
+        except ValueError:
+            raise ValueError(f"{name!r}: eval.date {date!r} is not a valid ISO date (YYYY-MM-DD)") from None
+
+
+def entry_eval(entry: dict) -> dict | None:
+    """The entry's eval block, or None when absent or malformed.
+
+    Defensive by design, like every other entry_* derivation: a bad block is
+    treated as absent here so a rogue entry can never crash the tree render
+    or the push path — REJECTION happens at the entry boundary
+    (validate_eval in Catalog.add / merge_entries), not at render time.
+    """
+    eval_block = entry.get("eval")
+    if not isinstance(eval_block, dict):
+        return None
+    suite = eval_block.get("suite")
+    score = eval_block.get("score")
+    if not isinstance(suite, str) or not suite.strip():
+        return None
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+        return None
+    return eval_block
+
+
+# Weight levels that ARE the model itself (full precision) — the reference a
+# quantised variant is judged against.  Everything else entry_quant() can
+# detect is a quantised/derived variant.
+_FULL_PRECISION_QUANTS = frozenset({"BF16", "FP16"})
+
+
+def entry_unvalidated(entry: dict) -> bool:
+    """True when the entry is a QUANTISED variant with no recorded eval.
+
+    A full-precision entry (BF16/FP16) is the baseline itself, and an entry
+    whose quant cannot be determined ("") is not claimed to be quantised —
+    neither earns the badge.  This drives both the catalog UI's
+    "unvalidated" badge and the MLIS push warning.
+    """
+    quant = entry_quant(entry)
+    if not quant or quant in _FULL_PRECISION_QUANTS:
+        return False
+    return entry_eval(entry) is None
+
+
 def entry_shared_gpu(entry: dict) -> bool:
     """True when the config is meant to share a GPU with other models."""
     tags = str((entry.get("metadata") or {}).get("tags") or "").lower()
@@ -438,6 +570,10 @@ class Catalog:
             elif cid in self._removed_seed_ids:
                 removed += 1
             else:
+                # EVAL: a bad block in a seed/GitHub payload is a LOUD startup
+                # failure (seed) or a 502 "invalid catalog JSON from GitHub" —
+                # never a silently skipped entry.
+                validate_eval(entry.get("eval"), str(entry.get("name") or ""))
                 # Same normalisation as the on-load pass: a seed file or a
                 # GitHub refresh may carry an inherited MLIS version.
                 entry = dict(entry)
@@ -527,6 +663,10 @@ class Catalog:
                     "hicache": entry_hicache(entry),
                     "mooncake": entry_mooncake(entry),
                     "caveats": entry_caveats(entry),
+                    # EVAL: the stored block (None when absent) plus the
+                    # derived "unvalidated" flag the UI badges on.
+                    "eval": entry_eval(entry),
+                    "unvalidated": entry_unvalidated(entry),
                     "shared_gpu": entry_shared_gpu(entry),
                     "gpus": entry_gpus(entry),
                     "publisher": entry_publisher(entry),
@@ -538,6 +678,10 @@ class Catalog:
 
     def add(self, entry: dict) -> dict:
         entry = dict(entry)
+        # EVAL: reject a malformed block at the entry boundary (clear error
+        # naming the entry and field) instead of storing it and discovering
+        # the problem at render/push time.
+        validate_eval(entry.get("eval"), str(entry.get("name") or ""))
         entry["catalog_id"] = uuid.uuid4().hex[:12]
         if entry.get("tier") not in TIERS:
             entry["tier"] = TIERS[0]

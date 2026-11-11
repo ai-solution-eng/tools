@@ -242,6 +242,82 @@ only — TPM is blind to them.
   explicit `X-PCAI-Execute-Tools: 0` still wins over a body execution
   request (loud 400, not a silent ignore).
 
+## Tool-definition pinning (rug-pull defence)
+
+An MCP server can rewrite a tool's `description` or `inputSchema` AFTER the
+operator approved the grant. The ACL admits the NAME, so the model is then
+offered a definition nobody reviewed — and a rewritten description is an
+instruction channel straight into its context. This is the "rug-pull" class in
+the OWASP MCP guidance.
+
+- **What is pinned**: a 16-hex sha256 over a canonical JSON encoding of
+  `{name, description, inputSchema, annotations}` (`core/tool_pin.py`,
+  pure and I/O-free). Sorted keys and whitespace normalisation make the digest
+  stable across runs and dict ordering; `annotations` is included because
+  `destructiveHint`/`readOnlyHint` are exactly what a rug-pull would flip.
+  The relay catalog carries all four fields (`api/routes_proxy._relay_catalog`)
+  so the pin covers the whole definition, not just its prose.
+- **When it is observed**: once per relay request, at the catalog → offered-surface
+  boundary (`toolrelay.pin_catalog_with_verdicts`). The verdict is
+  FIRST_SEEN / MATCH / CHANGED per `(server, tool)`; pins are in-memory, so a
+  restart re-records them (a persisted pin table is a deliberate non-goal of
+  this cut — it needs a schema migration).
+- **Modes** (`tool_pin_mode`): `off` inert; `warn` logs the old → new digest
+  and keeps offering the tool; `block` drops the changed tool from the
+  OFFERED surface **and** refuses the call at dispatch
+  (`toolrelay.pin_dispatch_refusal`). Both halves matter — the offer alone is
+  bypassable by history replay, where the model names a tool it saw in an
+  earlier turn. A refusal is an ordinary `role=tool` error naming
+  `server__tool` and both digests, so the relay loop keeps iterating. Unknown
+  values fall back to `warn`: a typo must neither silently disable the defence
+  nor block every tool.
+- **A VANISHED tool is a rug-pull too.** Dropping a definition from
+  `tools/list` used to leave the call ungated — the ACL admits by NAME, so a
+  server could pin D1, rewrite to D2 and then simply stop listing the tool,
+  and the executor would run D2 forever. In `block` mode a tool that this
+  store has pinned, that this turn's grants expect, and that the listing no
+  longer carries is refused at dispatch ("vanished from the listing since this
+  grant approved it") and reported during the offer pass. A tool that was
+  NEVER pinned still dispatches: the defence must not break a first run.
+- **Fail-open on fault**: a fingerprint error or a missing verdict for an
+  unpinned tool dispatches the call. A pinning bug must never break a turn.
+
+## Tool-result injection screening
+
+The gateway is the only component that sees every MCP tool result before it
+re-enters the model. `core/guardrails.py` covers user text pre-call and
+assistant text post-call; tool output is the third channel and was unguarded.
+
+- `core/tool_injection.py` is a pure, model-free scanner over four families:
+  instruction override, role/control-token spoofing, exfiltration shapes
+  (destination + credential in one payload), and encoded-payload smells.
+  Severity is `high` only for a clear override or role spoof; everything else
+  is `low`, because a false positive costs tokens while a missed override
+  costs the turn.
+- `tool_injection_screen`: `off` inert; `warn` logs and passes through;
+  `annotate` prepends a short machine-readable provenance header naming the
+  server, tool and finding count WITHOUT removing content; `block` replaces
+  the body with a short refusal that keeps the tool-call shape valid. Applied
+  in `_prepare_tool_content` (in-cluster, discovery meta-tool and client
+  results) and on the `pcai__retrieve` path, so a withheld original cannot be
+  re-fetched unscreened. Unknown values fall back to `warn` (and log once —
+  a typo like `enforce` must not silently disable the gate).
+- **Two shapes are screened, not one.** The detector runs over the
+  JSON-serialized envelope AND the unwrapped single-text-block candidate, and
+  takes the worst severity. Screening only the envelope was a real blind spot:
+  inside `json.dumps` a newline rides as `\n`, so the role-label detectors
+  could never match the default (compression-off) tool-result shape.
+- **Normalised matching.** Text is NFKC-normalised, stripped of
+  format/zero-width/bidi/soft-hyphen characters and homoglyph-folded before
+  phrase matching, with reasons quoted back from the ORIGINAL text. Without
+  this, `іgnore` (Cyrillic і), `ig\u200bnore`, `ig\u00adnore` and
+  `ignore\nall\nprevious\ninstructions` all scored clean in every mode.
+- **The provenance header is not forgeable.** `annotate` emits a fresh
+  per-result `token=<16 hex>` that appears only in the real header, and a body
+  that hand-writes the gateway's own header shape is itself a
+  `provenance_spoof` finding — otherwise the model would see two
+  indistinguishable headers and could be talked into trusting the forged one.
+
 ## Content guardrails
 
 Per-model content policy, ported from the hpe-llm-gateway design and

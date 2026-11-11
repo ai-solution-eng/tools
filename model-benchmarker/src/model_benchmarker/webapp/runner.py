@@ -229,6 +229,18 @@ def _usage_is_local(params: dict) -> bool:
     return usage == "local"
 
 
+def _usage_is_remote(params: dict) -> bool:
+    """The toggle's REMOTE half: true only for an explicit 'remote'.
+
+    An ABSENT toggle is not remote: the chat engine's default (no --remote) is
+    local, so omitting target_usage must keep the historical local behavior
+    (apply_target_usage's own default is about the URL rewrite, not the
+    client -- see build_chat_argv).
+    """
+    usage = str(params.get("target_usage") or params.get("model_usage") or "").strip().lower()
+    return usage == "remote"
+
+
 def apply_target_usage(url: str, params: dict) -> str:
     """Resolve the LOCAL/REMOTE toggle (the pcai-model-classes behavior, one
     press in the UI): usage=local rewrites '.serving.' URLs to their
@@ -279,6 +291,15 @@ def target_aliases(url: str) -> list[str]:
     return deduped
 
 
+def _clean_api_key(raw: str) -> str:
+    """The endpoint key as pasted: trim, and drop a pasted 'Bearer ' prefix --
+    the clients add the scheme themselves, so a doubled scheme is a 401."""
+    key = str(raw or "").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key
+
+
 def endpoint_api_keys() -> dict[str, str]:
     """Target API keys: JSON object of exact target URL -> key (from a
     Secret). When a run's target matches exactly, the key is injected into
@@ -302,22 +323,22 @@ def endpoint_api_keys() -> dict[str, str]:
             flush=True,
         )
         return {}
-    return {str(k).rstrip("/"): str(v) for k, v in data.items()}
+    return {str(k).rstrip("/"): _clean_api_key(str(v)) for k, v in data.items()}
 
 
 def list_models_for_target(target_url: str, params: dict, api_key: str = "") -> dict:
     """Model ids an OpenAI-compatible endpoint advertises -- the chat page's
     Model dropdown (POST /api/models).
 
-    The target is resolved EXACTLY like a chat run: validated, the toggle
-    applied, then the engine's in-cluster rewrite (.serving. ->
-    .svc.cluster.local) -- benchmark_chat is launched without --remote, so
-    even a "remote" toggle ends up on the in-cluster form. The probe then
-    calls ``GET {resolved}/v1/models`` with the run's auth precedence
-    (client-supplied key, else the operator map for the typed URL) and the
-    run's plain client. That matters because the dropdown must list what the
-    benchmark will see -- probing the typed serving URL (or the wrong TLS
-    posture) could list the wrong models, or none, while the run succeeds.
+    The target is resolved EXACTLY like a chat run: validated, then the
+    LOCAL/REMOTE toggle applied -- local (also the default when the toggle is
+    absent) rewrites .serving. URLs in-cluster and uses the system-TLS client;
+    remote keeps the URL as typed and uses the engine's remote client
+    (TLS-unverified by default, REMOTE_CA_BUNDLE when pinned). The probe then calls ``GET {resolved}/v1/models`` with the
+    run's auth precedence (client-supplied key, else the operator map for the
+    typed URL). That matters because the dropdown must list what the
+    benchmark will see -- probing a different URL form or TLS posture could
+    list the wrong models, or none, while the run succeeds.
 
     Fails SOFT, like auto-discovery: an unreachable endpoint returns
     ``models=[]`` plus ``error`` instead of raising, because typing the id by
@@ -325,25 +346,33 @@ def list_models_for_target(target_url: str, params: dict, api_key: str = "") -> 
     target raises :class:`BenchError` (HTTP 400), matching /api/runs.
     """
     target = validate_target(target_url)
-    # Chat runs are launched WITHOUT --remote, so benchmark_chat's ChatModel
-    # always takes the in-cluster form of the URL (its url_local rewrite) and
-    # the plain (system-TLS) client -- even when the page's toggle is remote.
-    # Probe the same form with the same client, or the dropdown could fail on
-    # the ingress URL while the run itself succeeds in-cluster.
-    resolved = convert_remote_url_to_local(apply_target_usage(target, params))
+    # Resolve EXACTLY like the chat launch: the toggle picks the URL form AND
+    # the client. local -> in-cluster rewrite + system-TLS client; remote ->
+    # the URL as typed + the engine's remote client (TLS-unverified by
+    # default, REMOTE_CA_BUNDLE when the operator pins the platform CA).
+    # build_chat_argv passes --remote for the same reason.
+    remote = _usage_is_remote(params)
+    resolved = apply_target_usage(target, params)
+    if not remote:
+        # absent toggle == the engine's local default: its url_local rewrite
+        # still applies even though apply_target_usage left the URL as typed
+        resolved = convert_remote_url_to_local(resolved)
     base = resolved + "/v1"
-    key = api_key or endpoint_api_keys().get(target.rstrip("/"), "")
+    key = _clean_api_key(api_key) or endpoint_api_keys().get(target.rstrip("/"), "")
     # The discovery probe is shared with the bench engines (same client, TLS
     # posture and auth header); imported lazily so webapp startup does not
     # pull the PCAI model stack in.
     from ..utils.pcai_model_classes import discover_model_ids
 
-    ids, error = discover_model_ids(base, key, remote=False)
+    ids, error = discover_model_ids(base, key, remote=remote)
     # one bounded line: the UI hint is small and httpx errors carry a docs URL
     error = " ".join((error or "").split())
     if len(key) >= 8:
         error = error.replace(key, "***")  # a malformed header error can echo it
     error = error[:300]
+    if error:
+        # operational trail: the UI shows it, but the pod log must carry it too
+        print(f"[webapp] model list probe failed for {base}: {error}", file=sys.stderr, flush=True)
     # offer only ids the launch would accept (and bound a hostile endpoint's ids)
     unique = [i for i in dict.fromkeys(ids) if _MODEL_ID_RE.fullmatch(i)]
     return {
@@ -640,9 +669,15 @@ def build_chat_argv(
     ]
     if resume_from:
         argv += ["--resume-from", resume_from]
+    if _usage_is_remote(params):
+        # The toggle's REMOTE half: benchmark_chat's --remote switches the model
+        # to its ingress URL and the TLS-unverified (or REMOTE_CA_BUNDLE-pinned)
+        # client. Without this flag the engine always uses the in-cluster form
+        # and the local client, making the toggle inert for chat runs.
+        argv.append("--remote")
     env: dict[str, str] = {}
 
-    api_key = _capped_str(params, "api_key", 4096) or ""
+    api_key = _clean_api_key(_capped_str(params, "api_key", 4096) or "")
     if not api_key:
         api_key = endpoint_api_keys().get(original_url.rstrip("/"), "")
     if api_key:
@@ -766,7 +801,9 @@ def build_endpoint_argv(
     env: dict[str, str] = {}
 
     headers = _kv_dict(params, "headers")
-    api_key = _capped_str(params, "api_key", 4096) or endpoint_api_keys().get(original_url.rstrip("/"), "")
+    api_key = _clean_api_key(_capped_str(params, "api_key", 4096) or "") or endpoint_api_keys().get(
+        original_url.rstrip("/"), ""
+    )
     if api_key and not any(h.lower() == "authorization" for h in headers):
         headers["Authorization"] = "Bearer " + api_key
     for k, v in headers.items():

@@ -27,7 +27,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/model-benchmarker
-  tag: v1.1.0
+  tag: v1.1.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -47,6 +47,13 @@ bench:
       kind: chat
     - name: glm-53-flash (chat)
       url: https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>
+      kind: chat
+    # PCAI LLM gateway -- the in-cluster Service (no ingress/proxy/TLS hop).
+    # Its /v1/models lists the pools, the auto/auto-demand-aware cascades,
+    # model groups and routing aliases; the chat page's Model field is a
+    # dropdown over exactly those ids.
+    - name: PCAI LLM gateway (in-cluster)
+      url: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200
       kind: chat
     # Retrieval / RAG pipeline endpoints.
     - name: qwen3-vl-embedding-8b
@@ -92,6 +99,9 @@ bench:
   endpointApiKeys:
     "https://qwen-38-27b.project-user-<USERNAME>.serving.<cluster-domain>": "<QWEN_API_KEY>"
     "https://glm-53-flash.project-user-<USERNAME>.serving.<cluster-domain>": "<GLM_API_KEY>"
+    # Gateway virtual key (hllm-..., scope "proxy"); optional -- users can
+    # also paste their own key into the page's Endpoint API key field.
+    "http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200": "<GATEWAY_API_KEY>"
     "http://rag-mcp-server-mcp.mm-rag.svc.cluster.local:9090/mcp": "<MCP_FLEET_KEY>"
 
 # ============================================================================

@@ -177,6 +177,9 @@ def atomize_chat_report(md_text: str, source: str, meta: dict) -> list[dict]:
                     "tokens_per_s": _pcts(tokens),
                     "itl_ms": _pcts(r.get("itl")),
                     "tpot_ms": _pcts(r.get("tpot")),
+                    # MB-CACHE: percent of prompt tokens served from the
+                    # server cache (None for legacy files without the column).
+                    "cache_hit_pct": _num_or_none(r.get("cache_hit_pct")),
                 },
             }
         )

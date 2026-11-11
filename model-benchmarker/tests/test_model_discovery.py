@@ -83,6 +83,18 @@ def test_fetch_model_ids_fails_soft_on_transport_error(monkeypatch):
     assert "RuntimeError" in error and "connection refused" in error
 
 
+def test_fetch_model_ids_surfaces_the_api_error_detail(monkeypatch):
+    """A 401 must carry the API's own reason (the LLM gateway says why)."""
+    import httpx2
+
+    request = httpx2.Request("GET", "http://h:8000/v1/models")
+    response = httpx2.Response(401, request=request, json={"detail": "invalid, revoked, or expired key"})
+    _clients(monkeypatch, error=httpx2.HTTPStatusError("401", request=request, response=response))
+    ids, error = P._fetch_model_ids("http://h:8000/v1", "bad-key")
+    assert ids == []
+    assert "HTTP 401" in error and "invalid, revoked, or expired key" in error
+
+
 def test_fetch_model_ids_reports_an_empty_list_without_an_error(monkeypatch):
     # reachable-but-empty is NOT a transport failure: the dropdown says "no
     # models advertised" rather than "could not list models"

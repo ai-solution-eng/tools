@@ -315,7 +315,7 @@
       emptyText: function () {
         if (modelsLoading) return "listing models…";
         if (!$("c-target").value.trim()) return "type the endpoint first — its models will appear here";
-        if (modelsError) return "could not list models — type the id manually";
+        if (modelsError) return "could not list models — " + modelsError;
         if (!endpointModels.length) return "the endpoint advertises no models — type the id manually";
         return "no model id matches — free text is allowed";
       },

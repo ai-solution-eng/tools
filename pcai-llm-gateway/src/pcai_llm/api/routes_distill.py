@@ -774,6 +774,7 @@ async def distill_conversation(
         fallback_session_id=str(cid),
         mcp_search=await _mcp_search_for(key),
         verdict_out=verdict,
+        trace_messages=conv.get("messages") or [],
     )
     kind = memory_write.KIND_SUMMARY if distilled else memory_write.KIND_FALLBACK
     # seed the marker on success: an explicit distill claims the conversation
@@ -941,6 +942,7 @@ async def distill_due_conversation(row: dict[str, Any], *, deadline: float | Non
         fallback_doc=transcript if distilled else "",
         fallback_session_id=str(cid),
         verdict_out=verdict,
+        trace_messages=conv.get("messages") or [],
     )
     # the marker is written ONLY on a successful write: a failed write (both
     # summary and fallback refused) leaves the conversation due, so the next
@@ -1186,6 +1188,7 @@ async def distill_due_canonical(row: dict[str, Any], *, deadline: float | None =
         fallback_session_id=thread_id[:64],
         mcp_search=await _mcp_search_for(key),
         verdict_out=verdict,
+        trace_messages=messages,
     )
     if ok:
         await distill_schedule.mark_canonical_distilled(key_id, thread_id, row.get("updated_at"), _content_hash)

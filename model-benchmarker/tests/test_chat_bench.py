@@ -21,6 +21,7 @@ import asyncio
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -421,17 +422,21 @@ class TestLevelAggregation:
         # COMPACT format (one cell per metric group; fits GitHub width)
         assert "ITL P50/P95/P99/P100 (ms)" in header and "TPOT P50/P95/P99/P100 (ms)" in header
         cells = [c.strip() for c in lines[2].strip("|").split("|")]
-        # 4 keys + TTFT + tokens/s + ITL + TPOT + prefill tok/s (compact, single-turn)
-        assert len(cells) == 9
+        # 4 keys + TTFT + tokens/s + ITL + TPOT + prefill tok/s + cache hit %
+        # (compact, single-turn)
+        assert len(cells) == 10
+        assert "cache hit %" in header
         assert cells[4] == "100.0 / 110.0 / 120.0 / 130.0"  # TTFT group
         assert cells[5] == "33.0 / 32.0 / 31.0 / 30.0"  # tokens/s group
         assert cells[6] == "12.0 / 13.0 / 14.0 / 15.0"  # ITL group (extended)
         assert cells[7] == "11.0 / 11.5 / 12.0 / 12.5"  # TPOT group
+        assert cells[9] == "-"  # cache unmeasurable: no prompt tokens reported
         parsed = rh._parse_md_chat_row(lines[2], lines[0].strip("|").split("|"))
         assert parsed["ttft"] == [100.0, 110.0, 120.0, 130.0]
         assert parsed["tokens"] == [33.0, 32.0, 31.0, 30.0]
         assert parsed["itl"] == [12.0, 13.0, 14.0, 15.0]
         assert parsed["tpot"] == [11.0, 11.5, 12.0, 12.5]
+        assert parsed["cache_hit_pct"] is None
 
     def test_markdown_round_trip_all_groups(self):
         row = LevelRow(
@@ -444,18 +449,23 @@ class TestLevelAggregation:
             tps={"P50": 91.5, "P95": 84.0, "P99": 82.5, "P100": 78.9},
             itl={"P50": 11.0, "P95": 25.0, "P99": 90.0, "P100": 1500.0},
             tpot={"P50": 10.9, "P95": 20.0, "P99": 55.0, "P100": 90.0},
+            cached_tokens=7330,
+            prompt_tokens_total=10000,
+            cache_hit_rate=0.733,
         )
         md = format_table_markdown([row], multiturn=True)
         lines = md.splitlines()
         cells = [c.strip() for c in lines[2].strip("|").split("|")]
         # multiturn compact: 4 keys + TTFT + TTFT-post + tokens/s + ITL + TPOT
-        # + prefill tok/s (MB-PREFILL aggregate column)
-        assert len(cells) == 10
+        # + prefill tok/s (MB-PREFILL) + cache hit % (MB-CACHE)
+        assert len(cells) == 11
+        assert cells[-1] == "73.3"  # cache hit rate, percent
         parsed = rh._parse_md_chat_row(lines[2], lines[0].strip("|").split("|"))
         assert parsed["ctx"] == 32768 and parsed["failed"] == 2
         assert parsed["ttft"][0] == 19000.0 and parsed["tokens"][0] == 91.5
         assert parsed["ttft_post"][0] == 600.0
         assert parsed["itl"][2] == 90.0 and parsed["tpot"][3] == 90.0
+        assert parsed["cache_hit_pct"] == pytest.approx(73.3)
 
     def test_markdown_round_trip_multiturn(self):
         row = LevelRow(
@@ -471,10 +481,11 @@ class TestLevelAggregation:
         )
         md = format_table_markdown([row], multiturn=True)
         cells = [c.strip() for c in md.splitlines()[2].strip("|").split("|")]
-        assert len(cells) == 10
+        assert len(cells) == 11  # ...+ cache hit % column (MB-CACHE)
         parsed = rh._parse_md_chat_row(md.splitlines()[2], md.splitlines()[0].strip("|").split("|"))
         assert parsed["itl"] == [1.0, 1.0, 1.0, 1.0]
         assert parsed["tpot"] == [1.0, 1.0, 1.0, 1.0]
+        assert parsed["cache_hit_pct"] is None
 
     def test_markdown_none_group_compact_dash(self):
         """A None group renders as ONE dash cell and parses back as None."""
@@ -489,11 +500,13 @@ class TestLevelAggregation:
         )
         md = format_table_markdown([row], multiturn=True, extended=False)
         cells = [c.strip() for c in md.splitlines()[2].strip("|").split("|")]
-        assert len(cells) == 7  # 4 keys + ttft + ttft_post(dash) + tokens
+        assert len(cells) == 8  # 4 keys + ttft + ttft_post(dash) + tokens + cache(dash)
         assert cells[5] == "-"
+        assert cells[7] == "-"  # cache column always present, dash when unmeasurable
         parsed = rh._parse_md_chat_row(md.splitlines()[2], md.splitlines()[0].strip("|").split("|"))
         assert parsed["ttft_post"] is None
         assert parsed["tokens"] == [9.0, 8.0, 7.0, 6.0]
+        assert parsed["cache_hit_pct"] is None
 
     def test_print_table_dashes_for_none_groups(self, capsys):
         row = LevelRow(ctx=0, users=1, task="x", failed=0, ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1})
@@ -514,6 +527,174 @@ class TestLevelAggregation:
         except SystemExit:
             pass
         assert "ITL" in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# MB-CACHE: server-reported cached prompt tokens (cache hit rate)
+# ---------------------------------------------------------------------------
+
+
+class _UsageFull:
+    """usage block carrying prompt_tokens and a prompt_tokens_details block."""
+
+    def __init__(self, completion, prompt=None, details=None):
+        self.completion_tokens = completion
+        self.prompt_tokens = prompt
+        self.prompt_tokens_details = details
+
+
+class _DetailsObj:
+    def __init__(self, cached_tokens):
+        self.cached_tokens = cached_tokens
+
+
+def _usage_events(details=None, prompt=1000):
+    """A two-token stream ending in a full usage block."""
+    return [
+        (5.0 / 1000.0, FakeDelta(content="t0"), None),
+        (10.0 / 1000.0, FakeDelta(content="t1"), None),
+        (0.0, None, _UsageFull(2, prompt, details)),
+    ]
+
+
+class TestCacheHitRate:
+    def test_details_absent_is_none_and_no_crash(self):
+        # usage block without prompt_tokens_details (most engines) -> None,
+        # no crash, prompt/completion still captured.
+        res = asyncio.run(stream_once(FakeModel(_usage_events(details=None)), _task()))
+        assert res.success
+        assert res.prompt_tokens == 1000
+        assert res.cached_tokens is None
+
+    def test_details_object_and_dict_forms(self):
+        obj = asyncio.run(stream_once(FakeModel(_usage_events(details=_DetailsObj(400))), _task()))
+        assert obj.cached_tokens == 400
+        dct = asyncio.run(stream_once(FakeModel(_usage_events(details={"cached_tokens": 250})), _task()))
+        assert dct.cached_tokens == 250
+
+    def test_details_none_or_garbage_is_none(self):
+        garbage = asyncio.run(stream_once(FakeModel(_usage_events(details={"cached_tokens": "many"})), _task()))
+        assert garbage.cached_tokens is None  # never crashes on a mangled field
+        negative = asyncio.run(stream_once(FakeModel(_usage_events(details=_DetailsObj(-5))), _task()))
+        assert negative.cached_tokens is None
+
+    def test_level_row_cache_hit_rate(self):
+        r1 = _mk_result(prompt_tokens=4000, cached_tokens=1600)
+        r2 = _mk_result(prompt_tokens=4000, cached_tokens=2400)
+        row = bc.build_level_rows(ctx=0, users=2, task_name="t", group=[r1, r2], group_fail=0, multiturn=False)[0]
+        assert row.cached_tokens == 4000
+        assert row.prompt_tokens_total == 8000
+        assert row.cache_hit_rate == pytest.approx(0.5)
+
+    def test_level_row_divide_by_zero_guarded(self):
+        # No prompt tokens reported at all: rate is unmeasurable (None), not a
+        # ZeroDivisionError, and cached_tokens stays 0.
+        row = bc.build_level_rows(ctx=0, users=1, task_name="t", group=[_mk_result()], group_fail=0, multiturn=False)[0]
+        assert row.cached_tokens == 0
+        assert row.prompt_tokens_total == 0
+        assert row.cache_hit_rate is None
+
+    def test_markdown_carries_the_cache_column(self):
+        row = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1.0, "P95": 1.0, "P99": 1.0, "P100": 1.0},
+            tps={"P50": 9.0, "P95": 9.0, "P99": 9.0, "P100": 9.0},
+            cached_tokens=733,
+            prompt_tokens_total=1000,
+            cache_hit_rate=0.733,
+        )
+        md = format_table_markdown([row])
+        header = md.splitlines()[0]
+        assert "cache hit %" in header
+        cells = [c.strip() for c in md.splitlines()[2].strip("|").split("|")]
+        assert cells[-1] == "73.3"
+        parsed = rh._parse_md_chat_row(md.splitlines()[2], header.strip("|").split("|"))
+        assert parsed["cache_hit_pct"] == pytest.approx(73.3)
+
+    def test_print_table_cache_column(self, capsys):
+        row = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            cache_hit_rate=0.25,
+        )
+        print_table([row])
+        out = capsys.readouterr().out
+        assert "cache%" in out
+        assert "25.0%" in out
+
+    def test_cache_note_zero_rate_only(self):
+        # Measured zero (prompt reported, none cached) -> the config note.
+        zero = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            prompt_tokens_total=8000,
+        )
+        note = bc._cache_note([zero])
+        assert "cache hit rate is exactly 0" in note
+        assert "--enable-cache-report" in note
+        # A run with actual cache hits -> no note.
+        hit = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            cached_tokens=100,
+            prompt_tokens_total=8000,
+            cache_hit_rate=0.0125,
+        )
+        assert bc._cache_note([hit]) == ""
+        # Unmeasurable (no prompt tokens) -> no note either.
+        blind = LevelRow(ctx=0, users=1, task="t", failed=0, ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1})
+        assert bc._cache_note([blind]) == ""
+
+    def test_cache_note_suppressed_when_reuse_is_impossible(self):
+        """XV-DS-1: the default sweep nonces every prompt, so a zero rate is the
+        design — claiming "the engine may not be reporting" sent operators after
+        a flag that was already correct on every default run."""
+        zero = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            prompt_tokens_total=8000,
+        )
+        note = bc._cache_note([zero], cache_possible=False)
+        assert "by construction" in note
+        assert "--no-nonce" in note
+        # The misconfiguration wording must NOT appear in this mode.
+        assert "--enable-cache-report" not in note
+
+    def test_cache_reuse_possible_reads_the_sweep_flags(self):
+        assert bc._cache_reuse_possible(SimpleNamespace(no_nonce=True, multiturn=False)) is True
+        assert bc._cache_reuse_possible(SimpleNamespace(no_nonce=False, multiturn=True)) is True
+        assert bc._cache_reuse_possible(SimpleNamespace(no_nonce=False, multiturn=False)) is False
+        # Missing attributes must not explode a run.
+        assert bc._cache_reuse_possible(SimpleNamespace()) is False
+
+    def test_resume_seed_rows_restore_cache_rate(self):
+        md = (
+            "| ctx | users | task | failed | TTFT P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 | cache hit % |\n"
+            "|:---|:---|:---|:---|---:|---:|---:|\n"
+            "| 0 | 1 | t | 0 | 100.0 / 110.0 / 120.0 / 130.0 | 33.0 / 32.0 / 31.0 / 30.0 | 25.0 |\n"
+        )
+        rows = bc._resume_seed_rows(md)
+        assert len(rows) == 1
+        assert rows[0].cache_hit_rate == pytest.approx(0.25)
+        # a legacy artifact without the column stays unmeasurable
+        md_legacy = md.replace(" | cache hit % |", " |").replace("| 25.0 |", "|")
+        rows_legacy = bc._resume_seed_rows(md_legacy)
+        assert rows_legacy[0].cache_hit_rate is None
 
 
 # ---------------------------------------------------------------------------
@@ -1253,3 +1434,49 @@ class TestResumeFromWebappPath:
             ]
         )
         assert not bool((args.resume or args.resume_from) and not args.resume_force)
+
+
+# ---------------------------------------------------------------------------
+# --remote must be in effect before the constructor's auto-discovery
+# ---------------------------------------------------------------------------
+
+
+def test_build_model_applies_remote_before_auto_discovery(monkeypatch):
+    """A local-mode first discovery against a TLS-untrusted ingress fails and
+    negative-caches the URL; model.remote() afterwards cannot rescue it for
+    non-.serving URLs (same base URL). The constructor must get the usage."""
+    import argparse
+    import types
+
+    seen: dict = {}
+
+    class FakeChat:
+        def __init__(self, url_remote="", api_key="", model_usage="local"):
+            seen["model_usage"] = model_usage
+            self.url_remote = url_remote
+            self.api_key = api_key
+            self.model_usage = model_usage
+            self.model_name = ""
+
+        def remote(self):
+            self.model_usage = "remote"
+
+        def _discover_model_name(self):
+            seen["discovered_with"] = self.model_usage
+            return "fake-model"
+
+    fake_mod = types.ModuleType("model_benchmarker.utils.pcai_model_classes")
+    fake_mod.ChatModel = FakeChat  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "model_benchmarker.utils.pcai_model_classes", fake_mod)
+
+    args = argparse.Namespace(
+        model_class_name=None,
+        url="https://gw.example.net",
+        api_key="k",
+        api_key_file=None,
+        remote=True,
+        model=None,
+    )
+    model = bc.build_model(args)
+    assert seen["model_usage"] == "remote"  # construction, not a later remote()
+    assert model.model_name == "fake-model"

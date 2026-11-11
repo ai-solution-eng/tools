@@ -4011,7 +4011,9 @@ async def _relay_catalog(
     opt-in) narrows everything to those servers; an unknown name is a 400
     (fail loud beats a silent skip) and a fully-empty result is a 400 that
     points at grants. Entries carry inputSchema when the upstream declares
-    one (client-side execution needs the real argument schema).
+    one (client-side execution needs the real argument schema) and
+    annotations when it declares those — both are part of the definition
+    core.tool_pin fingerprints, so neither may be dropped in transit.
 
     FIX (was latent in the inline version): the old loop iterated only
     EXPLICITLY granted servers, so a scope-mode key with no explicit ACL
@@ -4078,6 +4080,15 @@ async def _relay_catalog(
                 # a tuple change would ripple through both for a display string.
                 "server_description": target.get("description", "") or "",
                 **({"inputSchema": t["inputSchema"]} if isinstance(t.get("inputSchema"), dict) else {}),
+                # ANNOTATIONS ride too (2026-11-10, tool-trust hardening):
+                # destructiveHint/readOnlyHint are SECURITY-relevant — a
+                # rug-pull can flip them without touching name, description or
+                # schema — and tool_pin.fingerprint() pins all four fields, so
+                # dropping them HERE left the one field the defence most needs
+                # unpinned. Additive key: consumers that do not know it ignore
+                # it, and a server that declares none adds nothing (absent and
+                # empty pin the same definition).
+                **({"annotations": t["annotations"]} if isinstance(t.get("annotations"), dict) else {}),
             }
             for t in tools
             if server_allows(target, t["tool"])
@@ -5263,12 +5274,21 @@ async def chat_completions(
         # function tools; the model's tool_calls stream back untouched and
         # the client decides what to execute. No relay, no server-side
         # execution, normal gates/settle on the model call itself.
-        catalog, _ = await _relay_catalog(key, relay_grants, requested_servers)
+        catalog, catalog_grants = await _relay_catalog(key, relay_grants, requested_servers)
         if not catalog:
             raise fastapi.HTTPException(400, "approval passthrough requested but no MCP tools are granted to this key")
         # An agent narrows the CLIENT-execution surface too: a model handed an
         # agent must never see a tool the agent excludes, whichever side runs it.
         catalog = agents_mod.narrow_catalog(catalog, agent.servers if agent else None, agent.tools if agent else None)
+        # Tool-definition pinning rides THIS offer too (2026-11-10,
+        # cross-validation P1): the passthrough hands the model the same
+        # definitions the relay would, so a rug-pulled description used to
+        # reach its context with no pin observation at all. block mode drops
+        # a changed (or vanished) tool from this surface; warn logs it.
+        offered_grants = agents_mod.narrow_grants(
+            catalog_grants, agent.servers if agent else None, agent.tools if agent else None
+        )
+        catalog = toolrelay.pin_catalog_with_verdicts(catalog, offered_grants)[0]
         fn_defs = [
             {
                 "type": "function",

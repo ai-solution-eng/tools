@@ -170,13 +170,61 @@ def _client_verify(remote: bool) -> str | bool:
     return _remote_verify() if remote else True
 
 
-# Sync clients are thread-safe and can be shared globally.
-_SHARED_HTTP_CLIENT = httpx2.Client()
+def _new_http_client(**kwargs: Any) -> httpx2.Client:
+    """Build a shared httpx client without letting the proxy environment kill the process.
+
+    httpx reads ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``ALL_PROXY`` / ``NO_PROXY``
+    at CONSTRUCTION time (``trust_env`` defaults to True).  A ``NO_PROXY`` entry
+    in bracketed IPv6 form -- ``[::1]``, a very common corporate/desktop default
+    -- makes httpx2's URL parser raise ``InvalidURL: Invalid port: ':1]'``.  At
+    module scope that aborted the import of the whole package (2026-11-10 audit:
+    reproduced, 65 pytest collection errors, app would not start).
+
+    Retry once with the environment ignored rather than dying: losing proxy
+    support for model calls is a degraded network path, an unimportable package
+    is an outage.
+    """
+    try:
+        return httpx2.Client(**kwargs)
+    except Exception as exc:  # retried once below, then raised
+        logger.warning(
+            "httpx client construction failed with the process proxy environment (%s: %s) - "
+            "retrying with trust_env=False; check HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY",
+            type(exc).__name__,
+            exc,
+        )
+        kwargs["trust_env"] = False
+        return httpx2.Client(**kwargs)
+
+
+# Sync clients are thread-safe and can be shared globally.  Both are built on
+# first use (never at import): construction reads the proxy environment and,
+# for the remote client, configures TLS -- neither belongs in module import.
+_SHARED_HTTP_CLIENT: httpx2.Client  # built on first use; see below
+_shared_client_lock = threading.Lock()
 # The remote client is built on first use by the module __getattr__ below, so
 # importing this module never configures TLS nor prints the "verification
 # disabled" notice -- that now fires when a remote model is actually used.
 _SHARED_REMOTE_HTTP_CLIENT: httpx2.Client  # built on first use; see below
 _shared_remote_client_lock = threading.Lock()
+
+
+def _shared_http_client() -> httpx2.Client:
+    """The process-wide client for in-cluster (non-remote) model endpoints.
+
+    Built lazily for the same reason as the remote client: an import-time
+    ``httpx2.Client()`` turns a malformed proxy variable into an unimportable
+    package (see :func:``_new_http_client``).
+    """
+    client = globals().get("_SHARED_HTTP_CLIENT")
+    if client is not None:
+        return client
+    with _shared_client_lock:
+        client = globals().get("_SHARED_HTTP_CLIENT")
+        if client is None:
+            client = _new_http_client()
+            globals()["_SHARED_HTTP_CLIENT"] = client
+    return client
 
 
 def _shared_remote_http_client() -> httpx2.Client:
@@ -193,7 +241,7 @@ def _shared_remote_http_client() -> httpx2.Client:
     with _shared_remote_client_lock:
         client = globals().get("_SHARED_REMOTE_HTTP_CLIENT")
         if client is None:
-            client = httpx2.Client(
+            client = _new_http_client(
                 verify=_client_verify(remote=True),
                 limits=_pool_limits_from_env(),
             )
@@ -202,13 +250,17 @@ def _shared_remote_http_client() -> httpx2.Client:
 
 
 def __getattr__(name: str) -> Any:
-    """Keep _SHARED_REMOTE_HTTP_CLIENT readable as a module attribute (PEP 562).
+    """Keep the shared-client globals readable as module attributes (PEP 562).
 
-    Legacy access path; new code should call _shared_remote_http_client().
+    Both are lazy now, so a bare attribute read must still resolve to the
+    constructed client (legacy access path).  New code should call
+    _shared_http_client() / _shared_remote_http_client().
     """
-    if name != "_SHARED_REMOTE_HTTP_CLIENT":
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return _shared_remote_http_client()
+    if name == "_SHARED_REMOTE_HTTP_CLIENT":
+        return _shared_remote_http_client()
+    if name == "_SHARED_HTTP_CLIENT":
+        return _shared_http_client()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Async clients must be bound to a single event loop.
@@ -246,6 +298,27 @@ _MODEL_CARD_FAILURE_TTL_S = 60.0
 _model_card_failures: dict[str, float] = {}
 
 
+def _http_status_error_detail(exc: httpx2.HTTPStatusError) -> str:
+    """A one-line reason from a non-2xx discovery answer: status + the API's
+    own ``detail``/``error`` text. The PCAI LLM gateway says exactly why a
+    key was refused ("invalid, revoked, or expired key"), which is the whole
+    diagnosis for a 401 -- raise_for_status() alone would hide it."""
+    response = exc.response
+    message = f"HTTP {response.status_code} {response.reason_phrase}".strip()
+    detail = ""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        raw = body.get("detail") or body.get("error") or body.get("message")
+        if isinstance(raw, str):
+            detail = raw
+    if not detail:
+        detail = (response.text or "").strip()[:200]
+    return f"{message}: {detail}" if detail else message
+
+
 def _fetch_model_ids(
     base_url: str, api_key: str = "", remote: bool = True, timeout: float = 10.0
 ) -> tuple[list[str], str]:
@@ -260,7 +333,7 @@ def _fetch_model_ids(
     exactly the same models.
     """
     url = f"{base_url}/models"
-    client = _shared_remote_http_client() if remote else _SHARED_HTTP_CLIENT
+    client = _shared_remote_http_client() if remote else _shared_http_client()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         resp = client.get(url, headers=headers, timeout=timeout)
@@ -269,6 +342,8 @@ def _fetch_model_ids(
         models = data.get("data", []) if isinstance(data, dict) else []
         ids = [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
         return ids, ""
+    except httpx2.HTTPStatusError as e:
+        return [], _http_status_error_detail(e)
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
 
@@ -670,17 +745,14 @@ class BaseModel:
         """Rewrite a remote PCAI serving URL to its in-cluster form.
 
         Only URLs containing the ``.serving.`` marker (PCAI serving hostnames)
-        are rewritten (https->http plus the .svc.cluster.local suffix); any
-        other URL (e.g. a localhost test endpoint, or a public https API passed
-        via ``--url``) is returned unchanged instead of being mangled.
+        are rewritten; any other URL (e.g. a localhost test endpoint passed via
+        ``--url``) is returned unchanged instead of being mangled.
         """
-        marker = path.find(".serving.")
+        new_path = path.replace("https", "http")
+        marker = new_path.find(".serving.")
         if marker == -1:
-            return path
-        head = path[:marker]
-        if head.startswith("https://"):
-            head = "http://" + head[len("https://") :]
-        return head + ".svc.cluster.local"
+            return new_path
+        return new_path[:marker] + ".svc.cluster.local"
 
     def _openai_client_kwargs(self, client_cls: Callable, http_client: Any) -> dict[str, Any]:
         """Keyword args shared by the sync/async OpenAI client constructors.
@@ -735,7 +807,7 @@ class BaseModel:
 
     @cached_property
     def http_client(self):
-        return _shared_remote_http_client() if self.model_usage == "remote" else _SHARED_HTTP_CLIENT
+        return _shared_remote_http_client() if self.model_usage == "remote" else _shared_http_client()
 
     @cached_property
     def http_async_client(self):
@@ -2041,6 +2113,8 @@ class RerankerModel(BaseModel):
                 handler=_rerank,
             )
         ]
+
+
 @dataclass(repr=False)
 class DecisionModel(BaseModel):
     """A *decision* model served by the vLLM-SR native runtime (System One API).
@@ -2249,8 +2323,7 @@ class DecisionModel(BaseModel):
     @cached_property
     def model(self):
         raise ValueError(
-            "Use system_one(...) / system_one_async(...); a decision model is "
-            "not instantiated as a chat client."
+            "Use system_one(...) / system_one_async(...); a decision model is not instantiated as a chat client."
         )
 
     @property
@@ -2475,9 +2548,7 @@ class DecisionModel(BaseModel):
         dict[str, Any]
             The raw response envelope, as described on system_one.
         """
-        payload = self._payload(
-            state, questions, images=images, videos=videos, options=options
-        )
+        payload = self._payload(state, questions, images=images, videos=videos, options=options)
         resp = await self.http_async_client.post(
             self.decisions_url,
             json=payload,
@@ -2622,9 +2693,7 @@ class DecisionModel(BaseModel):
         'Deepseek-V4.1-Flash-1017': 0.00551571931381253},
         'confidence': 0.9899787878995843}
         """
-        return self.decide(
-            state, instructions=instructions, criteria=criteria, type="choice", **kwargs
-        )
+        return self.decide(state, instructions=instructions, criteria=criteria, type="choice", **kwargs)
 
     def yes_no(self, state: Any, instructions: str, **kwargs: Any) -> float:
         """Probability that the answer is yes (decide with type="noul").
@@ -2672,9 +2741,7 @@ class DecisionModel(BaseModel):
         dict[str, Any]
             The answer, typically {"score": <expected level index>, ...}.
         """
-        return self.decide(
-            state, instructions=instructions, criteria=levels, type="score", **kwargs
-        )
+        return self.decide(state, instructions=instructions, criteria=levels, type="score", **kwargs)
 
     # -- agent integration ------------------------------------------------
 
@@ -2744,10 +2811,7 @@ class DecisionModel(BaseModel):
                             "description": "The question, in plain language.",
                         },
                         "criteria": {
-                            "description": (
-                                "choice: {option: description}; score: ordered list "
-                                "of levels."
-                            ),
+                            "description": ("choice: {option: description}; score: ordered list of levels."),
                         },
                         "images": {
                             "type": "array",

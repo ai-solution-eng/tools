@@ -383,6 +383,12 @@ class RequestResult:
     # no usage block). This is the exact prefill input length; the nominal
     # --context_length is only a padding target and runs ~25% low.
     prompt_tokens: int | None = None
+    # MB-CACHE: server-reported cached prompt tokens
+    # (usage.prompt_tokens_details.cached_tokens; None when the endpoint sends
+    # no usage block or omits the details — many engines never do).  A cached
+    # count without the prompt total is unusable, so both ride the same usage
+    # block and are either both present or both absent.
+    cached_tokens: int | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -763,7 +769,10 @@ def _resume_seed_rows(text: str) -> list[LevelRow]:
     rewrite preserves the skipped levels; the final table shows the whole
     sweep). Percentile dicts rebuild positionally ([P50, P95, P99, P100]);
     aggregates the atoms do not carry (itl_mean, n_requests, goodput) default
-    — the table cells the artifacts render are all preserved."""
+    — the table cells the artifacts render are all preserved (MB-CACHE: the
+    cache hit rate comes back as the atoms' cache_hit_pct; the raw token
+    counts are not in the table, so they default to 0 and a fully-seeded run
+    cannot fire the zero-cache note)."""
     atoms = _resume_atoms(text)
     rows: list[LevelRow] = []
     for a in atoms:
@@ -785,6 +794,7 @@ def _resume_seed_rows(text: str) -> list[LevelRow]:
         tps = pct(m.get("tokens_per_s"))
         if ttft is None or tps is None:
             continue
+        cache_pct = m.get("cache_hit_pct")
         rows.append(
             LevelRow(
                 ctx=int(test.get("ctx", 0)),
@@ -797,6 +807,10 @@ def _resume_seed_rows(text: str) -> list[LevelRow]:
                 itl=pct(m.get("itl_ms")),
                 tpot=pct(m.get("tpot_ms")),
                 arrival=str(a.get("arrival") or "closed"),
+                # MB-CACHE: percent -> fraction; absent/legacy atoms stay None.
+                cache_hit_rate=(cache_pct / 100.0)
+                if isinstance(cache_pct, (int, float)) and not isinstance(cache_pct, bool)
+                else None,
             )
         )
     return rows
@@ -896,7 +910,18 @@ def build_model(args: argparse.Namespace):
         # OpenAI client is built with credential enforcement relaxed so no
         # Authorization header is sent (see stream_once / _openai_client_kwargs).
         # Resolution order: --api_key > --api_key_file > $PCAI_API_KEY.
-        model = ChatModel(url_remote=args.url, api_key=resolve_api_key(args))
+        #
+        # --remote must be in effect BEFORE __post_init__ runs: construction
+        # performs the model-name auto-discovery, and a local-mode probe of a
+        # TLS-untrusted ingress (e.g. the PCAI LLM gateway) fails there and
+        # negative-caches the URL for 60s. For non-.serving URLs the local and
+        # remote base URLs are identical, so the later model.remote() could not
+        # rescue the discovery -- the run would start with an empty model id.
+        model = ChatModel(
+            url_remote=args.url,
+            api_key=resolve_api_key(args),
+            model_usage="remote" if args.remote else "local",
+        )
 
     if args.remote:
         model.remote()
@@ -981,6 +1006,29 @@ def render_prompt(task: Task, context_length: int = 0, no_nonce: bool = False) -
     return prompt
 
 
+def _extract_cached_tokens(details) -> int | None:
+    """Server-reported cached prompt tokens from
+    ``usage.prompt_tokens_details.cached_tokens``, extracted defensively.
+
+    ``details`` may be absent (None), a client object with a
+    ``cached_tokens`` attribute, or a raw dict, depending on the client
+    version; the value itself may be absent or non-numeric.  Never raises —
+    cache usage is informational and a benchmark must not crash because a
+    server omits or mangles the field (its absence is silent by design on
+    many engines, e.g. vLLM without ``--enable-cache-report``).
+    """
+    if details is None:
+        return None
+    raw = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
 def _debug_first_delta(tag: str, delta, debug_stream: bool) -> None:
     """Debug print the first text-bearing delta (the chunk that set TTFT)."""
     if not debug_stream:
@@ -1024,6 +1072,10 @@ async def stream_once(
     # any throughput derived from prompt length must use THIS value when the
     # endpoint reports it.
     usage_prompt_tokens: int | None = None
+    # MB-CACHE: cached prompt tokens from usage.prompt_tokens_details (None
+    # when the engine does not report it — the field is silently absent on
+    # servers without cache reporting enabled).
+    usage_cached_tokens: int | None = None
     content_parts: list[str] = []
     gaps = GapHistogram()  # MB-A: inter-token gaps of THIS request
     last_text_at: float | None = None  # timestamp of the last text-bearing delta
@@ -1057,6 +1109,10 @@ async def stream_once(
                 # last non-null value (servers send it once, on the final chunk).
                 if getattr(chunk.usage, "prompt_tokens", None) is not None:
                     usage_prompt_tokens = chunk.usage.prompt_tokens
+                # MB-CACHE: the details sub-block may be absent, None, an object
+                # or a dict depending on client version — _extract_cached_tokens
+                # handles all of them without ever raising.
+                usage_cached_tokens = _extract_cached_tokens(getattr(chunk.usage, "prompt_tokens_details", None))
             if chunk.choices:
                 delta = chunk.choices[0].delta
                 if delta is not None:
@@ -1136,6 +1192,7 @@ async def stream_once(
         itl=itl,
         burst_guarded=burst_guarded,
         prompt_tokens=usage_prompt_tokens,
+        cached_tokens=usage_cached_tokens,
     )
 
 
@@ -1612,6 +1669,14 @@ def build_level_rows(
     itl_pcts = merged.percentiles() if merged.n else None
     burst_frac = sum(1 for r in group if r.burst_guarded) / len(group)
 
+    # MB-CACHE: the server-reported cached prompt tokens of the group, plus
+    # the cached/prompt rate.  The rate is None (unmeasurable, rendered as a
+    # dash) when no prompt tokens were reported, which stays distinct from a
+    # measured 0.0 — the CONFIG signal that cache reporting may be off.
+    cached_tokens = sum(r.cached_tokens for r in group if r.cached_tokens)
+    prompt_tokens_total = sum(r.prompt_tokens for r in group if r.prompt_tokens)
+    cache_hit_rate = cached_tokens / prompt_tokens_total if prompt_tokens_total > 0 else None
+
     goodput: float | None = None
     goodput_each: dict[str, float] | None = None
     if slo:
@@ -1640,6 +1705,9 @@ def build_level_rows(
             n_requests=len(group),
             prefill_tps=aggregate_prefill_tps(group, nominal_ctx=ctx),
             prefill_stable=prefill_is_stable(group),
+            cached_tokens=cached_tokens,
+            prompt_tokens_total=prompt_tokens_total,
+            cache_hit_rate=cache_hit_rate,
         )
     ]
 
@@ -1727,6 +1795,12 @@ class LevelRow:
     # False when the level's max TTFT is straggler-dominated (P100/P50 above
     # the stability threshold), so prefill_tps understates the real rate.
     prefill_stable: bool = True
+    # MB-CACHE: server-reported cache usage for the group — total cached
+    # prompt tokens (0 when unreported), the group's total prompt tokens, and
+    # the cached/prompt rate (None when unmeasurable, distinct from 0.0).
+    cached_tokens: int = 0
+    prompt_tokens_total: int = 0
+    cache_hit_rate: float | None = None
 
     def as_tuple(self) -> tuple[int, int, str, int, dict[str, float], dict[str, float] | None, dict[str, float] | None]:
         """Legacy 7-tuple view (print_table / format_table_markdown callers)."""
@@ -1753,7 +1827,9 @@ def print_table(
 
     With ``extended`` (default) two more metric groups are appended: ITL
     P50/P95/P99/P100 (ms) and TPOT P50/P95/P99/P100 (ms), from the MB-A
-    per-request gap histograms.
+    per-request gap histograms.  A trailing ``cache%`` column reports the
+    group's cache hit rate (cached prompt tokens / prompt tokens), or ``-``
+    when the engine reported no prompt tokens to divide by.
     """
     ttft_label = "TTFT turn1 (ms)" if multiturn else "TTFT (ms)"
     head_labels = [ttft_label]
@@ -1762,11 +1838,18 @@ def print_table(
     head_labels.append("tokens/s")
     if extended:
         head_labels += ["ITL (ms)", "TPOT (ms)"]
-    title_row = f"{'':>8} {'':>6} {'':>10} {'':>6}    |    " + "    |    ".join(
-        f"{lab:^{len(_pct_header())}}" for lab in head_labels
+    # MB-CACHE: the cache column is a single number (not a percentile block),
+    # appended after the last metric group so existing columns keep their
+    # positions.
+    title_row = (
+        f"{'':>8} {'':>6} {'':>10} {'':>6}    |    "
+        + "    |    ".join(f"{lab:^{len(_pct_header())}}" for lab in head_labels)
+        + f"    |    {'cache%':>8}"
     )
-    pct_row = f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    " + "    |    ".join(
-        _pct_header() for _ in head_labels
+    pct_row = (
+        f"{'ctx':>8} {'users':>6} {'task':>10} {'failed':>6}    |    "
+        + "    |    ".join(_pct_header() for _ in head_labels)
+        + f"    |    {'':>8}"
     )
     print(title_row, file=file)
     print(pct_row, file=file)
@@ -1793,7 +1876,15 @@ def print_table(
                 blocks.append("".join(f"{'-':>{_CELL}}" for _ in PCTS))
             else:
                 blocks.append("".join(f"{s[p]:>{_CELL}.1f}" for p in PCTS))
-        line = f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |    " + "    |    ".join(blocks)
+        if row.cache_hit_rate is None:
+            cache_cell = f"{'-':>8}"
+        else:
+            cache_cell = f"{row.cache_hit_rate * 100:.1f}%"
+        line = (
+            f"{ctx:>8} {n_users:>6} {task:>10} {n_fail:>6}    |    "
+            + "    |    ".join(blocks)
+            + f"    |    {cache_cell:>8}"
+        )
         print(line, file=file)
 
 
@@ -1808,13 +1899,15 @@ def format_table_markdown(
     This is what ``--output`` files contain (results_to_html.py parses the
     Markdown back).  COMPACT percentiles: one cell per metric group holding
     all four percentiles slash-joined (``706.8 / 706.8 / 706.8 / 706.8``),
-    so the widest table is 9 columns and renders WITHOUT a horizontal
+    so the widest table is 10 columns and renders WITHOUT a horizontal
     scrollbar on GitHub (their renderer fixes table width to the page; a
     20+ column table clips the row header out of view).  A missing group
     renders as a single dash cell, which the parser reads back as None.
     ``extended`` adds the ITL and TPOT groups; results_to_html identifies
     groups by header name, so old wide files keep parsing and new compact
-    files gain the columns.
+    files gain the columns.  The trailing ``cache hit %`` cell is the group's
+    cache hit rate (cached prompt tokens / prompt tokens; MB-CACHE), a single
+    number rather than a percentile block, ``-`` when unmeasurable.
     """
     ttft1 = "TTFT turn1" if multiturn else "TTFT"
     cols = ["ctx", "users", "task", "failed"]
@@ -1828,6 +1921,7 @@ def format_table_markdown(
         # MB-PREFILL: single aggregate figure (n*S/max TTFT), not a percentile
         # group, so it reads as one cell rather than a slash-joined block.
         cols.append("prefill tok/s (agg)")
+    cols.append("cache hit %")
     out = [
         "| " + " | ".join(cols) + " |",
         "|" + "|".join([":---", ":---", ":---", ":---"] + ["---:"] * (len(cols) - 4)) + "|",
@@ -1858,8 +1952,63 @@ def format_table_markdown(
                 cells.append(f"{row.prefill_tps:,.0f}")
             else:
                 cells.append(f"~{row.prefill_tps:,.0f}")
+        # MB-CACHE: None (no prompt tokens reported) renders as a dash; the
+        # rate is a percent so 73.3 means 73.3% of prompt tokens came from
+        # the server cache.
+        if row.cache_hit_rate is None:
+            cells.append("-")
+        else:
+            cells.append(f"{row.cache_hit_rate * 100:.1f}")
         out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out)
+
+
+def _cache_reuse_possible(args) -> bool:
+    """True when this run's request construction ALLOWS prefix-cache reuse.
+
+    The default sweep prepends a unique random nonce per request (see the
+    module docstring), so nothing can be reused and a zero cache rate is the
+    design, not a finding.  --no-nonce shares one fixed marker, and a
+    multiturn sweep re-sends a growing conversation prefix, so both can
+    legitimately produce hits.
+    """
+    return bool(getattr(args, "no_nonce", False) or getattr(args, "multiturn", False))
+
+
+def _cache_note(rows: list[LevelRow], *, cache_possible: bool = True) -> str:
+    """MB-CACHE: the one-line run-summary note for a run whose aggregate
+    cache hit rate is EXACTLY 0.
+
+    A measured zero (prompt tokens reported, none of them cached) is a CONFIG
+    signal: the engine most likely does not have cache reporting enabled
+    (vLLM needs ``--enable-cache-report``; the fleet enables it only on some
+    catalog entries, and its absence is silent).  An UNMEASURABLE rate (no
+    prompt tokens at all) says nothing and earns no note.
+
+    ``cache_possible=False`` means the run was CONSTRUCTED so that no request
+    can reuse a prefix — the default mode prepends a unique random nonce to
+    every prompt precisely so no two requests share one.  A zero there is the
+    design working, not a misconfigured engine, and saying otherwise sends
+    operators chasing a flag that is already correct (cross-validation
+    XV-DS-1: every default run against a reporting engine emitted the wrong
+    note).  Those runs get the accurate note instead.
+    """
+    prompt_total = sum(r.prompt_tokens_total for r in rows)
+    cached_total = sum(r.cached_tokens for r in rows)
+    if prompt_total > 0 and cached_total == 0:
+        if not cache_possible:
+            return (
+                "\nNOTE: cache hit rate is 0 by construction — this run uses a unique "
+                "per-request nonce, so no two requests share a prefix and prefix-cache "
+                "reuse is impossible. Re-run with --no-nonce (optionally --warm) to "
+                "measure cache reuse."
+            )
+        return (
+            "\nNOTE: cache hit rate is exactly 0 across the run (prompt tokens were "
+            "reported but none were cached) — the engine may not have cache reporting "
+            "enabled (e.g. vLLM without --enable-cache-report)."
+        )
+    return ""
 
 
 def write_results_file(
@@ -2298,6 +2447,11 @@ async def main() -> None:
         print(summary_head)
         print(summary_note)
         print_table(rows, multiturn=args.multiturn)
+        # MB-CACHE: a measured zero hit rate is a config signal, not a perf
+        # result — say so next to the table it belongs to.
+        cache_note = _cache_note(rows, cache_possible=_cache_reuse_possible(args))
+        if cache_note:
+            print(cache_note)
         if slo:
             print_goodput_table(rows)
             best = max_goodput_level(rows, min_goodput=0.9)
@@ -2323,6 +2477,13 @@ async def main() -> None:
         raise
     finally:
         if args.output:
+            # MB-CACHE: stamp the zero-cache note into the FINAL artifact as
+            # well (summary_note is what write_results_file embeds), so the
+            # persistent record carries the config signal even when the run
+            # died mid-sweep.
+            note = _cache_note(rows, cache_possible=_cache_reuse_possible(args))
+            if note and note not in summary_note:
+                summary_note += note
             update_output(status)
             print(f"Table written to {args.output} (status: {status})")
 

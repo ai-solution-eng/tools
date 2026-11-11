@@ -69,6 +69,126 @@ Raises on transport failure - caught HERE, never by the route.
 """
 
 
+# --- pcai-llm-playbook overlay BEGIN (idempotent patch; integrations/pcai_llm_playbook) ---
+async def _overlay_emit_playbook(
+    mcp_call: McpCall,
+    doc: str,
+    *,
+    session_id: str,
+    source: str,
+    key_id: uuid.UUID | None,
+    trace_messages: list[dict[str, Any]] | None = None,
+) -> str:
+    """Split the optional Playbook section off a distilled summary.
+
+    Overlay behaviour (Feature A): the "## Playbook" section is stripped
+    from the summary body, and when it parses as a valid playbook a
+    SECOND, best-effort memory of kind "playbook" is written. Never
+    raises and never changes the summary write's (ok, detail) result or
+    its verdict: a playbook-write failure is logged and swallowed.
+
+    Server-side gate + outcome (lead rulings 2026-11-11): when
+    trace_messages carries TOOL DATA, the session must pass
+    emission_eligible() or the playbook is NOT written (the section is
+    still stripped from the summary), and the outcome label is
+    infer_outcome(trace_messages) - the model's own claimed outcome is
+    DISCARDED, never merged, and the stored body is rewritten with the
+    server-side label. A trace with no tool data, or trace_messages=None,
+    gives the structural gate nothing to judge: the model's claimed
+    outcome may be stored but is stamped outcome_source="unverified" -
+    "inferred" is reserved for labels derived from trace signals.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        from .playbook import (
+            OUTCOME_UNKNOWN,
+            OUTCOME_UNVERIFIED,
+            emission_eligible,
+            format_playbook_section,
+            infer_outcome,
+            parse_playbook,
+            playbook_key,
+            strip_playbook_section,
+        )
+    except ImportError:  # pragma: no cover - overlay module removed
+        return doc
+    body = doc
+    try:
+        body = strip_playbook_section(doc)
+        if not body.strip():
+            return doc  # the section was the whole document: keep the original
+        playbook = parse_playbook(doc)
+        if playbook is None:
+            return body
+        if trace_messages is not None and not emission_eligible(trace_messages):
+            log.debug(
+                "playbook gate: session not eligible (key=%s, session=%s)"
+                " - section stripped from the summary, no playbook written",
+                key_id,
+                session_id[:16],
+            )
+            return body
+        if trace_messages is not None:
+            # SERVER-SIDE OUTCOME (design note point 4): derived from
+            # trace signals, never the model's self-assessment.
+            outcome, outcome_source = infer_outcome(trace_messages)
+            if outcome == OUTCOME_UNKNOWN:
+                # the trace carried NO tool data: nothing was inferable -
+                # store the model's claim stamped "unverified", never
+                # "inferred" (lead ruling F1/F2)
+                outcome = str(playbook.get("outcome") or "")
+                outcome_source = OUTCOME_UNVERIFIED
+        else:
+            # no trace at all: the same honesty rule - the model's claim
+            # is stored but stamped "unverified" (lead ruling F2)
+            outcome = str(playbook.get("outcome") or "")
+            outcome_source = OUTCOME_UNVERIFIED
+        playbook["outcome"] = outcome
+        signature = str(playbook.get("task_signature") or "")
+        args = build_add_memory_arguments(
+            format_playbook_section(playbook),
+            session_id,
+            source,
+            "playbook",
+        )
+        args["metadata"].update(
+            {
+                "playbook_key": playbook_key(signature),
+                "task_signature": signature,
+                "applies_when": list(playbook.get("applies_when") or []),
+                "steps": list(playbook.get("steps") or []),
+                "failure_modes": list(playbook.get("failure_modes") or []),
+                "outcome": outcome,
+                "outcome_source": outcome_source,
+                "last_validated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "success_count": 0,
+                "fail_count": 0,
+                "evidence_thread": session_id,
+            }
+        )
+        try:
+            ok, detail = await mcp_call(args)
+            if not ok:
+                log.warning(
+                    "playbook memory write refused (key=%s, session=%s): %s",
+                    key_id,
+                    session_id[:16],
+                    str(detail)[:120],
+                )
+        except Exception as exc:
+            log.warning(
+                "playbook memory write failed (key=%s, session=%s): %s",
+                key_id,
+                session_id[:16],
+                type(exc).__name__,
+            )
+    except Exception:  # pragma: no cover - the overlay must never break a write
+        log.warning("playbook emission fault (key=%s)", key_id, exc_info=True)
+    return body
+# --- pcai-llm-playbook overlay END ---
+
+
 def build_add_memory_arguments(
     doc: str,
     session_id: str,
@@ -101,6 +221,7 @@ async def write_memory(
     fallback_session_id: str = "",
     mcp_search: McpCall | None = None,
     verdict_out: list[str] | None = None,
+    trace_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, str]:
     """Write ONE memory document to the calling key memory dataset.
 
@@ -205,6 +326,17 @@ async def write_memory(
                     + hit_session[:16]
                     + f" (containment {score:.2f}); write suppressed"
                 )
+
+
+    # --- pcai-llm-playbook overlay: split the optional Playbook section off ---
+    doc = await _overlay_emit_playbook(
+        mcp_call,
+        doc,
+        session_id=session_id,
+        source=source,
+        key_id=key_id,
+        trace_messages=trace_messages,
+    )
 
     try:
         ok, detail = await mcp_call(build_add_memory_arguments(doc, session_id, source, kind))

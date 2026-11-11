@@ -487,6 +487,8 @@ def state_matches(cookie_state: str, query_state: str) -> bool:
 def safe_next_path(raw: str) -> str:
     """Only same-site absolute paths may be a post-login redirect target
     (an open redirect would launder the auth code).  Everything else → /."""
+    if not raw or not raw.isprintable():
+        return "/"
     if raw.startswith("/") and not raw.startswith("//") and "\\" not in raw:
         return raw
     return "/"

@@ -377,6 +377,46 @@ class Settings(BaseSettings):
     # and an unbounded store is a memory/disk liability, not a feature.
     tool_compress_max_store_chars: int = 1_000_000
 
+    # --- tool-definition pinning (rug-pull defence, 2026-11-10) ----------
+    # An MCP server may rewrite a tool's description or inputSchema AFTER the
+    # operator approved the grant: the ACL still admits the NAME, so the model
+    # is offered a definition nobody reviewed (and a rewritten description is
+    # an instruction channel into its context). The gateway fingerprints every
+    # definition it offers and remembers it; a later mismatch is a rug-pull
+    # (core.tool_pin, observed in toolrelay.pin_catalog).
+    #   "off"   -> inert.
+    #   "warn"  -> log the old -> new digest and keep offering the tool.
+    #   "block" -> drop the changed tool from the OFFERED surface AND refuse
+    #              the call at dispatch. Both halves are needed: the offer alone
+    #              is bypassable by history replay, where the model names a tool
+    #              it saw in an earlier turn. The GRANT is untouched in either
+    #              case: a definition change is not an ACL change.
+    # Unknown values fall back to "warn" — a typo must neither silently
+    # disable the defence nor block every tool.
+    tool_pin_mode: str = "warn"
+    # How long a recorded fingerprint stays trusted (seconds). 0 = never
+    # expires (the default: an approval is an approval). > 0 re-records each
+    # pin once it is that old, so a definition change older than the TTL is
+    # re-approved silently — use it only where definitions are expected to
+    # churn, and watch the WARNING line.
+    tool_pin_ttl_s: float = 0.0
+
+    # --- tool-result injection screening (2026-11-10) ---------------------
+    # Guardrails cover user text pre-call and assistant text post-call; MCP
+    # tool RESULTS were the one unguarded channel back into the model. The
+    # gateway sees every result before it re-enters the conversation, so it
+    # screens there (core.tool_injection): instruction-override phrases,
+    # role/control-token spoofs, exfiltration shapes, encoded-payload smells.
+    #   "off"      -> inert.
+    #   "warn"     -> log the findings, pass the result through untouched.
+    #   "annotate" -> prepend a one-line provenance header naming the server,
+    #                 the tool and the finding count; the content is kept.
+    #   "block"    -> replace the body with a short refusal naming the
+    #                 server/tool and the reason. The tool call keeps a valid,
+    #                 non-empty result either way.
+    # Unknown values fall back to "warn".
+    tool_injection_screen: str = "warn"
+
     # --- reasoning continuity (2026-10-26) -------------------------------
     # Whether the model is shown its OWN prior reasoning: in-loop (the
     # assistant rows a relay turn builds between tool calls) and inbound (the

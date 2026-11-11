@@ -537,9 +537,7 @@ async def test_no_event_loop_task_is_created_when_disabled(fake: FakeClient) -> 
     assert fake.calls == []
 
 
-async def test_mcp_call_tool_emits_a_span(
-    monkeypatch: pytest.MonkeyPatch, fake: FakeClient
-) -> None:
+async def test_mcp_call_tool_emits_a_span(monkeypatch: pytest.MonkeyPatch, fake: FakeClient) -> None:
     """Every /mcp tools/call produces exactly one span — even when it fails.
 
     /mcp is the surface the harnesses call DIRECTLY, and it carries far more
@@ -556,7 +554,12 @@ async def test_mcp_call_tool_emits_a_span(
     _enable(monkeypatch)
     server = routes_mcp._new_gateway_server()
 
-    with pytest.raises(Exception):
+    # The real type, not a blind Exception: an unknown tool name raises
+    # ToolError from the MCP server, and asserting the concrete class is what
+    # makes this test fail if that contract ever changes.
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    with pytest.raises(ToolError):
         await server.call_tool("definitely-not-a-tool", {})
 
     await tracing.flush()
@@ -569,4 +572,4 @@ async def test_mcp_call_tool_emits_a_span(
     assert by_key["tool.status"] == {"stringValue": "error"}
     assert by_key["langfuse.trace.name"] == {"stringValue": "tool"}
     # No arguments and no result content may reach a backend.
-    assert not any(k.startswith("tool.arg") or k.startswith("tool.result") for k in by_key)
+    assert not any(k.startswith(("tool.arg", "tool.result")) for k in by_key)

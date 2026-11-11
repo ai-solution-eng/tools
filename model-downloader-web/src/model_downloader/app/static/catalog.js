@@ -230,11 +230,22 @@ function buildConfigRow(cfg) {
       '</button>'
     : '';
 
+  // EVAL: a quantised variant with no eval block is served as equivalent to
+  // the bf16 model whether or not it actually is -- the badge makes that gap
+  // visible at a glance (bf16/full-precision entries never earn it).
+  const unvalidatedBadge = cfg.unvalidated
+    ? '<span class="cfg-badge-unvalidated"' +
+        ' title="Quantised variant with no eval block recorded -- its quality versus the bf16 original is unmeasured">' +
+        'unvalidated' +
+      '</span>'
+    : '';
+
   row.innerHTML =
     '<label class="tree-config-select"><input type="checkbox" data-catalog-id="' + esc(e.catalog_id) +
       '" data-tier="' + esc(e.tier || '') + '"></label>' +
     '<span class="tree-config-label">' + configLabelHtml(cfg) + '</span>' +
     caveatChip +
+    unvalidatedBadge +
     '<span class="tree-config-id">' + esc(cfg.model_id || '') + '</span>' +
     '<span class="tree-config-actions">' +
       '<button type="button" class="action-btn details-btn" data-details="' + esc(e.catalog_id) + '">Config</button>' +
