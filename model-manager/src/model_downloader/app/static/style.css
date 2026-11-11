@@ -1,0 +1,1203 @@
+/* HPE brand palette (hpe.design) */
+:root, :root[data-theme="light"] {
+  color-scheme: light;
+  --hpe-green: #01A982;        /* HPE Bright Green */
+  --hpe-green-dark: #00715B;   /* deep green */
+  --hpe-green-tint: #E6F7F2;   /* light green wash */
+  --hpe-text: #1F1F1F;
+  --hpe-text-soft: #555555;
+  --hpe-bg: #F7F7F7;
+  --hpe-surface: #FFFFFF;
+  --hpe-border: #D9D9D9;
+  --hpe-border-soft: #ECECEC;
+  --hpe-critical: #C92C2C;
+  --hpe-critical-tint: #FCE8E8;
+  --hpe-warning: #FFBC44;
+  --hpe-running-tint: #E8F4F1;
+  --hpe-focus: #0073E6;
+  --hpe-code-bg: #FAFAFA;
+  --hpe-skip-tint: #FFF8E6;
+  --hpe-l3-tint: #E8EEFB;     /* Mooncake L3 chip: blue, distinct from the L2 green */
+  --hpe-l3-text: #1F3A8A;
+  --hpe-tint-hover: #D0ECE4;
+  --hpe-critical-hover: #F5D0D0;
+  --hpe-row-alt: #F1F2F4;   /* slightly lighter gray, alternating model shade */
+}
+
+/* Dark mode — HPE dark palette: neutral darks with green accents.
+   This is a PARTIAL override: both dark blocks below redefine the same subset
+   of custom properties and everything else keeps inheriting from :root. */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    /* DARK VARS — KEEP IN SYNC with the block below. */
+    color-scheme: dark;
+    --hpe-green-dark: #4DD8B6;
+    --hpe-green-tint: #12352E;
+    --hpe-text: #E8E8E8;
+    --hpe-text-soft: #A6A6A6;
+    --hpe-bg: #1E1E1E;
+    --hpe-surface: #262626;
+    --hpe-border: #3A3A3A;
+    --hpe-border-soft: #333333;
+    --hpe-critical-tint: #3D1D1D;
+    --hpe-running-tint: #14302A;
+    --hpe-focus: #4DA3FF;
+    --hpe-code-bg: #1B1B1B;
+    --hpe-skip-tint: #3A3318;
+    --hpe-l3-tint: #1B2740;
+    --hpe-l3-text: #9DB8F5;
+    --hpe-tint-hover: #17403A;
+    --hpe-critical-hover: #4A2324;
+    --hpe-row-alt: #303030;   /* slightly lighter gray, alternating model shade */
+  }
+}
+/* Dark mode pinned by the user — same palette as the auto block above. */
+:root[data-theme="dark"] {
+  /* DARK VARS — KEEP IN SYNC with the block above. */
+  color-scheme: dark;
+  --hpe-green-dark: #4DD8B6;
+  --hpe-green-tint: #12352E;
+  --hpe-text: #E8E8E8;
+  --hpe-text-soft: #A6A6A6;
+  --hpe-bg: #1E1E1E;
+  --hpe-surface: #262626;
+  --hpe-border: #3A3A3A;
+  --hpe-border-soft: #333333;
+  --hpe-critical-tint: #3D1D1D;
+  --hpe-running-tint: #14302A;
+  --hpe-focus: #4DA3FF;
+  --hpe-code-bg: #1B1B1B;
+  --hpe-skip-tint: #3A3318;
+  --hpe-l3-tint: #1B2740;
+  --hpe-l3-text: #9DB8F5;
+  --hpe-tint-hover: #17403A;
+  --hpe-critical-hover: #4A2324;
+  --hpe-row-alt: #303030;   /* slightly lighter gray, alternating model shade */
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  /* Metric is HPE's brand typeface; fall back to system sans. */
+  font-family: "MetricWeb", "Metric", Arial, Helvetica, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: var(--hpe-bg);
+  color: var(--hpe-text);
+}
+
+/* ---- Brand header bar ---- */
+.brandbar {
+  background: var(--hpe-surface);
+  border-bottom: 3px solid var(--hpe-green);
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.wordmark {
+  font-weight: 800;
+  font-size: 22px;
+  letter-spacing: -0.5px;
+  color: var(--hpe-green);
+  line-height: 1;
+}
+.wordmark .bar {
+  display: inline-block;
+  width: 4px;
+  height: 18px;
+  margin-right: 8px;
+  background: var(--hpe-green);
+  transform: translateY(2px);
+  border-radius: 1px;
+}
+.brandbar .app-title {
+  font-size: 15px;
+  color: var(--hpe-text-soft);
+  border-left: 1px solid var(--hpe-border);
+  padding-left: 14px;
+}
+.brandbar .spacer { flex: 1; }
+.brandbar .tag {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  background: var(--hpe-green-tint);
+  border: 1px solid var(--hpe-green);
+  color: var(--hpe-green-dark);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.theme-seg {
+  display: inline-flex;
+  border: 1px solid var(--hpe-border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.theme-seg button {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border: 0;
+  background: var(--hpe-surface);
+  color: var(--hpe-text-soft);
+  font-weight: 600;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.theme-seg button.on { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.theme-seg button:not(.on):hover { background: var(--hpe-green-tint); }
+
+/* ---- Main nav ---- */
+.main-nav { display: flex; gap: 4px; margin-left: 18px; }
+.nav-link {
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--hpe-text-soft);
+  text-decoration: none;
+  border-radius: 6px;
+}
+.nav-link:hover { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.nav-link.active { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+
+/* ---- Model name combobox ---- */
+.combo { position: relative; min-width: 0; }
+.combo input { width: 100%; min-width: 0; padding-right: 34px; }
+.combo-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: 0;
+  color: var(--hpe-text-soft);
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 13px;
+  line-height: 1;
+}
+.combo-toggle:hover { color: var(--hpe-green-dark); }
+.combo-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+}
+.combo-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--hpe-border-soft);
+}
+.combo-item:hover { background: var(--hpe-green-tint); }
+.combo-item-id {
+  display: block;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 13px;
+  color: var(--hpe-text);
+}
+.combo-item-name {
+  display: block;
+  font-size: 11px;
+  color: var(--hpe-text-soft);
+}
+.combo-empty { padding: 10px; color: var(--hpe-text-soft); font-style: italic; font-size: 12px; }
+
+/* ---- Layout ---- */
+main { max-width: 1100px; margin: 28px auto; padding: 0 24px; }
+h1 { margin: 0 0 4px; font-size: 26px; }
+h2 { margin-top: 36px; font-size: 18px; }
+.hint { color: var(--hpe-text-soft); margin-top: 0; }
+.field-note {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+}
+.field-note code {
+  font-size: 11px;
+  background: var(--hpe-surface-alt, rgba(0,0,0,0.04));
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* ---- Form ---- */
+form {
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-top: 3px solid var(--hpe-green);
+  border-radius: 4px;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+  max-width: 480px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+label { display: flex; flex-direction: column; font-size: 13px; }
+form label { min-width: 0; }
+label span {
+  margin-bottom: 5px;
+  font-weight: 700;
+  color: var(--hpe-text);
+}
+#submit-form input:not([type="checkbox"]),
+#submit-form select,
+#submit-form textarea {
+  width: 100%;
+  min-width: 0;
+}
+input {
+  padding: 9px 11px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 14px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+}
+input:focus {
+  outline: 2px solid var(--hpe-green);
+  outline-offset: -1px;
+  border-color: var(--hpe-green);
+}
+/* Checkboxes are not text inputs: the padding/border above is meant for text
+   fields and makes a bare checkbox render oversized and push its label onto a
+   new line.  Reset them everywhere they appear. */
+input[type="checkbox"], input[type="radio"] {
+  padding: 0;
+  border: 0;
+  background: none;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--hpe-green);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+select {
+  padding: 9px 11px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 14px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+}
+select:focus {
+  outline: 2px solid var(--hpe-green);
+  outline-offset: -1px;
+  border-color: var(--hpe-green);
+}
+#submit-form textarea {
+  padding: 9px 11px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 14px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  resize: vertical;
+}
+#submit-form textarea:focus {
+  outline: 2px solid var(--hpe-green);
+  outline-offset: -1px;
+  border-color: var(--hpe-green);
+}
+button {
+  padding: 11px 18px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--hpe-green);
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+  letter-spacing: 0.2px;
+}
+button:hover { background: var(--hpe-green-dark); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: 2px; }
+
+.msg { margin-top: 6px; font-size: 14px; min-height: 20px; }
+.msg.ok { color: var(--hpe-green-dark); }
+.msg.error { color: var(--hpe-critical); }
+
+/* ---- Table ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 14px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+th, td {
+  text-align: left;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--hpe-border-soft);
+  vertical-align: top;
+}
+th {
+  background: var(--hpe-green-tint);
+  color: var(--hpe-green-dark);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+tr:last-child td { border-bottom: 0; }
+
+/* status rows */
+tr.status-queued td { color: var(--hpe-text-soft); font-style: italic; }
+tr.status-running td { background: var(--hpe-running-tint); }
+tr.status-succeeded td { background: var(--hpe-green-tint); }
+tr.status-failed td { background: var(--hpe-critical-tint); }
+
+/* status pill inside the Status column */
+td:nth-child(4) { font-weight: 700; }
+tr.status-queued td:nth-child(4) { color: var(--hpe-text-soft); }
+tr.status-running td:nth-child(4) { color: var(--hpe-green-dark); }
+tr.status-succeeded td:nth-child(4) { color: var(--hpe-green-dark); }
+tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
+
+/* ---- PVC URL cell ---- */
+.pvc-wrap { display: flex; align-items: center; gap: 6px; }
+.pvc-url {
+  font-size: 12px;
+  background: var(--hpe-green-tint);
+  border: 1px solid var(--hpe-border-soft);
+  padding: 3px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+  display: inline-block;
+}
+.copy-btn {
+  padding: 3px 8px;
+  font-size: 12px;
+  border-radius: 3px;
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  color: var(--hpe-green-dark);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.copy-btn:hover { background: var(--hpe-green-tint); }
+
+/* ---- Logs button ---- */
+.log-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 3px;
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  color: var(--hpe-green-dark);
+  font-weight: 600;
+  cursor: pointer;
+}
+.log-btn:hover { background: var(--hpe-green-tint); }
+
+/* ---- Action buttons (Delete, Progress) ---- */
+.action-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--hpe-border);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.action-btn:hover { filter: brightness(0.95); }
+.delete-btn {
+  background: var(--hpe-critical-tint);
+  border-color: var(--hpe-critical);
+  color: var(--hpe-critical);
+}
+.delete-btn:hover { background: var(--hpe-critical-hover); }
+.progress-btn {
+  background: var(--hpe-running-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.progress-btn:hover { background: var(--hpe-tint-hover); }
+.download-btn {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.download-btn:hover { background: var(--hpe-tint-hover); }
+.template-btn {
+  background: var(--hpe-warning);
+  border-color: #e0a63c;
+  color: #5c4700;
+}
+.template-btn:hover { background: #eeb03c; }
+
+/* ---- Logs modal ---- */
+.modal { position: fixed; inset: 0; z-index: 1000; }
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+.modal-panel {
+  position: relative;
+  max-width: 900px;
+  width: 90vw;
+  max-height: 80vh;
+  margin: 5vh auto;
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-top: 3px solid var(--hpe-green);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hpe-border-soft);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--hpe-green-dark);
+}
+.modal-close {
+  background: none;
+  border: 0;
+  font-size: 22px;
+  cursor: pointer;
+  color: var(--hpe-text-soft);
+  padding: 0 4px;
+  line-height: 1;
+}
+.modal-close:hover { color: var(--hpe-text); }
+#log-body {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--hpe-text);
+  background: var(--hpe-code-bg);
+  flex: 1;
+}
+
+/* ---- Catalog controls ---- */
+.catalog-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+/* Optional project for the MLIS push: the download page's namespace combobox,
+   inline in the control bar (label defaults to a column, hence the override). */
+.push-project { flex-direction: row; align-items: center; gap: 8px; }
+.push-project > span { margin-bottom: 0; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.push-project .combo { width: 250px; }
+/* Effective value after the server strips the PCAI project- prefix. */
+.push-project > span.push-project-effective {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+}
+/* Inline result of the control-bar actions (refresh / refresh-from-github /
+   add-to-catalog): sits right beside the buttons so feedback is visible
+   without scrolling past the whole table. */
+.ctl-status {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--hpe-text-soft);
+  min-height: 18px;
+}
+.ctl-status.ok { color: var(--hpe-green-dark); }
+.ctl-status.error { color: var(--hpe-critical); }
+.secondary-btn {
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  color: var(--hpe-green-dark);
+}
+.secondary-btn:hover { background: var(--hpe-green-tint); }
+
+/* ---- Tier sections ---- */
+.tier-section {
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+.tier-header {
+  background: var(--hpe-green-tint);
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--hpe-border-soft);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.tier-select-all { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
+.tier-select-all input { width: 16px; height: 16px; }
+/* GPU spec chips in the tier header: supported quants + VRAM. */
+.tier-specs { display: flex; align-items: center; gap: 6px; }
+.tier-spec {
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 8px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 10px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+}
+.tier-empty { padding: 14px; color: var(--hpe-text-soft); font-style: italic; font-size: 13px; }
+
+/* ---- Catalog table ---- */
+.catalog-table { font-size: 13px; }
+.catalog-table th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+.catalog-table input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+.cat-name { font-weight: 700; }
+.cat-name .cat-model-id {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+  margin-top: 2px;
+  word-break: break-all;
+}
+.cat-details-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--hpe-green-dark);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-align: left;
+}
+.cat-details-btn:hover { color: var(--hpe-text); }
+.cat-image { font-family: "SF Mono", "Fira Code", Consolas, monospace; font-size: 12px; color: var(--hpe-text-soft); }
+.catalog-table tbody tr.model-shade td { background: var(--hpe-row-alt); }
+
+/* ---- JSON textarea ---- */
+.json-input {
+  width: 100%;
+  max-width: 100%;
+  padding: 12px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--hpe-code-bg);
+  color: var(--hpe-text);
+  resize: vertical;
+}
+.json-input:focus { outline: 2px solid var(--hpe-green); border-color: var(--hpe-green); }
+
+/* ---- Push results ---- */
+.push-summary {
+  margin: 12px 0;
+  font-size: 14px;
+  padding: 8px 14px;
+  background: var(--hpe-green-tint);
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 4px;
+}
+tr.push-ok td { background: var(--hpe-green-tint); }
+tr.push-skip td { background: var(--hpe-skip-tint); }
+tr.push-err td { background: var(--hpe-critical-tint); }
+
+/* ---- Downloaded models ---- */
+.backend-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-right: 4px;
+  border: 1px solid var(--hpe-border);
+}
+.backend-pvc {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.backend-s3 {
+  background: var(--hpe-code-bg);
+  border-color: var(--hpe-focus);
+  color: var(--hpe-focus);
+}
+/* ModelScan verdict badge in the GC report (warn/unsafe verdicts). */
+.backend-scan-risk {
+  background: var(--hpe-skip-tint);
+  border-color: var(--hpe-warning);
+  color: var(--hpe-text-soft);
+}
+
+/* ---- Add-model modal ---- */
+.modal-wide { max-width: 720px; }
+.modal-body-scroll {
+  padding: 20px;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+/* ---- Model details modal ---- */
+#details-body {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  max-height: 70vh;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--hpe-text);
+  background: var(--hpe-code-bg);
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+}
+.form-grid label { font-size: 12px; }
+.form-grid label span { display: block; margin-bottom: 4px; font-weight: 700; }
+.form-grid .full-width { grid-column: 1 / -1; }
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 13px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+}
+.form-grid input:focus,
+.form-grid select:focus,
+.form-grid textarea:focus {
+  outline: 2px solid var(--hpe-green);
+  border-color: var(--hpe-green);
+}
+.form-grid textarea { font-family: "SF Mono", "Fira Code", Consolas, monospace; resize: vertical; }
+.checkbox-label {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+}
+.checkbox-label input { width: 18px; height: 18px; }
+#add-model-form > button { margin-top: 16px; width: 100%; }
+
+/* ---- GPU class filter (radio group) ---- */
+.gpu-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+}
+/* The legend is visually hidden but kept for screen readers: the radios are
+   self-describing ("H200", "L40S"), so a visible heading would just be noise. */
+.gpu-filter-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.gpu-option {
+  display: inline-flex;
+  flex-direction: row;      /* override the global label { column } rule */
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 16px;
+  background: var(--hpe-surface);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.gpu-option:hover { border-color: var(--hpe-green); background: var(--hpe-green-tint); }
+/* :has lets the pill itself show selection — the radio is tiny and easy to
+   miss, and the whole pill is the click target. */
+.gpu-option:has(input:checked) {
+  border-color: var(--hpe-green);
+  background: var(--hpe-green-tint);
+  color: var(--hpe-green-dark);
+  font-weight: 700;
+}
+.gpu-option:has(input:focus-visible) { outline: 2px solid var(--hpe-focus); outline-offset: 2px; }
+.gpu-option input[type="radio"] { width: 14px; height: 14px; margin: 0; }
+.gpu-spec {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Catalog search ---- */
+.catalog-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.catalog-search input[type="search"] {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  font-size: 14px;
+  background: var(--hpe-surface);
+  color: var(--hpe-text);
+}
+.catalog-search input[type="search"]:focus {
+  outline: 2px solid var(--hpe-green);
+  border-color: var(--hpe-green);
+}
+.search-summary {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+}
+
+/* ---- Hierarchical tree: lab > model > configuration ---- */
+/* Nested <details> so expand/collapse is native: no JS state, keyboard
+   accessible, and the open/closed state survives a re-render. */
+.tree-lab {
+  background: var(--hpe-surface);
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  margin-bottom: 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+.tree-lab-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  background: var(--hpe-green-tint);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+/* Hide the default disclosure triangle; we draw our own so it can be styled
+   and rotated consistently across browsers. */
+.tree-lab-summary::-webkit-details-marker,
+.tree-model-summary::-webkit-details-marker { display: none; }
+.tree-lab-summary::before,
+.tree-model-summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.15s ease;
+  opacity: 0.65;
+}
+details[open] > .tree-lab-summary::before,
+details[open] > .tree-model-summary::before { transform: rotate(90deg); }
+.tree-lab-summary:hover { background: var(--hpe-tint-hover); }
+.tree-lab-summary:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+.tree-lab-name { font-size: 15px; font-weight: 700; color: var(--hpe-green-dark); }
+.tree-count {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  font-variant-numeric: tabular-nums;
+}
+.tree-lab-actions { margin-left: auto; }
+.tree-select {
+  display: inline-flex;
+  flex-direction: row;   /* override the global label { column } rule */
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.tree-select input { width: 14px; height: 14px; cursor: pointer; }
+
+.tree-lab-body { padding: 8px 10px 10px 14px; }
+
+.tree-model {
+  border-left: 2px solid var(--hpe-border-soft);
+  margin: 6px 0;
+  padding-left: 10px;
+}
+.tree-model-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 3px;
+  user-select: none;
+}
+.tree-model-summary:hover { background: var(--hpe-row-alt); }
+.tree-model-summary:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+.tree-model-name { font-size: 13px; font-weight: 700; }
+
+.tree-configs { padding: 2px 0 4px 16px; }
+.tree-config {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 3px;
+  font-size: 12.5px;
+}
+.tree-config:hover { background: var(--hpe-row-alt); }
+.tree-config-select { flex-direction: row; }
+.tree-config-select input { width: 15px; height: 15px; cursor: pointer; display: block; }
+.tree-config-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Everything after the label groups to the right of the row, so the chips and
+   model path sit together instead of floating mid-row with a dead gap. */
+/* Emphasised label segments (HiCache / shared GPU) -- part of the label text
+   itself, so they never duplicate what the label already says. */
+.cfg-emph {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 700;
+}
+.cfg-emph-cache { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.cfg-emph-shared { background: var(--hpe-skip-tint); color: var(--hpe-text); }
+.cfg-emph-mooncake { background: var(--hpe-l3-tint); color: var(--hpe-l3-text); }
+.cfg-sep { color: var(--hpe-text-soft); font-weight: 400; }
+/* EVAL: "unvalidated" badge for quantised variants with no recorded eval
+   block -- a status chip, not a label segment, so it sits beside the label
+   like the caveat chip.  Warning-tinted: it marks an honesty gap, not a
+   broken deployment. */
+.cfg-badge-unvalidated {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border: 1px solid var(--hpe-warning);
+  border-radius: 3px;
+  background: var(--hpe-skip-tint);
+  color: var(--hpe-text);
+}
+.tree-config-id {
+  flex: 0 1 auto;
+  margin-left: auto;
+  max-width: 34%;
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--hpe-text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-config-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; margin-left: 6px; }
+.tree-config-actions .action-btn { padding: 3px 8px; font-size: 11px; }
+
+/* Deployment caveat (Mooncake RDMA): a chip on the row that expands the
+   manual step inline.  The catalog cannot carry the step itself -- RDMA
+   devices, IPC_LOCK and the per-pod hostname are not catalog fields -- so the
+   note lives next to the configuration that needs it. */
+.caveat-btn {
+  flex: 0 0 auto;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border: 1px solid var(--hpe-warning);
+  border-radius: 3px;
+  background: var(--hpe-skip-tint);
+  color: var(--hpe-text);
+  cursor: pointer;
+}
+.caveat-btn:hover,
+.caveat-btn[aria-expanded="true"] { background: var(--hpe-warning); color: #1F1F1F; }
+.caveat-btn:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: 1px; }
+
+/* Aligns under the label: row padding (8px) + checkbox (15px) + gap (10px). */
+.tree-config-caveat {
+  margin: 0 8px 6px 33px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-warning);
+  border-radius: 0 3px 3px 0;
+  background: var(--hpe-code-bg);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.tree-config-caveat .caveat-title { margin: 0 0 4px; font-weight: 700; }
+.tree-config-caveat .caveat-body { margin: 0 0 6px; color: var(--hpe-text-soft); }
+.caveat-commands { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.caveat-commands li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.caveat-cmd-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--hpe-text-soft);
+}
+.tree-config-caveat code {
+  padding: 1px 5px;
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 3px;
+  background: var(--hpe-surface);
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* Narrow screens: let the label wrap and drop the model-path column so the
+   action buttons stay reachable instead of overflowing. */
+@media (max-width: 720px) {
+  .tree-config { flex-wrap: wrap; }
+  .tree-config-label { white-space: normal; }
+  .tree-config-id { display: none; }
+  .tree-config-actions { margin-left: auto; }
+  .tree-config-caveat { margin-left: 8px; }
+  .catalog-search { flex-wrap: wrap; }
+  .search-summary { width: 100%; }
+}
+
+/* ---- Manual deletion (admin) ---- */
+/* Solid red primary: the page's only destructive submit. The tinted
+   .delete-btn stays for inline row actions; a page-level "delete N paths"
+   needs the full-strength treatment so it cannot read as a routine button.
+   Solid red + white text is theme-agnostic, and hover follows the existing
+   .action-btn filter pattern instead of a second hardcoded colour. */
+.danger-btn {
+  background: var(--hpe-critical);
+  border: 1px solid var(--hpe-critical);
+  color: #fff;
+}
+.danger-btn:hover { filter: brightness(0.9); }
+.danger-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* Verdict badges: the shared .backend-badge shape, tinted per verdict. The
+   colours mirror the GC report (green = fine, warning tint = caution, red =
+   blocked) via the same CSS variables, so dark/light both hold. */
+.verdict-badge-deletable {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.verdict-badge-soft {
+  background: var(--hpe-skip-tint);
+  border-color: var(--hpe-warning);
+  color: var(--hpe-text);
+}
+.verdict-badge-block {
+  background: var(--hpe-critical-tint);
+  border-color: var(--hpe-critical);
+  color: var(--hpe-critical);
+}
+
+/* Exact cache path cell: wraps (unlike .pvc-url) because the user must be
+   able to read every character of the path they are deleting. */
+.md-path {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--hpe-text);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.md-col-manifest, .md-col-scan { white-space: nowrap; }
+/* The jobs/GC tables bold their 4th (status) column via the global
+   td:nth-child(4) rule; this table's 4th column is Size, so neutralise it. */
+#md-table td:nth-child(4) { font-weight: 400; color: inherit; }
+#md-table .checkbox-label { margin: 0; }
+#md-table input[type="checkbox"] { width: 16px; height: 16px; }
+.md-row-note {
+  margin-top: 3px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--hpe-text-soft);
+}
+.md-verdict-reason {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--hpe-text-soft);
+}
+.md-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.md-actions-note { font-size: 12px; color: var(--hpe-text-soft); }
+
+/* Confirm modal: same .modal shell as the logs/details dialogs, red-topped
+   so the destructive panel cannot be mistaken for a read-only one. */
+.md-modal-panel { max-width: 760px; border-top-color: var(--hpe-critical); }
+.md-modal-summary { margin: 0 0 10px; font-size: 14px; }
+.md-path-list {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  list-style: none;
+  max-height: 34vh;
+  overflow: auto;
+  background: var(--hpe-code-bg);
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 4px;
+}
+.md-path-list li {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--hpe-border-soft);
+}
+.md-path-list li:last-child { border-bottom: 0; }
+.md-path-list code {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--hpe-text);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.md-override-note {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-warning);
+  background: var(--hpe-skip-tint);
+  font-size: 12.5px;
+  color: var(--hpe-text);
+}
+.md-modal-error {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-critical);
+  background: var(--hpe-critical-tint);
+  font-size: 12.5px;
+  color: var(--hpe-critical);
+}
+.md-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--hpe-border-soft);
+}
+.md-modal-actions #md-modal-confirm { flex: 1; min-width: 0; }
+@media (max-width: 720px) {
+  .md-modal-actions { flex-wrap: wrap; }
+  .md-modal-actions #md-modal-confirm { flex: 1 1 100%; }
+}
+
+/* ---- NIM source switch (HuggingFace | NVIDIA NIM) ---- */
+/* Segmented control: same pill shape as the header .theme-seg, sized for the
+   form column. The global button reset gives every button the solid green
+   primary look, so paddings and colours are overridden at this scope. */
+.source-seg {
+  display: inline-flex;
+  justify-self: start;   /* grid item: hug the buttons instead of stretching */
+  border: 1px solid var(--hpe-border);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--hpe-surface);
+}
+.source-seg button {
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  border: 0;
+  background: var(--hpe-surface);
+  color: var(--hpe-text-soft);
+  cursor: pointer;
+}
+.source-seg button.active { background: var(--hpe-green-tint); color: var(--hpe-green-dark); }
+.source-seg button:not(.active):hover { background: var(--hpe-green-tint); }
+.source-seg button:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: -2px; }
+
+/* Source pill in the jobs table Model cell: the shared .backend-badge shape,
+   green for HF and the L3 blue (kept distinct from every storage badge) for
+   NIM, so dark/light both hold via the same variables. */
+.src-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-left: 6px;
+  border: 1px solid var(--hpe-border);
+  vertical-align: middle;
+}
+.src-hf {
+  background: var(--hpe-green-tint);
+  border-color: var(--hpe-green);
+  color: var(--hpe-green-dark);
+}
+.src-nim {
+  background: var(--hpe-l3-tint);
+  border-color: var(--hpe-l3-text);
+  color: var(--hpe-l3-text);
+}
+
+/* The NIM target note under the NIM fields: the caveat/override note shape
+   (left rule + tinted panel) in the brand green — it points at the serving
+   deployment's config, so it is guidance, not a warning. */
+.nim-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--hpe-green);
+  background: var(--hpe-green-tint);
+  border-radius: 0 3px 3px 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.nim-note code {
+  padding: 1px 5px;
+  border: 1px solid var(--hpe-border-soft);
+  border-radius: 3px;
+  background: var(--hpe-surface);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}

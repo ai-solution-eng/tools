@@ -1,0 +1,276 @@
+# ============================================================================
+# Model Manager — hosted-trial (customer PCAI) example values (SANITIZED).
+# Full values document: paste it into the PCAI Helm Values editor. PCAI
+# resolves ${DOMAIN_NAME} before rendering — leave the placeholders untouched.
+# Full guide: README.md §"Kyverno on hosted trial systems".
+
+#  ### REQUIRED ### — fill these before applying on a customer trial
+#   1. defaultNamespace — the customer project-user-* namespace that owns
+#      `models-pvc`.
+#   2. s3.accessKeyId / s3.secretAccessKey — the customer MinIO credentials.
+#   3. aioli.dbPasswordSecret — name/namespace/key of an EXISTING Secret.
+#   4. ezua.virtualService.endpoint — RENDER FAILS without it while ezua.enabled.
+#   5. Platform Kyverno: the customer `protect-models-pvc` policy must admit the
+#      downloader/debug/scanner Jobs — see README.md before deploying.
+
+#  ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Storage: storage.backend (pvc|s3|both) / downloader.s3Work* / catalog.*
+#   Gates: provenance / gate (ModelScan) / preflight + quota / gc
+#   Egress: proxy.http|https|noProxy — each key wired only when non-empty
+#   PCAI: pcai.enabled / kyverno.enabled / ezua.authorizationPolicy
+
+# ============================================================================
+# Application
+# ============================================================================
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Tags are packaged with the chart — change only if you build your own images.
+image:
+  repository: ghcr.io/ai-solution-eng/model-downloader
+  tag: v2.1.2
+  # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
+  # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
+  pullPolicy: IfNotPresent
+
+# Max concurrent model downloads; extras queue in-process.
+maxConcurrency: 4
+
+# Namespace pre-filled in the download form; must own `models-pvc`.
+defaultNamespace: project-user-<USERNAME>
+
+service:
+  type: ClusterIP
+  port: 8000
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: "200m", memory: 256Mi}
+  limits: {cpu: "1", memory: 512Mi}
+
+# Hosted trials are usually direct-egress: keep proxy: {} and fill the keys
+# only when the cluster egresses through a proxy (each key wired when non-empty).
+proxy: {}
+
+# ============================================================================
+# PCAI Feature Gate
+# ============================================================================
+
+# Set explicitly — PCAI features no longer follow proxy config.
+pcai:
+  enabled: true
+
+# ============================================================================
+# Download storage
+# ============================================================================
+
+storage:
+  backend: both
+  default: pvc
+
+# Customer S3/MinIO endpoint, bucket and credentials. The bucket must already
+# exist; fill the two credential keys at apply time and never publish them.
+s3:
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"  # MinIO / S3-compatible URL
+  bucket: "mlis-models"  # bucket must already exist
+  prefix: "large-models"  # objects land at s3://<bucket>/<prefix>/<org>/<Model>/
+  accessKeyId: "<MINIO_ACCESS_KEY>"  # MinIO access key
+  secretAccessKey: "<MINIO_PASSWORD>"  # MinIO secret key
+
+# Lists models physically present on the PVC (scanner Job) and/or S3. One row per model.
+downloadList:
+  enabled: true
+  # PVC scanning spawns a short-lived scanner Job; false = scan only on "Rescan storage".
+  pvcScanEnabled: false
+  pvcRefreshInterval: 60
+  # Image for the short-lived scanner Job. Needs /bin/sh, find, stat.
+  scanImage: "andrewbydlon/basic-ubuntu-essentials:v1.0"
+
+# ============================================================================
+# Jobs
+# ============================================================================
+
+# Rendered into a ConfigMap the app reads and substitutes per-submission placeholders in.
+downloader:
+
+  image:
+    repository: ghcr.io/ai-solution-eng/hf-downloader
+    tag: v1.0
+  # PVC backed at /mnt where the model cache is written (pvc backend only).
+  pvcName: models-pvc
+  # Node selector for the download Job; empty = let the scheduler choose.
+  nodeSelector: {}
+  # S3 backend only: scratch space while downloading before upload.
+  s3WorkPvcName: ""
+  s3WorkSize: 20Gi
+  s3WorkPath: "/mnt/s3work"
+  # Retries before the Job is marked Failed; a retry resumes the partial HF cache.
+  backoffLimit: 2
+  # Root + platform security-context opt-out (hpe-ezua/disable-sc); HPE PCAI only.
+  disableSecurityContext: true
+
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+
+  resources:
+    requests: {cpu: "2", memory: 4Gi}
+    limits: {cpu: "4", memory: 8Gi}
+  ttlSecondsAfterFinished: 3600
+  # Your HF username (request headers / logging).
+  user: <USERNAME>
+
+  hf:
+    downloadTimeout: "300"
+    etagTimeout: "30"
+    enableHfTransfer: "0"
+    disableXet: "1"
+
+# ============================================================================
+# Download integrity + GC
+# ============================================================================
+
+provenance:
+  enabled: true
+  revision: "main"
+
+# ModelScan scans unsafe formats (.bin/.pt/.pth/.ckpt/pickle); needs the rebuilt image.
+gate:
+  enabled: true
+  mode: warn  # demo the scan badge; flip to block after a warn period
+  threshold: low
+
+# Submit-time gate before the Job is created; unknown model size degrades to warn-only.
+preflight:
+  enabled: true
+  mode: refuse
+  safetyMargin: 0
+  usageTtl: 120
+  sizeTtl: 300
+
+# Per-namespace byte quotas, enforced submit-time (see preflight.mode).
+# quota.default is the per-customer cap; per-team entries go under namespaces.
+quota:
+  default: 2Ti  # per-customer cap — tune per trial
+  namespaces: {}
+  mode: refuse
+
+# OFF BY DEFAULT — dry-run-first discipline: review /api/gc/report before
+# enabling deletion. The GC pod carries hpe-ezua/app: mlis, so Kyverno must admit it.
+gc:
+  enabled: false
+  schedule: "0 3 * * *"
+  ttlDays: 30
+  dryRun: true
+  minKeep: 0
+  protectedModels: []
+  concurrencyPolicy: Forbid
+
+  resources:
+    requests: {cpu: "100m", memory: 128Mi}
+    limits: {cpu: "500m", memory: 256Mi}
+
+# Long-running shell on the same PVC at /mnt for cache inspection, rendered as
+# a Job so job-controller creates the Pod; scheduling follows downloader.
+# Admin-initiated deletion of model cache dirs on the PVC — the on-demand
+# counterpart to the scheduled GC pass. Needs a rebuilt app image (it ships the
+# delete module) AND the re-packaged chart (it carries the Job template), so
+# values alone cannot deliver it. Flip enabled only after both are in place.
+manualDelete:
+  enabled: false
+  maxTargets: 20
+  jobTtlSeconds: 86400
+  image: ""
+  auth:
+    mode: sso
+    admins: [<USERNAME>]
+    # PCAI's own admin group (EzUA policy server: "admin" in input.groups);
+    # oauth2-proxy forwards the Keycloak `groups` claim. Union with `admins`.
+    adminGroups: [admin]
+
+# Admin-gate token verification. The deletion page requires a VERIFIED OIDC
+# bearer token instead of the proxy identity header (any pod in the cluster
+# could forge that header). The issuer is claim-compared only and never
+# fetched; the JWKS URL IS fetched, so it points at the in-cluster Keycloak
+# headless service over plain HTTP — no egress proxy, no platform-CA TLS gap.
+# Leaving issuer empty makes the verifier inert and the gate falls back to the
+# header: fill this in on any shared cluster.
+oidc:
+  enabled: true
+  issuer: "https://keycloak.${DOMAIN_NAME}/realms/UA"
+  audience: "ua"
+  jwksUrl: "http://keycloak-headless.keycloak.svc.cluster.local:8080/realms/UA/protocol/openid-connect/certs"
+  identityClaim: "preferred_username"
+
+debugPod:
+  enabled: true
+
+  image:
+    repository: andrewbydlon/basic-ubuntu-essentials
+    tag: v1.0
+    pullPolicy: IfNotPresent
+  pvcName: ""
+  disableSecurityContext: true
+
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  # Your HF username (USER env var inside the pod).
+  user: <USERNAME>
+  cachePath: /mnt/large-models
+  ttlSecondsAfterFinished: 86400
+
+# ============================================================================
+# Model catalog
+# ============================================================================
+
+catalog:
+  enabled: true
+  size: 100Mi
+  storageClassName: ""
+  # Raw URL of the seed catalog JSON; a trial without GitHub egress can clear it.
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_downloader/app/seed_catalog.json"
+
+# ============================================================================
+# MLIS database
+# ============================================================================
+
+# Point at the customer MLIS/AIOLI database service and password Secret.
+aioli:
+  dbHost: aioli-db-service-hpe-mlis.mlis.svc.cluster.local
+  dbPort: 5432
+  dbName: aioli
+  dbUser: postgres
+
+  dbPasswordSecret:
+    name: aioli-db-password
+    namespace: mlis
+    key: password
+
+# ============================================================================
+# PCAI integration
+# ============================================================================
+
+# Stamps vendor-app labels (hpe-ezua/type, hpe-ezua/app) onto the release via a pre-install hook.
+kyverno:
+  enabled: true
+
+# ${DOMAIN_NAME} is resolved by PCAI before rendering; the UI is served at
+# https://model-downloader.<customer-domain> behind oauth2-proxy SSO.
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"  # informational only — no template reads it
+
+  virtualService:
+    endpoint: "model-downloader.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

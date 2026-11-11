@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Manager</title>
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v={{ assets['favicon.jpg'] }}">
+  <link rel="stylesheet" href="/static/style.css?v={{ assets['style.css'] }}">
+  <script>
+    // Theme — Auto (default, follows the OS) / Light / Dark, remembered per browser.
+    var THEME_KEY = 'md-theme';
+
+    // Pre-paint resolver: apply the saved choice before first paint.
+    (function () {
+      var t = 'auto';
+      try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+
+    function applyTheme(t) {
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+      try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-theme-btn') === t;
+        btns[i].classList.toggle('on', on);
+        btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+
+    // Auto resolves to the OS scheme — no consumer may treat data-theme as binary.
+    function effectiveTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (t === 'light' || t === 'dark') return t;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+
+    function initTheme() {
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () {
+          applyTheme(this.getAttribute('data-theme-btn'));
+        });
+      }
+      var saved = 'auto';
+      try { saved = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      applyTheme(saved);
+      // The palette is pure CSS, so an OS flip while in Auto needs no re-render;
+      // the listener stays as the hook for any follow-up added later.
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+          if (document.documentElement.getAttribute('data-theme') !== 'auto') return;
+          document.dispatchEvent(new CustomEvent('md-theme-change', { detail: { theme: effectiveTheme() } }));
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', initTheme);
+  </script>
+</head>
+<body>
+  <header class="brandbar">
+    <span class="wordmark"><span class="bar"></span>HPE</span>
+    <span class="app-title">Model Manager</span>
+    <nav class="main-nav">
+      <a href="/" class="nav-link active" aria-current="page">Download</a>
+      <a href="/catalog" class="nav-link">Model Catalog</a>
+      {%- if manual_delete_enabled %}
+      <a href="/admin/delete" class="nav-link">Manual Deletion</a>
+      {%- endif %}
+    </nav>
+    <span class="spacer"></span>
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
+    <span class="tag">Parallel models: {{ max_concurrency }}</span>
+  </header>
+  <main>
+    <h1>Model Manager</h1>
+    <p class="hint">Submit a Kubernetes Job to cache a HuggingFace model into the shared PVC or an S3 path{% if nim_enabled %}, or mirror NVIDIA NIM model profiles from NGC into the S3 bucket{% endif %}. Up to {{ max_concurrency }} models download in parallel; the rest are queued. Each model download itself uses 8-way file parallelism.</p>
+
+    <form id="submit-form" autocomplete="off" data-default-ns="{{ default_namespace }}">
+      {% if nim_enabled %}
+      <div class="source-seg" id="source-seg" role="group" aria-label="Download source">
+        <button type="button" data-source="hf" class="active">HuggingFace</button>
+        <button type="button" data-source="nim">NVIDIA NIM</button>
+      </div>
+      <input type="hidden" name="source" id="source-input" value="hf">
+      {% endif %}
+      <label>
+        <span>Namespace</span>
+        <div class="combo">
+          <input name="namespace" id="ns-input" autocomplete="off"
+                 pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+                 value="{{ default_namespace }}"
+                 placeholder="project-user-{INSERT_YOUR_NAME}">
+          <button type="button" id="ns-toggle" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
+          <div id="ns-menu" class="combo-menu" hidden></div>
+        </div>
+      </label>
+      <label class="hf-field">
+        <span>Model name</span>
+        <div class="combo">
+          <input name="model_name" required id="model-input" autocomplete="off"
+                 placeholder="deepseek-ai/DeepSeek-V4-Flash">
+          <button type="button" id="model-toggle" class="combo-toggle" aria-label="Model suggestions">▾</button>
+          <div id="model-menu" class="combo-menu" hidden></div>
+        </div>
+      </label>
+      <label class="hf-field">
+        <span>HF token</span>
+        <input name="hf_token" type="password" required
+               placeholder="hf_...">
+      </label>
+      {% if nim_enabled %}
+      <label class="nim-field" hidden>
+        <span>NIM image</span>
+        <input name="nim_image" autocomplete="off"
+               placeholder="nvcr.io/nim/meta/llama-3.1-8b-instruct:1.0.0">
+        <small class="field-note">NIM 2.x image; pin a tag or digest.</small>
+      </label>
+      <label class="nim-field" hidden>
+        <span>NGC API key</span>
+        <input name="ngc_api_key" type="password"
+               placeholder="nvapi-...">
+        <small class="field-note">Stored as a per-job Secret and deleted when the job finishes.</small>
+      </label>
+      <label class="nim-field" hidden>
+        <span>Profiles (optional)</span>
+        <input name="nim_profiles" autocomplete="off"
+               placeholder="8835c31... (blank = the image's default profile)">
+        <small class="field-note">Space/comma separated profile IDs from <code>list-model-profiles</code>.</small>
+      </label>
+      <p class="hint nim-note" hidden>
+        Mirrors to <code>s3://{{ nim_bucket }}</code>. Set
+        <code>NIM_REPOSITORY_OVERRIDE=s3://{{ nim_bucket }}</code> on the NIM deployment.
+      </p>
+      {% endif %}
+      <label id="cache-root-field" class="hf-field">
+        <span>Custom download location</span>
+        <input name="cache_root" autocomplete="off"
+               placeholder="/mnt/large-models/Qwen/Qwen3.8-27B-FP8">
+        <small class="field-note">If blank, we default to <code>/mnt/large-models/${MODEL_NAME}</code></small>
+      </label>
+      {% if storage_options|length > 1 %}
+      <label class="hf-field">
+        <span>Storage</span>
+        <select name="storage">
+          {% for s in storage_options %}
+          <option value="{{ s }}" {% if s == storage_default %}selected{% endif %}>{{ "S3 path" if s == "s3" else "Model PVC" }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% else %}
+      <input type="hidden" name="storage" class="hf-field" value="{{ storage_options[0] }}">
+      {% endif %}
+      {% if 's3' in storage_options %}
+      <label id="s3-path-field" class="hf-field" {% if storage_default != 's3' %}hidden{% endif %}>
+        <span>S3 destination</span>
+        <input name="s3_path"
+               placeholder="s3://bucket/prefix/"
+               value="{{ s3_default_path }}">
+      </label>
+      {% endif %}
+      <label id="template-select-field" class="hf-field">
+        <span>Chat template preset</span>
+        <select name="template_preset" id="template-select">
+          <option value="">None (default)</option>
+        </select>
+      </label>
+      <label class="checkbox-label hf-field" id="chat-template-field">
+        <input type="checkbox" name="chat_template_enabled">
+        <span>Write chat template file</span>
+      </label>
+      <label id="chat-template-path-field" class="hf-field" hidden>
+        <span>Chat template path</span>
+        <input name="chat_template_path" placeholder="chat_template.jinja">
+      </label>
+      <label id="chat-template-contents-field" class="hf-field" hidden>
+        <span>Chat template contents</span>
+        <textarea name="chat_template_contents" rows="6"
+                  placeholder="Jinja template body, e.g. {% raw %}{% for message in messages %}...{% endfor %}{% endraw %}"></textarea>
+      </label>
+      <button type="submit">Submit download</button>
+    </form>
+    <div id="msg" class="msg"></div>
+
+    <h2>Jobs</h2>
+    <table id="jobs">
+      <thead>
+        <tr>
+          <th>Model</th><th>Namespace</th><th>Status</th>
+          <th>Output URL</th><th>Submitted</th><th>Finished</th>
+          <th>Logs</th><th>Error</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div id="log-modal" class="modal" hidden>
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <span id="log-title">Logs</span>
+          <button class="modal-close" type="button">&times;</button>
+        </div>
+        <pre id="log-body"></pre>
+      </div>
+    </div>
+
+    {% if nim_enabled %}
+    <h2>NIM profile mirrors</h2>
+    <p class="hint">NIM profiles mirrored to S3 by this app (job history).</p>
+    <table id="nim-mirrors">
+      <thead><tr><th>Image</th><th>Profiles</th><th>Bucket</th><th>Status</th>
+      <th>Submitted</th><th>Finished</th><th>Error</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    {% endif %}
+
+    {% if download_list_enabled %}
+    <h2>Downloaded models</h2>
+    <p class="hint">
+      Models downloaded through this UI, deduplicated by name (most recent
+      location and timestamp shown).
+      {% if not pvc_scan_enabled %}"Rescan storage" also lists models physically
+      present on the model PVC, even if placed there outside this UI.{% endif %}
+    </p>
+    <div id="downloaded-msg" class="msg ok">{{ download_scan_status }}</div>
+    <table id="downloaded-models">
+      <thead>
+        <tr>
+          <th>Model</th><th>Backends</th><th>Location</th><th>Size</th><th>Last modified</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <button type="button" id="downloaded-refresh" class="secondary-btn" style="margin-top:10px;">Rescan storage</button>
+    {% endif %}
+
+    {% if gc_enabled %}
+    <h2>Storage GC (dry-run report)</h2>
+    <p class="hint">
+      Models on the model PVC evaluated against the TTL line (<code>{{ gc_ttl_days }} days</code>) and the
+      three-key rule — a directory is a deletion candidate <em>only</em> when a provenance manifest exists,
+      no AIOLI <code>packaged_models</code> row references it, and no live job pins it. This report is
+      read-only: the actual deletion runs in the GC CronJob{% if gc_dry_run %} with <code>dryRun: true</code>
+      (deletion disabled — flip <code>gc.dryRun</code> to enable){% else %} with <strong>deletion enabled</strong>{% endif %}.
+    </p>
+    <div id="gc-msg" class="msg ok">Loading GC report...</div>
+    <table id="gc-report">
+      <thead>
+        <tr>
+          <th>Model</th><th>Size</th><th>Age (days)</th><th>Manifest</th><th>Scan</th><th>Action</th><th>Reason</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <button type="button" id="gc-refresh" class="secondary-btn" style="margin-top:10px;">Rebuild GC report</button>
+    {% endif %}
+
+    {% if debug_pods_enabled %}
+    <h2>Debug pod</h2>
+    <p class="hint">
+      Launch a long-running debug shell that mounts the model PVC at <code>/mnt</code>. It is
+      submitted as a Job so its pod is created by the job-controller and admitted exactly like
+      downloader job pods (mlis label + security-context opt-outs — a directly-created pod is denied
+      by the platformwide Kyverno policy). Then
+      <code>kubectl exec -it $(kubectl get pods -n &lt;ns&gt; -l job-name=&lt;job&gt; -o jsonpath='{{ '{{' }}.items[0].metadata.name{{ '}}' }}') -- bash</code>.
+      The proxy / no_proxy env vars follow the chart's <code>proxy.http/https/noProxy</code> settings (each key wired only when non-empty).
+    </p>
+    <form id="debug-form" autocomplete="off" data-default-ns="{{ default_namespace }}">
+      <label>
+        <span>Namespace</span>
+        <div class="combo">
+          <input name="namespace" id="ns-input-debug" autocomplete="off"
+                 pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+                 value="{{ default_namespace }}"
+                 placeholder="project-user-{INSERT_YOUR_NAME}">
+          <button type="button" id="ns-toggle-debug" class="combo-toggle" aria-label="Namespace suggestions">▾</button>
+          <div id="ns-menu-debug" class="combo-menu" hidden></div>
+        </div>
+      </label>
+      <label>
+        <span>Image</span>
+        <input name="image" value="{{ debug_pod_image }}"
+               placeholder="registry/repo:tag">
+        <small class="field-note">Defaults to the chart's <code>debugPod.image</code>; override with any tools image.</small>
+      </label>
+      <label>
+        <span>HF token (optional)</span>
+        <input name="hf_token" type="password"
+               placeholder="hf_... (leave empty to skip)">
+        <small class="field-note">Set only if you plan to run <code>hf download</code> / <code>huggingface-cli</code> inside the pod.</small>
+      </label>
+      <button type="submit">Launch debug pod</button>
+    </form>
+    <div id="debug-msg" class="msg"></div>
+    <table id="debug-pods">
+      <thead>
+        <tr><th>Pod</th><th>Namespace</th><th>Status</th><th>Node</th><th>Created</th><th>Actions</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    {% endif %}
+  </main>
+  <script src="/static/app.js?v={{ assets['app.js'] }}"></script>
+</body>
+</html>

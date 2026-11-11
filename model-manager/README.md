@@ -1,0 +1,347 @@
+# HPE Model Manager
+
+[![Model Manager](model-downloader.jpg)](model-downloader.jpg)
+
+**Model Manager** is a web UI + FastAPI service (Helm chart `model-downloader` v2.1.0, images `ghcr.io/ai-solution-eng/model-downloader` and `ghcr.io/ai-solution-eng/hf-downloader`) that submits HuggingFace model-download Jobs and NVIDIA NIM profile-mirror Jobs onto a Kubernetes cluster's shared storage. Users pick a model (or a NIM image) and a target namespace in the browser; the service creates a per-submission credential Secret plus a Job (PVC- or S3-backed for HF; S3 for NIM) and tracks it to completion. Downloaded models are listed from the shared `models-pvc` and/or S3, and model configurations can be pushed from a curated catalog straight into the MLIS/AIOLI database. It is built for **HPE Private Cloud AI (PCAI / HPE Ezmeral Unified Analytics)**, where models land on the shared `models-pvc` every `project-user-*` namespace mounts, and/or an S3-compatible bucket such as MinIO. The Helm chart, image repositories and Python package keep the `model-downloader` identifier for upgrade compatibility, while the product name is Model Manager.
+
+## What problem(s) it solves
+
+- **Pulling HF models into air-gapped / proxied PCAI clusters.** A per-key `proxy:` dict (`proxy.http` / `proxy.https` / `proxy.noProxy`) wires the corporate proxy and `no_proxy` environment into downloader Jobs, debug pods and the app pod — each key is injected only when non-empty, so a direct-egress site leaves `proxy: {}` and nothing renders. Where the egress proxy is a MITM (untrusted cert), `downloader.hf.verifyTls: false` opts the httpx client out of TLS verification — explicitly, never by default. Outbound GitHub fetches (catalog refresh) have their own verify knob (`catalog.githubVerifyTls`, default verify-on).
+- **A shared `models-pvc` workflow without cluster access for end users.** End users never touch `kubectl`: they submit a download from the UI, the Job runs in their `project-user-*` namespace, writes the HF cache on the PVC every project namespace already mounts, and shows the resulting `pvc://models-pvc/large-models/<model>?containerPath=/mnt/models` URL in the Jobs table.
+- **Model catalog management + push to MLIS.** A GPU-tier-grouped catalog (seeded from a bundled JSON, refreshable from GitHub, extendable in the UI or by pasting JSON) can push model configurations straight into the AIOLI/MLIS `packaged_models` table — the step that makes models appear in MLIS model serving.
+- **Debug pods for cache inspection.** A one-click long-running debug shell mounts the same PVC at `/mnt`, so you can inspect/repair the model cache with `huggingface-cli` instead of submitting probe downloads. It is deliberately created as a Job so platform Kyverno admission admits it (see [Kyverno on hosted trial systems](#kyverno-on-hosted-trial-systems--read-before-deploying)).
+- **S3 / MinIO downloads.** When the deployment has an S3-compatible backend, model files stream straight into `s3://<bucket>/<prefix>/<org>/<Model>/` with per-file parallelism — no PVC required — and the "Downloaded models" list scans both backends.
+- **NVIDIA NIM profiles for air-gapped serving.** The same UI can mirror NGC NIM model profiles into the configured S3 bucket using the NIM image's own `mirror s3` command, so the percent-encoded keys `NIM_REPOSITORY_OVERRIDE` requires are correct without a workstation Docker setup. The NGC API key is per submission and deleted with the Job.
+
+## Features
+
+All of the following are implemented in `src/model_downloader/` and wired by `helm/`:
+
+- **Web UI** (FastAPI + Jinja2 + static JS, dark/light theme): submit downloads, a live Jobs table with logs/progress/error columns and delete for finished jobs, a "Downloaded models" table, and a debug-pod section.
+- **PVC downloads**: the Job runs `huggingface_hub.snapshot_download` with 8-way per-file parallelism (`max_workers=8`) into `HUGGINGFACE_HUB_CACHE` on the shared PVC mounted at `/mnt`. Default cache root is `/mnt/large-models/<model>`; an explicit custom absolute path is accepted and validated (no `..`). Retries (`downloader.backoffLimit`) resume the partial HF cache instead of restarting, because blobs and `.incomplete` files live on the PVC.
+- **S3 downloads**: the Job lists repo files and uploads each one to S3 with a thread pool of 8 concurrent files; each upload itself uses S3 multipart (64 MB threshold, 8-way concurrency). Scratch space is an `emptyDir` sized by `downloader.s3WorkSize` (or `downloader.s3WorkPvcName` when set), so only in-flight files are held locally.
+- **NIM profile mirrors (S3)**: a second source in the submit form runs the NIM 2.x image's `mirror s3` command with the per-submission NGC key and an optional profile list. It shares the download queue, shows the exact `NIM_REPOSITORY_OVERRIDE=s3://<bucket>` in the Jobs table, and lists past mirrors in a **NIM profile mirrors** table. Scratch is an `emptyDir` sized by `nim.workSize` (or `nim.workPvcName`); no GPU is requested. See [NIM profile mirror](documentation/nim-mirror-design.md).
+- **Queue with bounded concurrency**: at most `maxConcurrency` model downloads run at once; extra submissions queue in-process. On startup the queue reconciles previously created Jobs from Kubernetes, so downloads submitted before an app restart reappear in the UI.
+- **Per-submission HF-token Secrets**: each submission creates `hf-token-<model>-<suffix>` in the target namespace, referenced only by that Job, and is deleted as soon as the Job finishes (or if Job creation is denied).
+- **"Downloaded models" list**: merges three sources — succeeded job history, a live boto3 S3 listing, and a short-lived PVC scanner Job (`md-scan-*`, finds `models--<org>--<repo>` cache dirs) — deduplicated by model name, most recent first. The PVC is scanned on demand via **Rescan storage**, or automatically every `downloadList.pvcRefreshInterval` seconds when `downloadList.pvcScanEnabled: true`.
+- **Namespace dropdown search** on the submit form, backed by `/api/namespaces` and filtered to `project-user-*` (an RBAC denial degrades to typing a namespace manually).
+- **Debug pods**: UI-launched long-running shell Jobs (`md-debug-*`) mounting the same PVC at `/mnt` with `HUGGINGFACE_HUB_CACHE` preset; optional HF token; the UI prints the ready-made `kubectl exec` command and deleting a debug job from the UI also deletes its token Secret.
+- **Model catalog** (`/catalog`): entries presented as a three-level expandable tree — **lab** (Qwen, DeepSeek, Z.ai, Google, …) → **model** (Qwen3.8-27B, DeepSeek-V4-Flash-0731, …) → **configuration** (GPU class, serving framework, quantization, GPU count, HiCache, Mooncake L3, shared-GPU). Two filters narrow the tree live and compose: **GPU class** radio buttons (All / H200 / RTX Pro 6000 / L40S, each showing its supported quants and VRAM) and a **search box** matching every dimension shown, so `nvfp4`, `sglang`, `hicache`, `mooncake`, `rdma` or `8 gpu` all work. A configuration whose HiCache L3 tier is the shared **Mooncake** store is labelled `Mooncake` (previously it rendered identically to the L2-only configuration it was cloned from) and carries an **RDMA setup** chip: the catalog cannot express the RDMA client (device, `IPC_LOCK`, per-pod hostname), so clicking the chip shows the `patch-model-mooncake.sh` step and the transport check. The caveat is derived from the serving arguments, not stored, so it appears in catalogs that already hold the entry and never rides the Push-to-MLIS payload. Both are linkable (`?gpu=h200&q=sglang`). Selections survive filtering: a configuration ticked under one filter stays ticked when you switch, so "Push Selected" always pushes exactly what you picked. The tree is **derived** from the flat stored entries (lab comes from the model family, not the URI org — a Qwen re-upload under `Inferact`/`RamManavalan` still files under Qwen), so the stored catalog and the Push-to-MLIS payload are unchanged. Seeded on start from the bundled `seed_catalog.json` without overwriting user edits or resurrecting removed entries; **Refresh from GitHub** pulls the upstream seed JSON from `catalog.githubUrl` (button hidden when unset); the direct-JSON box accepts a single object **or** an array for **Push to MLIS** or **Add to Catalog** (duplicates by `catalog_id`, or by `name` + deployment configuration, are skipped). **Versions are assigned by MLIS, not authored in the catalog**: every entry is stored as `version` 1 and a push lands as v1 for a model name MLIS has never seen, `max(version)+1` when the name exists with a different configuration, and a skip (reported with the existing version) when the configuration is identical — so a catalog entry pulled from one MLIS instance no longer arrives as v9 on another. Descriptions are kept short and user-facing — 400 characters or fewer in the seed catalog, enforced by a test — because MLIS shows them in a side panel; the long-form operational reasoning lives in the catalog-only `notes` field, which is searchable in the UI and never pushed to MLIS.
+- **Chat templates**: pick a preset from the catalog or supply path + contents; the downloader Job writes the file into the model cache during the download.
+- **ModelScan provenance gate**: every PVC download is scanned in-job for unsafe serialization formats before it can block (warn by default, `gate.mode: block` to fail the Job); the verdict rides `manifest.json` and the Downloaded-models/GC views.
+- **PVC preflight + per-namespace quota**: submissions are checked for disk fit and namespace quota BEFORE a Job is created; refusals (422) name the exact bytes-needed vs bytes-free / used-vs-quota math in the submit error path.
+- **TTL/GC eviction** (opt-in): a dry-run-first GC report in the UI (three-key AND deletion rule enforced in the GC CronJob — manifest AND no-AIOLI-row AND no-live-job, with fail-safe keeps when any cross-check is unavailable).
+- **Admin manual deletion** (opt-in, default off): an SSO-gated page that lists the model cache dirs on the PVC with their verdicts and deletes the ones an admin selects — the on-demand counterpart to the TTL/GC pass. The gate requires a **verified** OIDC token (see **Vendored fleet code**). Live jobs and `gc.protectedModels` globs are hard blocks; an AIOLI-registered model is a soft block an admin may override per request. Deletion is limited to exactly the directories the preview resolved (see **Manual deletion** below).
+- **PCAI integration**: Istio VirtualService on `istio-system/ezaf-gateway` at `model-downloader.${DOMAIN_NAME}`, an oauth2-proxy `AuthorizationPolicy` in `istio-system`, a pre-install Kyverno ClusterPolicy stamping EZUA vendor labels (see below), and RBAC for cross-namespace Job/Secret creation, pod-log reads and namespace listing (plus read-only PVC `get`/`list` when preflight is on).
+
+## Python version
+
+The app image runs **Python 3.14** (`python:3.14-slim`), matching the rest of
+the fleet (MultimodalRAG, Speech2Speech and the mcp_servers are all on
+`python:3.14-slim`). The app code is 3.14-clean — no `asyncio.get_event_loop`,
+`utcnow()`, `distutils` or `imp` — and the full test suite runs on 3.14.
+
+Dependency evidence for the base-image bump:
+
+| Requirement | 3.14 status |
+|---|---|
+| `fastapi`, `uvicorn[standard]`, `jinja2`, `pydantic` | proven — already installed by the fleet's 3.14 images at the same floors |
+| `pyyaml`, `boto3` | proven — MultimodalRAG installs both on 3.14 |
+| `kubernetes` | pure-Python client |
+| `psycopg2-binary` | **the one item to confirm** — it needs a `cp314` wheel or a source build (the slim base has no compiler). Pre-flight: `docker run --rm python:3.14-slim pip download --only-binary=:all: --dest /tmp/p psycopg2-binary` |
+
+If that pre-flight fails, the image needs `libpq-dev` + `gcc` in a builder
+stage, or a move to `psycopg` 3 (`db.py` uses the psycopg2 API, so that is a
+code change, not a dependency swap).
+
+## Vendored fleet code
+
+`src/model_downloader/app/oidc_identity.py` is a **verbatim copy** of
+`pcai_utils/oidc_identity.py`, the fleet's shared OIDC verifier (RS256/JWKS,
+fail-closed, no token material logged). It is vendored rather than hardlinked
+because this repo is not a `pcai_utils` mesh consumer.
+
+Do not patch it here — improvements go upstream and are backported, and
+`tests/test_oidc_vendored.py` fails if the copy is edited without re-syncing.
+To update: re-copy from `pcai_utils`, then bump `VENDORED_SHA256` in that test.
+
+The env names are the fleet's canonical `OIDC_*` (`OIDC_ENABLED`,
+`OIDC_ISSUER`, ...); the pre-rename `RAG_OIDC_*` names are still read as a
+deprecated alias. A backport added `PCAI_OIDC_ENV_PREFIX` to the shared module
+so an app can namespace its own variables instead of forking the file — this
+app uses the canonical names and needs no prefix.
+
+The admin deletion gate requires a **verified** token when `oidc.enabled` is
+true: oauth2-proxy injects `Authorization: Bearer <id_token>`, and a bare
+identity header is refused. The chart maps `oidc.*` onto the canonical
+`OIDC_*` env names, so the module stays byte-identical to the fleet copy.
+With `oidc.issuer` empty the verifier is inert and the gate falls back to the
+header — weaker by construction, so set the issuer on any shared cluster.
+
+## Deploying on PCAI
+
+PCAI users **never** run `helm install` or `kubectl apply`. The chart is imported into PCAI once (the packaged chart, e.g. `model-downloader-2.1.0.tar.gz`), and from then on deployments are just values: edit the chart's `values.yaml` in the PCAI **Helm Values** editor (or via the PCAI API) and apply. PCAI resolves `${DOMAIN_NAME}` itself before rendering, so leave those placeholders as-is.
+
+**Before you start** (cluster-side prerequisites, not chart values):
+
+- The target `project-user-*` namespaces have the shared `models-pvc` (PCAI provides this).
+- For S3: the bucket exists (`s3.bucket` — the chart does not create it) and you have its access/secret keys.
+- For MLIS push: the AIOLI database service is reachable and its password Secret (`aioli.dbPasswordSecret`, default `aioli-db-password` in namespace `mlis`) exists. The chart never creates it — if you don't have one yet:
+  ```bash
+  kubectl -n mlis create secret generic aioli-db-password \
+    --from-literal=password='<aioli-db-password>'
+  # aioli.dbPasswordSecret.name / .namespace / .key point at it (defaults shown).
+  # Skip this entirely if you don't use the catalog's Push-to-MLIS feature.
+  ```
+- HF tokens need **no deploy-time setup**: every download submission creates its own short-lived `hf-token-<model>-<suffix>` Secret in the target namespace from the token typed in the UI, and deletes it when the Job finishes. The chart ships no token.
+- For PCAI ingress: the platform gateway `istio-system/ezaf-gateway` and the `oauth2-proxy` auth provider exist.
+
+**Required values** (the ones every deployment must set or confirm):
+
+| Value | Why |
+|---|---|
+| `defaultNamespace` | Namespace pre-filled in the download form; must be a `project-user-*` namespace that owns a `models-pvc`. |
+| `storage.backend` + `storage.default` | `pvc`, `s3`, or `both`; `default` is the preselected option in the submit form. With `backend: pvc` the app gets no S3 configuration at all. |
+| `s3.endpointUrl`, `s3.bucket`, `s3.accessKeyId`, `s3.secretAccessKey` | Required when the backend includes `s3` (e.g. MinIO at `http://minio.minio.svc.cluster.local:9000`, bucket `mlis-models`). `s3.prefix` is optional. |
+| `aioli.*` (`dbHost`, `dbPort`, `dbName`, `dbUser`, `dbPasswordSecret`) | MLIS/AIOLI database connection used by the catalog **Push to MLIS** endpoints (and the GC CronJob's read-only cross-check). Defaults: `aioli.dbPasswordSecret.name` = `aioli-db-password`, `aioli.dbPasswordSecret.namespace` = `mlis`, `aioli.dbPasswordSecret.key` = `password` — that Secret must exist with that key. |
+| `ezua.virtualService.endpoint` | **REQUIRED when `ezua.enabled: true`** (the default — this is a PCAI app). The VirtualService template refuses to render without it: `Valid .Values.ezua.virtualService.endpoint is required !`. Set `model-downloader.${DOMAIN_NAME}` and leave the placeholder as-is — PCAI substitutes the real domain before rendering. Pair with `ezua.virtualService.istioGateway` (`istio-system/ezaf-gateway`): the VirtualService attaches to that gateway, so it must name an existing one. |
+| Image tags | Packaged with the chart — `image.tag` v2.1.0 (matches the chart version), `downloader.image` `ghcr.io/ai-solution-eng/hf-downloader:v1.0`, `debugPod.image` / `downloadList.scanImage` `andrewbydlon/basic-ubuntu-essentials:v1.0`. Leave defaults unless you build your own images. |
+
+**Optional values** (defaults are sane; see [helm/values.yaml](helm/values.yaml) comments):
+
+- `maxConcurrency` — max parallel model downloads (default 4).
+- `downloader.*` — Job resources (`downloader.resources`), `backoffLimit`, `nodeSelector`, `ttlSecondsAfterFinished`, `hf.*` timeouts (`downloadTimeout`, `etagTimeout`, `enableHfTransfer`, `disableXet`, `verifyTls`), `disableSecurityContext`/`downloader.securityContext` (`runAsUser`/`runAsGroup`, both `0` by default), S3 scratch (`s3WorkPvcName`, `s3WorkSize`, `s3WorkPath`).
+- `nim.*` — NVIDIA NIM profile mirroring: `enabled`, `bucket` (default `s3.bucket`; profiles land at the bucket root), `region`, `pathStyle`, `manifestPath`, scratch (`workPvcName`/`workSize`), `imagePullSecrets`, and the usual resources/nodeSelector/backoff/TTL. NIM 2.x images only, S3-only; the NGC key is typed per submission. See [NIM profile mirror](documentation/nim-mirror-design.md).
+- `downloadList.*` — `enabled`, `pvcScanEnabled`, `pvcRefreshInterval`, `scanImage`.
+- `provenance.*` — `enabled` (default true) and `revision` (default `"main"`). After a successful PVC download the Job writes `${cache_root}/models--<org>--<Repo>/manifest.json`: repo, the resolved revision commit, per-file sha256 + size (LFS files cross-checked against Hub metadata when reachable — non-LFS files carry the local hash only), license, download time, job id, namespace, and a free-text `submitted_by` (empty today; identity arrives later). The scanner's model list carries a `provenance_manifest` flag per model. `enabled: false` omits the whole step and downloads on the default branch exactly as before.
+- `gate.*` — the ModelScan provenance gate. `enabled` (default true) runs [modelscan](https://pypi.org/project/modelscan/) inside the downloader Job on the unsafe serialization formats (`.bin`/`.pt`/`.pth`/`.ckpt` + pickle-class files) after the manifest hashing; safetensors-only snapshots are skipped. The verdict lands in `manifest.json`'s `scan` block (`verdict`/`mode`/`threshold`/`detail`) and the PVC scanner surfaces it as a per-model `scanned` column. `mode: warn` (default) records and proceeds; `mode: block` makes the Job exit 1 on an unsafe verdict so the failure appears verbatim in the Jobs table's Error column — a broken scanner is always warn-only. `threshold` (default `low`) downgrades findings at or below it to clean. **Rebuilding the downloader image is required** (the Dockerfile gains the `modelscan` dependency); the gate degrades to `error`-verdict records on images without modelscan.
+- `preflight.*` + `quota.*` — PVC preflight + per-namespace quota. Before a downloader Job is created the app checks (a) disk fit — model size from the Hub API vs PVC `status.capacity` minus used bytes (a `du -sb` pass in the scanner Job; both TTL-cached, with in-flight submissions charged between scans) and (b) the namespace's byte quota (`quota.namespaces.<ns>` map + `quota.default`; values accept `500Gi`-style quantities). `mode: refuse` (default) returns a 422 naming bytes-needed vs bytes-free / used vs quota; `warn` reports without refusing; `off` skips the check. `preflight.enabled: false` also drops the read-only `persistentvolumeclaims` get/list RBAC addition. Refusals and warnings surface in the UI's submit error path verbatim. Tuning: `preflight.safetyMargin` (default `0`, k8s quantity or bytes) is headroom subtracted from free space before the fit check, covering writes the `du` snapshot can't see yet; `preflight.usageTtl` (default `120`s) caches the used-bytes census; `preflight.sizeTtl` (default `300`s) caches Hub size estimates. (Env vars are injected only when a value differs from its default — the defaults are compiled into the app.)
+- `gc.*` — TTL/GC eviction (default **off**). `enabled: true` renders a CronJob (`schedule` default nightly `0 3 * * *`, pod template = the scanner Job's admission pattern verbatim) plus the UI's **Storage GC (dry-run report)** section. Deletion rule — three-key AND, all three must hold: `manifest.json` present next to the models--* dir, **no** AIOLI `packaged_models` row referencing the model (matched by cache-dir name / repo id appearing in the uri — never exact path equality; custom cache roots), and **no** live managed job pinning the cache root. Each signal alone is unreliable (job TTLs erase evidence; paths vary; MLIS rows go stale) — hence the AND. `dryRun: true` is the default: the job logs every verdict and deletes nothing; the `/api/gc/report` view (cached, `?force=1` rebuilds) is the review surface. `ttlDays` (default 30) is the age line, `minKeep` an LRU floor, `protectedModels` a glob list never to delete, and an unreachable AIOLI/jobs API fail-safes to *keep everything*. The GC job's AIOLI access is a strictly read-only `SELECT` (`default_transaction_read_only=on`); S3 eviction is out of scope. `gc.concurrencyPolicy` (default `Forbid`) keeps two GC pods from ever running at once — leave it alone unless you have a reason.
+- `debugPod.*` — `enabled`, `image` (`repository`, `tag`, `pullPolicy`), `pvcName` (override), `disableSecurityContext`/`securityContext`, `user`, `cachePath`, `ttlSecondsAfterFinished`.
+- `proxy.http` / `proxy.https` / `proxy.noProxy` — per-key proxy wiring: each key is injected into downloader Jobs, debug pods and the app pod only when non-empty (a direct-egress site leaves `proxy: {}`). The former `hpe_proxies` flag is gone — see [Migrating from `hpe_proxies`](#migrating-from-hpe_proxies).
+- `pcai.enabled` — the PCAI feature gate for the ezua/kyverno-style integration defaults; **defaults to false now** — set it explicitly. (`kyverno.enabled` / `ezua.enabled` remain the per-feature switches for this app's own PCAI integration.)
+- `catalog.*` — `enabled`, `size`, `storageClassName`, `githubUrl` (enables **Refresh from GitHub**), `githubVerifyTls`, `defaultProject` (project recorded on a packaged model that names none; empty = blank, so the model only shows under "All projects" in MLIS; a PCAI `project-*` namespace is accepted and its `project-` prefix is stripped, because MLIS files by project name).
+- `kyverno.enabled` — keep `true` on any PCAI cluster (see next section).
+- `ezua.*` — `domainName`, `virtualService.endpoint` / `.istioGateway` / `.timeout`, `authorizationPolicy.namespace` / `.providerName`.
+- Rarely needed: `service.*`, `nameOverride`/`fullnameOverride`.
+
+## Chart values reference
+
+Every key in [helm/values.yaml](helm/values.yaml), with the default from the chart and what actually consumes it. The per-feature walkthrough above ([Required values](#deploying-on-pcai), [Optional values](#deploying-on-pcai)) covers the behavioral keys in prose; this section is the flat lookup table, ending with the standard Kubernetes knobs.
+
+| Key | Default | Effect |
+|---|---|---|
+| `maxConcurrency` | `4` | Max model downloads running at once; extras queue in-process. |
+| `defaultNamespace` | `project-user-<your-username>` (override it) | Namespace pre-filled in the submit form — set it to a `project-user-*` namespace that owns `models-pvc`. |
+| `service.type` / `service.port` | `ClusterIP` / `8000` | Cluster-internal exposure of the UI; the Istio VirtualService routes to this port. |
+| `proxy.http` / `proxy.https` / `proxy.noProxy` | `{}` (all keys empty) | Per-key corporate-proxy wiring into downloader Jobs, debug pods and the app pod. Each key renders only when non-empty; `proxy: {}` = direct egress, nothing rendered. |
+| `pcai.enabled` | `false` | PCAI feature gate for the ezua/kyverno-style integration defaults. Defaults to false; set explicitly. Does NOT follow proxy config. |
+| `storage.backend` / `storage.default` | `both` / `pvc` | Which backends users can pick; which is preselected. `backend: pvc` removes all S3 env from the app. |
+| `s3.*` | MinIO defaults, demo credentials | `endpointUrl`, `bucket` (must exist), `prefix` (objects land at `s3://<bucket>/<prefix>/<org>/<Model>/`), `accessKeyId`, `secretAccessKey` — injected only when the backend includes `s3`. |
+| `nim.enabled` / `nim.bucket` | `true` / `` → `s3.bucket` | Ships the NIM Job template + UI source. `bucket` is the mirror destination root (bucket root, no prefix); empty = `s3.bucket`. A PVC-only backend disables NIM regardless. |
+| `nim.region` / `nim.pathStyle` | `us-east-1` / `true` | `AWS_REGION`/`AWS_DEFAULT_REGION` for the in-container SDK; path-style addressing (MinIO/Ceph true, AWS S3 false). |
+| `nim.manifestPath` | `/opt/nim/etc/default/model_manifest.yaml` | The NIM image's built-in manifest passed to `mirror s3 --manifest-file`. |
+| `nim.workPvcName` / `nim.workSize` | `` / `100Gi` | Scratch for profiles before upload: an existing PVC, else an `emptyDir` with that size limit. |
+| `nim.imagePullSecrets` | `[]` | Extra pull secrets for a private/local NIM image registry. |
+| `nim.disableSecurityContext` / `nim.securityContext` / `nim.resources` / `nim.nodeSelector` / `nim.backoffLimit` / `nim.ttlSecondsAfterFinished` | same shape as `downloader.*` | NIM mirror Job pod settings; no `nvidia.com/gpu` request. |
+| `downloadList.enabled` | `true` | Master switch for the Downloaded-models list. |
+| `downloadList.pvcScanEnabled` | `false` | Auto-rescan the PVC every interval; off = scan on **Rescan storage** clicks only. |
+| `downloadList.pvcRefreshInterval` | `60` (s) | PVC scan cache TTL; S3 and job history are always fresh. |
+| `downloadList.scanImage` | `andrewbydlon/basic-ubuntu-essentials:v1.0` | Image for the short-lived PVC scanner Job (needs `/bin/sh`, `find`, `stat`) and, when `gc.enabled`, the GC CronJob pod too. |
+| `provenance.enabled` | `true` | Writes `manifest.json` (repo, resolved revision, per-file sha256+size, license, job/namespace) next to each cache dir. `false` omits the step entirely. |
+| `provenance.revision` | `"main"` | Revision the download pins to — a tag or commit sha gives reproducible re-downloads. |
+| `gate.enabled` / `gate.mode` / `gate.threshold` | `true` / `warn` / `low` | ModelScan gate on unsafe formats; `block` fails the Job on an unsafe verdict; `threshold` downgrades severities at or below it to clean. Needs the rebuilt downloader image. |
+| `preflight.enabled` / `preflight.mode` | `true` / `refuse` | Submit-time disk-fit gate; `false` also drops the PVC get/list RBAC. `warn`/`off` as described above. |
+| `preflight.safetyMargin` | `0` | Headroom (bytes or k8s quantity) subtracted from free space before the fit check — covers writes the `du` snapshot can't see yet. |
+| `preflight.usageTtl` | `120` (s) | TTL of the cached storage census (used bytes / usage split). |
+| `preflight.sizeTtl` | `300` (s) | TTL of cached Hub model-size estimates. |
+| `quota.default` / `quota.namespaces` / `quota.mode` | `""` / `{}` / `refuse` | Per-namespace byte quotas (k8s quantities or plain bytes), independent of `preflight.mode`. |
+| `gc.enabled` | `false` | Renders the GC CronJob + the UI dry-run report; off = nothing GC-related rendered and `/api/gc/*` return 400. |
+| `gc.schedule` | `"0 3 * * *"` | Standard cron for the CronJob. |
+| `gc.ttlDays` | `30` | Delete cache dirs whose newest mtime is older than this (0 disables the TTL line). |
+| `gc.dryRun` | `true` | Log every verdict, delete nothing. Flip only after reviewing the report. |
+| `gc.minKeep` | `0` | LRU floor — never delete below this many cache dirs (0 = no floor). |
+| `gc.protectedModels` | `[]` | Glob list of model ids / cache-dir names never to delete. |
+| `gc.concurrencyPolicy` | `Forbid` | Keeps two GC pods from ever running at once. |
+| `gc.resources` | `100m`/`128Mi` req, `500m`/`256Mi` lim | Resources of the GC CronJob pod. |
+| `downloader.image.repository` / `downloader.image.tag` | `ghcr.io/ai-solution-eng/hf-downloader` / `v1.0` | The downloader Job's image (both PVC and S3 paths). |
+| `manualDelete.enabled` | `false` | Renders the `/admin/delete` page and the delete-Job template. Off = the route does not exist and `/api/admin/*` return 400. |
+| `manualDelete.auth.mode` | `sso` | `sso` reads the identity oauth2-proxy injects; `secret` is an opt-in fallback for installs with no SSO gate (shared key, so no per-person attribution). |
+| `manualDelete.auth.adminGroups` | `[admin]` | Keycloak groups that confer admin (union with `admins`). `admin` is PCAI's own admin group — the EzUA policy server grants admin on `"admin" in input.groups` — so every AIE Admin is an admin by default. Both empty = nobody. |
+| `manualDelete.auth.admins` | `[]` | Explicit usernames that confer admin. |
+| `manualDelete.auth.secret` | `{name: model-delete-key, namespace: "", key: token}` | `mode=secret` only: an EXISTING Secret the chart never creates (same convention as `aioli.dbPasswordSecret`). |
+| `manualDelete.maxTargets` | `20` | Hard cap on directories in one request. |
+| `manualDelete.jobTtlSeconds` | `86400` | How long the delete Job and its logs are kept — the audit surface. |
+| `manualDelete.jobDeadlineSeconds` | `3600` | Hard cap on one delete Job. Deliberately generous: removing tens of GiB over network storage takes minutes, and killing it mid-delete is worse than waiting. It exists to catch a pod that never schedules, not to bound the deletion. |
+| `manualDelete.image` | `""` | Delete-Job image; empty = the app image, which ships `app.delete_targets`. Never the scanner image — it has no such module. |
+| `oidc.enabled` | `true` | Verify the OIDC bearer token oauth2-proxy injects instead of trusting the identity header. With `oidc.issuer` empty the verifier is inert and the gate falls back to the header (weaker — see **Vendored fleet code**). |
+| `oidc.issuer` | `""` | Keycloak realm URL. **Claim-compared only, never fetched** — it must equal the token's `iss`. |
+| `oidc.audience` | `ua` | Expected `aud`/`azp` on the token. |
+| `oidc.jwksUrl` | `""` | The URL that **is** fetched. Empty derives `<issuer>/protocol/openid-connect/certs`; on PCAI point it at the in-cluster Keycloak headless service over plain HTTP so the fetch bypasses the egress proxy and the platform-CA TLS gap. |
+| `oidc.identityClaim` | `preferred_username` | Claim carrying the identity — the same string that suffixes `project-user-<name>`. |
+| `downloader.pvcName` | `models-pvc` | PVC mounted at `/mnt` for the model cache (pvc backend) — also what the GC CronJob mounts. |
+| `downloader.nodeSelector` | `{}` | Node selector for downloader Jobs (empty = scheduler chooses). Debug pods follow it too — there is no separate `debugPod.nodeSelector`. |
+| `downloader.s3WorkPvcName` / `downloader.s3WorkSize` / `downloader.s3WorkPath` | `""` / `20Gi` / `/mnt/s3work` | S3-backend scratch: an existing PVC, else an `emptyDir` sized by `s3WorkSize`; cache root under the `/mnt` mount. |
+| `downloader.backoffLimit` | `2` | Retries before the Job is Failed; retries resume the partial HF cache on the PVC. `0` disables. |
+| `downloader.disableSecurityContext` | `true` | Sets the `hpe-ezua/disable-sc` pod annotation so the Job can run as root and mount the shared PVC (PCAI only). |
+| `downloader.ttlSecondsAfterFinished` | `3600` | Finished downloader Jobs self-delete after this. |
+| `downloader.user` | `<your-username>` (override it) | `USER` env var in the Job — HF request headers / logging. Set it to your own username. |
+| `downloader.hf.downloadTimeout` / `.etagTimeout` | `"300"` / `"30"` | `HF_HUB_DOWNLOAD_TIMEOUT` / `HF_HUB_ETAG_TIMEOUT`. |
+| `downloader.hf.enableHfTransfer` / `.disableXet` | `"0"` / `"1"` | `HF_HUB_ENABLE_HF_TRANSFER` / `HF_HUB_DISABLE_XET`. |
+| `downloader.hf.verifyTls` | unset → `true` (verify) | Explicit TLS-verify override for the downloader (`false` = bypass — set it ONLY behind a corporate MITM proxy with an untrusted cert). |
+| `debugPod.enabled` | `true` | Enables the UI's Launch-debug-pod section. |
+| `debugPod.pvcName` | `""` → `downloader.pvcName` | Mount a different PVC than the downloader's. |
+| `debugPod.disableSecurityContext` | `true` | Same `hpe-ezua/disable-sc` opt-out as the downloader Jobs. |
+| `debugPod.user` / `debugPod.cachePath` | matches `downloader.user` (override it) / `/mnt/large-models` | `USER` and `HUGGINGFACE_HUB_CACHE` inside the debug shell. |
+| `debugPod.ttlSecondsAfterFinished` | `86400` | Applies only once the debug Job finishes/fails (it normally runs `tail -f /dev/null`); a dead debug job self-cleans. |
+| `catalog.enabled` | `true` | Renders the catalog PVC and mounts it at `/mnt/catalog`. |
+| `catalog.size` / `catalog.storageClassName` | `100Mi` / `""` (default class) | Catalog PVC capacity / storage class. |
+| `catalog.githubUrl` | tools-repo seed JSON | Enables **Refresh from GitHub** (button hidden when empty). |
+| `catalog.githubVerifyTls` | unset → `true` (verify) | Override for that fetch (`false` = bypass — set it ONLY behind a corporate MITM proxy with an untrusted cert). |
+| `catalog.defaultProject` | `""` (blank) | Project recorded on a pushed packaged model whose catalog entry names none and for which the push did not pick one (the catalog page's optional **Project** field). MLIS rows with an empty `project` only appear under **All projects**, so set this to the project that should own the packaged models (e.g. `user-andrew-bydlon`). A PCAI `project-user-andrew-bydlon` namespace is accepted too: the `project-` prefix is stripped from every project source — the catalog page's **Project** field, the entry's own `project`, and this default — before the row is written and before the fingerprint is computed, so the two spellings resolve to the same value. Note that changing it later mints a new version of every affected model, because `project` is part of the configuration fingerprint. |
+| `aioli.dbHost` / `.dbPort` / `.dbName` / `.dbUser` | MLIS service defaults | AIOLI/MLIS database connection for Push to MLIS and the GC cross-check. |
+| `aioli.dbPasswordSecret.name` / `.namespace` / `.key` | `aioli-db-password` / `mlis` / `password` | Where the database password Secret lives and which key holds it. |
+| `kyverno.enabled` | `true` | Pre-install ClusterPolicy stamping `hpe-ezua` vendor labels on the app Deployment/Service (EZUA discovery). |
+| `ezua.enabled` | `true` | Renders the Istio VirtualService + AuthorizationPolicy. `false` (non-PCAI clusters) removes the ingress entirely — and with it the `ezua.virtualService.endpoint` requirement. |
+| `ezua.domainName` | `${DOMAIN_NAME}` | Informational only — no template reads it; PCAI substitutes the placeholder everywhere. |
+| `ezua.virtualService.endpoint` | `model-downloader.${DOMAIN_NAME}` | **REQUIRED when `ezua.enabled: true`** — the VirtualService host; render fails without it. |
+| `ezua.virtualService.istioGateway` / `.timeout` | `istio-system/ezaf-gateway` / `300s` | Gateway the VirtualService attaches to / route timeout. |
+| `ezua.authorizationPolicy.namespace` / `.providerName` | `istio-system` / `oauth2-proxy` | Where the `CUSTOM` AuthorizationPolicy lives and which auth provider it references. |
+
+### Standard Kubernetes knobs
+
+Pure boilerplate — plain pass-through into the pod templates, same meaning as in any chart. Defaults are sized for the workload; touch them only when a pod is being OOM-killed, throttled, or you have cluster quota pressure. Paths:
+
+| Key | Default | Consumed by |
+|---|---|---|
+| `resources.requests.cpu` / `.requests.memory` | `200m` / `256Mi` | App Deployment (via `resources`). |
+| `resources.limits.cpu` / `.limits.memory` | `1` / `512Mi` | App Deployment. |
+| `downloader.resources.requests.cpu` / `.requests.memory` | `2` / `4Gi` | Downloader Job pods (PVC and S3 templates). |
+| `downloader.resources.limits.cpu` / `.limits.memory` | `4` / `8Gi` | Downloader Job pods. |
+| `gc.resources.requests.cpu` / `.requests.memory` | `100m` / `128Mi` | GC CronJob pod. |
+| `gc.resources.limits.cpu` / `.limits.memory` | `500m` / `256Mi` | GC CronJob pod. |
+| `downloader.securityContext.runAsUser` / `.runAsGroup` | `0` / `0` | Downloader containers (root, so the shared model PVC is traversable). |
+| `debugPod.securityContext.runAsUser` / `.runAsGroup` | `0` / `0` | Debug container (same reason). |
+| `debugPod.image.repository` / `debugPod.image.tag` | `andrewbydlon/basic-ubuntu-essentials` / `v1.0` | Debug shell image: injected into the app pod as `DEBUG_POD_IMAGE`, which the app substitutes into the debug Job's `__IMAGE__` placeholder. |
+| `debugPod.image.pullPolicy` | `IfNotPresent` | Debug container image-pull policy (`imagePullPolicy` on the debug Job — contrast the app's deliberate `Always`). |
+| `image.pullPolicy` | `Always` | App container. `Always` is deliberate: overwriting the tag in the registry is enough to deploy a rebuild — `IfNotPresent` would keep a node-cached image. |
+
+Every `resources` key accepts standard Kubernetes quantities (`250m`, `1`, `512Mi`, `8Gi`); every `runAs*` key is the numeric UID/GID. The scanner Job's resources and securityContext are hardcoded in the template (not values-driven); image tags (`image.tag`, `downloader.image.tag`) are packaged with the chart — change them only for your own builds.
+
+## Kyverno on hosted trial systems — read before deploying
+
+This is the section that decides whether downloads run at all on a hosted trial. Everything below is taken from this repository's own code and comments.
+
+### What the platform policy does
+
+HPE PCAI ships a **cluster-wide Kyverno policy named `protect-models-pvc`** that **denies any pod mounting the shared `models-pvc` unless it carries the MLIS authorization label `hpe-ezua/app: mlis`**. A pod created directly — by a user or by this app's ServiceAccount — is not allowed to set that label, so creation is rejected. The repo documents the denial rule and message verbatim:
+
+> denied by the platformwide protect-models-pvc Kyverno policy
+> (prevent-unauthorized-create-with-mlis: "Insufficient authorization to set
+> the 'hpe-ezua/app' label to 'mlis'")
+
+— `helm/templates/configmap-job-template.yaml` (comment above the `debug-job.yaml` template, lines 653–660; same wording in the `debugPod:` block of `helm/values.yaml`, lines 289–294, and in `src/model_downloader/app/k8s.py`, `create_debug_job`'s docstring).
+
+### How this chart's Jobs get admitted
+
+- **Downloader Jobs carry the label.** Both Job templates (`job.yaml` for PVC, `job-s3.yaml` for S3) set `hpe-ezua/app: mlis` on the pod template (`helm/templates/configmap-job-template.yaml` lines 34 and 499), alongside the `hpe-ezua/disable-sc` security-context opt-out annotation that lets them run as root and mount the root-owned shared PVC.
+- **The UI debug pod is a Job on purpose.** A bare Pod created by the app's ServiceAccount would be denied by `protect-models-pvc` for setting `hpe-ezua/app: mlis`. The debug pod is therefore created as a Job (`debug-job.yaml`, label at line 687): its Pod is then created by the **kube-system job-controller**, i.e. the exact same admission path as the downloader Jobs, and pods with these labels are admitted (`helm/values.yaml` lines 289–294, `src/model_downloader/app/k8s.py` `create_debug_job` docstring at lines 254–262, UI text in `src/model_downloader/app/templates/index.html` lines 186–190).
+- **The PVC scanner Job carries the same label** (`scan-job.yaml`, line 762), so "Rescan storage" works under the same policy.
+- **The GC CronJob pod carries the same label** (`helm/templates/gc-cronjob.yaml`, line 51; the pod template copies the scanner Job's admission pattern verbatim), so an enabled GC works under the same policy on hosted trials too.
+
+### The chart's own Kyverno policy
+
+Separate from the platform policy, the chart installs a **pre-install ClusterPolicy named `add-vendor-app-labels-<release>-<chart>`** (`helm/templates/kyverno-policy.yaml`, rule `add-vendor-app-labels`), gated by `kyverno.enabled` (default `true`). It stamps `hpe-ezua/type: app-service-core` and `hpe-ezua/app: model-downloader` onto Deployments and Services **in the release namespace** so EZUA/PCAI ingress discovery picks the app up. It does not touch the downloader Jobs (those live in `project-user-*` namespaces and rely on the platform policy described above).
+
+### What must hold on a hosted trial
+
+On **SE G2** this all works out of the box. On a **hosted trial** the *customer's* platform policies are the gate, and the following must hold before downloads will run:
+
+1. **The platform `protect-models-pvc` policy admits the labeled Jobs.** The chart's Jobs run in `project-user-*` namespaces and present `hpe-ezua/app: mlis` — the exact label the policy wants. If the customer's installed policy is stricter than the stock one (e.g. it also restricts *who* may set the label, or it does not exempt job-controller-created pods), the customer admin must apply the platform policy patch/exception for the namespaces this release writes to. Confirm with the customer's PCAI admin before assuming a denial is an app bug. The concrete patch is in [the next subsection](#the-platform-policy-patch-customer-admin).
+2. **`kyverno.enabled` stays `true`.** Disabling it stops the pre-install `add-vendor-app-labels-<release>-<chart>` ClusterPolicy from stamping the vendor labels, and the Deployment/Service can disappear from EZUA's app discovery.
+3. **`debugPod.enabled` / downloader behavior is unchanged** — the debug pod's Job-based admission path is the documented workaround; do not "fix" a denial by switching it to a bare Pod, that will always be denied.
+
+### The platform-policy patch (customer admin)
+
+The concrete patch for the hosted-trial case where the installed `protect-models-pvc` policy denies job-controller-created pods: it appends a `NotEquals` condition to the deny conditions of `rules[1]`, exempting the kube-system job-controller — which creates the Pods for every Job this chart submits (downloader, debug, and scanner alike) — while leaving the original conditions in force for every other creator:
+
+```bash
+kubectl patch clusterpolicy protect-models-pvc --type json -p='[
+  {"op": "add", "path": "/spec/rules/1/validate/deny/conditions/all/-",
+   "value": {"key": "{{request.userInfo.username}}", "operator": "NotEquals", "value": "system:serviceaccount:kube-system:job-controller"}}
+]'
+```
+
+After applying, Job pods created by the job-controller are no longer denied and the Jobs can mount `models-pvc`; the admission webhook may take a few seconds to pick up the updated policy. This mutates a customer-owned, cluster-wide platform policy — apply it only with the customer's PCAI admin, and only if their installed policy does not already carry the exception.
+
+### What a denial looks like
+
+Admission failures surface as Kubernetes API errors, passed through verbatim:
+
+- **Debug pod launch**: the API handler maps the `ApiException` to `k8s API returned <status>: <apiserver message>` (`src/model_downloader/app/main.py` `_api_error_detail`, lines 687–706) and the UI shows it in the message box. For this policy you would see, e.g., `k8s API returned 400: ... prevent-unauthorized-create-with-mlis: Insufficient authorization to set the 'hpe-ezua/app' label to 'mlis'`. On failure the app cleans up the token Secret it had created (`src/model_downloader/app/k8s.py`, the `except ApiException` block of `create_debug_job`, lines 292–298).
+- **Download submission**: the queue records the raw exception (including the apiserver denial body) in the job's **Error** column of the Jobs table (`src/model_downloader/app/queue.py` `_run`, lines 207–209).
+- An RBAC denial (403) surfaces the same way, e.g. on `/api/namespaces`.
+
+If you see either message on a hosted trial, it is the customer's platform policy — take it to the admin with the rule names above, not to the chart.
+
+## Deployment targets
+
+### Proxied corporate site
+
+A proxied corporate PCAI site (example values use placeholder addresses):
+
+- Proxied corporate egress: `proxy.http`/`proxy.https` point at the corporate proxy with the site's `no_proxy` list; `downloader.hf.verifyTls: false` is set explicitly because the MITM cert is untrusted (also applies to the catalog's GitHub fetch via `catalog.githubVerifyTls`, or leave it and accept the per-fetch default — the example sets the downloader knob).
+- Storage: both backends — the shared `models-pvc` (default) and MinIO at `http://minio.minio.svc.cluster.local:9000`, bucket `mlis-models`, prefix `large-models`.
+- `defaultNamespace: project-user-<USERNAME>`; Kyverno works out of the box.
+- Sanitized example: [helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml).
+
+### Hosted trial
+
+A customer-hosted PCAI system:
+
+- Everything ingress-related uses `${DOMAIN_NAME}` placeholders (`ezua.domainName`, `ezua.virtualService.endpoint` = `model-downloader.${DOMAIN_NAME}`) — PCAI substitutes the real domain before rendering. The UI is then served at `https://model-downloader.<customer-domain>` behind oauth2-proxy SSO.
+- Direct egress is the norm: leave `proxy: {}` unless the cluster egresses through a corporate proxy (then wire `proxy.http`/`proxy.https`/`proxy.noProxy` and, only for a MITM proxy with an untrusted cert, `downloader.hf.verifyTls: false`).
+- The Kyverno requirements in [the section above](#kyverno-on-hosted-trial-systems--read-before-deploying) are the main risk: the customer's platform `protect-models-pvc` policy must admit the labeled downloader/debug/scanner Jobs (and the GC CronJob pod, when `gc.enabled: true` — same job-controller admission path, same labels), and `kyverno.enabled` must stay `true`.
+- Sanitized example: [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
+
+## Using the UI
+
+The header now carries three tabs: **Download** (`/`), **Model Catalog** (`/catalog`) and **Manual Deletion** (`/admin/delete`, rendered only when `manualDelete.enabled` is `true`).
+
+- **Submit a download** (`/`): pick a namespace via the searchable dropdown (filtered to `project-user-*`), enter a model name (`org/Repo-Name`), your HF token (stored as a per-submission Secret, deleted when the job finishes), optionally a custom download location (blank = `/mnt/large-models/<model>`), a chat-template preset or custom path/contents, and — when the deployment has both backends — choose **Model PVC** or **S3 path** (pre-filled `s3://<bucket>/<prefix>/`). Up to `maxConcurrency` models download in parallel; the rest queue. A submission refused by preflight/quota shows `Submission refused: ...` with the exact bytes math (422) in the message box; warn-mode decisions appear as a `— warning: ...` suffix on the success message.
+- **Mirror NIM profiles** (when `nim.enabled` and an S3 backend): switch the source to **NVIDIA NIM**, enter a NIM 2.x image ref (e.g. `nvcr.io/nim/meta/llama-3.1-8b-instruct:1.0.0`), the NGC API key (per-submission Secret, deleted with the Job), and optionally profile IDs (blank = the image's default profile). The Job runs the image's `mirror s3` command into the configured bucket and the Jobs table shows the exact `NIM_REPOSITORY_OVERRIDE=s3://<bucket>` to set on the NIM deployment. NIM mirrors share the download queue; the **NIM profile mirrors** table lists them.
+- **Jobs table**: status, output URL (`pvc://models-pvc/...?containerPath=/mnt/models` or `s3://bucket/prefix/org/Model/`), submitted/finished timestamps, live logs and progress (parsed from pod logs), and delete for finished jobs. A gate-mode-block scan failure surfaces here verbatim in the Error column.
+- **Downloaded models**: one row per model found on any backend (job history + S3 listing + PVC scanner), most recent first, with the overall on-disk size of the checkpoint (from the PVC scanner's `du -sb`; `—` when unknown, e.g. job-history/S3-only rows); **Rescan storage** forces a fresh scan; the status line states which automatic scans are enabled.
+- **Storage GC (dry-run report)** (when `gc.enabled: true`): one row per model cache dir on the PVC scan root with size, age, manifest presence, ModelScan verdict, and the three-key verdict (`delete`/`keep` + reason). Read-only — the actual deletion runs in the GC CronJob and stays off until `gc.dryRun` is flipped. **Rebuild GC report** forces a fresh evaluation (scan Job + read-only AIOLI SELECT + live-job cross-check).
+- **Manual deletion** (`/admin/delete`, when `manualDelete.enabled: true`, reachable from the third header tab): one row per model cache dir on the PVC scan root with size, age, and its verdict. An admin selects directories and confirms; the confirmation lists the **exact absolute paths** and requires typing `DELETE`. Hard blocks (a live job pinning the cache root, a `gc.protectedModels` glob, a path outside the scan root) cannot be overridden; an AIOLI `packaged_models` row is a soft block that needs an explicit per-target override, recorded in the audit trail. The protections are re-checked in the **app at commit time**, immediately before the Job is created, against a fresh scan, a fresh AIOLI read and a fresh live-Job list; anything that became blocked or vanished is dropped and reported. The Job itself is deliberately as simple as a download Job: it runs in the namespace that owns `models-pvc` with the default ServiceAccount and **no cluster RBAC**, mounts the volume read-write, validates each path structurally (absolute, not a symlink, a directory, `models--<org>--<repo>`, `realpath` under the scan root), and removes only the paths it was handed — it never walks, globs, or expands a path. Each directory is renamed to `.deleting-<name>` before removal, so the model leaves the listing the moment deletion starts and a killed run leaves obvious junk rather than a half-deleted model. Every deletion writes a tombstone (stdout JSON + `_deleted/` on the PVC) carrying the actor, the verdict, and a copy of the model's `manifest.json`. It also clears `huggingface_hub`'s lock entry for that repo (`<cache root>/.locks/<cache id>/`), which is otherwise left behind with a `models--<org>--<repo>` name — the scanner and the GC pass both exclude `.locks/`, so a deleted model can neither linger nor resurface as a 0-byte phantom.
+- **Debug pod**: launch a long-running shell in any `project-user-*` namespace that mounts the model PVC at `/mnt` (optionally with an HF token for `hf download` inside it), then connect with the displayed `kubectl exec -it $(kubectl get pods -n <ns> -l job-name=<job> -o jsonpath='{.items[0].metadata.name}') -- bash`. Delete it from the table when done — that removes its token Secret too.
+- **Model catalog** (`/catalog`): browse the lab → model → configuration tree (searchable, collapsible, remembers what you had open), view a configuration's full JSON via **Config**, add/edit/delete via the form, **Refresh from GitHub**, paste JSON (object or array) to **Push to MLIS** directly or **Add to Catalog**, and tick individual configurations — or a whole lab's **all** box — to **Push Selected to MLIS** (identical configurations are skipped; a changed configuration of a known name lands as the next version, and the result table shows the version MLIS assigned). Configurations on the Mooncake L3 tier are labelled **Mooncake** and carry an **RDMA setup** chip that expands the patch-script caveat inline. An optional **Project** field next to the push button files the pushed models under a project — the same `project-user-*` namespace combobox the download form uses (`/api/namespaces`), degrading to free text if the list is RBAC-denied; the PCAI `project-` namespace prefix is stripped before the push (the field shows `→ pushes as <name>` when that happens), because MLIS files by project name. A model pushed before this canonicalisation stored the namespace spelling, so its first re-push lands as one new version (project is part of the configuration fingerprint); empty falls back to the entry's own project, then to `catalog.defaultProject`, then to unfiled.
+
+## Documentation index
+
+| Document | Contents |
+|---|---|
+| [helm/values.yaml](helm/values.yaml) | Canonical, fully commented default for every chart value. |
+| [documentation/nim-mirror-design.md](documentation/nim-mirror-design.md) | NIM profile mirror: NGC `mirror s3` workflow, profile selection, `NIM_REPOSITORY_OVERRIDE`, sizing, security, failure modes. |
+| [helm/values-examples/README.md](helm/values-examples/README.md) | How the example values files are meant to be used on PCAI; secrets hygiene. |
+| [helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml) | Sanitized **SE G2** site values — full paste-ready document. |
+| [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml) | Sanitized **hosted-trial** site values — full paste-ready document. |
+
+Per-site values with real credentials live in `helm/local/` (repo-only: gitignored, hardlink-ignored, never packaged — see `helm/local/README.md` in the source repo). The files under `helm/values-examples/` are the shareable counterparts of those.
+
+## Migrating from `hpe_proxies`
+
+The `hpe_proxies` flag is **removed** (fleet-wide deprecation). What changed and what to do:
+
+- **Proxy env** used to be a single boolean; it is now the per-key `proxy:` dict — `proxy.http`, `proxy.https`, `proxy.noProxy`. Each key is wired into the pods (downloader Jobs, debug pods, the app pod) **only when non-empty**; a direct-egress site leaves `proxy: {}` and everything renders off:
+  ```yaml
+  proxy:
+    http: http://proxy.corp.example:8080
+    https: http://proxy.corp.example:8080
+    noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+  ```
+- **`pcai.enabled` no longer falls back to the proxy flag** — it **defaults to `false`**. PCAI features (ezua/kyverno-style integration defaults) no longer follow proxy config: set `pcai.enabled: true` explicitly where you want them.
+- **`downloader.hf.verifyTls` now defaults to VERIFY ON.** The old default turned the httpx TLS-verification bypass on together with the proxy flag; the bypass now happens **only** with an explicit `downloader.hf.verifyTls: false` — set that ONLY behind a corporate MITM proxy with an untrusted cert. `catalog.githubVerifyTls` likewise defaults to verify-on.
+- `kyverno.enabled` / `ezua.enabled` are unchanged (they never followed the flag).
+
+`helm/values-examples/values.g2.yaml` shows a full migrated proxied-site document (placeholder addresses, explicit `pcai.enabled: true` and `verifyTls: false`).

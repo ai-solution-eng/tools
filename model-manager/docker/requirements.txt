@@ -1,0 +1,18 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+kubernetes>=29.0
+pyyaml>=6.0
+jinja2>=3.1
+pydantic>=2.0
+psycopg2-binary>=2.9
+# RS256 verification for the SSO admin gate (app/oidc_identity.py, vendored
+# from pcai_utils). Imported lazily: without it the gate fails closed.
+cryptography>=42.0
+# Pinned exactly, not >=: an open boto3 range sent pip's resolver into an
+# unbounded backtrack over boto3/botocore pairs (it flashed versions and never
+# settled, so the image build hung). boto3, botocore and s3transfer are
+# version-locked to each other — bump all three together, and to versions that
+# have cp314 wheels. This set is what the app runs against on Python 3.14.
+boto3==1.43.71
+botocore==1.43.71
+s3transfer==0.19.2
