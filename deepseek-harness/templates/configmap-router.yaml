@@ -143,11 +143,17 @@ data:
     // words, so the row says which hop failed.
     // 43: drops the unused personal/logo.png — the personal ConfigMap never
     // rendered it and the init loop logged "cp: cannot stat" on every start.
+    // 44: data-manager renders markdown and HTML. A new /api/preview endpoint
+    // renders .md server-side (escape-first, zero dependencies) and serves
+    // .html verbatim, both under a CSP 'sandbox' and inside a sandboxed
+    // iframe; the edit dialog gains a Source/Rendered toggle so .md and .html
+    // stay editable. Bumped so existing units re-stamp onto the new
+    // data_manager.mjs + data_manager.html (subPath mounts never refresh).
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
     // reconcile — no chart edit needed. Defaults to 42 so an install that
     // does not set it keeps the historical value (no surprise rollout).
-    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 43 }}'
+    const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
     //   RUNTIME_REV    — chart-side template changes (nginx, supervisor,

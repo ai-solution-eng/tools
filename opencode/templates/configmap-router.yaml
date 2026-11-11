@@ -152,11 +152,17 @@ data:
     // init loop logged a cp error for on every start.
     // r23: re-stamp bump — rolls every existing unit onto the current
     // chart-rendered pod template on the next router reconcile.
+    // r24: the data manager now renders markdown and HTML — a new /api/preview
+    // endpoint renders .md server-side (escape-first, no raw-HTML passthrough)
+    // and serves .html verbatim under a CSP 'sandbox' inside a sandboxed
+    // iframe, with a Source/Rendered toggle in the edit dialog. Bumped so
+    // existing units re-stamp onto the new data_manager.mjs + data_manager.html:
+    // subPath mounts never refresh on their own.
     // RUNTIME_REV is part of the marker, same contract as the dsh and openwork
-    // charts: the shipped default is 23 and it is ALWAYS appended, so bumping
+    // charts: the shipped default is 24 and it is ALWAYS appended, so bumping
     // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
     // the next reconcile — no chart edit needed.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 23 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 24 }}'
     const userTemplateVersion = `terminal-tab-v24-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the

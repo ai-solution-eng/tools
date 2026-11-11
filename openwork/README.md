@@ -64,6 +64,18 @@ policy (keep both / skip / overwrite), the permission policy (644/664/755/775) a
 skipping (`.git`, `.venv` — on by default). Per-file ceiling `dataManager.clientMaxBodySize`
 (default `2g`); `dataManager.maxUploadMb` (default `2048`) is the server-side guard.
 
+**Previews (0.1.27).** Double-clicking a file previews it in the dialog: images, PDF (native viewer),
+audio and video render inline, and **markdown and HTML now render too** — every other extension still
+opens as text in Monaco. `.md` is rendered server-side by `/api/preview` inside `data_manager.mjs`:
+escape-first, zero dependencies, **no raw-HTML passthrough** (a `<script>` written in a `.md` file is
+displayed as text, never executed), with GFM tables, task lists, nested lists, fenced code and relative
+links/images resolved against the file's own folder. `.html` is served **verbatim**, so an exported
+report keeps its own markup, but under `Content-Security-Policy: sandbox` — opaque origin, scripts
+cannot run, nothing remote may load — inside an iframe that also carries `sandbox=""`. Both are
+read-only previews; a **Source / Rendered** toggle in the dialog switches back to Monaco so `.md` and
+`.html` stay editable. Nothing on this path can execute file content in the data-manager origin:
+markdown is escaped before parsing, HTML is isolated twice over.
+
 The server (`data_manager.mjs`, port 7682, zero dependencies) clamps every operation to the
 navigable roots, writes through a temp file + `rename()`, and refuses to follow symlinks out of a
 root.

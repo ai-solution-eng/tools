@@ -126,7 +126,13 @@ data:
     // onto the current chart-rendered pod template on the next reconcile.
     // Jumps to 23 to match the opencode chart, which moves to 23 in the same
     // release; the two counters are independent, this just keeps them aligned.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 23 }}'
+    // r24 (RUNTIME_REV): the data manager now renders markdown and HTML — a new
+    // /api/preview endpoint renders .md server-side (escape-first, no raw-HTML
+    // passthrough) and serves .html verbatim under a CSP 'sandbox' inside a
+    // sandboxed iframe, with a Source/Rendered toggle in the edit dialog.
+    // Bumped so existing units re-stamp onto the new data_manager.mjs +
+    // data_manager.html: subPath mounts never refresh on their own.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 24 }}'
     const userTemplateVersion = `terminal-tab-v21-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
