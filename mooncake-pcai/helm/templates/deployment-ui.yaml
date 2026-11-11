@@ -1,0 +1,102 @@
+{{- if .Values.ui.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-ui
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.ui.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.name }}-ui
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.name }}-ui
+        hpe-ezua/type: vendor-service
+        hpe-ezua/app: {{ .Chart.Name }}
+      annotations:
+        # Roll the pod whenever the dashboard source changes. Without this a
+        # helm upgrade updates the ConfigMap but the running pod keeps the old
+        # mounted copy until something else restarts it.
+        checksum/app-py: {{ .Files.Get "files/app.py" | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.ui.serviceAccount.name | default (printf "%s-ui" .Values.deployment.name) }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ui
+          image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag }}"
+          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+          command: ["python3", "/app/app.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.ui.service.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.ui.service.port }}"
+            - name: MOONCAKE_MASTER_URL
+              value: "http://{{ .Values.deployment.name }}-master.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.master.metricsPort }}"
+            - name: REFRESH_INTERVAL_SECONDS
+              value: "{{ .Values.ui.refreshIntervalSeconds }}"
+            - name: REQUEST_TIMEOUT_SECONDS
+              value: "{{ .Values.ui.requestTimeoutSeconds }}"
+            - name: DISCOVERY_NAMESPACES
+              value: "{{ join "," (uniq (concat (list .Release.Namespace) .Values.ui.discovery.namespaces)) }}"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+          volumeMounts:
+            - name: app
+              mountPath: /app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: app
+          configMap:
+            name: {{ .Values.deployment.name }}-ui
+        - name: tmp
+          emptyDir: {}
+{{- end }}

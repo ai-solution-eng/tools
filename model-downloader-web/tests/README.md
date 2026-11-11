@@ -37,6 +37,47 @@ Run with the repo's app sources importable (no package install needed):
 - `test_wave4_wiring.py` — app-side wiring: `_parse_quota_map` env format,
   the GC dry-run report shape + AIOLI-unavailable fail-safe, and defaults
   matching values.yaml (needs `psycopg2` — skipped when absent).
+- `test_manual_delete_plan.py` — the admin deletion verdict
+  (`gc.evaluate_manual_targets`): the TTL line is NOT applied, a missing
+  manifest warns rather than blocks, an AIOLI row is a SOFT block, and a live
+  job / protected glob / unavailable cross-check are HARD blocks. Also that
+  delete Jobs are dropped from the live-job list (a legacy annotated one
+  otherwise blocks the whole page).
+- `test_manual_delete_wiring.py` — the real FastAPI app: the auth gate (SSO
+  admin by username or group, shared key, and the verified-OIDC-token path
+  including forged-header refusal), the isolation rule (a target must come from
+  the current scan), list vs pin preview modes, single-use `verdict_id`,
+  override rules, the form's SSO-derived default namespace, and that the Job is
+  created in the namespace that OWNS the PVC.
+- `test_delete_targets.py` — the in-pod module: payload decoding, every
+  structural refusal (relative, symlink, non-directory, bad basename, outside
+  root, traversal), rename-before-delete, vanished-target accounting, tombstone
+  contents, and exit codes. Uses the real filesystem, not mocks.
+- `test_nim_wiring.py` — NIM profile mirroring, app side: request validation
+  (NIM requires enable+bucket+image+NGC key; forces S3 and clears HF fields;
+  profile normalization/dedupe), `_render_nim` substitutions + `--profiles`
+  append + Job annotations, `create_nim_job` (NGC key Secret + nvcr.io pull
+  Secret, rollback on admission denial), the queue path (NIM bypasses the PVC
+  preflight and records `s3://<bucket>`), reconciliation from annotations, and
+  Secret cleanup on watch/remove. No cluster.
+- `test_nim_render.py` — `helm template` for the NIM feature: `job-nim.yaml`
+  present/absent with `nim.enabled`, mirror args and bucket fallback,
+  deployment `NIM_*` env (and its absence on a PVC-only backend), no GPU
+  request, MinIO env + cache volume (emptyDir vs PVC), and chart-level pull
+  secrets.
+- `test_nim_ui.py` — the source selector / NIM fields / NIM mirrors table
+  contract in `index.html`, `app.js` and `style.css`; renders the real page
+  and checks the target bucket when `psycopg2` is available.
+- `test_job_templates.py` — regression guards for two shipped bugs: every
+  optional template key must be mapped in `K8sClient.start()` (a missing one
+  made every commit die with "template is missing"), and the delete Job must
+  carry no `cache-root` annotation (it pinned the whole PVC, blocking its own
+  targets and every later preview). Also that a client with no template
+  ConfigMap can still start — the in-pod delete Job does exactly that.
+- `test_oidc_vendored.py` — the vendored `pcai_utils` OIDC verifier is
+  unmodified (SHA-256 guard: edit it upstream and re-copy, never patch here),
+  and the admin gate still calls the shared verifier rather than trusting a
+  header.
 
 Requires `helm` on PATH and pyyaml/pytest (`pip install pytest pyyaml`).
 `test_wave4_wiring.py` additionally imports the app (needs `psycopg2-binary`;

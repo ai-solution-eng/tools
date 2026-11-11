@@ -1,16 +1,30 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Team Leader</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<!-- Pre-paint theme resolver: read the saved choice BEFORE the stylesheet is
+     parsed so a pinned Light/Dark never flashes the dark default. Anything that
+     is not exactly "light"/"dark" — unset, corrupt, a legacy value — is Auto.
+     Storage can be BLOCKED (iframes / privacy mode) and then getItem throws;
+     the try/catch degrades to Auto instead of killing the page. -->
+<script>
+  (function () {
+    var t = "auto";
+    try { t = localStorage.getItem("pcai-llm-theme") || "auto"; } catch (e) {}
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <style>
   /* The Team Leader console is a SMALLER SIBLING of admin.html — the same
      :root variables, the same control idioms (pill / card / row / ghost /
      banner / key-once), so a leader who has seen the admin console finds the
-     same hand on this one. Dark default + light theme via data-theme,
-     persisted in the SAME 'pcai-llm-theme' key so both consoles match. */
+     same hand on this one. Auto / Light / Dark theme: Auto (the default)
+     follows the OS live, Light/Dark pin, and the choice is persisted in the
+     SAME 'pcai-llm-theme' key so all three consoles match. */
   :root {
     color-scheme: dark;
     --bg: #0f1117; --panel: #1a1d27; --border: #2a2e3d;
@@ -25,6 +39,26 @@
     --ushade-2: rgba(255,255,255,.06); --ushade-3: rgba(255,255,255,.08);
     --ushade-4: rgba(255,255,255,.10); --ushade-5: rgba(255,255,255,.12);
   }
+  /* Auto (the default state) follows the OS: the light ramp applies under
+     prefers-color-scheme, scoped to [data-theme="auto"] so an explicit Light or
+     Dark choice always wins even when the OS disagrees.
+     KEEP IN SYNC with the explicit :root[data-theme="light"] block below — the
+     two blocks must carry identical declarations. */
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="auto"] {
+      color-scheme: light;
+      --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
+      --text: #191919; --dim: #5f6773;
+      --accent: #00815f; --accent-contrast: #ffffff;
+      --accent2: #2c6a9e; --user-bubble: #e3f2ee;
+      --err: #b42323; --err-bg: rgba(180,35,35,.06);
+      --focus: #00815f55;
+      --ushade-0: rgba(0,0,0,.03); --ushade-1: rgba(0,0,0,.05);
+      --ushade-2: rgba(0,0,0,.07); --ushade-3: rgba(0,0,0,.09);
+      --ushade-4: rgba(0,0,0,.11); --ushade-5: rgba(0,0,0,.13);
+    }
+  }
+  /* KEEP IN SYNC with the Auto media block above — identical declarations. */
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
@@ -54,8 +88,17 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
     font-size: 13px; width: 300px; }
   header .spacer { flex: 1; }
-  #theme { background: none; border: 1px solid var(--border); border-radius: 6px;
-           padding: 4px 9px; cursor: pointer; color: var(--text); }
+  /* Theme control: three-way Auto / Light / Dark segmented pill (the same shape
+     admin.html and index.html carry). */
+  .theme-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
+               overflow: hidden; }
+  .theme-seg button { background: transparent; color: var(--dim); border: 0;
+                      padding: 4px 9px; font: inherit; font-size: 12px; line-height: 1.4;
+                      cursor: pointer; }
+  .theme-seg button:hover { color: var(--text); }
+  .theme-seg button.on { background: var(--accent); color: var(--accent-contrast);
+                         font-weight: 600; }
+  .theme-seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   /* Sticky tab bar — same parking trick as admin.html: top is the measured
      header height, z-index below the header (5) and the error strip (9). */
   nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px 0; background: var(--panel);
@@ -192,7 +235,13 @@
   <input id="tlkey" type="password" placeholder="Team leader key" aria-label="Team leader key" autocomplete="off">
   <button id="connect" class="btn">Connect</button>
   <span id="conn" class="muted"></span>
-  <button id="theme" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  <!-- Auto follows the OS; Light/Dark pin and are remembered. The #theme id is
+       the shared anchor the other two consoles use — keep it. -->
+  <div class="theme-seg" id="theme" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <nav>
   <button data-tab="keys" class="active">Keys</button>
@@ -405,21 +454,52 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 
-// Same theme key as admin.html — a leader and an admin on one machine see
-// one consistent look across both consoles.
+// ---- theme: Auto (default) / Light / Dark -------------------------------
+// Auto follows the OS live through the CSS media query; Light and Dark pin. Same
+// theme key as admin.html and index.html — a leader and an admin on one machine
+// see one consistent look across all three consoles, and a saved Light/Dark
+// choice from the old two-state toggle keeps working.
 const THEME_KEY = 'pcai-llm-theme';
-const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
-applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
-$('theme').onclick = () => { const n = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  store.set(THEME_KEY, n); applyTheme(n); };
+// Auto is a real state (not "no choice"), so the control always shows which of
+// the three is in force.
+function markThemeButtons(t) {
+  for (const b of document.querySelectorAll('[data-theme-btn]')) {
+    const on = b.getAttribute('data-theme-btn') === t;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+function applyTheme(t) {
+  if (t !== 'light' && t !== 'dark') t = 'auto';
+  document.documentElement.dataset.theme = t;
+  store.set(THEME_KEY, t);
+  markThemeButtons(t);
+}
+applyTheme(store.get(THEME_KEY) || 'auto');
+for (const b of document.querySelectorAll('[data-theme-btn]')) {
+  b.addEventListener('click', () => applyTheme(b.getAttribute('data-theme-btn')));
+}
+// In Auto the palette follows the OS without JS; re-mark the control when the OS
+// flips so it stays truthful if anything else rewrote the attribute.
+try {
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (document.documentElement.dataset.theme !== 'auto') return;
+    markThemeButtons('auto');
+  });
+} catch (e) {}
 
 const KEY_STORE = 'pcai_team_leader_key';
 const key = () => $('tlkey').value.trim();
 const state = { overview: null, keys: [] };
 
-function banner(msg, cls = '', timeout) {
+function banner(msg, cls = '', timeout, html = false) {
+  // Same default-escape contract as the admin console (2026-11-02 stored-XSS
+  // fix, w6 F1): every dynamic string reaching innerHTML goes through esc()
+  // UNLESS the caller composes markup itself (html=true) — so a new call
+  // site cannot reopen the footgun the default exists to close. cls is
+  // escaped too (admin parity).
   const b = $('banner');
-  b.innerHTML = `<div class="banner ${cls}">${msg}</div>`;
+  b.innerHTML = `<div class="banner ${esc(cls)}">${html ? msg : esc(msg)}</div>`;
   if (timeout) setTimeout(() => { b.innerHTML = ''; }, timeout);
 }
 // Security: esc must be safe inside double-quoted attributes (the admin
@@ -728,7 +808,7 @@ $('ovr-overflow-tog').onchange = async () => {
     await loadOverview();   // re-read: the pill, the help line, and the pool truth all refresh
   } catch (e) {
     tog.checked = !desired;   // never leave the toggle lying
-    banner(esc(e.message), 'error', 9000);
+    banner(e.message, 'error', 9000);
   } finally { overflowBusy = false; }
 };
 
@@ -757,7 +837,7 @@ async function loadTopups() {
   try { reqs = await api('/topup-requests'); }
   catch (e) {
     if (String(e.message).startsWith('401')) return;   // loseAuth already fired + prompted
-    banner(esc(e.message), 'error', 7000);
+    banner(e.message, 'error', 7000);
     return;
   }
   state.topups = reqs || [];
@@ -802,7 +882,7 @@ $('ovr-topup').addEventListener('click', () => {
       $('dlg').close();
       banner('top-up request sent to your admin', '', 4000);
       await loadTopups();
-    } catch (e) { banner(esc(e.message), 'error', 9000); }   // 409 "one open ask at a time" — verbatim
+    } catch (e) { banner(e.message, 'error', 9000); }   // 409 "one open ask at a time" — verbatim
   });
 });
 
@@ -844,7 +924,7 @@ $('k-create').onclick = guarded('k-create', async () => {
     $('k-name').value = ''; $('k-subject').value = '';
     $('k-budget-tokens').value = ''; $('k-budget-usd').value = '';
     await loadKeys(); await loadOverview();
-  } catch (e) { banner(esc(e.message), 'error', 7000); }
+  } catch (e) { banner(e.message, 'error', 7000); }
 });
 
 async function loadKeys() {
@@ -998,9 +1078,9 @@ window.tlEditKey = (btn, id) => withBtn(btn, async () => {
     try {
       await api(`/keys/${id}`, { method: 'PATCH', body });
       $('dlg').close();
-      banner(`key updated — limits live immediately (${esc(nm || name)})`, '', 3500);
+      banner(`key updated — limits live immediately (${nm || name})`, '', 3500);
       await loadKeys();
-    } catch (e) { banner(esc(e.message), 'error', 7000); }
+    } catch (e) { banner(e.message, 'error', 7000); }
   });
 });
 
@@ -1033,7 +1113,7 @@ window.tlBudgets = (btn, id) => withBtn(btn, async () => {
   const k = (state.keys || []).find(x => x.id === id) || {};
   let u;
   try { u = await api(`/keys/${id}/usage`); }
-  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  catch (e) { banner(e.message, 'error', 7000); return; }
   // Working rows: the budget_status projection mapped to the PUT shape.
   const rows = (u.budgets || []).map(b => b.kind === 'usd'
     ? { model: b.model, period: b.period, limit_usd: b.limit_usd }
@@ -1082,7 +1162,7 @@ window.tlBudgets = (btn, id) => withBtn(btn, async () => {
       $('dlg').close();
       banner('budgets saved', '', 3000);
       await loadKeys(); await loadOverview();
-    } catch (e) { banner(esc(e.message), 'error', 9000); }
+    } catch (e) { banner(e.message, 'error', 9000); }
   });
 });
 
@@ -1092,7 +1172,7 @@ window.tlUsage = (btn, id) => withBtn(btn, async () => {
   const k = (state.keys || []).find(x => x.id === id) || {};
   let u;
   try { u = await api(`/keys/${id}/usage`); }
-  catch (e) { banner(esc(e.message), 'error', 7000); return; }
+  catch (e) { banner(e.message, 'error', 7000); return; }
   const rows = (u.recent || []).map(r2 =>
     `<tr><td>${new Date(r2.ts).toLocaleString()}</td><td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
      <td>${r2.prompt_tokens}</td><td>${r2.completion_tokens}</td><td>${r2.total_tokens}</td>
@@ -1112,7 +1192,7 @@ window.tlRevoke = (btn, id) => withBtn(btn, async () => {
     await api(`/keys/${id}`, { method: 'DELETE' });
     banner('key revoked', '', 3000);
     await loadKeys(); await loadOverview();
-  } catch (e) { banner(esc(e.message), 'error', 7000); }
+  } catch (e) { banner(e.message, 'error', 7000); }
 });
 
 // ---------- advertised (full registry view) ----------
@@ -1207,7 +1287,7 @@ async function loadPresentedModels() {
     '<tbody>' + (modelRows || '<tr><td colspan="7" class="muted">none registered</td></tr>') + '</tbody></table>';
 }
 $('pe-reload').addEventListener('click', () =>
-  loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadPresentedModels().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- usage (scoped rollups + ledger) ----------
 // The SAME three tables the admin console shows (totals / by model / by key),
@@ -1217,7 +1297,7 @@ async function loadUsage() {
   const winSel = $('usage-window');
   if (winSel && !winSel.dataset.bound) {
     winSel.dataset.bound = '1';
-    winSel.addEventListener('change', () => loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+    winSel.addEventListener('change', () => loadUsage().catch(e => banner(e.message, 'error', 5000)));
   }
   const winDays = winSel ? winSel.value : '366';
   const winSince = new Date(Date.now() - Number(winDays) * 86400000).toISOString();
@@ -1326,17 +1406,17 @@ $('u-csv').addEventListener('click', async ev => {
     a.href = url; a.download = 'team-usage.csv';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-  } catch (e) { banner(esc(e.message), 'error', 6000); }
+  } catch (e) { banner(e.message, 'error', 6000); }
 });
 $('u-reload').addEventListener('click', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 // (the rollup-by selector is gone: the tab now renders the admin's three
 // tables — totals, by model, by key — and the window selector binds inside
 // loadUsage() on first call.)
 $('u-key').addEventListener('change', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 $('u-since').addEventListener('change', () =>
-  loadUsage().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadUsage().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- traces (request-grouped cards, admin.html's rendering) ----------
 function traceStatusCell(status) {
@@ -1440,8 +1520,8 @@ async function loadTraces() {
   list.innerHTML = groups.map(g => g.reqs.length > 1 ? traceThread(g) : traceCard(g.reqs[0])).join('')
     || '<p class="muted">no traces yet</p>';
 }
-$('t-key').addEventListener('change', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
-$('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(esc(e.message), 'error', 5000)));
+$('t-key').addEventListener('change', () => loadTraces().catch(e => banner(e.message, 'error', 5000)));
+$('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(e.message, 'error', 5000)));
 
 // ---------- form plane: structure + measurement (admin.html's contract) ----
 // Kept BYTE-FOR-BYTE equivalent to admin.html so the two consoles cannot drift.
@@ -1578,17 +1658,17 @@ function activateTab(name) {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
   btn.classList.add('active'); $(`tab-${name}`).classList.add('active');
-  if (name === 'keys') loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
-  if (name === 'advertised') loadPresentedModels().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'keys') loadKeys().catch(e => banner(e.message, 'error', 5000));
+  if (name === 'advertised') loadPresentedModels().catch(e => banner(e.message, 'error', 5000));
   if (name === 'usage') {
     // The envelope card lives on THIS tab now (2026-10-30: it was pinned above
     // every tab, where three of the four pages had no use for it), so opening
     // the tab re-reads it — the numbers here are spend-aware and stale the
     // moment a key is minted or a request settles.
-    loadOverview().catch(e => banner(esc(e.message), 'error', 5000));
-    loadUsage().catch(e => banner(esc(e.message), 'error', 5000));
+    loadOverview().catch(e => banner(e.message, 'error', 5000));
+    loadUsage().catch(e => banner(e.message, 'error', 5000));
   }
-  if (name === 'traces') loadTraces().catch(e => banner(esc(e.message), 'error', 5000));
+  if (name === 'traces') loadTraces().catch(e => banner(e.message, 'error', 5000));
   // The plane variables are measured per VISIBLE row — a section that was
   // display:none measured as 0, so every activation re-measures (synchronously).
   layoutFormRowsNow();
@@ -1609,9 +1689,9 @@ function restoreSavedTab() {
 
 $('ovr-reload').addEventListener('click', () =>
   loadOverview().then(() => loadKeys()).then(() => loadTopups())
-    .catch(e => banner(esc(e.message), 'error', 6000)));
+    .catch(e => banner(e.message, 'error', 6000)));
 $('show-revoked').addEventListener('change', () =>
-  loadKeys().catch(e => banner(esc(e.message), 'error', 5000)));
+  loadKeys().catch(e => banner(e.message, 'error', 5000)));
 
 async function connect() {
   const btn = $('connect');
@@ -1622,12 +1702,12 @@ async function connect() {
     setConn(true);
     $('tl-connect').classList.add('hidden');
     restoreSavedTab();      // a restored tab's loader needs the overview loaded first
-    loadKeys().catch(e => banner(esc(e.message), 'error', 5000));
-    loadTopups().catch(e => banner(esc(e.message), 'error', 5000));   // the queue is overview-adjacent
+    loadKeys().catch(e => banner(e.message, 'error', 5000));
+    loadTopups().catch(e => banner(e.message, 'error', 5000));   // the queue is overview-adjacent
     btn.textContent = 'Connected ✓';
   } catch (e) {
     setConn(false); btn.textContent = 'Connect';
-    banner(esc(e.message), 'error', 6000);
+    banner(e.message, 'error', 6000);
   }
   btn.disabled = false;
 }

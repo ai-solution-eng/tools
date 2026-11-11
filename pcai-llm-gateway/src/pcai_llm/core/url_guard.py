@@ -38,6 +38,12 @@ import ipaddress
 import logging
 import socket
 import threading
+import time
+
+# No import cycle: core.metrics imports only logging/prometheus_client at
+# module level (its db import is lazy, inside _pool_stat) — and this module's
+# design rule bans FastAPI imports, not core.telemetry ones.
+from . import metrics as _metrics
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +52,67 @@ log = logging.getLogger(__name__)
 # FAILURE, which warns and skips the resolved-address check (nothing was
 # SHOWN dangerous) rather than refusing.
 RESOLVE_TIMEOUT_S = 5.0
+
+# P3 (audit 2026-11-10): the lookup used to spawn a fresh daemon thread per
+# call — a model-supplied URL that times out DNS leaked one thread PER call
+# with no memory of the failure, so a repeated bad host leaked unboundedly.
+#
+# CROSS-VAL AMENDMENT (still P3, audit 2026-11-10): the first fix swapped the
+# threads for a shared ThreadPoolExecutor(max_workers=4) — which turned the
+# leak into a GLOBAL OUTAGE. CPython cannot cancel a wedged getaddrinfo, so
+# four blackholed names occupied ALL FOUR workers and every later lookup
+# queue-timed-out into the fail-open "warn and skip" path: a model could
+# disable destination validation for ALL hosts for the resolver window — the
+# exact class the SSRF gate exists to stop.
+#
+# Final shape: PER-CALL daemon threads (one wedged lookup can never starve
+# another host's check) with the number of concurrently RUNNING lookups
+# bounded by a semaphore (a model cannot spawn unbounded threads either),
+# plus the short per-host NEGATIVE cache (a host that failed resolution
+# answers from the cache for the TTL without new work). Saturation is a
+# DISTINCT, fail-CLOSED outcome (ResolverSaturated), not EAI_AGAIN.
+_RESOLVE_MAX_CONCURRENT = 8
+_resolve_slots = threading.BoundedSemaphore(_RESOLVE_MAX_CONCURRENT)
+_NEGATIVE_TTL_S = 30.0
+_NEGATIVE_CACHE_MAX = 256
+_negative_cache: dict[str, float] = {}
+_negative_lock = threading.Lock()
+
+
+class ResolverSaturated(RuntimeError):
+    """The bounded resolver already carries its full complement of in-flight
+    lookups; this request's check was NOT performed.
+
+    Deliberately NOT a socket.gaierror/OSError subclass: the fail-open rule
+    ("a resolver that cannot answer says nothing about the name") applies to
+    RESOLUTION failures. Capacity exhaustion is a different fact — callers
+    that catch only the narrow resolution-failure tuple propagate this and
+    REFUSE, so four-plus wedged names cannot silently switch the SSRF gate
+    off. The metric for this event is tracked with the audit remediation."""
+
+
+def _negative_hit(host: str) -> bool:
+    """True when host failed resolution recently enough to skip re-trying."""
+    now = time.monotonic()
+    with _negative_lock:
+        deadline = _negative_cache.get(host)
+        if deadline is not None and deadline > now:
+            return True
+        _negative_cache.pop(host, None)
+        if deadline is None and len(_negative_cache) >= _NEGATIVE_CACHE_MAX:
+            # Bound the cache: drop the soonest-expiring entries first.
+            for key, _when in sorted(_negative_cache.items(), key=lambda kv: kv[1])[: len(_negative_cache) // 2]:
+                del _negative_cache[key]
+        return False
+
+
+def _negative_remember(host: str) -> None:
+    with _negative_lock:
+        if len(_negative_cache) >= _NEGATIVE_CACHE_MAX:
+            for key, _when in sorted(_negative_cache.items(), key=lambda kv: kv[1])[: len(_negative_cache) // 2]:
+                del _negative_cache[key]
+        _negative_cache[host] = time.monotonic() + _NEGATIVE_TTL_S
+
 
 # Ranges denied UNCONDITIONALLY. See design rule 2.
 CORE_DENIED_CIDRS: tuple[str, ...] = (
@@ -75,11 +142,29 @@ def resolve_host_addresses(host: str, timeout_s: float | None = None) -> list[st
 
     Returns the distinct address strings, or raises socket.gaierror when the
     name does not resolve. A stuck resolver must not hang the caller: the
-    lookup runs on a daemon thread with a bounded join, and a timeout is
-    surfaced as an EAI_AGAIN gaierror. Callers treat every failure class the
-    same way - warn and skip the check (see api.routes_admin._check_url).
+    lookup runs on a PER-CALL daemon thread (one wedged lookup can never
+    starve another host's check — the shared-pool detour was a global-outage
+    bug, see the module comment) with a bounded wait, and a timeout is
+    surfaced as an EAI_AGAIN gaierror. The number of concurrently RUNNING
+    lookups is bounded: when the bound is exhausted, ResolverSaturated is
+    raised — a DISTINCT fail-closed outcome, not the fail-open gaierror. A
+    host whose resolution recently failed answers from the negative cache
+    without new work. Resolution failures stay fail-open at the documented
+    call sites (warn and skip — see api.routes_admin._check_url).
     """
+    if _negative_hit(host):
+        raise socket.gaierror(socket.EAI_AGAIN, f"resolution of {host!r} failed recently (negative cache)")
     timeout = RESOLVE_TIMEOUT_S if timeout_s is None else timeout_s
+    if not _resolve_slots.acquire(blocking=False):
+        log.warning(
+            "url_guard: resolver saturated (%d in-flight lookups) — destination check for %r NOT performed",
+            _RESOLVE_MAX_CONCURRENT,
+            host,
+        )
+        # The dashboard surface for the log line above: saturation is a
+        # fail-closed refusal an operator must be able to see and alert on.
+        _metrics.observe_url_guard_resolver_saturated()
+        raise ResolverSaturated(f"url resolver saturated: {_RESOLVE_MAX_CONCURRENT} lookups already in flight")
     results: list[list[str]] = []
     errors: list[BaseException] = []
 
@@ -89,6 +174,11 @@ def resolve_host_addresses(host: str, timeout_s: float | None = None) -> list[st
         except Exception as exc:  # re-raised on the caller's thread
             errors.append(exc)
             return
+        finally:
+            # The slot covers the LOOKUP — a wedged getaddrinfo holds it for
+            # the OS resolver's natural duration, a finished one frees it
+            # before the (cheap) parse.
+            _resolve_slots.release()
         seen: list[str] = []
         for info in infos:
             addr = info[4][0]
@@ -98,12 +188,26 @@ def resolve_host_addresses(host: str, timeout_s: float | None = None) -> list[st
                 seen.append(addr)
         results.append(seen)
 
-    worker = threading.Thread(target=_work, name="pcai-url-check-resolve", daemon=True)
-    worker.start()
+    # P3 (cross-val wave 2): the slot is released inside _work's finally, which
+    # only runs if the thread actually STARTS. A "can't start new thread"
+    # RuntimeError from start() used to propagate with the slot still held —
+    # one permanent leak per failure, saturating the resolver (every later
+    # lookup -> ResolverSaturated -> global SSRF-check refusal). Release the
+    # slot on ANY construction/start failure and re-raise unchanged.
+    try:
+        worker = threading.Thread(target=_work, name="pcai-url-check-resolve", daemon=True)
+        worker.start()
+    except BaseException:
+        _resolve_slots.release()
+        raise
     worker.join(timeout)
     if worker.is_alive():
-        raise socket.gaierror(socket.EAI_AGAIN, f"resolution of {host!r} timed out after {timeout}s")
+        # The daemon thread finishes (and frees its slot) on its own; the
+        # failure is remembered so a repeated bad host spawns nothing new.
+        _negative_remember(host)
+        raise socket.gaierror(socket.EAI_AGAIN, f"resolution of {host!r} timed out after {timeout}s") from None
     if errors:
+        _negative_remember(host)
         raise errors[0]
     return results[0] if results else []
 
@@ -186,6 +290,34 @@ def decode_ip_literal(host: str) -> str | None:
         return None  # malformed literal (caller refuses) or a hostname
 
 
+# P3 (audit 2026-11-10): the core deny list was re-parsed with ip_network()
+# per ENTRY on EVERY denied_ip_reason() call — per URL, per tool call. It is
+# static: parse it once at module level.
+_CORE_DENIED_NETS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
+    ipaddress.ip_network(cidr) for cidr in CORE_DENIED_CIDRS
+]
+# extra_cidrs changes only when an operator reconfigures: cache the parsed
+# list keyed by the exact tuple and rebuild only when it differs. (A malformed
+# entry is logged once per rebuild instead of once per call.)
+_extra_nets_cache: tuple[tuple[str, ...], list[ipaddress.IPv4Network | ipaddress.IPv6Network]] | None = None
+
+
+def _denied_nets(extra_cidrs: tuple[str, ...] | list[str]) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    global _extra_nets_cache
+    key = tuple(extra_cidrs)
+    cached = _extra_nets_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    nets = list(_CORE_DENIED_NETS)
+    for cidr in key:
+        try:
+            nets.append(ipaddress.ip_network(cidr))
+        except ValueError:
+            log.warning("ignoring malformed deny-CIDR entry %r", cidr)
+    _extra_nets_cache = (key, nets)
+    return nets
+
+
 def denied_ip_reason(host: str, extra_cidrs: tuple[str, ...] | list[str] = ()) -> str:
     """Reason string when host is an IP literal inside a denied range
     (loopback / unspecified / link-local-metadata / CGNAT / operator extra-deny),
@@ -204,7 +336,9 @@ def denied_ip_reason(host: str, extra_cidrs: tuple[str, ...] | list[str] = ()) -
 
     extra_cidrs: operator-added ranges. Callers pass settings.url_deny_cidrs
     (the registration gate's default) or an argument-policy override; a
-    malformed entry is logged and ignored, never fatal."""
+    malformed entry is logged and ignored, never fatal. The parsed networks
+    are built once at module level and rebuilt only when extra_cidrs changes
+    (P3, audit 2026-11-10 — the list used to be re-parsed on every call)."""
     decoded = decode_ip_literal(host)
     if decoded is None:
         return ""  # not an address literal - the caller handles it as a host
@@ -213,15 +347,7 @@ def denied_ip_reason(host: str, extra_cidrs: tuple[str, ...] | list[str] = ()) -
     # v4-shaped; ::ffff:127.0.0.1 must hit 127.0.0.0/8).
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
-    denied: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
-        ipaddress.ip_network(cidr) for cidr in CORE_DENIED_CIDRS
-    ]
-    for cidr in extra_cidrs:
-        try:
-            denied.append(ipaddress.ip_network(cidr))
-        except ValueError:
-            log.warning("ignoring malformed deny-CIDR entry %r", cidr)
-    for net in denied:
+    for net in _denied_nets(extra_cidrs):
         if addr in net:
             return f"address {addr} is inside denied range {net}"
     return ""

@@ -42,7 +42,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ..config import settings
-from ..core import enroll_memory, secretbox, teams
+from ..core import enroll_memory, identity, secretbox, teams
 from ..core.audit import audit_action
 from ..core.budgets import MAX_LIMIT_TOKENS, MAX_LIMIT_USD, split_preset_budgets
 from ..core.identity import (
@@ -61,6 +61,7 @@ from ..core.identity import (
 from ..core.keys import create_key, hash_key
 from ..db import db
 from ..routing.router import router as model_router
+from . import auth as auth_mod
 from .routes_admin import _NAME_PATTERN, AdminDep
 
 log = logging.getLogger(__name__)
@@ -104,10 +105,17 @@ _GENERIC_CODE_REJECTION = "invalid, expired, or exhausted code"
 ENROLL_SCOPES = ["proxy", "mcp"]
 
 # Per-key MCP credential override limits (header-injection hygiene: these
-# become upstream request headers, so both names and values are bounded).
+# become upstream request headers, so both names and values are bounded —
+# names by grammar, values by LENGTH and CHARSET; the charset half is
+# CRED_VALUE_RE, audit 2026-11-10 P2-3).
 MAX_CRED_HEADERS = 16
 MAX_CRED_VALUE_LEN = 512
 HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
+# A header field value is printable ASCII (plus TAB) — RFC 9110 field-vchar.
+# CR/LF would let a stored override inject a header line upstream, and
+# non-ASCII is not legal in a field value at all; httpx would either raise at
+# call time (a 500 on someone else's request) or send it raw.
+CRED_VALUE_RE = re.compile(r"^[\t\x20-\x7e]*$")
 # Reserved override names (see _validate_creds_headers): the gateway's own
 # attribution stamps, imported from the identity module so the stamp sites
 # and the reservation site can never drift apart. X-MCP-Caller rides every
@@ -709,8 +717,21 @@ LIMIT 1
 
 _FOR_ME_REVOKE_SQL = "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL"
 
+# ONE string for BOTH sources of the one-key-per-identity refusal (audit
+# 2026-11-10 P2-13): the advisory pre-check in create_key_for_me AND the partial
+# unique index uq_api_keys_one_live_sso (db/schema.py) that catches the
+# concurrent double-mint the pre-check cannot see (it reads OUTSIDE the mint
+# transaction). A caller must not be able to tell which one refused it — the
+# SPA branches on one shape: 409 + this message -> offer the rotate prompt.
+_FOR_ME_ONE_KEY_MSG = 'key already exists for this identity — POST {"rotate": true} to replace it'
 
-async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, Any] | None) -> None:
+
+async def _bind_user_profile(
+    conn: Any,
+    user_id: uuid.UUID,
+    profile: dict[str, Any] | None,
+    tenant_id: uuid.UUID | None = None,
+) -> None:
     """Bind an SSO-created user to the tenant default profile when it has none.
 
     WHY (2026-10-29): the tenant default profile used to land ONLY as stamped
@@ -721,9 +742,12 @@ async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, A
     mean the user ROW or the profile is only half applied: the key gets its
     budgets and grants while every profile-scoped feature silently ignores it.
 
-    ONLY WHEN NULL: an operator who assigned a profile by hand (Keys > Profile)
-    keeps it. The tenant setting is a DEFAULT, not an override — a mint must
-    never silently re-scope a user an operator already placed.
+    NULL OR AN SSO SLOT (2026-11-08, review F1-3): a NULL row is bound (the
+    first mint). A row already pointing at ONE OF THIS TENANT'S TWO SSO SLOTS
+    was assigned by the SSO flow, so it follows a tier change on rotate
+    (default -> admin, or admin -> default). A profile an operator assigned BY
+    HAND (Keys > Profile) is a different id and is never re-scoped — the
+    tenant setting is a DEFAULT, not an override.
 
     Runs INSIDE the mint transaction (same conn), so a failed stamp and a
     failed bind roll back together: no key is issued against a half-applied
@@ -731,39 +755,98 @@ async def _bind_user_profile(conn: Any, user_id: uuid.UUID, profile: dict[str, A
     """
     if profile is None:
         return
+    if tenant_id is None:
+        await conn.execute(
+            "UPDATE users SET profile_id = $2 WHERE id = $1 AND profile_id IS NULL",
+            user_id,
+            profile["id"],
+        )
+        return
+    # TIER RE-SCOPE ON ROTATE (review F1-3): a user row pointing at EITHER of
+    # this tenant's SSO slots was assigned by the SSO flow, so it follows the
+    # tier on a re-resolve (default -> admin, or admin -> default). A profile
+    # assigned by hand is a DIFFERENT id and is never re-scoped — the original
+    # "the tenant setting is a default, not an override" contract holds.
     await conn.execute(
-        "UPDATE users SET profile_id = $2 WHERE id = $1 AND profile_id IS NULL",
+        "UPDATE users SET profile_id = $2 WHERE id = $1 AND ("
+        "  profile_id IS NULL OR profile_id IN ("
+        "    SELECT sso_default_profile_id FROM tenants WHERE id = $3 AND sso_default_profile_id IS NOT NULL"
+        "    UNION"
+        "    SELECT sso_admin_profile_id FROM tenants WHERE id = $3 AND sso_admin_profile_id IS NOT NULL"
+        "  )"
+        ")",
         user_id,
         profile["id"],
+        tenant_id,
     )
 
 
-async def _sso_default_profile(conn: Any, tenant_id: uuid.UUID) -> dict[str, Any] | None:
-    """The tenant's configured SSO self-mint default profile (admin sets it
-    via PUT /admin/tenants/{id}/sso-default-profile), or None when unset /
-    the profile row vanished (profiles FK is ON DELETE SET NULL — a deleted
-    profile degrades to the bare grant, never blocks a mint). Shape mirrors
-    routes_admin's create-key preset resolution: budgets (model/period plus
-    exactly one of limit_tokens / limit_usd), mcp_grants ([server, tool]
-    pairs), limits (rpm/tpm/max_concurrent presets that OVERRIDE the
-    mint's bare defaults)."""
+async def _sso_profile(conn: Any, tenant_id: uuid.UUID, groups: list[str]) -> dict[str, Any] | None:
+    """The tenant's SSO self-mint profile for THIS caller's groups (SSO tier
+    profiles, 2026-11-08), or None when unset / the profile row vanished
+    (profiles FK is ON DELETE SET NULL — a deleted profile degrades to the
+    bare grant, never blocks a mint).
+
+    TIER SPLIT: when ``tenants.sso_admin_groups`` is non-empty AND any of
+    its entries (comma-separated, case-sensitive, whitespace-trimmed,
+    empties ignored) appears in ``groups``, the ADMIN profile
+    (``tenants.sso_admin_profile_id``) is chosen over the tenant default.
+    An empty ``sso_admin_groups`` (the column default) DISABLES the split:
+    resolution is byte-identical to the single-profile deployment, so an
+    upgrade never re-scopes an existing tenant. The admin profile is also
+    skipped when its row vanished (ON DELETE SET NULL left the id NULL) —
+    the default profile degrades in.
+
+    BOTH joins are LEFT (review fix, 2026-11-08): the two profile settings
+    are INDEPENDENT. A tenant may ship an admin tier with NO default
+    profile (members mint the bare grant, admins get the admin profile) —
+    an INNER default join would have returned None for EVERYONE there.
+    Admin wins on a group match with a live admin row; otherwise the
+    default profile applies when wired; otherwise None (the bare grant).
+
+    Shape mirrors routes_admin's create-key preset resolution: budgets
+    (model/period plus exactly one of limit_tokens / limit_usd), mcp_grants
+    ([server, tool] pairs), limits (rpm/tpm/max_concurrent presets that
+    OVERRIDE the mint's bare defaults). One row, one round-trip.
+    """
     row = await conn.fetchrow(
-        "SELECT p.id, p.name, p.defaults_json FROM tenants t "
-        "JOIN profiles p ON p.id = t.sso_default_profile_id WHERE t.id = $1",
+        "SELECT t.sso_admin_groups, p.id, p.name, p.defaults_json, "
+        "ap.id AS admin_id, ap.name AS admin_name, ap.defaults_json AS admin_json "
+        "FROM tenants t "
+        "LEFT JOIN profiles p ON p.id = t.sso_default_profile_id "
+        "LEFT JOIN profiles ap ON ap.id = t.sso_admin_profile_id "
+        "WHERE t.id = $1",
         tenant_id,
     )
     if row is None:
         return None
+    admin_cfg = str(row.get("sso_admin_groups") or "")
+    admin_entries = {g.strip() for g in admin_cfg.split(",") if g.strip()}
+    caller_groups = {g.strip() for g in groups}
+    # Admin wins when the tier split is on, the caller carries a matching
+    # group, AND the admin profile row is still there. Matching is SET
+    # intersection: case-sensitive, trimmed on both sides, empty entries
+    # ignored. Otherwise the default profile applies WHEN IT EXISTS (both
+    # joins are LEFT — an unset default with a live admin tier is a legal
+    # configuration and must not drop the admin branch); neither wired ->
+    # None (the bare grant).
+    use_admin = bool(admin_entries) and bool(admin_entries & caller_groups) and row.get("admin_id") is not None
+    if use_admin:
+        prof_id, prof_name, prof_json = row["admin_id"], row.get("admin_name", ""), row["admin_json"]
+    elif row.get("id") is not None:
+        prof_id, prof_name, prof_json = row["id"], row.get("name", ""), row["defaults_json"]
+    else:
+        return None
     try:
-        defaults = json.loads(row["defaults_json"] or "{}")
+        defaults = json.loads(prof_json or "{}")
     except (json.JSONDecodeError, TypeError):
         defaults = {}
     return {
-        "id": row["id"],
+        "id": prof_id,
         # name rides along so a stamp-time config failure can NAME the
         # profile in the 503 the self-mint returns (an operator cannot act
         # on "invalid budget preset" without knowing which profile).
-        "name": row.get("name", ""),
+        "name": prof_name,
         "budgets": defaults.get("budgets", []),
         "mcp_grants": defaults.get("mcp_grants", []),
         "limits": defaults.get("limits", {}) or {},
@@ -797,19 +880,28 @@ async def _stamp_profile_grants(conn: Any, key_id: uuid.UUID, profile: dict[str,
     rolling the mint/rotate back, instead of minting a key whose budgets
     silently differ from the profile. Callers translate the ValueError to
     a status the client can act on (the for-me route: 503 naming the
-    profile) — a bare 500 would tell a user nothing they could report."""
+    profile) — a bare 500 would tell a user nothing they could report.
+
+    ON CONFLICT DO NOTHING (audit 2026-11-10 P2-14): on a ROTATE the caller
+    has already carried the old key's budget rows onto the fresh key (their
+    limits may have drifted from the profile — the operator's per-key reality
+    wins), so the stamp must GAP-FILL, not raise on the overlap. A plain
+    INSERT here would 500 every rotate whose profile preset the old key
+    already carried."""
     try:
         token_rows, usd_rows = split_preset_budgets(profile.get("budgets") or [])
     except ValueError as exc:
         raise ProfilePresetConfigError(f"profile {profile.get('name') or profile.get('id')!r}: {exc}") from None
     if token_rows:
         await conn.executemany(
-            "INSERT INTO budgets (key_id, model, period, limit_tokens) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO budgets (key_id, model, period, limit_tokens) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (key_id, model, period) DO NOTHING",
             [(key_id, m, p, lim) for m, p, lim in token_rows],
         )
     if usd_rows:
         await conn.executemany(
-            "INSERT INTO cost_budgets (key_id, model, period, limit_usd) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO cost_budgets (key_id, model, period, limit_usd) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (key_id, model, period) DO NOTHING",
             [(key_id, m, p, lim) for m, p, lim in usd_rows],
         )
     if profile.get("mcp_grants"):
@@ -978,6 +1070,22 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     if browser is None:
         raise HTTPException(401, "no browser identity headers present")
     subject, groups = browser
+    # TOKEN GROUPS OVERRIDE (SSO tier profiles, 2026-11-08): behind the proxy
+    # chain the Bearer IS the caller's id_token, so when a JWKS-validated
+    # bearer rides the request its ``groups`` claim is the freshest IdP
+    # assertion and outranks the proxy-injected header. groups_from_
+    # validated_token NEVER raises and returns None on every failure shape
+    # (no token, validation unconfigured, bad token, JWKS blip) — the header
+    # groups stay the fallback and the mint cannot fail on an IdP blip.
+    # Applies to BOTH branches below (mint and rotate): the profile tier and
+    # the subject binding see the same groups.
+    bearer = auth_mod._bearer_of(request)
+    # SUBJECT-BOUND (review F1-1): token groups are adopted only when the token
+    # identifies the SAME person as the header subject — a valid token for a
+    # different subject must never stamp ITS groups (admin tier) onto this key.
+    token_groups = await identity.groups_from_validated_token(bearer, subject)
+    if token_groups is not None:
+        groups = token_groups
     tenant_setting = settings.token_shadow_tenant_id
     try:
         tenant_id = uuid.UUID(tenant_setting)
@@ -1013,20 +1121,22 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     rotate = bool(mint.rotate)
     existing = await _live_sso_key_for_subject(subject)
     if existing is not None and not rotate:
-        raise HTTPException(
-            409,
-            'key already exists for this identity — POST {"rotate": true} to replace it',
-        )
+        raise HTTPException(409, _FOR_ME_ONE_KEY_MSG)
 
     if existing is not None:
         # ROTATE: create-then-revoke in ONE transaction (the enroll-redeem
-        # ACQUIRED-connection pattern — key + binding + revoke all on the
+        # ACQUIRED-connection pattern — key + revoke + binding all on the
         # acquired connection). Any failure inside rolls EVERYTHING back —
         # the old key survives live, no new key exists (never two live
-        # keys, never zero; the crash-safety contract). The revoke is the
-        # same revoked_at=now() the admin console writes; authenticate()
-        # already refuses revoked keys, so the old plaintext stops working
-        # once the transaction commits.
+        # keys, never zero; the crash-safety contract). ONE ordering
+        # constraint is load-bearing, not cosmetic: uq_api_keys_one_live_sso
+        # allows ONE live bound_via='sso-create' key per subject
+        # (db/schema.py), so the BIND must come AFTER the revoke — binding
+        # while this transaction still held the old row live raised a unique
+        # violation on EVERY rotate. The revoke is the same revoked_at=now()
+        # the admin console writes; authenticate() already refuses revoked
+        # keys, so the old plaintext stops working once the transaction
+        # commits.
         #
         # USER ROW REUSE (why NOT _create_enroll_user here): the live key
         # row IS the subject's per-subject user anchor (api_keys.user_id —
@@ -1043,7 +1153,7 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
         # attribution).
         rotate_user_id: uuid.UUID = existing["user_id"]
         async with db.acquire() as conn, conn.transaction():
-            profile = await _sso_default_profile(conn, tenant_id)
+            profile = await _sso_profile(conn, tenant_id, groups)
             rpm, tpm = _profile_limits(profile, FOR_ME_RATE_LIMIT_RPM, FOR_ME_RATE_LIMIT_TPM)
             plaintext, key_id = await create_key(
                 rotate_user_id,
@@ -1053,59 +1163,47 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                 rate_limit_tpm=tpm,
                 conn=conn,
             )
+            # REVOKE BEFORE THE BIND — see the ORDER note above (audit
+            # 2026-11-10 P2-13): the partial unique index tolerates ONE live
+            # sso-create key per subject, so binding the new row while this one
+            # was still live raised a unique violation on EVERY rotate. The
+            # revoke is inside the transaction, so a later failure rolls it
+            # back (and it must come AFTER create_key, so a create failure
+            # leaves the old credential untouched).
+            await conn.execute(_FOR_ME_REVOKE_SQL, existing["id"])
             # bind_key_subject's conn= posture JOINS this transaction (its
             # failures propagate → rollback) — a committed mint can never
             # be anonymous, and the revoked old key can never be the
             # subject's only key.
-            await bind_key_subject(
-                key_id,
-                subject=subject,
-                idp=IDP_OAUTH2_PROXY,
-                bound_via=VIA_SSO_CREATE,
-                tenant_id=tenant_id,
-                display_name=subject,  # the user row already carries the name
-                groups=groups,
-                conn=conn,
-            )
-            # Tenant default profile stamping on ROTATE too (the rotate's
-            # fresh key row would otherwise silently DROP the budgets/grants
-            # the original mint stamped — grants dying at first rotation).
-            if profile is not None:
-                # The profile must reach the USER row too, not just the key's
-                # stamped presets — otherwise the cascade ordering, routing
-                # policy, off-peak fraction and agents menu all see "no profile"
-                # (see _bind_user_profile). Only when the user has none.
-                await _bind_user_profile(conn, rotate_user_id, profile)
-                try:
-                    await _stamp_profile_grants(conn, key_id, profile)
-                except ProfilePresetConfigError as exc:
-                    # A tenant-default profile with a bad preset is a CONFIG
-                    # failure: 503 (retryable once the operator fixes it) that
-                    # NAMES the profile, instead of the opaque 500 a bare raise
-                    # produced. The transaction rolls back — no key is issued.
-                    log.error("keys/for-me rotate: tenant default profile unusable (%s)", exc)
-                    raise HTTPException(503, f"tenant default profile unusable: {exc}") from None
-            # Spend lineage + budget LIMIT carry (the budget-reset bypass
-            # fix): the fresh key inherits the old key's spend_ancestors
-            # (+ the old id), so in-window budget spend survives rotation —
-            # rotating mid-month can never reset the period budget. And the
-            # old key's EXISTING budget/cost_budget rows copy over (their
-            # limits may have drifted from the profile since minting; the
-            # operator's per-key reality wins, same INSERT..SELECT + ON
-            # CONFLICT DO NOTHING shape the admin rotate uses — profile
-            # presets land first, per-key edits merge on top without
-            # duplication). Both writes JOIN the transaction.
-            await conn.fetchrow(
-                # KEY GROUP (2026-11-03): the replacement credential joins the
-                # OLD key's group. Rotation is the flow that used to orphan
-                # saved conversations (the new key_id listed nothing), and the
-                # SSO "Sign in with SSO" click is exactly the path that
-                # rotates — so this is the line that makes history survive it.
-                "UPDATE api_keys SET spend_ancestors = $2, key_group = $3 WHERE id = $1",
-                key_id,
-                list(existing["spend_ancestors"] or []) + [existing["id"]],
-                existing.get("key_group") or existing["id"],
-            )
+            try:
+                await bind_key_subject(
+                    key_id,
+                    subject=subject,
+                    idp=IDP_OAUTH2_PROXY,
+                    bound_via=VIA_SSO_CREATE,
+                    tenant_id=tenant_id,
+                    display_name=subject,  # the user row already carries the name
+                    groups=groups,
+                    conn=conn,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                # CONCURRENT ROTATE (audit 2026-11-10 P2-13): a second rotate
+                # for this subject won the partial unique index; this one
+                # answers the pre-check's own 409 and the transaction (revoke
+                # included) rolls back — the old key stays live.
+                raise HTTPException(409, _FOR_ME_ONE_KEY_MSG) from exc
+            # BUDGET LIMIT CARRY — **BEFORE** THE PROFILE STAMP (audit
+            # 2026-11-10 P2-14). The old key's EXISTING budget/cost_budget
+            # rows copy over: their limits may have drifted from the profile
+            # since minting (an operator's per-key edit), and that per-key
+            # reality WINS. The ORDER is the fix: this copy used to run AFTER
+            # _stamp_profile_grants with ON CONFLICT DO NOTHING, so the PROFILE
+            # claimed every overlapping (model, period) cell and the operator's
+            # drift was silently reverted on the next "Sign in with SSO" — the
+            # opposite of what the old comment here claimed, and of what the
+            # grants copy below always did (DO UPDATE). Landing the old rows
+            # first lets the profile stamp fill only the cells the old key
+            # never had. JOINs the transaction.
             for btable, bcols in (
                 ("budgets", "model, period, limit_tokens"),
                 ("cost_budgets", "model, period, limit_usd"),
@@ -1117,6 +1215,43 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                     key_id,
                     existing["id"],
                 )
+            # Tenant default profile stamping on ROTATE too (the rotate's
+            # fresh key row would otherwise silently DROP the budgets/grants
+            # the original mint stamped — grants dying at first rotation).
+            # The carried rows above are already in place, so this stamp is
+            # GAP-FILL ONLY (its INSERTs are ON CONFLICT DO NOTHING): the
+            # operator's drifted limits survive, a preset the old key never
+            # had still lands.
+            if profile is not None:
+                # The profile must reach the USER row too, not just the key's
+                # stamped presets — otherwise the cascade ordering, routing
+                # policy, off-peak fraction and agents menu all see "no profile"
+                # (see _bind_user_profile). Only when the user has none.
+                await _bind_user_profile(conn, rotate_user_id, profile, tenant_id)
+                try:
+                    await _stamp_profile_grants(conn, key_id, profile)
+                except ProfilePresetConfigError as exc:
+                    # A tenant-default profile with a bad preset is a CONFIG
+                    # failure: 503 (retryable once the operator fixes it) that
+                    # NAMES the profile, instead of the opaque 500 a bare raise
+                    # produced. The transaction rolls back — no key is issued.
+                    log.error("keys/for-me rotate: tenant default profile unusable (%s)", exc)
+                    raise HTTPException(503, f"tenant default profile unusable: {exc}") from None
+            # Spend lineage (the budget-reset bypass fix): the fresh key
+            # inherits the old key's spend_ancestors (+ the old id), so
+            # in-window budget spend survives rotation — rotating mid-month can
+            # never reset the period budget.
+            await conn.fetchrow(
+                # KEY GROUP (2026-11-03): the replacement credential joins the
+                # OLD key's group. Rotation is the flow that used to orphan
+                # saved conversations (the new key_id listed nothing), and the
+                # SSO "Sign in with SSO" click is exactly the path that
+                # rotates — so this is the line that makes history survive it.
+                "UPDATE api_keys SET spend_ancestors = $2, key_group = $3 WHERE id = $1",
+                key_id,
+                list(existing["spend_ancestors"] or []) + [existing["id"]],
+                existing.get("key_group") or existing["id"],
+            )
             # GRANT + CREDENTIAL carry-over (2026-11-03 cross-validation): the
             # ADMIN rotate has copied these since the 2026-09-18 incident (a
             # rotated key dropped from ~102 federated tools to 2); THIS branch
@@ -1147,11 +1282,12 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
                 key_id,
                 existing["id"],
             )
-            await conn.execute(_FOR_ME_REVOKE_SQL, existing["id"])
+            # (the OLD key was revoked just above the bind — the revoke has to
+            # precede the bind, see the ORDER note at the top of this branch)
     else:
         user = await _create_enroll_user(tenant_id, subject)
         async with db.acquire() as conn, conn.transaction():
-            profile = await _sso_default_profile(conn, tenant_id)
+            profile = await _sso_profile(conn, tenant_id, groups)
             rpm, tpm = _profile_limits(profile, FOR_ME_RATE_LIMIT_RPM, FOR_ME_RATE_LIMIT_TPM)
             plaintext, key_id = await create_key(
                 user["id"],
@@ -1168,18 +1304,28 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
             # that is anonymous — binding + stamping must commit or fail as
             # one. (The plaintext is still irreplaceable; a rollback here
             # fails the mint before it exists, which is the honest outcome.)
-            bound = await bind_key_subject(
-                key_id,
-                subject=subject,
-                idp=IDP_OAUTH2_PROXY,
-                bound_via=VIA_SSO_CREATE,
-                tenant_id=tenant_id,
-                display_name=user["name"],
-                groups=groups,
-                conn=conn,
-            )
+            try:
+                bound = await bind_key_subject(
+                    key_id,
+                    subject=subject,
+                    idp=IDP_OAUTH2_PROXY,
+                    bound_via=VIA_SSO_CREATE,
+                    tenant_id=tenant_id,
+                    display_name=user["name"],
+                    groups=groups,
+                    conn=conn,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                # CONCURRENT FIRST MINT (audit 2026-11-10 P2-13): two browser
+                # tabs raced past the advisory pre-check (it reads OUTSIDE this
+                # transaction, so it cannot see the other mint). The partial
+                # unique index uq_api_keys_one_live_sso is the serialization
+                # point: the loser lands here, its whole transaction rolls back
+                # (no orphan key) and it answers the pre-check's own 409 — the
+                # SPA's rotate prompt — instead of a 500.
+                raise HTTPException(409, _FOR_ME_ONE_KEY_MSG) from exc
             if profile is not None:
-                await _bind_user_profile(conn, user["id"], profile)
+                await _bind_user_profile(conn, user["id"], profile, tenant_id)
                 try:
                     await _stamp_profile_grants(conn, key_id, profile)
                 except ProfilePresetConfigError as exc:
@@ -1191,7 +1337,11 @@ async def create_key_for_me(request: Request) -> ForMeKeyCreated:
     # attributed to the caller's OWN subject — never an admin action.
     await _enroll_audit(
         request,
-        action="enroll.redeem",
+        # DISTINCT ACTION (audit 2026-11-10 P3): this used to reuse
+        # "enroll.redeem", so a "how many codes were redeemed" report was
+        # inflated by every SSO self-mint/rotate. details.via still carries the
+        # flow ("sso-create") for the cross-surface view.
+        action="enroll.sso_mint",
         resource_type="key",
         resource_id=str(key_id),
         actor_source="proxy-identity",
@@ -1339,9 +1489,16 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
     spend_tokens, allocated_tokens) only add columns. spend/allocated
     ride the core.teams helpers so the numbers CANNOT drift from what
     the budget gate enforces (visibility that disagrees with the gate is
-    worse than none), computed per row for that enrollment's own period;
-    a lookup fault degrades that row's numbers to 0 (logged) rather than
-    500ing a console listing.
+    worse than none), computed for that enrollment's own period.
+
+    BATCHED (audit 2026-11-10 P2-34): the stats used to cost 2-3 aggregate
+    round trips PER ROW, serially — 2N + K statements for a page of N rows.
+    The page is now priced by teams.team_totals_bulk (one statement per
+    DISTINCT period) plus teams.team_cap_spend_bulk (one statement for every
+    cap on the page), so the listing is a constant number of statements. A
+    lookup fault still never 500s the console listing: it degrades the PAGE's
+    numbers to 0 (logged) — the same fail-soft contract, one blast radius
+    wider than the per-row version it replaces.
     """
     rows = await db.fetch(
         "SELECT e.id, e.label, t.name AS tenant_name, p.name AS profile_name, "
@@ -1356,21 +1513,12 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
         "ORDER BY e.created_at DESC"
     )
     out: list[dict[str, Any]] = []
+    # The bulk stats need the DERIVED envelope first (it decides which caps the
+    # page has to price), so the row shaping runs before the aggregate calls.
+    by_period: dict[str, list[uuid.UUID]] = {}
+    caps_by_id: dict[uuid.UUID, tuple[teams.TeamModelCap, ...]] = {}
     for r in rows:
         row = dict(r)
-        # .get-safe: a fake row (or an older snapshot shape) missing the new
-        # columns degrades to the no-envelope defaults, never a KeyError.
-        period = row.get("budget_period") or "month"
-        try:
-            spend_tokens, _spend_usd = await teams.team_spend(row["id"], period)
-            alloc_tokens, _alloc_usd = await teams.team_allocated(row["id"], period)
-        except Exception:
-            log.warning(
-                "enrollments listing: spend/allocated lookup failed for %s — reporting 0",
-                row.get("id"),
-                exc_info=True,
-            )
-            spend_tokens, alloc_tokens = 0, 0
         # The SELECT projects every new column; setdefault keeps the ADDITIVE
         # contract honest even when a row (test fake, mid-migration snapshot)
         # arrives without them — the console can always read these keys.
@@ -1399,18 +1547,38 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
         row.setdefault("team_leader_key_revoked_at", None)
         row.setdefault("team_leader_key_last_used_at", None)
         row.setdefault("key_count", 0)
-        row["spend_tokens"] = spend_tokens
-        row["allocated_tokens"] = alloc_tokens
+        by_period.setdefault(row.get("budget_period") or "month", []).append(row["id"])
+        if caps:
+            caps_by_id[row["id"]] = caps
+        out.append(row)
+    try:
+        totals = await teams.team_totals_bulk(by_period)
+    except Exception:
+        log.warning("enrollments listing: spend/allocated lookup failed — reporting 0 for the page", exc_info=True)
+        totals = {}
+    try:
+        cap_spends_by_id = await teams.team_cap_spend_bulk(
+            {eid: [(c.model, c.period) for c in caps] for eid, caps in caps_by_id.items()}
+        )
+    except Exception:
+        log.warning("enrollments listing: per-cap spend lookup failed — reporting 0", exc_info=True)
+        cap_spends_by_id = {}
+    for row in out:
+        spent_tokens, _spent_usd, alloc_tokens, _alloc_usd = totals.get(row["id"], (0, 0.0, 0, 0.0))
+        row["spend_tokens"] = int(spent_tokens)
+        row["allocated_tokens"] = int(alloc_tokens)
         # The PER-MODEL caps of a derived envelope (2026-10-30): the console
         # renders one line per limit instead of one opaque pooled number, so
         # "budget 48M / allocated 24M" stops reading as nonsense. Empty for
         # an explicit envelope (the pooled budget_* fields are the truth).
-        if caps:
+        row_caps = caps_by_id.get(row["id"])
+        if row_caps:
             # PER-CAP SPEND (2026-10-30 review): the admin cell shows one line
             # per pool, so each line must carry the number that pool has
             # consumed — otherwise the team-wide Spent column sits beside
-            # per-model caps and reads as if it were one pool's spend.
-            cap_spends = await teams.team_cap_spend(row["id"], [(c.model, c.period) for c in caps])
+            # per-model caps and reads as if it were one pool's spend. ONE
+            # statement priced every cap on the page (audit P2-34).
+            cap_spends = cap_spends_by_id.get(row["id"], {})
             row["budget_caps"] = [
                 {
                     "model": c.model,
@@ -1420,11 +1588,10 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
                     "spent_tokens": int(cap_spends.get((c.model, c.period), (0, 0.0))[0]),
                     "spent_usd": float(cap_spends.get((c.model, c.period), (0, 0.0))[1]),
                 }
-                for c in caps
+                for c in row_caps
             ]
         else:
             row["budget_caps"] = []
-        out.append(row)
     return out
 
 
@@ -1496,8 +1663,11 @@ class EnrollmentPatch(BaseModel):
     against core.teams.TEAM_PERIODS exactly like the create path. budgets
     carry the same column bounds the create model enforces (a limit the
     column cannot hold would 500 the UPDATE — a key-creation-site
-    contract of 400/422). expires_at explicit null clears; omitted =
-    untouched (model_fields_set, the admin KeyPatch convention).
+    contract of 400/422). expires_at / budget_tokens / budget_usd explicit
+    null CLEARS; omitted = untouched (model_fields_set, the admin KeyPatch
+    convention — audit 2026-11-10 P2-24: only expires_at used to have the
+    clear path, so a team cap could never be removed without deleting the
+    whole enrollment).
     """
 
     # None = untouched; a value must be positive (0 is refused — see the create
@@ -1527,14 +1697,21 @@ async def patch_enrollment(
         raise HTTPException(400, f"budget_period must be one of {sorted(teams.TEAM_PERIODS)}")
     sets: list[str] = []
     args: list[Any] = []
-    for col in ("max_uses", "budget_tokens", "budget_usd", "budget_period", "overflow_enabled"):
+    for col in ("max_uses", "budget_period", "overflow_enabled"):
         val = getattr(body, col)
         if val is not None:
             args.append(val)
             sets.append(f"{col} = ${len(args)}")
-    if "expires_at" in body.model_fields_set:
-        args.append(body.expires_at)
-        sets.append(f"expires_at = ${len(args)}")
+    # EXPLICIT-NULL CLEAR (audit 2026-11-10 P2-24): these columns are
+    # NULLABLE and "omitted" must keep meaning "untouched" — so the clear is
+    # keyed on model_fields_set, never on the value. expires_at always had
+    # this path; budget_tokens/budget_usd did not, so a team cap could never be
+    # REMOVED through the API (the only alternative was deleting the whole
+    # enrollment, which un-groups its keys).
+    for col in ("expires_at", "budget_tokens", "budget_usd"):
+        if col in body.model_fields_set:
+            args.append(getattr(body, col))
+            sets.append(f"{col} = ${len(args)}")
     if not sets:
         raise HTTPException(400, "no editable fields provided")
     # column names above are a fixed tuple, never user input
@@ -1611,8 +1788,10 @@ class McpCredsUpsert(BaseModel):
 def _validate_creds_headers(headers: dict[str, str]) -> dict[str, str]:
     """Bound + normalize the override headers before they become upstream
     request headers: RFC token-ish names (^[A-Za-z0-9-]+$), <=16 headers,
-    values <=512 chars. Empty set is refused — clearing goes through
-    DELETE, so an empty PUT is always a mistake, not a semantic.
+    values <=512 chars of PRINTABLE ASCII + TAB (the charset bound is as
+    load-bearing as the length one — see CRED_VALUE_RE). Empty set is
+    refused — clearing goes through DELETE, so an empty PUT is always a
+    mistake, not a semantic.
 
     RESERVED NAMES: the gateway's attribution stamps (identity.py) —
     ``X-MCP-Caller`` on every keyed upstream call, plus
@@ -1642,6 +1821,18 @@ def _validate_creds_headers(headers: dict[str, str]) -> dict[str, str]:
             )
         if len(value) > MAX_CRED_VALUE_LEN:
             raise HTTPException(400, f"header {name!r} value exceeds {MAX_CRED_VALUE_LEN} characters")
+        # CHARSET BOUND (audit 2026-11-10 P2-3, the WRITE side): the length
+        # check above was the only value bound, and the comment at the top of
+        # this module claimed "both names and values are bounded" — a stored
+        # value could carry CR/LF (header injection at the upstream call) or
+        # non-ASCII (not a legal field value). Refuse it here, at the write,
+        # where the operator gets a 400 instead of a request-time 500.
+        if not CRED_VALUE_RE.fullmatch(value):
+            raise HTTPException(
+                400,
+                f"header {name!r} value must be printable ASCII (TAB allowed): "
+                "control characters and non-ASCII are not legal in a header field value",
+            )
         clean[name] = value
     return clean
 

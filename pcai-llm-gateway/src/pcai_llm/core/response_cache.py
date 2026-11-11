@@ -59,10 +59,21 @@ def eligible(body: dict[str, Any]) -> bool:
         return False
 
 
-def request_hash(body: dict[str, Any]) -> str:
-    """sha256 of the canonical request (volatile fields excluded). PURE."""
+def request_hash(body: dict[str, Any], want_metadata: bool = False) -> str:
+    """sha256 of the canonical request (volatile fields excluded). PURE.
+
+    want_metadata (X-PCAI-Metadata: 1) is part of the KEY, not of the body
+    (audit 2026-11-10 P2-1). The stored bytes are the FINAL response — the
+    body the caller receives, including the "pcai" block when one was asked
+    for — so one key for both variants served a caller who never opted in a
+    metadata block naming the ORIGINAL request's endpoint and cost. Two
+    variants, two keys, and a metadata-less caller can only ever hit a
+    metadata-less body.
+    """
     payload = {k: v for k, v in body.items() if k not in _VOLATILE}
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    if want_metadata:
+        blob += "|pcai-metadata"
     return hashlib.sha256(blob.encode()).hexdigest()
 
 

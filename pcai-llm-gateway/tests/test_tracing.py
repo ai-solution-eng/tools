@@ -71,7 +71,17 @@ class FakeClient:
         return self.body(index)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
 
     def attrs(self, index: int = 0) -> dict[str, str]:
-        return {a["key"]: a["value"]["stringValue"] for a in self.span(index)["attributes"]}
+        """Attribute map flattened to text.
+
+        intValue/doubleValue are stringified so the existing assertions read
+        the same as before; the WIRE type is asserted separately in
+        test_int_attributes_use_int_value.
+        """
+        out: dict[str, str] = {}
+        for a in self.span(index)["attributes"]:
+            _kind, raw = next(iter(a["value"].items()))
+            out[a["key"]] = str(raw)
+        return out
 
 
 @pytest.fixture(autouse=True)
@@ -252,9 +262,28 @@ async def test_enabled_posts_one_span_with_the_documented_shape(
         "http.status_code": "200",
         "duration_ms": "12.500",
     }
-    # every attribute value is a stringValue on the wire
-    for attr in span_doc["attributes"]:
-        assert set(attr["value"]) == {"stringValue"}
+    # Attribute VALUES are TYPED on the wire: an int rides as intValue so a
+    # backend reads it as a number (Langfuse's usage columns), a string stays
+    # stringValue. Nothing else is emitted.
+    by_key = {attr["key"]: attr["value"] for attr in span_doc["attributes"]}
+    assert by_key["http.status_code"] == {"intValue": "200"}, "int -> intValue"
+    assert by_key["http.method"] == {"stringValue": "GET"}, "str -> stringValue"
+    assert by_key["duration_ms"] == {"stringValue": "12.500"}, "str -> stringValue"
+
+
+async def test_int_attributes_use_int_value(monkeypatch: pytest.MonkeyPatch, fake: FakeClient) -> None:
+    """Token counts must be numbers, not strings, or Langfuse files them in
+    metadata instead of the usage column."""
+    _enable(monkeypatch)
+    tracing.start_span(
+        "chat",
+        {"gen_ai.usage.input_tokens": 123, "gen_ai.usage.output_tokens": 0, "langfuse.trace.name": "chat"},
+    ).end()
+    await tracing.flush()
+    by_key = {a["key"]: a["value"] for a in fake.span()["attributes"]}
+    assert by_key["gen_ai.usage.input_tokens"] == {"intValue": "123"}
+    assert by_key["gen_ai.usage.output_tokens"] == {"intValue": "0"}
+    assert by_key["langfuse.trace.name"] == {"stringValue": "chat"}
 
 
 async def test_error_flag_sets_status_code_2(monkeypatch: pytest.MonkeyPatch, fake: FakeClient) -> None:
@@ -506,3 +535,38 @@ async def test_no_event_loop_task_is_created_when_disabled(fake: FakeClient) -> 
     tracing.start_span("GET /health").end()
     assert tracing._PENDING == set()
     assert fake.calls == []
+
+
+async def test_mcp_call_tool_emits_a_span(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeClient
+) -> None:
+    """Every /mcp tools/call produces exactly one span — even when it fails.
+
+    /mcp is the surface the harnesses call DIRECTLY, and it carries far more
+    traffic than the relay path (488 tools/call requests vs 56 model calls in
+    one measured window). Without a span here the bulk of MCP usage is
+    invisible to any backend.
+
+    The failure path is deliberate: it exercises the finally block that has to
+    fire on errors and cancellation, and pins that the span records
+    tool.status="error" rather than being lost.
+    """
+    from pcai_llm.api import routes_mcp
+
+    _enable(monkeypatch)
+    server = routes_mcp._new_gateway_server()
+
+    with pytest.raises(Exception):
+        await server.call_tool("definitely-not-a-tool", {})
+
+    await tracing.flush()
+    assert len(fake.calls) == 1, "exactly one span per tools/call"
+    span = fake.span()
+    assert span["name"] == "definitely-not-a-tool", "named after the tool called"
+    by_key = {a["key"]: a["value"] for a in span["attributes"]}
+    assert by_key["mcp.tool"] == {"stringValue": "definitely-not-a-tool"}
+    assert by_key["mcp.surface"] == {"stringValue": "mcp"}
+    assert by_key["tool.status"] == {"stringValue": "error"}
+    assert by_key["langfuse.trace.name"] == {"stringValue": "tool"}
+    # No arguments and no result content may reach a backend.
+    assert not any(k.startswith("tool.arg") or k.startswith("tool.result") for k in by_key)

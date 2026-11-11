@@ -46,6 +46,8 @@ from .chain_audit import (  # noqa: F401  (ADMIN_AUDIT_CHAIN_FIELDS = the chain 
     ADMIN_AUDIT_CHAIN_FIELDS,
     canonical,
     is_unique_violation,
+    refresh_anchor,
+    unchained_tombstone,
 )
 
 log = logging.getLogger(__name__)
@@ -260,6 +262,14 @@ async def audit_action(
                 details_sha,
                 "|" + chain_parts,
             )
+            # P2-5 (audit 2026-11-10): re-anchor the chain tail outside the
+            # chained tables so a DB-write attacker who recomputes the tail
+            # cannot pass verify as ok:true. Only on this module's own pool
+            # seam — the row must already be committed, and an anchor written
+            # inside a caller transaction that later rolls back would point
+            # past the real tail. Best-effort: refresh_anchor never raises.
+            if conn is None:
+                await refresh_anchor("admin_audit")
             return
         except Exception as exc:
             last_exc = exc
@@ -282,13 +292,20 @@ async def audit_action(
             exc_info=True,
         )
         try:
+            # Unique tombstones in BOTH chain columns (chain_audit.unchained_tombstone):
+            # prev_hash is never '' again, so the uq_admin_audit_prev partial
+            # unique index guards concurrent writers AFTER a degraded row too,
+            # and the row still verifies as kind="unchained" (never "break").
+            tombstone_prev = unchained_tombstone()
+            tombstone_row = unchained_tombstone()
             target = db if conn is None else conn
             await target.execute(
                 """
                 INSERT INTO admin_audit
                     (actor_key_id, actor_subject, actor_source, action,
-                     resource_type, resource_id, details, request_id, source_ip)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+                     resource_type, resource_id, details, request_id, source_ip,
+                     prev_hash, row_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
                 """,
                 actor_key_id,
                 actor_subject or "",
@@ -299,6 +316,8 @@ async def audit_action(
                 details_json,
                 request_id,
                 source_ip,
+                tombstone_prev,
+                tombstone_row,
             )
             return
         except Exception:

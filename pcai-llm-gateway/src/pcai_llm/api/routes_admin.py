@@ -47,9 +47,11 @@ from ..core import costs, mcp_weights, registry, secretbox, teams, url_guard
 from ..core import metrics as _metrics
 from ..core.audit import audit_action, stable_actor_label
 from ..core.budgets import (
+    _COSTED_SQL,
     MAX_LIMIT_TOKENS,
     MAX_LIMIT_USD,
     _budget_token_expr,
+    _budget_token_value,
     budget_status,
     budget_status_many,
     split_preset_budgets,
@@ -211,13 +213,28 @@ AdminDep = Annotated[None, Depends(require_admin)]
 # admin audit trail — actor/context resolution + the instrumented-write helper
 # ---------------------------------------------------------------------------
 
+# The admin-plane audit vocabulary (regenerated 2026-11-10 against the actual
+# _audit(...) call sites in routes_admin.py + routes_enroll.py's admin_router,
+# after the doc drifted from the emitted actions — 9 actions were undocumented:
+# tenant.sso_default_profile.set, tenant.sso_users.bind, key.self_mint_eligibility,
+# agent.upsert, agent.delete, profile.grants.propagate, distiller.config,
+# routing.config, enroll.delete). tests/test_audit_20261110_admin.py asserts the
+# doc stays a superset of the emitted literals. NOT listed here: the self-service
+# vocabulary (mcp.creds.self, mcp.creds.self.delete, mcp.grants.self —
+# routes_mcp_self.py, the /v1/self surface, never an admin actor).
 AUDIT_ACTIONS_DOC = (
-    "key.create key.patch key.revoke key.rotate budget.set costs.set costs.delete "
-    "model.upsert model.delete model.fallbacks.set mcp.server.upsert mcp.server.patch "
-    "mcp.acl.set mcp.acl.server.set mcp.acl.copy mcp.creds.set mcp.creds.delete profile.upsert "
-    "profile.delete profile.limits.propagate user.profile.set tenant.create user.create "
+    "key.create key.patch key.revoke key.rotate key.self_mint_eligibility key.profile.apply "
+    "budget.set costs.set costs.delete "
+    "model.upsert model.delete model.fallbacks.set "
+    "model_group.create model_group.update model_group.delete "
+    "mcp.server.upsert mcp.server.patch mcp.acl.set mcp.acl.server.set mcp.acl.copy "
+    "mcp.creds.set mcp.creds.delete "
+    "profile.upsert profile.delete profile.limits.propagate profile.grants.propagate "
+    "user.profile.set tenant.create tenant.sso_default_profile.set tenant.sso_users.bind "
+    "user.create agent.upsert agent.delete "
     "guardrail.create guardrail.patch guardrail.delete guardrail.models.set offpeak.set "
-    "enroll.code.mint enroll.code.revoke enroll.redeem enroll.envelope.patch "
+    "distiller.config routing.config "
+    "enroll.code.mint enroll.code.revoke enroll.redeem enroll.sso_mint enroll.delete enroll.envelope.patch "
     "team.key.create team.key.patch team.key.revoke team.key.rotate team.budget.set "
     "team.settings.set team.topup.request "
     "enroll.topup.approve enroll.topup.deny"
@@ -832,6 +849,7 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "DELETE /admin/keys/{key_id}",
             "POST   /admin/keys/{key_id}/rotate",
             "POST   /admin/keys/{key_id}/budgets",
+            "POST   /admin/keys/{key_id}/apply-profile",
             "GET    /admin/keys/{key_id}/usage",
             "GET    /admin/audit/chain",
             "GET    /admin/keys/{key_id}/mcp-grants",
@@ -880,6 +898,10 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "POST   /admin/routing/prompt-preview",
             "GET    /admin/endpoint-metrics",
             "GET    /admin/presented-models",
+            "GET    /admin/model-groups",
+            "PUT    /admin/model-groups/{name}",
+            "DELETE /admin/model-groups/{name}",
+            "POST   /admin/model-groups/{name}/preview",
         ],
     }
 
@@ -900,22 +922,104 @@ async def create_tenant(body: TenantCreate, request: Request, _: AdminDep) -> di
 
 @router.get("/tenants")
 async def list_tenants(_: AdminDep) -> list[dict[str, Any]]:
-    """All tenants (console dropdown) + each tenant's SSO self-mint default
-    profile (the Enroll tab's dropdown writes it; the mint stamps it)."""
+    """All tenants (console dropdown) + each tenant's SSO self-mint profiles
+    (the Enroll tab's dropdowns write them; the mint stamps them).
+
+    The tier pair (2026-11-08) rides the SAME read: an operator has to see the
+    admin profile + its groups wherever the default profile is editable, or the
+    tier split is configurable-but-invisible. Both joins are LEFT — a tenant
+    with neither profile configured (the default) must still list.
+    """
     return [
         dict(r)
         for r in await db.fetch(
-            "SELECT t.id, t.name, t.created_at, t.sso_default_profile_id, p.name AS sso_default_profile_name "
-            "FROM tenants t LEFT JOIN profiles p ON p.id = t.sso_default_profile_id ORDER BY t.name"
+            "SELECT t.id, t.name, t.created_at, t.sso_default_profile_id, p.name AS sso_default_profile_name, "
+            "t.sso_admin_profile_id, ap.name AS sso_admin_profile_name, t.sso_admin_groups "
+            "FROM tenants t "
+            "LEFT JOIN profiles p ON p.id = t.sso_default_profile_id "
+            "LEFT JOIN profiles ap ON ap.id = t.sso_admin_profile_id "
+            "ORDER BY t.name"
         )
     ]
 
 
 class TenantSsoDefaultProfile(BaseModel):
-    """PUT body for the SSO self-mint default profile. profile_id null =
-    clear (mints fall back to the bare fixed grant)."""
+    """PUT body for the SSO self-mint profiles. profile_id null = clear
+    (mints fall back to the bare fixed grant).
+
+    EVERY FIELD (2026-11-08) is applied only when PRESENT in the body
+    (model_fields_set), never on the default None. A tier-only body such as
+    {"admin_groups": "admin"} must not clear the default profile, and a body
+    carrying only profile_id must not clear the admin tier. The console always
+    sends all three; an empty body is a 400 rather than a no-op UPDATE.
+
+    admin_groups is comma-separated, case-sensitive, whitespace-trimmed; ''
+    (the column default) DISABLES the split.
+    """
 
     profile_id: uuid.UUID | None = None
+    admin_profile_id: uuid.UUID | None = None
+    admin_groups: str | None = None
+
+
+async def _validated_sso_profile(profile_id: uuid.UUID, role: str) -> None:
+    """404 when the profile is absent; 400 when its budget presets are invalid.
+
+    WHY at WIRE time, not at first use: the profile is stamped onto every
+    self-mint and every rotation for the tenant, so a bad preset here would
+    brick both — surfacing as an opaque 500 long after the operator left this
+    screen. 'role' names the SLOT in the 400 ("default" / "admin profile")
+    so the message points at the field the operator must fix.
+    """
+    if not await _exists("profiles", profile_id):
+        raise HTTPException(404, f"profile {profile_id} not found")
+    prow = await db.fetchrow("SELECT name, defaults_json FROM profiles WHERE id = $1", profile_id)
+    try:
+        defaults = json.loads((prow["defaults_json"] if prow else None) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        defaults = {}
+    try:
+        split_preset_budgets(defaults.get("budgets") or [])
+    except ValueError as exc:
+        pname = prow["name"] if prow else str(profile_id)
+        raise HTTPException(
+            400,
+            f"profile {pname!r} cannot be the SSO {role}: it has an invalid budget preset ({exc})",
+        ) from None
+
+
+# One IdP group name: the claim is a group path, not a sentence. The cap keeps
+# the column (and the mint's per-request parse) bounded; the control-char
+# refusal keeps a newline/CR out of the comma-joined value the mint splits —
+# the same edge discipline every other name surface applies.
+_ADMIN_GROUP_MAX_LEN = 64
+
+
+def _normalize_admin_groups(raw: str | None) -> str:
+    """Normalize the tier-split group list: comma-separated, trimmed, empties
+    dropped, duplicates collapsed (order-preserving), rejoined with ','.
+
+    '' (the column default) is the documented "tier split OFF" sentinel, so a
+    cleared list is stored as the empty string — never as a string of commas,
+    which would leave the column out of its sentinel meaning without ever
+    matching a real IdP group.
+    """
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        group = part.strip()
+        if not group:
+            continue
+        if len(group) > _ADMIN_GROUP_MAX_LEN:
+            raise HTTPException(
+                400,
+                f"admin group {group[:_ADMIN_GROUP_MAX_LEN]!r}... exceeds {_ADMIN_GROUP_MAX_LEN} characters",
+            )
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in group):
+            raise HTTPException(400, f"admin group {group!r} contains a control character")
+        if group not in out:
+            out.append(group)
+    _check_list_len(out, "admin_groups")
+    return ",".join(out)
 
 
 @router.put("/tenants/{tenant_id}/sso-default-profile", status_code=200)
@@ -929,45 +1033,61 @@ async def set_sso_default_profile(
     profile's budgets, limit presets, and MCP grants onto the fresh key;
     scopes stay the mint's fixed least-privilege grant. Clearing (null)
     returns mints to the bare grant. Live immediately: the mint reads the
-    column per request.
+    columns per request.
+
+    THE TIER SPLIT: when sso_admin_groups is non-empty AND the caller's IdP
+    groups intersect it, the mint stamps sso_admin_profile_id instead of
+    sso_default_profile_id. Both slots are validated the same way here (404
+    unknown / 400 bad preset) so the operator cannot wire a profile that only
+    breaks for one tier.
     """
     if not await _exists("tenants", tenant_id):
         raise HTTPException(404, f"tenant {tenant_id} not found")
-    if body.profile_id is not None and not await _exists("profiles", body.profile_id):
-        raise HTTPException(404, f"profile {body.profile_id} not found")
-    if body.profile_id is not None:
-        # Validate the presets at WIRE time, not at first use. This profile
-        # is stamped onto every self-mint and every rotation for the tenant,
-        # so a bad preset here would brick both — surfacing as an opaque 500
-        # long after the operator left this screen. Refuse the wiring with
-        # the same 400 the profile save uses.
-        prow = await db.fetchrow("SELECT name, defaults_json FROM profiles WHERE id = $1", body.profile_id)
-        try:
-            defaults = json.loads((prow["defaults_json"] if prow else None) or "{}")
-        except (json.JSONDecodeError, TypeError):
-            defaults = {}
-        try:
-            split_preset_budgets(defaults.get("budgets") or [])
-        except ValueError as exc:
-            pname = prow["name"] if prow else str(body.profile_id)
-            raise HTTPException(
-                400,
-                f"profile {pname!r} cannot be the SSO default: it has an invalid budget preset ({exc})",
-            ) from None
+    fields = body.model_fields_set
+    if not fields:
+        raise HTTPException(400, "no SSO profile fields to update")
+    # ALL THREE FIELDS ARE APPLY-ONLY-WHEN-PRESENT (review F1-2): a tier-only
+    # body such as {"admin_groups": "admin"} must NOT silently NULL the
+    # tenant's default profile. profile_id's historical always-applied
+    # semantics changed here on purpose — the console always sends all three,
+    # and a partial script update is a data-loss footgun, not a compat case.
+    sets: list[str] = []
+    args: list[Any] = [tenant_id]
+    if "profile_id" in fields:
+        if body.profile_id is not None:
+            await _validated_sso_profile(body.profile_id, "default")
+        args.append(body.profile_id)
+        sets.append(f"sso_default_profile_id = ${len(args)}")
+    if "admin_profile_id" in fields:
+        if body.admin_profile_id is not None:
+            await _validated_sso_profile(body.admin_profile_id, "admin profile")
+        args.append(body.admin_profile_id)
+        sets.append(f"sso_admin_profile_id = ${len(args)}")
+    if "admin_groups" in fields:
+        args.append(_normalize_admin_groups(body.admin_groups))
+        sets.append(f"sso_admin_groups = ${len(args)}")
     row = await db.fetchrow(
-        "UPDATE tenants SET sso_default_profile_id = $2 WHERE id = $1 RETURNING id, name, sso_default_profile_id",
-        tenant_id,
-        body.profile_id,
+        f"UPDATE tenants SET {', '.join(sets)} WHERE id = $1 "
+        "RETURNING id, name, sso_default_profile_id, sso_admin_profile_id, sso_admin_groups",
+        *args,
     )
     assert row is not None
+    # dict(row): an asyncpg Record and the test fakes' plain dicts both answer
+    # .get(), and the details record the STORED state (what the mint will read)
+    # rather than the request — the audit trail's job is the resulting config.
+    stored = dict(row)
     await _audit(
         request,
         action="tenant.sso_default_profile.set",
         resource_type="tenant",
         resource_id=str(tenant_id),
-        details={"profile_id": str(body.profile_id) if body.profile_id else None},
+        details={
+            "profile_id": str(stored["sso_default_profile_id"]) if stored.get("sso_default_profile_id") else None,
+            "admin_profile_id": (str(stored["sso_admin_profile_id"]) if stored.get("sso_admin_profile_id") else None),
+            "admin_groups": stored.get("sso_admin_groups") or "",
+        },
     )
-    return dict(row)
+    return stored
 
 
 @router.post("/tenants/{tenant_id}/bind-sso-users")
@@ -1220,6 +1340,17 @@ async def revoke_key_endpoint(key_id: uuid.UUID, request: Request, _: AdminDep) 
     return {"revoked": revoked}
 
 
+def _like_literal_escape(needle: str) -> str:
+    """Escape the LIKE/ILIKE metacharacters so the enrollment filter matches
+    the needle LITERALLY (audit 2026-11-10 P3). The query is parameterised
+    (core.keys.list_keys), but a needle carrying % or _ still silently
+    broadened the match — searching "100%" matched every label containing
+    "100". Postgres's default LIKE escape character is the backslash, so the
+    pattern side needs no ESCAPE clause; the backslash itself is escaped
+    first so an existing one is never read as an escape."""
+    return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/keys")
 async def list_keys_endpoint(
     _: AdminDep,
@@ -1242,13 +1373,20 @@ async def list_keys_endpoint(
     `enrollment` is a case-insensitive SUBSTRING match on the enrollment
     label ("show me everything minted from the *station* codes"). Forwarded
     to core.keys.list_keys — the JOIN and the ILIKE live there; this route
-    only trims the needle so an all-whitespace search is a no-filter call.
+    trims the needle so an all-whitespace search is a no-filter call, and
+    escapes the LIKE wildcards so a label metacharacter in the needle is
+    matched literally (audit 2026-11-10 P3), not read as a pattern.
     """
     needle = enrollment.strip() if enrollment else ""
+    # Wildcards escaped (audit 2026-11-10 P3) and trimmed to 50 BEFORE the
+    # escape: each metacharacter at most doubles when escaped, so the escaped
+    # needle stays within the 100-char cap core.keys.list_keys re-applies —
+    # trimming AFTER escaping could cut a "\%" pair in half and leave a lone
+    # trailing backslash that eats the pattern's closing "%".
     rows = await list_keys(
         include_revoked=include_revoked,
         enrollment_id=enrollment_id,
-        enrollment_search=needle[:100] or None,
+        enrollment_search=_like_literal_escape(needle[:50]) or None,
     )
     statuses = await budget_status_many([r["id"] for r in rows])
     for row in rows:
@@ -1808,9 +1946,12 @@ async def key_usage(key_id: uuid.UUID, _: AdminDep) -> dict[str, Any]:
     """Per-key view: current budget windows plus the 50 most recent ledger rows."""
     if not await _exists("api_keys", key_id):
         raise HTTPException(404, f"key {key_id} not found")
+    # P10 unit-aware billing: billable_units/unit_kind ride the projection —
+    # the quantity the row billed and its unit name (NULL on legacy token
+    # rows: 'measured as always').
     recent = await db.fetch(
         "SELECT id, model, endpoint, prompt_tokens, completion_tokens, total_tokens, "
-        "status, latency_ms, request_id, ts FROM usage_ledger "
+        "status, latency_ms, request_id, ts, billable_units, unit_kind FROM usage_ledger "
         "WHERE key_id = $1 ORDER BY ts DESC LIMIT 50",
         key_id,
     )
@@ -1882,35 +2023,53 @@ async def usage(
     where = f"WHERE {' AND '.join(conds)}" if conds else ""
 
     if group_by is not None:
-        dims = {
-            "key": "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
-            "model": "l.model",
-            "tenant": "t.id AS tenant_id, t.name AS tenant_name",
-            "day": "date_trunc('day', l.ts) AS day",
+        # SELECT and GROUP BY carry SEPARATE expressions (audit 2026-11-10
+        # P1-1): four of the five dimensions alias in the projection
+        # ("expr AS alias"), and PostgreSQL's group_by_item accepts only
+        # a_expr — GROUP BY "x AS y" is a syntax error, which made 4 of the
+        # 5 group_by modes 500. One dict of (select_dims, group_dims) pairs;
+        # the bare group expressions are exactly the aliased ones.
+        dims_by_group: dict[str, tuple[str, str]] = {
+            "key": (
+                "l.key_id, k.name AS key_name, k.key_prefix AS key_prefix",
+                "l.key_id, k.name, k.key_prefix",
+            ),
+            "model": ("l.model", "l.model"),
+            "tenant": ("t.id AS tenant_id, t.name AS tenant_name", "t.id, t.name"),
+            "day": ("date_trunc('day', l.ts) AS day", "date_trunc('day', l.ts)"),
             # Phase A identity: subject projection via the key→subject FK
             # (read-time LEFT JOIN — the binding is immutable after
             # issuance, so the join is faithful; unbound keys group under a
             # NULL subject — "no subject" is an honest bucket, not an error).
-            "subject": "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
-        }[group_by]
+            "subject": (
+                "k.subject_id, s.subject AS subject, s.idp AS subject_idp, s.kind AS subject_kind",
+                "k.subject_id, s.subject, s.idp, s.kind",
+            ),
+        }
+        select_dims, group_dims = dims_by_group[group_by]
         args.append(capped)
         lim = f"${len(args)}"
         rows = await db.fetch(
             f"""
-            SELECT {dims},
+            SELECT {select_dims},
                    count(*)                                      AS requests,
                    COALESCE(SUM(l.prompt_tokens), 0)             AS input_tokens,
                    COALESCE(SUM(l.completion_tokens), 0)         AS output_tokens,
                    COALESCE(SUM(l.cached_tokens), 0)             AS cached_tokens,
                    count(*) FILTER (WHERE l.status = 'cache_hit') AS cache_hits,
-                   COALESCE(SUM(l.cost_usd), 0)::float           AS cost_usd
+                   COALESCE(SUM(l.cost_usd), 0)::float           AS cost_usd,
+                   -- P10 unit-aware billing: summed units + the distinct unit
+                   -- kinds behind them (all-NULL kinds aggregate to NULL — the
+                   -- legacy measured-token shape, shown as such).
+                   COALESCE(SUM(l.billable_units), 0)::float     AS billable_units,
+                   string_agg(DISTINCT l.unit_kind, ',')         AS unit_kinds
             FROM usage_ledger l
             LEFT JOIN api_keys k ON k.id = l.key_id
             LEFT JOIN users u ON u.id = k.user_id
             LEFT JOIN tenants t ON t.id = u.tenant_id
             LEFT JOIN subjects s ON s.id = k.subject_id
             {where}
-            GROUP BY {dims}
+            GROUP BY {group_dims}
             ORDER BY requests DESC
             LIMIT {lim}
             """,
@@ -1936,6 +2095,10 @@ async def usage(
                -- the per-row view dropped them, so the two halves of the same tab
                -- disagreed with each other.
                l.cached_tokens, l.cost_usd, l.billing_fraction,
+               -- P10: the unit the row billed in (NULL on legacy measured-
+               -- token rows) and the quantity, so a 'second'/'char_estimate'
+               -- row reads as what it is instead of as a token count.
+               l.billable_units, l.unit_kind,
                k.name AS key_name, k.key_prefix AS key_prefix,
                u.name AS user_name, t.name AS tenant_name,
                k.bound_via AS bound_via, s.subject AS subject, s.idp AS subject_idp
@@ -2014,17 +2177,37 @@ async def audit_chain_status(_: AdminDep) -> dict[str, Any]:
                                             written before chaining existed.
       * first_bad_id names the first offending row, so an auditor can page
         straight to it with GET /admin/audit.
+      * anchored=false + anchor_status="anchor-mismatch" -> the HMAC tail
+        anchor does not vouch for the walked tail: a full-recompute tamper
+        (an edit that re-derives every row_hash consistently) is INVISIBLE
+        to the hash walk alone — the anchor is what catches it.
 
-    Read-only and cheap enough to poll: both trails are control-plane/tool-call
-    volume, not chat volume. Registered ABOVE /audit so the literal path is
-    not shadowed by the /audit handler's sibling routes.
+    Read-only; NOT cheap — the verifier walks each never-pruned trail (now
+    keyset-paged, but still a FULL pass) on the pool the data plane shares,
+    so do not poll this on a loop; call it once per incident or after a
+    tamper suspicion (audit 2026-11-10 P2-29). It reports the anchor status
+    so a full-recompute tamper is visible, not just a chain break. The
+    top-level anchored/anchor_status are the WORST of the two trails; the
+    per-trail detail stays in admin_audit / mcp_call_audit. Registered
+    ABOVE /audit so the literal path is not shadowed by the /audit
+    handler's sibling routes.
     """
     from ..core.chain_audit import verify_admin_audit_chain, verify_mcp_call_chain
 
     admin_chain = await verify_admin_audit_chain()
     mcp_chain = await verify_mcp_call_chain()
+    # Anchor roll-up (worst-of): a mismatch anywhere is a mismatch; an
+    # unavailable verifier must not read as a verified anchor. The ordering
+    # mirrors core.chain_audit's own severity (a mismatch can flip ok, the
+    # rest only report) — "stale" (rows appended after the last anchor) is
+    # the LEAST alarming state that still says not-fully-anchored.
+    _ANCHOR_SEVERITY = ("anchor-mismatch", "unavailable", "unanchored", "no-master-key", "stale", "anchored")
+    statuses = [str(c.get("anchor_status") or "unanchored") for c in (admin_chain, mcp_chain)]
+    anchor_status = min(statuses, key=_ANCHOR_SEVERITY.index) if statuses else "unanchored"
     return {
         "ok": bool(admin_chain.get("ok")) and bool(mcp_chain.get("ok")),
+        "anchored": bool(admin_chain.get("anchored")) and bool(mcp_chain.get("anchored")),
+        "anchor_status": anchor_status,
         "admin_audit": admin_chain,
         "mcp_call_audit": mcp_chain,
     }
@@ -2138,6 +2321,12 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
             400,
             f"model_type {body.model_type!r} is invalid — must be one of {sorted(MODEL_TYPES)}",
         )
+    # SSRF GATE FIRST (audit 2026-11-10 P2-9): _check_url_async must refuse
+    # loopback/link-local/metadata targets BEFORE any outbound request —
+    # _probe_endpoint_type below issues a real GET /models plus up to four
+    # POST probes with a 20 s timeout, and the old order let it fire at a
+    # not-yet-validated URL.
+    await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
     if body.model_type is None:
         # DETECT (2026-10-26): probe the pool's first endpoint and use the
         # verdict. Detection is best-effort by design — an unreachable endpoint
@@ -2158,7 +2347,29 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
             log.exception("model_type detection failed for %r — defaulting to chat", body.model_name)
         body = body.model_copy(update={"model_type": detected_type})
         log.info("model_type not supplied for %r — %s (%s)", body.model_name, detected_type, detected_reason)
-    await _check_url_async([ep.base_url for ep in body.endpoints], "base_url")
+    # MODEL-GROUP SHADOW GUARD (review F3-2): a group name is a callable model
+    # id, and the data plane resolves it as a group BEFORE any pool lookup. A
+    # pool registered under an existing group's name would therefore be
+    # silently unaddressable — refuse at the write path, the mirror of the
+    # group-create check that refuses a name equal to a registered model.
+    # GATED on settings.model_groups_enabled (audit 2026-11-10 P2-10): with
+    # the flag off (the default) the data plane never resolves a group, so
+    # consulting the table here would refuse config for a feature that is
+    # inert — the same gate the profile-ordering check below applies.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _model_groups_mod
+
+            await _model_groups_mod.load()
+            if _model_groups_mod.group_for(body.model_name) is not None:
+                raise HTTPException(
+                    400,
+                    f"model {body.model_name!r} is already a model group — a pool may not shadow a group",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            log.warning("model upsert: model-group shadow check failed (fail-open)", exc_info=True)
     # Panel credentials: resolve each endpoint's api_key to ciphertext (or a
     # clear/set marker) BEFORE the write; plaintext never leaves this block.
     enc_rows = []
@@ -2577,12 +2788,33 @@ async def _validate_fallback_chain(model_name: str, fallbacks: list[str]) -> lis
     """
     _check_list_len(fallbacks, "fallbacks")
     known = {r["model_name"] for r in await db.fetch("SELECT DISTINCT model_name FROM model_endpoints")}
+    # MODEL GROUPS (2026-11-08): a chain entry may name a group — the data
+    # plane's fallback walker resolves it to an eligible member
+    # (routes_proxy._next_fallback_candidate). Accept it at save time too, or
+    # the feature is unreachable through the admin API. Chat groups only: the
+    # walker would skip a non-chat one, so saving it would be dead config.
+    # GATED on settings.model_groups_enabled (audit 2026-11-10 P2-10), the
+    # sibling of the profile-ordering gate: with the flag off the walker
+    # never resolves a group, so accepting a group name would save inert
+    # config and a group-named entry must read as the unknown name it is.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _model_groups_mod
+
+            await _model_groups_mod.load()
+            for _gname, _group in _model_groups_mod.snapshot().items():
+                if getattr(_group, "model_type", "chat") == "chat":
+                    known.add(_gname)
+        except Exception:
+            log.warning("fallbacks: model-group names unavailable (fail-open to models only)", exc_info=True)
     if model_name not in known:
         raise HTTPException(404, f"model {model_name!r} is not registered")
     unknown = [n for n in fallbacks if n not in known]
     if unknown:
         raise HTTPException(
-            400, f"unknown fallback model name(s): {unknown} — register them under POST /admin/models first"
+            400,
+            f"unknown fallback name(s): {unknown} — register them under POST /admin/models "
+            "or create a chat model group under PUT /admin/model-groups/{name}",
         )
     deduped: list[str] = []
     for n in fallbacks:
@@ -2781,7 +3013,8 @@ async def patch_mcp_grants_server(
                   key currently holds on this server (TRUE rows + the
                   profile's live-grant presets) and the server's live
                   catalog. This is what makes "disable all" actually hold
-                  under the default tool_relay_grant_mode="scope": the
+                  under tool_relay_grant_mode="scope" (the legacy opt-in — the
+                  default is "explicit"): the
                   scope merge re-adds the whole policy-admitted catalog
                   AFTER the grant filter, so a deny row per offered tool is
                   the only thing that holds it back. Bounded: the write set
@@ -3008,6 +3241,161 @@ async def copy_mcp_grants_from(
         "key_id": str(key_id),
         "source_key_id": str(body.source_key_id),
         "grants": copied,
+    }
+
+
+class KeyApplyProfile(BaseModel):
+    """Body for POST /keys/{key_id}/apply-profile.
+
+    `profile_id` is attached to the key's OWNER (profiles are user-scoped).
+    The two apply flags default TRUE so the console's one click — pick a
+    profile in Edit key, save — does what an operator means by "give this key
+    the admin profile's budgets and grants". Either can be turned off to
+    assign the profile without touching the key's current preset rows.
+    """
+
+    profile_id: uuid.UUID
+    apply_budgets: bool = True
+    apply_grants: bool = True
+
+
+@router.post("/keys/{key_id}/apply-profile")
+async def apply_profile_to_key(
+    key_id: uuid.UUID, body: KeyApplyProfile, request: Request, _: AdminDep
+) -> dict[str, Any]:
+    """Attach a user profile AND re-stamp its presets onto THIS key.
+
+    THE GAP THIS CLOSES (console Edit key): assigning a profile only moved
+    `users.profile_id`. Budgets and MCP grants are CREATION presets, so an
+    existing key kept whatever it was born with — "give Tanguy the admin
+    profile" silently changed his model ordering and nothing else. This is
+    the one-key bridge: assign the profile to the owner (user-scoped, exactly
+    like PUT /users/{user_id}/profile) and replace this key's budget rows and
+    MCP grant rows with the profile's presets.
+
+    ATOMIC: one transaction. A key can never end up with the new profile but
+    a half-applied preset set. Validation happens BEFORE the transaction, so
+    a refused apply (empty preset list, malformed stored preset) writes
+    nothing at all.
+
+    REFUSE-EMPTY (same posture as propagate-grants): a profile that declares
+    NO budgets (or no grants) is a 400, never a silent clear. Replacing a
+    live key's limits with nothing is the destructive-by-omission hazard the
+    propagate endpoints already refuse; clearing stays an explicit per-key
+    action.
+
+    LIVE GRANTS: when the profile runs `live_grants`, the profile layer
+    already decides every call (mcpf.federation.load_live_profile_grants), so
+    the grant write is skipped — materialising the pairs as key rows would
+    pin the preset to this key. The response reports `live_grants: true`
+    and `grants: 0`.
+
+    GRANT SEMANTICS: replace-all of the GRANT set — the same per-key contract
+    as PUT /keys/{key_id}/mcp-grants. The key's TRUE rows are deleted and the
+    profile's pairs inserted TRUE (ON CONFLICT flips a surviving deny row for
+    a granted pair). Deny rows for pairs the profile does NOT grant are left
+    in place: under the legacy scope grant mode those rows are the only thing
+    holding a policy-admitted pair back, so erasing them would WIDEN the key
+    instead of applying the profile.
+
+    Audit `key.profile.apply` carries the profile id + applied counts, never
+    the pair list (the profile's own upsert row already records it).
+    """
+    key_row = await db.fetchrow("SELECT user_id FROM api_keys WHERE id = $1", key_id)
+    if key_row is None:
+        raise HTTPException(404, f"key {key_id} not found")
+    if not await _exists("profiles", body.profile_id):
+        raise HTTPException(404, f"profile {body.profile_id} not found")
+    prow = await db.fetchrow("SELECT defaults_json FROM profiles WHERE id = $1", body.profile_id)
+    if prow is None:
+        raise HTTPException(404, f"profile {body.profile_id} not found")
+    try:
+        parsed = json.loads(prow["defaults_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    defaults: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
+
+    token_rows: list[tuple[str, str, int]] = []
+    usd_rows: list[tuple[str, str, float]] = []
+    if body.apply_budgets:
+        presets = defaults.get("budgets") or []
+        if not presets:
+            raise HTTPException(400, "profile has no budget presets to apply")
+        try:
+            token_rows, usd_rows = split_preset_budgets(presets)
+        except (ValueError, AttributeError, TypeError) as exc:
+            # A hand-edited/older defaults_json can carry a non-list or a
+            # non-mapping entry; the splitter raises on those shapes too. A
+            # 400 naming the preset beats a bare 500 from an admin action.
+            raise HTTPException(400, f"profile budget preset invalid: {exc}") from None
+
+    live_grants = bool(defaults.get("live_grants"))
+    grant_pairs: list[tuple[str, str]] = []
+    if body.apply_grants and not live_grants:
+        grant_pairs = sorted(
+            {
+                (str(g[0]), str(g[1]))
+                for g in (defaults.get("mcp_grants") or [])
+                if isinstance(g, (list, tuple)) and len(g) == 2
+            }
+        )
+        if not grant_pairs:
+            raise HTTPException(400, "profile has no mcp_grants to apply")
+
+    user_id = key_row["user_id"]
+    async with db.acquire() as conn, conn.transaction():
+        # Profile attach first: a later statement failing rolls this back with
+        # the rest, so the owner is never left pointing at a profile whose
+        # presets the key did not receive.
+        await conn.execute("UPDATE users SET profile_id = $2 WHERE id = $1", user_id, body.profile_id)
+        if body.apply_budgets:
+            # REPLACE-ALL across BOTH kinds: the key's budget state is the
+            # profile's list, not a merge with whatever it had before.
+            await conn.execute("DELETE FROM budgets WHERE key_id = $1", key_id)
+            await conn.execute("DELETE FROM cost_budgets WHERE key_id = $1", key_id)
+            if token_rows:
+                await conn.executemany(
+                    "INSERT INTO budgets (key_id, model, period, limit_tokens) VALUES ($1,$2,$3,$4)",
+                    [(key_id, m, p, lim) for m, p, lim in token_rows],
+                )
+            if usd_rows:
+                await conn.executemany(
+                    "INSERT INTO cost_budgets (key_id, model, period, limit_usd) VALUES ($1,$2,$3,$4)",
+                    [(key_id, m, p, lim) for m, p, lim in usd_rows],
+                )
+        if body.apply_grants and not live_grants:
+            # Replace the GRANT set only. Deny rows survive (they are
+            # load-bearing under the legacy scope grant mode); a deny for a
+            # pair the profile now grants is flipped TRUE by the upsert —
+            # exactly the PUT /mcp-grants contract.
+            await conn.execute("DELETE FROM mcp_tool_acls WHERE key_id = $1 AND allowed", key_id)
+            if grant_pairs:
+                await conn.executemany(
+                    "INSERT INTO mcp_tool_acls (key_id, server, tool, allowed) "
+                    "VALUES ($1,$2,$3,TRUE) ON CONFLICT (key_id, server, tool) DO UPDATE SET allowed = TRUE",
+                    [(key_id, s, t) for s, t in grant_pairs],
+                )
+    applied_budgets = len(token_rows) + len(usd_rows)
+    applied_grants = len(grant_pairs)
+    await _audit(
+        request,
+        action="key.profile.apply",
+        resource_type="key",
+        resource_id=str(key_id),
+        details={
+            "profile_id": str(body.profile_id),
+            "budgets": applied_budgets,
+            "grants": applied_grants,
+            "live_grants": live_grants,
+        },
+    )
+    return {
+        "key_id": str(key_id),
+        "user_id": str(user_id),
+        "profile_id": str(body.profile_id),
+        "budgets": applied_budgets,
+        "grants": applied_grants,
+        "live_grants": live_grants,
     }
 
 
@@ -3249,33 +3637,123 @@ class ModelCost(BaseModel):
     input_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
     output_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
     cached_per_m: float = Field(0.0, ge=0, allow_inf_nan=False, le=9999.99999999)
+    # P10 billing unit — the CHECK vocabulary model_costs carries. Default
+    # 'token': a client that never heard of units writes exactly what every
+    # pre-P10 row stores, so existing console/API callers are byte-compatible.
+    # Literal (not a free str) makes an out-of-vocabulary unit a 422, never a
+    # Postgres CHECK violation 500.
+    unit: Literal["token", "char", "second", "image", "request"] = "token"
 
 
 @router.post("/costs")
 async def set_model_cost(body: ModelCost, request: Request, _: AdminDep) -> dict[str, Any]:
-    """Price a model: USD per 1M tokens (input / output / cached).
+    """Price a model: USD per 1M UNITS (input / output / cached).
 
     Costs are computed AND STORED on each ledger row at request time —
     repricing later never rewrites history. Unpriced models ledger NULL.
+    P10: `unit` names what a "1M" of the rates IS — 'token' (default, every
+    pre-P10 row), or 'char' | 'second' | 'image' | 'request' for the
+    unit-aware routes. The routes that bill a REAL unit price through
+    costs.compute_units and REFUSE a mismatched row (guard-reported), so a
+    wrong unit here is a named misconfiguration, not a wrong-rate bill.
     """
     for v in (body.input_per_m, body.output_per_m, body.cached_per_m):
         if v < 0:
             raise HTTPException(400, "rates must be >= 0")
-    await costs.set_cost(body.model_name, body.input_per_m, body.output_per_m, body.cached_per_m)
+    await costs.set_cost(body.model_name, body.input_per_m, body.output_per_m, body.cached_per_m, unit=body.unit)
     await _audit(
         request,
         action="costs.set",
         resource_type="model",
         resource_id=body.model_name,
-        details={"input_per_m": body.input_per_m, "output_per_m": body.output_per_m, "cached_per_m": body.cached_per_m},
+        details={
+            "input_per_m": body.input_per_m,
+            "output_per_m": body.output_per_m,
+            "cached_per_m": body.cached_per_m,
+            "unit": body.unit,
+        },
     )
-    return {"model_name": body.model_name, "priced": True}
+    return {"model_name": body.model_name, "priced": True, "unit": body.unit}
 
 
 @router.get("/costs")
-async def list_model_costs(_: AdminDep) -> list[dict[str, Any]]:
-    """All configured model prices."""
-    return await costs.list_costs()
+async def list_model_costs(_: AdminDep) -> dict[str, Any]:
+    """All configured model prices, plus the pricing-COVERAGE blind spot
+    (audit 2026-11-10 §7): an unpriced model ledgers cost_usd NULL and the
+    USD-budget SUM ignores NULL, so a tenant with only a USD budget can burn
+    unbounded GPU time on it — this read surface NAMES the gap instead of
+    leaving it invisible.
+
+    Shape: {"costs": [<price rows, exactly the projection this endpoint
+    always returned>], "unpriced": [<registered model names with no
+    model_costs row, sorted>], "unit_mismatch": [{model, unit, expected,
+    model_type}]}.
+
+    unpriced uses costs.unpriced (NOT warn_unpriced): the console refreshes
+    this endpoint on every Costs-tab visit, and the WARNING line belongs to
+    startup/the operator, not to a per-refresh log. The model list is the
+    registered POOLS (model_router.models()), deliberately not
+    _routing_chat_models(): a MODEL GROUP never needs a price row (the
+    selected member bills its own price), so groups would be permanent false
+    positives there — and chat-only scoping would hide the same blind spot
+    on embedding/voice pools, which bill just as real.
+
+    unit_mismatch (P10): a PRICED model whose model_costs.unit cannot match
+    what its route bills is reported here instead of silently billing at the
+    wrong rate. The expected units keep the provisional PLURAL spellings the
+    2026-11-10 read shape pinned ('tokens'/'seconds'); model_costs.unit stores
+    the CHECK vocabulary's singular ('token'/'second'), so a singular stored
+    unit is normalized onto its plural expected form for the COMPARISON only —
+    a correctly configured token row must not read as a false mismatch.
+    """
+    rows = await costs.list_costs()
+    models = model_router.models()
+    unpriced_models = await costs.unpriced(models)
+    # The check reads the LIST_COSTS rows (not the _load cache): the rows are
+    # this endpoint's own projection and the only place a pre-P10-shaped row
+    # (unit absent -> legacy token behaviour, never a mismatch) is visible.
+    # Expected-unit map by registry model_type — the provisional plural wire
+    # vocabulary (chat/embedding/reranker/decision bill per TOKEN; voice per
+    # SECOND of audio). Unknown types are skipped, not guessed.
+    _EXPECTED_UNIT = {
+        "chat": "tokens",
+        "embedding": "tokens",
+        "reranker": "tokens",
+        "decision": "tokens",
+        "voice": "seconds",
+    }
+    _SINGULAR_TO_PLURAL = {
+        "token": "tokens",
+        "char": "chars",
+        "second": "seconds",
+        "image": "images",
+        "request": "requests",
+    }
+    unit_mismatch: list[dict[str, str]] = []
+    priced = {str(r.get("model_name")): r for r in rows}
+    for name in models:
+        row = priced.get(name)
+        if row is None:
+            continue  # unpriced — already reported above
+        unit = row.get("unit")
+        if not isinstance(unit, str) or not unit:
+            continue  # a pre-P10 row (column absent/empty) — legacy, not a mismatch
+        pool = model_router.pool(name)
+        types = {str(ep.model_type) for ep in pool.endpoints} if pool is not None and pool.endpoints else set()
+        # A MIXED pool may bill more than one unit (per-endpoint routes); the
+        # stored unit must match at least one of them.
+        expected_units = {_EXPECTED_UNIT[t] for t in types if t in _EXPECTED_UNIT}
+        stored = _SINGULAR_TO_PLURAL.get(unit, unit)  # singular CHECK vocab -> provisional plural
+        if expected_units and stored not in expected_units:
+            unit_mismatch.append(
+                {
+                    "model": name,
+                    "unit": unit,
+                    "expected": "/".join(sorted(expected_units)),
+                    "model_type": ",".join(sorted(types)),
+                }
+            )
+    return {"costs": rows, "unpriced": unpriced_models, "unit_mismatch": unit_mismatch}
 
 
 @router.delete("/costs/{model_name:path}")
@@ -3415,7 +3893,11 @@ class MemoryPreset(BaseModel):
 
 
 class ProfileCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit 2026-11-10): profile names render in the console
+    # dropdowns and the CSV exports — the INVARIANT's own comment requires the
+    # same rule every other name surface enforces (tenants/users/keys above,
+    # the team-leader mint, the enroll door).
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
     model_order: list[str] = Field(default_factory=list, max_length=100)
     # Key-creation presets: budgets + MCP tool grants stamped onto every key
     # created with this profile ("profiles as defaults").
@@ -3557,7 +4039,10 @@ async def _preset_stamp_catalogs() -> tuple[dict[str, list[dict[str, Any]]], lis
 
 
 class AgentUpsert(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    # THE NAME CHARSET (audit 2026-11-10): an agent name IS a callable model id
+    # (/v1/models advertises it; it renders in the console and the CSV exports)
+    # — the same rule every other name surface enforces, per the invariant.
+    name: str = Field(min_length=1, max_length=200, pattern=_NAME_PATTERN)
     description: str = Field("", max_length=400)
     servers: list[str] = Field(default_factory=list, max_length=100)
     # Per-server TOOL narrowing: {server: [tool, ...]}. A server OMITTED here is
@@ -3938,6 +4423,26 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
     # before endpoints, and a site draining its registry. The defect this
     # guards needs a registry to hide models FROM.
     registered_models = model_router.models()
+    # MODEL GROUPS (2026-11-08): a chat group is a valid LADDER entry — the
+    # routing capability order may name the group instead of listing its
+    # members (that is the whole point: one rung, not three). Chat groups only;
+    # a non-chat group would never be a chat rung. The loader is TTL-cached and
+    # never raises; a fault degrades to the pool-only check.
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _mg
+
+            await _mg.load()
+            registered_models = [
+                *registered_models,
+                *[
+                    _g.name
+                    for _g in _mg.snapshot().values()
+                    if getattr(_g, "model_type", "chat") == "chat" and _g.name not in registered_models
+                ],
+            ]
+        except Exception:
+            log.debug("profile: model groups unavailable for the ordering check (fail-open)", exc_info=True)
     # Validate the EFFECTIVE ordering, but only when the caller actually sent
     # one: a partial save (say, agents only) must not be refused because a model
     # stored months ago has since left the registry — that would make an
@@ -4037,10 +4542,31 @@ async def create_profile(body: ProfileCreate, request: Request, _: AdminDep) -> 
                     f"agents not defined: {missing} — create them under POST /admin/agents first",
                 )
         assert row is not None
+        # BOTH halves are load-bearing (2026-11-06 incident, and the review
+        # that followed it):
+        #   * PostgreSQL evaluates a data-modifying CTE against the SAME
+        #     snapshot as the outer statement, so a row the CTE deletes is
+        #     STILL VISIBLE to the INSERT's uniqueness check. A blanket
+        #     "DELETE every link, then INSERT every wanted agent" therefore
+        #     raises duplicate key on EVERY re-save — the 500 that started
+        #     this.
+        #   * Adding ON CONFLICT DO NOTHING to that blanket delete would be
+        #     WORSE than the 500: the delete commits while the conflicting
+        #     insert is skipped, silently REMOVING the agents that were meant
+        #     to stay. "Do nothing" is only correct when the conflicting row
+        #     is one we intend to keep.
+        # So the DELETE removes ONLY the links no longer selected. The kept
+        # links stay live and untouched, their re-insert conflicts for real,
+        # and DO NOTHING keeps them: final membership equals the requested
+        # set, idempotently. The mcp_tool_acls propagate below has the same
+        # delete+insert shape and the same guard for the same snapshot reason.
         await db.execute(
-            "WITH gone AS (DELETE FROM profile_agents WHERE profile_id = $1) "
+            "WITH gone AS ("
+            "  DELETE FROM profile_agents WHERE profile_id = $1"
+            "   AND agent_id NOT IN (SELECT id FROM agent_profiles WHERE name = ANY($2::text[]))) "
             "INSERT INTO profile_agents (profile_id, agent_id) "
-            "SELECT $1, a.id FROM agent_profiles a WHERE a.name = ANY($2::text[])",
+            "SELECT $1, a.id FROM agent_profiles a WHERE a.name = ANY($2::text[]) "
+            "ON CONFLICT (profile_id, agent_id) DO NOTHING",
             row["id"],
             wanted,
         )
@@ -4344,6 +4870,36 @@ async def assign_profile(user_id: uuid.UUID, body: UserAssignProfile, request: R
     return dict(row)
 
 
+def _fold_unit_rows(rows: list[Any], group_cols: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Fold GROUPING SETS per-unit subrows into their group's total row.
+
+    The unit-aware rollups (P10) group by (group, unit_kind) AS WELL AS the
+    group itself — one SUM(billable_units) across kinds adds CHARS to SECONDS,
+    which is not a number (cross-validation wave 2, 2026-11-10). The group
+    total row (unit_kind IS NULL) keeps every shared aggregate EXACTLY as the
+    pre-GROUPING-SETS query computed it; each per-unit subrow contributes one
+    key to the total row's `billable_units_by_unit` object ({unit: units}).
+    The fold runs AFTER the whole pass (subrows and totals interleave in the
+    SQL ordering) and the folded list is re-sorted by cost, the display
+    order the query used to deliver.
+    """
+    folded: list[dict[str, Any]] = []
+    by_unit: dict[tuple[Any, ...], dict[str, float]] = {}
+    for r in rows:
+        d = dict(r)
+        unit_kind = d.pop("unit_kind", None)
+        unit_units = d.pop("unit_units", None)
+        key = tuple(d.get(c) for c in group_cols)
+        if unit_kind is None:
+            folded.append(d)
+        else:
+            by_unit.setdefault(key, {})[str(unit_kind)] = float(unit_units or 0.0)
+    for d in folded:
+        d["billable_units_by_unit"] = by_unit.get(tuple(d.get(c) for c in group_cols), {})
+    folded.sort(key=lambda d: d.get("cost_usd") or 0.0, reverse=True)
+    return folded
+
+
 @router.get("/usage/summary")
 async def usage_summary(_: AdminDep, since: str | None = None, until: str | None = None) -> dict[str, Any]:
     """Ledger rollup: requests, tokens (in/out/cached split), cache hits,
@@ -4354,6 +4910,20 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     console received "4427047307" (a string) and its String.toLocaleString
     rendered it comma-less. bigint decodes as a plain int, so the wire
     carries real JSON numbers (exact well past any plausible token count).
+
+    Status scope (cross-validation wave 2, 2026-11-10): the totals row is
+    the number the USD budget GATE can be compared against, so its
+    requests/billed_tokens projections carry the gate's OWN predicate —
+    status IN _COSTED_SQL for billed tokens (cache_hit rows are free) and
+    routing rows excluded from requests — instead of counting the
+    gateway's own routing turns as if the tenant made them. The routing
+    spend stays VISIBLE as its own routing_requests/routing_cost_usd line
+    so chargeback still sees the decision model's real GPU time.
+
+    Unit-aware rows (P10): by_model/by_key carry billable_units_by_unit —
+    an object keyed by unit kind ({"second": 30.0, "char_estimate": 1000.0})
+    — instead of one SUM across kinds (adding chars to seconds is not a
+    number, it is a typo with a decimal point).
 
     Bounded (audit P1-4): defaults to the last 30 days; the ledger is never
     pruned and an unbounded aggregate on the pool the data plane shares
@@ -4370,7 +4940,13 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     row = await db.fetchrow(
         f"""
         SELECT
-          count(*)                                                    AS requests,
+          -- The tenant made this many requests (cross-validation wave 2):
+          -- routing rows are the gateway's OWN decision turn, settled under
+          -- the caller's key — counting them here reported 2 requests where
+          -- the tenant made 1. The routing spend stays visible as its own
+          -- line below.
+          count(*) FILTER (WHERE status <> 'routing')                AS requests,
+          count(*) FILTER (WHERE status = 'routing')                 AS routing_requests,
           COALESCE(SUM(total_tokens), 0)::bigint                      AS total_tokens,
           COALESCE(SUM(prompt_tokens), 0)::bigint                     AS input_tokens,
           COALESCE(SUM(completion_tokens), 0)::bigint                 AS output_tokens,
@@ -4390,13 +4966,20 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                THEN ROUND(100.0 * SUM(cached_tokens) FILTER (WHERE status <> 'cache_hit') / SUM(prompt_tokens) FILTER (WHERE status <> 'cache_hit'), 1)
                ELSE NULL END                                          AS cache_hit_rate_pct,
           COALESCE(SUM(cost_usd), 0)::float                           AS cost_usd,
-          COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billed_tokens,
+          COALESCE(SUM(cost_usd) FILTER (WHERE status = 'routing'), 0)::float AS routing_cost_usd,
+          -- The GATE's own number (2026-10-30) WITH the gate's own money
+          -- predicate: the budget SUM adds AND status IN (_COSTED_SQL), so the
+          -- console MUST too — comparing the gate's spend against a summary
+          -- that also summed the gateway's own routing rows showed +26.7%
+          -- phantom spend (cross-validation wave 2, measured).
+          COALESCE(SUM({_budget_token_value("usage_ledger")})
+                   FILTER (WHERE usage_ledger.status IN ({_COSTED_SQL})), 0)::float AS billed_tokens,
           COALESCE(SUM(cost_usd * billing_fraction), 0)::float        AS billed_cost_usd
         FROM usage_ledger{_cond}
         """,
         *_win,
     )
-    by_model = await db.fetch(
+    raw_by_model = await db.fetch(
         f"""
         SELECT model,
                count(*)                                            AS requests,
@@ -4410,11 +4993,21 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                COALESCE(SUM(cost_usd), 0)::float                   AS cost_usd,
                COALESCE(SUM(total_tokens * billing_fraction), 0)::float AS billed_tokens,
                COALESCE({_billable_tokens_sql("usage_ledger")}, 0)::float AS billable_tokens,
-               COALESCE(SUM(cost_usd * billing_fraction), 0)::float     AS billed_cost_usd
-        FROM usage_ledger{_cond} GROUP BY model ORDER BY cost_usd DESC
+               COALESCE(SUM(cost_usd * billing_fraction), 0)::float     AS billed_cost_usd,
+               unit_kind,
+               -- P10 unit-aware billing (see the /usage explorer note):
+               -- summed PER UNIT KIND only — one SUM across kinds adds chars
+               -- to seconds (cross-validation wave 2, 2026-11-10); the
+               -- per-unit GROUPING SETS subrows are folded into the model
+               -- total row's billable_units_by_unit object in Python.
+               COALESCE(SUM(billable_units), 0)::float             AS unit_units
+        FROM usage_ledger{_cond}
+        GROUP BY GROUPING SETS ((model), (model, unit_kind))
+        ORDER BY model, unit_kind NULLS FIRST
         """,
         *_win,
     )
+    by_model = _fold_unit_rows(raw_by_model, ("model",))
     # CHARGEBACK ROLLUP (2026-10-20): grouped by (key NAME, user), NOT by
     # key_id. `POST /keys/{id}/rotate` mints a NEW key row with the SAME name
     # and user and revokes the old one, so grouping by id split one logical
@@ -4429,7 +5022,7 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
     # only ever REVOKED (never deleted), so every ledger row resolves to a name.
     # `generations` counts the distinct key rows behind a row, so a rotated
     # credential stays visible as rotated instead of masquerading as one key.
-    by_key = await db.fetch(
+    raw_by_key = await db.fetch(
         f"""
         SELECT k.name AS key_name, u.name AS user_name,
                count(DISTINCT l.key_id)                            AS generations,
@@ -4444,15 +5037,22 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                COALESCE(SUM(l.cost_usd), 0)::float                 AS cost_usd,
                COALESCE(SUM(l.total_tokens * l.billing_fraction), 0)::float AS billed_tokens,
                COALESCE({_billable_tokens_sql("l")}, 0)::float             AS billable_tokens,
-               COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd
+               COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd,
+               l.unit_kind,
+               -- P10 unit-aware billing (see the /usage explorer note):
+               -- per-unit-kind sums only, folded into billable_units_by_unit
+               -- in Python (one SUM across kinds adds chars to seconds).
+               COALESCE(SUM(l.billable_units), 0)::float           AS unit_units
         FROM usage_ledger l
         LEFT JOIN api_keys k ON k.id = l.key_id
         LEFT JOIN users u ON u.id = k.user_id
         {_cond_l}
-        GROUP BY k.name, u.name ORDER BY cost_usd DESC
+        GROUP BY GROUPING SETS ((k.name, u.name), (k.name, u.name, l.unit_kind))
+        ORDER BY k.name, u.name, l.unit_kind NULLS FIRST
         """,
         *_win,
     )
+    by_key = _fold_unit_rows(raw_by_key, ("key_name", "user_name"))
     # PER-KEY / PER-MODEL breakdown, for the console's expandable rows.
     # Same (key NAME, user) grouping as by_key so a rotated credential stays
     # one logical row; adding model splits it further without changing the
@@ -5243,14 +5843,20 @@ def _routing_decision_models() -> list[str]:
     return out
 
 
-def _routing_chat_models() -> list[str]:
-    """Registered models whose pool serves CHAT.
+async def _routing_chat_models() -> list[str]:
+    """Registered models whose pool serves CHAT, plus chat MODEL GROUPS.
 
     The router's ladder is a chat concept: an embedding or reranker pool can
     never be a routing candidate, so the panel's checkboxes and the
     `routing__<model>` advertisement must not offer them. Same predicate as
     routes_proxy's /v1/models routing block — one definition, so the admin view
     and the data plane cannot disagree about what "a chat model" is.
+
+    MODEL GROUPS (2026-11-08): a group is a chat-capable routing target whose
+    MEMBER is picked at request time, so it belongs on this list exactly like a
+    pool. The loader is awaited (TTL-cached, never raises) so a group created a
+    moment ago is visible in the panel without waiting for a chat request to
+    warm the cache.
     """
     from ..core.cascade import pool_serves_chat  # local: keeps this module import-light
 
@@ -5264,7 +5870,17 @@ def _routing_chat_models() -> list[str]:
         # routing candidate at all, which is a different question from type.
         if pool is not None and pool.endpoints and pool_serves_chat(pool):
             out.append(m)
-    return out
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as _mg
+
+            await _mg.load()
+            for _g in _mg.snapshot().values():
+                if getattr(_g, "model_type", "chat") == "chat" and _g.name not in out:
+                    out.append(_g.name)
+        except Exception:
+            log.debug("routing candidates: model groups unavailable (fail-open)", exc_info=True)
+    return sorted(out)
 
 
 @router.get("/routing/config")
@@ -5293,7 +5909,7 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         "defaults": routing_config.defaults(),
         "overridden": sorted(overridden),
         "registered": model_router.models(),
-        "chat_models": _routing_chat_models(),
+        "chat_models": await _routing_chat_models(),
         # The decision-model dropdown source: decision pools first (the
         # intended type), chat pools accepted for first-cut deployments.
         "decision_models": _routing_decision_models(),
@@ -5308,7 +5924,7 @@ async def get_routing_config(_: AdminDep) -> dict[str, Any]:
         # "does every model the panel can offer carry a description", and the
         # panel counts the same set -- two different denominators for one
         # concept is how a "3/3 described" panel disagrees with its own API.
-        "card_coverage": routing_config.describe_coverage(cfg.get("model_cards"), _routing_chat_models()),
+        "card_coverage": routing_config.describe_coverage(cfg.get("model_cards"), await _routing_chat_models()),
         "gpu": await routing_config.gpu_load_snapshot(),
     }
 
@@ -5502,7 +6118,7 @@ async def put_routing_config(body: RoutingConfigPatch, request: Request, _: Admi
     # fallback and reports EVERY chat model eligible, the opposite of the
     # saved restriction. Refusing here keeps that fallback reserved for ids
     # that genuinely vanished from the registry.
-    chat_models = _routing_chat_models()
+    chat_models = await _routing_chat_models()
     decision_model = provided.get("decision_model")
     # The decision model is NOT a ladder candidate — it is the thing that
     # CHOOSES a ladder candidate, so it is validated against the decision/chat
@@ -5682,7 +6298,7 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
     # must not offer the decision model an embedding/reranker candidate it
     # could never serve. Same candidate set presented-models reports as
     # routing_eligible, so the preview and the panel cannot disagree.
-    models = await routing_config.routing_allowed_models(_routing_chat_models())
+    models = await routing_config.routing_allowed_models(await _routing_chat_models())
     snapshot = await routing_config.gpu_load_snapshot()
     # 'inject' is the DECISION being previewed (possibly overridden); the
     # snapshot's own 'available' is only the data question. Folding the
@@ -5739,7 +6355,7 @@ async def preview_routing_prompt(body: RoutingPromptPreview, _: AdminDep) -> dic
         # allowlisted subset this preview happens to render. Otherwise a site
         # with a 2-of-3 allowlist sees "2/2 described" here and "2/3" in the
         # panel for the same config.
-        "card_coverage": routing_config.describe_coverage(cards, _routing_chat_models()),
+        "card_coverage": routing_config.describe_coverage(cards, await _routing_chat_models()),
     }
 
 
@@ -5811,7 +6427,7 @@ async def presented_models_payload() -> dict[str, Any]:
     snapshot = await routing_config.gpu_load_snapshot()
     raw_offpeak = snapshot.get("models")
     offpeak_models: dict[str, Any] = raw_offpeak if isinstance(raw_offpeak, dict) else {}
-    chat_models = _routing_chat_models()
+    chat_models = await _routing_chat_models()
     # DERIVED ordering (no profile on an admin key): the CHAT pools in the
     # registry's own (name-sorted) order. CHAT ONLY (2026-10-29): this used to
     # append every non-chat pool to the tail, so the panel rendered
@@ -5943,20 +6559,54 @@ async def presented_models_payload() -> dict[str, Any]:
     except Exception:
         log.warning("presented-models: agent listing failed (reporting none)", exc_info=True)
 
+    # --- MODEL GROUPS (F3, 2026-11-08) --------------------------------------
+    # A group is a model id /v1/models advertises (owned_by "group"), so this
+    # view must list them or it lies by omission — the agents section's rule.
+    # They are CONFIG truth (a DB row, not a registry pool), so they are their
+    # own section and never mixed into 'models'. 'present' is the fleet switch
+    # only: an admin key has no profile, so no ACL is knowable here.
+    # best-effort — the loader never raises, but this view must not 500 on a
+    # DB/loader fault either (the same degrade-first posture as agents above).
+    groups_out: list[dict[str, Any]] = []
+    if settings.model_groups_enabled:
+        try:
+            from ..core import model_groups as model_groups_mod
+
+            loaded = await model_groups_mod.load()
+            for g in sorted(loaded.values(), key=lambda item: item.name):
+                groups_out.append(
+                    {
+                        "id": g.name,
+                        "type": "group",
+                        "owned_by": "group",
+                        "model_type": g.model_type,
+                        "policy": g.policy,
+                        "members": list(g.members),
+                        "description": g.description,
+                        "present": True,
+                        "reason": "fleet switch on — the data plane /v1/models lists groups too",
+                    }
+                )
+        except Exception:
+            log.warning("presented-models: model-group listing failed (reporting none)", exc_info=True)
+
     presented = (
         len(models_out)
         + sum(1 for a in aliases if a["present"])
         + sum(1 for r in routing_out if r["present"])
         + sum(1 for a in agents_out if a["present"])
+        + sum(1 for g in groups_out if g["present"])
     )
     return {
         "aliases": aliases,
         "models": models_out,
         "routing": routing_out,
         "agents": agents_out,
+        "groups": groups_out,
         "env": {
             "routing_enabled": bool(settings.routing_enabled),
             "load_aware_cascade": bool(settings.load_aware_cascade),
+            "model_groups_enabled": bool(settings.model_groups_enabled),
         },
         "counts": {"presented": presented, "registered": len(registered)},
     }
@@ -6197,3 +6847,300 @@ async def deny_topup_request(
         },
     )
     return dict(resolved)
+
+
+# ---------------------------------------------------------------------------
+# model groups (F3, 2026-11-08) — named sets of EQUIVALENT chat models.
+#
+# A group is a first-class ROUTE TARGET (direct request, fallback-chain entry,
+# advertised in /v1/models); the DATA PLANE resolves it (routes_proxy) and
+# core.model_groups owns the cache + the load pick. These endpoints only CURATE
+# the rows — the same split as guardrails/fallbacks, so the admin plane never
+# grows a dependency on the hot path: core.model_groups is imported LAZILY
+# inside each handler.
+#
+# Validation happens HERE, at save time, against the LIVE registry: a group
+# naming a dead model would be a silently-unroutable config (the guardrail
+# attachment lesson), so every reject reason is a 400 the operator can act on.
+# ---------------------------------------------------------------------------
+
+
+class ModelGroupUpsert(BaseModel):
+    """PUT body for one group — REPLACE semantics (the whole member set is the
+    desired state; a diff would leave stale members routing traffic).
+
+    model_type/policy default to the only v1 values, and the handlers REFUSE
+    any other value rather than storing a mode the data plane does not
+    implement: core.model_groups treats an unknown policy as 'load', so a typo
+    would otherwise look saved and behave differently from what was asked.
+    """
+
+    model_type: str = "chat"
+    policy: str = "load"
+    members: list[str]
+    description: str = Field("", max_length=1000)
+
+
+# A group name IS a model id: /v1/models advertises it, a request may name it,
+# and X-PCAI-Group echoes it. So it is closed at the edge like every other name
+# surface (no markup / control chars) and it is a SLUG — no whitespace, no '/'
+# — because it is a virtual id, not a namespaced registry model (and a slash
+# would make it unaddressable as a plain path parameter).
+_GROUP_NAME_BAD_CHARS = re.compile(r"""[<>"'&\x00-\x1f\x7f/\s]""")
+_GROUP_NAME_MAX_LEN = 200
+
+
+def _validate_model_group_name(name: str) -> str:
+    """Validate a group name (returns it unchanged, or raises a 400).
+
+    Refuses the cascade aliases too: 'auto' and the demand-aware alias are
+    model ids the data plane already resolves, so a group with one of those
+    names would shadow (or be shadowed by) the alias depending on resolution
+    order — an ambiguity with no correct answer, refused at the edge.
+    """
+    from ..core.cascade import DEMAND_AWARE_ALIAS
+
+    if name != name.strip():
+        raise HTTPException(400, "model group name must not have leading/trailing whitespace")
+    if not name:
+        raise HTTPException(400, "model group name must not be empty")
+    if len(name) > _GROUP_NAME_MAX_LEN:
+        raise HTTPException(400, f"model group name must be at most {_GROUP_NAME_MAX_LEN} characters")
+    if _GROUP_NAME_BAD_CHARS.search(name):
+        raise HTTPException(
+            400,
+            "model group name must not contain whitespace, '/', control characters or HTML metacharacters",
+        )
+    if name in {"auto", DEMAND_AWARE_ALIAS}:
+        raise HTTPException(400, f"model group name {name!r} is a reserved cascade alias")
+    # PSEUDO-MODELS (review F3-2): detect_pseudo_model claims 'routing' and
+    # 'routing__<model>' BEFORE any group lookup, so a group saved under one of
+    # those names would be stored and then unaddressable. Refuse at the edge.
+    if name == "routing" or name.startswith("routing__"):
+        raise HTTPException(400, f"model group name {name!r} is a reserved routing pseudo-model")
+    return name
+
+
+def _group_member_names(raw: Any) -> list[str]:
+    """Member names from a stored JSONB members value.
+
+    The documented shape is [{"model": name, "weight": w}] (db/schema.py); the
+    pool registers no JSONB codec, so the column arrives as a RAW STRING. A
+    bare [name, ...] is tolerated — a hand-edited row must degrade to a
+    readable list, not 500 the whole admin page. Order is preserved (the editor
+    shows the stored order), empties dropped, duplicates collapsed.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        member = item.get("model") if isinstance(item, dict) else item
+        if isinstance(member, str) and member and member not in out:
+            out.append(member)
+    return out
+
+
+def _model_group_out(row: Any) -> dict[str, Any]:
+    """One group in the admin API's wire shape.
+
+    members are NAMES, not the stored [{model, weight}] objects: weight is
+    reserved for the not-yet-implemented weighted policy and would be a number
+    the operator cannot set through this API, so exposing it would invite a
+    config that looks tunable and is not.
+    """
+    data = dict(row)
+    return {
+        "name": data.get("name"),
+        "model_type": data.get("model_type") or "chat",
+        "policy": data.get("policy") or "load",
+        "members": _group_member_names(data.get("members")),
+        "description": data.get("description") or "",
+        "created_at": data.get("created_at"),
+    }
+
+
+async def _invalidate_model_groups_best_effort() -> None:
+    """Drop the model-group cache AFTER a committed write.
+
+    Best effort, same posture as _refresh_registry_best_effort: the row is
+    already durable, so an invalidate fault must never 500 the request that
+    wrote it (the operator would retry and double-write). The stale window is
+    the loader's cache TTL at worst.
+    """
+    try:
+        from ..core import model_groups as model_groups_mod
+
+        await model_groups_mod.invalidate()
+    except Exception:
+        log.exception(
+            "model-group cache invalidation failed after a COMMITTED admin mutation — "
+            "routing keeps the previous group snapshot until the loader TTL expires"
+        )
+
+
+@router.get("/model-groups")
+async def list_model_groups(_: AdminDep) -> dict[str, Any]:
+    """Every group, straight from the table (the console's list + edit source).
+
+    DB truth, not the routing cache: an operator editing a group must see what
+    is STORED even while the loader still serves its previous snapshot.
+    """
+    rows = await db.fetch(
+        "SELECT name, model_type, policy, members, description, created_at FROM model_groups ORDER BY name"
+    )
+    return {"groups": [_model_group_out(r) for r in rows]}
+
+
+@router.put("/model-groups/{name}")
+async def upsert_model_group(name: str, body: ModelGroupUpsert, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Create or replace a group (upsert; a 409-on-duplicate is not attempted —
+    the console edits through the same verb, and a PUT is idempotent by
+    definition).
+
+    Rejects BEFORE the write: a bad name, a non-chat group type, an
+    unimplemented policy, a member set core.model_groups refuses (empty /
+    unknown / duplicate / a group / >32), plus the chat-only member rule the
+    member validator cannot see (it has no registry types).
+    """
+    from ..core import model_groups as model_groups_mod
+
+    group_name = _validate_model_group_name(name)
+    if body.model_type != "chat":
+        raise HTTPException(
+            400,
+            f"model_type {body.model_type!r} is not supported for a model group — v1 groups are chat-only",
+        )
+    if body.policy != "load":
+        raise HTTPException(400, f"policy {body.policy!r} is not implemented — must be 'load'")
+    _check_list_len(body.members, "members")
+    # Store the TRIMMED names: validate_members trims before it checks, so
+    # persisting the raw payload would let " glm " pass validation and then
+    # never match the registry — an unroutable member the validator believed
+    # was fine.
+    members = [str(m or "").strip() for m in body.members]
+    members = [m for m in members if m]
+    known = set(model_router.models())
+    existed = await db.fetchval("SELECT 1 FROM model_groups WHERE name = $1", group_name) is not None
+    if not existed and group_name in known:
+        raise HTTPException(
+            400,
+            f"model group name {group_name!r} is already a registered model — a group may not shadow a pool",
+        )
+    # snapshot() only knows what the loader has cached, and the ONE-LEVEL rule
+    # (a member may not itself be a group) is enforced against it — so warm the
+    # cache first, or a cold process could persist a cycle the schema comment
+    # promises cannot exist. load() is TTL-cached and never raises.
+    await model_groups_mod.load()
+    reason = model_groups_mod.validate_members(members, known, model_groups_mod.snapshot())
+    if reason:
+        raise HTTPException(400, reason)
+    non_chat = []
+    for member in members:
+        pool = model_router.pool(member)
+        endpoints = pool.endpoints if pool is not None else []
+        types = sorted({str(getattr(ep, "model_type", "") or "") for ep in endpoints} - {""})
+        # ANY chat endpoint makes the pool chat-servable: the data plane's
+        # serves_chat() is an any() predicate, so endpoints[0] would refuse a
+        # pool whose first registered endpoint happens to be non-chat (the
+        # exact order-dependence defect the proxy fixed — review F3-1).
+        if types and "chat" not in types:
+            non_chat.append(f"{member} ({', '.join(types)})")
+    if non_chat:
+        raise HTTPException(400, f"model group members must be chat models — refusing {non_chat}")
+    # The stored shape is [{model, weight}] (db/schema.py). weight is RESERVED
+    # for the not-yet-implemented weighted policy; 1.0 for every member keeps a
+    # future weighted pick equivalent to today's uniform one.
+    members_json = json.dumps([{"model": m, "weight": 1.0} for m in members])
+    row = await db.fetchrow(
+        "INSERT INTO model_groups (name, model_type, policy, members, description) "
+        "VALUES ($1, $2, $3, $4::jsonb, $5) "
+        "ON CONFLICT (name) DO UPDATE SET model_type = EXCLUDED.model_type, "
+        "policy = EXCLUDED.policy, members = EXCLUDED.members, description = EXCLUDED.description "
+        "RETURNING name, model_type, policy, members, description, created_at",
+        group_name,
+        body.model_type,
+        body.policy,
+        members_json,
+        body.description,
+    )
+    assert row is not None
+    await _invalidate_model_groups_best_effort()
+    out = _model_group_out(row)
+    await _audit(
+        request,
+        action="model_group.update" if existed else "model_group.create",
+        resource_type="model_group",
+        resource_id=group_name,
+        details={
+            "name": out["name"],
+            "model_type": out["model_type"],
+            "policy": out["policy"],
+            "members": out["members"],
+            "description": out["description"],
+        },
+    )
+    return out
+
+
+@router.delete("/model-groups/{name}")
+async def delete_model_group(name: str, request: Request, _: AdminDep) -> dict[str, Any]:
+    """Remove a group. 404 when absent — a delete of nothing is not a success
+    (the console would otherwise report "deleted" for a typo). The cache is
+    invalidated after the commit so the data plane stops selecting the
+    members."""
+    group_name = _validate_model_group_name(name)
+    row = await db.fetchrow("DELETE FROM model_groups WHERE name = $1 RETURNING name", group_name)
+    if row is None:
+        raise HTTPException(404, f"model group {group_name!r} not found")
+    await _invalidate_model_groups_best_effort()
+    await _audit(
+        request,
+        action="model_group.delete",
+        resource_type="model_group",
+        resource_id=group_name,
+        details={"name": group_name},
+    )
+    return {"deleted": True, "name": group_name}
+
+
+@router.post("/model-groups/{name}/preview")
+async def preview_model_group(name: str, _: AdminDep) -> dict[str, Any]:
+    """What the LOAD PICK would choose right now — read-only.
+
+    Never pins and never writes: the data plane's grp: pin is per (key,
+    conversation) and only a real request may take one. This is the operator's
+    "would it go to GLM or Deepseek right now?" probe, so the per-member score
+    (min queue across the member's endpoints; null = no metrics) is returned
+    next to the pick, plus each member's pool health — a group whose members
+    are all unhealthy picks something that cannot serve, and the panel must say
+    so instead of showing a confident member.
+    """
+    from ..core import load_snapshot
+    from ..core import model_groups as model_groups_mod
+
+    group_name = _validate_model_group_name(name)
+    # load() is TTL-cached and never raises; calling it makes the preview work
+    # on a cold cache (first request after boot, before any /v1 call).
+    await model_groups_mod.load()
+    group = model_groups_mod.group_for(group_name)
+    if group is None:
+        raise HTTPException(404, f"model group {group_name!r} not found")
+    candidates = []
+    for member in group.members:
+        pool = model_router.pool(member)
+        candidates.append(
+            {
+                "model": member,
+                "score": load_snapshot.member_score(member),
+                "healthy": bool(pool.healthy()) if pool is not None else False,
+            }
+        )
+    return {
+        "member": model_groups_mod.pick_member(group, None, load_snapshot.member_score),
+        "candidates": candidates,
+    }

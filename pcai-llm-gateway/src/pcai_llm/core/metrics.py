@@ -193,7 +193,14 @@ if _REAL:
     #   model  - bounded by the endpoint registry; "" normalises to
     #            "unattributed" (the relay path settles with model="*" today -
     #            see the P1-1 note in routes_proxy).
-    #   server - bounded by the MCP registry.
+    #   server - bounded ONLY BY THE CALLER'S DISCIPLINE, not by anything
+    #            this counter does: each call site must pass a
+    #            registry-resolved server name (or the fixed "unknown"
+    #            bucket), never a caller-supplied string — an unverified
+    #            argument here is an unbounded label cardinality bomb
+    #            (audit P1-5, 2026-11-10; the old "bounded by the MCP
+    #            registry" comment described the registry, not the call
+    #            sites).
     # Per-KEY attribution stays in usage_ledger / mcp_call_audit, which are
     # access-controlled and now hash-chained.
     MCP_CALLS = Counter(
@@ -240,6 +247,17 @@ if _REAL:
         "reported separately so refunds + discards reconcile against the "
         "ledger cached_tokens column.",
         ["outcome"],  # refunded | discarded
+    )
+    # URL-guard resolver saturation (cross-validation 2026-11-10): the SSRF
+    # destination check resolves model-supplied hostnames through a bounded
+    # pool of per-call daemon threads (core.url_guard); exhaustion is a
+    # DISTINCT fail-closed outcome (ResolverSaturated) that a log line alone
+    # does not put on a dashboard. NO labels on purpose: saturation is a
+    # POD-level condition, not a per-server/tool/key one.
+    URL_GUARD_RESOLVER_SATURATED = Counter(
+        "gateway_url_guard_resolver_saturated_total",
+        "Destination checks refused fail-closed because the bounded DNS "
+        "resolver pool was saturated (core.url_guard.ResolverSaturated).",
     )
     # --- session-memory distiller (2026-10-14) -----------------------------
     # Added after a TOTAL feed outage that nothing could detect: the sweep
@@ -341,6 +359,25 @@ if _REAL:
         "the cache is worth it on this workload.",
         ["mode", "result"],  # shadow|active x hit|miss
     )
+    TOOL_COMPRESS = Counter(
+        "gateway_tool_compress_total",
+        "Deterministic tool-result compression outcomes in the relay. "
+        "compressed = the model saw the rewrite; not_stored = a candidate was "
+        "built but the original could not be retained (over the store ceiling, "
+        "no key, or a failed write), so the original passed through; shadow = "
+        "measured, nothing rewritten. A zero rate on a mode=on fleet means the "
+        "detectors are not matching the traffic — the failure this counter was "
+        "added to make visible.",
+        ["mode", "kind", "outcome"],
+    )
+    TOOL_COMPRESS_CHARS_SAVED = Counter(
+        "gateway_tool_compress_chars_saved_total",
+        "Characters removed by tool-result compression (before-after, marker "
+        "included), counted ONCE per rewritten result. The context saving is "
+        "larger than this number: a rewritten result is re-prefilled on every "
+        "later iteration of its turn.",
+        ["mode"],
+    )
     # set_function, not a periodic set(): prometheus_client calls these at
     # scrape time, so the reading is always current and the steady-state cost
     # is one attribute read per scrape rather than a background task.
@@ -356,6 +393,8 @@ else:
     DB_POOL_IDLE: Any = _NoopMetric()  # type: ignore[no-redef]
     DB_POOL_MAX: Any = _NoopMetric()  # type: ignore[no-redef]
     RESPONSE_CACHE: Any = _NoopMetric()  # type: ignore[no-redef]
+    TOOL_COMPRESS: Any = _NoopMetric()  # type: ignore[no-redef]
+    TOOL_COMPRESS_CHARS_SAVED: Any = _NoopMetric()  # type: ignore[no-redef]
     LATENCY: Any = _NoopMetric()  # type: ignore[no-redef]
     TTFT: Any = _NoopMetric()  # type: ignore[no-redef]
     BUDGET_REJECTIONS: Any = _NoopMetric()  # type: ignore[no-redef]
@@ -372,6 +411,7 @@ else:
     UPSTREAM_AUTH_DEGRADED: Any = _NoopMetric()  # type: ignore[no-redef]
     CASCADE_HEAD_PICKS: Any = _NoopMetric()  # type: ignore[no-redef]
     TPM_CACHE_REFUND: Any = _NoopMetric()  # type: ignore[no-redef]
+    URL_GUARD_RESOLVER_SATURATED: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_DUE_ROWS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_LAST_WRITE_TS: Any = _NoopMetric()  # type: ignore[no-redef]
     DISTILL_WRITES: Any = _NoopMetric()  # type: ignore[no-redef]
@@ -416,6 +456,26 @@ def observe_mcp_call(server: str, outcome: str, model: str = "") -> None:
     point of P2-1: you cannot act on a rare event you cannot attribute.
     """
     MCP_CALLS.labels(server=server, outcome=outcome, model=model or "unattributed").inc()
+
+
+def observe_tool_compress(*, mode: str, kind: str, outcome: str, saved: int) -> None:
+    """One deterministic tool-result compression decision.
+
+    outcome vocabulary: compressed | not_stored | shadow (bounded). Saved
+    chars are counted only for a rewrite the model actually received — a
+    shadow measurement is reported on the wire and in the log, never added to
+    a counter whose name promises a real saving.
+    """
+    TOOL_COMPRESS.labels(mode=mode, kind=kind, outcome=outcome).inc()
+    if outcome == "compressed":
+        TOOL_COMPRESS_CHARS_SAVED.labels(mode=mode).inc(max(0, saved))
+
+
+def observe_url_guard_resolver_saturated() -> None:
+    """One destination check refused because the bounded resolver pool was
+    exhausted (core.url_guard.ResolverSaturated — the fail-CLOSED outcome,
+    distinct from the fail-open gaierror). Global condition: no labels."""
+    URL_GUARD_RESOLVER_SATURATED.inc()
 
 
 def observe_tpm_cache_refund(tokens: int, discarded: bool) -> None:

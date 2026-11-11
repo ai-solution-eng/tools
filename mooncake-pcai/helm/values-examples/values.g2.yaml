@@ -1,0 +1,48 @@
+# G2 site values — overlay on top of helm/values.yaml.
+#
+#   helm install mooncake ./helm -n mooncake --create-namespace \
+#     -f helm/values-examples/values.g2.yaml
+#
+# What this changes: the public host, the PVC-backed capacity tier (the VAST CSI
+# class this cluster actually exposes), and which namespaces the dashboard may
+# scan for Mooncake clients.
+#
+# Transport: left at the chart default (tcp). It is a whole-pool decision -
+# pick it with values.transport-tcp.yaml or values.transport-rdma.yaml, last
+# on the command line.
+
+ezua:
+  virtualService:
+    endpoint: "mooncake.${DOMAIN_NAME}"
+
+store:
+  replicaCount: 3
+  # DRAM hot tier per pod. Small on purpose: the PVC is the capacity tier.
+  segmentSize: "16gb"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 24Gi
+    limits:
+      cpu: "4"
+      memory: 32Gi
+  persistence:
+    enabled: true
+    # Generic template sizing: 3 x 1Ti = 3 TiB total. This is an EXAMPLE, not a
+    # recommendation - the demo/site file (helm/local/values.g2.yaml) runs
+    # 3 x 350Gi ≈ 1.05 TiB. Pick the size from measured write volume.
+    size: 1Ti
+    # The G2 cluster exposes two classes today: `gl4f-filesystem` (VAST CSI,
+    # csi.vastdata.com - what every app uses) and `vastdata-block`. There is no
+    # X10000-backed class on this unit yet; point this at the X10000 class once
+    # one exists. Empty = the cluster default (gl4f-filesystem).
+    storageClassName: "gl4f-filesystem"
+    accessModes:
+      - ReadWriteOnce
+
+ui:
+  refreshIntervalSeconds: 1800
+  discovery:
+    # Namespaces whose Mooncake clients the dashboard should list.
+    namespaces:
+      - project-user-andrew-bydlon

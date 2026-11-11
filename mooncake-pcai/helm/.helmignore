@@ -1,0 +1,13 @@
+# Local/site values and examples are never packaged.
+local/
+values-examples/
+.values*.yaml
+.DS_Store
+.git/
+.gitignore
+*.tgz
+*.md
+# Python bytecode: helm/files/ is mounted into the UI ConfigMap, and a
+# stray __pycache__/ otherwise ships inside the packaged chart.
+__pycache__/
+*.pyc

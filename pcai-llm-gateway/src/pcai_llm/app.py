@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -35,7 +36,7 @@ from .api.routes_identity import router as identity_router
 from .api.routes_mcp import mount as mount_mcp
 from .api.routes_team_leader import router as team_leader_router
 from .config import settings
-from .core import health_probe, housekeeping, offpeak, registry, tracing
+from .core import costs, health_probe, housekeeping, offpeak, registry, tracing
 from .db import PoolUnavailable, db
 from .routing.router import router as model_router
 
@@ -79,6 +80,32 @@ class DurationHeaderMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
+
+
+# CSP frame-ancestors token vocabulary (audit P3, 2026-11-10): an
+# operator origin must be an exact scheme://host[:port][/path] token with
+# NO quotes, semicolons, spaces or commas — CSP directives are
+# space-separated inside one header, so any of those in an "origin" would
+# be header-shaping, not naming. A non-matching token is DROPPED, not
+# escaped: an unparseable origin can only shrink the allow-list back
+# toward 'self', the safe direction.
+_FRAME_ANCESTORS_TOKEN_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%!$&()*=:@%-]*)?$"
+)
+
+
+def _csp_frame_ancestors() -> str:
+    """frame-ancestors value for the console CSP: 'self' plus any exact
+    origins the operator allow-listed (settings.csp_frame_ancestors,
+    comma-separated). Empty setting = 'self' only — the audit's fix for the
+    previous 'self' https: default that let any https origin frame the
+    admin/leader consoles."""
+    tokens = []
+    for raw in settings.csp_frame_ancestors.split(","):
+        origin = raw.strip()
+        if origin and _FRAME_ANCESTORS_TOKEN_RE.fullmatch(origin):
+            tokens.append(origin)
+    return "'self'" + ("" if not tokens else " " + " ".join(tokens))
 
 
 class ServerSpanMiddleware:
@@ -162,6 +189,46 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if hasattr(model_router, "start"):
         await model_router.start()
     await registry.refresh()
+    # Unpriced-model WARNING (audit 2026-11-10): a model with no model_costs
+    # row ledgers cost NULL, which every USD budget gate's SUM ignores — the
+    # gate is silently inert for that model (cost_fallback_per_m below is
+    # the billing answer). One best-effort WARNING at startup names them
+    # all; a cost-table fault must never block startup.
+    try:
+        # P10: hand the SAME guard the registry's model_type view, so the
+        # boot-time warning also names unit MISCONFIGURATIONS (a priced model
+        # whose model_costs.unit cannot match the unit its route bills — the
+        # rows would ledger NULL instead of a wrong-rate bill). Injected as a
+        # module attribute rather than a second parameter so the pinned
+        # one-line guard call below keeps its shape
+        # (tests/test_audit_20261110_ops.py); core.costs stays import-light.
+        def _pool_types(name: str) -> set[str]:
+            pool = model_router.pool(name)
+            return {str(ep.model_type) for ep in pool.endpoints} if pool is not None else set()
+
+        costs.types_lookup = _pool_types
+        await costs.warn_unpriced(model_router.models())
+    except Exception:
+        log.debug("startup: unpriced-model check skipped", exc_info=True)
+    # Model groups (F3): load the group map once so the very first request can
+    # classify a group name, then start the load-snapshot loop that feeds the
+    # member pick (queue depth per member, refreshed off the request path).
+    # Both are best-effort and gated on the flag: a group feature must never
+    # block startup, and with the flag off (the default) this block is one
+    # boolean read.
+    if settings.model_groups_enabled:
+        try:
+            from .core import model_groups as _model_groups
+
+            await _model_groups.load(force=True)
+        except Exception:
+            log.warning("model groups: initial load failed — the TTL refresh will retry", exc_info=True)
+        try:
+            from .core import load_snapshot as _load_snapshot
+
+            _load_snapshot.start()
+        except Exception:
+            log.warning("model groups: load snapshot did not start — picks fall back to random", exc_info=True)
     # Active health probe (GOAL A): passive availability (breaker-not-cooling,
     # traffic-fed) leaves an idle-but-broken model reading healthy forever.
     # The probe gives Pool.healthy() a traffic-independent signal (GET
@@ -191,6 +258,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Before the pool closes: the watcher's watermark query needs a
         # connection, and a cancel mid-query must not outlive db.close().
         await registry.stop_watcher()
+        # Model groups: stop the load-snapshot loop during teardown so it
+        # cannot outlive the app (its refresh reads Prometheus through
+        # endpoint_metrics; stop() is a no-op when it never started).
+        if settings.model_groups_enabled:
+            try:
+                from .core import load_snapshot as _load_snapshot
+
+                await _load_snapshot.stop()
+            except Exception:
+                log.warning("model groups: load snapshot stop failed", exc_info=True)
         await health_probe.stop()
         await housekeeping.stop()
         if settings.offpeak_enabled:
@@ -308,18 +385,24 @@ def create_app() -> FastAPI:
             # - img-src allows https: — the chat console renders markdown
             #   ![](https://...) images by design (charset-restricted, escaped,
             #   lazy, no referrer); scripts/styles stay locked to 'self'.
-            # - frame-ancestors 'self' https: — both pages are deliberately
-            #   iframe-safe (sessionStorage wrappers exist FOR iframe-blocked
-            #   storage), so 'none' would break console embedding. Script
-            #   execution stays same-origin; a framing https: parent cannot
-            #   read the page, only display it.
+            # - frame-ancestors: 'self' plus the operator's exact allow-list
+            #   (_csp_frame_ancestors / settings.csp_frame_ancestors). The
+            #   pages REMAIN deliberately iframe-safe (sessionStorage
+            #   wrappers exist FOR iframe-blocked storage) — the change is
+            #   WHO may frame them: the old 'self' https: default let any
+            #   https origin frame the consoles, a clickjacking surface on
+            #   destructive admin actions (audit P3, 2026-11-10). A site
+            #   that embeds the console opts in by naming those exact
+            #   origins; everyone else gets 'self'. Script execution stays
+            #   same-origin; a framing parent cannot read the page, only
+            #   display it.
             "Content-Security-Policy": (
                 "default-src 'self'; "
                 "script-src 'self' 'unsafe-inline'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "connect-src 'self'; "
                 "img-src 'self' data: https:; "
-                "frame-ancestors 'self' https:; "
+                f"frame-ancestors {_csp_frame_ancestors()}; "
                 "base-uri 'self'; "
                 "form-action 'self'"
             ),

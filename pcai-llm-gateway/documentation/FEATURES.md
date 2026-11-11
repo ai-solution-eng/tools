@@ -340,6 +340,48 @@ each hop take".
   and the relay turn proceeds untouched. Debugging aid, not a second
   transcript store.
 
+## Prometheus sweep agent (built-in preset)
+
+- **What**: `prometheus-sweep` — a curated agent profile that turns the
+  cluster's current alert set into one prioritized, evidence-backed JSON
+  report. It is not a new route: it is an agent profile installed through
+  `POST /admin/agents` (an upsert) and selected by naming it as the request
+  `model`. The definition lives in `core/agent_presets` (reviewed and tested
+  as code); `scripts/seed_agents.py` seeds it as config. No boot-time writes.
+- **Report-only by construction**: its servers are `prometheus`, `k8s-ops`
+  and `logsearch`, each narrowed to read tools. `applygate` is absent,
+  k8s-ops is narrowed past exec/kubectl/secrets, logsearch past its export
+  writer — the strongest mutation the agent could attempt is one its surface
+  does not contain. The prompt states the same contract; the grant
+  intersection is what enforces it.
+- **Deterministic where it matters**: a model writes the prose, so runs are
+  not byte-identical. What IS fixed: the numbered tool order (one
+  `prom_alerts`, one `prom_rules`, then at most two evidence calls per
+  defect), the clustering rules (one defect per alertname+namespace+workload;
+  a stuck Job's three alerts are one defect), the priority ladder (P1 active
+  damage / self-escalating, P2 schedule, P3 noise or expected), the
+  classification vocabulary (leak, plateau, undersized, crashloop, capacity,
+  config-drift, monitoring), the sort keys, and exactly one JSON object as the
+  reply. `prompt_version` is echoed into every report, so a stored report's
+  provenance is answerable without reading the agent row.
+- **Alert hygiene is encoded**: a cache-tier workload at its plateau (HiCache
+  predictor, KV/engram table sized to a budget) is P3 with a growth-ladder
+  recommendation, never a P1 — the plateau IS the healthy steady state, and
+  chronic criticals train operators to ignore alerts.
+- **Honest about budget**: the relay's per-turn tool budget
+  (`toolRelayMaxIterations` — chart default 32, the reference g2 site 16) is
+  smaller than a full sweep. The agent investigates top-down, P1 first, and
+  marks what it did not reach `unverified` with cause "not investigated: tool
+  budget"; every firing alert still appears in exactly one defect or in
+  `noise`, and a relay that ends tool use for budget still gets a report. A
+  profile offering the agent should raise `tool_relay_budget`.
+- **Install**: `scripts/seed_agents.py` — `--dry-run` validates server names
+  against the live registry and tool names against each server's live
+  `list_tools`; `--offer-to-profile` appends the agent to a profile's
+  selection (union, never removal). An unreachable MCP server downgrades its
+  name check to a warning: installing config must not depend on every server
+  being up.
+
 ## Saved conversations (per key group)
 
 - **Key-GROUP-scoped server-side transcripts**: every conversation belongs to
@@ -422,6 +464,25 @@ each hop take".
   replacement. Admin-governed
   eligibility: `users.self_mint_enabled` (a first mint is default-eligible)
   via `GET/PUT /admin/keys/self-mint-eligibility`.
+- **The minted profile is tiered by IdP groups (2026-11-08)**: a tenant
+  holds a DEFAULT SSO profile and an optional ADMIN profile (`PUT
+  /admin/tenants/{id}/sso-default-profile`; console Enroll tab). At mint
+  AND rotate, when the caller's IdP groups intersect the tenant's
+  `sso_admin_groups` list the admin profile is stamped instead of the
+  default; the default profile otherwise; the bare fixed grant when
+  neither slot is set. The PCAI admin tier is the literal `admin` in the
+  Keycloak `groups` claim — there is no `member` string; absence of a
+  match is "not an admin". When token validation is configured, the groups
+  come from the JWKS-VALIDATED id_token, which outranks the proxy-injected
+  `X-Auth-Request-Groups` header — but ONLY for the token's OWN subject
+  (sub / email / preferred_username): a valid token identifying a DIFFERENT
+  person is ignored, so a leaked admin id_token cannot stamp its groups
+  onto another caller's key. The header stays the fallback — an IdP blip
+  must not fail a mint the chain already authenticated. On ROTATE the user
+  row follows the tier when it points at one of the tenant's two SSO
+  slots; a hand-assigned profile is never re-scoped. Scopes, the bare
+  grant and the eligibility gate are unchanged; an empty group list turns
+  the split off and mints byte-identically to the single-profile behavior.
 - **The chat page keeps the association (2026-11-03)**: the minted key is
   stored with SSO PROVENANCE, so the chip keeps rendering "Signed in as
   <subject> · oidc" after sign-in and across reloads — boot auto-connects
@@ -746,6 +807,18 @@ stateless streamable-http).
   404 ("routing requires a profile model ordering"); `routing__X` →
   serve X pinned.
 
+- **Hard models as rungs (2026-11-08)**: a chat MODEL GROUP and — with
+  `PCAI_LLM_ROUTING_AGENTS_ENABLED` on — the key's OFFERED AGENTS are
+  routing candidates alongside pools. A group is ONE rung whose member is
+  picked at request time (and pinned); an agent is a hard model whose tool
+  surface + system prompt is applied when the router picks it (safe:
+  routing runs BEFORE the request is prepared). A group may sit on the
+  profile ladder (one rung instead of three) and in the routing allowlist;
+  agents are PER-KEY (the profile's agent menu), so they join the window
+  automatically at the cheap end — their capability is not declared on the
+  ladder. Both are advertised as `routing__<name>` and can be named as a
+  ceiling.
+
 - **Routing score** (deterministic, pre-generation, no extra model
   calls): chars/4 over every message's content (the system prompt rides
   along) + tool-definition JSON bytes // 64 + 100 per message beyond the
@@ -777,8 +850,9 @@ stateless streamable-http).
 
 - **`GET /v1/models` routing entries**: when the CALLING key's profile
   policy is shadow/active and the master switch is on, the listing
-  appends `routing` + `routing__{X}` for each registered chat model the
-  key may use, each with `"pcai": {"type": "routing"}` and — when capacity is
+  appends `routing` + `routing__{X}` for each registered chat model, chat
+  group, and (with the agents flag) offered agent the key may use, each with
+  `"pcai": {"type": "routing"}` and — when capacity is
   known — `pcai.capacity` aggregated over that entry's floor..ceiling window
   (`ok` = at least one rung can serve, `warn` = the tightest rung's band,
   `candidates` = {ok, blocked} counts). Off-policy keys
@@ -1051,6 +1125,41 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   entity-escaped BEFORE any transform and link URLs are charset-restricted
   (https? only, no quotes/whitespace), so upstream markup can never reach
   `innerHTML` as tags. No raw-HTML passthrough, no images/headings/tables.
+- **KV cache detail on `GET /admin/endpoint-metrics` (2026-11-08)**: the
+  rows gain `kv_*` fields read from the inference servers' own gauges
+  (SGLang-only — vLLM rows read null): the GPU KV pool (`kv_gpu_pct` =
+  the ACTIVE usage ratio — evictable radix-cache tokens are not holding
+  it — plus the absolute used / evictable / max token gauges), the
+  HiCache host-RAM L2 (`kv_host_*` — occupancy near 100% at
+  write_through steady state is normal, not a fault), and the storage
+  tier, which has NO occupancy gauge — `kv_disk_configured` (bool) +
+  `kv_disk_hit_tps` (activity only) are all the disk story can be. The
+  Off-peak tab's per-model cards render the strip under the sparkline
+  (tiers with no data omitted entirely, replicas aggregated, the
+  per-replica breakdown in the row tooltip). The same module's
+  `load_rows()` is the 3-query load snapshot the model groups'
+  background refresher consumes.
+- **All-models cache utilization summary on the Off-peak tab (2026-11-09)**:
+  a card above the per-model evaluators aggregates EVERY endpoint row —
+  including models with no per-model evaluator — into POD MEMORY (the pod's
+  container working set vs its memory limit), RAM (cached) (host HiCache L2 pool
+  occupancy, tokens), and DISK (GPU active usage stays on the per-model
+  cards: vLLM reports a ratio with no absolute pool size). POD MEMORY is the
+  raw utilization (`container_memory_working_set_bytes` /
+  `kube_pod_container_resource_limits`), summed over the cache-bearing pods —
+  process memory (weights + host pool + runtime), not a token-to-byte
+  conversion. RAM (cached) is the same `kv_host_used_tokens` /
+  `kv_host_total_tokens` the per-model strips read, summed across pods
+  (weighted percent, never a mean of ratios). The engine exports NO storage
+  occupancy gauge, so a real disk number is read from the L3 VOLUMES:
+  `settings.endpointMetricsDiskSelector` (env
+  `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR`) is a PromQL label selector
+  over `kubelet_volume_stats_*` naming them — on G2 the Mooncake store's SSD
+  offload PVCs — and `GET /admin/endpoint-metrics` gains
+  `disk: {used_bytes, total_bytes, pct, selector}` (null when unset/unknown,
+  never a fabricated 0%). Without a volume number the summary falls back to
+  L3 activity/status; two extra PromQL calls run per snapshot only when the
+  selector is set.
 
 ## Router extras
 
@@ -1118,6 +1227,55 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   ERROR after this long, never a hang; per-tool `timeout_s` values from an
   offer are clamped to `[1, timeout]`).
 
+## Model groups
+
+Named sets of EQUIVALENT chat models, selected by live load instead of a
+fixed order — the load-balanced sibling of the ordered fallback chain
+(§ Router extras): a chain says "try these in order", a group says "any
+of these, take the idle one".
+
+- **What a group is** (`model_groups` table; admin CRUD + read-only
+  preview via `GET/PUT/DELETE /admin/model-groups` and `POST
+  /admin/model-groups/{name}/preview`, API.md § 4.3). A group is a
+  first-class ROUTE TARGET: a request may name it directly, a per-model
+  fallback chain may list it, and `GET /v1/models` advertises it
+  (`owned_by: "group"`, `pcai.type: "group"`) when the key may use it.
+- **The pick** (per request, only with `model_groups_enabled` on):
+  power-of-two over live queue depth — two members sampled, the one with
+  the lower MINIMUM queue across its endpoints wins. Load is a BACKGROUND
+  Prometheus snapshot (refreshed every `model_group_load_refresh_s`, 5 s;
+  NEVER queried on the request path — the pick reads the in-memory view);
+  a snapshot older than `model_group_load_stale_s` (30 s) degrades the
+  pick to random, so a Prometheus outage must never stop model selection.
+  A member with no load data draws a NEUTRAL rank over the OBSERVED score
+  range (a single observed value ties it; no data at all is uniform
+  [0,1]) — an unmonitored model is neither herded onto nor starved from.
+- **The pins**: the conversation is pinned to the chosen member (`grp:`
+  stickiness scope), and — with session affinity enabled too — to one of
+  its endpoints (`ep:` scope), so the next turn does not re-prefill. A
+  pin sticks until the member leaves the group or the key's ACL, or the
+  member's WHOLE pool is unhealthy — one failed call keeps it (re-picking
+  would cost a full re-prefill); the endpoint pin's drop-on-failure is
+  unchanged.
+- **Policy and budgets**: the SELECTED member bills and carries the ACL —
+  a group never bypasses `allowed_models` or budgets (a key that may use
+  one member may use the group; one that may use none gets 503 when no
+  member qualifies — also the all-unhealthy answer). Groups never enter
+  budget-capacity maps or the routing ladder.
+- **v1 limits, stated**: chat members only; ONE level (a member may not
+  be a group); `load` is the only policy (any other value is refused at
+  save time, not silently coerced); no group-level budgets; groups do NOT
+  enter profile ordering or the `auto` cascade. `X-PCAI-Group` names
+  the group on the response (the member rides `X-PCAI-Served-Model`, the
+  endpoint `X-PCAI-Endpoint`); a group reached via a fallback-chain hop
+  is named by those two headers instead.
+- **Config**: `PCAI_LLM_MODEL_GROUPS_ENABLED` (default off — off makes a
+  group name unroutable while the admin API still stores the rows and
+  routing is byte-identical), `PCAI_LLM_MODEL_GROUP_LOAD_REFRESH_S` (5),
+  `PCAI_LLM_MODEL_GROUP_LOAD_STALE_S` (30); chart keys
+  `settings.modelGroupsEnabled` / `modelGroupLoadRefreshS` /
+  `modelGroupLoadStaleS`.
+
 ## Admin mutation audit trail
 
 The control-plane twin of the usage ledger: the ledger answers "what did
@@ -1182,6 +1340,7 @@ The full method/path/auth/body/response reference now lives in
 | Tenancy | `/admin/tenants`, `/admin/tenants/{id}/users` | admin key |
 | Keys | `/admin/keys` (+ PATCH, rotate, budgets, usage, mcp-grants, mcp-creds) | admin key |
 | Models | `/admin/models` (+ DELETE, probe, fallbacks GET/PUT), `GET /admin/endpoints` | admin key |
+| Model groups | `/admin/model-groups` (+ DELETE, `POST /admin/model-groups/{name}/preview`) | admin key |
 | MCP admin | `/admin/mcp-servers` (+ PATCH, tools), `POST /admin/registry/refresh` | admin key |
 | Costs | `POST/GET /admin/costs` | admin key |
 | Profiles | `/admin/profiles` (+ DELETE), `PUT /admin/users/{id}/profile` | admin key |

@@ -24,7 +24,11 @@ spec:
       http:
         paths:
           {{- /* /admin intentionally NOT exposed by default — add a path
-               block here only with platform-level auth in front. */}}
+               block here only with platform-level auth in front. The
+               catch-all "/" path this comment used to sit above ROUTED
+               /admin (and /v1/enroll, /v1/keys/for-me) anyway — it was
+               dropped (audit 2026-11-10): explicit paths only, and the
+               chat UI stays reachable at the /ui alias. */}}
           - path: /v1
             pathType: Prefix
             backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
@@ -38,9 +42,6 @@ spec:
             pathType: Prefix
             backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
           - path: /ui
-            pathType: Prefix
-            backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
-          - path: /
             pathType: Prefix
             backend: { service: { name: {{ .Values.deployment.name }}-service, port: { number: {{ .Values.service.port }} } } }
 {{- end }}

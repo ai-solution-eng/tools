@@ -287,3 +287,136 @@ def test_artifact_path_traversal_refused(tmp_path):
         mgr.artifact_path("some-run", "../../etc/passwd")
     with pytest.raises(R.BenchError):
         mgr.artifact_path("some-run", ".hidden")
+
+
+# ---------------------------------------------------------------------------
+# model-list probe for the chat page's Model dropdown (POST /api/models)
+# ---------------------------------------------------------------------------
+
+
+def _fake_discovery(monkeypatch, ids=("qwen3-32b",), error=""):
+    """Patch the shared discovery probe; return the captured call arguments."""
+    from model_benchmarker.utils import pcai_model_classes as P
+
+    seen: dict = {}
+
+    def fake(base_url, api_key="", remote=True, timeout=10.0):
+        seen.update(base_url=base_url, api_key=api_key, remote=remote, timeout=timeout)
+        return list(ids), error
+
+    monkeypatch.setattr(P, "discover_model_ids", fake)
+    return seen
+
+
+def test_list_models_for_target_local_rewrite_and_operator_key(monkeypatch):
+    monkeypatch.setenv(R.ENDPOINT_KEYS_ENV, json.dumps({"https://m.serving.pcai.example.net": "tok-op"}))
+    seen = _fake_discovery(monkeypatch)
+    out = R.list_models_for_target("https://m.serving.pcai.example.net/", {"target_usage": "local"})
+    # the probe follows the RESOLVED in-cluster URL, like the run will
+    assert seen["base_url"] == "http://m.svc.cluster.local/v1"
+    assert seen["api_key"] == "tok-op"  # operator key for the typed URL
+    assert seen["remote"] is False
+    assert out == {
+        "models": ["qwen3-32b"],
+        "source": "http://m.svc.cluster.local/v1/models",
+        "target_url": "http://m.svc.cluster.local",
+        "truncated": False,
+        "error": None,
+    }
+
+
+def test_list_models_for_target_non_serving_url_and_user_key_wins(monkeypatch):
+    seen = _fake_discovery(monkeypatch, ids=("a", "a", "b"))
+    out = R.list_models_for_target("https://gpu.example.net:8443", {"target_usage": "remote"}, api_key="sk-user")
+    assert seen["base_url"] == "https://gpu.example.net:8443/v1"
+    assert seen["api_key"] == "sk-user"
+    # chat runs never pass --remote, so the engine's plain client is used even
+    # when the page's toggle says remote
+    assert seen["remote"] is False
+    assert out["models"] == ["a", "b"]  # gateway aliases repeating an id collapse
+    assert "sk-user" not in json.dumps(out)
+
+
+def test_list_models_for_target_remote_toggle_still_resolves_in_cluster(monkeypatch):
+    """Parity with the run: benchmark_chat runs without --remote, so a
+    .serving. URL is rewritten in-cluster even when the toggle says remote."""
+    seen = _fake_discovery(monkeypatch)
+    out = R.list_models_for_target("https://m.serving.pcai.example.net", {"target_usage": "remote"})
+    assert seen["base_url"] == "http://m.svc.cluster.local/v1"
+    assert out["target_url"] == "http://m.svc.cluster.local"
+
+
+def test_list_models_for_target_reachable_but_empty(monkeypatch):
+    _fake_discovery(monkeypatch, ids=())
+    out = R.list_models_for_target("http://h:8000", {"target_usage": "local"})
+    assert out["models"] == []
+    assert out["error"] is None  # not a failure: the endpoint simply lists none
+
+
+def test_list_models_for_target_offers_only_launchable_ids(monkeypatch):
+    _fake_discovery(
+        monkeypatch,
+        ids=("qwen3-32b", "Qwen/Qwen3-8B", "bad id", "x" * 201, "semi;colon"),
+    )
+    out = R.list_models_for_target("http://h:8000", {"target_usage": "local"})
+    # the dropdown must not offer an id POST /api/runs would reject
+    assert out["models"] == ["qwen3-32b", "Qwen/Qwen3-8B"]
+
+
+def test_list_models_for_target_redacts_the_key_from_errors(monkeypatch):
+    key = "sk-super-secret-123"
+    _fake_discovery(monkeypatch, ids=(), error=f"Illegal header value b'Bearer {key}'")
+    out = R.list_models_for_target("http://h:8000", {"target_usage": "local"}, api_key=key)
+    assert key not in out["error"]
+    assert "***" in out["error"]
+
+
+def test_list_models_for_target_fails_soft(monkeypatch):
+    _fake_discovery(monkeypatch, ids=(), error="ConnectError: refused")
+    out = R.list_models_for_target("http://h:8000", {})
+    assert out["models"] == []
+    assert out["error"] == "ConnectError: refused"
+    # default usage is remote; a non-serving URL passes through unchanged
+    assert out["target_url"] == "http://h:8000"
+
+
+def test_list_models_for_target_flattens_the_error(monkeypatch):
+    _fake_discovery(monkeypatch, ids=(), error="HTTPStatusError: 401 Unauthorized\nFor more information...")
+    out = R.list_models_for_target("http://h:8000", {})
+    assert "\n" not in out["error"]
+    assert out["error"] == "HTTPStatusError: 401 Unauthorized For more information..."
+
+
+def test_list_models_for_target_caps_the_list(monkeypatch):
+    ids = [f"model-{i}" for i in range(R.MAX_MODELS + 5)]
+    _fake_discovery(monkeypatch, ids=ids)
+    out = R.list_models_for_target("http://h:8000", {"target_usage": "local"})
+    assert len(out["models"]) == R.MAX_MODELS
+    assert out["truncated"] is True
+
+
+def test_list_models_for_target_rejects_bad_target(monkeypatch):
+    _fake_discovery(monkeypatch)  # would answer if reached
+    with pytest.raises(R.BenchError):
+        R.list_models_for_target("ftp://nope", {})
+
+
+def test_convert_remote_url_to_local_only_rewrites_serving_urls():
+    """The docstring/UI promise: non-serving URLs are never mangled. The old
+    implementation downgraded every https URL to http, breaking public APIs."""
+    assert R.convert_remote_url_to_local("https://m.serving.pcai.example.net") == "http://m.svc.cluster.local"
+    assert R.convert_remote_url_to_local("http://m.serving.pcai.example.net") == "http://m.svc.cluster.local"
+    assert R.convert_remote_url_to_local("https://api.example.com/v1") == "https://api.example.com/v1"
+    assert R.convert_remote_url_to_local("http://h:8000") == "http://h:8000"
+    assert R.apply_target_usage("https://api.example.com/", {"target_usage": "local"}) == "https://api.example.com"
+
+
+def test_apply_target_usage_strips_trailing_slashes():
+    """The engines append '/v1' or path templates, so one normalised form is
+    shared by the run and the model probe (a pasted trailing slash must not
+    turn into '//v1')."""
+    assert R.apply_target_usage("http://h:8000/", {}) == "http://h:8000"
+    assert (
+        R.apply_target_usage("https://m.serving.pcai.example.net/", {"target_usage": "local"})
+        == "http://m.svc.cluster.local"
+    )

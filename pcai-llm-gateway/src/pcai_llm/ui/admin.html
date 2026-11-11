@@ -1,10 +1,23 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PCAI LLM Gateway — Admin</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTAiIGZpbGw9IiMwMWE5ODIiLz48ZyBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMzYiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDQgMjQpIHNjYWxlKDAuMDg4OSkiPjxwYXRoIGQ9Ik0xOCAxODBWMG0xNTQgMTgwVjBNMTggODloMTM3bTk1IDkxVjBtMCAxOGgxMDJhMzIgMzIgMCAwIDEgMCAxMDBIMjUwbTIyMi02N1YxOGgxNThNNjMwIDE2Mkg0NzJWODZoMTU4Ii8+PC9nPjwvc3ZnPgo=">
+<!-- Pre-paint theme resolver: read the saved choice BEFORE the stylesheet is
+     parsed so a pinned Light/Dark never flashes the dark default. Anything that
+     is not exactly "light"/"dark" — unset, corrupt, a legacy value — is Auto.
+     Storage can be BLOCKED (iframes / privacy mode) and then getItem throws;
+     the try/catch degrades to Auto instead of killing the page. -->
+<script>
+  (function () {
+    var t = "auto";
+    try { t = localStorage.getItem("pcai-llm-theme") || "auto"; } catch (e) {}
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <style>
   :root {
     color-scheme: dark;
@@ -20,6 +33,26 @@
     --ushade-2: rgba(255,255,255,.06); --ushade-3: rgba(255,255,255,.08);
     --ushade-4: rgba(255,255,255,.10); --ushade-5: rgba(255,255,255,.12);
   }
+  /* Auto (the default state) follows the OS: the light ramp applies under
+     prefers-color-scheme, scoped to [data-theme="auto"] so an explicit Light or
+     Dark choice always wins even when the OS disagrees.
+     KEEP IN SYNC with the explicit :root[data-theme="light"] block below — the
+     two blocks must carry identical declarations. */
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="auto"] {
+      color-scheme: light;
+      --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
+      --text: #191919; --dim: #5f6773;
+      --accent: #00815f; --accent-contrast: #ffffff;
+      --accent2: #2c6a9e; --user-bubble: #e3f2ee;
+      --err: #b42323; --err-bg: rgba(180,35,35,.06);
+      --focus: #00815f55;
+      --ushade-0: rgba(0,0,0,.03); --ushade-1: rgba(0,0,0,.05);
+      --ushade-2: rgba(0,0,0,.07); --ushade-3: rgba(0,0,0,.09);
+      --ushade-4: rgba(0,0,0,.11); --ushade-5: rgba(0,0,0,.13);
+    }
+  }
+  /* KEEP IN SYNC with the Auto media block above — identical declarations. */
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: #ffffff; --panel: #f5f7fa; --border: #d8dde4;
@@ -55,8 +88,17 @@
     border: 1px solid var(--border); border-radius: 7px; padding: 5px 10px; }
   header a.backlink:hover { border-color: var(--accent2); }
   header .spacer { flex: 1; }
-  #theme { background: none; border: 1px solid var(--border); border-radius: 6px;
-           padding: 4px 9px; cursor: pointer; color: var(--text); }
+  /* Theme control: three-way Auto / Light / Dark segmented pill (same shape in
+     all three PCAI consoles). */
+  .theme-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
+               overflow: hidden; }
+  .theme-seg button { background: transparent; color: var(--dim); border: 0;
+                      padding: 4px 9px; font: inherit; font-size: 12px; line-height: 1.4;
+                      cursor: pointer; }
+  .theme-seg button:hover { color: var(--text); }
+  .theme-seg button.on { background: var(--accent); color: var(--accent-contrast);
+                         font-weight: 600; }
+  .theme-seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   /* Sticky tab bar (2026-10-23): the admin page runs long enough that the
      tab strip scrolled away and you had to scroll back to the top to change
      sections. `top` is the header height so it parks directly under the
@@ -358,7 +400,13 @@
   <input id="adminkey" type="password" placeholder="Admin key (PCAI_LLM_ADMIN_API_KEYS)" aria-label="Admin key" autocomplete="off">
   <button id="connect" class="btn">Connect</button>
   <span id="conn" class="muted"></span>
-  <button id="theme" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  <!-- Auto follows the OS; Light/Dark pin and are remembered. The #theme id is
+       the shared anchor the other two consoles use — keep it. -->
+  <div class="theme-seg" id="theme" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 <!-- Grouped tabs (5a, 2026-10-23 wave): four intent groups — identity
      (keys/profiles/enroll), inventory (models/mcp), observability
@@ -387,6 +435,7 @@
   </div>
   <div class="navgroup">
     <button data-tab="offpeak">Off-peak</button>
+    <button data-tab="groups">Model groups</button>
     <button data-tab="distiller">Memory Distiller</button>
     <button data-tab="routing">Routing</button>
   </div>
@@ -788,11 +837,20 @@
     <table id="usage-by-key"><thead>
       <tr><th style="width:1.4em"></th><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted) — per KEY, so a key that leans on a cacheable model shows its own rate">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
     </thead><tbody></tbody></table>
-    <h2 style="margin-top:18px">Pricing (USD per 1M tokens) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time</span></h2>
+    <h2 style="margin-top:18px">Pricing (USD per 1M units) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time. Unit (P10): what a “1M” of the rates is — voice models bill per second, others per token; a unit that cannot match the model's route is refused (ledger NULL) and reported, never billed at the wrong rate</span></h2>
     <div class="card">
       <div class="row">
         <label>Model
           <select id="c-model"></select>
+        </label>
+        <label title="token | char | second | image | request — what the per-1M rates are denominated in. Voice models bill per second of audio; the default 'token' matches every pre-existing row.">Unit
+          <select id="c-unit">
+            <option value="token" selected>token</option>
+            <option value="char">char</option>
+            <option value="second">second</option>
+            <option value="image">image</option>
+            <option value="request">request</option>
+          </select>
         </label>
         <label>Input $/1M <input id="c-in" type="number" step="0.000001" value="0" style="width:110px"></label>
         <label>Output $/1M <input id="c-out" type="number" step="0.000001" value="0" style="width:110px"></label>
@@ -800,8 +858,9 @@
         <button class="btn" id="c-save">Save price</button>
       </div>
     </div>
+    <p id="costs-unpriced" style="margin:8px 0 2px;font-size:12.5px;color:var(--warn,#e6aa28)" hidden></p>
     <table id="costs-table"><thead>
-      <tr><th>Model</th><th>Input $/1M</th><th>Output $/1M</th><th>Cached $/1M</th><th>Updated</th><th></th></tr>
+      <tr><th>Model</th><th>Unit</th><th>Input $/1M</th><th>Output $/1M</th><th>Cached $/1M</th><th>Updated</th><th></th></tr>
     </thead><tbody></tbody></table>
     <h2 style="margin-top:18px">Recent usage (ledger)</h2>
     <div class="row" style="margin-bottom:8px">
@@ -853,7 +912,14 @@
         <label>Limit <input id="a-limit" type="number" value="100" min="1" max="500" style="width:80px"></label>
         <button class="btn" id="a-reload">Refresh</button>
         <a class="ghost" id="a-csv" href="#" download="admin-audit.csv" style="padding:6px 12px;border:1px solid var(--border);border-radius:7px;font-size:13px;color:var(--text);text-decoration:none">export CSV</a>
+        <button class="btn" id="a-verify" title="Walk both hash-chained trails and check the tail anchor">verify chain</button>
       </div>
+      <!-- Tamper evidence (2026-11-10): the trails are hash-chained AND the
+           tail is HMAC-anchored outside the chain. Without a consumer here the
+           whole signal was invisible — an operator could only see ok:true from
+           the API. anchor_status distinguishes a healthy chain from an
+           UNANCHORED one, which is NOT the same as verified. -->
+      <p class="hint" id="a-chain" style="margin:8px 0 2px" hidden></p>
     </div>
     <table id="audit-table"><thead>
       <tr><th>Time</th><th>Actor</th><th>Source</th><th>Action</th><th>Resource</th><th>Details</th><th>Request</th><th>IP</th></tr>
@@ -872,6 +938,12 @@
         <label>Profile for SSO-minted keys
           <select id="sso-profile"><option value="">— none (bare mint grant) —</option></select>
         </label>
+        <label>Admin-tier profile
+          <select id="sso-admin-profile"><option value="">— none (no tier split) —</option></select>
+        </label>
+        <label>Admin groups
+          <input id="sso-admin-groups" placeholder="admin" style="width:140px">
+        </label>
         <button class="btn" id="sso-prof-save">Save</button>
         <button class="ghost mini" id="sso-bind" title="Bind every user of this tenant who has NO profile to the SSO default above — the backfill for people who signed in before the default existed. Hand-assigned users are never re-scoped; idempotent, so run it again after adding people.">bind existing users</button>
       </div>
@@ -879,6 +951,7 @@
         <li>The mint's tenant is the deployment's <code>tokenShadowTenantId</code>. Clearing the profile returns mints to the bare grant (60 rpm · 100k tpm, no budgets or grants).</li>
         <li>Edit the profile itself under <b>Profiles</b>.</li>
         <li>Users who signed in before this setting existed have no profile. <b>Bind existing users</b> backfills them — idempotent, and a user placed by hand is never re-scoped. Until then their keys carry the stamped presets, but cascade ordering, routing, off-peak and agents ignore the profile.</li>
+        <li><b>Admin tier</b> — a mint whose SSO groups intersect <b>Admin groups</b> (comma-separated, case-sensitive) gets the <b>Admin-tier profile</b> instead; the token's JWKS-validated groups win over the proxy headers when both are present. Leave <b>Admin groups</b> empty to turn the tier split off — every mint uses the default profile above.</li>
       </ul></div>
     </div>
     <div class="card">
@@ -939,7 +1012,7 @@
         <span id="op-pill" class="pill">—</span>
         <span id="op-billing" class="muted"></span>
         <span style="flex:1"></span>
-        <button class="ghost mini" id="op-reload" title="Reload off-peak status">↻ reload</button>
+        <button class="ghost mini" id="op-reload" title="Reload off-peak status and KV stats (forces a fresh metrics read)">↻ reload</button>
       </div>
       <p id="op-hint" class="muted" style="margin:0 0 10px"></p>
       <table id="op-table"><tbody>
@@ -953,11 +1026,64 @@
       </tbody></table>
     </div>
     <div class="card">
+      <h2>Cache utilization <span class="muted">— all models</span></h2>
+      <p class="hint" style="margin:0 0 8px">POD MEMORY is the pod's working set against its memory limit; RAM (cached) is the HiCache host prefix-cache pool (tokens); DISK is the L3 volume occupancy (or activity when only counters exist). Aggregated over the cache-bearing endpoints. GPU stays on the per-model cards.</p>
+      <div id="op-cache" class="muted">—</div>
+    </div>
+    <div class="card">
       <h2>Per-model utilization</h2>
       <p class="hint" style="margin:0 0 8px">One row per model with its own PromQL. This is the evaluator state the discount reads — a model with no query configured has no row.</p>
       <div id="op-models"></div>
     </div>
   </section>
+
+  <!-- ============ MODEL GROUPS (load-balanced sets of equivalent models) ============ -->
+  <!-- v1 semantics: a group is a named set of equivalent registered CHAT pools.
+       A request naming the group picks a member by LIVE load (power-of-two
+       over the members' queue depth), the conversation pins to that member,
+       and the SELECTED member bills and carries its ACL — the group never
+       bypasses budgets or allowed_models. -->
+  <section id="tab-groups">
+    <div class="card">
+      <h2>Model groups</h2>
+      <p class="hint" style="margin:0 0 8px">A group is a named set of equivalent registered models. A request naming the group picks a member by LIVE load, the conversation is pinned to that member, and the <b>selected member</b> bills and carries its ACL — the group never bypasses budgets or <span class="mono">allowed_models</span>. Members are one level: a member may not itself be a group. While enabled, a group is advertised in <span class="mono">/v1/models</span> and usable as a direct model id or a fallback-chain entry.</p>
+      <table id="mg-table"><thead>
+        <tr><th>Group</th><th>Type</th><th>Members</th><th>Policy</th><th>Description</th><th>Created</th><th></th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2 id="mg-form-title">Create a model group</h2>
+      <p class="hint" style="margin:0 0 8px">Save upserts by name: an existing group is replaced WHOLE — members not listed are dropped. A row's <i>edit</i> button loads the group here.</p>
+      <div class="row">
+        <label>Group name <input id="mg-name" placeholder="big-chat" style="width:200px"></label>
+        <label>Members (registered pools)
+          <select id="mg-members" multiple size="6" style="width:280px">
+            <option>(none — the registry is empty)</option>
+          </select>
+        </label>
+        <label>Policy
+          <select id="mg-policy"><option value="load">load</option></select>
+        </label>
+        <label>Description <input id="mg-desc" placeholder="8B-equivalent chat pool" style="width:240px"></label>
+        <button class="btn" id="mg-save">Save</button>
+      </div>
+      <div class="hint"><ul>
+        <li><b>Name</b> — a slug: no whitespace, no <span class="mono">/</span>, no markup or control characters, 200 chars max. The server also refuses the reserved names <span class="mono">auto</span> / <span class="mono">auto-demand-aware</span> and any name equal to a registered model (the reason rides the banner).</li>
+        <li><b>Members</b> — hold Ctrl/⌘ to select several. Every member must be a registered chat pool; the server rejects unknown names, group members, duplicates and &gt;32 members with the reason in the banner.</li>
+        <li><b>Policy</b> — only <span class="mono">load</span> exists in v1 (power-of-two choices over live queue depth); anything else is treated as load.</li>
+      </ul></div>
+    </div>
+    <div class="card">
+      <h2>Would pick now (live preview)</h2>
+      <p class="hint" style="margin:0 0 8px">The same power-of-two choice a real request would get: scores are the member's minimum request queue across its endpoints (no data = unknown, neither herded nor starved). A preview never pins or mutates anything.</p>
+      <div class="row" style="align-items:center">
+        <label>Group <select id="mg-preview" style="min-width:180px"><option value="">— pick a group —</option></select></label>
+        <button class="btn" id="mg-preview-go">Preview</button>
+      </div>
+      <div id="mg-preview-out" class="muted" style="margin-top:8px">pick a group, then press Preview</div>
+    </div>
+  </section>
+
   <section id="tab-distiller">
     <div class="card">
       <h2>Session memory distiller</h2>
@@ -1216,11 +1342,39 @@ const sessionStore = {
   set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
 };
 
+// ---- theme: Auto (default) / Light / Dark -------------------------------
+// Auto follows the OS live through the CSS media query; Light and Dark pin. The
+// choice lives in 'pcai-llm-theme' — the SAME key index.html and
+// team_leader.html use, so one browser setting covers all three consoles and a
+// saved Light/Dark choice from the old two-state toggle keeps working.
 const THEME_KEY = 'pcai-llm-theme';
-const applyTheme = t => { document.documentElement.dataset.theme = t; $('theme').textContent = t === 'light' ? '☾' : '☀'; };
-applyTheme(store.get(THEME_KEY) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
-$('theme').onclick = () => { const n = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  store.set(THEME_KEY, n); applyTheme(n); };
+// Auto is a real state (not "no choice"), so the control always shows which of
+// the three is in force.
+function markThemeButtons(t) {
+  for (const b of document.querySelectorAll('[data-theme-btn]')) {
+    const on = b.getAttribute('data-theme-btn') === t;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+function applyTheme(t) {
+  if (t !== 'light' && t !== 'dark') t = 'auto';
+  document.documentElement.dataset.theme = t;
+  store.set(THEME_KEY, t);
+  markThemeButtons(t);
+}
+applyTheme(store.get(THEME_KEY) || 'auto');
+for (const b of document.querySelectorAll('[data-theme-btn]')) {
+  b.addEventListener('click', () => applyTheme(b.getAttribute('data-theme-btn')));
+}
+// In Auto the palette follows the OS without JS; re-mark the control when the OS
+// flips so it stays truthful if anything else rewrote the attribute.
+try {
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (document.documentElement.dataset.theme !== 'auto') return;
+    markThemeButtons('auto');
+  });
+} catch (e) {}
 
 const key = () => $('adminkey').value.trim();
 // agentsLoaded distinguishes "this profile offers no agents" from "the agent
@@ -1229,7 +1383,7 @@ const key = () => $('adminkey').value.trim();
 // whole selection — the exact destructive-by-omission hazard the server's
 // three-state `agents` field exists to prevent (cross-validation 2026-10-29).
 const state = { profiles: [], models: [], mcpServers: [], agents: [], agentsLoaded: false,
-                tenants: [], users: [], traceUsers: [], guardrails: [] };
+                tenants: [], users: [], traceUsers: [], guardrails: [], modelGroups: [] };
 
 function banner(msg, cls = '', timeout, html = false) {
   // w6 F1 (REPRODUCED): msg goes through esc() UNLESS the caller composes
@@ -1339,7 +1493,7 @@ async function api(path, opts = {}) {
              // header that survives with the console's key in it (require_admin
              // still reads Authorization; on a skip-auth-classified /admin path
              // the chain leaves our Bearer intact and this header is inert).
-             ...(opts.body ? {} : {}), ...(opts.headers || {}) },
+             ...(opts.headers || {}) },
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
   } catch (e) {
@@ -1369,14 +1523,14 @@ async function api(path, opts = {}) {
 // ---------- keys ----------
 async function loadTenants() {
   state.tenants = await api('/tenants');
-  $('k-tenant').innerHTML = state.tenants.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
+  $('k-tenant').innerHTML = state.tenants.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
   $('k-tenant').onchange = loadUsers;
   await loadUsers();
 }
 async function loadUsers() {
   const tid = $('k-tenant').value;
   state.users = tid ? await api(`/tenants/${tid}/users`) : [];
-  $('k-user').innerHTML = state.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
+  $('k-user').innerHTML = state.users.map(u => `<option value="${esc(u.id)}">${esc(u.name)}</option>`).join('') || '<option value="">(none — create one)</option>';
 }
 window.newTenant = async btn => withBtn(btn, async () => {
   const name = prompt('New tenant name:'); if (!name) return;
@@ -1401,7 +1555,7 @@ async function loadProfiles() {
     catch (e) { state.agents = []; state.agentsLoaded = false; }
   }
   $('k-profile').innerHTML = '<option value="">— none —</option>' +
-    state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   renderProfilesTable();
   renderProfileEditorSelects();
 }
@@ -1786,9 +1940,44 @@ window.editKey = (btn, id) => withBtn(btn, async () => {
   let bud = { budgets: [] };
   try { bud = await api(`/keys/${id}/usage`); }
   catch (e) { bud = { budgets: [], _err: (e && e.message) || 'unavailable' }; }
+  // Profile picker + one-click preset apply (2026-11-09). The dialog used to
+  // omit the user's profile entirely; the Keys-table pill was the only control
+  // and it moved users.profile_id only. Budgets/grants are CREATION presets,
+  // so an existing key kept its old set — "give this key the admin profile"
+  // silently did half the job. The picker assigns the profile and (when the
+  // box is ticked) re-stamps its presets onto THIS key via
+  // POST /keys/{id}/apply-profile. Gated on user_profile_id so an older
+  // backend renders no dead control (same rule as profileCell).
+  const hasProfile = 'user_profile_id' in k;
+  const curProfile = k.user_profile_id || '';
+  let profilesOk = true;
+  if (hasProfile) {
+    try { if (!(state.profiles || []).length) await loadProfiles(); }
+    catch (e) { profilesOk = false; }
+  }
+  let profileBlock = '';
+  if (hasProfile) {
+    let opts = profilesOk
+      ? ['<option value="">— none —</option>'].concat((state.profiles || []).map(p =>
+          '<option value="' + esc(p.id) + '"' + (p.id === curProfile ? ' selected' : '') + '>' + esc(p.name) + '</option>')).join('')
+      : '<option value="">— profile list unavailable —</option>';
+    // A user whose profile row is gone (or absent from this projection) must
+    // not silently read as "none": keep the stored id selectable so an
+    // unrelated edit cannot clear it.
+    if (profilesOk && curProfile && !(state.profiles || []).some(p => p.id === curProfile)) {
+      opts = '<option value="' + esc(curProfile) + '" selected>— current profile (not listed) —</option>' + opts;
+    }
+    profileBlock =
+      '<label>Profile (user-scoped) <select id="ek-profile"' + (profilesOk ? '' : ' disabled') + '>' + opts + '</select>' +
+      '<div class="hint">Assigns the profile to this key’s user. Existing keys do NOT inherit its budgets/grants unless the apply box is ticked.</div></label>' +
+      '<label class="chk" for="ek-apply-presets"><input type="checkbox" id="ek-apply-presets" style="width:auto"' + (profilesOk ? '' : ' disabled') + '>' +
+      '<span>Apply this profile’s budgets + grants to THIS key now</span></label>' +
+      '<div class="hint" id="ek-apply-hint"></div>';
+  }
   dlg(`<h2>Edit key — ${esc(name)}</h2>
     <p class="muted">Blank fields stay unchanged. Edits apply to the NEXT request (keys are read per request — no restart).</p>
     <label>Name <input id="ek-name" value="${esc(name)}" style="width:100%"></label>
+    ${profileBlock}
     <label>Rate limit — requests/min <input id="ek-rpm" type="number" value="${+k.rate_limit_rpm || ''}" style="width:100%"></label>
     <label>Rate limit — tokens/min <input id="ek-tpm" type="number" value="${+k.rate_limit_tpm || ''}" style="width:100%"></label>
     <label>Max concurrent (0 = unlimited) <input id="ek-mc" type="number" placeholder="unchanged" style="width:100%"></label>
@@ -1811,6 +2000,28 @@ window.editKey = (btn, id) => withBtn(btn, async () => {
   // Budgets save INDEPENDENTLY of the form (own endpoint, replace-all
   // semantics); save-changes never touches them.
   wireBudgets(id, bud, async () => { await loadKeys(); });
+  // Wire the profile picker. Auto-tick the apply box ONLY when the profile
+  // actually changes: an ordinary limits/name edit must not silently re-stamp
+  // the key's budgets/grants from a profile the operator never touched.
+  const profileSel = $('ek-profile');
+  const applyBox = $('ek-apply-presets');
+  const applyHint = $('ek-apply-hint');
+  const syncApplyHint = () => {
+    if (!applyHint || !profileSel) return;
+    const chosen = profileSel.value || '';
+    if (!chosen) applyHint.textContent = "No profile selected — clearing removes the user’s profile (model ordering); budgets/grants are untouched.";
+    else if (chosen !== curProfile) applyHint.textContent = "Profile changed — tick the box to also copy its budgets + grants onto this key.";
+    else applyHint.textContent = "Tick to re-apply this profile’s budgets + grants to this key.";
+  };
+  if (profileSel && applyBox) {
+    profileSel.onchange = () => {
+      // Choosing "none" must not leave a ticked box behind: the apply flag
+      // only means something when a profile is selected.
+      applyBox.checked = !!profileSel.value && profileSel.value !== curProfile;
+      syncApplyHint();
+    };
+    syncApplyHint();
+  }
   // guarded (NOT a bare withBtn call): withBtn is async — invoking it
   // directly would PATCH immediately on dialog-open and leave onclick a
   // Promise. guarded defers to click time and disables during the request.
@@ -1837,8 +2048,34 @@ window.editKey = (btn, id) => withBtn(btn, async () => {
     body.relay_default = $('ek-relay').checked;
     body.stream_pcai_events = $('ek-stream-events').checked;
     const r = await api(`/keys/${id}`, { method: 'PATCH', body });
+    // Profile apply (2026-11-09): the picker's one action. Assigning a profile
+    // alone is not enough for an EXISTING key (budgets/grants are creation
+    // presets), so the ticked box calls the one-key re-stamp endpoint. A
+    // failure here must not hide the fact that the key fields already saved:
+    // keep the dialog open and say exactly what happened.
+    let profNote = '';
+    if (hasProfile && profilesOk && profileSel) {
+      const chosen = profileSel.value || '';
+      const changed = chosen !== curProfile;
+      const applyNow = !!(applyBox && applyBox.checked && chosen);
+      if (chosen && (changed || applyNow)) {
+        try {
+          const j = await api(`/keys/${id}/apply-profile`, {
+            method: 'POST',
+            body: { profile_id: chosen, apply_budgets: applyNow, apply_grants: applyNow },
+          });
+          profNote = ` · profile ${applyNow ? 'applied' : 'assigned'} (${j.budgets} budgets, ${j.grants} grants${j.live_grants ? ', live' : ''})`;
+        } catch (e) {
+          banner(`key fields saved, but profile apply failed: ${e.message}`, 'error', 8000);
+          return;
+        }
+      } else if (!chosen && changed) {
+        await api('/users/' + k.user_id + '/profile', { method: 'PUT', body: { profile_id: null } });
+        profNote = ' · profile cleared';
+      }
+    }
     $('dlg').close();
-    banner(`key updated — limits live immediately (${r.name || name})`, '', 3500);
+    banner(`key updated — limits live immediately (${r.name || name})${profNote}`, '', 4000);
     await loadKeys();
   });
 });
@@ -2005,7 +2242,8 @@ window.viewCaps = btn => {
 //      controls, so all controls on a line share ONE horizontal plane instead
 //      of floating by whatever their hint measured.
 // Both are idempotent (marked on the label) and cheap; the boot block runs
-// them once and a MutationObserver re-runs the layout after any render.
+// them once and a scoped MutationObserver re-runs the layout after any
+// render that changes a row container (see the boot block).
 function structureFormRows(root) {
   for (const label of (root || document).querySelectorAll('.row > label, .ep-row > label')) {
     if (label.dataset.headed) continue;
@@ -2479,7 +2717,7 @@ async function fetchGrantCatalogs() {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 12000);
     try {
-      const r = await fetch(`/admin/mcp-servers/${sv.name}/tools`, {
+      const r = await fetch(`/admin/mcp-servers/${encodeURIComponent(sv.name)}/tools`, {
         headers: { 'Authorization': 'Bearer ' + key() }, signal: ctrl.signal });
       const j = await r.json();
       if (!r.ok) throw new Error(j.detail || r.status);
@@ -2861,14 +3099,14 @@ async function loadMcpServers() {
   // instant-apply: toggles + policy dropdown PATCH the server inline
   document.querySelectorAll('#mcp-table .m-enable-chk').forEach(c =>
     c.addEventListener('change', async () => {
-      try { await api(`/mcp-servers/${c.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(c.dataset.server)}`, { method: 'PATCH',
             body: { enabled: c.checked } });
         banner(`${c.dataset.server} ${c.checked ? 'enabled' : 'disabled'}`, '', 2500);
       } catch (e) { banner(e.message, 'error', 5000); c.checked = !c.checked; }
     }));
   document.querySelectorAll('#mcp-table .m-policy-sel').forEach(sel =>
     sel.addEventListener('change', async () => {
-      try { await api(`/mcp-servers/${sel.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(sel.dataset.server)}`, { method: 'PATCH',
             body: { tool_policy: sel.value } });
         banner(`${sel.dataset.server} policy: ${sel.value}`, '', 2500);
         await loadMcpServers();
@@ -2878,7 +3116,7 @@ async function loadMcpServers() {
   document.querySelectorAll('#mcp-table .m-priority-in').forEach(inp =>
     inp.addEventListener('change', async () => {
       const v = parseInt(inp.value, 10) || 0;
-      try { await api(`/mcp-servers/${inp.dataset.server}`, { method: 'PATCH',
+      try { await api(`/mcp-servers/${encodeURIComponent(inp.dataset.server)}`, { method: 'PATCH',
             body: { priority: v } });
         banner(`${inp.dataset.server} priority: ${v}`, '', 2500);
         await loadMcpServers();
@@ -2965,7 +3203,7 @@ window.viewTools = async el => {
   const name = typeof el === 'string' ? el : (el && el.dataset ? el.dataset.name : '');
   if (!name) return;
   try {
-    const j = await api(`/mcp-servers/${name}/tools`);
+    const j = await api(`/mcp-servers/${encodeURIComponent(name)}/tools`);
     const editable = j.policy === 'allowlist';
     const rows = j.tools.map(t =>
       `<tr><td class="mono">${esc(t.tool)}</td>
@@ -2985,7 +3223,7 @@ window.viewTools = async el => {
       $('tl-save').onclick = guarded('tl-save', async () => {
         const allowed = [...document.querySelectorAll('#dlg-body input[data-tool]:checked')]
           .map(c => c.dataset.tool);
-        await api(`/mcp-servers/${name}`, { method: 'PATCH', body: { allowed_tools: allowed } });
+        await api(`/mcp-servers/${encodeURIComponent(name)}`, { method: 'PATCH', body: { allowed_tools: allowed } });
         $('dlg').close();
         banner(`allowlist saved (${allowed.length} tools)`, '', 3000);
         await loadMcpServers();
@@ -3220,6 +3458,33 @@ function refreshFilterSelects() {
     if (cur && keys.some(k => k.id === cur)) tk.value = cur;
   }
 }
+// The pricing table renders identically in both places it appears (the
+// Usage-tab rollups and the Costs editor) — one renderer; the empty-state
+// row is caller-specific (the Usage-tab variant explains WHY an unpriced
+// ledger row costs nothing).
+// GET /admin/costs returns {costs, unpriced, unit_mismatch} (2026-11-10):
+// the rows ride in costs, and unpriced names every registered model with no
+// price row. An unpriced model ledgers $0 and consumes ZERO of every USD
+// budget, so the list is surfaced right above the pricing table instead of
+// staying buried in the response body.
+function paintUnpricedModels(cresp) {
+  const el = $('costs-unpriced');
+  if (!el) return;
+  const unpriced = cresp && Array.isArray(cresp.unpriced) ? cresp.unpriced : [];
+  if (!unpriced.length) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  // esc() EVERY model name before innerHTML (the page's esc-everything
+  // discipline) — a hostile name cannot inject markup.
+  el.innerHTML = 'unpriced — ledger no cost, consume no USD budget: ' + unpriced.map(esc).join(', ');
+}
+function renderCostsTable(costs, empty) {
+  return (costs || []).map(c =>
+    `<tr><td class="mono">${esc(c.model_name)}</td><td class="mono">${esc(c.unit || 'token')}</td><td>${fmtPrice(c.input_per_m)}</td>
+     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
+     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
+     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
+    || empty;
+}
 async function loadUsage() {
   // WINDOW (2026-10-26): the endpoint is bounded to the last 30 days by
   // default, which made a growing lifetime total look like it was DROPPING --
@@ -3395,13 +3660,19 @@ async function loadUsage() {
     const caret = byKeyBody.querySelector('.ukey-caret[data-kidx="' + idx + '"]');
     if (caret) caret.textContent = open ? '▸' : '▾';
   };
+  // {costs, unpriced, unit_mismatch} — 2026-11-10 shape; rows ride in costs
   const costs = await api('/costs');
-  $('costs-table').querySelector('tbody').innerHTML = (costs || []).map(c =>
-    `<tr><td class="mono">${esc(c.model_name)}</td><td>${fmtPrice(c.input_per_m)}</td>
-     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
-     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
-     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">no prices configured — ledger rows carry no cost</td></tr>';
+  // SHAPE FALLBACK (rolling upgrade): GET /admin/costs became an OBJECT
+  // {costs, unpriced, unit_mismatch} on 2026-11-10, but a new admin.html can be
+  // served by a pod while the API answers from a not-yet-upgraded one that
+  // still returns a bare ARRAY. Without this, costs.costs is undefined, the
+  // renderer returns its empty state, and the operator is told "no prices
+  // configured" while prices exist and are billing.
+  const costRows = Array.isArray(costs) ? costs : (costs && costs.costs) || [];
+  state.lastCostRows = costRows;
+  $('costs-table').querySelector('tbody').innerHTML = renderCostsTable(costRows,
+    '<tr><td colspan="7" class="muted">no prices configured — ledger rows carry no cost</td></tr>');
+  paintUnpricedModels(costs);
   // E: the ledger explorer reloads scoped to the selected user (?user_id=).
   // Seed the pending filter straight from the session store when the select
   // hasn't been populated yet (the restored-tab loadUsage races ahead of
@@ -3421,25 +3692,42 @@ async function loadUsage() {
       <td class="muted">${r2.subject ? esc(r2.subject) + (r2.subject_idp === 'self-asserted' ? ' <span title="self-asserted">~</span>' : '') : '—'}</td>
       <td>${esc(r2.model)}</td><td class="mono">${esc(r2.endpoint)}</td>
       <td>${fmtInt(r2.prompt_tokens)}</td><td>${fmtInt(r2.completion_tokens)}</td><td>${fmtInt(r2.cached_tokens)}</td>
-      <td>${fmtInt(r2.total_tokens)}</td><td>${fmtUSD(r2.cost_usd)}</td><td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('')
+      <td>${fmtInt(r2.total_tokens)}${r2.unit_kind && r2.unit_kind !== 'token'
+        // P10: the row billed in a non-token unit — say WHICH and how much
+        // (billable_units), esc()ed like everything else on this page.
+        ? ` <span class="muted" title="billed in a non-token unit">(${esc(String(r2.billable_units))} ${esc(r2.unit_kind)})</span>` : ''}</td>
+      <td>${fmtUSD(r2.cost_usd)}</td><td>${esc(r2.status)}</td><td>${r2.latency_ms}</td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">no requests recorded yet</td></tr>';
   refreshFilterSelects();
 }
 async function loadCostsEditor() {
   await loadModels();
   $('c-model').innerHTML = state.models.map(m => `<option>${esc(m)}</option>`).join('');
+  // {costs, unpriced, unit_mismatch} — 2026-11-10 shape; rows ride in costs
   const costs = await api('/costs');
-  $('costs-table').querySelector('tbody').innerHTML = (costs || []).map(c =>
-    `<tr><td class="mono">${esc(c.model_name)}</td><td>${fmtPrice(c.input_per_m)}</td>
-     <td>${fmtPrice(c.output_per_m)}</td><td>${fmtPrice(c.cached_per_m)}</td>
-     <td class="muted">${new Date(c.updated_at).toLocaleString()}</td>
-     <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">no prices configured</td></tr>';
+  // SHAPE FALLBACK — see loadUsage: a bare array is the pre-2026-11-10 shape.
+  const costRows = Array.isArray(costs) ? costs : (costs && costs.costs) || [];
+  state.lastCostRows = costRows;
+  $('costs-table').querySelector('tbody').innerHTML = renderCostsTable(costRows,
+    '<tr><td colspan="7" class="muted">no prices configured</td></tr>');
+  paintUnpricedModels(costs);
+  // P10: preselect the selected model's CURRENT unit (default 'token' — the
+  // vocabulary every pre-existing row carries) so an edit cannot silently
+  // flip a 'second'-priced voice model back to tokens.
+  const sel = $('c-model').value;
+  const curRow = costRows.find(c => c.model_name === sel);
+  $('c-unit').value = (curRow && curRow.unit) || 'token';
 }
+$('c-model').addEventListener('change', () => {
+  // Follow the model switch with its stored unit, same rule as loadCostsEditor.
+  const name = $('c-model').value;
+  const row = (state.lastCostRows || []).find(c => c.model_name === name);
+  $('c-unit').value = (row && row.unit) || 'token';
+});
 $('c-save').onclick = guarded('c-save', async () => {
   try {
     await api('/costs', { method: 'POST', body: {
-      model_name: $('c-model').value, input_per_m: +$('c-in').value,
+      model_name: $('c-model').value, unit: $('c-unit').value, input_per_m: +$('c-in').value,
       output_per_m: +$('c-out').value, cached_per_m: +$('c-cached').value } });
     banner('price saved', '', 2500);
     await loadCostsEditor();
@@ -3563,7 +3851,10 @@ function traceThread(group) {
     ? `${esc(new Date(first.started_ts).toLocaleTimeString())} → ${esc(new Date(last.started_ts || last.started_ts).toLocaleTimeString())}`
     : '';
   const who = reqs[0] || {};
-  return `<details class="trace-thread" open>
+  // Collapsed by default: one thread can hold up to 200 requests — expanding
+  // every thread at once laid out all of those rows on first paint instead
+  // of letting the operator scan the summaries and open what they need.
+  return `<details class="trace-thread">
     <summary><b>conversation</b>
       <b>${esc(who.user_name || 'unknown user')}</b><span class="muted">· ${esc(who.key_name || 'unknown key')}</span>
       <span class="pill">${esc(models.join(' → '))}</span>
@@ -3663,14 +3954,14 @@ async function loadTraces() {
 // empty trail and still needs the full filter, and the vocabulary is
 // server-side contract, not data.
 const AUDIT_ACTIONS = [
-  'key.create', 'key.patch', 'key.revoke', 'key.rotate', 'budget.set',
+  'key.create', 'key.patch', 'key.revoke', 'key.rotate', 'key.profile.apply', 'budget.set',
   'costs.set', 'costs.delete', 'model.upsert', 'model.delete', 'model.fallbacks.set',
   'mcp.server.upsert', 'mcp.server.patch', 'mcp.acl.set', 'mcp.acl.copy',
   'mcp.creds.set', 'mcp.creds.delete', 'profile.upsert', 'profile.delete',
   'profile.limits.propagate', 'user.profile.set', 'tenant.create', 'user.create',
   'guardrail.create', 'guardrail.patch', 'guardrail.delete', 'guardrail.models.set',
   'offpeak.set', 'distiller.config', 'routing.config',
-  'enroll.code.mint', 'enroll.code.revoke', 'enroll.redeem',
+  'enroll.code.mint', 'enroll.code.revoke', 'enroll.redeem', 'enroll.sso_mint',
   'enroll.envelope.patch', 'enroll.delete',
 ];
 // 'system' (routing wave): system-scoped config PUTs (routing.config) audit
@@ -3703,9 +3994,14 @@ async function loadAudit() {
   params.set('limit', String(Math.min(500, Math.max(1, limit))));
   const qs = params.toString();
   // CSV export rides the SAME filters (the /admin/usage export pattern) —
-  // rebuilt per load so the link never lags the visible filter state.
+  // rebuilt per load so the link never lags the visible filter state. The
+  // anchor carries the query string only (dataset.qs): the click handler
+  // below FETCHES it with the admin key. A bare navigation would 401 on
+  // bearer-key deployments (require_admin is header-only) and the browser
+  // would save the JSON error body as admin-audit.csv — the same fix the
+  // team_leader console's u-csv already carries.
   const csv = $('a-csv');
-  if (csv) csv.href = '/admin/audit' + (qs ? '?' + qs + '&' : '?') + 'format=csv';
+  if (csv) csv.dataset.qs = qs + (qs ? '&' : '') + 'format=csv';
   const rows = await api('/audit' + (qs ? '?' + qs : ''));
   $('audit-table').querySelector('tbody').innerHTML = (rows || []).map(r => {
     const det = r.details && Object.keys(r.details).length
@@ -3811,23 +4107,33 @@ window.deleteEnrollment = (btn, id, keyCount) => withBtn(btn, async () => {
 async function loadEnrollTab() {
   if (!$('e-tenant') || !$('enroll-table')) return;
   if (!state.tenants.length) { try { await loadTenants(); } catch {} }
-  $('e-tenant').innerHTML = state.tenants.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')
+  $('e-tenant').innerHTML = state.tenants.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('')
     || '<option value="">(no tenants — create one under Keys)</option>';
   $('e-profile').innerHTML = '<option value="">— none —</option>' +
-    state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   // SSO self-mint default profile card: tenant select + the configured
-  // value rendered from the tenants payload (sso_default_profile_id),
-  // profiles from the shared state — save PUTs the tenant's setting.
+  // values rendered from the tenants payload (sso_default_profile_id, plus
+  // the admin-tier pair sso_admin_profile_id / sso_admin_groups), profiles
+  // from the shared state — save PUTs the tenant's setting.
   const st = $('sso-tenant'), sp = $('sso-profile');
   if (st && sp) {
     st.innerHTML = state.tenants.map(t =>
-      `<option value="${t.id}">${esc(t.name)}${t.sso_default_profile_name ? ' · ' + esc(t.sso_default_profile_name) : ''}</option>`).join('')
+      `<option value="${esc(t.id)}">${esc(t.name)}${t.sso_default_profile_name ? ' · ' + esc(t.sso_default_profile_name) : ''}</option>`).join('')
       || '<option value="">(no tenants)</option>';
     sp.innerHTML = '<option value="">— none (bare mint grant) —</option>' +
-      state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+      state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    // Admin tier (2026-11-08): the second profile + the group list that
+    // selects it. Both blank = tier split OFF (every mint takes the default).
+    const sap = $('sso-admin-profile'), sag = $('sso-admin-groups');
+    if (sap) {
+      sap.innerHTML = '<option value="">— none (no tier split) —</option>' +
+        state.profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    }
     const syncProf = () => {
       const t = state.tenants.find(x => x.id === st.value);
       sp.value = (t && t.sso_default_profile_id) || '';
+      if (sap) sap.value = (t && t.sso_admin_profile_id) || '';
+      if (sag) sag.value = (t && t.sso_admin_groups) || '';
     };
     st.onchange = syncProf; syncProf();
   }
@@ -3906,27 +4212,38 @@ async function loadEnrollTab() {
 $('sso-prof-save').onclick = guarded('sso-prof-save', async () => {
   const tid = $('sso-tenant').value;
   if (!tid) return banner('create a tenant first (Keys ▸ + new tenant)', 'error', 5000);
-// Backfill (2026-10-29): the tenant default only reaches users created after
-// it was set. Binding them is what makes the profile REAL for the fleet —
-// cascade ordering, routing policy, off-peak fraction and the agents menu all
-// read users.profile_id — and it is what makes "apply grants" match their keys.
-$("sso-bind").onclick = guarded("sso-bind", async () => {
-  const tid = $("sso-tenant").value;
-  if (!tid) return banner("pick a tenant first", "error", 4000);
-  if (!$("sso-profile").value) return banner("set the SSO default profile first", "error", 4000);
-  try {
-    const r = await api("/tenants/" + tid + "/bind-sso-users", { method: "POST" });
-    banner("bound " + r.bound + " user(s) to the SSO default profile", "", 4500);
-    await loadKeys();   // the Profile column is the proof
-  } catch (e) { banner(e.message, "error", 7000); }
-});
+  // Admin tier (2026-11-08): the two extra fields ride the same PUT — blank
+  // selects send null (clear), an empty groups box turns the tier split off.
   const body = { profile_id: $('sso-profile').value || null };
+  body.admin_profile_id = $('sso-admin-profile').value || null;
+  body.admin_groups = $('sso-admin-groups').value.trim() || null;
   const t = await api(`/tenants/${tid}/sso-default-profile`, { method: 'PUT', body });
   const local = state.tenants.find(x => x.id === tid) || {};
   local.sso_default_profile_id = t.sso_default_profile_id;
   local.sso_default_profile_name = ($('sso-profile').value ? (state.profiles.find(p => p.id === $('sso-profile').value) || {}).name : null);
-  banner(`SSO self-mint profile for <b>${esc(local.name || 'tenant')}</b>: ${esc(local.sso_default_profile_name || 'bare mint grant (none)')}`, '', 4000, true);
+  local.sso_admin_profile_id = t.sso_admin_profile_id || null;
+  local.sso_admin_groups = t.sso_admin_groups || '';
+  const tierTxt = local.sso_admin_groups
+    ? 'admin tier: profile <b>' + esc(local.sso_admin_profile_name || '—') + '</b> for groups <code>' + esc(local.sso_admin_groups) + '</code>'
+    : 'admin tier: off';
+  banner('SSO self-mint profile for <b>' + esc(local.name || 'tenant') + '</b>: ' + esc(local.sso_default_profile_name || 'bare mint grant (none)') + ' · ' + tierTxt, '', 4000, true);
   await loadEnrollTab();
+});
+// Backfill (2026-10-29): the tenant default only reaches users created after
+// it was set. Binding them is what makes the profile REAL for the fleet —
+// cascade ordering, routing policy, off-peak fraction and the agents menu all
+// read users.profile_id — and it is what makes "apply grants" match their keys.
+// Top-level wiring (Lead review 2026-11-08): this was nested inside the save
+// handler, so the bind button only became live after a first save click.
+$('sso-bind').onclick = guarded('sso-bind', async () => {
+  const tid = $('sso-tenant').value;
+  if (!tid) return banner('pick a tenant first', 'error', 4000);
+  if (!$('sso-profile').value) return banner('set the SSO default profile first', 'error', 4000);
+  try {
+    const r = await api('/tenants/' + tid + '/bind-sso-users', { method: 'POST' });
+    banner('bound ' + r.bound + ' user(s) to the SSO default profile', '', 4500);
+    await loadKeys();   // the Profile column is the proof
+  } catch (e) { banner(e.message, 'error', 7000); }
 });
 $('e-create').onclick = guarded('e-create', async () => {
   const label = $('e-label').value.trim();
@@ -4435,7 +4752,8 @@ window.deleteGuardrail = (btn, id) => withBtn(btn, async () => {
 // painted via textContent (inherently inert) or esc()'d.
 // Auto-refresh runs ONLY while this tab is the visible one: the 30s interval
 // is started on tab activation and cleared on every switch-away — nothing
-// polls in the background. ↻ re-fetches on demand.
+// polls in the background. ↻ re-fetches on demand AND forces the shared
+// endpoint-metrics read, so the KV strips repaint from a fresh scrape.
 let opTimer = null;
 
 function opTs(v) {
@@ -4571,7 +4889,274 @@ if (diSave) diSave.addEventListener('click', saveDistiller);
 // initial paint follows the same lazy pattern as the other panels
 document.addEventListener('DOMContentLoaded', () => { try { loadDistiller(); } catch (e) { reportError('distiller panel: ' + e.message); } });
 
-async function loadOffpeak() {
+// ---------- KV strip for the off-peak per-model cards (2026-11-08) --------
+// The per-model cards bill by the model's OWN GPUs, so the card also carries
+// that model's KV-cache state (GPU = the engine tier, RAM = host HiCache
+// L2, DISK = L3 activity). Data: the SHARED /admin/endpoint-metrics cache
+// (emFetch below) — one fetch per refresh feeds the Metrics tab AND these
+// cards, so the off-peak 30s poll and the metrics 10s poll never
+// double-query the collector.
+// JOIN: row.pool === cardName first; else the backend _model_key compare
+// (lowercase, strip non-alphanumerics, substring in EITHER direction).
+// Never on model_name — other namespaces carry look-alike models, and a pod
+// with no pool is UNMAPPED, so it joins nothing.
+function kvNormKey(s) {
+  return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function kvRowsFor(cardName, rows) {
+  if (!Array.isArray(rows)) return [];
+  const exact = rows.filter(r => r && r.pool === cardName);
+  if (exact.length) return exact;
+  const nk = kvNormKey(cardName);
+  if (!nk) return [];
+  // AMBIGUITY GUARD (review F2-1): a normalized substring can match two
+  // distinct pools whose names embed each other (qwen3 / qwen3-8b). Only a
+  // UNIQUE matching pool may join; an ambiguous match renders nothing rather
+  // than merging two models' numbers into one card.
+  const pools = new Set();
+  for (const r of rows) {
+    const rk = r && r.pool ? kvNormKey(r.pool) : '';
+    if (rk && (rk.includes(nk) || nk.includes(rk))) pools.add(r.pool);
+  }
+  if (pools.size !== 1) return [];
+  const only = [...pools][0];
+  return rows.filter(r => r && r.pool === only);
+}
+// 4590000 -> "4.59M" · 62000 -> "62.0K" · 950 -> "950" (the strip is M-scale).
+function kvTok(v) {
+  if (v == null || !isFinite(v)) return null;
+  const n = Number(v);
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+function kvPctTxt(v) {
+  return (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(1) + '%';
+}
+// Aggregate a tier over the card's replicas: SUM used/total, pct weighted
+// (used/total) — a small busy replica and a big idle one must not average
+// into a plausible-looking middle. Totals absent (vLLM exposes the ratio
+// only) -> the worst row ratio, since the bar must not undersell.
+function kvTier(rows, usedK, totalK, pctK) {
+  let used = null, total = null, maxPct = null;
+  for (const r of rows || []) {
+    if (!r) continue;
+    const u = Number(r[usedK]), t = Number(r[totalK]), p = Number(r[pctK]);
+    if (r[usedK] != null && isFinite(u)) used = (used == null ? 0 : used) + u;
+    if (r[totalK] != null && isFinite(t)) total = (total == null ? 0 : total) + t;
+    if (r[pctK] != null && isFinite(p) && (maxPct == null || p > maxPct)) maxPct = p;
+  }
+  if (used == null && total == null && maxPct == null) return null;
+  const pct = total ? (used == null ? null : (used / total) * 100) : maxPct;
+  return { used, total, pct };
+}
+function kvSum(rows, key) {
+  let sum = null;
+  for (const r of rows || []) {
+    if (!r) continue;
+    const v = Number(r[key]);
+    if (r[key] != null && isFinite(v)) sum = (sum == null ? 0 : sum) + v;
+  }
+  return sum;
+}
+function kvStripHtml(cardName, rows) {
+  const rs = kvRowsFor(cardName, rows);
+  if (!rs.length) return '';
+  // GPU "cached" = the evictable radix/prefix cache held in the SAME pool;
+  // the percentage is ACTIVE usage (the engine excludes evictable tokens
+  // from it). The two-segment bar shows active (accent) + cached (dim)
+  // inside the pool capacity, so a 4% GPU reading next to a large cache is
+  // legible instead of looking like an empty pool.
+  const gpuCached = kvSum(rs, 'kv_gpu_evictable_tokens');
+  // Per-replica breakdown. Pod names are SERVER STRINGS: this is the single
+  // esc() they pass through — the title attribute is built from raw parts
+  // and escaped exactly once (a pre-escaped pod would double-escape on
+  // render, and &lt;img would read as &amp;lt;img).
+  const perReplica = rs.map(r => {
+    const pod = String(r.pod || r.instance || '—').trim() || '—';
+    const g = kvTier([r], 'kv_gpu_used_tokens', 'kv_gpu_max_tokens', 'kv_gpu_pct');
+    const hh = kvTier([r], 'kv_host_used_tokens', 'kv_host_total_tokens', 'kv_host_pct');
+    const c = Number(r.kv_gpu_evictable_tokens);
+    const cached = r.kv_gpu_evictable_tokens != null && isFinite(c) ? ' (' + kvTok(c) + ' cached)' : '';
+    return pod + ': GPU active ' + kvPctTxt(g && g.pct) + cached + ' · RAM cached ' + kvPctTxt(hh && hh.pct);
+  });
+  const gpu = kvTier(rs, 'kv_gpu_used_tokens', 'kv_gpu_max_tokens', 'kv_gpu_pct');
+  const kv = kvTier(rs, 'kv_host_used_tokens', 'kv_host_total_tokens', 'kv_host_pct');
+  const diskAny = rs.find(r => r && r.kv_disk_configured);
+  // The tooltip states what each number IS, so nobody reads a full KV host
+  // pool as pressure: GPU% is the ACTIVE usage ratio (the evictable radix
+  // cache is excluded), RAM (cached) is the host HiCache L2 (near-full is the
+  // write_through steady state, not an error), disk has no occupancy gauge
+  // (activity only). Only the facts about tiers that actually render.
+  const notes = [];
+  if (gpu) notes.push('GPU is ACTIVE KV usage (running sequences); the evictable radix cache excluded from the % is the "cached" figure');
+  if (kv) notes.push('RAM (cached) is the host HiCache L2 prefix-cache pool (cached sequences, not active conversations) — near-full is the normal write_through steady state');
+  if (diskAny) notes.push('disk has no occupancy gauge — activity only');
+  const title = esc([...perReplica, ...notes].join('; '));
+  const bar = (pct, color) => {
+    const w = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    return `<div style="flex:0 0 120px;height:6px;border-radius:3px;background:rgba(128,138,160,.18);overflow:hidden"><div style="width:${w}%;height:100%;background:${color}"></div></div>`;
+  };
+  // Active + cached inside ONE pool. The cached share is clamped so a
+  // metric family whose totals disagree can never overflow the track.
+  const bar2 = (activePct, cachedPct) => {
+    const a = activePct == null ? 0 : Math.max(0, Math.min(100, activePct));
+    const c = cachedPct == null ? 0 : Math.max(0, Math.min(100 - a, cachedPct));
+    return `<div style="flex:0 0 120px;height:6px;border-radius:3px;background:rgba(128,138,160,.18);overflow:hidden;display:flex"><div style="width:${a}%;height:100%;background:var(--accent)"></div><div style="width:${c}%;height:100%;background:var(--dim)"></div></div>`;
+  };
+  const tokTxt = t => (t && t.used != null && t.total)
+    ? kvTok(t.used) + ' / ' + kvTok(t.total) + ' tok'
+    : null;
+  const lines = [];
+  if (gpu) {
+    const w = tokTxt(gpu);
+    const cachedPct = gpu.total && gpuCached != null ? (gpuCached / gpu.total) * 100 : null;
+    const cachedTxt = gpuCached != null ? '<span class="mono muted">· ' + esc(kvTok(gpuCached)) + ' cached</span>' : '';
+    lines.push({
+      label: 'GPU (active)',
+      body: (cachedPct != null ? bar2(gpu.pct, cachedPct) : bar(gpu.pct, 'var(--accent)')) +
+        '<span class="mono">' + esc(kvPctTxt(gpu.pct)) + '</span>' +
+        (w ? '<span class="mono muted">' + esc(w) + '</span>' : '') + cachedTxt,
+    });
+  }
+  if (kv) {
+    // ~100% of the KV host pool is NORMAL (write_through steady state): the
+    // bar is neutral or warn, never the error colour.
+    const w = tokTxt(kv);
+    lines.push({
+      label: 'RAM (cached)',
+      body: bar(kv.pct, kv.pct != null && kv.pct >= 95 ? 'var(--warn)' : 'var(--dim)') +
+        '<span class="mono">' + esc(kvPctTxt(kv.pct)) + '</span>' +
+        (w ? '<span class="mono muted">' + esc(w) + '</span>' : ''),
+    });
+  }
+  if (diskAny) {
+    const disk = diskAny;
+    const tps = Number(disk.kv_disk_hit_tps);
+    lines.push({
+      label: 'DISK (L3)',
+      body: '<span class="mono muted">L3 active' + (disk.kv_disk_hit_tps != null && isFinite(tps) ? ' · ' + tps.toFixed(1) + ' tok/s hit' : '') + '</span>',
+    });
+  }
+  if (!lines.length) return '';   // a card whose rows carry no KV data renders nothing
+  const span = lines.length + 1;
+  return `<div class="kvstrip" style="display:grid;grid-template-columns:26px 96px auto;column-gap:8px;row-gap:3px;align-items:center;margin-top:6px;font-size:12px" title="${title}">` +
+    `<span class="mono muted" style="grid-row:1/${span}">KV</span>` +
+    lines.map(l => `<span class="mono muted">${l.label}</span><div style="display:flex;align-items:center;gap:8px">${l.body}</div>`).join('') +
+    '</div>';
+}
+
+// Bytes -> "1.00 TiB" / "350 GiB" / "0 B". Binary units because the volume
+// metrics are bytes and GiB/TiB is how an operator sizes a PVC.
+function kvBytes(v) {
+  if (v == null || !isFinite(v)) return null;
+  let n = Number(v);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  const txt = i === 0 ? String(Math.round(n)) : (n >= 100 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2));
+  return txt + ' ' + units[i];
+}
+// ALL-MODELS cache summary: the per-model strips answer "what is THIS model
+// holding"; this answers "how much of the fleet's host-RAM / disk cache is in
+// use". Same aggregation rules as kvTier (sum used/total, weighted percent —
+// never a mean of ratios). The disk line prefers the server's volume
+// occupancy (`disk`, read from the operator-configured L3 volume selector —
+// the engine exports no storage gauge); with engine counters only it falls
+// back to L3 activity, and with neither it says so instead of inventing a 0%.
+// GPU active usage is deliberately NOT aggregated here: vLLM reports a ratio
+// with no absolute pool size, so mixing it with SGLang's token gauges would
+// compare unlike things — the per-model cards show GPU.
+function kvOverallHtml(rows, disk) {
+  const rs = Array.isArray(rows) ? rows : [];
+  // POD MEMORY and RAM (cached) both cover the pods that report the HiCache host
+  // tier (the cache-bearing engines): a vLLM pod's process memory is not part
+  // of this cache and has no host tier to compare against.
+  const cacheRows = rs.filter(r => r && r.kv_host_total_tokens != null);
+  const kv = kvTier(cacheRows, 'kv_host_used_tokens', 'kv_host_total_tokens', 'kv_host_pct');
+  const diskAny = rs.some(r => r && r.kv_disk_configured);
+  const diskTps = kvSum(rs, 'kv_disk_hit_tps');
+  const dUsed = disk && disk.used_bytes != null && isFinite(Number(disk.used_bytes)) ? Number(disk.used_bytes) : null;
+  const dTotal = disk && disk.total_bytes != null && isFinite(Number(disk.total_bytes)) ? Number(disk.total_bytes) : null;
+  if (!rs.length && !dTotal) return '<span class="muted">—</span>';
+  const dPct = dTotal && dUsed != null
+    ? (disk.pct != null && isFinite(Number(disk.pct)) ? Number(disk.pct) : (dUsed / dTotal) * 100)
+    : null;
+  const bar = (pct, color) => {
+    const w = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    return `<div style="flex:0 0 120px;height:6px;border-radius:3px;background:rgba(128,138,160,.18);overflow:hidden"><div style="width:${w}%;height:100%;background:${color}"></div></div>`;
+  };
+  const tokTxt = t => (t && t.used != null && t.total) ? kvTok(t.used) + ' / ' + kvTok(t.total) + ' tok' : null;
+  const lines = [];
+  // POD MEMORY first: the pod's actual memory measurement (working set vs its
+  // memory limit), summed over the cache-bearing pods. This is process memory
+  // — model weights + host pool + runtime — not a conversion of the KV token
+  // count, which is why the token number is its own line below.
+  const ramUsed = kvSum(cacheRows, 'ram_used_bytes');
+  const ramLimit = kvSum(cacheRows, 'ram_limit_bytes');
+  if (ramUsed != null) {
+    const pct = ramLimit ? (ramUsed / ramLimit) * 100 : null;
+    lines.push({
+      label: 'POD MEMORY',
+      body: bar(pct, pct != null && pct >= 90 ? 'var(--warn)' : 'var(--dim)') +
+        '<span class="mono">' + esc(kvPctTxt(pct)) + '</span>' +
+        '<span class="mono muted">' + esc((kvBytes(ramUsed) || '—') + (ramLimit ? ' / ' + (kvBytes(ramLimit) || '—') : ' used')) + '</span>',
+    });
+  }
+  if (kv) {
+    const w = tokTxt(kv);
+    lines.push({
+      label: 'RAM (cached)',
+      body: bar(kv.pct, kv.pct != null && kv.pct >= 95 ? 'var(--warn)' : 'var(--dim)') +
+        '<span class="mono">' + esc(kvPctTxt(kv.pct)) + '</span>' +
+        (w ? '<span class="mono muted">' + esc(w) + '</span>' : ''),
+    });
+  }
+  if (dTotal) {
+    // The volume number exists even when serving has not reported a storage
+    // backend yet (Mooncake deployed but not yet attached to serving): say
+    // which it is.
+    const wiring = diskAny ? '' : ' <span class="muted" style="font-size:11px">· serving reports no L3 backend</span>';
+    lines.push({
+      label: 'DISK (L3)',
+      body: bar(dPct, dPct != null && dPct >= 90 ? 'var(--warn)' : 'var(--dim)') +
+        '<span class="mono">' + esc(kvPctTxt(dPct)) + '</span>' +
+        '<span class="mono muted">' + esc((dUsed == null ? '—' : (kvBytes(dUsed) || '—')) + ' / ' + (kvBytes(dTotal) || '—')) + '</span>' + wiring,
+    });
+  } else if (diskAny) {
+    lines.push({
+      label: 'DISK (L3)',
+      body: '<span class="mono muted">L3 active' + (diskTps != null ? ' · ' + diskTps.toFixed(1) + ' tok/s hit' : '') + '</span>',
+    });
+  } else {
+    lines.push({ label: 'DISK (L3)', body: '<span class="mono muted">no L3 storage backend configured</span>' });
+  }
+  // Per-pod working-set breakdown in the tooltip, the same way the per-model
+  // strip carries its per-replica numbers: the summary is an aggregate, but
+  // "which pod is using its memory" must stay visible.
+  const perPod = cacheRows.map(r => {
+    const pod = String(r.pod || r.instance || '—').trim() || '—';
+    const used = Number(r.ram_used_bytes);
+    if (r.ram_used_bytes == null || !isFinite(used)) return null;
+    const lim = Number(r.ram_limit_bytes);
+    const limTxt = r.ram_limit_bytes != null && isFinite(lim) ? ' / ' + (kvBytes(lim) || '—') : '';
+    return pod + ': ' + (kvBytes(used) || '—') + limTxt;
+  }).filter(Boolean);
+  const notes = [
+    'POD MEMORY is the pod working set vs its memory limit (all containers; model weights + host pool + runtime)',
+    'RAM (cached) is the HiCache host L2 pool occupancy in tokens — not process memory',
+  ];
+  if (dTotal) notes.push('DISK is the L3 volume occupancy');
+  else if (diskAny) notes.push('DISK is L3 hit activity (no storage occupancy gauge)');
+  const title = esc([...perPod, ...notes].join('; '));
+  const span = lines.length + 1;
+  return `<div class="kvstrip" style="display:grid;grid-template-columns:26px 96px auto;column-gap:8px;row-gap:3px;align-items:center;font-size:12px" title="${title}">` +
+    `<span class="mono muted" style="grid-row:1/${span}">KV</span>` +
+    lines.map(l => `<span class="mono muted">${l.label}</span><div style="display:flex;align-items:center;gap:8px">${l.body}</div>`).join('') +
+    '</div>';
+}
+
+async function loadOffpeak(force) {
   const pill = $('op-pill');
   if (!pill) return;                       // section absent — nothing to paint
   const billing = $('op-billing'), hint = $('op-hint');
@@ -4645,20 +5230,37 @@ async function loadOffpeak() {
   // "low demand" off the fleet-wide average while its own GPUs are pegged).
   // Each card: sparkline vs the enter/exit thresholds, live state, and the
   // model's pricing-ratio editor (empty = profile/default fallback).
+  // ONE endpoint-metrics fetch per refresh feeds the ALL-MODELS summary and
+  // the per-model strips (and, through the shared cache, the Metrics tab).
+  // A manual ↻ forces past that cache; the 30s poll reuses it. A failed fetch
+  // degrades to "no summary / no strips", never a dead tab.
+  let kvRows = [];
+  let em = null;
+  try {
+    em = await emFetch(15000, force === true);
+    kvRows = em && Array.isArray(em.endpoints) ? em.endpoints : [];
+  } catch { /* summary shows —, strips omitted */ }
+  const oc = $('op-cache');
+  if (oc) {
+    try { oc.innerHTML = kvOverallHtml(kvRows, em && em.disk); }
+    catch { oc.innerHTML = '<span class="muted">—</span>'; }
+  }
   const mc = $('op-models');
-  if (mc) {
-    // Focus guard: the 30s auto-refresh re-renders this block; if the admin
-    // is mid-edit in a ratio input, SKIP this tick (their caret + value
-    // survive; the next tick after blur repaints). innerHTML rebuild would
-    // silently eat both.
-    if (mc.contains(document.activeElement) && document.activeElement?.classList?.contains('op-frac')) {
-      return;
-    }
-    const entries = Object.entries(d.models && typeof d.models === 'object' ? d.models : {});
-    if (!entries.length) {
-      mc.innerHTML = '<p class="muted" style="margin:10px 0 0">Per-model evaluators: none — every model bills by the global query above. On a shared cluster a busy model can be diluted below the enter threshold by idle GPUs (observed live: serving GPUs ~53-90%, fleet average ~19.6%, threshold 20%); attach one per model via the helm <span class="mono">settings.offpeakModelPromql</span> map (env <span class="mono">PCAI_LLM_OFFPEAK_MODEL_PROMQL</span>) — e.g. GLM on <span class="mono">scs04</span> GPUs 4-7, Qwen on <span class="mono">scs05</span> — and validate the query in Prometheus first (an empty result bills full price).</p>';
-    } else {
-      mc.innerHTML = '<h3 style="margin:14px 0 6px;font-size:13.5px">Per-model utilization <span class="muted">— bill by the model\'s own GPUs, not the fleet average; the ratio applies while THIS row is ACTIVE</span></h3>'
+  if (!mc) return;
+  // Focus guard: the 30s auto-refresh re-renders this block; if the admin
+  // is mid-edit in a ratio input, SKIP this tick (their caret + value
+  // survive; the next tick after blur repaints). innerHTML rebuild would
+  // silently eat both. The all-models summary above is unaffected.
+  if (mc.contains(document.activeElement) && document.activeElement?.classList?.contains('op-frac')) {
+    return;
+  }
+  const entries = Object.entries(d.models && typeof d.models === 'object' ? d.models : {});
+  if (!entries.length) {
+    mc.innerHTML = '<p class="muted" style="margin:10px 0 0">Per-model evaluators: none — every model bills by the global query above. On a shared cluster a busy model can be diluted below the enter threshold by idle GPUs (observed live: serving GPUs ~53-90%, fleet average ~19.6%, threshold 20%); attach one per model via the helm <span class="mono">settings.offpeakModelPromql</span> map (env <span class="mono">PCAI_LLM_OFFPEAK_MODEL_PROMQL</span>) — e.g. GLM on <span class="mono">scs04</span> GPUs 4-7, Qwen on <span class="mono">scs05</span> — and validate the query in Prometheus first (an empty result bills full price).</p>';
+  } else {
+    // The strip is context: the utilization state above is the billing
+    // source of truth. kvRows came from the ONE shared fetch above.
+    mc.innerHTML = '<h3 style="margin:14px 0 6px;font-size:13.5px">Per-model utilization <span class="muted">— bill by the model\'s own GPUs, not the fleet average; the ratio applies while THIS row is ACTIVE</span></h3>'
         + entries.map(([name, m]) => {
             const mm = m || {};
             const statePill = mm.last_error
@@ -4686,11 +5288,11 @@ async function loadOffpeak() {
                 ${opSpark(mm.history, d.enter_pct, d.exit_pct)}
                 <span class="muted" style="font-size:12px">dashed: enter ${esc(String(d.enter_pct))}% / exit ${esc(String(d.exit_pct))}%</span>
               </div>
+              ${kvStripHtml(name, kvRows)}
               ${mm.last_error ? `<div class="mono st-err" style="font-size:12px;margin-top:4px">${esc(mm.last_error)}</div>` : ''}
               <div class="muted mono" style="font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(mm.promql || '')}">${esc(mm.promql || '')}</div>
             </div>`;
           }).join('');
-    }
   }
 }
 function stopOffpeakAuto() {
@@ -5548,6 +6150,23 @@ $("ag-save").onclick = guarded("ag-save", async () => {
 // KV-cache occupancy. Read-only and best-effort -- an unreachable Prometheus
 // degrades to a line of text, never a dead tab.
 let emTimer = null;
+// Shared /admin/endpoint-metrics cache (2026-11-08): the off-peak tab's
+// per-model KV strip and this table want the SAME rows, so one fetch per
+// ~15s feeds both instead of double-querying the collector. A REJECTED fetch
+// is not cached (the next caller retries) and emFetch re-throws, so each
+// caller keeps its own degradation (unavailable pill / no KV strips).
+let emCache = null;   // { at: number, p: Promise } | null
+async function emFetch(maxAgeMs = 15000, force = false) {
+  const now = Date.now();
+  if (!force && emCache && now - emCache.at < maxAgeMs) return emCache.p;
+  emCache = { at: now, p: api('/endpoint-metrics') };
+  try {
+    return await emCache.p;
+  } catch (e) {
+    emCache = null;
+    throw e;
+  }
+}
 function emNum(v, digits) {
   return (v == null || !isFinite(v)) ? '<span class="muted">—</span>' : Number(v).toFixed(digits);
 }
@@ -5595,12 +6214,12 @@ function emEndpointSub(r) {
   if (r.idle) parts.push('idle');
   return parts.join(' · ');
 }
-async function loadEndpointMetrics() {
+async function loadEndpointMetrics(force) {
   const pill = $('em-pill');
   if (!pill) return;
   let d;
   try {
-    d = await api('/endpoint-metrics');
+    d = await emFetch(15000, force);
   } catch (e) {
     pill.textContent = 'unavailable';
     pill.className = 'pill';
@@ -5658,7 +6277,7 @@ function startEndpointMetricsAuto() {
   emTimer = setInterval(() => { loadEndpointMetrics().catch(() => {}); }, 10000);
 }
 const emReloadBtn = $('em-reload');
-if (emReloadBtn) emReloadBtn.addEventListener('click', () => loadEndpointMetrics().catch(() => {}));
+if (emReloadBtn) emReloadBtn.addEventListener('click', () => loadEndpointMetrics(true).catch(() => {}));   // a manual ↻ forces past the 15s cache
 const emAutoBox = $('em-auto');
 if (emAutoBox) emAutoBox.addEventListener('change', startEndpointMetricsAuto);
 document.addEventListener('visibilitychange', () => {
@@ -5668,6 +6287,118 @@ document.addEventListener('visibilitychange', () => {
     startEndpointMetricsAuto();
   } else {
     stopEndpointMetricsAuto();
+  }
+});
+
+// ---------- model groups (load-balanced sets of equivalent models) -------
+// A group is a named set of equivalent registered CHAT pools. A request
+// naming the group picks a member by LIVE load (power-of-two over the
+// members' queue depth), the conversation pins to that member, and the
+// SELECTED member bills and carries its ACL — the group never bypasses
+// budgets or allowed_models. v1 console surface: list + upsert + delete +
+// a read-only "would pick now" preview (it never pins or mutates).
+async function loadGroups() {
+  const table = $('mg-table');
+  if (!table) return;
+  if (!state.models.length) { try { await loadModels(); } catch { /* registry stays empty */ } }
+  const d = await api('/model-groups');
+  const groups = d && Array.isArray(d.groups) ? d.groups : [];
+  state.modelGroups = groups;
+  // members multi-select: the registered pools are the ONLY legal members
+  // (the server re-validates: unknown names, group members, duplicates and
+  // >32 members are all rejected with the reason in the banner).
+  $('mg-members').innerHTML = state.models.length
+    ? state.models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('')
+    : '<option>(no registered pools — add some under Models first)</option>';
+  // preview select: keep the current choice when it still exists
+  const pv = $('mg-preview');
+  const cur = pv.value;
+  pv.innerHTML = '<option value="">— pick a group —</option>' +
+    groups.map(g => `<option value="${esc(g.name)}">${esc(g.name)}</option>`).join('');
+  if (groups.some(g => g.name === cur)) pv.value = cur;
+  table.querySelector('tbody').innerHTML = groups.length
+    ? groups.map(g => {
+        const members = Array.isArray(g.members) ? g.members : [];
+        return `<tr>
+          <td class="mono"><b>${esc(g.name)}</b></td>
+          <td><span class="pill" title="model_type every member of the group serves">${esc(g.model_type || 'chat')}</span></td>
+          <td>${members.length ? members.map(m => `<span class="pill mono" title="member — equivalent to every other member of the group">${esc(m)}</span>`).join(' ') : '<span class="muted">—</span>'}</td>
+          <td><span class="pill" title="load = power-of-two choices over live queue depth">${esc(g.policy || 'load')}</span></td>
+          <td class="muted">${esc(g.description || '')}</td>
+          <td class="muted">${g.created_at ? new Date(g.created_at).toLocaleString() : '—'}</td>
+          <td><button class="ghost mini" onclick="mgEdit(this,'${esc(g.name)}')" title="Load this group into the form above — Save replaces it whole">edit</button> <button class="ghost mini danger" onclick="mgDelete(this,'${esc(g.name)}')" title="Delete the group — requests naming it stop resolving; the members themselves are untouched">delete</button></td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="7" class="muted">no model groups yet — create one below</td></tr>';
+}
+// Row actions — window globals for the inline onclick registry (the console
+// rule: an inline handler may only call a window-level function).
+window.mgEdit = (btn, name) => withBtn(btn, async () => {
+  const g = (state.modelGroups || []).find(x => x.name === name);
+  if (!g) return banner('group not found — reload the tab first', 'error', 4000);
+  $('mg-name').value = g.name;
+  $('mg-policy').value = g.policy || 'load';
+  $('mg-desc').value = g.description || '';
+  const sel = $('mg-members');
+  const members = Array.isArray(g.members) ? g.members : [];
+  for (const o of [...sel.options]) o.selected = members.includes(o.value);
+  $('mg-form-title').textContent = 'Edit model group — ' + g.name;
+  banner('editing <b>' + esc(name) + '</b> — adjust, then Save (replaces the group whole)', '', 4500, true);
+});
+window.mgDelete = (btn, name) => withBtn(btn, async () => {
+  if (!confirm('Delete model group "' + name + '"? Requests naming it stop resolving (the members themselves are untouched).')) return;
+  try {
+    await api('/model-groups/' + encodeURIComponent(name), { method: 'DELETE' });
+    banner('model group <b>' + esc(name) + '</b> deleted', '', 3500, true);
+    await loadGroups();
+  } catch (e) { banner(e.message, 'error', 7000); }
+});
+$('mg-save').onclick = guarded('mg-save', async () => {
+  const name = $('mg-name').value.trim();
+  if (!name) return banner('the group needs a name — it becomes the model id clients request', 'error', 4500);
+  // Name charset (2026-11-08, impl-platform): slug — the server refuses
+  // whitespace, '/', markup/control chars, >200, the reserved names and any
+  // name equal to a registered model. Catch the two operator-error classes
+  // up front; everything else surfaces as the server's 422 reason.
+  if (/\s/.test(name) || name.length > 200)
+    return banner('group names are slugs — no whitespace, 200 chars max (the server also refuses "/" and markup, the reserved names and names equal to a registered model)', 'error', 6000);
+  const sel = $('mg-members');
+  const members = [...sel.selectedOptions].map(o => o.value);
+  if (!members.length) return banner('pick at least one member (registered pools — Ctrl/⌘ multi-select)', 'error', 4500);
+  try {
+    await api('/model-groups/' + encodeURIComponent(name), { method: 'PUT', body: {
+      model_type: 'chat',
+      policy: $('mg-policy').value || 'load',
+      members,
+      description: $('mg-desc').value.trim(),
+    } });
+    banner('model group <b>' + esc(name) + '</b> saved — ' + members.length + ' member(s)', '', 4000, true);
+    $('mg-name').value = '';
+    $('mg-desc').value = '';
+    $('mg-form-title').textContent = 'Create a model group';
+    for (const o of [...sel.options]) o.selected = false;
+    await loadGroups();
+  } catch (e) { banner(e.message, 'error', 7000); }
+});
+// Read-only preview: the same power-of-two choice a real request would get.
+$('mg-preview-go').onclick = guarded('mg-preview-go', async () => {
+  const name = $('mg-preview').value;
+  const out = $('mg-preview-out');
+  if (!name) { if (out) out.innerHTML = '<span class="muted">pick a group first</span>'; return; }
+  if (out) out.innerHTML = '<span class="muted">choosing…</span>';
+  try {
+    const d = await api('/model-groups/' + encodeURIComponent(name) + '/preview', { method: 'POST' });
+    const cands = d && Array.isArray(d.candidates) ? d.candidates : [];
+    const pick = d && d.member ? '<b class="mono">' + esc(d.member) + '</b>' : '<span class="muted">none — no member qualifies right now</span>';
+    out.innerHTML = 'would pick now: ' + pick + (cands.length
+      ? ' <span class="muted">— candidates:</span> ' + cands.map(c => {
+          const score = c && c.score != null && isFinite(Number(c.score)) ? Number(c.score).toFixed(2) : 'no data';
+          const ok = !c || c.healthy !== false;
+          return '<span class="pill mono ' + (ok ? '' : 'off') + '" title="' + (ok ? 'healthy pool' : 'unhealthy pool') + '">' + esc(c ? c.model : '') + ' · ' + score + '</span>';
+        }).join(' ')
+      : '');
+  } catch (e) {
+    if (out) out.innerHTML = '<span class="st-err mono">' + esc(e.message) + '</span>';
   }
 });
 
@@ -5694,6 +6425,9 @@ function activateTab(name) {
   // registry, loaded here if boot did not reach it yet).
   if (name === 'agents') loadAgents().catch(e => banner(e.message, 'error', 5000));
   if (name === 'routing') loadRouting().catch(e => banner(e.message, 'error', 5000));
+  // Model groups: list + form + preview lazy-load on activation like every
+  // other tab (the nav click handler picks the new button up generically).
+  if (name === 'groups') loadGroups().catch(e => banner(e.message, 'error', 5000));
   if (name === 'guardrails') {
     gApplyEngineUI();   // (re)fit the create form's hint + config template
     loadGuardrails().catch(e => banner(e.message, 'error', 5000));
@@ -5751,7 +6485,50 @@ $('t-reload').addEventListener('click', () => loadTraces().catch(e => banner(e.m
 $('a-action').addEventListener('change', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
 $('a-type').addEventListener('change', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
 $('a-reload').addEventListener('click', () => loadAudit().catch(e => banner(e.message, 'error', 5000)));
-$('op-reload').addEventListener('click', () => loadOffpeak().catch(() => {}));
+// Authenticated CSV download: fetch with the Bearer header, stream to a
+// blob, click a transient anchor (a bare navigation would lose the key).
+// Same two-envelope rule as api(): the SSO chain overwrites Authorization.
+// Verify the hash-chained audit trails (2026-11-10). Read-only and NOT cheap
+// (the verifier walks each never-pruned trail), so it is a button, never a poll.
+$('a-verify').addEventListener('click', guarded('a-verify', async () => {
+  const el = $('a-chain');
+  el.hidden = false;
+  el.textContent = 'verifying…';
+  try {
+    const j = await api('/audit/chain');
+    const st = (j && j.anchor_status) || 'unknown';
+    // anchor-mismatch / anchor-invalid / trail-wiped are FAILURES even if a
+    // bare ok:true came back — the anchor is what proves the tail is real.
+    const bad = st === 'anchor-mismatch' || st === 'anchor-invalid' || st === 'trail-wiped';
+    const ok = j && j.ok && !bad;
+    el.innerHTML = (ok ? '✓ chains verified' : '✗ chain check FAILED')
+      + ' — anchor: ' + esc(st)
+      + (j && j.checked !== undefined ? ' (' + esc(String(j.checked)) + ' rows walked)' : '')
+      + (j && j.first_bad_id ? ' — first bad row id ' + esc(String(j.first_bad_id)) : '');
+    el.style.color = ok ? 'var(--ok, #3fb950)' : 'var(--err, #f85149)';
+  } catch (e) {
+    el.innerHTML = 'chain check unavailable: ' + esc(e.message);
+    el.style.color = 'var(--err, #f85149)';
+  }
+}));
+$('a-csv').addEventListener('click', async ev => {
+  ev.preventDefault();
+  const qs = $('a-csv').dataset.qs;
+  if (!qs) return;
+  try {
+    if (!key()) throw new Error('enter the admin key first');
+    const r = await fetch('/admin/audit?' + qs, {
+      headers: { 'Authorization': 'Bearer ' + key(), 'X-API-Key': key() } });
+    if (!r.ok) throw new Error(r.status + ' — CSV export refused');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'admin-audit.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { banner(e.message, 'error', 6000); }
+});
+$('op-reload').addEventListener('click', () => loadOffpeak(true).catch(() => {}));   // a manual ↻ forces past the 15s shared cache
 async function refreshAll() {
   await loadTenants(); await loadProfiles(); await loadModels(); await loadMcpServers(); await loadKeys();
 }
@@ -5781,6 +6558,7 @@ function setConn(ok) { $('conn').textContent = ok ? 'connected' : 'not connected
 Object.assign(window, {
   newTenant, newUser, revokeKey, showBudgets, showGrants, showUsage,
   editProfile, deleteProfile, viewTools, moAddRow, deleteModel, deletePrice, saveOpFraction,
+  mgEdit, mgDelete,
   pAddModel, pAddBudget, pMove, pDel, pDelBudget, pReloadTools,
   rotateKey, probeModel, testMcp, editMcp, editKey, propagateLimits,
   showCreds, delCred, revokeEnrollment,
@@ -5790,13 +6568,27 @@ Object.assign(window, {
 // F4: boot read uses the SAME store the write above uses (sessionStorage via
 // the iframe-safe sessionStore wrapper — never a bare, unguarded access).
 armPasswordToggles(document);
-// The one-plane contract: measure now, re-measure on resize and after ANY
-// render (dialogs, endpoint rows, tables). The observer watches childList
-// only — layoutFormRows writes STYLE attributes, never children — so it
-// cannot re-trigger itself.
+// The one-plane contract: measure now, re-measure on resize and after any
+// render that can change a form row's shape. The observer is scoped to the
+// roots that hold rows — each static .row/.ep-row, the dialog body (dialog
+// rows are rebuilt per open) and the endpoint-row container — instead of
+// document.body: the body-wide watch forced a full pass (getBoundingClientRect
+// per .row item) on EVERY DOM mutation, banners and table renders included,
+// none of which can change a row's flex lines. Dynamic rows get an explicit
+// layoutFormRowsNow() at their render site (dlg(), addEndpointRow); the
+// observer backstops structural edits inside a live row (selects, the agent
+// picker). The observer watches childList only — layoutFormRows writes STYLE
+// attributes, never children — so it cannot re-trigger itself.
 layoutFormRowsNow();
 window.addEventListener('resize', layoutFormRows);
-new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });
+{
+  const rowObs = new MutationObserver(layoutFormRows);
+  for (const r of document.querySelectorAll('.row, .ep-row'))
+    rowObs.observe(r, { childList: true, subtree: true });
+  rowObs.observe($('dlg-body'), { childList: true, subtree: true });
+  const moEps = $('mo-eps');
+  if (moEps) rowObs.observe(moEps, { childList: true, subtree: true });
+}
 const storedKey = sessionStore.get('pcai-admin-key');
 if (storedKey) {
   $('adminkey').value = storedKey;

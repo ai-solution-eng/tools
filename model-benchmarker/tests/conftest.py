@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import sys
 import threading
@@ -18,6 +19,18 @@ import pytest
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+# httpx2 < 2.12 (this dev env; requirements pin httpx2>=2.12, where it is
+# fixed) mis-parses the bracketed IPv6 entry "[::1]" in NO_PROXY while
+# building its default client, which breaks importing the shared PCAI model
+# modules. No test proxies to ::1, so normalize the entry away once, before
+# any test module imports the model stack.
+for _var in ("NO_PROXY", "no_proxy"):
+    _entries = [e for e in os.environ.get(_var, "").split(",") if e and e != "[::1]"]
+    if _entries:
+        os.environ[_var] = ",".join(_entries)
+    else:
+        os.environ.pop(_var, None)
 
 
 # ---------------------------------------------------------------------------

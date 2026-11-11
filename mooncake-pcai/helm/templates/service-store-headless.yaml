@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.deployment.name }}-store-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-store
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  # Headless: the StatefulSet needs stable per-pod DNS. Clients do not use this
+  # service - they reach each store pod at the address it registers with the
+  # master (MOONCAKE_LOCAL_HOSTNAME).
+  clusterIP: None
+  selector:
+    app: {{ .Values.deployment.name }}-store
+  ports:
+    - name: http
+      port: {{ .Values.master.metadataPort }}
+      targetPort: http

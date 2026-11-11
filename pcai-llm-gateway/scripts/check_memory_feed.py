@@ -51,8 +51,24 @@ def psql(sql: str) -> tuple[int, str]:
     """One read-only query against the gateway database via kubectl exec."""
     return sh(
         [
-            "kubectl", "-n", NS, "exec", PG_POD, "-c", "postgres", "--",
-            "psql", "-U", "pcai_llm", "-d", "pcai_llm", "-X", "-A", "-t", "-c", sql,
+            "kubectl",
+            "-n",
+            NS,
+            "exec",
+            PG_POD,
+            "-c",
+            "postgres",
+            "--",
+            "psql",
+            "-U",
+            "pcai_llm",
+            "-d",
+            "pcai_llm",
+            "-X",
+            "-A",
+            "-t",
+            "-c",
+            sql,
         ]
     )
 
@@ -63,22 +79,45 @@ def main() -> int:
     args = ap.parse_args()
 
     print("=== 1. deployed image + distiller gates ===")
-    rc, out = sh([
-        "kubectl", "-n", NS, "get", "deploy", "pcai-llm-gateway",
-        "-o", "jsonpath={.spec.template.spec.containers[0].image}",
-    ])
+    rc, out = sh(
+        [
+            "kubectl",
+            "-n",
+            NS,
+            "get",
+            "deploy",
+            "pcai-llm-gateway",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+        ]
+    )
     if rc != 0:
         print("  cannot read the deployment (kubectl configured?):", out[:200])
         return 1
     print("  image:", out)
-    rc, env = sh([
-        "kubectl", "-n", NS, "get", "deploy", "pcai-llm-gateway",
-        "-o", "jsonpath={range .spec.template.spec.containers[0].env[*]}{.name}={.value}{'\\n'}{end}",
-    ])
+    rc, env = sh(
+        [
+            "kubectl",
+            "-n",
+            NS,
+            "get",
+            "deploy",
+            "pcai-llm-gateway",
+            "-o",
+            "jsonpath={range .spec.template.spec.containers[0].env[*]}{.name}={.value}{'\\n'}{end}",
+        ]
+    )
     gates = [
-        line for line in env.splitlines()
-        if line.startswith(("PCAI_LLM_DISTILLER_ENABLED", "PCAI_LLM_DISTILLER_MEMORY_SERVER",
-                            "PCAI_LLM_DISTILLER_MEMORY_PROBE_TOOL", "PCAI_LLM_DISTILLER_RAW_FALLBACK"))
+        line
+        for line in env.splitlines()
+        if line.startswith(
+            (
+                "PCAI_LLM_DISTILLER_ENABLED",
+                "PCAI_LLM_DISTILLER_MEMORY_SERVER",
+                "PCAI_LLM_DISTILLER_MEMORY_PROBE_TOOL",
+                "PCAI_LLM_DISTILLER_RAW_FALLBACK",
+            )
+        )
     ]
     for g in gates:
         print("  " + g)
@@ -87,11 +126,21 @@ def main() -> int:
         return 1
 
     print("\n=== 2. Postgres error log: distiller SQL faults (last 500 lines) ===")
-    rc, logs = sh([
-        "kubectl", "-n", NS, "logs", PG_POD, "-c", "postgres", "--tail=500",
-    ])
+    rc, logs = sh(
+        [
+            "kubectl",
+            "-n",
+            NS,
+            "logs",
+            PG_POD,
+            "-c",
+            "postgres",
+            "--tail=500",
+        ]
+    )
     faults = [
-        line for line in logs.splitlines()
+        line
+        for line in logs.splitlines()
         if "ERROR" in line and any(k in line for k in ("does not exist", "cannot cast", "more target columns"))
     ]
     if faults:
@@ -108,9 +157,7 @@ def main() -> int:
         print("  cannot query (kubectl exec blocked?):", newest[:200])
         return 1
     print("  newest distill marker:", newest)
-    rc, recent = psql(
-        "select count(*) from canonical_distills where distilled_at > now() - interval '30 minutes';"
-    )
+    rc, recent = psql("select count(*) from canonical_distills where distilled_at > now() - interval '30 minutes';")
     print("  distills in the last 30 min:", recent)
 
     print("\n=== 4. memory dataset growing? ===")

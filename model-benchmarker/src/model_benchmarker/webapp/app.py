@@ -8,6 +8,7 @@ Surfaces:
 * GET /benchmark/endpoint  universal-bench launcher (API-key gated)
 * POST /api/estimate       memory-estimate JSON API backing the default page
 * GET /api/endpoints       the operator-configured endpoint allowlist (gated)
+* POST /api/models         model ids an endpoint advertises (gated; chat page dropdown)
 * POST /api/runs           launch a benchmark (gated) -- one per endpoint
 * GET /api/runs            run history (gated)
 * GET /api/runs/{id}       status + log tail + artifacts (gated)
@@ -38,6 +39,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .. import __version__
 from ..memory_model import ModelConfig, config_from_dict
@@ -198,7 +200,7 @@ def create_app(work_dir: str | None = None) -> Any:
 
     @app.get("/api/results/compare")
     async def results_compare(request: Request) -> JSONResponse:
-        """Side-by-side comparison of 2..4 runs (public read-only, like the
+        """Side-by-side comparison of 2..6 runs (public read-only, like the
         rest of the /results surface). ids: comma-separated run ids, read
         from request.query_params so the route behaves identically through
         real HTTP and the ASGI test helper (which routes on the full URI);
@@ -390,6 +392,41 @@ def create_app(work_dir: str | None = None) -> Any:
             {"targets": [{"name": t.name, "url": t.url, "kind": t.kind} for t in R.load_target_suggestions()]}
         )
 
+    @app.post("/api/models")
+    async def endpoint_models(request: Request) -> JSONResponse:
+        """Model ids an OpenAI-compatible endpoint advertises via
+        ``GET {target}/v1/models`` -- the chat page's Model dropdown.
+
+        Body: {"target": <base URL, root without /v1>, "target_usage":
+        "local"|"remote", "api_key": <optional>}. The target is resolved and
+        keyed exactly like a launch (see runner.list_models_for_target), so
+        the list is what the benchmark itself would discover.
+
+        Fails SOFT: an unreachable endpoint answers 200 with models=[] and a
+        reason -- typing the id manually, or leaving the field empty
+        (auto-discover), keeps working. Only an invalid target is a 400.
+        """
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="body must be JSON") from None
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        target = str(payload.get("target") or payload.get("url") or "").strip()
+        usage = str(payload.get("target_usage") or "remote").strip().lower()
+        if usage not in ("local", "remote"):
+            raise HTTPException(status_code=400, detail="target_usage must be 'local' or 'remote'")
+        api_key = str(payload.get("api_key") or "")
+        if len(api_key) > 4096:
+            raise HTTPException(status_code=400, detail="api_key is too long")
+        # the probe is synchronous and can block for its timeout: keep it off
+        # the event loop so a slow/unroutable endpoint cannot stall the app
+        try:
+            result = await run_in_threadpool(R.list_models_for_target, target, {"target_usage": usage}, api_key=api_key)
+        except R.BenchError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return JSONResponse(result)
+
     @app.post("/api/runs")
     async def launch_run(request: Request) -> JSONResponse:
         try:
@@ -478,6 +515,8 @@ def create_app(work_dir: str | None = None) -> Any:
             return True  # launcher pages
         if path == "/api/targets":
             return True  # launch-advice catalog
+        if path == "/api/models":
+            return True  # the chat page's model-list probe (same trust as a launch)
         # hiding entries changes the shared results page for every viewer
         if path == "/api/results/hidden":
             return True
@@ -777,10 +816,11 @@ def _float_field(payload: dict, key: str, default: float, lo: float, hi: float) 
     return f
 
 
-def _https_fetch_json_url(url: str, timeout: float = 10.0) -> tuple[dict | None, str]:
+def _https_fetch_json_url(url: str, timeout: float = 10.0) -> tuple[dict | list | None, str]:
     """Stdlib HTTPS GET of a small public JSON API response, reusing the
     memory_model trust ladder (system verify -> certifi -> marked-unverified
-    last resort for public metadata). Returns (data | None, error)."""
+    last resort for public metadata). Returns (data | None, error); the hub
+    model-list API answers with a JSON list, other callers with an object."""
     from ..memory_model.configs import _https_fetch_json
 
     data, _source, err = _https_fetch_json(url, timeout=timeout)

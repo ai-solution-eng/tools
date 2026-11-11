@@ -50,9 +50,16 @@ def test_every_dollar_lookup_has_a_matching_element_id() -> None:
 
     for name, path in (("team_leader", TEAM), ("admin", ADMIN)):
         s = _read(path)
-        script = re.search(r"<script>(.*)</script>", s, re.DOTALL)
-        assert script, f"{name}: no inline script block"
-        looked_up = set(re.findall(r"\$\('([^']+)'\)", script.group(1)))
+        # Every inline block, not the greedy first-to-last span: the theme wave's
+        # pre-paint <script> in <head> made the old greedy re.search swallow the
+        # markup between blocks. Union the lookups across all of them — a
+        # non-greedy re.search alone would only ever inspect the head script and
+        # the check would pass vacuously.
+        blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", s, re.DOTALL)
+        assert blocks, f"{name}: no inline script block"
+        looked_up = set()
+        for block in blocks:
+            looked_up |= set(re.findall(r"\$\('([^']+)'\)", block))
         present = set(re.findall(r'id="([^"]+)"', s))
         missing = sorted(looked_up - present)
         assert not missing, f"{name}: $() with no element in the markup: {missing}"
@@ -394,7 +401,10 @@ def test_team_leader_overflow_settings_patch() -> None:
     so = s[s.index("$('ovr-overflow-tog').onchange") : s.index("$('ovr-overflow-tog').onchange") + 900]
     assert so.index("api('/settings'" + "") < so.index("loadOverview()"), "PATCH before re-read"
     assert "tog.checked = !desired" in so, "failed PATCH must revert the toggle"
-    assert "banner(esc(e.message), 'error', 9000)" in so
+    # banner() now escapes BY DEFAULT (audit 2026-11-10 P2: the team console
+    # matched the admin console's escape-first contract), so call sites no
+    # longer pre-escape — pre-escaping here would double-escape.
+    assert "banner(e.message, 'error', 9000)" in so
 
 
 def test_team_leader_overview_is_spend_aware() -> None:
@@ -454,7 +464,7 @@ def test_team_leader_allocation_cell_and_409_verbatim() -> None:
     assert "typeof j.detail === 'string' ? j.detail" in s
     # …and the budgets save handler banners that message verbatim
     save = s[s.index("$('tb-save').onclick") : s.index("$('tb-save').onclick") + 420]
-    assert "banner(esc(e.message), 'error', 9000)" in save
+    assert "banner(e.message, 'error', 9000)" in save
 
 
 def test_budget_envelope_card_lives_on_the_usage_tab() -> None:

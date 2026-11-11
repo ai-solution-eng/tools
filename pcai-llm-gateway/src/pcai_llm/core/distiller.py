@@ -246,7 +246,14 @@ def build_transcript(messages: list[dict[str, Any]], title: str = "") -> str:
             pass
     lines = ["# Session History", ""]
     if title:
-        lines = ["# Session History - " + title, ""]
+        # TITLE NEUTRALISATION (audit 2026-11-10 P3, the residual of the P1-3
+        # class): the title is transcript-authored text interpolated into the
+        # document HEADER, where _neutralize (message bodies only) never runs —
+        # a title carrying a newline put "### Assistant" or "[MEMORY INDEX" on
+        # its own line and every later recall read it back as distiller-written
+        # structure. Collapsing all whitespace keeps the title on the header
+        # line, where it is inert.
+        lines = ["# Session History - " + " ".join(str(title).split()), ""]
     # total = the EXACT length of the document rendered so far, separators
     # included (audit D-9: the cap is enforced against this before every
     # append, so MAX_HISTORY_CHARS is a real bound, not an after-the-fact

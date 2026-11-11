@@ -33,6 +33,17 @@ class JobRecord:
     storage: str = "pvc"  # pvc | s3
     s3_path: str = ""  # user-chosen s3://bucket/prefix/ destination
     cache_root: str = ""  # user-chosen absolute PVC path; empty => /mnt/large-models/{model_name}
+    # ---- NIM profile mirrors (source == "nim") --------------------------
+    source: str = "hf"  # hf | nim
+    nim_image: str = ""
+    nim_profiles: str = ""
+    nim_bucket: str = ""
+    nim_override: str = ""  # s3://<bucket> for NIM_REPOSITORY_OVERRIDE
+    ngc_secret_name: str = ""
+    nim_pull_secret_name: str = ""
+    # Display URL for backends whose destination is not a PVC path. NIM mirrors
+    # show s3://<bucket>; HF jobs keep using pvc_url.
+    output_url: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -51,6 +62,7 @@ class JobQueue:
         pvc_subpath: str = "large-models",
         s3_bucket: str = "",
         s3_prefix: str = "",
+        nim_bucket: str = "",
     ):
         self.max_concurrency = max_concurrency
         self.k8s = k8s
@@ -59,6 +71,7 @@ class JobQueue:
         self.pvc_subpath = pvc_subpath
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix.rstrip("/")
+        self.nim_bucket = nim_bucket.strip()
         self.jobs: dict[str, JobRecord] = {}
         self._sem: asyncio.Semaphore | None = None
 
@@ -94,6 +107,8 @@ class JobQueue:
         for m in managed:
             if m["id"] in self.jobs:
                 continue
+            source = m.get("source", "hf")
+            nim_override = m.get("nim_override", "")
             record = JobRecord(
                 id=m["id"],
                 namespace=m["namespace"],
@@ -104,8 +119,20 @@ class JobQueue:
                 storage=m.get("storage", "pvc"),
                 s3_path=m.get("s3_path", ""),
                 cache_root=m.get("cache_root", ""),
-                pvc_url=self._output_url(
-                    m["model_name"], m.get("storage", "pvc"), m.get("s3_path", ""), m.get("cache_root", "")
+                source=source,
+                nim_image=m.get("nim_image", ""),
+                nim_profiles=m.get("nim_profiles", ""),
+                nim_bucket=m.get("nim_bucket", ""),
+                nim_override=nim_override,
+                ngc_secret_name=m.get("ngc_secret_name", ""),
+                nim_pull_secret_name=m.get("nim_pull_secret_name", ""),
+                output_url=nim_override if source == "nim" else "",
+                pvc_url=(
+                    ""
+                    if source == "nim"
+                    else self._output_url(
+                        m["model_name"], m.get("storage", "pvc"), m.get("s3_path", ""), m.get("cache_root", "")
+                    )
                 ),
                 created_at=m["created_at"],
                 finished_at=m["finished_at"],
@@ -115,6 +142,10 @@ class JobQueue:
             self.jobs[record.id] = record
             if record.status == "running":
                 asyncio.create_task(self._watch(record))
+            elif record.status in ("succeeded", "failed"):
+                # The Job finished while the app was down, so its annotated
+                # Secrets were never cleaned up. Do it now (best effort).
+                await self._delete_secrets(record)
 
     async def submit(
         self,
@@ -127,7 +158,37 @@ class JobQueue:
         chat_template_contents: str = "",
         cache_root: str = "",
         preflight=None,
+        source: str = "hf",
+        nim_image: str = "",
+        nim_profiles: str = "",
+        ngc_api_key: str = "",
     ) -> JobRecord:
+        # NIM profile mirrors are an S3-only backend: no PVC cache, no chat
+        # template, no preflight (disk/quota apply to the shared PVC). The Job
+        # runs the NIM image's mirror s3 command; the NGC key becomes a
+        # per-submission Secret deleted with the Job.
+        if source == "nim":
+            if self._sem is None:
+                raise RuntimeError("queue not started")
+            job_id = uuid.uuid4().hex[:12]
+            override = f"s3://{self.nim_bucket}" if self.nim_bucket else ""
+            record = JobRecord(
+                id=job_id,
+                namespace=namespace,
+                model_name=nim_image,
+                status="queued",
+                storage="s3",
+                source="nim",
+                nim_image=nim_image,
+                nim_profiles=nim_profiles,
+                nim_bucket=self.nim_bucket,
+                nim_override=override,
+                output_url=override,
+            )
+            self.jobs[job_id] = record
+            asyncio.create_task(self._run_nim(record, ngc_api_key))
+            return record
+
         # MD-B preflight/quota gate runs BEFORE Job creation (and before the
         # semaphore): a refused submission must never occupy a concurrency
         # slot or create a half-configured record. preflight is the app's
@@ -213,19 +274,60 @@ class JobQueue:
                 record.error = f"{type(e).__name__}: {e}"
             finally:
                 record.finished_at = time.time()
-                if record.hf_secret_name:
-                    try:
-                        await self.k8s.delete_secret(record.namespace, record.hf_secret_name)
-                    except Exception:
-                        pass
+                await self._delete_secrets(record)
+
+    async def _run_nim(self, record: JobRecord, ngc_api_key: str) -> None:
+        """Run one NIM profile mirror (same slot pool as HF downloads)."""
+        if self._sem is None:
+            raise RuntimeError("queue not started")
+        async with self._sem:
+            record.status = "running"
+            record.started_at = time.time()
+            try:
+                ngc_secret, pull_secret, job_name = await self.k8s.create_nim_job(
+                    record.namespace,
+                    record.nim_image,
+                    record.nim_profiles,
+                    record.id,
+                    ngc_api_key,
+                    record.nim_bucket,
+                )
+                record.ngc_secret_name = ngc_secret
+                record.nim_pull_secret_name = pull_secret
+                record.k8s_job_name = job_name
+                success, msg = await self.k8s.wait_for_job(record.namespace, job_name)
+                record.status = "succeeded" if success else "failed"
+                if not success:
+                    record.error = msg
+            except Exception as e:
+                record.status = "failed"
+                record.error = f"{type(e).__name__}: {e}"
+            finally:
+                record.finished_at = time.time()
+                await self._delete_secrets(record)
+
+    async def _delete_secrets(self, record: JobRecord) -> None:
+        """Best-effort removal of every per-submission Secret a job created."""
+        for secret in (record.hf_secret_name, record.ngc_secret_name, record.nim_pull_secret_name):
+            if not secret:
+                continue
+            try:
+                await self.k8s.delete_secret(record.namespace, secret)
+            except Exception:
+                pass
 
     async def _watch(self, record: JobRecord) -> None:
         """Poll a reconciled (already-running) Job to completion without semaphore."""
-        success, msg = await self.k8s.wait_for_job(record.namespace, record.k8s_job_name)
-        record.status = "succeeded" if success else "failed"
-        if not success:
-            record.error = msg
-        record.finished_at = time.time()
+        try:
+            success, msg = await self.k8s.wait_for_job(record.namespace, record.k8s_job_name)
+            record.status = "succeeded" if success else "failed"
+            if not success:
+                record.error = msg
+        finally:
+            record.finished_at = time.time()
+            # A Job created before an app restart still owns its Secrets; clean
+            # them here or they outlive the Job (Jobs TTL away, Secrets do not).
+            await self._delete_secrets(record)
 
     def get(self, job_id: str) -> JobRecord | None:
         return self.jobs.get(job_id)
@@ -253,11 +355,7 @@ class JobQueue:
                 record.error = f"delete error: {e}"
                 self.jobs[job_id] = record
                 return f"failed to delete k8s job: {e}"
-        if record.hf_secret_name:
-            try:
-                await self.k8s.delete_secret(record.namespace, record.hf_secret_name)
-            except Exception:
-                pass
+        await self._delete_secrets(record)
         return None
 
     async def get_progress(self, job_id: str) -> dict:

@@ -59,7 +59,7 @@ image:
   #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
   # (the reference renders as repository:tag@sha256:...); for tag-only
   # sites the alternative is pullPolicy: Always (re-checks every pull).
-  tag: v3.9.2
+  tag: v4.0.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -320,6 +320,11 @@ settings:
   # silently changes what an existing client request does; the explicit routing /
   # routing__<model> names always route regardless of this flag.
   routeDefaultModel: false
+  # AGENTS AS ROUTING CANDIDATES: with this on, the key's OFFERED agents join the
+  # router's candidate window (an agent is a hard model: tool surface + pinned
+  # model/cascade), and a pick applies the agent's surface + prompt for the whole
+  # turn. Off by default; it changes what the router may choose.
+  routingAgentsEnabled: false
   # MCP federation (/mcp): tools/list returns the key's GRANTED tools as individual
   # `{server}__{tool}` tools; false = legacy two-tool surface.
   mcpFlatTools: true
@@ -495,6 +500,13 @@ settings:
   # model serves on. DCGM series carry NO pod label — scope by Hostname + device:
   #   GLM-5.3-Flash: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs04.hst.lab",device=~"nvidia[4-7]"}[5m]))'
   offpeakModelPromql: {}
+  # L3 cache volume occupancy for the Off-peak tab's all-models summary: a PromQL label
+  # selector over kubelet_volume_stats_* naming the volumes backing the L3 store. The
+  # inference engine exports NO storage-occupancy gauge (activity counters only), so this
+  # is how a real disk utilization number is read. Empty = no disk occupancy section.
+  # Example (Mooncake SSD offload PVCs):
+  #   endpointMetricsDiskSelector: 'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'
+  endpointMetricsDiskSelector: ""
   # Load-aware cascade head: the HEAD model is picked at conversation start by per-model
   # off-peak state, then stays sticky. Only reorders candidates.
   loadAwareCascade:
@@ -512,11 +524,29 @@ settings:
 
   # OpenTelemetry tracing: one server span per HTTP request, exported as OTLP/HTTP
   # JSON to {otelEndpoint}/v1/traces. Off = no span object, no task, no client.
+  #
+  # ⚠️ THESE ARE CHART DEFAULTS, NOT SITE CONFIG. Leaving tracing off here is
+  # correct for a portable chart — most sites have no collector. But it means a
+  # site that WANTS tracing must set it in its own values document
+  # (helm/values-examples/values.<site>.yaml, pasted into PCAI Configure), not
+  # here. An install/upgrade that starts from chart defaults silently disables
+  # tracing: 2026-11-10, the v4.0.1 rollout reset otelEnabled to false and the
+  # fleet emitted nothing for an hour before anyone noticed.
+  #
+  # The placeholder endpoint below does NOT resolve — a real site must point at
+  # the full in-cluster name, e.g.
+  #   http://otel-collector.otel-traces.svc.cluster.local:4318
   otelEnabled: false
   otelEndpoint: http://otel-collector:4318
   otelServiceName: pcai-llm-gateway
   # Deterministic per-trace hash ratio: 0 = none, 1 = all.
   otelSampleRatio: 1.0
+  # Extra headers on every OTLP export, in the OpenTelemetry convention: a
+  # comma-separated list of Key=Value pairs. Needed when the backend
+  # authenticates the exporter — Langfuse wants
+  #   Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4
+  # Empty (default) = content-type only, i.e. an unauthenticated collector.
+  otelHeaders: ""
 
   # Session affinity: a chat conversation that sends X-PCAI-Session pins the
   # ENDPOINT (not just the cascade head) so its prefix keeps hitting the same
@@ -525,6 +555,18 @@ settings:
   # selection, so it is opted into per site).
   sessionAffinityEnabled: false
   sessionAffinityTtlS: 3600
+
+  # Model groups: named sets of EQUIVALENT chat models, selected by live load
+  # (power-of-two over queue depth, then KV%) instead of a fixed order. A group
+  # is a route target usable anywhere a model name is accepted (direct request,
+  # fallback chain, /v1/models); the chosen member's endpoint is then pinned
+  # per conversation. This is the load-balanced sibling of the ORDERED fallback
+  # chain. Off by default: groups are inert (not routable) until enabled.
+  # Load comes from a background Prometheus snapshot (never the request path);
+  # a stale/unavailable snapshot degrades to weighted random.
+  modelGroupsEnabled: false
+  modelGroupLoadRefreshS: 5
+  modelGroupLoadStaleS: 30
 
   # Audio passthrough billing heuristics. TTS/ASR report no token usage, and
   # a zero-token row would be a budget bypass, so the gateway bills an

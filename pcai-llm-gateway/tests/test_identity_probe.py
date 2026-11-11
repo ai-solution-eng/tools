@@ -815,10 +815,16 @@ def test_invalid_token_falls_through_to_key(probe_env, monkeypatch: pytest.Monke
     stays invisible to key holders, review §1.1)."""
     tc, fake = probe_env
     _token_env(monkeypatch)
-    expired = _sign(_claims(exp=int((datetime.now(UTC) - timedelta(minutes=1)).timestamp())))
+    # audit 2026-11-10 P3: a JWT-SHAPED bearer no longer reaches
+    # authenticate() when validation is configured — virtual keys are always
+    # "hllm-…" (core/keys.py generate_key) and never JWT-shaped, so that
+    # lookup was a guaranteed miss on every expired-token request. The
+    # fall-through is exercised with the shape that exists in production:
+    # a virtual key presented on the token-accepted surface.
+    virtual = "hllm-KeyInTokPlain"
     rec = _key(key_prefix="hllm-KeyInTok", scopes=["proxy"])
-    fake.add_key(expired, rec, subject="carol", idp=identity.IDP_SELF_ASSERTED)
-    r = tc.get("/v1/identity", headers={"Authorization": f"Bearer {expired}"})
+    fake.add_key(virtual, rec, subject="carol", idp=identity.IDP_SELF_ASSERTED)
+    r = tc.get("/v1/identity", headers={"Authorization": f"Bearer {virtual}"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["authenticated"] is True

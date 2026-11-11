@@ -1,7 +1,9 @@
 """FastAPI service that serves the HF Model Downloader UI and Job API."""
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -10,6 +12,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,9 +23,18 @@ from fastapi.templating import Jinja2Templates
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, field_validator, model_validator
 
+from . import oidc_identity
 from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog
 from .db import AioliDB
-from .gc import build_gc_plan, parse_aioli_rows
+from .gc import (
+    VERDICT_BLOCK,
+    VERDICT_DELETABLE,
+    VERDICT_SOFT_BLOCK,
+    build_gc_plan,
+    drop_delete_jobs,
+    evaluate_manual_targets,
+    parse_aioli_rows,
+)
 from .k8s import K8sClient
 from .preflight import (
     PreflightConfig,
@@ -52,6 +64,13 @@ S3_PREFIX = os.environ.get("S3_PREFIX", "")
 # ride along on every PVC-backend submit and be rejected by the s3_path
 # validator, which demands a bucket after the scheme.
 S3_DEFAULT_PATH = (f"s3://{S3_BUCKET}/" + (f"{S3_PREFIX}/" if S3_PREFIX else "")) if S3_BUCKET else ""
+# ---- NVIDIA NIM profile mirroring ------------------------------------------
+# The chart wires these only when nim.enabled and the storage backend includes
+# s3. NIM_AVAILABLE is the single gate the API and the page context both use.
+NIM_ENABLED = os.environ.get("NIM_ENABLED", "false").strip().lower() == "true"
+NIM_BUCKET = os.environ.get("NIM_BUCKET", "").strip()
+NIM_REGION = os.environ.get("NIM_REGION", "us-east-1").strip()
+NIM_AVAILABLE = NIM_ENABLED and bool(NIM_BUCKET) and STORAGE_BACKEND != "pvc"
 # Debug pod ("Launch debug pod" in the UI). Requires chart >= 1.2.0, which
 # renders the debug-pod.yaml template into the job-template ConfigMap.
 DEBUG_POD_ENABLED = os.environ.get("DEBUG_POD_ENABLED", "true").strip().lower() == "true"
@@ -70,9 +89,9 @@ CATALOG_PATH = os.environ.get("CATALOG_PATH", "/mnt/catalog/catalog.json")
 # Project recorded on a pushed packaged model that names none (chart:
 # catalog.defaultProject).  Empty = leave it blank, the historical behaviour.
 # The target is MLIS's "project" filter: rows with an empty project only show
-# under "All projects".  PCAI projects are namespaces, so this is normally a
-# project-user-* namespace -- verify the exact string MLIS filters on with one
-# push before rolling it out.
+# under "All projects".  The value is a project NAME: a PCAI project-* namespace
+# is accepted and its project- prefix is stripped before the push (see
+# versioning.strip_project_prefix).
 CATALOG_DEFAULT_PROJECT = os.environ.get("CATALOG_DEFAULT_PROJECT", "").strip()
 # "Refresh from GitHub" button: raw URL of the catalog JSON on GitHub
 # (e.g. https://raw.githubusercontent.com/<org>/<repo>/<branch>/seed_catalog.json).
@@ -123,6 +142,43 @@ GC_PROTECTED = [p for p in os.environ.get("GC_PROTECTED", "").split(",") if p.st
 GC_MIN_KEEP = int(os.environ.get("GC_MIN_KEEP", "0"))
 GC_REPORT_TTL = int(os.environ.get("GC_REPORT_TTL", "120"))
 
+# ---- Manual deletion (admin-initiated) --------------------------------------
+# A different feature from GC: GC is scheduled, TTL-driven and unattended; this
+# is an admin selecting exact directories now. It shares gc.py's protection
+# signals and nothing else. Disabled by default; the route handlers are always
+# registered (decorators run at import) but every one of them refuses with 404
+# (page) or 400 (API) when the feature is off, so there is nothing to
+# authenticate and nothing to reach.
+MANUAL_DELETE_ENABLED = os.environ.get("MANUAL_DELETE_ENABLED", "false").strip().lower() == "true"
+MANUAL_DELETE_MAX_TARGETS = int(os.environ.get("MANUAL_DELETE_MAX_TARGETS", "20"))
+MANUAL_DELETE_JOB_TTL = int(os.environ.get("MANUAL_DELETE_JOB_TTL", "86400"))
+# Hard cap on one delete Job. Generous on purpose: removing tens of GiB over
+# network storage takes minutes, and killing the process mid-rmtree is worse
+# than waiting. It exists to catch a pod that never schedules.
+MANUAL_DELETE_JOB_DEADLINE = int(os.environ.get("MANUAL_DELETE_JOB_DEADLINE", "3600"))
+# No fallback to the scanner image on purpose: the Job runs
+# "python3 -m app.delete_targets" and imports the kubernetes + psycopg2
+# clients, none of which the scanner image carries (see §9.1 of the design
+# note). The chart sets this to the app image; an empty value is a
+# misconfiguration the commit endpoint refuses rather than guesses at.
+MANUAL_DELETE_IMAGE = os.environ.get("MANUAL_DELETE_IMAGE", "")
+MANUAL_DELETE_AUTH_MODE = (os.environ.get("MANUAL_DELETE_AUTH_MODE", "sso") or "sso").strip().lower()
+MANUAL_DELETE_ADMIN_GROUPS = [g for g in os.environ.get("MANUAL_DELETE_ADMIN_GROUPS", "").split(",") if g.strip()]
+MANUAL_DELETE_ADMINS = [a for a in os.environ.get("MANUAL_DELETE_ADMINS", "").split(",") if a.strip()]
+MANUAL_DELETE_SECRET_NAME = os.environ.get("MANUAL_DELETE_SECRET_NAME", "model-delete-key")
+MANUAL_DELETE_SECRET_NAMESPACE = os.environ.get("MANUAL_DELETE_SECRET_NAMESPACE", APP_NAMESPACE)
+MANUAL_DELETE_SECRET_KEY = os.environ.get("MANUAL_DELETE_SECRET_KEY", "token")
+# Header names the PCAI oauth2-proxy injects (verified against the live
+# oauth2-proxy alpha config). X-Forwarded-User is NOT among them.
+SSO_USER_HEADERS = ("X-Auth-Request-Preferred-Username", "kubeflow-userid")
+SSO_GROUP_HEADERS = ("X-Auth-Request-Groups", "kubeflow-groups")
+# How long a preview's pinned target set stays valid. Must exceed the scanner
+# Job timeout (300s) because the clock starts when the preview finishes, not
+# when it starts.
+MANUAL_DELETE_VERDICT_TTL = int(os.environ.get("MANUAL_DELETE_VERDICT_TTL", "900"))
+# Cap on concurrent pinned previews; each one can hold a resolved target list.
+_MANUAL_DELETE_MAX_PREVIEWS = 32
+
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
@@ -134,7 +190,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # that predates the custom download-location field) after an upgrade — silently
 # dropping cache_root from submissions. A per-file hash guarantees the browser
 # refetches the asset on the next deploy.
-ASSET_NAMES = ("app.js", "style.css", "catalog.js", "favicon.jpg")
+ASSET_NAMES = ("app.js", "style.css", "catalog.js", "admin_delete.js", "favicon.jpg")
 
 
 def _static_hashes() -> dict[str, str]:
@@ -160,6 +216,7 @@ queue = JobQueue(
     pvc_subpath=PVC_SUBPATH,
     s3_bucket=S3_BUCKET,
     s3_prefix=S3_PREFIX,
+    nim_bucket=NIM_BUCKET,
 )
 catalog = Catalog(CATALOG_PATH)
 aioli_db = AioliDB(
@@ -246,13 +303,17 @@ app = FastAPI(title="HF Model Downloader", lifespan=lifespan)
 
 class SubmitRequest(BaseModel):
     namespace: str
-    model_name: str
-    hf_token: str
+    source: str = "hf"  # hf | nim
+    model_name: str = ""  # required for hf
+    hf_token: str = ""  # required for hf
     storage: str = "pvc"
     s3_path: str = ""
     chat_template_path: str = ""
     chat_template_contents: str = ""
     cache_root: str = ""
+    nim_image: str = ""  # NIM 2.x image ref, e.g. nvcr.io/nim/meta/...:tag
+    nim_profiles: str = ""  # space/comma separated profile ids; empty = default
+    ngc_api_key: str = ""  # per-submission NGC key
 
     @field_validator("namespace")
     @classmethod
@@ -261,11 +322,53 @@ class SubmitRequest(BaseModel):
             raise ValueError("invalid namespace")
         return v
 
+    @field_validator("source")
+    @classmethod
+    def _valid_source(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ("hf", "nim"):
+            raise ValueError("source must be 'hf' or 'nim'")
+        return v
+
     @field_validator("model_name")
     @classmethod
     def _valid_model(cls, v: str) -> str:
-        if not re.match(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$", v):
+        # Empty is legal for a NIM submission; the model validator requires it
+        # for hf and fills it from nim_image for nim.
+        if v and not re.match(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$", v):
             raise ValueError("model_name must be 'org/Repo-Name'")
+        return v
+
+    @field_validator("nim_image")
+    @classmethod
+    def _valid_nim_image(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            return v
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._\-/:@]*$", v):
+            raise ValueError("nim_image must look like [registry/]repo[:tag|@digest]")
+        if ":" not in v and "@" not in v:
+            raise ValueError("nim_image must pin a tag or digest")
+        return v
+
+    @field_validator("nim_profiles")
+    @classmethod
+    def _valid_nim_profiles(cls, v: str) -> str:
+        parts = [p for p in re.split(r"[,\s]+", v.strip()) if p]
+        if len(parts) > 50:
+            raise ValueError("nim_profiles accepts at most 50 profile ids")
+        for p in parts:
+            if not re.match(r"^[A-Za-z0-9._\-]+$", p):
+                raise ValueError(f"invalid NIM profile id: {p!r}")
+        # Dedupe preserving order; the job receives them as one --profiles list.
+        return " ".join(dict.fromkeys(parts))
+
+    @field_validator("ngc_api_key")
+    @classmethod
+    def _valid_ngc_key(cls, v: str) -> str:
+        v = v.strip()
+        if re.search(r"\s", v):
+            raise ValueError("ngc_api_key must not contain whitespace")
         return v
 
     @field_validator("storage")
@@ -300,13 +403,41 @@ class SubmitRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def _check_source(self):
+        if self.source == "hf":
+            if not self.model_name:
+                raise ValueError("model_name must be 'org/Repo-Name'")
+            if not self.hf_token.strip():
+                raise ValueError("hf_token is required")
+            return self
+        if not NIM_AVAILABLE:
+            raise ValueError("NIM downloads are not enabled on this deployment")
+        if not self.nim_image:
+            raise ValueError("nim_image is required")
+        if not self.ngc_api_key:
+            raise ValueError("ngc_api_key is required")
+        # A NIM mirror is S3-only and has no HF cache/chat-template semantics.
+        self.model_name = self.nim_image
+        self.hf_token = ""
+        self.storage = "s3"
+        self.s3_path = ""
+        self.cache_root = ""
+        self.chat_template_path = ""
+        self.chat_template_contents = ""
+        return self
+
+    @model_validator(mode="after")
     def _check_s3_path(self):
+        if self.source == "nim":
+            return self
         if self.storage == "s3" and not self.s3_path:
             raise ValueError("s3_path is required when storage is 's3'")
         return self
 
     @model_validator(mode="after")
     def _check_chat_template(self):
+        if self.source == "nim":
+            return self
         if bool(self.chat_template_path) != bool(self.chat_template_contents):
             raise ValueError("chat template path and contents must be provided together")
         return self
@@ -364,10 +495,13 @@ def _download_scan_status() -> str:
     return " ".join(parts) if parts else "No automatic scanning enabled."
 
 
-def _page_context() -> dict:
+async def _page_context(request: Request | None = None) -> dict:
+    # The namespace field defaults to the caller's own project namespace when
+    # SSO tells us who they are and that namespace exists.
+    default_namespace = await _resolve_user_namespace(request) if request is not None else DEFAULT_NAMESPACE
     return {
         "max_concurrency": MAX_CONCURRENCY,
-        "default_namespace": DEFAULT_NAMESPACE,
+        "default_namespace": default_namespace,
         "app_namespace": APP_NAMESPACE,
         "tier_labels": TIER_LABELS,
         "tier_info": TIER_INFO,
@@ -378,6 +512,12 @@ def _page_context() -> dict:
         "s3_bucket": S3_BUCKET,
         "s3_prefix": S3_PREFIX,
         "s3_default_path": S3_DEFAULT_PATH,
+        # NIM profile mirroring (S3-only). Empty when the deployment has no S3
+        # backend or nim.enabled is off; the template hides the whole source.
+        "nim_enabled": NIM_AVAILABLE,
+        "nim_bucket": NIM_BUCKET,
+        "nim_region": NIM_REGION,
+        "nim_override": f"s3://{NIM_BUCKET}" if NIM_AVAILABLE else "",
         # Job history always populates the table, so the section only depends
         # on the master switch; PVC/S3 scans enrich it when enabled/configured.
         "download_list_enabled": DOWNLOAD_LIST_ENABLED,
@@ -395,12 +535,12 @@ def _page_context() -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html", context=_page_context())
+    return templates.TemplateResponse(request=request, name="index.html", context=await _page_context(request))
 
 
 @app.get("/catalog", response_class=HTMLResponse)
 async def catalog_page(request: Request):
-    return templates.TemplateResponse(request=request, name="catalog.html", context=_page_context())
+    return templates.TemplateResponse(request=request, name="catalog.html", context=await _page_context(request))
 
 
 @app.post("/api/jobs")
@@ -421,12 +561,22 @@ async def submit_job(req: SubmitRequest):
             chat_template_contents=req.chat_template_contents,
             cache_root=req.cache_root,
             preflight=preflight_service,
+            source=req.source,
+            nim_image=req.nim_image,
+            nim_profiles=req.nim_profiles,
+            ngc_api_key=req.ngc_api_key,
         )
     except PreflightError as e:
         # QuotaExceededError subclasses PreflightError; both carry the exact
         # human-readable refusal (bytes-needed vs bytes-free / used vs quota).
         raise HTTPException(422, e.detail) from e
-    return {"id": record.id, "status": record.status, "storage": record.storage}
+    return {
+        "id": record.id,
+        "status": record.status,
+        "storage": record.storage,
+        "source": record.source,
+        "output_url": record.output_url,
+    }
 
 
 @app.get("/api/jobs")
@@ -678,6 +828,572 @@ async def gc_config():
     }
 
 
+# ---- Manual deletion (admin-initiated) -------------------------------------
+#
+# Two gates, deliberately independent (see documentation/manual-delete-design.md):
+#
+#   * auth    -- WHO may delete. An admin identity from the PCAI SSO gate, or a
+#                shared key on installs without oauth2-proxy. Never a normal
+#                user session.
+#   * verdict -- MAY this be deleted. gc.evaluate_manual_targets(), the same
+#                logic the preview shows and the Job re-runs in-pod.
+#
+# The isolation rule is the load-bearing one: the client may only name
+# cachepaths that the CURRENT scan returned. Anything else is rejected, never
+# normalised or repaired. The Job then receives exactly the resolved set.
+
+# Secret read once per process: rotation of a destructive-action credential
+# should require a restart anyway, and re-reading per request would be an API
+# call per keystroke.
+_delete_key_cache: dict[str, str] = {}
+# Pinned previews: verdict_id -> {actor, created, expires_at, rows, targets}.
+# In-memory and therefore single-replica (deployment.yaml pins replicas: 1).
+_manual_delete_previews: dict[str, dict] = {}
+_preview_lock: asyncio.Lock | None = None
+
+
+class DeletionPreviewRequest(BaseModel):
+    targets: list[str] = []
+
+
+class DeletionCommitRequest(BaseModel):
+    verdict_id: str = ""
+    confirm: str = ""
+    overrides: list[str] = []
+
+
+def _require_manual_delete() -> None:
+    if not MANUAL_DELETE_ENABLED:
+        # House convention for a disabled feature: 400 + detail, like _require_gc.
+        raise HTTPException(400, "manual delete is disabled (manualDelete.enabled=false)")
+
+
+async def _expected_delete_key() -> str:
+    """The configured shared key, or "" when the feature is unusable."""
+    if "value" in _delete_key_cache:
+        return _delete_key_cache["value"]
+    value = ""
+    if MANUAL_DELETE_SECRET_NAME:
+        try:
+            data = await k8s_client.read_secret(MANUAL_DELETE_SECRET_NAMESPACE, MANUAL_DELETE_SECRET_NAME)
+            value = (data.get(MANUAL_DELETE_SECRET_KEY) or "").strip()
+        except ApiException as e:
+            if e.status != 404:
+                log.warning(
+                    "manual delete: could not read Secret %s/%s: %s",
+                    MANUAL_DELETE_SECRET_NAMESPACE,
+                    MANUAL_DELETE_SECRET_NAME,
+                    e,
+                )
+            value = ""
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("manual delete: Secret read failed: %s", e)
+            value = ""
+    if not value:
+        # Absent/empty must NEVER mean "no gate": leave it empty so every
+        # comparison below fails, and say so in the response. Deliberately NOT
+        # cached: a transient API failure must not turn into a permanent
+        # lockout until restart, and a key created after startup should start
+        # working without one.
+        log.warning("manual delete: no usable delete key configured — all requests will be refused")
+        return value
+    _delete_key_cache["value"] = value
+    return value
+
+
+def _sso_subject(request: Request) -> str:
+    """The caller's SSO identity, or "" when no identity header is present.
+
+    oauth2-proxy injects X-Auth-Request-Preferred-Username (claim
+    preferred_username) and kubeflow-userid on this cluster; X-Forwarded-User is
+    NOT among them. The value is the same string the fleet's OIDC verifier
+    resolves (pcai_utils/oidc_identity.py, D21) — its token fixtures use
+    andrew-bydlon for both sub and preferred_username.
+    """
+    for header in SSO_USER_HEADERS:
+        candidate = (request.headers.get(header) or "").strip()
+        if candidate:
+            return candidate
+    return ""
+
+
+# Namespace list cache: one API call per minute rather than one per page render.
+_namespace_cache: dict = {"at": 0.0, "names": frozenset()}
+_NAMESPACE_CACHE_TTL = 60.0
+
+
+async def _namespace_names() -> frozenset:
+    now = time.time()
+    if _namespace_cache["names"] and (now - _namespace_cache["at"]) < _NAMESPACE_CACHE_TTL:
+        return _namespace_cache["names"]
+    try:
+        names = await k8s_client.list_namespaces()
+    except Exception as e:
+        # Best effort: a denied or failed list must not break page rendering.
+        log.debug("namespace list unavailable for the form default: %s", e)
+        return _namespace_cache["names"] or frozenset()
+    _namespace_cache["at"] = now
+    _namespace_cache["names"] = frozenset(names)
+    return _namespace_cache["names"]
+
+
+# Per-namespace "does models-pvc live here" cache, same 60s TTL.
+_pvc_ns_cache: dict[str, tuple[float, bool]] = {}
+
+
+async def _namespace_serves_models_pvc(namespace: str) -> bool:
+    """True when PVC_NAME exists in *namespace*.
+
+    A PVC is namespace-scoped, so a download or delete Job created anywhere else
+    waits forever on "persistentvolumeclaim not found". A namespace is only a
+    valid form default if it actually serves the model volume — otherwise the
+    prefill would hand the user a guaranteed-hanging Job.
+    """
+    now = time.time()
+    cached = _pvc_ns_cache.get(namespace)
+    if cached and (now - cached[0]) < _NAMESPACE_CACHE_TTL:
+        return cached[1]
+    ok = False
+    try:
+        # A successful read (even with unknown capacity) proves the PVC exists;
+        # a 404 or an RBAC denial both mean "do not default here".
+        await k8s_client.read_pvc_capacity(namespace, PVC_NAME)
+        ok = True
+    except Exception as e:
+        log.debug("models PVC not readable in %s: %s", namespace, e)
+    _pvc_ns_cache[namespace] = (now, ok)
+    return ok
+
+
+async def _resolve_user_namespace(request: Request) -> str:
+    """project-user-<preferred_username> when that namespace exists, else the default.
+
+    The convention is PCAI's: a user owns project-user-<username>, and
+    preferred_username is the claim oauth2-proxy forwards. That is a naming
+    convention, not an authorization fact, so it is used ONLY to pre-fill the
+    form and is verified against the namespace list the app can already read.
+    It also requires that namespace to actually hold the model PVC, because a
+    Job elsewhere cannot mount it. Anything unexpected — no identity header, no
+    such namespace, no PVC there, a failed list — falls back to the configured
+    default rather than guessing.
+    """
+    subject = _sso_subject(request)
+    if not subject:
+        return DEFAULT_NAMESPACE
+    candidate = f"{NAMESPACE_PREFIX}{subject}"
+    if candidate in await _namespace_names() and await _namespace_serves_models_pvc(candidate):
+        return candidate
+    return DEFAULT_NAMESPACE
+
+
+async def _verified_subject(request: Request) -> str:
+    """The subject of a VERIFIED OIDC bearer token, or "".
+
+    oauth2-proxy injects `Authorization: Bearer <id_token>` alongside the
+    identity headers, so the app can verify the token instead of trusting a
+    header any pod in the cluster could forge. Verification is the fleet's
+    shared pcai_utils module (vendored here): RS256 only, JWKS-cached,
+    fail-closed, and it never logs token material.
+
+    The JWKS fetch is blocking, so it runs in a worker thread; the module caches
+    keys (and negative-caches failures), so this is cheap after the first call.
+    """
+    header = request.headers.get("Authorization") or ""
+    if not header.lower().startswith("bearer "):
+        return ""
+    token = header[7:].strip()
+    if not token:
+        return ""
+    claims = await asyncio.to_thread(oidc_identity.verify_and_decode, token)
+    if not claims:
+        return ""
+    name = str(claims.get(oidc_identity.DEFAULT_IDENTITY_CLAIM) or claims.get("sub") or "").strip()
+    return name
+
+
+async def _actor_from_sso(request: Request) -> str:
+    """The caller's identity, or a 403 that names the misconfiguration."""
+    if oidc_identity.oidc_enabled():
+        # A verified token is REQUIRED when an IdP is configured: a bare header
+        # is forgeable by anything that can reach the Service directly.
+        user = await _verified_subject(request)
+        if not user:
+            raise HTTPException(
+                403,
+                "SSO token missing or not verifiable — admin actions require a valid "
+                "OIDC bearer token (set oidc.issuer/audience, or manualDelete.auth.mode=secret)",
+            )
+    else:
+        # No IdP configured: fall back to the proxy-injected header. Weaker by
+        # construction — the Service must not be reachable except via the ingress.
+        user = _sso_subject(request)
+    if not user:
+        raise HTTPException(
+            403,
+            "no identity header on this request — this deployment is not behind the "
+            "PCAI oauth2-proxy gate; set manualDelete.auth.mode=secret",
+        )
+    if not MANUAL_DELETE_ADMINS and not MANUAL_DELETE_ADMIN_GROUPS:
+        raise HTTPException(
+            403,
+            "no admins configured — set manualDelete.auth.admins or manualDelete.auth.adminGroups",
+        )
+    if user in MANUAL_DELETE_ADMINS:
+        return user
+    groups: set[str] = set()
+    for header in SSO_GROUP_HEADERS:
+        raw = request.headers.get(header) or ""
+        for part in raw.replace(",", " ").split():
+            part = part.strip()
+            if part:
+                groups.add(part)
+    if groups & set(MANUAL_DELETE_ADMIN_GROUPS):
+        return user
+    raise HTTPException(403, f"admin required: {user} is not in an admin group")
+
+
+async def _delete_actor(request: Request) -> str:
+    """Resolve the acting admin, or raise. Never returns for a denial."""
+    _require_manual_delete()
+    if MANUAL_DELETE_AUTH_MODE == "secret":
+        presented = (request.headers.get("X-Delete-Key") or "").strip()
+        if not presented:
+            raise HTTPException(401, "missing X-Delete-Key header")
+        expected = await _expected_delete_key()
+        if not expected:
+            raise HTTPException(
+                403, "deletion is not configured on this deployment (delete key Secret missing or empty)"
+            )
+        # compare_digest on bytes: the "" == "" case above is already excluded
+        # by the empty check, and a constant-time compare avoids a timing oracle.
+        if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+            raise HTTPException(403, "invalid delete key")
+        # Fingerprint, never the key, so two keys are distinguishable in audit.
+        return "shared-key:" + hashlib.sha256(expected.encode("utf-8")).hexdigest()[:8]
+    return await _actor_from_sso(request)
+
+
+async def _collect_deletion_inputs() -> tuple[list[dict], dict]:
+    """Scan once, then the two cross-checks, each with an availability flag.
+
+    Only rows with a cachepath are deletion candidates: a job-history or S3 row
+    has no on-disk directory, so it cannot be named as a target.
+    """
+    scan_root = f"/mnt/{PVC_SUBPATH}"
+    models = await downloaded_cache.get_models(
+        queue.list_jobs(),
+        pvc_enabled=True,
+        pvc_namespace=DEFAULT_NAMESPACE,
+        pvc_name=PVC_NAME,
+        pvc_scan_root=scan_root,
+        pvc_image=PVC_SCAN_IMAGE,
+        pvc_mount_path="/mnt/",
+        k8s=k8s_client,
+        s3_bucket="",  # S3 eviction is out of scope: PVC rows only
+        s3_prefix="",
+        s3_endpoint="",
+        s3_access_key="",
+        s3_secret_key="",
+        # force=False on purpose: this shares the DownloadedModelsCache with
+        # /api/downloaded, so the admin page reuses the scan the main page (or a
+        # previous preview) already paid for, and only spawns a scanner Job when
+        # the cached list is older than PVC_REFRESH_INTERVAL. The safety
+        # property does not depend on the preview being seconds old — the Job
+        # re-validates every path in-pod before removing it.
+        force=False,
+    )
+    entries = [
+        {
+            "model_name": m.model_name,
+            "cachepath": m.cachepath or "",
+            "mtime": m.last_modified,
+            "bytes": m.bytes,
+            "manifest": m.provenance_manifest,
+            "scanned": m.scanned,
+        }
+        for m in models
+        if m.cachepath
+    ]
+
+    # Surface why an empty or all-blocked list happened: an empty table with no
+    # explanation is the failure mode this app keeps having to fix.
+    scan_error = ""
+    pvc_status = str((downloaded_cache.last_status or {}).get("pvc") or "")
+    if pvc_status.startswith("error"):
+        scan_error = pvc_status
+
+    aioli_uris: list[str] = []
+    aioli_available = True
+    aioli_error = ""
+    try:
+        aioli_uris = parse_aioli_rows(await aioli_db.fetch_packaged_uris())
+    except Exception as e:
+        aioli_available = False
+        aioli_error = f"{type(e).__name__}: {e}"
+        log.warning("manual delete: AIOLI cross-check failed (%s) — refusing all targets", e)
+
+    live_jobs: list[dict] = []
+    jobs_available = True
+    try:
+        live_jobs = drop_delete_jobs(await k8s_client.list_managed_jobs_by_annotation())
+    except Exception as e:
+        # NOTE: _build_gc_report fails OPEN here (it proceeds with an empty
+        # list). The manual path must fail CLOSED, like the GC CronJob: a
+        # deletion we cannot prove is safe is not performed.
+        jobs_available = False
+        log.warning("manual delete: live-jobs cross-check failed (%s) — refusing all targets", e)
+
+    return entries, {
+        "aioli_uris": aioli_uris,
+        "aioli_available": aioli_available,
+        "aioli_error": aioli_error,
+        "live_jobs": live_jobs,
+        "jobs_available": jobs_available,
+        "scan_error": scan_error,
+        "scan_root": scan_root,
+    }
+
+
+def _prune_previews() -> None:
+    now = time.time()
+    for key in [k for k, v in _manual_delete_previews.items() if v["expires_at"] <= now]:
+        _manual_delete_previews.pop(key, None)
+    while len(_manual_delete_previews) > _MANUAL_DELETE_MAX_PREVIEWS:
+        oldest = min(_manual_delete_previews, key=lambda k: _manual_delete_previews[k]["created"])
+        _manual_delete_previews.pop(oldest, None)
+
+
+@app.get("/admin/delete", response_class=HTMLResponse)
+async def admin_delete_page(request: Request):
+    """The admin deletion page. The route does not exist when disabled."""
+    if not MANUAL_DELETE_ENABLED:
+        raise HTTPException(404)
+    context = await _page_context(request)
+    context.update(
+        {
+            "md_auth_mode": MANUAL_DELETE_AUTH_MODE,
+            "md_max_targets": MANUAL_DELETE_MAX_TARGETS,
+        }
+    )
+    return templates.TemplateResponse(request=request, name="admin_delete.html", context=context)
+
+
+@app.post("/api/admin/deletions/preview")
+async def preview_deletions(req: DeletionPreviewRequest, request: Request):
+    """Resolve a selection to an exact target set and return per-row verdicts.
+
+    Nothing is deleted here, and the returned verdict_id pins the resolved set
+    so the commit call acts on exactly what the operator reviewed.
+    """
+    actor = await _delete_actor(request)
+    # Dedupe before anything else: the same directory named twice must not be
+    # resolved, listed, or deleted twice.
+    req.targets = list(dict.fromkeys(req.targets))
+    # Two modes on purpose:
+    #   * no targets -> LIST mode. Every candidate on the scan root with its
+    #     verdict, so the page can render the picker. No verdict_id is issued:
+    #     a pin requires an explicit selection.
+    #   * targets    -> PIN mode. The selection is resolved and stored, and the
+    #     commit call may only act on that stored set.
+    list_mode = not req.targets
+    if len(req.targets) > MANUAL_DELETE_MAX_TARGETS:
+        raise HTTPException(422, f"too many targets ({len(req.targets)} > {MANUAL_DELETE_MAX_TARGETS})")
+
+    entries, ctx = await _collect_deletion_inputs()
+    by_path = {e["cachepath"]: e for e in entries}
+    unknown = [t for t in req.targets if t not in by_path]
+    if unknown:
+        # The isolation rule: only directories the CURRENT scan returned may be
+        # named. A path we did not scan is refused, never repaired.
+        raise HTTPException(
+            422,
+            f"{len(unknown)} target(s) are not in the current scan: {unknown[:3]}" + (" …" if len(unknown) > 3 else ""),
+        )
+
+    selected = list(by_path.values()) if list_mode else [by_path[t] for t in req.targets]
+    rows = evaluate_manual_targets(
+        selected,
+        aioli_uris=ctx["aioli_uris"],
+        live_jobs=ctx["live_jobs"],
+        protected_models=GC_PROTECTED,
+        aioli_available=ctx["aioli_available"],
+        jobs_available=ctx["jobs_available"],
+    )
+
+    verdict_id = ""
+    global _preview_lock
+    if _preview_lock is None:
+        _preview_lock = asyncio.Lock()
+    if not list_mode:
+        async with _preview_lock:
+            _prune_previews()
+            verdict_id = uuid.uuid4().hex
+            _manual_delete_previews[verdict_id] = {
+                "actor": actor,
+                "created": time.time(),
+                "expires_at": time.time() + MANUAL_DELETE_VERDICT_TTL,
+                "rows": rows,
+                "scan_root": ctx["scan_root"],
+            }
+
+    summary = {
+        "deletable": sum(1 for r in rows if r["verdict"] == VERDICT_DELETABLE),
+        "soft_block": sum(1 for r in rows if r["verdict"] == VERDICT_SOFT_BLOCK),
+        "block": sum(1 for r in rows if r["verdict"] == VERDICT_BLOCK),
+        "bytes": sum(int(r["bytes"] or 0) for r in rows if r["verdict"] != VERDICT_BLOCK),
+    }
+    return {
+        "verdict_id": verdict_id,
+        "expires_at": int(time.time() + MANUAL_DELETE_VERDICT_TTL) if verdict_id else 0,
+        "rows": rows,
+        "summary": summary,
+        "scan_root": ctx["scan_root"],
+        "max_targets": MANUAL_DELETE_MAX_TARGETS,
+        # Empty/blocked results must be explainable in the UI, like the GC
+        # report's fail-safe banner.
+        "scan_error": ctx["scan_error"],
+        "aioli_error": ctx["aioli_error"],
+        # How old the shared scan is, so the page can say "reused" instead of
+        # looking like it is doing work it is not.
+        "scan_age_seconds": downloaded_cache.pvc_scan_age,
+    }
+
+
+@app.post("/api/admin/deletions")
+async def commit_deletions(req: DeletionCommitRequest, request: Request):
+    """Create the Job that deletes exactly the pinned target set."""
+    actor = await _delete_actor(request)
+    if req.confirm != "DELETE":
+        raise HTTPException(422, "confirmation text must be exactly DELETE")
+
+    global _preview_lock
+    if _preview_lock is None:
+        _preview_lock = asyncio.Lock()
+    async with _preview_lock:
+        _prune_previews()
+        pinned = _manual_delete_previews.get(req.verdict_id)
+    if not pinned:
+        raise HTTPException(409, "preview expired or unknown — re-run the preview")
+    if pinned["actor"] != actor:
+        # A verdict_id is bound to the admin who produced it.
+        raise HTTPException(403, "this preview belongs to a different caller")
+
+    rows = pinned["rows"]
+    by_path = {r["cachepath"]: r for r in rows}
+    overrides: set[str] = set()
+    for path in req.overrides:
+        row = by_path.get(path)
+        if row is None:
+            raise HTTPException(422, f"override for a target that is not in this preview: {path}")
+        if row["verdict"] == VERDICT_BLOCK:
+            raise HTTPException(422, f"cannot override a hard block: {path} ({'; '.join(row['blocks'])})")
+        if row["verdict"] == VERDICT_SOFT_BLOCK:
+            overrides.add(path)
+
+    chosen = [
+        {"cachepath": r["cachepath"], "override": r["cachepath"] in overrides}
+        for r in rows
+        if r["verdict"] == VERDICT_DELETABLE or (r["verdict"] == VERDICT_SOFT_BLOCK and r["cachepath"] in overrides)
+    ]
+    if not chosen:
+        raise HTTPException(409, "no deletable targets in this preview")
+    if len(chosen) > MANUAL_DELETE_MAX_TARGETS:
+        raise HTTPException(422, f"too many targets ({len(chosen)} > {MANUAL_DELETE_MAX_TARGETS})")
+
+    # Consume the preview: one verdict_id authorises exactly ONE Job. Without
+    # this, a replay inside the TTL would spawn duplicate delete Jobs against
+    # directories the first one already removed.
+    async with _preview_lock:
+        if _manual_delete_previews.pop(req.verdict_id, None) is None:
+            raise HTTPException(409, "preview already used — re-run the preview")
+
+    # Re-verify against FRESH state immediately before creating the Job. The
+    # Job itself no longer re-checks protections (it runs in the PVC's
+    # namespace with the default ServiceAccount and therefore has no cluster
+    # RBAC, exactly like a download Job) — so this is where the guarantee
+    # lives, and it must not trust verdicts the operator may have been looking
+    # at for minutes.
+    fresh_entries, ctx = await _collect_deletion_inputs()
+    fresh_by_path = {e["cachepath"]: e for e in fresh_entries}
+    still_present = [c for c in chosen if c["cachepath"] in fresh_by_path]
+    vanished = [c["cachepath"] for c in chosen if c["cachepath"] not in fresh_by_path]
+    recheck = evaluate_manual_targets(
+        [fresh_by_path[c["cachepath"]] for c in still_present],
+        aioli_uris=ctx["aioli_uris"],
+        live_jobs=ctx["live_jobs"],
+        protected_models=GC_PROTECTED,
+        aioli_available=ctx["aioli_available"],
+        jobs_available=ctx["jobs_available"],
+    )
+    admitted: list[dict] = []
+    refused: list[str] = []
+    for row in recheck:
+        path = row["cachepath"]
+        if row["verdict"] == VERDICT_DELETABLE:
+            admitted.append({"cachepath": path, "override": path in overrides, "verdict": row["verdict"]})
+        elif row["verdict"] == VERDICT_SOFT_BLOCK and path in overrides:
+            admitted.append({"cachepath": path, "override": True, "verdict": row["verdict"]})
+        else:
+            refused.append(f"{path}: {'; '.join(row['blocks']) or row['verdict']}")
+    if not admitted:
+        detail = "; ".join((refused + [f"{p}: no longer present" for p in vanished])[:5])
+        raise HTTPException(409, f"nothing is still deletable — re-run the preview ({detail})")
+    chosen = admitted
+
+    payload = base64.b64encode(json.dumps(chosen).encode("utf-8")).decode("ascii")
+    try:
+        job_name = await k8s_client.create_delete_job(
+            # The namespace that OWNS models-pvc — the same one the scan Job
+            # mounts it from and the download Jobs are created in. PVCs are
+            # namespace-scoped: naming the app's namespace here left the pod
+            # Pending forever with "persistentvolumeclaim not found".
+            namespace=DEFAULT_NAMESPACE,
+            pvc_name=PVC_NAME,
+            scan_root=pinned["scan_root"],
+            image=MANUAL_DELETE_IMAGE,
+            job_id=uuid.uuid4().hex[:8],
+            targets_b64=payload,
+            actor=actor,
+            job_ttl=MANUAL_DELETE_JOB_TTL,
+            job_deadline=MANUAL_DELETE_JOB_DEADLINE,
+            mount_path="/mnt/",
+        )
+    except Exception as e:
+        # Nothing was created, so restore the pin: forcing the operator to
+        # re-run a preview that can take a 300s scanner Job, over a transient
+        # API error, is a worse trade than letting them retry the commit.
+        async with _preview_lock:
+            _manual_delete_previews.setdefault(req.verdict_id, pinned)
+        raise HTTPException(500, f"could not create the delete Job: {e}") from e
+
+    # The listing must stop showing what is about to disappear, and the GC
+    # report must not serve a stale verdict for the next two minutes.
+    downloaded_cache._last_pvc_scan = 0.0
+    gc_report_cache["report"] = None
+    gc_report_cache["built_at"] = 0.0
+
+    log.info("manual delete: %s queued %d target(s) in %s", actor, len(chosen), job_name)
+    return {
+        "job_name": job_name,
+        "targets": [c["cachepath"] for c in chosen],
+        "overrides": sorted(overrides),
+        "job_ttl_seconds": MANUAL_DELETE_JOB_TTL,
+    }
+
+
+@app.get("/api/admin/deletions/{job_name}")
+async def deletion_status(job_name: str, request: Request):
+    """Status + logs for a delete Job (pod logs, not a queue JobRecord)."""
+    await _delete_actor(request)
+    try:
+        logs = await k8s_client.get_job_logs(APP_NAMESPACE, job_name)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(404, "job not found") from e
+        raise HTTPException(e.status or 500, _api_error_detail(e)) from e
+    return {"job_name": job_name, "logs": logs}
+
+
 # ---- Debug pod ----
 
 
@@ -901,10 +1617,11 @@ async def push_models(req: Request, project: str = ""):
     landed as and whether that version was bumped.
 
     The optional "project" query parameter files the pushed models under that
-    project (the UI sends the namespace picked next to the push button).  It
-    only fills in configs that name no project of their own; a config's own
-    project always wins, and the chart default (catalog.defaultProject) applies
-    when neither is set.
+    project (the UI sends the namespace picked next to the push button; the
+    PCAI "project-" namespace prefix is stripped, because MLIS files by project
+    name).  It only fills in configs that name no project of their own; a
+    config's own project always wins, and the chart default
+    (catalog.defaultProject) applies when neither is set.
     """
     try:
         project = normalize_project(project)

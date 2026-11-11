@@ -262,7 +262,7 @@ async def probe(client: Any, base_url: str, headers: dict[str, str]) -> int | No
         _INFLIGHT.discard(key)
 
 
-def _text_tokens(text: str) -> int:
+def text_tokens(text: str) -> int:
     """Token charge for one text blob. PURE, never raises.
 
     ASCII at len//4 -- byte-identical to the shipped estimator, so ASCII-only
@@ -270,6 +270,11 @@ def _text_tokens(text: str) -> int:
     (audit w6 F2): no tokenizer can encode a CJK character or an emoji in a
     quarter of a token, so len//4 under-counted those ~4x and an UNDER-count is
     what 400s (the module docstring's invariant is the opposite direction).
+
+    PUBLIC (audit 2026-11-10 P2-21): the admission/billing estimator in
+    routes_proxy is the same charge for the same reason, and it had drifted
+    back to a bare len//4 there — TPM simply did not bind for CJK/emoji
+    traffic. One implementation, two callers, so the two can never disagree.
     """
     if text.isascii():
         return len(text) // 4
@@ -340,7 +345,7 @@ def estimate_context_tokens(body: dict[str, Any]) -> int:
     and excluding it is precisely how a 65536-token headroom assumption died.
 
     Charges: ASCII text at len//4, NON-ASCII characters at >= 1 token each (an
-    under-count is what 400s — see _text_tokens), tool schemas at the same
+    under-count is what 400s — see text_tokens), tool schemas at the same
     serialized charge, a flat per-image charge, and a small per-message
     overhead for role/framing tokens.
     """
@@ -355,13 +360,13 @@ def estimate_context_tokens(body: dict[str, Any]) -> int:
             calls = msg.get("tool_calls")
             if isinstance(calls, list) and calls:
                 try:
-                    total += _text_tokens(json.dumps(calls, default=str))
+                    total += text_tokens(json.dumps(calls, default=str))
                 except (TypeError, ValueError):
                     total += 64 * len(calls)
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
         try:
-            total += _text_tokens(json.dumps(tools, default=str))
+            total += text_tokens(json.dumps(tools, default=str))
         except (TypeError, ValueError):
             total += 256 * len(tools)
     total += count_images(body) * IMAGE_TOKEN_EQUIVALENT
@@ -382,6 +387,9 @@ def completion_cap(
       * the client's own cap (a clamp never RAISES what was asked for),
       * the operator's ceiling (a cost policy, still honoured),
       * what is left of the window after the prompt and the safety margin.
+    A window remainder below MIN_COMPLETION_TOKENS is NOT offered as a
+    candidate: it is no opinion, not a truncated reply (same floor fits()
+    uses).
     """
     candidates: list[int] = []
     if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0:
@@ -395,6 +403,15 @@ def completion_cap(
             # and clamping to zero would turn a clear upstream 400 into an
             # empty answer -- so express "no opinion" and let the caller's
             # candidate gate / failover handle it.
+            return None
+        if headroom < MIN_COMPLETION_TOKENS:
+            # SAME DECISION ONE STEP EARLIER (audit 2026-11-10 P2-26). A
+            # headroom below the minimum viable reply is not a fit: clamping
+            # to it TRUNCATES the answer mid-sentence instead of failing over
+            # to a candidate with a bigger window. fits() already drops such a
+            # model from the ladder at exactly this floor, and the two
+            # predicates must agree — the floor used to be read ONLY by
+            # fits(), so the cap happily returned 7 tokens here.
             return None
         candidates.append(headroom)
     if not candidates:

@@ -73,6 +73,19 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS self_mint_enabled BOOLEAN NOT NULL DE
 -- overridden (the mint's fixed least-privilege grant stays).
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_default_profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL;
 
+-- SSO TIER PROFILES (2026-11-08): the self-mint profile can differ by the
+-- caller's IdP groups. The PCAI admin tier is the literal string `admin` in
+-- the Keycloak `groups` claim (the platform's own Rego tests
+-- `"admin" in groups`); there is NO `member` string — member means "not
+-- admin". sso_admin_profile_id is stamped when ANY entry of
+-- sso_admin_groups (comma-separated, case-sensitive, whitespace-trimmed)
+-- is present in the caller's groups; otherwise sso_default_profile_id
+-- applies. Empty sso_admin_groups (the default) DISABLES the tier split:
+-- resolution is byte-identical to the single-profile deployment, so an
+-- upgrade never re-scopes an existing tenant.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_admin_profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_admin_groups TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -139,6 +152,34 @@ ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS subject_id UUID REFERENCES subject
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS bound_via TEXT NOT NULL DEFAULT ''; -- enrollment|sso-create|admin-console|token-shadow
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS bound_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_api_keys_subject ON api_keys(subject_id);
+-- ONE LIVE SSO-CREATE KEY PER SUBJECT, enforced BY THE DATABASE (audit
+-- P2-13, 2026-11-10): the /v1/keys/for-me mint checks for an existing live
+-- key before inserting, but check-then-INSERT is a race two concurrent first
+-- mints both win — the double-mint leaves two live keys bound to one
+-- subject. The partial unique index makes the loser FAIL instead (the route
+-- maps the violation to the same 409 its pre-check raises — the
+-- uq_topup_one_pending shape below). GATED creation: a database that already
+-- holds duplicates (any pre-fix deployment can) must not fail its whole boot
+-- on an uncreatable index — the duplicates are counted first and, when any
+-- exist, the index is skipped with a loud WARNING for the operator to
+-- deduplicate; the next boot after that creates it. NULL subject_id rows are
+-- naturally exempt (unique indexes treat NULLs as distinct).
+DO $$
+DECLARE
+    dup_subjects INTEGER;
+BEGIN
+    SELECT count(*) INTO dup_subjects FROM (
+        SELECT subject_id FROM api_keys
+        WHERE bound_via = 'sso-create' AND revoked_at IS NULL AND subject_id IS NOT NULL
+        GROUP BY subject_id HAVING count(*) > 1
+    ) dup;
+    IF dup_subjects > 0 THEN
+        RAISE WARNING 'uq_api_keys_one_live_sso NOT created: % subject(s) already hold multiple live sso-create keys — deduplicate them and reboot to enforce one-live-key-per-subject (audit P2-13)', dup_subjects;
+    ELSE
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_one_live_sso
+            ON api_keys(subject_id) WHERE bound_via = 'sso-create' AND revoked_at IS NULL;
+    END IF;
+END $$;
 
 -- Spend lineage (budget-carry across rotation, 2026-10-09): every rotate
 -- sets the NEW key's spend_ancestors = old.spend_ancestors || [old.id], so
@@ -169,9 +210,26 @@ ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS spend_ancestors UUID[] NOT NULL DE
 -- widen visibility across a user's INDEPENDENT keys (those get their own
 -- group), which user_id scoping would.
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_group UUID;
-UPDATE api_keys SET key_group = COALESCE(spend_ancestors[1], id) WHERE key_group IS NULL;
-ALTER TABLE api_keys ALTER COLUMN key_group SET DEFAULT gen_random_uuid();
-ALTER TABLE api_keys ALTER COLUMN key_group SET NOT NULL;
+-- One-shot backfill, GATED on actual state (audit P2-27, 2026-11-10): bare,
+-- both statements re-plan on EVERY boot inside the one implicit transaction
+-- SCHEMA_SQL runs as — the UPDATE full-scans api_keys to prove no NULLs
+-- remain, and SET NOT NULL re-validates with its own scan. The gates turn a
+-- steady-state boot into a cheap probe (idx_api_keys_group, created below,
+-- indexes NULLs) that touches no rows; the work happens exactly once, on the
+-- boot that actually finds un-backfilled rows.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM api_keys WHERE key_group IS NULL) THEN
+        UPDATE api_keys SET key_group = COALESCE(spend_ancestors[1], id) WHERE key_group IS NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'api_keys' AND column_name = 'key_group'
+                 AND is_nullable = 'YES') THEN
+        ALTER TABLE api_keys ALTER COLUMN key_group SET DEFAULT gen_random_uuid();
+        ALTER TABLE api_keys ALTER COLUMN key_group SET NOT NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_api_keys_group ON api_keys(key_group);
 
 -- Embedding cache: dedupes identical (model, input) embedding calls.
@@ -237,12 +295,19 @@ CREATE INDEX IF NOT EXISTS idx_cost_budgets_key ON cost_budgets(key_id);
 -- DROP IF EXISTS then ADD). 'hour' is deliberately NOT added - the rate
 -- limiter already owns per-minute windows, and an hourly BUDGET has no
 -- consumer.
+-- NOT VALID (audit P2-27, 2026-11-10): without it the ADD re-validates EVERY
+-- existing row on EVERY boot — a full scan under ACCESS EXCLUSIVE inside the
+-- one implicit transaction SCHEMA_SQL runs as. The check is only ever
+-- WIDENED, so pre-existing rows satisfy it by construction; NOT VALID keeps
+-- the re-add catalog-only (instant), same discipline as ck_ledger_status
+-- below (pinned by tests/test_deploy_contract.py). VALIDATE left to the
+-- operator if ever desired.
 ALTER TABLE budgets DROP CONSTRAINT IF EXISTS budgets_period_check;
 ALTER TABLE budgets ADD CONSTRAINT budgets_period_check
-    CHECK (period IN ('day','week','month','quarter','year'));
+    CHECK (period IN ('day','week','month','quarter','year')) NOT VALID;
 ALTER TABLE cost_budgets DROP CONSTRAINT IF EXISTS cost_budgets_period_check;
 ALTER TABLE cost_budgets ADD CONSTRAINT cost_budgets_period_check
-    CHECK (period IN ('day','week','month','quarter','year'));
+    CHECK (period IN ('day','week','month','quarter','year')) NOT VALID;
 
 CREATE TABLE IF NOT EXISTS usage_ledger (
     -- PARTITIONING NOTE (2026-09-24): created UNPARTITIONED for zero-friction
@@ -285,17 +350,32 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
 -- are checked — VALIDATE later if desired).
 ALTER TABLE usage_ledger DROP CONSTRAINT IF EXISTS ck_ledger_status;
 ALTER TABLE usage_ledger ADD CONSTRAINT ck_ledger_status
-    CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked','policy_blocked','denied')) NOT VALID;
+    CHECK (status IN ('ok','error','cache_hit','budget_exceeded','rate_limited','guardrail_blocked','policy_blocked','denied','routing')) NOT VALID;
+-- 'routing' (P10): the decision model's OWN call, settled under the calling
+-- key with its real upstream usage. It is PRICED (settle bills it) but kept
+-- OUT of budgets._COSTED_STATUSES: the budget SUMs must not charge the user's
+-- token/completion envelope for the routing turn — only the USD chargeback
+-- sees it. The vocabulary lives here (and in scripts/partition_ledger.py's
+-- stamp — pinned identical by tests/test_deploy_contract.py).
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cached_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6);
 
--- Per-model prices (USD per 1M tokens — the industry convention). Absent
--- row = unpriced model (cost NULL).
+-- Per-model prices (USD per 1M units — the industry convention for tokens;
+-- P10 widens "token" to a unit vocabulary: 'token'|'char'|'second'|'image'|
+-- 'request', so a voice model prices per 1M SECONDS of audio, an image model
+-- per 1M images, and a flat-fee model per 1M requests). Absent row = unpriced
+-- model (cost NULL). Existing rows default to 'token' -> zero behaviour change
+-- (the token path never reads the column for its arithmetic).
 CREATE TABLE IF NOT EXISTS model_costs (
     model_name        TEXT PRIMARY KEY,
     input_per_m       NUMERIC(12,8) NOT NULL DEFAULT 0,
     output_per_m      NUMERIC(12,8) NOT NULL DEFAULT 0,
     cached_per_m      NUMERIC(12,8) NOT NULL DEFAULT 0,
+    -- billing unit the rates are denominated in (P10). 'token' rows price
+    -- exactly as always (costs.compute); the unit-aware paths (audio seconds,
+    -- images, ...) bill through costs.compute_units, which refuses — and the
+    -- guard REPORTS — a row whose unit does not match the unit its route bills.
+    unit              TEXT NOT NULL DEFAULT 'token',
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- migration from the hours-old per-1k naming (unpriced in production).
@@ -319,6 +399,53 @@ BEGIN
                WHERE table_schema = current_schema()
                  AND table_name = 'model_costs' AND column_name = 'cached_per_1k') THEN
         ALTER TABLE model_costs RENAME COLUMN cached_per_1k TO cached_per_m;
+    END IF;
+END $$;
+
+-- P10 billing unit (see the CREATE TABLE above): every pre-existing row is
+-- 'token' by construction, which is exactly what it billed before — zero
+-- behaviour change. ADD COLUMN IF NOT EXISTS keeps a second boot (and a DB
+-- created with the column already inline) a no-op, same discipline as the
+-- usage_ledger evolutions below.
+ALTER TABLE model_costs ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'token';
+
+-- The unit vocabulary, DO-block-gated (the guarded-rename block above is the
+-- file's precedent for DDL that has no IF NOT EXISTS form). TWO hardening
+-- rules (cross-validation wave 2, 2026-11-10), the same discipline as every
+-- other re-added CHECK in this file (ck_ledger_status, budgets_period_check,
+-- guardrails_engine_check):
+--   * NOT VALID. SCHEMA_SQL is ONE implicit transaction, so a VALID add
+--     full-scans model_costs inside the boot transaction and ONE legacy
+--     out-of-vocabulary row (unit='seconds', e.g. written by an older build
+--     before this vocabulary existed) would roll the ENTIRE boot DDL back
+--     — a crash loop on every replica, no in-product repair. NOT VALID
+--     fences new writes immediately; the operator VALIDATEs at leisure.
+--   * Gated on the constraint DEFINITION (pg_get_constraintdef), not mere
+--     existence: a constraint left by an older vocabulary (the plural
+--     'seconds') would otherwise survive boot and reject the new singular
+--     vocabulary at write time with a 500. Compare, drop, re-add.
+DO $$
+DECLARE
+    _def TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO _def
+      FROM pg_constraint
+     WHERE conname = 'ck_model_costs_unit'
+       AND conrelid = 'model_costs'::regclass;
+    IF _def IS NULL
+       OR position('NOT VALID' in _def) = 0
+       OR position('token' in _def) = 0
+       OR position('char' in _def) = 0
+       OR position('second' in _def) = 0
+       OR position('image' in _def) = 0
+       OR position('request' in _def) = 0
+       OR position('seconds' in _def) > 0
+    THEN
+        IF _def IS NOT NULL THEN
+            ALTER TABLE model_costs DROP CONSTRAINT ck_model_costs_unit;
+        END IF;
+        ALTER TABLE model_costs ADD CONSTRAINT ck_model_costs_unit
+            CHECK (unit IN ('token','char','second','image','request')) NOT VALID;
     END IF;
 END $$;
 
@@ -534,9 +661,40 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS idx_conversations_key ON conversations(key_id, updated_at DESC);
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS key_group UUID;
 -- Backfill from the creating key's group; every existing row has a key_id.
-UPDATE conversations c SET key_group = k.key_group
-  FROM api_keys k WHERE c.key_id = k.id AND c.key_group IS NULL;
-ALTER TABLE conversations ALTER COLUMN key_group SET NOT NULL;
+-- One-shot, GATED on actual state (audit P2-27, 2026-11-10): this is the
+-- TRANSCRIPT table — on the first post-upgrade boot the backfill legitimately
+-- rewrites every row, but bare, the statement also re-plans on every boot
+-- AFTER that, full-scanning the biggest table in the schema to prove no NULLs
+-- remain, inside the one implicit transaction SCHEMA_SQL runs as while it
+-- holds ACCESS EXCLUSIVE on ~20 tables (every other pod's ledger inserts and
+-- key lookups queue behind it; HPA replays it per new pod). The gate makes a
+-- steady-state boot an index probe (idx_conversations_group, created below,
+-- indexes NULLs) that touches no rows.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM conversations WHERE key_group IS NULL) THEN
+        UPDATE conversations c SET key_group = k.key_group
+          FROM api_keys k WHERE c.key_id = k.id AND c.key_group IS NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'conversations' AND column_name = 'key_group'
+                 AND is_nullable = 'YES') THEN
+        -- SET DEFAULT must precede SET NOT NULL (cross-validation P1,
+        -- reproduced on PG 18): NOT NULL-without-default means (a) any row
+        -- inserted between the backfill UPDATE's snapshot and this ALTER —
+        -- an old-version pod mid rolling-upgrade writes no key_group —
+        -- makes the ALTER fail "column contains null values", and
+        -- SCHEMA_SQL being one implicit transaction, the WHOLE schema
+        -- apply (hence the boot) rolls back; HPA replays the race per new
+        -- pod. (b) every pre-upgrade writer that does not name the column
+        -- 500s on save until replaced. The server-side default makes the
+        -- column self-sufficient for any writer, exactly the api_keys
+        -- shape above.
+        ALTER TABLE conversations ALTER COLUMN key_group SET DEFAULT gen_random_uuid();
+        ALTER TABLE conversations ALTER COLUMN key_group SET NOT NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(key_group, updated_at DESC);
 
 -- Session distiller state (2026-10): one row per distilled conversation.
@@ -853,9 +1011,18 @@ CREATE TABLE IF NOT EXISTS guardrails (
 -- 2026-11-02: the secrets engine joined the framework. CREATE TABLE IF NOT
 -- EXISTS cannot widen an existing CHECK, so the constraint is re-stated for
 -- databases created before this wave (DROP IF EXISTS + ADD is idempotent).
+-- NOT VALID (cross-validation 2026-11-10): a VALID re-add scans every row
+-- under ACCESS EXCLUSIVE on EVERY boot inside the same implicit transaction
+-- as the rest of SCHEMA_SQL — the budgets_period_check pair above got the
+-- same fix. NOT VALID is the right POSTURE for these re-adds generally, not
+-- just a speed trick: the unconditional DROP+ADD would silently reset an
+-- operator's manual VALIDATE CONSTRANT on the next boot anyway, so keeping
+-- the re-add NOT VALID states the honest contract (existing rows trusted;
+-- new writes checked; VALIDATE is the operator's, and it sticks only until
+-- this file widens the vocabulary again).
 ALTER TABLE guardrails DROP CONSTRAINT IF EXISTS guardrails_engine_check;
 ALTER TABLE guardrails ADD CONSTRAINT guardrails_engine_check
-    CHECK (engine IN ('blocklist','regex_pii','length','webhook','secrets'));
+    CHECK (engine IN ('blocklist','regex_pii','length','webhook','secrets')) NOT VALID;
 
 CREATE TABLE IF NOT EXISTS model_guardrails (
     model_name   TEXT NOT NULL,
@@ -899,6 +1066,18 @@ ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL D
 -- to clear the floor. Without the distribution an operator cannot tune the
 -- confidence floor against real traffic (2026-10-23).
 ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS routing_probabilities TEXT NOT NULL DEFAULT '';
+-- P10 unit-aware billing: billable_units is the QUANTITY the row billed in the
+-- unit its cost was computed from (seconds of audio, characters of a TTS
+-- script, images, requests) and unit_kind names that unit — with an
+-- '_estimate' suffix when the number is a PROXY rather than a measurement
+-- ('char_estimate' = the TTS char heuristic, 'second_estimate' = the ASR byte
+-- proxy, 'token_estimate' = the len//4 family). NULL on every legacy row and
+-- on rows with REAL measured usage (chat's upstream-reported tokens): a NULL
+-- unit_kind means "priced exactly as always". Both appended LAST — the
+-- partition script's COLUMNS block (positional INSERT..SELECT * copy) is
+-- pinned to this physical order by tests/test_deploy_contract.py.
+ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS billable_units NUMERIC(18,6);
+ALTER TABLE usage_ledger ADD COLUMN IF NOT EXISTS unit_kind TEXT;
 
 -- ============================================================================
 -- Server-owned conversations (ROADMAP §7, phase 1: canonical reconciliation).
@@ -1140,6 +1319,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_call_audit_prev
     ON mcp_call_audit(prev_hash) WHERE prev_hash <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_admin_audit_prev
     ON admin_audit(prev_hash) WHERE prev_hash <> '';
+
+-- EXTERNAL TAIL ANCHOR (audit P2-5): the chain above is tamper-EVIDENT only
+-- against an attacker who cannot recompute the tail — an attacker with DB
+-- write access who rewrites the last rows and every hash after them passes
+-- verify as ok. The anchor is the off-chain counterweight: core.chain_audit
+-- periodically stamps the trail's tail (last_id, last_row_hash) here under
+-- an HMAC keyed from the master key (an env SECRET, never in this database),
+-- so a re-tailed trail no longer matches the anchored tail. Verbatim the
+-- ANCHOR_DDL in core.chain_audit (that module also keeps its per-process
+-- lazy ensure, so a boot against a pre-migration schema still works).
+-- Idempotent: CREATE TABLE IF NOT EXISTS only, no ALTER — safe per boot.
+CREATE TABLE IF NOT EXISTS audit_chain_anchor (
+    table_name TEXT PRIMARY KEY,   -- which trail: admin_audit | mcp_call_audit
+    last_id BIGINT NOT NULL,
+    last_row_hash TEXT NOT NULL,
+    mac TEXT NOT NULL,
+    anchored_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- Model groups (2026-11-08) — named sets of EQUIVALENT chat models.
+--
+-- WHY: a deployment can serve the same capability from several models
+-- (Deepseek / GLM / Qwen) and several replicas of each. A group is a
+-- first-class route target: members are chosen by LIVE LOAD (not a fixed
+-- order), then the conversation is pinned to the chosen member's endpoint.
+-- It is usable anywhere a model name is accepted (direct request, fallback
+-- chain, /v1/models). This is the load-balanced sibling of the ORDERED
+-- fallback chain: fallback is a failure path, a group is a selection path.
+--
+-- members is JSONB [{model, weight}] in registry model-name spelling. ONE
+-- LEVEL ONLY: a member may not itself be a group (validated at the write
+-- path, so a cycle can never be stored). policy 'load' today; 'weighted'
+-- is reserved. model_type keeps a group from serving chat with an
+-- embedding member (mirrors the pool type gate).
+--
+-- NOT a budget or ACL boundary: the SELECTED member bills and its
+-- allowed_models gate applies (a group never makes a model reachable that
+-- the key could not reach on its own).
+CREATE TABLE IF NOT EXISTS model_groups (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL UNIQUE,
+    model_type  TEXT NOT NULL DEFAULT 'chat',
+    policy      TEXT NOT NULL DEFAULT 'load',
+    members     JSONB NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ============================================================================
 -- Load-aware cascade stickiness (auto entry, off-peak-driven). ADDITIVE /

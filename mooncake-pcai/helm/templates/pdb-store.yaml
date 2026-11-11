@@ -1,0 +1,18 @@
+{{- if and .Values.store.pdb.enabled (gt (int .Values.store.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.deployment.name }}-store
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-store
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  # A node drain takes one store pod at a time; two must stay for the pool to
+  # keep serving.
+  minAvailable: {{ .Values.store.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.name }}-store
+{{- end }}

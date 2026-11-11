@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.deployment.name }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-master
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Values.deployment.name }}-master
+  ports:
+    - name: rpc
+      port: {{ .Values.master.rpcPort }}
+      targetPort: rpc
+    - name: metadata
+      port: {{ .Values.master.metadataPort }}
+      targetPort: metadata
+    - name: metrics
+      port: {{ .Values.master.metricsPort }}
+      targetPort: metrics

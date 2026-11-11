@@ -1153,6 +1153,7 @@ def test_routing_stamp_does_not_cross_models(env, monkeypatch: pytest.MonkeyPatc
     assert resp.status_code == 200
     ok_rows = [s for s in fake.settled if s[8] == "ok"]
     assert ok_rows and ok_rows[0][1] == FALLBACK
-    # settle signature (positional tail) stays intact: 18 params total
+    # settle signature (positional tail) stays intact: 20 params total since
+    # zone P10 appended billable_units + unit_kind (append-only contract)
     # (routing_probabilities joined the routing_* block in 2026-10-23)
-    assert len(ok_rows[0]) == 18
+    assert len(ok_rows[0]) == 20

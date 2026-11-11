@@ -472,11 +472,10 @@ def test_pending_task_set_is_bounded() -> None:
     """BUG 3: _PENDING_MAX was declared but never enforced."""
     import asyncio as _aio
 
-    async def _drive() -> None:
-        async def _noop(*a, **k):
-            return None
+    async def _noop(*a, **k):
+        return None
 
-        stickiness.set_sticky = _noop  # type: ignore[assignment]
+    async def _drive() -> None:
         stickiness._PENDING.clear()
         w = stickiness.make_writer(KEY, THREAD)
         assert w is not None
@@ -485,7 +484,16 @@ def test_pending_task_set_is_bounded() -> None:
         await _aio.sleep(0)
         assert len(stickiness._PENDING) <= stickiness._PENDING_MAX
 
-    _aio.run(_drive())
+    # RESTORE the module seam: a bare assignment leaked for the WHOLE pytest
+    # session, so every later sticky write silently no-opped and the suite
+    # became order-dependent (test_load_aware_cascade failed when it ran
+    # after this file). The patch is scoped to this one test by try/finally.
+    _orig_set_sticky = stickiness.set_sticky
+    stickiness.set_sticky = _noop  # type: ignore[assignment]
+    try:
+        _aio.run(_drive())
+    finally:
+        stickiness.set_sticky = _orig_set_sticky
 
 
 # ---------------------------------------------------------------------------

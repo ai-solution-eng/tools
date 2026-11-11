@@ -68,6 +68,23 @@ fully allowlisted public host still carries a payload in its path/query - the
 article's actual exfiltration. Closing that needs an egress proxy with content
 inspection; `scan_payload_signals» only OBSERVES payload shapes (metric, no
 refusal). DNS rebinding after the check is the documented url_guard residual.
+SATURATION of the bounded resolver is NOT in that fail-open class: "no capacity
+to vet this name" refuses (REASON_RESOLVER_SATURATED), because a model that can
+wedge the pool must not thereby switch the destination check off.
+
+EXEC-class arguments (command/script/code) are TOKEN-SCANNED, not understood.
+A token that is a scheme URL or an address literal (any encoding, percent-
+decoded once) is classified; the scan does NOT see:
+  * a destination built at RUN time — "echo <b64> | base64 -d | sh",
+    "curl $(cat url.txt)", "X=169.254.169.254; curl http://$X/";
+  * a bare HOSTNAME token — never DNS-resolved here (a command line is full of
+    dotted non-destinations and a 2 s lookup per token is a latency bomb), so
+    "curl internal-svc.cluster.local" is NOT refused;
+  * a numeric literal shorter than _EXEC_MIN_BARE_LITERAL chars.
+A command line with more tokens than _EXEC_MAX_TOKENS is REFUSED
+(REASON_TOO_COMPLEX), never partially scanned. Closing the first bullet needs
+the egress proxy above: this stage raises the cost of the trivial spelling, it
+does not make `exec_in_pod» safe.
 
 POSTURE
 -------
@@ -260,6 +277,14 @@ def _separate_read_egress_mode() -> str:
 # keeps capping the per-call scan work.
 MAX_DEPTH = 12
 MAX_STRINGS = 2000
+# Audit 2026-11-10 P2-32: depth and string count bound the SCAN RESULT, but a
+# tree of EMPTY dicts/lists pushes one stack entry per node while incrementing
+# neither counter — so neither bound ever tripped and one gated call could burn
+# unbounded CPU on the event loop. The node bound caps the WORK; it sits well
+# above MAX_STRINGS because a legitimate tree carries container nodes too
+# (a 2000-string payload is ~2000+ nodes), and a walk of 20k nodes is still
+# microseconds.
+MAX_NODES = 20_000
 MAX_SCAN_CHARS = 8 * 1024
 
 # --- BOUNDED reason vocabulary ---------------------------------------------
@@ -272,6 +297,7 @@ REASON_SCHEME = "url-scheme"  # non-http(s) scheme (file:, gopher:, ...)
 REASON_DESTINATION = "url-destination"  # denied range / loopback name / unparseable
 REASON_IP_LITERAL = "ip-literal"  # IP-shaped but not decodable
 REASON_CLUSTER_HOST = "cluster-host"  # in-cluster name on an egress-class server
+REASON_RESOLVER_SATURATED = "resolver-saturated"  # the destination was never vetted: refuse, never allow
 
 REASONS = (
     REASON_TOO_COMPLEX,
@@ -279,6 +305,7 @@ REASONS = (
     REASON_DESTINATION,
     REASON_IP_LITERAL,
     REASON_CLUSTER_HOST,
+    REASON_RESOLVER_SATURATED,
     ADMIN_TOOL_REASON,
     READ_EGRESS_REASON,
     READ_EGRESS_WARN_REASON,
@@ -292,6 +319,9 @@ _REASON_TEXT = {
     REASON_DESTINATION: "the {key} argument targets a denied destination",
     REASON_IP_LITERAL: "the {key} argument is a malformed IP literal",
     REASON_CLUSTER_HOST: "the {key} argument targets an in-cluster host on an egress-class server",
+    REASON_RESOLVER_SATURATED: (
+        "the {key} argument targets a destination the gateway could not vet (the DNS resolver pool is saturated)"
+    ),
 }
 
 # Servers whose whole purpose is to reach OUT (a web fetcher/search). Only for
@@ -345,6 +375,20 @@ _DEST_KEY_RE = re.compile(
 # LOCAL path never starts with a scheme, so leaving it out costs nothing and
 # keeps a URL-valued path argument (a real egress vector) checked. RULE 2
 # (a bare IP literal) stays UNCONDITIONAL for every key, payload or not.
+#
+# ALSO DELIBERATELY ABSENT (audit 2026-11-10 P2-4): command, script, code.
+# They were payload keys, which skipped RULE 3 entirely — but a command a
+# granted tool EXECUTES is the fleet's strongest egress vector (k8s-ops
+# exec_in_pod, workbench run_command), so it must not be exempt from the
+# destination rules. They are scanned by _exec_reason instead: the command
+# line is split into tokens and each token is classified as a standalone
+# destination, which is what catches "curl http://169.254.169.254/x" while
+# leaving an ordinary command line ("kubectl get pods -n prod") alone.
+# THAT IS A TOKEN SCAN, NOT AN UNDERSTANDING OF THE COMMAND: a destination
+# assembled at run time (pipes, base64, $(...), variable expansion), a bare
+# hostname token and a sub-threshold numeric literal are NOT caught. The
+# module docstring's "WHAT THIS DOES NOT DO" lists those residuals — do not
+# read this comment as "commands are destination-checked".
 PAYLOAD_ARG_KEYS = frozenset(
     {
         "content",
@@ -357,8 +401,6 @@ PAYLOAD_ARG_KEYS = frozenset(
         "manifest_yaml",
         "pattern",
         "regex",
-        "script",
-        "code",
         "prompt",
         "description",
         "message",
@@ -367,9 +409,50 @@ PAYLOAD_ARG_KEYS = frozenset(
         "title",
         "query",
         "label_selector",
-        "command",
     }
 )
+
+# EXEC argument keys: a value a tool hands to a SHELL/executor rather than to
+# an HTTP client. Not payloads (see the P2-4 note above): the whole point of
+# these arguments is that something RUNS them, so a destination inside one is
+# a live egress vector, not stored data.
+_EXEC_ARG_KEYS = frozenset(
+    {
+        "command",
+        "commands",
+        "cmd",
+        "commandline",
+        "command_line",
+        "shell",
+        "shell_command",
+        "script",
+        "code",
+        "argv",
+    }
+)
+# Token bounds for the exec scan. A command with MORE tokens than this is
+# REFUSED (REASON_TOO_COMPLEX), never partially scanned: truncating the scan
+# let padding park the real destination past the slice (cross-validation wave
+# 1, P1). The bound keeps one gated call's scan work linear and small.
+_EXEC_MAX_TOKENS = 64
+# A bare token with no '.' or ':' is only decoded as an IP literal when it is
+# at least this long. Shorter values are ports/counts ("80", "443", "0") — and
+# the literal decoder reads those as 0.0.x.y inside the denied 0.0.0.0/8, so
+# classifying them would refuse ordinary commands. 7 chars is above every
+# common port/count and below every compact encoding worth catching
+# ("2130706433" = 10, "0x7f000001" = 10).
+_EXEC_MIN_BARE_LITERAL = 7
+# Shell punctuation that can wrap a destination token without being part of
+# it: quotes, command substitution, redirections, list separators.
+_EXEC_TOKEN_STRIP = "\"'`$(){}[]<>,;|&\\"
+# Tokens are split on whitespace AND '=' so "--url=http://x" and "FOO=http://x"
+# present their value as its own token.
+_EXEC_TOKEN_SPLIT_RE = re.compile(r"[\s=]+")
+# A token is only address-shaped (and therefore worth classifying) when it
+# carries a '.' or a ':'. Bare numbers are EXCLUDED on purpose: "80", "443",
+# "0" and "8080" are ports/counts in ordinary command lines, while the literal
+# decoder reads them as 0.0.x.y addresses inside the denied 0.0.0.0/8.
+_EXEC_ADDRESS_SHAPE_RE = re.compile(r"[.:]")
 
 # Telemetry shapes (D6 - observation only, never a refusal).
 # Base64 blob: the base64 alphabet only, after dropping line-wrapping
@@ -453,20 +536,22 @@ def iter_string_arguments(
     *,
     max_depth: int = MAX_DEPTH,
     max_strings: int = MAX_STRINGS,
+    max_nodes: int = MAX_NODES,
 ) -> _ScanResult:
     """Every string VALUE in arguments as (nearest-key-hint, value).
 
-    Bounded three ways (spec D1): depth 6, 200 strings, each string truncated
-    to MAX_SCAN_CHARS by the classifier. Iterative, so a hostile deeply-nested
-    payload cannot blow the Python stack. Keys are hints only - they name the
-    argument for the refusal message and for the destination-ish bare-host
-    rule; a key is never scanned as a value.
+    Bounded four ways: depth (MAX_DEPTH), string count (MAX_STRINGS), visited
+    node count (MAX_NODES) and, per string, MAX_SCAN_CHARS applied by the
+    classifier. Iterative, so a hostile deeply-nested payload cannot blow the
+    Python stack. Keys are hints only - they name the argument for the refusal
+    message and for the destination-ish bare-host rule; a key is never scanned
+    as a value.
 
     FAIL-CLOSED (audit C-1): the bounds are a REFUSAL TRIGGER, not a
     truncation. This walk used to stop silently at the 200th string and skip
     depth-exceeded subtrees, so padding the arguments with benign values
     parked a denied destination past the scan in a stage whose own posture is
-    "a security predicate that fails open is not a control". Exceeding either
+    "a security predicate that fails open is not a control". Exceeding ANY
     bound now marks .overflowed (the scan still returns what it saw); the
     gate refuses with REASON_TOO_COMPLEX instead of trusting a partial scan.
     The walk remains O(nodes) and iterative - the bound exists to cap the
@@ -475,8 +560,15 @@ def iter_string_arguments(
     out = _ScanResult()
     stack: list[tuple[Any, str, int]] = [(arguments, "", 0)]
     overflow = False
+    nodes = 0
     while stack:
         node, hint, depth = stack.pop()
+        # Audit P2-32: the NODE bound. Depth and string count never fire on a
+        # tree of empty containers, so this is the counter that caps the work.
+        nodes += 1
+        if nodes > max_nodes:
+            overflow = True
+            break
         if depth > max_depth:
             overflow = True
             continue
@@ -520,9 +612,20 @@ def _resolved_host_reason(host: str) -> str:
 
     Resolution FAILURE is not evidence of danger (url_guard design rule 4): a
     resolver that cannot answer says nothing about the name, so we log and
-    allow - the call-time controls (follow_redirects=False) remain."""
+    allow - the call-time controls (follow_redirects=False) remain.
+
+    RESOLVER SATURATION IS NOT A RESOLUTION FAILURE and must NOT take that
+    fail-open path (audit follow-up, guardrails resolver work): the bounded
+    pool answering "I have no capacity" says nothing about the NAME but a lot
+    about the check — the destination was never vetted, and a model that wedges
+    the pool could otherwise switch the SSRF gate off for its own next call.
+    url_guard.ResolverSaturated is deliberately not a gaierror/OSError, so it
+    is re-raised HERE, before the broad degradation handler, and turned into a
+    bounded refusal at check_arguments_detail."""
     try:
         addresses = url_guard.resolve_host_addresses(host, timeout_s=_ARG_RESOLVE_TIMEOUT_S)
+    except url_guard.ResolverSaturated:
+        raise
     except Exception as exc:  # gaierror, OSError, UnicodeError, timeout
         log.debug("mcp arg policy: could not resolve %r (%s) - resolution check skipped", host, exc)
         return ""
@@ -623,12 +726,104 @@ def _parent_relative(host_run: str) -> bool:
     return ".." in host_run
 
 
+def _exec_reason(server: str, tool: str, text: str) -> str:
+    """Deny reason for one EXEC-class argument (a command / script / code), else ''.
+
+    Audit 2026-11-10 P2-4: command/script/code used to be payload keys, so the
+    destination rules never saw them — and a command a granted tool EXECUTES
+    (k8s-ops exec_in_pod, workbench run_command) is the fleet's strongest
+    egress vector. The classifier only ever classifies a WHOLE string, so the
+    command line is split into tokens and each ADDRESS-SHAPED token is
+    classified by the same rules (RULE 2 for an IP literal, RULE 3 for a
+    scheme URL). An ordinary command line ("kubectl get pods -n prod",
+    "grep -r foo .") carries no such token and stays allowed.
+
+    BOUNDS ARE A REFUSAL, NOT A TRUNCATION (cross-validation wave 1, P1). The
+    scan used to take the first _EXEC_MAX_TOKENS tokens and allow the rest, so
+    ~96 characters of "A=1 " padding parked the real destination past the
+    slice and the call was allowed. A command line with more tokens than the
+    bound is now REFUSED with REASON_TOO_COMPLEX — the posture
+    iter_string_arguments already states for its own bounds.
+
+    Each candidate token is percent-DECODED once before classification, the
+    same contract as the main path (and what curl/a WHATWG client does):
+    without it "http://%31%32%37.0.0.1/" parsed as an unresolvable NAME and
+    was allowed, while the client connects to 127.0.0.1.
+
+    Deliberately NOT done here: a bare NAME token is never bare-host checked
+    and never DNS-resolved. A command line is full of dotted non-destinations
+    ("--field-selector=metadata.name=x", file names), and a 2 s resolution per
+    token on a request path is a latency bomb for no gain. SHORT bare numbers
+    are exempt too ("80", "443", "0" are ports/counts, and the literal decoder
+    reads them as 0.0.x.y inside the denied 0.0.0.0/8), but a bare
+    numeric/hex literal of at least _EXEC_MIN_BARE_LITERAL chars IS decoded
+    and range-checked: "2130706433" and "0x7f000001" are both 127.0.0.1.
+
+    The residual gaps (pipes/base64/subshell constructions, bare hostnames,
+    sub-threshold numerics) are listed in the module docstring's "WHAT THIS
+    DOES NOT DO" — this scan raises the cost of the trivial spelling, it does
+    not make exec_in_pod safe.
+    """
+    tokens = _EXEC_TOKEN_SPLIT_RE.split(text)
+    if len(tokens) > _EXEC_MAX_TOKENS:
+        # FAIL CLOSED: scanning a prefix would let padding hide the destination.
+        return REASON_TOO_COMPLEX
+    for token in tokens:
+        candidate = token.strip(_EXEC_TOKEN_STRIP)
+        if not candidate:
+            continue
+        # Percent-decode ONCE (the main path's contract): the client decodes,
+        # so "%31%32%37.0.0.1" must classify as 127.0.0.1, not as a name.
+        candidate = unquote(candidate) if "%" in candidate else candidate
+        if not candidate:
+            continue
+        scheme = _SCHEME_RE.match(candidate)
+        if scheme:
+            reason = _url_reason(server, tool, candidate, scheme.group(1).lower())
+            if reason:
+                return reason
+            continue
+        if _EXEC_ADDRESS_SHAPE_RE.search(candidate):
+            if candidate.startswith("[") and "]" in candidate:
+                literal = candidate[1 : candidate.index("]")]
+                if literal and url_guard.denied_ip_reason(literal, extra_cidrs=settings.url_deny_cidrs):
+                    return REASON_DESTINATION
+                continue
+            bare = _BARE_HOST_RE.match(candidate)
+            host = bare.group("host") if bare else ""
+            if not host or _parent_relative(host):
+                continue
+            if not (url_guard.looks_like_ip_literal(host) or url_guard.decode_ip_literal(host) is not None):
+                continue  # a NAME: never DNS-resolved from a command line
+            reason = _host_reason(server, host)
+            if reason:
+                return reason
+            continue
+        # No "." and no ":" — still an address literal in a COMPACT encoding
+        # ("2130706433", "0x7f000001"). Short values stay exempt: they are
+        # ports/counts far more often than addresses.
+        if len(candidate) < _EXEC_MIN_BARE_LITERAL:
+            continue
+        if not (url_guard.looks_like_ip_literal(candidate) or url_guard.decode_ip_literal(candidate) is not None):
+            continue
+        if url_guard.denied_ip_reason(candidate, extra_cidrs=settings.url_deny_cidrs):
+            return REASON_DESTINATION
+        if url_guard.decode_ip_literal(candidate) is None:
+            return REASON_IP_LITERAL
+    return ""
+
+
 def check_string(server: str, tool: str, key: str, value: str) -> str:
     """Deny reason for ONE argument string, else '' (the classification rule
     from the module docstring, executable)."""
     if not isinstance(value, str) or not value:
         return ""
     text = value.strip()[:MAX_SCAN_CHARS]
+    # EXEC-class arguments (a command/script/code the tool will RUN) are
+    # scanned as a TOKEN LIST first: RULE 1 below exempts any string carrying
+    # whitespace, which is every real command line (audit P2-4).
+    if _key_base(key) in _EXEC_ARG_KEYS:
+        return _exec_reason(server, tool, text)
     # A URL fragment is NEVER transmitted, so it cannot change where the tool
     # sends the request - drop it BEFORE classification. Otherwise a fragment
     # is a free bypass of every rule below: "#%20" (or a raw space inside the
@@ -697,9 +892,10 @@ def check_string(server: str, tool: str, key: str, value: str) -> str:
         return ""
     # RULE 3: URL-shaped (starts with a scheme) - for DESTINATION arguments.
     # A PAYLOAD key (content/text/sql/manifest/...) is data the caller wants
-    # stored or executed, never a host the tool will fetch, so a URL-valued
-    # payload is allowed (see PAYLOAD_ARG_KEYS). RULE 2 above already ran, so
-    # a bare IP literal is refused under ANY key.
+    # STORED, never a host the tool will fetch, so a URL-valued payload is
+    # allowed (see PAYLOAD_ARG_KEYS). RULE 2 above already ran, so a bare IP
+    # literal is refused under ANY key, and an EXEC-class key was already
+    # scanned token-by-token by _exec_reason above.
     scheme_match = _SCHEME_RE.match(decoded)
     if scheme_match and _key_base(key) not in PAYLOAD_ARG_KEYS:
         return _url_reason(server, tool, decoded, scheme_match.group(1).lower())
@@ -756,7 +952,17 @@ def check_arguments_detail(
             return "", ""
         return reason, message
     for key, value in scanned:
-        reason = check_string(server, tool, key, value)
+        try:
+            reason = check_string(server, tool, key, value)
+        except url_guard.ResolverSaturated:
+            # FAIL CLOSED (audit follow-up): the resolver pool refused to vet
+            # this destination, so the check did NOT happen. url_guard raises a
+            # distinct type precisely so this stage can tell "no capacity" from
+            # "the name does not resolve" (the latter stays fail-open above).
+            # Mapped to a bounded reason here — the gate chain turns a refusal
+            # MESSAGE into a policy_blocked settle; a raised exception would
+            # escape the stage as a 500 instead.
+            reason = REASON_RESOLVER_SATURATED
         if not reason:
             continue
         message = _refusal_message(reason, key)

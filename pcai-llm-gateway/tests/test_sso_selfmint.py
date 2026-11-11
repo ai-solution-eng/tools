@@ -821,7 +821,7 @@ def test_audit_mint_rotate_false_in_details(mint_env, monkeypatch: pytest.Monkey
     _mint(tc)
     assert len(calls) == 1
     call = calls[0]
-    assert call["action"] == "enroll.redeem"
+    assert call["action"] == "enroll.sso_mint"
     assert call["resource_type"] == "key"
     assert call["actor_source"] == "proxy-identity"
     assert call["actor_subject"] == "alice"

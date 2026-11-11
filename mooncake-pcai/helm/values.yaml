@@ -1,0 +1,190 @@
+# Owner: HPE AI Solution Engineering
+#
+# mooncake — a shared KV-cache store (Mooncake Store) for PCAI, plus a
+# read-only dashboard. Model deployments are NOT created by this chart; they
+# point at it with the MOONCAKE_* env vars and --hicache-storage-backend
+# mooncake. See documentation/DEPLOYMENT.md for the client-side recipe.
+#
+# STORAGE MODEL (read this before sizing)
+#   The pool has two tiers and they are NOT interchangeable:
+#     * store.segmentSize  -> DRAM, registered host memory, per pod. The store
+#                             serves KV pages out of this at memory speed. It
+#                             is not pod storage and a PVC cannot replace it -
+#                             a pod with 0 GB of segment has nowhere to put a
+#                             page.
+#     * store.persistence  -> a PVC per store pod (the capacity tier). This is
+#                             where the bulk of the pool lives; DRAM is the
+#                             hot cache in front of it.
+#   So the pool is roughly replicaCount x (segmentSize in RAM + PVC in SSD),
+#   and it is independent of how many model replicas use it.
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  # Configure the application endpoint. This host is ALSO the dashboard URL,
+  # so keep it unique on the shared gateway (two VirtualServices claiming one
+  # host split traffic between their backends).
+  virtualService:
+    endpoint: "mooncake.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 30s
+  # Gateway-level auth gate (oauth2-proxy / SSO). The dashboard is read-only;
+  # turn this on when the store stats should not be world-readable inside the
+  # cluster domain.
+  authorizationPolicy:
+    enabled: false
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# -- Naming ------------------------------------------------------------------------
+deployment:
+  name: mooncake          # object prefix: <name>-master, <name>-store, <name>-ui
+  appName: mooncake
+
+# -- Image (master and store pods) -------------------------------------------------
+# CUDA 12 flavour matches the H200 fleet; the store needs no GPU, but this is
+# the published image that carries mooncake_master and the Python store service.
+image:
+  repository: kvcacheai/mooncake
+  tag: 0.3.14-cuda12
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Master (control plane; KV bytes never flow through it) ------------------------
+master:
+  replicaCount: 1
+  rpcPort: 50051
+  metadataPort: 8080
+  metricsPort: 9003
+  # Evict when the pool crosses this fraction of capacity.
+  evictionHighWatermarkRatio: 0.95
+  # Seconds before a silent client is considered gone and its segment unmounted.
+  clientTtlSeconds: 10
+  # local_first keeps an object on the segment that wrote it, so losing one
+  # store pod invalidates only its own share instead of scattering the pool.
+  allocationStrategy: local_first
+  # Allow store pods to mount local disk segments (the SSD tier behind
+  # store.persistence). Required: with this false the pods log
+  # "MountLocalDiskSegment failed, error code is UNABLE_OFFLOAD" and the PVC
+  # stays empty.
+  enableOffload: true
+  # Quota for the SSD / storage backend tier, in bytes. 0 = 90% of the mounted
+  # volume (the backend default). This is the closest analogue of the file
+  # backend's MAX_SIZE knob, and like it, it is POOL-wide - Mooncake has no
+  # per-client size cap (see documentation/DEPLOYMENT.md, per-model capping).
+  quotaBytes: 0
+  metadata:
+    # The embedded HTTP metadata server REFUSES to bind a non-loopback address
+    # with no token. In a trusted namespace leave allowInsecure true; otherwise
+    # create a Secret holding the bearer token and set existingSecret. When a
+    # token is set it must reach the master AND every store pod AND every
+    # serving client (MC_METADATA_HTTP_TOKEN) - all three must match.
+    allowInsecure: true
+    existingSecret: ""
+    existingSecretKey: metadata-token
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+
+# -- Store (the pool: DRAM hot tier + one PVC per pod) -------------------------------
+store:
+  # Each replica is a StatefulSet pod with its own PVC and its own DRAM segment.
+  replicaCount: 3
+  # DRAM hot tier per pod. Not disk, not replaceable by a PVC. Keep it modest
+  # when the PVC tier is on - it is the latency tier, not the capacity tier.
+  segmentSize: "8gb"
+  localBufferSize: 4194304
+  # tcp | rdma. ONE decision for the whole pool: the store and EVERY model
+  # client must match, and a mixed pool cannot transfer. tcp is the default and
+  # the right bring-up - no device, no capability, no silent fallback. rdma is
+  # zero-copy (it skips the per-page memcpy) and needs the device AND
+  # /dev/infiniband inside the pod, on both sides.
+  # Transport profiles for the switch: values-examples/values.transport-*.yaml.
+  protocol: tcp
+  rdma:
+    # Resource from the NVIDIA RDMA shared-device plugin. Empty string = the
+    # chart will not request one (only meaningful when protocol: rdma).
+    deviceResource: "rdma/rdma_shared_device_a"
+    # The device plugin allocates a device; whether it also injects the device
+    # nodes depends on how it is configured, so the store pod mounts this host
+    # path explicitly instead of relying on it. Empty string = do not mount and
+    # rely on the plugin alone.
+    infinibandHostPath: "/dev/infiniband"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 12Gi
+    limits:
+      cpu: "2"
+      memory: 16Gi
+  # Spread the pool across nodes. Soft: a 3-replica pool must still schedule
+  # on a 2-node cluster, so required anti-affinity would leave a pod Pending.
+  podAntiAffinity: soft
+  # Keep quorum available during a drain: 3 replicas, 2 must stay.
+  pdb:
+    enabled: true
+    minAvailable: 2
+  persistence:
+    # PRIMARY CAPACITY TIER. One PVC per store pod, created from a
+    # volumeClaimTemplates entry on the StatefulSet, so it survives pod
+    # restarts and reschedules. Total SSD capacity = replicaCount x size.
+    enabled: true
+    size: 500Gi
+    # The storage class to bind. The G2 cluster currently exposes
+    # `gl4f-filesystem` (VAST CSI) and `vastdata-block`; there is no
+    # X10000-backed class on it yet. Point this at the X10000 class once one
+    # exists, or leave empty for the cluster default.
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+    mountPath: /mnt/mooncake-ssd
+
+# -- Dashboard (read-only) -------------------------------------------------------------
+ui:
+  enabled: true
+  replicaCount: 1
+  # Stock python image + the source from a ConfigMap: no custom image to build
+  # or push, which is what makes this importable on an air-gapped unit.
+  image:
+    repository: python
+    # Same base image as the other apps in the fleet (3.14-slim). The dashboard
+    # is stdlib-only, so it runs unmodified on 3.14. Pin by digest for anything
+    # durable - this is a moving tag.
+    tag: 3.14-slim
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8080
+  # How often the backend re-reads the store and the model metrics. The page
+  # itself polls the cached snapshot every 30 s; the Refresh button forces an
+  # immediate re-read.
+  refreshIntervalSeconds: 1800
+  requestTimeoutSeconds: 3
+  discovery:
+    # Namespaces to scan for Mooncake clients (pods carrying MOONCAKE_MASTER).
+    # Empty = the release namespace. A Role is created in each listed namespace.
+    namespaces: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  serviceAccount:
+    create: true
+    name: ""
+  rbac:
+    create: true
+
+# -- Pod placement / annotations ---------------------------------------------------------
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

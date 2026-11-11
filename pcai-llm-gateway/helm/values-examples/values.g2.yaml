@@ -159,18 +159,36 @@ settings:
   # a pool has two. Routing state, never policy: an unhealthy pin is dropped.
   sessionAffinityEnabled: true
   sessionAffinityTtlS: 3600
+  # Model groups: named sets of equivalent chat models, load-balanced by a background Prometheus snapshot; LEFT OFF
+  modelGroupsEnabled: false
+  modelGroupLoadRefreshS: 5
+  modelGroupLoadStaleS: 30
   # --- audio passthrough billing (3.7.3) ----------------------------------
   # TTS/ASR report no token usage; the gateway bills an estimate so a voice
   # call cannot bypass a budget. Tune to your real rates if they differ.
   audioTtsCharsPerToken: 4         # ~4 characters of spoken text per token
   audioAsrTokensPerSecond: 3.0     # ~180 tokens/minute of audio (~150 words)
   # --- OpenTelemetry tracing (3.7.3) --------------------------------------
-  # LEFT OFF: G2 has Prometheus but no OTLP collector in this values file.
-  # The exporter is fail-open (a DNS failure is swallowed), but a collector
-  # that does not exist produces nothing. Point otelEndpoint at a real
-  # collector and flip this to true; spans carry path-only attributes.
-  otelEnabled: false
-  otelEndpoint: http://otel-collector:4318
+  # ON as of 2026-11-10: G2 now runs a collector in the otel-traces namespace,
+  # which forwards to Langfuse (langfuse-v4). Spans carry path-only attributes;
+  # the generation spans add model, token counts and latency but never prompt
+  # or completion text.
+  #
+  # KEEP THESE HERE, NOT ONLY IN THE PCAI CONFIGURE BOX. Chart defaults ship
+  # otelEnabled: false and a placeholder endpoint, so any install/upgrade that
+  # starts from chart values silently disables tracing — which is exactly what
+  # happened when v4.0.1 rolled out and traces stopped dead for an hour. The
+  # site values document is the layer that survives a redeploy.
+  #
+  # The endpoint MUST be the full in-cluster name. The bare
+  # "http://otel-collector:4318" placeholder does not resolve from this
+  # namespace (the collector lives in otel-traces, not here).
+  #
+  # The collector filters /ready, /health and /metrics itself, so leave
+  # otelSampleRatio at 1.0 — dropping spans here would only cost you the
+  # interesting ones.
+  otelEnabled: true
+  otelEndpoint: http://otel-collector.otel-traces.svc.cluster.local:4318
   otelServiceName: pcai-llm-gateway
   otelSampleRatio: 1.0
   toolRelayEnabled: true           # server-side model<->MCP loop (X-PCAI-Execute-Tools)
@@ -234,6 +252,9 @@ settings:
   routingTier1Tokens: 1500
   routingTier2Tokens: 6000
   routingTurnAdderTokens: 100
+  # Agents as routing candidates (off by default): the key's OFFERED agents join
+  # the router's window; a pick applies the agent's surface + prompt for the turn.
+  routingAgentsEnabled: false
   # MCP federation: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
   # two-tool surface (mcp_catalog + mcp_call only).
   mcpFlatTools: true
@@ -259,6 +280,11 @@ settings:
   offpeakModelPromql:
     GLM-5.3-Flash: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs04.hst.lab",device=~"nvidia[4-7]"}[5m]))'
     Qwen3.8-27B: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="pcai-se-scs05.hst.lab",device=~"nvidia[4-7]"}[5m]))'
+  # L3 cache volume occupancy for the Off-peak tab's all-models summary: a PromQL
+  # label selector over kubelet_volume_stats_* naming the volumes backing the L3
+  # store (the engine exports no storage-occupancy gauge). Empty = no disk section.
+  # Site example (Mooncake SSD offload PVCs):
+  # endpointMetricsDiskSelector: 'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'
   # The load-aware cascade is OFF by fleet default (helm/values.yaml) and ON here —
   # the G2-only divergence. The cascade entry picks its head model at conversation START from the
   # per-model off-peak state above, then stays with it for the conversation.
@@ -267,10 +293,6 @@ settings:
   # TTFT failover budget (s): after a 2xx the stream waits up to this long for the upstream's
   # FIRST SSE data line (keepalives don't count). 0 disables.
   failoverTtftS: 45
-  # Per-model max_tokens ceiling: the auto entry sends 262144, which Qwen3.8-27B rejects with an
-  # API 400 when max_tokens+prompt exceeds its context. 192k leaves prompt headroom.
-  maxTokensCeiling:
-    Qwen3.8-27B: 196608
   # Upstream MCP caller attribution: stamps X-MCP-Caller on every upstream fleet MCP call.
   # Upstreams may RECORD it, never authorize off it.
   mcpCallerAttribution: true
@@ -557,8 +579,13 @@ ezua:
                                     # WITH trustProxyIdentity/ssoKeyCreateEnabled ON, EMPTY IS
                                     # INSECURE — the whole istio-system namespace may then
                                     # deliver spoofed X-Auth-Request-* headers (NOTES.txt
-                                    # warns at deploy time). Set the ezaf-gateway SA's
-                                    # SPIFFE ID, e.g.:
-                                    #   - cluster.local/ns/istio-system/sa/ezaf-gateway
+                                    # warns at deploy time). Set the ingress-gateway SA's
+                                    # VERIFIED SPIFFE ID (G2, verified 2026-11-02) — do NOT
+                                    # use sa/ezaf-gateway, that ServiceAccount does not exist:
+                                    #   - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+                                    # Discover the SA live with (both lines; the
+                                    # jsonpath half must survive the copy-paste):
+                                    #   kubectl -n istio-system get pod -l 'istio=ingressgateway' \
+                                    #     -o jsonpath='{.items[0].spec.serviceAccountName}'
     excludeInboundPorts: []         # KEEP EMPTY — an excluded port bypasses ALL policy rules
     rules: []                       # non-empty REPLACES the baseline ALLOW rules

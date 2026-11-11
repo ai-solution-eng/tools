@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -255,7 +256,12 @@ def atom_to_compare_metrics(atom: dict) -> dict:
 
     def n(d: dict, k: str) -> float | None:
         v = d.get(k)
-        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return None
+        num = float(v)
+        # inf/nan would 500 the compare route (starlette's JSONResponse is
+        # allow_nan=False), so a bad cell renders as a dash instead
+        return num if math.isfinite(num) else None
 
     failed = m.get("failed")
     return {
@@ -265,7 +271,7 @@ def atom_to_compare_metrics(atom: dict) -> dict:
         "ttft_post_p95_ms": n(tpost, "p95"),
         "tokens_p50": n(tps, "p50"),
         "tokens_p95": n(tps, "p95"),
-        "failed": float(failed) if isinstance(failed, (int, float)) and not isinstance(failed, bool) else None,
+        "failed": n(m, "failed") if failed is not None else None,
     }
 
 

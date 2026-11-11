@@ -940,7 +940,9 @@ NAV_GROUP_TABS = [
     # both are about the objects the Models tab registers.
     "models|advertised|agents|mcp|metrics",
     "usage|traces|audit|guardrails",
-    "offpeak|distiller|routing",
+    # 2026-11-08: "Model groups" (load-balanced sets of equivalent models)
+    # joins the background GPU-economy group next to Off-peak.
+    "offpeak|groups|distiller|routing",
 ]
 
 
@@ -1435,8 +1437,9 @@ def test_console_endpoint_metrics_panel() -> None:
     assert "unmapped" in s
     # idle is a WORD, not a zero that reads as a fault
     assert "· idle" in s
-    # a failed fetch degrades the pill instead of throwing
-    fn = re.search(r"async function loadEndpointMetrics\(\) \{.*?\n\}", s, re.DOTALL)
+    # a failed fetch degrades the pill instead of throwing (the force arg is
+    # the manual-reload bypass of the shared emFetch cache, 2026-11-08)
+    fn = re.search(r"async function loadEndpointMetrics\(force\) \{.*?\n\}", s, re.DOTALL)
     assert fn, "loadEndpointMetrics not extractable"
     body = fn.group(0)
     assert "unavailable" in body and "no endpoints reporting" in body
@@ -1462,15 +1465,19 @@ def test_console_offpeak_per_model_panel_is_its_own_card() -> None:
 
     It is a different object (one row per model, its own PromQL, its own
     hysteresis state) and it made the billing card scroll; it now has its own
-    heading and its own hint.
+    heading and its own hint. The ALL-MODELS cache summary (2026-11-09) is a
+    third card between them: one aggregate, no per-model ratio editor.
     """
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
     i = s.index('<section id="tab-offpeak"')
     j = s.index("</section>", i)
     panel = s[i:j]
-    assert panel.count('<div class="card">') == 2, "off-peak must be two cards"
+    assert panel.count('<div class="card">') == 3, "off-peak must be three cards"
     assert "Per-model utilization" in panel
-    # the util block is inside the SECOND card, after the global table
+    # the all-models summary sits between the global status and the cards
+    assert panel.index('id="op-cache"') > panel.index('id="op-table"')
+    assert panel.index('id="op-cache"') < panel.index("Per-model utilization")
+    # the util block is inside the THIRD card, after the global table
     assert panel.index("Per-model utilization") > panel.index('id="op-table"')
     assert 'id="op-models"' in panel
 
@@ -1818,7 +1825,15 @@ def test_form_rows_share_one_control_plane() -> None:
     assert "armPasswordToggles(div);\n  layoutFormRowsNow();" in s
     assert "layoutFormRowsNow();\n  return true;" in s  # activateTab
     assert "layoutFormRowsNow();\nwindow.addEventListener('resize', layoutFormRows);" in s
-    assert "new MutationObserver(layoutFormRows).observe(document.body, { childList: true, subtree: true });" in s
+    # audit 2026-11-10 P3: the observer is SCOPED, not body-wide. A
+    # document-wide observer ran a forced layout pass (getBoundingClientRect
+    # per .row) after every innerHTML table rebuild, none of which can change
+    # a row's flex lines. It now watches the row containers plus the dialog.
+    assert "const rowObs = new MutationObserver(layoutFormRows);" in s
+    assert "rowObs.observe(r, { childList: true, subtree: true });" in s
+    assert "observe(document.body, { childList: true, subtree: true })" not in s, (
+        "a body-wide observer re-introduces the forced-reflow-on-every-mutation cliff"
+    )
 
 
 def test_form_row_labels_carry_a_title_and_a_direct_hint() -> None:
@@ -1908,3 +1923,348 @@ def test_form_row_labels_carry_a_title_and_a_direct_hint() -> None:
             continue
         assert n.parent is not None and n.parent.tag == "label", "a row hint must sit on a label"
         assert n.parent.parent is a, "a row hint must be a DIRECT child of a row label"
+
+
+# ---------------------------------------------------------------------------
+# SSO admin tier (F1, 2026-11-08): two profiles instead of one
+# ---------------------------------------------------------------------------
+
+
+def test_sso_admin_tier_controls_and_bind_wiring() -> None:
+    """The SSO self-mint card selects a SECOND profile for mints whose SSO
+    groups match the admin tier. Both fields ride the same PUT (null = clear,
+    empty groups = tier split OFF), load back from GET /admin/tenants, and the
+    card explains the precedence. The 'bind existing users' handler must be
+    wired at TOP LEVEL — Lead review 2026-11-08 found it nested inside the
+    save handler, so the button only went live after a first save click."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # the two admin-tier controls exist in the SSO card
+    assert 'id="sso-admin-profile"' in s
+    assert 'id="sso-admin-groups"' in s
+    # profile_id ALWAYS rides the PUT: impl-platform 2026-11-08 — an OMITTED
+    # profile_id clears the default, so a tier-only save must include the
+    # current value (the select holds it, loaded from the tenant)
+    assert "const body = { profile_id: $('sso-profile').value || null };" in s
+    # the save PUT carries both fields (null = clear / tier split off)
+    assert "body.admin_profile_id = $('sso-admin-profile').value || null" in s
+    assert "body.admin_groups = $('sso-admin-groups').value.trim() || null" in s
+    # the GET /admin/tenants fields are loaded back onto the controls
+    assert "sap.value = (t && t.sso_admin_profile_id) || ''" in s
+    assert "sag.value = (t && t.sso_admin_groups) || ''" in s
+    # the card hint explains the tier split and its off state
+    assert "turn the tier split off" in s
+    # top-level wiring: column-0 assignment, and no indented (nested) copy
+    assert re.search(r"(?m)^\$\('sso-bind'\)\.onclick = guarded\(", s), "sso-bind must be wired at top level"
+    assert re.search(r"(?m)^\s+\$\('sso-bind'\)\.onclick", s) is None, "the nested sso-bind wiring must be gone"
+
+
+# ---------------------------------------------------------------------------
+# Off-peak KV strip (F2, 2026-11-08)
+# ---------------------------------------------------------------------------
+
+
+def test_offpeak_kv_strip_contract() -> None:
+    """Static contract: ONE shared /admin/endpoint-metrics fetch feeds both
+    the Metrics tab and the off-peak cards (no double-query), the join is
+    pool-equality-then-normalized-key and NEVER model_name, tiers without
+    data are omitted entirely (a card with no rows renders nothing, never an
+    error), the disk line exists only when configured, a full RAM tier is
+    warn-at-most (write_through steady state is normal), and every server
+    string the strip touches goes through esc()."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # one shared fetch with a ~15s promise cache
+    assert "async function emFetch(maxAgeMs = 15000, force = false)" in s
+    assert "emCache = null;" in s  # init AND the cleared-on-rejection reset
+    assert "d = await emFetch(15000, force);" in s  # the metrics table
+    assert "em = await emFetch(15000, force === true);" in s  # the off-peak cards, once per refresh
+    # a manual ↻ is a TRUE refresh: it forces past the shared cache, while the
+    # 30s poll keeps reusing it (one fetch still feeds both tabs)
+    assert "$('op-reload').addEventListener('click', () => loadOffpeak(true)" in s
+    assert "loadEndpointMetrics(true)" in s  # a manual reload forces past the cache
+    # join contract
+    kv = re.search(r"function kvRowsFor\(cardName, rows\) \{.*?\n\}", s, re.DOTALL)
+    assert kv, "kvRowsFor not extractable from admin.html"
+    assert "r.pool === cardName" in kv.group(0)
+    assert "rk.includes(nk) || nk.includes(rk)" in kv.group(0)
+    assert "model_name" not in kv.group(0), "the join must never use model_name"
+    # omission contract: no rows / no KV data -> render nothing
+    assert "if (!rs.length) return '';" in s
+    assert "if (!lines.length) return '';" in s
+    # the disk line exists only when a row says disk is configured
+    assert "rs.find(r => r && r.kv_disk_configured)" in s
+    # a full RAM tier is the write_through steady state: warn at most, never err
+    m = re.search(r"function kvStripHtml\(cardName, rows\) \{.*?\n\}", s, re.DOTALL)
+    assert m, "kvStripHtml not extractable from admin.html"
+    strip = m.group(0)
+    assert "var(--warn)" in strip and "var(--err)" not in strip
+    assert "write_through steady state" in strip  # the tooltip says so
+    # every server string the strip renders passes esc() exactly once
+    # (raw parts + one esc, so a hostile pod cannot break out of the title)
+    assert "const title = esc([...perReplica, ...notes].join('; '));" in strip
+    assert 'title="${title}"' in strip
+    # the strip sits under the sparkline in the per-model card
+    assert "${kvStripHtml(name, kvRows)}" in s
+
+
+def test_offpeak_overall_cache_summary_contract() -> None:
+    """Static contract: the ALL-MODELS summary sits ABOVE the per-model cards,
+    renders from the SAME single emFetch (even when no per-model evaluator is
+    configured), and its disk line prefers the server's volume occupancy,
+    falls back to L3 activity, and says "not configured" rather than a 0%."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'id="op-cache"' in s
+    assert s.index('id="op-cache"') < s.index('id="op-models"')
+    assert "function kvOverallHtml(rows, disk)" in s
+    assert "function kvBytes(v)" in s
+    # the fetch sits ABOVE the per-model entries check, so the summary still
+    # renders when no per-model evaluator exists (and above the focus guard)
+    fetch_at = s.index("em = await emFetch(15000, force === true);")
+    assert fetch_at < s.index("const entries = Object.entries(d.models")
+    assert "kvOverallHtml(kvRows, em && em.disk)" in s
+    fn = re.search(r"function kvOverallHtml\(rows, disk\) \{.*?\n\}", s, re.DOTALL)
+    assert fn, "kvOverallHtml not extractable"
+    body = fn.group(0)
+    # volume occupancy -> activity -> explicit absence, in that order
+    assert "const dTotal =" in body and "kv_disk_hit_tps" in body
+    assert "no L3 storage backend configured" in body
+    assert "serving reports no L3 backend" in body
+    # no fabricated percentage when the volume is unknown
+    assert "if (!rs.length && !dTotal) return" in body
+    # RAW RAM line: the pod's working set vs limit, never a token conversion
+    assert "POD MEMORY" in body
+    assert "RAM (cached)" in body
+    assert "ram_used_bytes" in body and "ram_limit_bytes" in body
+
+
+def test_offpeak_kv_strip_rendering() -> None:
+    """Behavioral: extract the KV-strip helpers from the page and run them
+    under node against the join / aggregation / rendering contract."""
+    import re
+    import subprocess
+    import tempfile
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    fns = []
+    for pat in (
+        r"function esc\(s\) \{.*?\n\}",
+        r"function kvNormKey\(s\) \{.*?\n\}",
+        r"function kvRowsFor\(cardName, rows\) \{.*?\n\}",
+        r"function kvTok\(v\) \{.*?\n\}",
+        r"function kvPctTxt\(v\) \{.*?\n\}",
+        r"function kvTier\(rows, usedK, totalK, pctK\) \{.*?\n\}",
+        r"function kvSum\(rows, key\) \{.*?\n\}",
+        r"function kvStripHtml\(cardName, rows\) \{.*?\n\}",
+        r"function kvBytes\(v\) \{.*?\n\}",
+        r"function kvOverallHtml\(rows, disk\) \{.*?\n\}",
+    ):
+        m = re.search(pat, s, re.DOTALL)
+        assert m, f"not extractable from admin.html: {pat}"
+        fns.append(m.group(0))
+    harness = (
+        "\n".join(fns)
+        + "\n"
+        + """
+const t = (n, c) => { if (!c) { console.error('FAIL ' + n); process.exit(1); } };
+// join: exact pool equality wins
+let got = kvRowsFor('qwen3-8b', [
+  { pod: 'a', pool: 'qwen3-8b', kv_gpu_pct: 10 },
+  { pod: 'b', pool: 'qwen3-8b', kv_gpu_pct: 20 },
+  { pod: 'c', pool: 'other', kv_gpu_pct: 50 },
+]);
+t('exact-pool-join', got.length === 2 && got[0].pod === 'a');
+// fallback: normalized-key substring compare, in EITHER direction, but only
+// a UNIQUE matching pool may join (review F2-1 ambiguity guard)
+got = kvRowsFor('qwen3-vl-8b', [
+  { pod: 'a', pool: 'Qwen3_VL-8B', kv_gpu_pct: 5 },
+  { pod: 'c', pool: 'llama-8b', kv_gpu_pct: 7 },
+]);
+t('norm-substring-joins-unique', got.length === 1 && got[0].pod === 'a');
+got = kvRowsFor('qwen3-vl-8b-instruct', [{ pod: 'a', pool: 'qwen3-vl-8b', kv_gpu_pct: 5 }]);
+t('norm-substring-reverse-direction', got.length === 1 && got[0].pod === 'a');
+got = kvRowsFor('qwen3-vl-8b', [
+  { pod: 'a', pool: 'Qwen3_VL-8B', kv_gpu_pct: 5 },
+  { pod: 'b', pool: 'qwen3-vl-8b-instruct', kv_gpu_pct: 6 },
+]);
+t('norm-substring-ambiguous-joins-nothing', got.length === 0);
+// an UNMAPPED row (no pool) joins nothing — model_name is never a key
+got = kvRowsFor('qwen3-vl-8b', [{ pod: 'x', model_name: 'Qwen3-VL-8B', kv_gpu_pct: 1 }]);
+t('unmapped-never-joins', got.length === 0);
+// no rows at all -> the card renders nothing
+t('no-rows-no-strip', kvStripHtml('qwen3-8b', []) === '');
+// aggregation: weighted pct = sum(used)/sum(total), never a mean of ratios
+let tier = kvTier([
+  { kv_gpu_used_tokens: 100, kv_gpu_max_tokens: 1000, kv_gpu_pct: 10 },
+  { kv_gpu_used_tokens: 300, kv_gpu_max_tokens: 1000, kv_gpu_pct: 30 },
+], 'kv_gpu_used_tokens', 'kv_gpu_max_tokens', 'kv_gpu_pct');
+t('weighted-pct', Math.abs(tier.pct - 20) < 1e-9 && tier.used === 400 && tier.total === 2000);
+// totals absent (vLLM: ratio only) -> the worst row ratio, not a mean
+tier = kvTier([{ kv_gpu_pct: 7.5 }, { kv_gpu_pct: 12.25 }], 'kv_gpu_used_tokens', 'kv_gpu_max_tokens', 'kv_gpu_pct');
+t('ratio-only-worst-pct', tier.pct === 12.25 && tier.used == null && tier.total == null);
+// nothing at all -> the tier is absent
+t('tier-absent-null', kvTier([], 'kv_gpu_used_tokens', 'kv_gpu_max_tokens', 'kv_gpu_pct') === null);
+// GPU-only rows -> GPU line only: no RAM label, no disk line
+let html = kvStripHtml('qwen3-8b', [
+  { pod: 'a', pool: 'qwen3-8b', kv_gpu_pct: 8 },
+  { pod: 'b', pool: 'qwen3-8b', kv_gpu_pct: 9 },
+]);
+t('renders-gpu-line', html.includes('GPU (active)') && html.includes('9.0%'));
+t('omits-ram-without-data', !html.includes('>RAM (cached)</span>'));
+t('omits-disk-without-config', !html.includes('L3 active'));
+// the tooltip states only the facts of the tiers that rendered
+t('tooltip-gpu-only', html.includes('evictable radix cache excluded') && !html.includes('activity only'));
+// GPU: ACTIVE (accent) + evictable cached (dim) in ONE pool; the cached
+// figure is stated next to the active token count.
+html = kvStripHtml('qwen3-8b', [{ pod: 'a', pool: 'qwen3-8b', kv_gpu_used_tokens: 100, kv_gpu_max_tokens: 10000, kv_gpu_pct: 4, kv_gpu_evictable_tokens: 1500000 }]);
+t('gpu-active-label', html.includes('GPU (active)'));
+t('gpu-cached-figure', html.includes('1.50M cached'));
+t('gpu-two-segment-bar', html.includes('display:flex') && html.includes('var(--accent)') && html.includes('var(--dim)'));
+// RAM says CACHED (prefix-cache pool), never "used by conversations"
+html = kvStripHtml('qwen3-8b', [{ pod: 'a', pool: 'qwen3-8b', kv_host_used_tokens: 100, kv_host_total_tokens: 1000, kv_host_pct: 10 }]);
+t('ram-cached-label', html.includes('RAM (cached)'));
+// a hostile pod name stays inert inside the title attribute
+html = kvStripHtml('qwen3-8b', [{ pod: '<img src=x onerror=alert(1)>', pool: 'qwen3-8b', kv_gpu_pct: 1 }]);
+t('pod-escaped', !html.includes('<img') && html.includes('&lt;img'));
+// disk line only when configured, with the hit rate
+html = kvStripHtml('qwen3-8b', [{ pod: 'a', pool: 'qwen3-8b', kv_gpu_pct: 1, kv_disk_configured: true, kv_disk_hit_tps: 12.34 }]);
+t('disk-line-configured', html.includes('L3 active') && html.includes('12.3 tok/s hit'));
+// RAM full = the write_through steady state: warn colour, never the error colour
+html = kvStripHtml('qwen3-8b', [{ pod: 'a', pool: 'qwen3-8b', kv_host_used_tokens: 6880000, kv_host_total_tokens: 6880000 }]);
+t('ram-full-warn-not-err', html.includes('var(--warn)') && !html.includes('var(--err)'));
+// full tier: the tooltip states all three facts
+html = kvStripHtml('qwen3-8b', [{ pod: 'a', pool: 'qwen3-8b', kv_gpu_pct: 8, kv_host_used_tokens: 6880000, kv_host_total_tokens: 6880000, kv_disk_configured: true, kv_disk_hit_tps: 12.3 }]);
+t('tooltip-states-all-facts', html.includes('evictable radix cache excluded') && html.includes('write_through steady state') && html.includes('activity only'));
+// ALL-MODELS summary: weighted across pods, never a mean of ratios
+let all = kvOverallHtml([
+  { kv_host_used_tokens: 100, kv_host_total_tokens: 1000, kv_host_pct: 10 },
+  { kv_host_used_tokens: 300, kv_host_total_tokens: 1000, kv_host_pct: 30 },
+], null);
+t('overall-ram-cached-weighted', all.includes('RAM (cached)') && all.includes('20.0%'));
+t('overall-disk-explicit', all.includes('no L3 storage backend configured'));
+// volume occupancy wins over activity when the server supplies it
+all = kvOverallHtml([{ kv_disk_configured: true, kv_disk_hit_tps: 12.3 }],
+  { used_bytes: 0, total_bytes: 1099511627776, pct: 0 });
+t('overall-disk-volume', all.includes('0.0%') && all.includes('0 B / 1.00 TiB'));
+// configured but no volume number -> activity, never a made-up percentage
+all = kvOverallHtml([{ kv_disk_configured: true, kv_disk_hit_tps: 12.3 }], null);
+t('overall-disk-activity', all.includes('L3 active') && all.includes('12.3 tok/s hit'));
+// nothing at all -> an em dash, not "0%"
+t('overall-empty', kvOverallHtml([], null) === '<span class="muted">—</span>');
+// RAW utilization: the pod's working set vs its memory limit, summed across
+// pods; the per-pod breakdown rides the tooltip (title attribute)
+all = kvOverallHtml([
+  { pod: 'p1', kv_host_used_tokens: 1, kv_host_total_tokens: 2, ram_used_bytes: 600, ram_limit_bytes: 1000 },
+  { pod: 'p2', kv_host_used_tokens: 1, kv_host_total_tokens: 2, ram_used_bytes: 200, ram_limit_bytes: 500 },
+], null);
+t('overall-pod-memory', all.includes('POD MEMORY') && all.includes('53.3%'));
+t('overall-pod-memory-bytes', all.includes('800 B / 1.46 KiB'));
+t('overall-pod-memory-tooltip', all.includes('p1: 600 B / 1000 B'));
+console.log('OK');
+"""
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+        fh.write(harness)
+        path = fh.name
+    r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"kv strip contract broken:\n{r.stdout}\n{r.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Model groups tab (F3, 2026-11-08)
+# ---------------------------------------------------------------------------
+
+
+def test_model_groups_tab() -> None:
+    """Static contract: the tab is wired into the generic tab machinery
+    (nav button + section + lazy loadGroups on activation), the form reads
+    its members from the registered pools (state.models), the fetch paths
+    match the admin API (GET/PUT/DELETE /admin/model-groups, POST .../preview),
+    and every group string rendered server-side goes through esc()."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # nav + section + lazy load on activation (the click handler is generic)
+    assert '<button data-tab="groups">Model groups</button>' in s
+    assert '<section id="tab-groups">' in s
+    assert "if (name === 'groups') loadGroups().catch(e => banner(e.message, 'error', 5000));" in s
+    # form + list + preview ids
+    for i in (
+        "mg-table",
+        "mg-name",
+        "mg-members",
+        "mg-policy",
+        "mg-desc",
+        "mg-save",
+        "mg-form-title",
+        "mg-preview",
+        "mg-preview-go",
+        "mg-preview-out",
+    ):
+        assert f'id="{i}"' in s, f"missing #{i}"
+    # members is a MULTI-select over the registered pools
+    assert 'id="mg-members" multiple' in s
+    # name charset (2026-11-08, impl-platform): documented AND pre-checked
+    # client-side — the server stays the authority, 422 reasons ride the banner
+    assert "no whitespace" in s and "auto-demand-aware" in s
+    assert ".test(name) || name.length > 200" in s
+    # fetch paths (api() prefixes /admin)
+    assert "api('/model-groups')" in s
+    assert "api('/model-groups/' + encodeURIComponent(name), { method: 'PUT'" in s
+    mgd = re.search(r"window\.mgDelete = \(btn, name\) => withBtn\(btn, async \(\) => \{.*?\n\}\);", s, re.DOTALL)
+    assert mgd, "mgDelete handler not extractable"
+    assert "method: 'DELETE'" in mgd.group(0) and "encodeURIComponent(name)" in mgd.group(0)
+    assert "'/preview', { method: 'POST' }" in s
+    # every server string is escaped (group names, members, descriptions, the pick)
+    assert "esc(g.name)" in s and "esc(g.description || '')" in s and "esc(d.member)" in s
+    assert 'class="pill mono" title="member' in s and ">${esc(m)}</span>" in s
+    # the group name is escaped even inside the inline onclick attribute
+    assert "onclick=\"mgEdit(this,'${esc(g.name)}')\"" in s
+    # inline onclick handlers stay in the window registry
+    reg = re.search(r"Object\.assign\(window, \{.*?\}\);", s, re.DOTALL)
+    assert reg and "mgEdit, mgDelete," in reg.group(0)
+    assert "window.mgEdit = " in s and "window.mgDelete = " in s
+
+
+def test_console_edit_key_applies_profile_presets() -> None:
+    """The Edit-key dialog is the operator's one control for "give this key
+    the admin profile". Assigning users.profile_id alone leaves an existing
+    key's creation-time budgets/grants untouched, so the dialog must expose
+    the profile picker, the apply tick, and call the one-key re-stamp route."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    assert 'id="ek-profile"' in s
+    assert 'id="ek-apply-presets"' in s
+    assert "ek-apply-hint" in s
+    assert "/apply-profile" in s
+    assert "apply_budgets" in s and "apply_grants" in s
+    # gated on backend support, like profileCell: no dead control on old backends
+    assert "const hasProfile = 'user_profile_id' in k;" in s
+    # an ordinary edit must not silently re-stamp: auto-tick only on a change
+    assert "applyBox.checked = !!profileSel.value && profileSel.value !== curProfile;" in s
+    # clearing is a real state: the empty option sends an explicit null
+    assert "body: { profile_id: null }" in s
+    # the audit trail action is filterable from the console
+    assert "'key.profile.apply'" in s
+
+
+def test_admin_script_blocks_parse() -> None:
+    """Regression guard: every inline <script> block must still PARSE — the
+    console is one IIFE with no build step, so a syntax error kills the whole
+    page at runtime with nothing to catch it."""
+    import re
+    import subprocess
+    import tempfile
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    blocks = re.findall(r"<script>(.*?)</script>", s, re.DOTALL)
+    assert len(blocks) >= 1
+    for i, b in enumerate(blocks):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+            fh.write(b)
+            path = fh.name
+        r = subprocess.run(["node", "--check", path], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, f"script block {i} does not parse:\n{r.stderr}"

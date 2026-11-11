@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -346,11 +347,40 @@ def test_compare_requires_ids(compare_app):
     assert status == 400  # FastAPI: ids is a required query param
 
 
-def test_compare_caps_at_four_ids(compare_app):
-    ids = ",".join(f"a{i}" for i in range(5))
+def test_compare_caps_at_six_ids(compare_app):
+    ids = ",".join(f"a{i}" for i in range(7))
     status, body = _call(compare_app, "GET", "/api/results/compare?ids=" + ids)
     assert status == 400
-    assert b"at most 4" in body
+    assert b"at most 6" in body
+
+
+def test_compare_accepts_six_ids(compare_app):
+    """Six picks is the cap, not four: the six-id request reaches the merge
+    (unknown ids land under "missing", they are not a cap violation)."""
+    ids = "ep-run-a,ep-run-b,chat-run-c,dead-run-d,nope-1,nope-2"
+    status, body = _call(compare_app, "GET", "/api/results/compare?ids=" + ids)
+    assert status == 200
+    data = json.loads(body)
+    assert data["missing"] == ["nope-1", "nope-2"]
+    assert [r["run_id"] for r in data["runs"]] == ["ep-run-a", "ep-run-b", "chat-run-c", "dead-run-d"]
+
+
+def test_compare_ui_cap_and_palette_track_the_api():
+    """The page must offer exactly the runs the API accepts, each with its OWN
+    colour: a pick past the palette length reuses a series colour, and a run
+    index past the .cmp-runN accents loses its card accent (it falls back to
+    the reference green). Both lists are hand-maintained in results.html, so
+    they are checked against compare.MAX_COMPARE_RUNS here."""
+    html = (Path(C.__file__).parent / "ui" / "results.html").read_text(encoding="utf-8")
+    cap = re.search(r"var MAX_CMP = (\d+);", html)
+    assert cap, "MAX_CMP not found in results.html"
+    assert int(cap.group(1)) == C.MAX_COMPARE_RUNS
+    colors_block = re.search(r"var RUN_COLORS = \[(.*?)\];", html, re.DOTALL)
+    assert colors_block, "RUN_COLORS not found in results.html"
+    palette = re.findall(r"#[0-9a-fA-F]{6}", colors_block.group(1))
+    assert len(set(palette)) == len(palette) >= C.MAX_COMPARE_RUNS
+    accents = re.findall(r"\.cmp-run\d+ \{ --cmp-accent: (#[0-9a-fA-F]{6}); \}", html)
+    assert accents == palette, "results.html .cmp-runN accents must match RUN_COLORS, in order"
 
 
 def test_compare_single_id_rejected(compare_app):
@@ -493,6 +523,22 @@ def test_build_comparison_info_metrics_have_no_delta():
     assert "gpu_util_mean" not in row["delta_vs_reference"]
 
 
+def test_build_comparison_merges_six_runs():
+    """The cap is six runs (MAX_COMPARE_RUNS) and the merge is count-agnostic:
+    six picks must produce one section whose rows carry all six columns."""
+    runs = [
+        {"run_id": f"r{i}", "kind": "endpoint", "rows": [{"label": "N=4", "metrics": {"rps": 100.0 + i}}]}
+        for i in range(C.MAX_COMPARE_RUNS)
+    ]
+    out = C.build_comparison(runs)
+    (section,) = out["sections"]
+    assert C.MAX_COMPARE_RUNS == 6
+    assert section["runs"] == [r["run_id"] for r in runs]
+    (row,) = section["rows"]
+    assert list(row["cells"]["rps"]) == [r["run_id"] for r in runs]
+    assert row["delta_vs_reference"]["rps"]["r5"] == 5.0  # +5% vs the r0 baseline
+
+
 def test_build_comparison_mixed_kind_sections_and_label_union():
     runs = [
         {"run_id": "c1", "kind": "chat", "rows": [{"label": "ctx=0 users=1 coding", "metrics": {"tokens_p50": 300.0}}]},
@@ -586,6 +632,64 @@ def test_normalize_chat_rows_last_occurrence_wins():
 
 def test_normalize_chat_rows_no_table_returns_empty():
     assert C.normalize_chat_rows("# empty\n\nno levels completed yet\n") == []
+
+
+# -- non-finite artifact cells must never 500 the compare route -------------
+# starlette's JSONResponse is allow_nan=False, so ONE inf/nan anywhere in the
+# payload used to kill the whole route; a bad cell is a dash now.
+
+
+def test_normalize_endpoint_rows_drops_nonfinite_metrics():
+    run_json = {
+        "summary": {
+            "rows": [
+                {
+                    "concurrency": 1,
+                    "rps": float("inf"),
+                    "lat_p50": 12.0,
+                    "success_rate_pct": float("nan"),
+                }
+            ]
+        }
+    }
+    (row,) = C.normalize_endpoint_rows(run_json)
+    assert row["metrics"]["rps"] is None
+    assert row["metrics"]["lat_p50_ms"] == 12.0
+    assert row["metrics"]["success_rate_pct"] is None
+
+
+def test_atom_to_compare_metrics_drops_nonfinite():
+    from model_benchmarker import atomize as ATOM
+
+    atom = {
+        "metrics": {
+            "ttft_ms": {"p50": float("inf"), "p95": 10.0},
+            "tokens_per_s": {"p50": float("nan")},
+            "failed": float("inf"),
+        }
+    }
+    out = ATOM.atom_to_compare_metrics(atom)
+    assert out["ttft_turn1_p50_ms"] is None
+    assert out["ttft_turn1_p95_ms"] == 10.0
+    assert out["tokens_p50"] is None
+    assert out["failed"] is None
+
+
+def test_compare_payload_stays_strict_json_with_bad_cells():
+    # the production path: artifact -> normalize_endpoint_rows -> build_comparison
+    def _run(rid: str, rps: float) -> dict:
+        return {
+            "run_id": rid,
+            "kind": "endpoint",
+            "rows": C.normalize_endpoint_rows({"summary": {"rows": [{"concurrency": 1, "rps": rps}]}}),
+        }
+
+    payload = C.build_comparison([_run("a", float("inf")), _run("b", 10.0)])
+    # raises ValueError if any non-finite value survived the merge
+    json.dumps(payload, allow_nan=False)
+    (section,) = payload["sections"]
+    assert section["rows"][0]["cells"]["rps"]["a"] is None
+    assert section["rows"][0]["cells"]["rps"]["b"] == 10.0
 
 
 def test_params_label_shapes():
@@ -1102,6 +1206,17 @@ def test_target_aliases_bridge_serving_and_origin():
     # malformed input: empty alias list, never a raise (the JS falls back
     # to [target_url] when the field is absent/empty)
     assert target_aliases("not a url") == []
+
+
+def test_target_aliases_keep_the_legacy_https_downgrade_for_matching():
+    """Records written before the non-serving-URL fix stored http:// for an
+    https target; the resume suggester must still find them (matching only --
+    the launch/probe URL is never downgraded)."""
+    from model_benchmarker.webapp.runner import target_aliases
+
+    typed = target_aliases("https://api.example.com")
+    legacy_record = target_aliases("http://api.example.com")
+    assert {a.rstrip("/").lower() for a in typed} & {a.rstrip("/").lower() for a in legacy_record}
 
 
 def test_public_index_carries_target_aliases(compare_app):
@@ -1856,3 +1971,88 @@ def test_measured_benchmarks_qwen_finds_its_runs():
     assert hits[0]["rows"][0]["tokens_p50"] == 136.4
     # a different model in the same tree is still not matched
     assert find_measured("Qwen/Qwen3-8B", "NVIDIA H200 SXM", 4, library=lib) == []
+
+
+# ---------------------------------------------------------------------------
+# chat page model dropdown: POST /api/models (gated, fail-soft)
+# ---------------------------------------------------------------------------
+
+
+def test_models_api_gated(gated_app):
+    status, _ = _call(gated_app, "POST", "/api/models", headers={"Content-Type": "application/json"}, body=b"{}")
+    assert status == 401
+
+
+def test_models_api_validates_the_body(gated_app):
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    for body in (
+        b"",
+        b"[]",
+        json.dumps({}).encode(),
+        json.dumps({"target": "ftp://x"}).encode(),
+        json.dumps({"target": "http://h:8000", "target_usage": "sideways"}).encode(),
+    ):
+        status, _ = _call(gated_app, "POST", "/api/models", headers=headers, body=body)
+        assert status == 400, body
+
+
+def test_models_api_delegates_with_usage_and_key(gated_app, monkeypatch):
+    calls = {}
+
+    def fake(target, params, api_key=""):
+        calls.update(target=target, params=params, api_key=api_key)
+        return {
+            "models": ["qwen3-32b"],
+            "source": "http://h:8000/v1/models",
+            "target_url": "http://h:8000",
+            "truncated": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(R, "list_models_for_target", fake)
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    status, body = _call(
+        gated_app,
+        "POST",
+        "/api/models",
+        headers=headers,
+        body=json.dumps({"target": "http://h:8000", "target_usage": "local", "api_key": "sk-1"}).encode(),
+    )
+    assert status == 200
+    assert json.loads(body)["models"] == ["qwen3-32b"]
+    assert "sk-1" not in body.decode()  # the key is request-only, never echoed
+    assert calls == {"target": "http://h:8000", "params": {"target_usage": "local"}, "api_key": "sk-1"}
+
+
+def test_models_api_fails_soft_payload(gated_app, monkeypatch):
+    """An unreachable endpoint is a 200 with models=[] + reason, not an error:
+    typing the id by hand must keep working."""
+    monkeypatch.setattr(
+        R,
+        "list_models_for_target",
+        lambda *a, **k: {
+            "models": [],
+            "source": "http://h:8000/v1/models",
+            "target_url": "http://h:8000",
+            "truncated": False,
+            "error": "ConnectError: refused",
+        },
+    )
+    headers = {"X-API-Key": "test-key-1", "Content-Type": "application/json"}
+    status, body = _call(
+        gated_app, "POST", "/api/models", headers=headers, body=json.dumps({"target": "http://h:8000"}).encode()
+    )
+    assert status == 200
+    data = json.loads(body)
+    assert data["models"] == [] and data["error"] == "ConnectError: refused"
+
+
+def test_chat_page_wires_the_model_dropdown(gated_app):
+    status, body = _call(gated_app, "GET", "/benchmark/chat", headers={"X-API-Key": "test-key-1"})
+    assert status == 200
+    html = body.decode("utf-8")
+    assert 'id="c-model-menu"' in html
+    assert 'id="c-model-hint"' in html
+    assert 'id="c-model-refresh"' in html
+    assert "MB.combobox(" in html and '"c-model"' in html
+    assert '"/api/models"' in html

@@ -38,12 +38,18 @@ model name. Same discipline: the raw fingerprint is identical across features,
 so the prefix is the ONLY thing keeping the three from reading each other's
 rows; every ep: writer/reader goes through the endpoint helpers below, which
 apply the scope internally so callers can never mix it up with a model row.
+A FOURTH scope, grp: (model groups), pins a conversation to the MEMBER its
+group resolved to — the model column holds a MODEL NAME, so it must never
+share a row with the cascade head or the routing floor either. Same
+discipline: the group helpers below own the prefix.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -66,6 +72,7 @@ _PENDING_MAX = 1024
 # never read each other's rows. See the module docstring's NAMESPACING note.
 SCOPE_ROUTING = "routing:"
 SCOPE_ENDPOINT = "ep:"
+SCOPE_GROUP = "grp:"
 
 
 def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
@@ -77,6 +84,42 @@ def scoped_thread_key(thread_key: str | None, scope: str) -> str | None:
     if not thread_key:
         return None
     return scope + thread_key
+
+
+# X-PCAI-Session is CLIENT-SUPPLIED and becomes the thread_key half of a
+# model_stickiness PRIMARY KEY, so it must be bounded before it is stored: the
+# header is up to the server's 1 MB limit, and every distinct value would mint
+# its own row (audit 2026-11-10 P2-2). The charset is the documented one; the
+# length is generous enough for any real session id (a UUID, a request id, a
+# conversation slug) and small enough that a row key is always cheap.
+AFFINITY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+AFFINITY_KEY_MAX = 128
+
+
+def affinity_key(raw: str | None) -> str | None:
+    """Canonical, bounded affinity key for a raw X-PCAI-Session value. PURE.
+
+    Returns sha256(value) hex, or None when the value is absent or does not
+    match the documented charset/length bound.
+
+    WHY hash and not store the value: the session id is a routing handle, never
+    something an operator reads back out of the table, and hashing makes the
+    stored key a FIXED 64 characters whatever the client sends — so a caller
+    cannot grow a row key (or the index entry) no matter what it puts in the
+    header, and cannot collide with another scope's row.
+
+    WHY an invalid value is DROPPED rather than refused: affinity is ROUTING
+    state, not policy. A client that sends a junk session id must still be
+    served; it simply does not get a pin, and the caller falls back to the
+    conversation fingerprint exactly as if no header had been sent. Returning a
+    400 here would turn a cosmetic header into an outage.
+    """
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value or not AFFINITY_KEY_RE.fullmatch(value):
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 async def get_sticky(key_id: uuid.UUID, thread_key: str | None) -> str | None:
@@ -191,9 +234,12 @@ async def get_sticky_row(key_id: uuid.UUID, thread_key: str | None) -> tuple[str
 async def get_endpoint_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
     """The conversation's pinned ENDPOINT id, or None.
 
-    `session` is the RAW X-PCAI-Session value; the ep: scope is applied HERE
-    (callers never see or write the namespaced key, so the three scopes can
-    never collide at the call site). TTL rides the row's own updated_at: a
+    `session` is the CANONICAL affinity key — affinity_key(raw X-PCAI-Session)
+    or the conversation fingerprint, never the raw header (audit 2026-11-10
+    P2-2: the raw value is client-controlled and unbounded); the ep: scope is
+    applied HERE (callers never see or write the namespaced key, so the three
+    scopes can never collide at the call site). TTL rides the row's own
+    updated_at: a
     pin older than ttl_s is expired — dropped, so it cannot outlive its
     lease — and reported as absent. ttl_s <= 0 disables the expiry (the
     housekeeping retention sweep still applies).
@@ -234,6 +280,72 @@ async def drop_endpoint_pin(key_id: uuid.UUID, session: str | None) -> None:
     rejects it anyway.
     """
     await drop_sticky(key_id, scoped_thread_key(session, SCOPE_ENDPOINT))
+
+
+# ---------------------------------------------------------------------------
+# Group pins (model groups) — the grp: scope
+# ---------------------------------------------------------------------------
+#
+# A group request resolves to a MEMBER; the conversation stays on that member
+# so the next turn does not re-roll the load pick. Re-picking per turn would
+# defeat the point of a conversation: the member's KV cache would go cold on
+# every turn. The pin is ROUTING state, never policy: the caller re-validates
+# the stored member against the LIVE registry, the group's membership and the
+# key's ACL on every read, and drops it when it no longer qualifies — the
+# same discipline as the ep: pin.
+#
+# TTL: same contract as the ep: helper -- the CALLER owns the lease and the age
+# comes from the row's updated_at, so an idle conversation's pin expires on its
+# own. Both pins describe one conversation, so the routes layer passes the same
+# settings.session_affinity_ttl_s it passes the endpoint pin.
+
+
+async def get_group_pin(key_id: uuid.UUID, session: str | None, ttl_s: float) -> str | None:
+    """The conversation's pinned group MEMBER, or None.
+
+    ``session`` is the CANONICAL affinity key (affinity_key(X-PCAI-Session) or
+    the conversation fingerprint — never the raw header); the grp: scope is
+    applied HERE, exactly like the ep:
+    helpers, so a caller can never address the cascade head's row by mistake.
+    The TTL rides the row's updated_at: a pin older than the lease is expired
+    — dropped, so it cannot outlive it — and reads as absent. ttl_s <= 0
+    disables the expiry (the housekeeping retention sweep still applies).
+
+    NEVER raises (module contract): any fault reads as "no pin", and the
+    group re-picks by load — a stickiness outage must never change the
+    response shape.
+    """
+    tk = scoped_thread_key(session, SCOPE_GROUP)
+    if not tk:
+        return None
+    row = await get_sticky_row(key_id, tk)
+    if row is None:
+        return None
+    pin, age = row
+    if ttl_s > 0 and age > ttl_s:
+        await drop_sticky(key_id, tk)
+        return None
+    return pin
+
+
+async def set_group_pin(key_id: uuid.UUID, session: str | None, member: str) -> None:
+    """Persist (or refresh) the conversation's group member pin.
+
+    Best-effort, never raises (set_sticky's contract): the call that produced
+    the pin already resolved, so a lost write costs one re-pick on the next
+    turn. A re-serve refreshes updated_at, which is also the TTL clock.
+    """
+    await set_sticky(key_id, scoped_thread_key(session, SCOPE_GROUP), member)
+
+
+async def drop_group_pin(key_id: uuid.UUID, session: str | None) -> None:
+    """Forget the group pin (member left the group, its pool is unhealthy).
+
+    Best-effort, never raises: the pin just proved stale, and leaving it in
+    place would only cost one ignored read before the caller's live
+    validation rejects it anyway.
+    """
+    await drop_sticky(key_id, scoped_thread_key(session, SCOPE_GROUP))
 
 
 def make_writer(key_id: uuid.UUID, thread_key: str | None, defer: bool = False) -> Callable[[str], Any] | None:

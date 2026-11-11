@@ -106,17 +106,23 @@
       '<div class="hpe-brand-title">Model <b>Benchmarker</b></div>' +
       "</div></div>" +
       "<nav>" + nav + "</nav>" +
-      '<div class="theme-toggle" onclick="MB.toggleTheme()" title="Toggle dark/light mode">' +
-      '<span id="theme-label">Light</span>' +
-      '<div class="theme-toggle-track"><div class="theme-toggle-thumb"></div></div>' +
+      '<div class="theme-seg" role="group" aria-label="Theme">' +
+      '<button type="button" data-theme-btn="auto">Auto</button>' +
+      '<button type="button" data-theme-btn="light">Light</button>' +
+      '<button type="button" data-theme-btn="dark">Dark</button>' +
       "</div>" +
       '<span class="chip" id="mb-status-chip" style="margin-left:12px">checking…</span>';
     document.body.insertBefore(el, document.body.firstChild);
-    var t = localStorage.getItem("theme") || "light";
-    if (t === "dark") {
-      document.documentElement.setAttribute("data-theme", "dark");
-      var lab = document.getElementById("theme-label");
-      if (lab) lab.textContent = "Dark";
+    // The pre-paint resolver in each page already set data-theme; this marks the
+    // active segment and wires the three buttons. Auto follows the OS live in CSS.
+    var saved = "auto";
+    try { saved = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+    applyTheme(saved);
+    var themeBtns = document.querySelectorAll("[data-theme-btn]");
+    for (var i = 0; i < themeBtns.length; i++) {
+      themeBtns[i].addEventListener("click", function () {
+        applyTheme(this.getAttribute("data-theme-btn"));
+      });
     }
     fetch("/api/status")
       .then(function (r) { return r.json(); })
@@ -135,14 +141,31 @@
       });
   }
 
-  function toggleTheme() {
-    var html = document.documentElement;
-    var isDark = html.getAttribute("data-theme") === "dark";
-    html.setAttribute("data-theme", isDark ? "light" : "dark");
-    var lab = document.getElementById("theme-label");
-    if (lab) lab.textContent = isDark ? "Light" : "Dark";
-    localStorage.setItem("theme", isDark ? "light" : "dark");
+  // Three-state theme: Auto (the default) follows the OS, Light/Dark pin. The key
+  // is the app's existing 'theme', so a Light/Dark choice saved by the old toggle
+  // still wins — nothing is migrated or cleared.
+  var THEME_KEY = "theme";
+
+  function applyTheme(t) {
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* private mode */ }
+    var btns = document.querySelectorAll("[data-theme-btn]");
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute("data-theme-btn") === t;
+      btns[i].classList.toggle("on", on);
+      btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
   }
+
+  // In Auto the palette follows the OS without JS; re-mark the control when the OS
+  // flips so it stays truthful if anything else rewrote the attribute.
+  try {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+      if (document.documentElement.getAttribute("data-theme") !== "auto") return;
+      applyTheme("auto");
+    });
+  } catch (e) { /* very old browser: the media query still themes the page */ }
 
   function fmtBytes(n) {
     if (n == null) return "-";
@@ -184,9 +207,13 @@
 
   // Searchable combobox (ModelDownloader-style): input + toggle + menu of
   // matches; free text ALWAYS wins -- an unmatched term just stays typed.
-  function combobox(inputId, getSuggestions, renderMeta) {
+  // opts.emptyText (string or function) replaces the target-centric empty
+  // message; the returned handle lets a caller refresh an open menu in place
+  // after suggestions arrive asynchronously (e.g. the chat page's model list).
+  function combobox(inputId, getSuggestions, renderMeta, opts) {
     var input = document.getElementById(inputId);
     if (!input) return;
+    opts = opts || {};
     var wrap = input.closest(".combo");
     if (!wrap) return;
     var menu = wrap.querySelector(".combo-menu");
@@ -205,7 +232,9 @@
       if (!matches.length) {
         var empty = document.createElement("div");
         empty.className = "combo-empty";
-        empty.textContent = "No suggested targets match \u2014 you can still type any URL manually.";
+        var emptyText = opts.emptyText;
+        if (typeof emptyText === "function") emptyText = emptyText();
+        empty.textContent = emptyText || "No suggested targets match \u2014 you can still type any URL manually.";
         menu.appendChild(empty);
       } else {
         matches.forEach(function (t) {
@@ -213,7 +242,8 @@
           item.type = "button";
           item.className = "combo-item";
           item.innerHTML = '<span class="combo-item-id">' + esc(t.name) + "</span>" +
-            '<span class="combo-item-name">' + esc(t.url) + "</span>";
+            // a model id is both fields: print it once, not twice
+            (t.name === t.url ? "" : '<span class="combo-item-name">' + esc(t.url) + "</span>");
           item.addEventListener("click", function () {
             input.value = t.url;
             hideMenu();
@@ -274,6 +304,13 @@
       menu.style.position = menu.style.left = menu.style.top = menu.style.bottom = "";
       menu.style.width = menu.style.maxHeight = menu.style.right = "";
     }
+    return {
+      show: function () { show(input.value); },
+      // re-render only when open: an async suggestion fetch must not pop the
+      // menu open (or steal focus) after the user closed it
+      refresh: function () { if (!menu.hidden) show(input.value); },
+      hide: hideMenu,
+    };
   }
 
   // Recent-runs restore: the run panel was tab-local, so leaving the page
@@ -407,7 +444,7 @@
   window.MB = { recentRuns: recentRuns, recentResults: recentResults,
     combobox: combobox,
     api: api, esc: esc, header: header, getKey: getKey, setKey: setKey,
-    fmtBytes: fmtBytes, fmtNum: fmtNum, downloadArtifact: downloadArtifact, toggleTheme: toggleTheme,
+    fmtBytes: fmtBytes, fmtNum: fmtNum, downloadArtifact: downloadArtifact, applyTheme: applyTheme,
     logView: logView, setLogFull: setLogFull, wireLogFullscreen: wireLogFullscreen,
   };
 })();

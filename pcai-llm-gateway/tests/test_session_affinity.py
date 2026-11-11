@@ -31,13 +31,19 @@ from pcai_llm.api import routes_proxy
 from pcai_llm.api.auth import KeyRecord
 from pcai_llm.config import settings
 from pcai_llm.core import budgets as budgets_mod
+from pcai_llm.core import canonical, stickiness
 from pcai_llm.core import cascade as cascade_mod
 from pcai_llm.core import costs as costs_mod
-from pcai_llm.core import stickiness
 from pcai_llm.routing.router import Endpoint, Pool, Router
 
 MODEL = "test-model"
 SESSION = "sess-1"
+# The route no longer stores the raw header: stickiness.affinity_key() bounds
+# and sha256-hashes it first (audit 2026-11-10 P2-2 — an unvalidated header was
+# a per-request row-creation path). Seeds and assertions below must therefore
+# use the SAME canonical key the route derives; _chat() still sends the raw
+# header, which is the point.
+AKEY = stickiness.affinity_key(SESSION)
 AUTH = {"Authorization": "Bearer hllm-x"}
 
 
@@ -224,15 +230,15 @@ def test_endpoint_pin_ttl_expiry_drops_the_row(monkeypatch: pytest.MonkeyPatch) 
     f = FakeDB()
     monkeypatch.setattr(stickiness, "db", f)
     # A pin older than the TTL: expired — dropped, not just ignored.
-    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + SESSION)] = ("ep2", float(settings.session_affinity_ttl_s + 1))
-    assert asyncio.run(stickiness.get_endpoint_pin(key.id, SESSION, settings.session_affinity_ttl_s)) is None
+    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + AKEY)] = ("ep2", float(settings.session_affinity_ttl_s + 1))
+    assert asyncio.run(stickiness.get_endpoint_pin(key.id, AKEY, settings.session_affinity_ttl_s)) is None
     assert f.sticky == {}, "expired pin must be dropped, not just ignored"
     # A fresh pin under the TTL reads back.
-    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + SESSION)] = ("ep2", 100.0)
-    assert asyncio.run(stickiness.get_endpoint_pin(key.id, SESSION, settings.session_affinity_ttl_s)) == "ep2"
+    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + AKEY)] = ("ep2", 100.0)
+    assert asyncio.run(stickiness.get_endpoint_pin(key.id, AKEY, settings.session_affinity_ttl_s)) == "ep2"
     # ttl <= 0 disables the expiry (housekeeping retention still applies).
-    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + SESSION)] = ("ep2", 1e9)
-    assert asyncio.run(stickiness.get_endpoint_pin(key.id, SESSION, 0)) == "ep2"
+    f.sticky[(key.id, stickiness.SCOPE_ENDPOINT + AKEY)] = ("ep2", 1e9)
+    assert asyncio.run(stickiness.get_endpoint_pin(key.id, AKEY, 0)) == "ep2"
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +251,12 @@ def test_pinned_endpoint_preferred_while_healthy(env) -> None:
     monkeypatch_flag = settings.session_affinity_enabled
     settings.session_affinity_enabled = True
     try:
-        asyncio.run(stickiness.set_endpoint_pin(key.id, SESSION, "ep2"))
+        asyncio.run(stickiness.set_endpoint_pin(key.id, AKEY, "ep2"))
         r = _chat(tc, session=SESSION)
         assert r.status_code == 200, r.text
         assert seen[-1].startswith("http://fake-b"), f"pin not honoured: {seen}"
         # Successful serve refreshed the pin (TTL clock reset to a fresh row).
-        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + SESSION), ("", -1.0))[0] == "ep2"
+        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + AKEY), ("", -1.0))[0] == "ep2"
     finally:
         settings.session_affinity_enabled = monkeypatch_flag
 
@@ -261,7 +267,7 @@ def test_pin_stored_after_successful_serve(env) -> None:
     try:
         r = _chat(tc, session=SESSION)  # no pin yet: normal pick -> ep1
         assert r.status_code == 200, r.text
-        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + SESSION)) == ("ep1", 0.0)
+        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + AKEY)) == ("ep1", 0.0)
         # Next turn with the same session re-reads the pin (ep1, already the
         # default pick — the point is the row exists and was served on).
         r2 = _chat(tc, session=SESSION)
@@ -274,7 +280,7 @@ def test_cooling_down_pin_falls_back_and_follows_serving_endpoint(env) -> None:
     tc, fake_db, mock_router, seen, key = env
     settings.session_affinity_enabled = True
     try:
-        asyncio.run(stickiness.set_endpoint_pin(key.id, SESSION, "ep2"))
+        asyncio.run(stickiness.set_endpoint_pin(key.id, AKEY, "ep2"))
         ep2 = next(e for e in mock_router.pool(MODEL).endpoints if e.id == "ep2")
         ep2.cooldown_until = time.monotonic() + 999  # breaker open
         r = _chat(tc, session=SESSION)
@@ -282,7 +288,7 @@ def test_cooling_down_pin_falls_back_and_follows_serving_endpoint(env) -> None:
         assert seen[-1].startswith("http://fake-a"), f"cooling pin must fall back: {seen}"
         # The conversation now lives on ep1's cache: the pin followed the
         # serving endpoint (a pin that can never qualify is dead weight).
-        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + SESSION)) == ("ep1", 0.0)
+        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + AKEY)) == ("ep1", 0.0)
     finally:
         settings.session_affinity_enabled = False
 
@@ -291,11 +297,11 @@ def test_pin_to_absent_endpoint_falls_back(env) -> None:
     tc, fake_db, _, seen, key = env
     settings.session_affinity_enabled = True
     try:
-        asyncio.run(stickiness.set_endpoint_pin(key.id, SESSION, "ghost"))  # not in the pool
+        asyncio.run(stickiness.set_endpoint_pin(key.id, AKEY, "ghost"))  # not in the pool
         r = _chat(tc, session=SESSION)
         assert r.status_code == 200, r.text
         assert seen[-1].startswith("http://fake-a")
-        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + SESSION)) == ("ep1", 0.0)
+        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + AKEY)) == ("ep1", 0.0)
     finally:
         settings.session_affinity_enabled = False
 
@@ -304,23 +310,51 @@ def test_header_ignored_when_flag_off(env) -> None:
     tc, fake_db, _, seen, key = env
     settings.session_affinity_enabled = False  # default; state it
     try:
-        asyncio.run(stickiness.set_endpoint_pin(key.id, SESSION, "ep2"))
+        asyncio.run(stickiness.set_endpoint_pin(key.id, AKEY, "ep2"))
         r = _chat(tc, session=SESSION)
         assert r.status_code == 200, r.text
         assert seen[-1].startswith("http://fake-a"), "flag off: the header must be inert"
         # No affinity read/write happened at all: the pin is untouched.
-        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + SESSION)) == ("ep2", 0.0)
+        assert fake_db.sticky.get((key.id, stickiness.SCOPE_ENDPOINT + AKEY)) == ("ep2", 0.0)
     finally:
         settings.session_affinity_enabled = False
 
 
-def test_no_session_header_no_pin_activity(env) -> None:
-    tc, fake_db, _, _, _ = env
+def test_no_header_uses_conversation_fingerprint_as_affinity_key(env) -> None:
+    """No X-PCAI-Session: the affinity key is the conversation fingerprint.
+
+    CONTRACT CHANGE (2026-11-08, model groups F3): the affinity key is the
+    client's session header OR the conversation's own fingerprint
+    (canonical.thread_key), so endpoint/group pins work with NO client
+    change, per conversation. Before this, a header-less request had no pin
+    identity at all.
+    """
+    tc, fake_db, _, _, key = env
     settings.session_affinity_enabled = True
     try:
         r = _chat(tc)  # no header
         assert r.status_code == 200, r.text
-        assert fake_db.sticky == {}, "no header, no pin machinery"
+        fp = canonical.thread_key([{"role": "user", "content": "hello"}], key.id)
+        assert fp, "the conversation must have a fingerprint"
+        assert fake_db.sticky == {(key.id, stickiness.SCOPE_ENDPOINT + fp): ("ep1", 0.0)}, (
+            "no header: the pin is keyed by the conversation fingerprint"
+        )
+    finally:
+        settings.session_affinity_enabled = False
+
+
+def test_no_header_and_no_seed_writes_no_pin(env) -> None:
+    """No session header AND no user-message seed: no fingerprint, no pin."""
+    tc, fake_db, _, _, _ = env
+    settings.session_affinity_enabled = True
+    try:
+        r = tc.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": [{"role": "assistant", "content": "hi"}]},
+            headers=dict(AUTH),
+        )
+        assert r.status_code == 200, r.text
+        assert fake_db.sticky == {}, "no user-message seed: no affinity key, no pin"
     finally:
         settings.session_affinity_enabled = False
 
@@ -329,7 +363,7 @@ def test_transport_error_drops_the_pin(env, monkeypatch: pytest.MonkeyPatch) -> 
     tc, fake_db, mock_router, _, key = env
     settings.session_affinity_enabled = True
     try:
-        asyncio.run(stickiness.set_endpoint_pin(key.id, SESSION, "ep1"))
+        asyncio.run(stickiness.set_endpoint_pin(key.id, AKEY, "ep1"))
 
         def broken(request: httpx2.Request) -> httpx2.Response:
             raise httpx2.ConnectError("upstream refused")

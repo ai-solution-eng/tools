@@ -1,0 +1,204 @@
+# ================================================================
+# OpenTelemetry Collector — trace fan-out for the PCAI LLM gateway
+#
+# WHAT THIS IS
+#   A stateless OTLP receiver that forwards traces to one or more backends.
+#   Senders (e.g. pcai-llm-gateway) point at this Service and never hold
+#   Langfuse credentials — the collector adds them.
+#
+# ADDING A BACKEND LATER (e.g. SigNoz)
+#   Add an exporter under config.exporters, then add its name to
+#   config.service.pipelines.traces.exporters. That is the only change;
+#   no sender needs to be rebuilt or redeployed.
+# ================================================================
+
+image:
+  # contrib (not core) so filter/transform processors are available if we
+  # later need to drop or enrich spans before they reach a backend.
+  repository: otel/opentelemetry-collector-contrib
+  tag: "0.165.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# -- Override the generated resource names (Service, Deployment, ConfigMap).
+fullnameOverride: ""
+
+# ================================================================
+# Langfuse credentials
+#
+# Rendered into a Secret and injected as the LANGFUSE_AUTH env var; the
+# collector config references it as ${env:LANGFUSE_AUTH}. The credential
+# therefore never appears in the ConfigMap.
+# ================================================================
+langfuse:
+  # The project the gateway's traces land in.
+  publicKey: ""
+  secretKey: ""
+  # -- Use a pre-existing Secret instead of rendering one.
+  # Must contain key `auth` = base64("<publicKey>:<secretKey>").
+
+# ================================================================
+# LiteLLM project credentials
+#
+# A SECOND Langfuse project, so LiteLLM traces do not mix with the
+# gateway's. Same contract as `langfuse` above: rendered into its own
+# Secret and injected as LANGFUSE_AUTH_LITELLM. Leave existingSecret
+# empty to render from these values, or point it at a Secret you own
+# (key `auth` = base64("<publicKey>:<secretKey>")).
+# ================================================================
+litellm:
+  # "PCAI Dev Team / LiteLLM"
+  publicKey: ""
+  secretKey: ""
+  existingSecret: ""
+  existingSecret: ""
+
+# ================================================================
+# Collector configuration
+#
+# Rendered verbatim into a ConfigMap, so anything the collector supports can
+# be set here — including extra receivers, processors and exporters.
+# ================================================================
+config:
+  extensions:
+    health_check:
+      endpoint: 0.0.0.0:13133
+
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+    # LiteLLM's door. A separate port keeps the two senders (and the two
+    # Langfuse projects) apart without attribute-based routing.
+    otlp/litellm:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4320
+
+  processors:
+    # Keep the collector's own footprint bounded; limit_mib must stay below
+    # the container memory limit below.
+    memory_limiter:
+      check_interval: 1s
+      limit_mib: 400
+      spike_limit_mib: 100
+
+    # Drop the gateway's OWN health/metrics traffic before it is batched or
+    # exported. Measured on the live fleet: kubelet probes and Prometheus
+    # scrapes were 1,922 of 2,710 traces (71%), burying the ~56 real model
+    # calls while paying Langfuse ingestion and storage for pure noise.
+    #
+    # WHY HERE and not in the gateway: policy belongs in the pipeline. Adding
+    # a path is a values edit + restart — no image rebuild, no gateway code
+    # change, and the app stays ignorant of what a backend finds interesting.
+    # It also keeps the gateway's tracing tests untouched.
+    #
+    # error_mode ignore: one malformed expression must never stop the
+    # pipeline. Matching on http.target (the path attribute the gateway's
+    # middleware sets) rather than the span name keeps it method-agnostic.
+    filter/drop_probes:
+      error_mode: ignore
+      traces:
+        span:
+          - 'attributes["http.target"] == "/ready"'
+          - 'attributes["http.target"] == "/health"'
+          - 'attributes["http.target"] == "/healthz"'
+          - 'attributes["http.target"] == "/livez"'
+          - 'attributes["http.target"] == "/readyz"'
+          - 'attributes["http.target"] == "/metrics"'
+          - 'attributes["http.target"] == "/metrics/"'
+
+    # LiteLLM's v1 "otel" callback emits one INTERNAL span per internal
+    # subsystem: auth, postgres (x5), router (x2), self, proxy_pre_call,
+    # batch_write_to_db. Those names are the ServiceTypes enum in
+    # litellm/types/services.py. They carry no gen_ai.* attributes and add
+    # ~12 observations per request to Langfuse, so drop them here. What
+    # survives is the real tree: the root span + raw_gen_ai_request.
+    #
+    # There is no LiteLLM env/config switch for this in v1 (upstream docs
+    # say so verbatim) — filtering belongs in the pipeline.
+    filter/drop_litellm_service_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'name == "postgres"'
+          - 'name == "auth"'
+          - 'name == "router"'
+          - 'name == "self"'
+          - 'name == "proxy_pre_call"'
+          - 'name == "batch_write_to_db"'
+          - 'name == "redis"'
+          - 'name == "reset_budget_job"'
+          - 'name == "pod_lock_manager"'
+
+    batch:
+      send_batch_size: 200
+      timeout: 5s
+
+  exporters:
+    # otlp_http (underscore) is the current component name; the old otlphttp
+    # alias logs a deprecation warning on 0.165.0 and will eventually be
+    # removed. The pipeline reference below MUST match this key exactly —
+    # the collector refuses to start on a mismatch ("references exporter
+    # ... which is not configured"), and PCAI's values merge can leave the
+    # two halves on different names: LISTS are replaced, MAPS are merged, so
+    # a renamed exporter key can survive while the pipeline list updates.
+    otlp_http/langfuse:
+      # The collector appends /v1/traces to this endpoint.
+      endpoint: http://langfuse-web.langfuse-v4.svc.cluster.local:3000/api/public/otel
+      headers:
+        Authorization: "Basic ${env:LANGFUSE_AUTH}"
+        x-langfuse-ingestion-version: "4"
+
+    # Second Langfuse project — the LiteLLM pipeline's only destination.
+    otlp_http/langfuse_litellm:
+      endpoint: http://langfuse-web.langfuse-v4.svc.cluster.local:3000/api/public/otel
+      headers:
+        Authorization: "Basic ${env:LANGFUSE_AUTH_LITELLM}"
+        x-langfuse-ingestion-version: "4"
+
+    # ---- Example: add SigNoz later, then list it under pipelines ----
+    # otlphttp/signoz:
+    #   endpoint: http://signoz-otel-collector.observability.svc.cluster.local:4318
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        # Order matters: bound memory first, drop the noise early (so the
+        # batcher never carries it), then batch what survives.
+        processors: [memory_limiter, filter/drop_probes, batch]
+        exporters: [otlp_http/langfuse]
+      # LiteLLM traffic: no probe filter (its spans carry no http.target),
+      # just the service-span drop, then batch, then its own project.
+      traces/litellm:
+        receivers: [otlp/litellm]
+        processors: [memory_limiter, filter/drop_litellm_service_spans, batch]
+        exporters: [otlp_http/langfuse_litellm]
+    telemetry:
+      logs:
+        level: info
+
+service:
+  type: ClusterIP
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Annotations added to the pod (e.g. for Prometheus scraping).
+podAnnotations: {}

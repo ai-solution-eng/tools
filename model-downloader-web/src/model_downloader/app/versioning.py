@@ -75,17 +75,33 @@ _EMPTY_CONTAINER: dict[str, object] = {"arguments": [], "environment": {}}
 
 # ---- the project field ----
 #
-# A packaged model can be filed under a project.  In PCAI a project IS a
-# Kubernetes namespace, so the value is a namespace name.  Resolution order is
-# explicit entry > the project picked for this push > the deployment default
-# (chart: catalog.defaultProject); unset stays "" -- which is what MLIS shows
-# only under "All projects".
+# A packaged model can be filed under a project.  MLIS stores the PROJECT name
+# (user-andrew-bydlon), while PCAI exposes it as a namespace with a project-
+# prefix; both spellings are accepted and canonicalised below.  Resolution
+# order is explicit entry > the project picked for this push > the deployment
+# default (chart: catalog.defaultProject); unset stays "" -- which is what MLIS
+# shows only under "All projects".
 PROJECT_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+# PCAI namespaces are named project-<project> (project-user-andrew-bydlon), but
+# MLIS files a packaged model under the PROJECT, whose name drops the prefix
+# (its project list shows user-andrew-bydlon).  The catalog page's combobox
+# offers NAMESPACES, so every source of the value -- entry, per-push pick,
+# chart default -- is canonicalised before it can reach the database.
+PROJECT_NAMESPACE_PREFIX = "project-"
+
+
+def strip_project_prefix(value: str | None) -> str:
+    """Drop the PCAI namespace prefix: project-user-x -> user-x."""
+    project = (value or "").strip()
+    if project.startswith(PROJECT_NAMESPACE_PREFIX):
+        return project[len(PROJECT_NAMESPACE_PREFIX) :]
+    return project
 
 
 def normalize_project(value: str) -> str:
-    """Strip and validate a project/namespace string.  "" is valid (unset)."""
-    project = (value or "").strip()
+    """Strip the namespace prefix, then validate.  "" is valid (unset)."""
+    project = strip_project_prefix(value)
     if project and (len(project) > 63 or not PROJECT_RE.match(project)):
         raise ValueError(
             "project must be a Kubernetes namespace name: lowercase letters, digits and '-', "
@@ -95,11 +111,17 @@ def normalize_project(value: str) -> str:
 
 
 def resolve_project(cfg: dict, push_project: str = "", default_project: str = "") -> str:
-    """Project to record for a config: explicit entry > per-push > chart default."""
-    explicit = str(cfg.get("project") or "").strip()
+    """Project to record for a config: explicit entry > per-push > chart default.
+
+    The winner is canonicalised (project- prefix stripped) so a prefixed
+    namespace and the bare MLIS project name resolve to the same value --
+    which also keeps the configuration fingerprint stable across the two
+    spellings.
+    """
+    explicit = strip_project_prefix(cfg.get("project"))
     if explicit:
         return explicit
-    return (push_project or "").strip() or (default_project or "").strip()
+    return strip_project_prefix(push_project) or strip_project_prefix(default_project)
 
 
 def config_fingerprint(cfg: dict) -> str:

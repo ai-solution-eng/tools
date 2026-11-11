@@ -163,17 +163,25 @@ def message_hash(message: Any) -> str:
     return hashlib.sha256(json.dumps(message, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def prefix_hashes(canon: list[dict], incoming: list[dict]) -> list[int] | None:
+def prefix_hashes(canon: list[dict], incoming: list[dict]) -> list[int]:
     """Indices where the two lists' hashes DISAGREE, walking only the canonical
     prefix (perf, audit P2-3): one shared walk for reconcile + continuation
-    detection instead of two. Returns None the moment a mismatch is found
-    (the caller's mode is then reset, and no continuation is possible) —
-    a full pass means byte-identical prefix."""
+    detection instead of two. Returns the offending index the moment a
+    mismatch is found (the caller's mode is then reset, and no continuation is
+    possible).
+
+    An EMPTY list means the whole canonical prefix matched — deliberately []
+    and never None (audit P1-7): the callers' prefix_verdict=None default
+    means "not computed", so returning None for a clean prefix made BOTH
+    callees recompute the walk they had just been handed. Every healthy
+    agent-loop turn is an extend, so that ambiguity cost three full hash walks
+    (one json.dumps(message, sort_keys=True) per message over the whole
+    history, synchronously before the upstream call) on the TTFT path."""
     limit = min(len(canon), len(incoming))
     for idx in range(limit):
         if message_hash(canon[idx]) != message_hash(incoming[idx]):
             return [idx]
-    return None
+    return []
 
 
 def reconcile(
@@ -213,8 +221,10 @@ def reconcile(
         return msgs, MODE_NEW
     if len(msgs) < len(canonical):
         return msgs, MODE_TRIMMED_INCOMING
+    # prefix_verdict is the caller's SHARED walk; None means "not computed"
+    # (an empty list means the prefix matched — see prefix_hashes).
     mismatch = prefix_hashes(canonical, msgs) if prefix_verdict is None else prefix_verdict
-    if mismatch is not None:
+    if mismatch:
         return msgs, MODE_RESET
     return msgs, MODE_EXTEND
 
@@ -264,8 +274,9 @@ def detect_continuation(
     canon = canonical if isinstance(canonical, list) else None
     if not canon or len(msgs) <= len(canon):
         return False, empty
+    # None = "not computed"; [] = the prefix matched (see prefix_hashes).
     mismatch = prefix_hashes(canon, msgs) if prefix_verdict is None else prefix_verdict
-    if mismatch is not None:
+    if mismatch:
         return False, empty
     tail = msgs[len(canon) :]
     head = tail[0]

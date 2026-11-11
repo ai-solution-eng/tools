@@ -126,9 +126,21 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2
 # (?<!\d) / (?!\d) anchors: a phone must not sit inside a longer digit run
 # (the reference pattern flagged suffixes of IDs and dates).
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}(?!\d)")
-# 13-19 digit runs with optional ' '/'-' separators; Luhn decides which
-# candidates are actual card numbers (see _mask_credit_cards).
-_CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+# 13-19 digit runs with optional separator characters; Luhn decides which
+# candidates are actual card numbers (see _mask_credit_cards). The class
+# covers the common card DISPLAY separators: space (incl. NBSP/narrow NBSP),
+# dot ("4111.1111.1111.1111") and hyphen — AUDIT-2026-11-10 P1-6: dot- and
+# NBSP-separated cards passed the old [ -] class unmasked. The ZERO-WIDTH
+# characters (\u200b\u200c\u200d\u2060\ufeff) are IN the class because a prompt
+# can embed them inside a card number to defeat any separator regex — and they
+# must be matched IN PLACE (cross-val fix: an earlier "strip, scan the cleaned
+# copy" version spliced CLEANED offsets into the ORIGINAL string, shifting
+# every mask left by the zero-widths before the card and asserting a
+# redaction that did not happen).
+_CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ .\-\u00a0\u202f\u200b\u200c\u200d\u2060\ufeff]?){13,19}\b")
+# The one-string twin of the candidate separator class (digit-strip before the
+# Luhn check and the trailing-separator borrow in _mask_credit_cards).
+_CARD_SEPARATORS = " .-\u00a0\u202f\u200b\u200c\u200d\u2060\ufeff"
 
 # Canonical entity order for masking and for detail strings.
 _PII_ORDER = ("EMAIL", "PHONE", "CREDIT_CARD")
@@ -666,22 +678,114 @@ def _luhn_ok(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _plausible_card_span(span: str) -> bool:
+    """False when a Luhn-valid candidate span is ORDINARY NUMERIC PROSE.
+
+    Cross-val P3 (audit 2026-11-10): the widened separator class also matches
+    dotted/spacey decimal text — "values 1.5 2.5 ... 13.5" concatenates to a
+    Luhn-valid 13-19 digit run (~1/10 of such lists), so masking it would
+    destroy content and raise a false CREDIT_CARD event. A span is masked
+    only when it LOOKS like card display:
+      * any zero-width separator — obfuscation intent by construction;
+      * a dot anywhere — only accepted with 4-DIGIT grouping (the dotted
+        display form "4111.1111.1111.1111"), never decimal points;
+      * otherwise (spaces / hyphens / NBSP) — rejected only when EVERY digit
+        group is shorter than 4 (range/decimal lists); bare 13-19 digit runs
+        and card groupings up to Amex's 4-6-5 stay accepted as before.
+    """
+    if any(ch in span for ch in "\u200b\u200c\u200d\u2060\ufeff"):
+        return True
+    groups = re.findall(r"\d+", span)
+    if not groups:
+        return False
+    if "." in span:
+        # P2 (cross-val wave 2): the dotted DISPLAY shapes are not all 4-digit
+        # groups — Amex is 4-6-5 and Diners 4-6-4 — so the old "every group is
+        # exactly 4" rule leaked both. A dotted span whose groups are all
+        # card-shaped (4/6/5) is card display, not a decimal.
+        return len(groups) >= 3 and all(4 <= len(g) <= 6 for g in groups)
+    return any(len(g) >= 4 for g in groups)
+
+
+def _strip_card_separators(span: str) -> str:
+    """The BARE digits of a candidate span (every separator class member gone)."""
+    digits = span
+    for sep in _CARD_SEPARATORS:
+        digits = digits.replace(sep, "")
+    return digits
+
+
+def _dotted_card_tail_offset(span: str) -> int | None:
+    """Offset within a REJECTED dotted candidate where a card-shaped TAIL starts.
+
+    P2 (cross-val wave 2, audit 2026-11-10): the candidate regex's greedy
+    separator class lets the LEFTMOST match swallow a decimal that touches a
+    card — "score 5.4111 1111 1111 1111" is ONE 17-digit candidate. The whole
+    span then fails the Luhn/plausibility gate, and because finditer matches
+    are NON-OVERLAPPING the inner 16-digit PAN is never retried: the full PAN
+    survived, for every leading digit. The same greedy fusion breaks the
+    dotted Amex (4-6-5) and dotted Diners (4-6-4) displays.
+
+    This re-scan recovers the card that STARTS at the first digit group long
+    enough to begin one (>= 4 digits), dropping a fused decimal's integer part
+    ("5.") while keeping the card intact. A tail is accepted when it is
+    Luhn-valid AND card-shaped, or — for a display split into card-shaped
+    groups with at most one short group (the dotted 4-4-4-2 Diners form) —
+    when its digit count is still a PAN length. Decimal prose has no group of
+    4+ digits, so it yields None and is left byte-identical.
+    """
+    groups = list(re.finditer(r"\d+", span))
+    start = next((m for m in groups if len(m.group(0)) >= 4), None)
+    if start is None:
+        return None
+    tail_groups = [m.group(0) for m in groups if m.start() >= start.start()]
+    tail_digits = _strip_card_separators(span[start.start() :])
+    if not 13 <= len(tail_digits) <= 19 or len(tail_groups) < 3:
+        return None
+    if all(4 <= len(g) <= 6 for g in tail_groups) and _luhn_ok(tail_digits):
+        return start.start()
+    if sum(1 for g in tail_groups if len(g) < 4) <= 1:
+        return start.start()
+    return None
+
+
 def _mask_credit_cards(text: str) -> tuple[str, int]:
     """Mask only Luhn-valid candidates. The candidate regex can borrow ONE
-    trailing separator into its span (greedy ``[ -]?`` before the closing
-    \\b); the mask replaces the card digits and leaves that separator, so
-    the following word does not fuse to the mask."""
+    trailing separator into its span (greedy separator class before the
+    closing \\b); the mask replaces the card digits and leaves that
+    separator, so the following word does not fuse to the mask.
+
+    The scan runs over the ORIGINAL text and the match span IS the splice
+    span (P1-6, cross-val fix): the zero-width characters a prompt embeds
+    inside a card number are members of the separator class, matched in
+    place — never stripped into a cleaned copy whose offsets would not line
+    up with the string being masked. A Luhn hit is further gated by
+    _plausible_card_span so ordinary numeric prose is not destroyed."""
     pieces: list[str] = []
     pos = 0
     count = 0
     for match in _CARD_CANDIDATE_RE.finditer(text):
-        digits = match.group(0).replace(" ", "").replace("-", "")
-        if not _luhn_ok(digits):
-            continue
+        # Strip EVERY separator class member before the Luhn check — the
+        # display formats differ only in the separator, never in the digits.
+        span = match.group(0)
+        start = match.start()
+        if not _luhn_ok(_strip_card_separators(span)) or not _plausible_card_span(span):
+            # P2 (cross-val wave 2): a dotted candidate the gate rejected may
+            # have fused a decimal onto a real PAN (or split an Amex/Diners
+            # display). Recover the card-shaped TAIL and splice the mask from
+            # its first digit — never the whole fused span, so the decimal's
+            # integer part survives. Non-overlapping finditer would otherwise
+            # never retry the PAN that lives inside the rejected span.
+            if "." not in span:
+                continue
+            offset = _dotted_card_tail_offset(span)
+            if offset is None:
+                continue
+            start += offset
         end = match.end()
-        if text[end - 1] in " -":
+        if text[end - 1] in _CARD_SEPARATORS:
             end -= 1
-        pieces.append(text[pos : match.start()])
+        pieces.append(text[pos:start])
         pieces.append(MASK)
         pos = end
         count += 1
@@ -716,8 +820,19 @@ def _entities_of(cfg: dict) -> set[str] | None:
 
 
 def _detail_of(counts: dict[str, int]) -> str:
-    '"EMAILx2, CREDIT_CARDx1" — hit entities only, canonical order.'
-    return ", ".join(f"{entity}x{counts[entity]}" for entity in _PII_ORDER if counts.get(entity))
+    """ "EMAILx2, CREDIT_CARDx1" — hit entities only, canonical order.
+
+    P2-7 (audit 2026-11-10): the secrets engine keys its counts by SECRET
+    KIND ("aws_access_key", "jwt", ...) — keys that are not in _PII_ORDER —
+    so its events always carried an EMPTY detail. The kinds are appended in
+    their declaration order (SECRET_KINDS); any key outside both vocabularies
+    is appended sorted, so an engine that adds a new count axis can never
+    silently emit an empty detail again."""
+    parts = [f"{entity}x{counts[entity]}" for entity in _PII_ORDER if counts.get(entity)]
+    parts += [f"{kind}x{counts[kind]}" for kind in SECRET_KINDS if counts.get(kind)]
+    extra = sorted(k for k in counts if counts[k] and k not in _PII_ORDER and k not in SECRET_KINDS)
+    parts += [f"{k}x{counts[k]}" for k in extra]
+    return ", ".join(parts)
 
 
 def _length_limit(guard: GuardrailSpec, cfg: dict) -> int:
@@ -764,6 +879,12 @@ async def _webhook_verdict(http: httpx2.AsyncClient, guard: GuardrailSpec, text:
                 raw_timeout,
                 timeout,
             )
+    # P3 (audit 2026-11-10): clamp the per-guardrail override to a sane band —
+    # timeout_s: 999999 used to pin one request for ~11 days against a hung
+    # moderator. Lower bound keeps a zero/negative junk value meaningful; the
+    # upper bound is the operator's own default (at least 30s) so a site with
+    # a deliberately slow moderator is not clamped below what it configured.
+    timeout = max(0.5, min(timeout, max(settings.guardrail_webhook_timeout_s, 30.0)))
     payload = {"text": text, "guardrail": guard.name}
     try:
         response = await http.post(url, json=payload, headers=headers, timeout=timeout)
