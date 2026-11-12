@@ -1,6 +1,6 @@
 # results/ — benchmark outputs and how to reproduce them
 
-Each chat-model `.md` under a per-model directory is the `--output` of one `benchmark_chat.py` run, written as Markdown (run configuration as bullets, a `Status:` line, then the results table as a GitHub-flavored Markdown table); the files in `RAG/` are Markdown transcripts of a separate RAG scale-benchmark tool (`benchmark.py`, MCP mode) and are parsed by a dedicated path in the report generator. Full flag documentation lives in the repo-root [`../README.md`](../README.md); this file explains the standard configuration these
+Each chat-model `.md` under a per-model directory is the `--output` of one `benchmark_chat.py` run, written as Markdown (run configuration as bullets, a `Status:` line, then the results table as a GitHub-flavored Markdown table); the files in `RAG/` are Markdown transcripts of a separate RAG scale-benchmark tool (`benchmark.py`, MCP mode) and are parsed by a dedicated path in the report generator. Full flag documentation lives in [`../documentation/cli-reference.md`](../documentation/cli-reference.md) and how to read the generated report in [`../documentation/results-and-report.md`](../documentation/results-and-report.md); this file explains the standard configuration these
 results were produced with and what to look for when reading them.
 
 Every `--output` file also carries the run's configuration as a bullet list (model, modes, `extra_body`) and a `Status:` line above the table — `complete` for a full sweep, `INTERRUPTED`/`CRASHED` when the run died mid-sweep and only the completed levels are in the table (the file is rewritten after every level, so an aborted benchmark still leaves its partial results).
@@ -36,7 +36,7 @@ This models "many opencode users (or back-to-back conversations) on one serving 
 
 ## Files
 
-Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicachexN][_replicasxN].md` (see the repo README for the full grammar); `OLD_`-prefixed files are flagged obsolete in the HTML report.
+Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicachexN][_replicasxN].md` (the full grammar: [`../documentation/results-and-report.md`](../documentation/results-and-report.md)); `OLD_`-prefixed files are flagged obsolete in the HTML report.
 
 | File | Hardware / notes |
 |---|---|

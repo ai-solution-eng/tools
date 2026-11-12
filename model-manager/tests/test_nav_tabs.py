@@ -5,8 +5,10 @@ third tab has to be conditional or every other deployment ships a dead link.
 Static checks pin the markup in all three templates; the live-render checks drive
 the real FastAPI app so the context wiring is exercised, not just the template.
 
-The rename guard is here too: the product name is Model Manager, while the chart,
-image repos and Python package deliberately keep the model-downloader identifier.
+The rename guard is here too: the product name is Model Manager. The chart,
+Python package and cluster identifiers are model-manager; the image repos and UI
+host keep the model-downloader identifier, and legacy model-downloader labels and
+annotations are still accepted on read.
 """
 
 import os
@@ -38,10 +40,10 @@ os.environ.setdefault("CATALOG_PATH", os.path.join(_TMP, "catalog.json"))
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from model_downloader.app import main as md  # noqa: E402
+from model_manager.app import main as md  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES = ROOT / "src" / "model_downloader" / "app" / "templates"
+TEMPLATES = ROOT / "src" / "model_manager" / "app" / "templates"
 PAGES = {
     "/": ("index.html", "/"),
     "/catalog": ("catalog.html", "/catalog"),

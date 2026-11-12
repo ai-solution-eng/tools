@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from model_downloader.app.k8s import (
+from model_manager.app.k8s import (
     CACHE_ROOT_ANNOTATION,
     DELETE_MANAGED_BY_VALUE,
     K8sClient,
@@ -133,12 +133,12 @@ def test_delete_job_has_no_cache_root_annotation():
 
 def test_delete_job_records_the_actor():
     _, body = _create()
-    assert body["metadata"]["annotations"]["model-downloader/delete-actor"] == "andrew"
+    assert body["metadata"]["annotations"]["model-manager/delete-actor"] == "andrew"
 
 
 def test_delete_job_carries_its_own_managed_by_value():
     name, body = _create()
-    assert name == "md-delete-abc123"
+    assert name == "mm-delete-abc123"
     labels = body["metadata"]["labels"]
     assert labels["app.kubernetes.io/managed-by"] == DELETE_MANAGED_BY_VALUE
 
@@ -190,7 +190,7 @@ def test_start_without_template_name_reads_no_configmap(monkeypatch):
     # verdict ran.
     import kubernetes.config as kubeconfig
 
-    import model_downloader.app.k8s as k8smod
+    import model_manager.app.k8s as k8smod
 
     monkeypatch.setattr(k8smod.client, "ApiClient", lambda *a, **k: object())
     monkeypatch.setattr(k8smod.client, "BatchV1Api", lambda *a, **k: object())

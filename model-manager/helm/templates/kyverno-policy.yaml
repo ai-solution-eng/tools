@@ -1,10 +1,10 @@
-{{- if eq (include "model-downloader.kyvernoEnabled" .) "true" }}
+{{- if eq (include "model-manager.kyvernoEnabled" .) "true" }}
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-5"

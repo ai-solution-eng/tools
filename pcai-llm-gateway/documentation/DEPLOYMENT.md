@@ -1,35 +1,158 @@
 # Deployment — pcai-llm-gateway
 
-> **What changed (2026-10-07 doc wave):** the SSO self-mint surfaces are now
-> documented end-to-end — `GET /v1/identity`, `POST /v1/keys/for-me` (one key
-> per browser identity + rotate) and the `X-API-Key` envelope — with the
-> coupled ordered rollout that turns them ON (§ SSO self-mint rollout). The
-> two AuthorizationPolicy relief rules are rewritten from the 2026-10-07
-> live-verified G2 findings: `allowMetricsScrape` is an ANY-SOURCE rule
-> scoped to `/metrics` (a namespace-scoped rule cannot work over raw pod
-> IPs), and `allowInClusterApi` admits unmeshed in-cluster callers with
-> `/v1/identity` + `/v1/keys/for-me` staying edge-only. The `${DOMAIN_NAME}`
-> CLI gotcha is now live-verified (raw `helm upgrade` passes the literal,
-> istio's webhook DENIES the VirtualService and the release fails while the
-> AuthorizationPolicy still applies — sed-resolve first; § Gateway
-> exposure). New § Deployment profiles: Internal G2 vs Hosted trial. The
-> G2-specific runbook with exact values, commands and per-step verification
-> is [`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
+## The deployment contract
 
-Deployment is a values problem: import the packaged chart into PCAI once,
-create the **required Secrets** out-of-band (three depending on mode), then
-everything below is
-edited in the chart's values (PCAI **Helm Values** editor, or the PCAI API)
-and re-applied. Operators running plain Helm do the same with
-`-f <values-file>`; per-cluster credentials-bearing values live in
-`helm/local/` (gitignored, never packaged).
+Deployment is a values problem: **import the packaged chart into PCAI once,
+create the required Secrets out-of-band, then everything below is edited in
+the chart's values** (PCAI **Helm Values** editor, or the PCAI API) and
+re-applied. Spelled out:
 
-## Trial unit quickstart (hosted PCAI, first deploy in ~15 minutes)
+- **The chart is packaged and imported once** (AI Essentials / EzAppConfig
+  import — EzAppConfig is PCAI's custom resource for a vendor-packaged app;
+  PCAI uploads the chart to its ChartMuseum — the in-cluster Helm chart
+  registry — and its controller installs it). The packaged artifact is
+  `pcai-llm-gateway-<ver>.tar.gz`; this document matches chart 4.1.0.
+- **The operator's only surface is the values editor.** Every site-specific
+  decision must be a value. No template edits, no post-render patching, no
+  editing rendered manifests.
+- **What PCAI does for you:** `${DOMAIN_NAME}` substitution in pasted values
+  before rendering, the Istio VirtualService / `ezua` block on the
+  `ezaf-gateway`, namespace creation, and the `hpe-ezua` vendor labels.
+- **What you must do out-of-band**, because it cannot be a value: **Secrets**
+  (admin keys always; the Postgres URL Secret in the default
+  external-Postgres mode; optionally the Fernet master key) and **cluster
+  objects** (the namespace Istio-injection label that must move atomically
+  with the AuthorizationPolicy, the SSO edge chain's route classes, optional
+  Kyverno). See [Prerequisites](#prerequisites) — each item there carries its
+  purpose, failure mode and verification.
+- **Upgrade = import the new chart version, keep the values, re-apply**
+  (§ Upgrading). Operators running plain Helm do the same with
+  `-f <values-file>` — that is the developer/secondary path, not the PCAI
+  path; per-cluster credentials-bearing values live in `helm/local/`
+  (gitignored, never packaged).
 
-Prereqs: you can reach the unit's PCAI console and have a namespace to deploy
-into. No cluster-admin required (the Kyverno policy stays off; the chart
-stamps the `hpe-ezua` labels itself). The rest of this document is the
-reference detail.
+## Prerequisites
+
+Ordered: create the Secrets (A), confirm the cluster objects (B) and the posture values that gate a safe install (B2), prove the external dependencies **from inside the cluster** (C), then import. (D) is
+external dependencies **from inside the cluster** (C), then import. (D) is
+not something you create — it is the set of values the chart refuses to
+render without.
+
+The chart **never creates a Secret and never inlines a credential in
+values** by default — an envsubst apply once emptied a live key Secret (the
+K8S-MCP lesson). Every credential is referenced by name; the pod fails loud
+(`CreateContainerConfigError`) until the referenced Secrets exist. These
+are operator-only steps — PCAI users import the chart and edit values only.
+
+### A. Secrets the operator creates (before install)
+
+| Secret (chart default name) | Keys | Consumed by | Why it exists | Fails how without it | Create with |
+|---|---|---|---|---|---|
+| `pcai-llm-gateway-admin` | `admin-api-keys` (comma-separated = staged rotation) | `/admin` API + console (`require_admin` hash-compares against every listed key) | The control plane's only credential — the admin key IS the authorization | `CreateContainerConfigError` — the pod never starts; nothing else in the deployment substitutes for it | `kubectl -n <ns> create secret generic pcai-llm-gateway-admin --from-literal="admin-api-keys=$(openssl rand -hex 32)"` |
+| `pcai-llm-gateway-db` | `database-url` (`postgresql://user:pass@host:5432/db`) | The gateway (`PCAI_LLM_DATABASE_URL`) — **external-Postgres mode only** (the default) | Carries the Postgres credentials the chart must never inline; the schema auto-applies at startup | `CreateContainerConfigError` at pod start; Secret present but DB unreachable → `/ready` fails and the pod leaves the Service | `kubectl -n <ns> create secret generic pcai-llm-gateway-db --from-literal=database-url='postgresql://<user>:<password>@<host>:5432/<database>'` |
+| `pcai-llm-gateway-pg-auth` | `password` | The embedded Postgres StatefulSet AND the gateway (`PCAI_LLM_DB_PASSWORD` — one Secret feeds both) — **embedded mode only** | One credential for both containers of the co-deployed pair; never inlined in values | Render fails earlier when the *name* is unset (see "Keys the chart refuses to render without"); name set but Secret absent → `CreateContainerConfigError` on both pods | `kubectl -n <ns> create secret generic pcai-llm-gateway-pg-auth --from-literal=password=$(openssl rand -hex 24)`, or `database.embedded.auth.create: true` |
+| `pcai-llm-gateway-secrets` | `master-key` | Panel-stored Fernet credentials (endpoint/MCP tokens, per-key MCP header overrides) and the audit-chain HMAC anchors — recommended, and required by the DEFAULT render | Fernet-encrypts every console-pasted credential; the audit trail's tail anchor is keyed from it | Default render (the name is preset in values.yaml): pod never starts (`CreateContainerConfigError`). Opt OUT by setting `secretsMasterKey.existingSecret: ""` — then panel credential **writes 503** (by-ref Secret names keep working) and `GET /admin/audit/chain` reports `no-master-key`/`unanchored` — treat as *not verified*, not as tamper | `kubectl -n <ns> create secret generic pcai-llm-gateway-secrets --from-literal="master-key=$(openssl rand -hex 32)"` |
+
+```bash
+# 1. Admin API keys for /admin (comma-separated = rotation mechanism:
+#    staged rotation: append the new key AND restart the pod (env from Secrets is read once at process start), migrate clients, drop the old key at the next restart).
+kubectl -n <namespace> create secret generic pcai-llm-gateway-admin \
+  --from-literal="admin-api-keys=$(openssl rand -hex 32)"
+
+# 2. PostgreSQL connection string — EXTERNAL mode only (the default).
+#    Point it at a database the gateway may create tables in — the schema is
+#    applied automatically at startup.
+kubectl -n <namespace> create secret generic pcai-llm-gateway-db \
+  --from-literal=database-url='postgresql://<user>:<password>@<host>:5432/<database>'
+
+# 3. Optional (recommended) — Fernet master key for panel-stored credentials.
+kubectl -n <namespace> create secret generic pcai-llm-gateway-secrets \
+  --from-literal="master-key=$(openssl rand -hex 32)"
+```
+
+Names are the chart defaults (`adminApiKey.existingSecret` /
+`database.existingSecret` / `secretsMasterKey.existingSecret` /
+`database.embedded.auth.existingSecret`); if your Secrets differ, change the
+names in values, not the chart.
+
+**Trial-friendly alternative — chart-generated Secrets.** Flip
+`adminApiKey.create: true`, `secretsMasterKey.create: true` and (in embedded
+mode) `database.embedded.auth.create: true` and ONE helm install generates
+the Secrets; every later apply re-reads the existing value via `lookup()`
+(nothing is regenerated or emptied, and `helm uninstall` deliberately leaves
+them in place). ⚠️ Do NOT use the `*.create` flags if your apply pipeline
+renders without cluster read access (offline `helm template`, CI apply gates)
+— `lookup()` returns nil there and an apply would regenerate the values.
+Such sites stay on the out-of-band path above. In embedded mode,
+`POSTGRES_PASSWORD` seeds the data dir on FIRST init only — never rotate
+that Secret without `ALTER USER` on the database too.
+
+### B. Cluster objects (the things that cannot be a value)
+
+| Object | Why it is required | What breaks without it | Verify |
+|---|---|---|---|
+| Release namespace labeled `istio-injection=enabled` — ONLY together with the AuthorizationPolicy (one change, pods restarted once) | AuthorizationPolicy is mesh L7: no sidecar, no enforcement point | Policy without injection = a silent NO-OP (verified live on G2: pods carried no istio-proxy); injection without policy = the proxy identity headers become spoofable at the pod | `kubectl get ns <ns> --show-labels | grep istio-injection`; `kubectl get pods -n <ns> -o jsonpath='{.items[*].spec.containers[*].name}' | tr ' ' '\n' | grep -c istio-proxy` |
+| SSO edge-chain route classes at the ezaf-gateway/oauth2-proxy layer | Browser paths (`/`, `/ui`) chain through Keycloak; `/v1/*`, `/mcp/*`, `/admin` are skip-auth — the app's own key is the control; `/v1/identity` + `/v1/keys/for-me` MUST stay chained (their identity IS the injected headers) | A blanket 302 to Keycloak (the MM RAG lesson, D25) leaves bare REST clients with `hllm-` keys unable to reach the app at all; unchained identity endpoints let `for-me` mint keys for whoever asks | Browser: chat page renders after the Keycloak redirect. Off-cluster: `curl -s https://<host>/v1/models -H "Authorization: Bearer hllm-<key>"` returns 200 |
+| DNS for the route host (the `${DOMAIN_NAME}` name) | Clients must resolve the VirtualService host to the ezaf-gateway | Off-cluster clients cannot connect at all; in-cluster `*.svc.cluster.local` traffic is unaffected | `getent hosts pcai-llm-gateway.<your-domain>` from a consumer network |
+| ServiceMonitor CRD — when `metrics.enabled`; PrometheusRule CRD — when `metrics.enabled` AND `metrics.prometheusRule.enabled` (BOTH flags; `prometheusrule.yaml:1` — one flag alone renders no object and NO error) | prometheus-operator custom resources the chart renders into | The apply fails (missing CRD) or the objects exist but never scrape/evaluate; with only `prometheusRule.enabled` set you silently get no rules at all | `kubectl get crd servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com` |
+| Metrics API provider (metrics-server or equivalent) — only when `autoscaling.enabled` | The HPA reads resource metrics through `metrics.k8s.io` | HPA shows `<unknown>/70%` forever and never scales | `kubectl get --raw /apis/metrics.k8s.io/v1beta1` returns (not 404) |
+| Kyverno ClusterPolicy (`kyverno.enabled`) — optional, needs cluster-admin to CREATE (the object is cluster-scoped) | Stamps the `hpe-ezua/*` vendor labels on THIS release's objects only — the rules match the release namespace (`kyverno.yaml:34-35`); labelling any OTHER namespace is the operator's prerequisite, not this policy | Console tile shows "Unknown" — cosmetic: the chart stamps the labels statically on the pod template + Service, so this release's pods are covered either way | EZUA console app tile; `kubectl get clusterpolicy` |
+
+<!-- VERIFY (SSO edge-chain row): the skip-auth / chained path classification is
+platform-edge configuration (oauth2-proxy / ezaf-gateway) that NO template in
+this chart renders or verifies — only the live cluster confirms a given site's
+classes. The G2 classification is recorded live-verified in
+changelogs/SSO-ROLLOUT-G2.md; other sites must confirm their own edge. -->
+
+### B2. Posture values that gate a safe install (these ARE values — set them deliberately)
+
+These are values in the Helm Values editor — the deployment contract above
+holds. They sit in the prerequisites because a default-valued install is
+either broken or exposed, the correct fix is always a VALUES edit (never a
+cluster object), and each has a verification step worth running at install
+time rather than after the first incident.
+
+| Value | Why it must be set deliberately | What breaks without it | Verify |
+|---|---|---|---|
+| `ezua.authorizationPolicy` relief rules (`allowMetricsScrape`, `allowInClusterApi`, optionally `excludeInboundPorts`) — under `ezua.authorizationPolicy.enabled: true`, which itself defaults **false** | Once the policy is enabled, its ALLOW baseline (ingress-gateway + same-namespace) admits neither kube-prometheus scrapes nor unmeshed in-cluster callers | `allowMetricsScrape` missing → Prometheus `up == 0` for this target forever (a raw-IP scrape is envoy passthrough — plaintext, no peer identity — even from a meshed scraper); `allowInClusterApi` missing → unmeshed consumers (dsh-web-helm, OpenWebUI namespaces, opencode-web-helm, clearwing) 403 at the mesh on their first call | Prometheus targets page shows the gateway target `up`; one real model call from an in-cluster consumer |
+| `database.embedded.persistence.storageClass` (`""` = cluster default) — embedded mode | The StatefulSet's `pgdata` PVC must bind before Postgres starts | Postgres StatefulSet Pending (unbound PVC) → gateway `/ready` fails and the pod leaves the Service | `kubectl get pvc -n <ns>` shows Bound |
+| `imagePullSecrets` — only when the image comes from a mirror/private GHCR | Both the gateway Deployment AND the embedded Postgres StatefulSet pull through them | `ImagePullBackOff` on first boot | `kubectl describe pod -n <ns>` → Events |
+
+### C. External dependencies
+
+| Dependency | Used for | Prove it from the cluster |
+|---|---|---|
+| Postgres (external mode) | The entire control plane — ledger, budgets, keys, registry | After install: `curl -s https://<host>/ready` → 200 (a live Postgres round-trip), or from any pod: `kubectl exec -n <ns> deploy/pcai-llm-gateway -- python -c "import asyncio,asyncpg;asyncio.run(asyncpg.connect('postgresql://...'))"` |
+| Model endpoints (vLLM/SGLang / MLIS) | The `/v1` proxy pools | Admin console Models tab `test` button — a real `GET /v1/models` with the endpoint's own credential (`POST /admin/models/{name}/probe`); the result (latency, error) renders in the row |
+| MCP servers | `/mcp` federation + the tool relay | `GET /admin/mcp-servers/{name}/tools` — a real `list_tools`, 15 s bound; or the MCP tab's test button |
+| Prometheus — only for off-peak billing, model groups, endpoint metrics | Demand evaluators, live-load snapshots, KV-cache strips | Admin ▸ Off-peak shows a live sample or a named error; `GET /admin/endpoint-metrics` returns non-null `kv_*` fields |
+| Keycloak JWKS — only when `settings.tokenValidation.*` is set | JWT validation (identity Phase B) | The JWKS URL is fetched by the POD and cached (`jwksCacheS`, default 300 s) — it must be reachable from the release namespace, not just from your laptop |
+
+### Keys the chart refuses to render without
+
+Four templates enforce values with `required` — an apply missing one fails
+at render time (helm/PCAI apply error, before anything is created), not at
+pod start:
+
+| Key | Required when | Failure behavior |
+|---|---|---|
+| `ezua.virtualService.endpoint` | `ezua.enabled: true` | template error `Valid .Values.ezua.virtualService.endpoint is required !` — the VirtualService host must be the literal route host |
+| `ingress.host` | `ingress.enabled: true` | template error `ingress.host is required when ingress.enabled` (checked on both the `rules[].host` and the TLS block) |
+| `database.embedded.auth.existingSecret` | `database.embedded.enabled: true` | template error in BOTH `postgres.yaml` (the Postgres StatefulSet's `POSTGRES_PASSWORD` secretKeyRef) and `deployment.yaml` (the gateway's `PCAI_LLM_DB_PASSWORD` secretKeyRef) |
+| `upstreamKeySecrets[].secretName` / `.secretKey` | every entry in the list | template error `upstreamKeySecrets[].secretName is required` (and the `.secretKey` twin) — each entry must name an operator-created Secret and the key inside it |
+| `mcpKeySecrets[].secretName` / `.secretKey` | every entry in the list | same mechanism: `mcpKeySecrets[].secretName is required` — the by-ref handle for `mcp_servers.auth_secret` |
+
+These are render-time guards, distinct from the pod-start failures in the
+Secrets table above: a referenced Secret that does not exist yields
+`CreateContainerConfigError` on the pod; a missing required *value* never
+renders at all.
+
+## Import and install — trial unit quickstart (hosted PCAI, ~15 minutes)
+
+The numbered path for a hosted trial unit. Prereqs: you can reach the unit's
+PCAI console and have a namespace to deploy into. No cluster-admin required
+(the Kyverno policy stays off; the chart stamps the `hpe-ezua` labels
+itself). The rest of this document is the reference detail.
 
 ### 1. Import and install
 
@@ -57,8 +180,9 @@ reference detail.
   kubectl -n <namespace> get secret pcai-llm-gateway-admin \
     -o jsonpath='{.data.admin-api-keys}' | base64 -d; echo
   ```
-- **Operator-managed:** create the Secrets by hand before applying
-  ("Required Secrets" below).
+- **Operator-managed:** create the Secrets by hand before applying —
+  [Prerequisites A](#a-secrets-the-operator-creates-before-install) has the
+  table and the `kubectl` commands.
 
 ### 3. Smoke test
 
@@ -120,29 +244,12 @@ one smoke check (full battery in [`VERIFICATION.md`](changelogs/VERIFICATION.md)
   `grants_copied`/`creds_copied` — both counts must be non-zero for a key
   that had grants + memory creds (the rotate-carries-identity fix).
 
-### 6. Upgrade / rollback
+### 6. Upgrade / rollback / uninstall
 
-- Upgrade = paste your edited values document again and Apply (maps merge
-  recursively; lists replace). Import a newer chart package first if the
-  release bumps `image.tag` — image tags flow from the chart.
-- Rollback (operator flow): `helm rollback pcai-llm-gateway <revision> -n <namespace>`.
-  On PCAI, re-apply the previous values document with the previous chart
-  package. The Postgres schema is additive and idempotent (`CREATE TABLE IF
-  NOT EXISTS` + guarded migrations); the ledger and budgets survive both
-  directions untouched.
-- Generated Secrets are never regenerated by an upgrade (lookup reuse).
-
-### 7. Uninstall — what persists
-
-`helm uninstall pcai-llm-gateway -n <namespace>`:
-
-- Deletes: Deployment, Service(s), VirtualService/Ingress, (optional)
-  ServiceMonitor, and in embedded mode the Postgres StatefulSet.
-- PERSISTS: the Postgres PVC (`pcai-llm-gateway-pg-pgdata-*`) — the usage
-  ledger, tenants, keys and endpoint pools live there. Delete it separately
-  if you want a clean slate; keep it to preserve state across a reinstall.
-- Chart-generated Secrets persist too (deliberate — so a reinstall doesn't
-  mint new admin keys); delete them explicitly if desired.
+Upgrade is a values edit + re-apply (full procedure, rollback and the
+uninstall persistence contract: [§ Upgrading](#upgrading) below). Import a
+newer chart package first if the release bumps `image.tag` — image tags
+flow from the chart.
 
 ## Deployment profiles: Internal G2 vs Hosted trial
 
@@ -166,74 +273,6 @@ paste it into the *Helm Values* editor, adjust the `# SITE:` lines, apply.
 The G2-specific, live-verified execution of the SSO + policy posture (exact
 values, exact commands, verified starting state, per-step verification) is
 [`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
-
-## Required Secrets
-
-The chart **never creates a Secret and never inlines a credential in
-values** by default — an envsubst apply once emptied a live key Secret (the
-K8S-MCP lesson). Every credential is referenced by name; the pod fails loud
-(`CreateContainerConfigError`) until the referenced Secrets exist. These
-are operator-only steps — PCAI users import the chart and edit values only.
-
-| Secret (chart default name) | Required? | Key | What it unlocks |
-|---|---|---|---|
-| `pcai-llm-gateway-admin` | **always** — `/admin` rejects everything without it | `admin-api-keys` (comma-separated = staged rotation) | Admin API + console |
-| `pcai-llm-gateway-db` | **external-Postgres mode only** (the default) | `database-url` (`postgresql://user:pass@host:5432/db`) | The whole control plane — skipped entirely in embedded mode |
-| `pcai-llm-gateway-pg-auth` | **embedded-Postgres mode only** | `password` | The co-deployed Postgres StatefulSet AND the gateway (`PCAI_LLM_DB_PASSWORD` — the same Secret feeds both) |
-| `pcai-llm-gateway-secrets` | optional but recommended | `master-key` | Panel-stored Fernet credentials (endpoint/MCP tokens, per-key MCP header overrides). Without it those writes 503 and by-ref Secret names still work |
-
-```bash
-# 1. Admin API keys for /admin (comma-separated = rotation mechanism:
-#    staged rotation: append the new key AND restart the pod (env from Secrets is read once at process start), migrate clients, drop the old key at the next restart).
-kubectl -n <namespace> create secret generic pcai-llm-gateway-admin \
-  --from-literal="admin-api-keys=$(openssl rand -hex 32)"
-
-# 2. PostgreSQL connection string — EXTERNAL mode only (the default).
-#    Point it at a database the gateway may create tables in — the schema is
-#    applied automatically at startup.
-kubectl -n <namespace> create secret generic pcai-llm-gateway-db \
-  --from-literal=database-url='postgresql://<user>:<password>@<host>:5432/<database>'
-
-# 3. Optional (recommended) — Fernet master key for panel-stored credentials.
-kubectl -n <namespace> create secret generic pcai-llm-gateway-secrets \
-  --from-literal="master-key=$(openssl rand -hex 32)"
-```
-
-Names are the chart defaults (`adminApiKey.existingSecret` /
-`database.existingSecret` / `secretsMasterKey.existingSecret` /
-`database.embedded.auth.existingSecret`); if your Secrets differ, change the
-names in values, not the chart.
-
-**Trial-friendly alternative — chart-generated Secrets.** Flip
-`adminApiKey.create: true`, `secretsMasterKey.create: true` and (in embedded
-mode) `database.embedded.auth.create: true` and ONE helm install generates
-the Secrets; every later apply re-reads the existing value via `lookup()`
-(nothing is regenerated or emptied, and `helm uninstall` deliberately leaves
-them in place). ⚠️ Do NOT use the `*.create` flags if your apply pipeline
-renders without cluster read access (offline `helm template`, CI apply gates)
-— `lookup()` returns nil there and an apply would regenerate the values.
-Such sites stay on the out-of-band path above. In embedded mode,
-`POSTGRES_PASSWORD` seeds the data dir on FIRST init only — never rotate
-that Secret without `ALTER USER` on the database too.
-
-### Keys the chart refuses to render without
-
-Four templates enforce values with `required` — an apply missing one fails
-at render time (helm/PCAI apply error, before anything is created), not at
-pod start:
-
-| Key | Required when | Failure behavior |
-|---|---|---|
-| `ezua.virtualService.endpoint` | `ezua.enabled: true` | template error `Valid .Values.ezua.virtualService.endpoint is required !` — the VirtualService host must be the literal route host |
-| `ingress.host` | `ingress.enabled: true` | template error `ingress.host is required when ingress.enabled` (checked on both the `rules[].host` and the TLS block) |
-| `database.embedded.auth.existingSecret` | `database.embedded.enabled: true` | template error in BOTH `postgres.yaml` (the Postgres StatefulSet's `POSTGRES_PASSWORD` secretKeyRef) and `deployment.yaml` (the gateway's `PCAI_LLM_DB_PASSWORD` secretKeyRef) |
-| `upstreamKeySecrets[].secretName` / `.secretKey` | every entry in the list | template error `upstreamKeySecrets[].secretName is required` (and the `.secretKey` twin) — each entry must name an operator-created Secret and the key inside it |
-| `mcpKeySecrets[].secretName` / `.secretKey` | every entry in the list | same mechanism: `mcpKeySecrets[].secretName is required` — the by-ref handle for `mcp_servers.auth_secret` |
-
-These are render-time guards, distinct from the pod-start failures in the
-Secrets table above: a referenced Secret that does not exist yields
-`CreateContainerConfigError` on the pod; a missing required *value* never
-renders at all.
 
 ## Chart values walkthrough
 
@@ -282,7 +321,7 @@ ezua:
     endpoint: pcai-llm-gateway.<your-domain>   # SITE: host on the ezaf-gateway
     istioGateway: istio-system/ezaf-gateway
     timeout: 120s
-# Secrets are referenced, not created — see "Required Secrets" above.
+# Secrets are referenced, not created — see Prerequisites A above.
 ```
 
 Full paste-ready documents: [`../helm/values-examples/README.md`](../helm/values-examples/README.md)
@@ -394,6 +433,40 @@ upstream; raise all three together (e.g. 900 / 900 / 960) rather than one.
 The keepalive + clean-close machinery guarantees such failures are always
 VISIBLE to the client (guard event + error chunk + `[DONE]`), never a
 silent 504.
+### Settings knobs added in the 4.0/4.1 waves (one line each)
+
+The knobs below ship in `helm/values.yaml` under `settings.*` (env
+`PCAI_LLM_*` — same render rule as the table above) but predate their
+FEATURES.md coverage; the design rationale for each lives in
+[FEATURES.md](FEATURES.md). Helm-only availability knobs follow the table.
+
+| Values key (env) | Default | Why |
+|---|---|---|
+| `settings.responseCacheMode` / `responseCacheTtlS` (`PCAI_LLM_RESPONSE_CACHE_MODE` / `_TTL_S`) | `off` / 3600 | Exact-match response cache for non-streaming chat (`off \| shadow \| active`); `shadow` measures the hit rate without serving — run shadow first, then flip `active` (FEATURES.md § Response cache) |
+| `settings.toolCompressDefault` / `MinChars` / `RatioFloor` / `StoreTtlS` / `MaxStoreChars` (`PCAI_LLM_TOOL_COMPRESS_*`) | off / 4096 / 0.15 / 86400 / 1000000 | Relay tool-result compression defaults (the per-request `X-PCAI-Compress-Tools` header overrides; FEATURES.md § Tool-use relay) |
+| `settings.toolRelaySurface` (`PCAI_LLM_TOOL_RELAY_SURFACE`) | `hybrid` | Relay tool surface: `hybrid` offers a compact discover-then-call catalog (~4.6-6k tokens for the whole fleet); `full` re-offers every definition — only for a client that cannot discover-then-call |
+| `settings.toolRelayRenderDeltas` / `toolRelayRenderIndexBase` (`PCAI_LLM_TOOL_RELAY_RENDER_DELTAS` / `_INDEX_BASE`) | false / 1000 | Re-emit each in-cluster tool call as a NATIVE `tool_call` delta stamped `pcai.relay: true`; requires request header `X-PCAI-Relay-Deltas: 1` — the stamp blocks client execution (unlike `toolRelayStreamWireTools`, safe to enable) |
+| `settings.stickyRouting` / `stickyRoutingIdleResetS` (`PCAI_LLM_STICKY_ROUTING` / `_IDLE_RESET_S`) | false / 1800 | Conversation stickiness for the ROUTER (never-downgrade): a routed conversation holds a capability FLOOR, may escalate, never falls below; idle reset re-decides fresh (0 = never) |
+| `settings.sessionAffinityEnabled` / `sessionAffinityTtlS` (`PCAI_LLM_SESSION_AFFINITY_ENABLED` / `_TTL_S`) | false / 3600 | Endpoint stickiness (KV-cache reuse): a pin to the serving endpoint survives the turn — routing STATE, never policy; a pin that no longer qualifies is discarded on read |
+| `settings.rateLimitExcludeCachedTokens` / `rateLimitPredictCached` / `rateLimitPredictReconcile` (`PCAI_LLM_RATE_LIMIT_*`) | true / false / true | TPM accounting for prompt-cache hits: exclude cached tokens from the window, optionally PREDICT admission from the key's own cached-token history, and settle the predicted-vs-actual difference afterward (prediction decides WHEN, never HOW MANY) |
+| `settings.budgetCachedExemptFraction` (`PCAI_LLM_BUDGET_CACHED_EXEMPT_FRACTION`) | 0.9 | Discount cached tokens against day/week/month TOKEN budgets (1.0 = fully exempt, 0.0 = legacy full count); USD budgets unaffected (cache is already priced at `cached_per_m`) |
+| `settings.failoverTtftS` (`PCAI_LLM_FAILOVER_TTFT_S`) | 45 | TTFT failover budget: after a 2xx, the stream waits this long for the upstream's FIRST SSE data line (keepalives do not count); 0 disables — a wedged-but-200 upstream no longer holds the turn |
+| `settings.healthProbe.enabled` / `intervalS` / `timeoutS` / `failuresToTrip` (`PCAI_LLM_HEALTH_PROBE_*`) | false / 30 / 5 / 2 | Background proactive probe (`GET {base_url}/models` with the endpoint's OWN credential) that trips the breaker between requests; `Pool.healthy()` ignores a probe verdict that would empty a pool — degraded routing, never an outage |
+| `settings.effectivePromptCapture` / `effectivePromptRetainDays` (`PCAI_LLM_EFFECTIVE_PROMPT_CAPTURE` / `_RETAIN_S`) | true / 7 | Write a ≤64 KB preview of every REAL model call to `effective_prompts` (transparency/debugging; `GET /admin/effective-prompts`) |
+| `settings.maxTokensCeiling` (`PCAI_LLM_MAX_TOKENS_CEILING`, JSON object) | `{}` | Per-model `max_tokens` ceiling — silently LOWERS a client's larger value for that virtual model (never raises); the static complement of live context-window discovery (FEATURES.md § Context-window discovery) |
+| `settings.demandAwareExcludedModels` (`PCAI_LLM_DEMAND_AWARE_EXCLUDED_MODELS`) | `[]` | Models the conversation-start head must never pick (they stay on the plain `auto` ladder and the failover tail) |
+| `settings.routeDefaultModel` (`PCAI_LLM_ROUTE_DEFAULT_MODEL`) | false | Promote the legacy `auto` alias INTO routing — off by default so arming routing never silently changes what an existing client request does |
+| `settings.audioTtsCharsPerToken` / `audioAsrTokensPerSecond` (`PCAI_LLM_AUDIO_TTS_CHARS_PER_TOKEN` / `_ASR_TOKENS_PER_SECOND`) | 4 / 3.0 | Audio billing estimates (TTS/ASR report no token usage; a zero-token row would be a budget bypass) — superseded per model by unit-aware pricing (`model_costs.unit`) |
+| `settings.distillerMaxTokens` (`PCAI_LLM_DISTILLER_MAX_TOKENS`) | 4096 | Distill OUTPUT cap — an overrun is rejected whole by `document_is_complete()`, so the memory write is lost rather than shortened |
+| `settings.distillerDisableThinking` (`PCAI_LLM_DISTILLER_DISABLE_THINKING`) | true | Send `chat_template_kwargs {"enable_thinking": false}` to the summarizer (engines without the kwarg ignore it) |
+| `settings.canonicalSkipTitleRequests` (`PCAI_LLM_CANONICAL_SKIP_TITLE_REQUESTS`) | true | Never capture a title-generation request as a canonical conversation (it would distill a bogus "session summary" of a title string) |
+| `settings.mcpSelfService` (`PCAI_LLM_MCP_SELF_SERVICE`) | true | Keyed users manage their OWN key's per-server MCP credential overrides and toggle grants within their entitlement catalog (`/v1/mcp/creds`, `/v1/mcp/selfservice`); false hides the routes |
+| `settings.otelEnabled` / `otelEndpoint` / `otelHeaders` / `otelSampleRatio` / `otelServiceName` (`PCAI_LLM_OTEL_*`) | false / `http://otel-collector:4318` / "" / 1.0 / `pcai-llm-gateway` | OTLP/Langfuse spans (FEATURES.md § OTLP / Langfuse spans); `otelHeaders` is comma-separated `Key=Value` pairs for exporter auth; spans carry metadata only — never prompt/completion content |
+| `database.maxConnectionsBudget` (helm-only — consumed by `templates/NOTES.txt`, not an env) | 0 | The real external-Postgres `max_connections`: makes the post-install connection-budget arithmetic (`autoscaling.maxReplicas × settings.dbPoolMax`) print a WARNING instead of an informational NOTE; embedded mode uses `database.embedded.maxConnections` instead |
+| `podDisruptionBudget.enabled` / `minAvailable` / `maxUnavailable` (helm-only) | false / — / 1 | PDB so a node drain cannot take every replica at once; the template REFUSES `enabled` with a single replica (a PDB there blocks every drain forever) |
+| `topologySpreadConstraints` / `affinity` (helm-only passthrough) | `[]` / `{}` | Standard scheduling spread/anti-affinity for multi-replica posture (commented example in `helm/values.yaml`) |
+| `autoscaling.targetCPUUtilizationPercentage` (helm-only) | 70 | The HPA's CPU target (see § Sizing for why CPU and not memory) |
+| `networkPolicy.probeCidrs` / `probeExceptCidrs` / `ingressGatewayNamespace` (helm-only) | `[]` / `[]` / `istio-system` | NetworkPolicy rule (iii) node-CIDR allowance for kubelet probes — `0.0.0.0/0` in `probeCidrs` FAILS the render unless `probeExceptCidrs` carves the pod CIDR out |
 
 ## Postgres
 
@@ -429,6 +502,11 @@ When `ezua.enabled=true` the chart renders one VirtualService on
 key** at the pod (`Authorization: Bearer hllm-...`); `/admin` requires an
 **admin key** and mutates the control plane — protect the endpoint host at
 the platform level (SSO/bearer at the ezaf-gateway) before exposing it.
+`/team_leader` (the enrollment-scoped team console, page + API) has no
+explicit route: it rides the catch-all `/` route, and the **team-leader
+key** — a hash-only credential stored on the enrollment row — is its
+authorization. Classify it with `/admin` when you decide which paths the
+edge chain skips.
 By default this chart ships no policy templates; the optional
 `networkPolicy.*` / `ezua.authorizationPolicy.*` flags below (§ Network
 isolation) render the in-chart equivalents where the platform does not
@@ -624,11 +702,13 @@ client-supplied forwarded header self-granted admin groups (audit r5 #4,
 
 `kyverno.enabled: true` ships a ClusterPolicy stamping the `hpe-ezua/*`
 vendor labels so the EZUA console shows the app as "Ready" instead of
-"Unknown". It is **cluster-scoped and needs cluster-admin** — on hosted
+"Unknown". The ClusterPolicy OBJECT is cluster-scoped (creating it needs
+cluster-admin), but its rules mutate only this release's namespace (scope
+reminder below) — on hosted
 trial units without it, leave it off: the chart also stamps the labels
 statically on the pod template, which covers the same gap for pods this
-chart creates. G2 (where Kyverno is installed) may enable it for fleet-wide
-consistency.
+chart creates. G2 (where Kyverno is installed) may enable it so the labels come
+from one mechanism instead of two. Scope reminder: the policy's rules mutate only the release namespace (`kyverno.yaml:34-35`) — other namespaces need their own labelling story.
 
 ## Upstream credentials (models + MCP servers)
 
@@ -734,6 +814,27 @@ Upgrades are a values edit + re-apply, not a redeploy:
    survive upgrades untouched. External mode has no PVC; in embedded mode
    the StatefulSet's PVC persists untouched across upgrades.
 
+**Rollback.** On PCAI, re-apply the previous values document with the
+previous chart package (import it the same way). Plain-Helm equivalent,
+labelled as the operator/secondary path: `helm rollback pcai-llm-gateway
+<revision> -n <namespace>`. The Postgres schema is additive and idempotent
+(`CREATE TABLE IF NOT EXISTS` + guarded migrations); the ledger and budgets
+survive both directions untouched. Generated Secrets are never regenerated
+by an upgrade or rollback (lookup reuse).
+
+### Uninstall — what persists
+
+`helm uninstall pcai-llm-gateway -n <namespace>` (or the PCAI console's
+delete of the deployment):
+
+- Deletes: Deployment, Service(s), VirtualService/Ingress, (optional)
+  ServiceMonitor, and in embedded mode the Postgres StatefulSet.
+- PERSISTS: the embedded-Postgres PVC — named `pgdata-<serviceName>-<ordinal>`: the volumeClaimTemplate is `pgdata` and the StatefulSet is `database.embedded.serviceName` (default `pcai-llm-gateway-pg`), so the live name is `pgdata-pcai-llm-gateway-pg-0` — the usage
+  ledger, tenants, keys and endpoint pools live there. Delete it separately
+  if you want a clean slate; keep it to preserve state across a reinstall.
+- Chart-generated Secrets persist too (deliberate — so a reinstall doesn't
+  mint new admin keys); delete them explicitly if desired.
+
 Sanity check after any change: `/ready` returns 200 (Postgres reachable) and
 `kubectl logs deploy/pcai-llm-gateway` shows `database connected and schema
 ensured` at startup. Then run the new-feature checks in
@@ -802,3 +903,35 @@ model endpoints, MCP federation, admin probes, enrollment provisioning.
 TLS verification is unconditional — there is no verify=False knob (the
 AgentBuilder lesson: an awkward CA setup must not push anyone toward
 disabling verification).
+You must also mount the bundle file yourself (operator Secret + volume —
+the chart does not create the mount). This applies to ALL upstream TLS:
+model endpoints, MCP federation, admin probes, enrollment provisioning.
+TLS verification is unconditional — there is no verify=False knob (the
+AgentBuilder lesson: an awkward CA setup must not push anyone toward
+disabling verification).
+
+## Troubleshooting
+
+Real failure modes from this package's history, `symptom → cause → fix`.
+After ANY fix, re-run the § Upgrading sanity check (`/ready` 200 + a clean
+schema startup in the log).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pod `CreateContainerConfigError`, never starts | A referenced Secret does not exist (admin keys, DB URL, pg-auth, master key — by-ref `upstreamKeySecrets[]`/`mcpKeySecrets[]` names) | Create the Secret(s) from [Prerequisites A](#a-secrets-the-operator-creates-before-install) with the exact name the values reference; no re-apply needed — the pod retries the pull |
+| Release lands `failed` at the VirtualService step; istio webhook: `domain name "${DOMAIN_NAME}" invalid` | A raw CLI `helm upgrade -f values.g2.yaml` passed the literal `${DOMAIN_NAME}` through — PCAI substitutes it in pasted values, the CLI does not; everything before the VS (the AuthorizationPolicy!) already applied | sed-resolve the placeholder into a copy first (§ Gateway exposure); apply through the PCAI values editor |
+| In-cluster consumers (dsh-web-helm, OpenWebUI, opencode, clearwing) get 403 on model/MCP calls — off-cluster clients fine | The AuthorizationPolicy rendered WITHOUT the `allowInClusterApi` relief: unmeshed callers carry no peer identity, so no namespace rule can match them | Set `ezua.authorizationPolicy.allowInClusterApi: true` and re-apply (§ Network isolation) |
+| Prometheus target for the gateway stays `up == 0` even with a meshed scraper | A namespace-scoped policy rule cannot admit the scrape: kube-prometheus scrapes raw POD IPs — envoy passthrough, plaintext, no peer identity, even from a meshed pod (verified live on G2) | `allowMetricsScrape: true` — the ANY-SOURCE rule scoped to `/metrics` + `/metrics/` (§ Network isolation) |
+| Policy applied but nothing is enforced (spoofable headers reach the app) | Namespace labeled for injection but pods NOT restarted, or the label missing — AuthorizationPolicy without sidecars is a NO-OP | Move the `istio-injection=enabled` label AND `ezua.authorizationPolicy.enabled: true` in ONE change and restart the pods (§ SSO self-mint rollout step 2 — the pair is deliberately atomic) |
+| Pod NotReady: kubelet probes fail while the app answers fine through the gateway | Probes run outside the mesh (no separate probe port) — an enforcing AuthorizationPolicy denies the kubelet | `excludeInboundPorts: [9200]` (the ipBlock rule becomes the control) or a platform-side probe-port exemption; never exclude a port serving real traffic (§ Network isolation) |
+| `503 database busy` under load (retryable) | The Postgres pool is saturated — the bounded-acquire fail-fast is your saturation signal, by design | Escalation order: `settings.dbPoolMax` → pod limits → `replicaCount` → autoscaling; check the shared DB's `max_connections` — worst case is `maxReplicas × dbPoolMax` (§ Sizing; `templates/NOTES.txt` prints the arithmetic) |
+| A relay turn dies as `(model error: relay model call timed out)` | ONE model call exceeded `upstreamTimeoutS` — under agent fan-out the usual trigger is prefill queueing on the endpoint, not a wedged upstream | Raise the COUPLED trio together: `upstreamTimeoutS` ≤ `toolRelayWallClockS` < `ezua.virtualService.timeout` (e.g. 900 / 900 / 960) — the long-turn note above |
+| A model/MCP registered on one pod 404s on another replica (HPA ≥ 2) | `PCAI_LLM_REGISTRY_WATCH_S: 0` disabled the cross-replica watermark poll — correct only on a single replica | Restore the watcher (default 5 s); out-of-band SQL edits converge too (the stamps are trigger-maintained) |
+| `/v1/keys/for-me` mints keys for unauthenticated callers | The identity endpoints were exposed without the SSO chain, or `trustProxyIdentity` / `ssoKeyCreateEnabled` were flipped before the chain enforced | Run the § SSO self-mint rollout IN ORDER; `for-me` + `/v1/identity` stay BEHIND oauth2-proxy, never skip-auth |
+| Admin console 401 behind the SSO chain with a valid admin key | The proxy overwrote the console's `Authorization: Bearer` with its id_token — not an admin key | The console already sends `X-API-Key` as the surviving envelope; alternatively keep `/admin` skip-auth, or use `PCAI_LLM_ADMIN_GROUPS` (§ SSO self-mint rollout step 3) |
+| Every request 401s or bounces to a login page after an SSO rollout | The edge chain 302s EVERYTHING to Keycloak (the MM RAG lesson, D25) — bare REST clients with `hllm-` keys cannot reach the app | Carve `/v1/*` + `/mcp/*` (and `/admin` unless using groups) as skip-auth at the edge; the app's key auth is the control (§ SSO self-mint rollout step 3) |
+<!-- VERIFY (blanket-302 row): the 302-everything failure mode is platform-edge
+behaviour (the MM RAG lesson, D25) — no template here renders the auth-skip
+classes, so only the live cluster can confirm a given site's edge config. -->
+| A diagnostic Job in this namespace hangs forever as `1/2 NotReady`, `active: 1` | `pcai-llm` is istio-injection=enabled — the Job's `istio-proxy` sidecar never exits, so the Job never completes and `ttlSecondsAfterFinished` never fires (14 such orphans observed 2026-10-14) | Set `sidecar.istio.io/inject: "false"` on the JOB's pod template + a short `ttlSecondsAfterFinished`; full runbook: [changelogs/DIAGNOSTIC-JOBS.md](changelogs/DIAGNOSTIC-JOBS.md) |
+| Reinstall shows an empty ledger / new admin keys (or old state survives a delete) | `helm uninstall` deliberately PERSISTS the Postgres PVC and the chart-generated Secrets | § Upgrading → Uninstall — what persists: delete the PVC (`pgdata-pcai-llm-gateway-pg-*`) and the generated Secrets explicitly for a clean slate |

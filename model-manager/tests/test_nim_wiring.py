@@ -36,8 +36,8 @@ import pytest  # noqa: E402
 from kubernetes.client.rest import ApiException  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 
-from model_downloader.app import main as md  # noqa: E402
-from model_downloader.app.k8s import (  # noqa: E402
+from model_manager.app import main as md  # noqa: E402
+from model_manager.app.k8s import (  # noqa: E402
     NGC_SECRET_ANNOTATION,
     NIM_BUCKET_ANNOTATION,
     NIM_IMAGE_ANNOTATION,
@@ -46,7 +46,7 @@ from model_downloader.app.k8s import (  # noqa: E402
     SOURCE_ANNOTATION,
     K8sClient,
 )
-from model_downloader.app.queue import JobQueue, JobRecord  # noqa: E402
+from model_manager.app.queue import JobQueue, JobRecord  # noqa: E402
 
 IMAGE = "nvcr.io/nim/meta/llama-3.1-8b-instruct:1.0.0"
 KEY = "nvapi-test-key"
@@ -243,13 +243,13 @@ def test_create_nim_job_creates_both_secrets_and_pull_secret():
     core, batch = _FakeCore(), _FakeBatch()
     client._core, client._batch = core, batch
     ngc, pull, job = asyncio.run(client.create_nim_job("ns", IMAGE, "abc", "job1", KEY, "nim-profiles"))
-    assert job.startswith("md-nim-") and ngc.startswith("ngc-api-") and pull.startswith("ngc-pull-")
+    assert job.startswith("mm-nim-") and ngc.startswith("ngc-api-") and pull.startswith("ngc-pull-")
     assert len(core.secrets) == 2
     types_ = {s.type for s in core.secrets}
     assert types_ == {"Opaque", "kubernetes.io/dockerconfigjson"}
     assert batch.body["spec"]["template"]["spec"]["imagePullSecrets"] == [{"name": pull}]
-    assert batch.body["metadata"]["labels"]["model-downloader/job-id"] == "job1"
-    assert batch.body["metadata"]["annotations"]["model-downloader/nim-pull-secret"] == pull
+    assert batch.body["metadata"]["labels"]["model-manager/job-id"] == "job1"
+    assert batch.body["metadata"]["annotations"]["model-manager/nim-pull-secret"] == pull
 
 
 def test_create_nim_job_skips_pull_secret_for_local_registry():
@@ -484,7 +484,7 @@ def test_real_chart_template_renders_through_app():
     assert container["args"][-2:] == ["--profiles", "abc"]
     rendered = yaml.safe_dump(manifest)
     assert "__" not in rendered, "unsubstituted placeholder left in the NIM Job"
-    assert manifest["metadata"]["labels"]["model-downloader/source"] == "nim"
+    assert manifest["metadata"]["labels"]["model-manager/source"] == "nim"
 
 
 def test_reconcile_cleans_finished_job_secrets():

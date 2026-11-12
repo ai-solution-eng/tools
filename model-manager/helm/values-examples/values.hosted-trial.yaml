@@ -29,8 +29,8 @@ fullnameOverride: ""
 
 # Tags are packaged with the chart — change only if you build your own images.
 image:
-  repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v2.1.2
+  repository: ghcr.io/ai-solution-eng/model-manager
+  tag: v2.2.0
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -234,7 +234,7 @@ catalog:
   size: 100Mi
   storageClassName: ""
   # Raw URL of the seed catalog JSON; a trial without GitHub egress can clear it.
-  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_downloader/app/seed_catalog.json"
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_manager/app/seed_catalog.json"
 
 # ============================================================================
 # MLIS database
@@ -261,13 +261,13 @@ kyverno:
   enabled: true
 
 # ${DOMAIN_NAME} is resolved by PCAI before rendering; the UI is served at
-# https://model-downloader.<customer-domain> behind oauth2-proxy SSO.
+# https://model-manager.<customer-domain> behind oauth2-proxy SSO.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"  # informational only — no template reads it
 
   virtualService:
-    endpoint: "model-downloader.${DOMAIN_NAME}"
+    endpoint: "model-manager.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 300s
 

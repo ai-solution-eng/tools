@@ -9,10 +9,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-job-template
+  name: {{ include "model-manager.fullname" . }}-job-template
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 data:
   job.yaml: |
     apiVersion: batch/v1
@@ -21,7 +21,7 @@ data:
       name: __JOB_NAME__
       namespace: __NAMESPACE__
       labels:
-        app.kubernetes.io/managed-by: model-downloader
+        app.kubernetes.io/managed-by: model-manager
     spec:
       ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
       backoffLimit: {{ .Values.downloader.backoffLimit }}
@@ -73,7 +73,7 @@ data:
               fi
               python3 -c "
               import os, httpx
-              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              {{- if eq (include "model-manager.skipTlsVerification" .) "true" }}
               _orig = httpx.Client
               class _Client(_orig):
                   def __init__(self, *a, **kw):
@@ -246,7 +246,7 @@ data:
                                   break
 
               manifest = {
-                  "schema": "model-downloader.provenance/1.0",
+                  "schema": "model-manager.provenance/1.0",
                   "repo": repo,
                   "revision": manifest_revision,
                   "revision_requested": requested_ref,
@@ -492,7 +492,7 @@ data:
       name: __JOB_NAME__
       namespace: __NAMESPACE__
       labels:
-        app.kubernetes.io/managed-by: model-downloader
+        app.kubernetes.io/managed-by: model-manager
     spec:
       ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
       backoffLimit: {{ .Values.downloader.backoffLimit }}
@@ -532,7 +532,7 @@ data:
               python3 -c "
               import os, shutil, threading
               from concurrent.futures import ThreadPoolExecutor, as_completed
-              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              {{- if eq (include "model-manager.skipTlsVerification" .) "true" }}
               import httpx
               _orig = httpx.Client
               class _Client(_orig):
@@ -675,8 +675,8 @@ data:
       name: __JOB_NAME__
       namespace: __NAMESPACE__
       labels:
-        app.kubernetes.io/managed-by: model-downloader
-        model-downloader/source: "nim"
+        app.kubernetes.io/managed-by: model-manager
+        model-manager/source: "nim"
     spec:
       ttlSecondsAfterFinished: {{ .Values.nim.ttlSecondsAfterFinished }}
       backoffLimit: {{ .Values.nim.backoffLimit }}
@@ -687,7 +687,7 @@ data:
             hpe-ezua/disable-sc: {{ .Values.nim.disableSecurityContext | quote }}
           labels:
             hpe-ezua/app: mlis
-            model-downloader/source: "nim"
+            model-manager/source: "nim"
         spec:
           {{- with .Values.nim.nodeSelector }}
           nodeSelector:
@@ -784,7 +784,7 @@ data:
   # Debug shell launched from the UI ("Launch debug pod"). Deliberately a Job,
   # not a bare Pod: the Job's Pod is then created by the kube-system
   # job-controller — the exact same admission path as the downloader Jobs —
-  # whereas a Pod created directly by the model-downloader ServiceAccount is
+  # whereas a Pod created directly by the model-manager ServiceAccount is
   # denied by the platformwide protect-models-pvc Kyverno policy
   # (prevent-unauthorized-create-with-mlis: "Insufficient authorization to set
   # the 'hpe-ezua/app' label to 'mlis'"). With the job-controller as creator,
@@ -797,9 +797,9 @@ data:
       namespace: __NAMESPACE__
       labels:
         # Distinct managed-by value so the download-jobs reconciliation
-        # (selector app.kubernetes.io/managed-by=model-downloader) never
+        # (selector app.kubernetes.io/managed-by=model-manager) never
         # picks debug jobs up into the Jobs table.
-        app.kubernetes.io/managed-by: model-downloader-debug
+        app.kubernetes.io/managed-by: model-manager-debug
     spec:
       # tail -f /dev/null never exits; a restart only matters when the pod
       # dies (node drain etc.) and 0 avoids masking a Failed state for long.
@@ -813,8 +813,8 @@ data:
             sidecar.istio.io/inject: "false"
             hpe-ezua/disable-sc: {{ .Values.debugPod.disableSecurityContext | quote }}
           labels:
-            app.kubernetes.io/managed-by: model-downloader-debug
-            model-downloader/debug-pod: "true"
+            app.kubernetes.io/managed-by: model-manager-debug
+            model-manager/debug-pod: "true"
             hpe-ezua/app: mlis
         spec:
           {{- with .Values.downloader.nodeSelector }}
@@ -885,8 +885,8 @@ data:
       labels:
         # Distinct managed-by value (like debug shells) so list_managed_jobs()
         # never picks scanner Jobs into the Downloads table.
-        app.kubernetes.io/managed-by: model-downloader-scan
-        model-downloader/scan: "true"
+        app.kubernetes.io/managed-by: model-manager-scan
+        model-manager/scan: "true"
     spec:
       ttlSecondsAfterFinished: 120
       backoffLimit: 0
@@ -897,7 +897,7 @@ data:
             hpe-ezua/disable-sc: "true"
           labels:
             hpe-ezua/app: mlis
-            model-downloader/scan: "true"
+            model-manager/scan: "true"
         spec:
           restartPolicy: Never
           containers:
@@ -1005,11 +1005,11 @@ data:
       labels:
         # Distinct managed-by value (like debug/scan Jobs) so the
         # download-jobs reconciliation (selector
-        # app.kubernetes.io/managed-by=model-downloader) never picks delete
+        # app.kubernetes.io/managed-by=model-manager) never picks delete
         # Jobs into the Downloads table.
-        app.kubernetes.io/managed-by: model-downloader-delete
-        model-downloader/delete: "true"
-      # NO model-downloader/cache-root annotation, deliberately. The GC/live-job
+        app.kubernetes.io/managed-by: model-manager-delete
+        model-manager/delete: "true"
+      # NO model-manager/cache-root annotation, deliberately. The GC/live-job
       # cross-check treats any managed Job whose cache-root covers an entry's
       # parent as pinning that entry, and it ignores Job status — so annotating
       # this Job with the scan root made it pin EVERY model on the PVC: the
@@ -1035,8 +1035,8 @@ data:
             hpe-ezua/disable-sc: "true"
           labels:
             hpe-ezua/app: mlis
-            app.kubernetes.io/managed-by: model-downloader-delete
-            model-downloader/delete: "true"
+            app.kubernetes.io/managed-by: model-manager-delete
+            model-manager/delete: "true"
         spec:
           # NO serviceAccountName on purpose: this Job runs in the namespace
           # that OWNS models-pvc (defaultNamespace), where the app's SA does not

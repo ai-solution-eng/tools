@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src" / "model_downloader"))
+sys.path.insert(0, str(REPO / "src" / "model_manager"))
 
 import app.catalog as catalog_module  # noqa: E402
 from app.catalog import Catalog  # noqa: E402
@@ -29,7 +29,7 @@ from app.versioning import (  # noqa: E402
     resolve_project,
 )
 
-SEED = json.loads((REPO / "src" / "model_downloader" / "app" / "seed_catalog.json").read_text())
+SEED = json.loads((REPO / "src" / "model_manager" / "app" / "seed_catalog.json").read_text())
 
 
 def _cfg(**overrides):

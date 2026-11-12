@@ -32,9 +32,7 @@ import pytest
 # a credential. The prefix is the documented exemption, not obfuscation.
 VENDORED_SHA256 = "sha256:5d6c42c4c1324af04933e2c94991ca82dac8c7f64a9a622bd690864b2cb23784"
 PCAI_UTILS_ROOT = pathlib.Path(os.environ.get("PCAI_UTILS_ROOT", "/home/andrew/Code/HPE/pcai_utils"))
-VENDORED_PATH = (
-    pathlib.Path(__file__).resolve().parents[1] / "src" / "model_downloader" / "app" / "oidc_identity.py"
-)
+VENDORED_PATH = pathlib.Path(__file__).resolve().parents[1] / "src" / "model_manager" / "app" / "oidc_identity.py"
 
 
 def test_vendored_oidc_module_is_unmodified():
@@ -64,7 +62,7 @@ def test_the_gate_uses_the_shared_verifier():
     # this test pass or fail depending on collection order.
     import re
 
-    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "model_downloader" / "app" / "main.py"
+    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "model_manager" / "app" / "main.py"
     source = path.read_text()
     match = re.search(r"async def _actor_from_sso.*?(?=\nasync def |\ndef )", source, re.DOTALL)
     assert match, "_actor_from_sso not found"

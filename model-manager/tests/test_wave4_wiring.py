@@ -22,8 +22,8 @@ pytest.importorskip("psycopg2")
 # startup contract); tests set a placeholder before importing it.
 os.environ.setdefault("JOB_TEMPLATE_CONFIGMAP", "test-job-template")
 
-from model_downloader.app import main
-from model_downloader.app.gc import build_gc_plan, parse_aioli_rows
+from model_manager.app import main
+from model_manager.app.gc import build_gc_plan, parse_aioli_rows
 
 
 class TestQuotaMapParsing:

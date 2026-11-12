@@ -1,11 +1,11 @@
-{{- if eq (include "model-downloader.ezuaEnabled" .) "true" }}
+{{- if eq (include "model-manager.ezuaEnabled" .) "true" }}
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-auth-policy
+  name: {{ include "model-manager.fullname" . }}-auth-policy
   namespace: {{ .Values.ezua.authorizationPolicy.namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
     hpe-ezua/app: {{ .Chart.Name }}
     hpe-ezua/type: vendor-service
 spec:

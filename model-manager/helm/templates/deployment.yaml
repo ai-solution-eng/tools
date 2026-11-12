@@ -1,27 +1,27 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+      app.kubernetes.io/name: {{ include "model-manager.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       annotations:
         sidecar.istio.io/inject: "false"
       labels:
-        app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+        app.kubernetes.io/name: {{ include "model-manager.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      serviceAccountName: {{ include "model-downloader.fullname" . }}
+      serviceAccountName: {{ include "model-manager.fullname" . }}
       containers:
       - name: app
         image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -35,7 +35,7 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
         - name: JOB_TEMPLATE_CONFIGMAP
-          value: {{ include "model-downloader.fullname" . }}-job-template
+          value: {{ include "model-manager.fullname" . }}-job-template
         - name: JOB_TEMPLATE_CONFIGMAP_NAMESPACE
           value: {{ .Release.Namespace }}
         - name: MAX_CONCURRENCY
@@ -227,7 +227,7 @@ spec:
         {{- end }}
         {{- end }}
         - name: CATALOG_GITHUB_VERIFY_TLS
-          value: {{ include "model-downloader.catalogGithubVerifyTls" . | quote }}
+          value: {{ include "model-manager.catalogGithubVerifyTls" . | quote }}
         {{- end }}
         {{- end }}
         - name: AIOLI_DB_HOST
@@ -269,5 +269,5 @@ spec:
       volumes:
       - name: catalog-storage
         persistentVolumeClaim:
-          claimName: {{ include "model-downloader.fullname" . }}-catalog
+          claimName: {{ include "model-manager.fullname" . }}-catalog
       {{- end }}

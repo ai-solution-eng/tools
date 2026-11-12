@@ -113,11 +113,7 @@ def _render_docs(*sets: str) -> list:
 def _deployment_env(docs: list) -> dict:
     """Map of env name -> value for the app container (valueFrom entries skipped)."""
     dep = next(d for d in docs if d["kind"] == "Deployment")
-    return {
-        e["name"]: e.get("value")
-        for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]
-        if "value" in e
-    }
+    return {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
 
 
 class TestManualDeleteDisabled:
@@ -138,8 +134,17 @@ class TestManualDeleteEnabled:
 
     def test_placeholders_admission_and_shape(self):
         job = _job(_render("manualDelete.enabled=true"), "manual-delete-job.yaml")
-        for ph in ("__JOB_NAME__", "__NAMESPACE__", "__PVC_NAME__", "__MOUNT_PATH__",
-                   "__SCAN_ROOT__", "__IMAGE__", "__TARGETS_B64__", "__ACTOR__", "__JOB_TTL__"):
+        for ph in (
+            "__JOB_NAME__",
+            "__NAMESPACE__",
+            "__PVC_NAME__",
+            "__MOUNT_PATH__",
+            "__SCAN_ROOT__",
+            "__IMAGE__",
+            "__TARGETS_B64__",
+            "__ACTOR__",
+            "__JOB_TTL__",
+        ):
             assert ph in job, ph
         # Admission copied verbatim from the GC CronJob / scanner Job.
         assert "hpe-ezua/app: mlis" in job
@@ -205,8 +210,8 @@ class TestManualDeleteEnabled:
 
     def test_managed_by_labels(self):
         job = _job(_render("manualDelete.enabled=true"), "manual-delete-job.yaml")
-        assert "app.kubernetes.io/managed-by: model-downloader-delete" in job
-        assert 'model-downloader/delete: "true"' in job
+        assert "app.kubernetes.io/managed-by: model-manager-delete" in job
+        assert 'model-manager/delete: "true"' in job
 
     def test_targets_b64_is_plain_env_value(self):
         job = _job(_render("manualDelete.enabled=true"), "manual-delete-job.yaml")
@@ -221,9 +226,7 @@ class TestManualDeleteEnabled:
         assert env["MANUAL_DELETE_SECRET_NAMESPACE"] == "project-user-x"
 
     def test_secret_namespace_override(self):
-        env = _deployment_env(
-            _render_docs("manualDelete.enabled=true", "manualDelete.auth.secret.namespace=mlis")
-        )
+        env = _deployment_env(_render_docs("manualDelete.enabled=true", "manualDelete.auth.secret.namespace=mlis"))
         assert env["MANUAL_DELETE_SECRET_NAMESPACE"] == "mlis"
 
     def test_admin_group_defaults_to_pcai_admin(self):

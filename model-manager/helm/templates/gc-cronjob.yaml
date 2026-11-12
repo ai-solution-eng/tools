@@ -8,7 +8,7 @@
 # Kyverno policy admits it (on hosted trials apply the documented
 # job-controller NotEquals platform-policy patch — see README).
 #
-# The pipeline mirrors src/model_downloader/app/gc.py (the report side):
+# The pipeline mirrors src/model_manager/app/gc.py (the report side):
 #   enumerate models--* dirs under the scan root (du bytes + mtime)
 #   -> TTL line (gc.ttlDays) + LRU floor (gc.minKeep)
 #   -> AIOLI cross-check: cache-dir name / repo id appearing in a
@@ -26,11 +26,11 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-gc
+  name: {{ include "model-manager.fullname" . }}-gc
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
-    app.kubernetes.io/managed-by: model-downloader-gc
+    {{- include "model-manager.labels" . | nindent 4 }}
+    app.kubernetes.io/managed-by: model-manager-gc
 spec:
   schedule: {{ .Values.gc.schedule | quote }}
   concurrencyPolicy: {{ .Values.gc.concurrencyPolicy }}
@@ -49,7 +49,7 @@ spec:
             hpe-ezua/disable-sc: "true"
           labels:
             hpe-ezua/app: mlis
-            app.kubernetes.io/managed-by: model-downloader-gc
+            app.kubernetes.io/managed-by: model-manager-gc
         spec:
           restartPolicy: Never
           containers:
@@ -76,8 +76,8 @@ spec:
               AIOLI_SECRET_NS="{{ .Values.aioli.dbPasswordSecret.namespace }}"
               AIOLI_SECRET_KEY="{{ .Values.aioli.dbPasswordSecret.key }}"
               MANAGED_LABEL="app.kubernetes.io/managed-by"
-              CACHE_ROOT_ANNOTATION="model-downloader/cache-root"
-              MODEL_NAME_ANNOTATION="model-downloader/model-name"
+              CACHE_ROOT_ANNOTATION="model-manager/cache-root"
+              MODEL_NAME_ANNOTATION="model-manager/model-name"
               # The gc pod reuses the downloader ServiceAccount; it needs the
               # kubernetes python package the app image ships but the scanner
               # image may not — probe once and degrade to the documented
@@ -106,14 +106,21 @@ spec:
                       config.load_kube_config()
                   batch = client.BatchV1Api()
                   jobs = []
-                  selector = "app.kubernetes.io/managed-by in (model-downloader,model-downloader-debug,model-downloader-scan)"
+                  selector = "app.kubernetes.io/managed-by in (model-manager,model-downloader,model-manager-debug,model-downloader-debug,model-manager-scan,model-downloader-scan)"
                   for j in batch.list_job_for_all_namespaces(label_selector=selector).items:
                       ann = j.metadata.annotations or {}
                       jobs.append({
                           "namespace": j.metadata.namespace,
                           "job_name": j.metadata.name,
-                          "model_name": ann.get("model-downloader/model-name", ""),
-                          "cache_root": (ann.get("model-downloader/cache-root", "") or "").rstrip("/"),
+                          # Canonical key first; the legacy model-downloader
+                          # key is deprecated but still read.
+                          "model_name": ann.get("model-manager/model-name")
+                          or ann.get("model-downloader/model-name", ""),
+                          "cache_root": (
+                              ann.get("model-manager/cache-root")
+                              or ann.get("model-downloader/cache-root", "")
+                              or ""
+                          ).rstrip("/"),
                       })
                   with open(os.environ["LIVE_JOBS_FILE"], "w") as fh:
                       json.dump(jobs, fh)

@@ -15,7 +15,7 @@ import shutil
 
 import pytest
 
-from model_downloader.app.delete_targets import (
+from model_manager.app.delete_targets import (
     build_entries,
     decode_targets,
     run,
@@ -33,7 +33,7 @@ def make_model(root, name="models--acme--Alpha", manifest=True):
     os.makedirs(path, exist_ok=True)
     if manifest:
         with open(os.path.join(path, "manifest.json"), "w") as fh:
-            json.dump({"schema": "model-downloader.provenance/1.0", "scan": {"verdict": "clean"}}, fh)
+            json.dump({"schema": "model-manager.provenance/1.0", "scan": {"verdict": "clean"}}, fh)
     return path
 
 
@@ -135,7 +135,14 @@ def test_run_hides_the_directory_before_deleting_it(tmp_path):
     # .deleting- sibling first, which the glob no longer matches.
     path = make_model(tmp_path)
     rec = Recorder()
-    code = run(targets=[{"cachepath": path, "override": False}], scan_root=str(tmp_path), actor="andrew", job="md-delete-1", remove=rec, write_tombstone=False)
+    code = run(
+        targets=[{"cachepath": path, "override": False}],
+        scan_root=str(tmp_path),
+        actor="andrew",
+        job="md-delete-1",
+        remove=rec,
+        write_tombstone=False,
+    )
     assert code == 0
     assert len(rec.calls) == 1
     pending = rec.calls[0]
@@ -151,7 +158,11 @@ def test_run_aborts_on_structural_failure(tmp_path):
     rec = Recorder()
     code = run(
         targets=[{"cachepath": path, "override": False}, {"cachepath": link, "override": False}],
-        scan_root=str(tmp_path), actor="a", job="j", remove=rec, write_tombstone=False,
+        scan_root=str(tmp_path),
+        actor="a",
+        job="j",
+        remove=rec,
+        write_tombstone=False,
     )
     assert code == 1
     assert rec.calls == []  # the good target is NOT deleted either
@@ -167,7 +178,9 @@ def test_run_records_a_vanished_target_as_a_skip(tmp_path):
     path = make_model(tmp_path)
     shutil.rmtree(path)
     rec = Recorder()
-    code = run(targets=[{"cachepath": path}], scan_root=str(tmp_path), actor="a", job="j", remove=rec, write_tombstone=False)
+    code = run(
+        targets=[{"cachepath": path}], scan_root=str(tmp_path), actor="a", job="j", remove=rec, write_tombstone=False
+    )
     assert code == 1  # nothing deleted -> non-zero
     assert rec.calls == []
 
@@ -185,7 +198,17 @@ def test_run_fails_when_a_delete_fails(tmp_path):
     def boom(_):
         raise OSError("nope")
 
-    assert run(targets=[{"cachepath": path}], scan_root=str(tmp_path), actor="a", job="j", remove=boom, write_tombstone=False) == 1
+    assert (
+        run(
+            targets=[{"cachepath": path}],
+            scan_root=str(tmp_path),
+            actor="a",
+            job="j",
+            remove=boom,
+            write_tombstone=False,
+        )
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +266,7 @@ def test_tombstone_copies_the_manifest(tmp_path):
     payload = tombstone(entry, actor="andrew", job="md-delete-1", override=True, verdict="soft_block")
     assert payload["actor"] == "andrew"
     assert payload["path"] == path
-    assert payload["manifest"]["schema"] == "model-downloader.provenance/1.0"
+    assert payload["manifest"]["schema"] == "model-manager.provenance/1.0"
     assert payload["override"] is True
     assert payload["verdict"] == "soft_block"
 

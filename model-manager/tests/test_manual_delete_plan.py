@@ -13,7 +13,7 @@ The contract this pins down:
   closed; this must follow the CronJob).
 """
 
-from model_downloader.app.gc import (
+from model_manager.app.gc import (
     VERDICT_BLOCK,
     VERDICT_DELETABLE,
     VERDICT_SOFT_BLOCK,
@@ -169,7 +169,10 @@ def test_a_custom_cache_root_uri_protects_the_model():
     # not as <org>/<Repo>: pvc://models-pvc/large-models/Cohere202603. Neither
     # the cache-dir name nor the repo id appears in that uri, so name matching
     # alone reported an actively-serving model as deletable.
-    e = entry("CohereLabs/cohere-transcribe-03-2026", cachepath="/mnt/large-models/Cohere202603/models--CohereLabs--cohere-transcribe-03-2026")
+    e = entry(
+        "CohereLabs/cohere-transcribe-03-2026",
+        cachepath="/mnt/large-models/Cohere202603/models--CohereLabs--cohere-transcribe-03-2026",
+    )
     uri = "pvc://models-pvc/large-models/Cohere202603?containerPath=/mnt/models"
     (row,) = verdict_of([e], aioli_uris=[uri])
     assert row["verdict"] == VERDICT_SOFT_BLOCK
@@ -209,11 +212,13 @@ def test_unknown_manifest_warns_but_allows():
 
 
 def test_delete_jobs_are_dropped_from_the_live_job_list():
-    # A legacy delete Job carrying the scan root as its cache-root blocked the
-    # whole page; delete Jobs must never count as use.
+    # A delete Job carrying the scan root as its cache-root blocked the whole
+    # page; delete Jobs must never count as use. Both the canonical and the
+    # deprecated managed-by values are dropped.
     jobs = [
-        {"job_name": "md-delete-abc", "managed_by": "model-downloader-delete", "cache_root": "/mnt/large-models"},
-        {"job_name": "md-x", "managed_by": "model-downloader", "cache_root": "/mnt/large-models"},
+        {"job_name": "md-delete-abc", "managed_by": "model-manager-delete", "cache_root": "/mnt/large-models"},
+        {"job_name": "md-delete-legacy", "managed_by": "model-downloader-delete", "cache_root": "/mnt/large-models"},
+        {"job_name": "md-x", "managed_by": "model-manager", "cache_root": "/mnt/large-models"},
     ]
     kept = drop_delete_jobs(jobs)
     assert [j["job_name"] for j in kept] == ["md-x"]

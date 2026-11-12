@@ -1,17 +1,37 @@
-# mooncake — a PVC-backed KV-cache store for PCAI
+# Mooncake — a shared KV-cache store for PCAI
 
 A PCAI (HPE Private Cloud AI / Ezmeral Unified Analytics) application that runs
-**Mooncake Store** as a cluster-wide KV-cache pool, plus a read-only dashboard that
-shows how the pool and each model deployment are doing.
+**Mooncake Store** as a cluster-wide **KV-cache pool** for LLM serving, plus a
+read-only dashboard that shows how the pool and each model deployment are doing.
+Chart: `mooncake` 0.2.4 (image `kvcacheai/mooncake:0.3.14-cuda12`).
 
-Model deployments (SGLang on this fleet) use it as a shared **L3 HiCache tier**: a
-prefix computed by one replica can be reused by any other replica of the same model,
-on any node, after a restart. Several models can share the same store — they are
-isolated by key prefix and never see each other's KV.
+---
 
-**The capacity tier is a PVC per store pod** (a StatefulSet volume claim template), so
-the pool is as large as the storage class you point it at — on G2, HPE Alletra
-class the cluster exposes — and it survives pod restarts and reschedules.
+## 1. What it is
+
+**A KV cache** is the attention state (keys and values) a large language model
+computes while reading a prompt. Recomputing it — *prefill* — is the expensive part
+of a request, and it is repeated from scratch whenever the same prompt prefix is
+served again: a shared system prompt, a document the user references twice, a
+conversation continued after the process restarted.
+
+**Mooncake Store is where those KV pages live outside the model's own process.**
+Model deployments (SGLang on this fleet) use it as a shared **L3 HiCache tier** —
+the third level of SGLang's hierarchical cache, after L1 (GPU memory) and
+L2 (host DRAM), both of which die with the process. With an L3 tier:
+
+- a prefix computed by **one replica** is reused by **any other replica** of the
+  same model, on any node, after a restart — one prefill serves the whole fleet;
+- cache capacity comes from a **dedicated store deployment** (no GPU needed) instead
+  of what one serving node happens to have free;
+- it is a *cache*, not storage: an evicted page is a miss that gets recomputed,
+  never an error.
+
+**The capacity tier is a PVC**: each store pod owns one persistent volume claim
+(StatefulSet volume claim template), so the pool is as large as the storage class
+you point it at (on G2: `gl4f-filesystem`, VAST CSI) and it survives pod restarts
+and reschedules. A small DRAM segment inside each pod is the hot tier in front of
+it — the two are sized independently (see [documentation/FEATURES.md](documentation/FEATURES.md)).
 
 ```
                  ┌───────────────────────────────┐
@@ -34,145 +54,178 @@ class the cluster exposes — and it survives pod restarts and reschedules.
 └───────────────────┘   └────────────────────┘   └────────────────────┘
 ```
 
-## Layout
+(Numbers are the G2 demo footprint; yours will differ with your values.)
 
-```
-mooncake-pcai/
-├── README.md
-├── helm/                       # the chart (packaged from here)
-│   ├── Chart.yaml
-│   ├── values.yaml
-│   ├── .helmignore
-│   ├── PORTING.md              # what was changed for PCAI, and why
-│   ├── files/app.py            # the dashboard app (stdlib Python, ConfigMap-mounted)
-│   ├── templates/
-│   ├── values-examples/        # site overlays (values.g2.yaml)
-│   └── local/                  # your site values, ignored by packaging
-├── documentation/
-│   ├── ARCHITECTURE.md         # components, data flow, the two storage tiers
-│   ├── DEPLOYMENT.md           # install + how to point model deployments at it
-│   ├── PRODUCTION.md           # transport, availability, capacity, the known gaps
-│   └── THEMING.md              # the Auto/Light/Dark pattern, reusable in other apps
-├── scripts/
-│   └── patch-model-mooncake.py # make an InferenceService a client (tcp or rdma)
-└── ezapp/                      # PCAI import artifact (EzAppConfig + logo)
-```
+## 2. The problem it solves
 
-## Quick start
+- **Replicas recompute the same prefixes.** → One shared pool: replica B reads what
+  replica A already wrote, isolated by key prefix so models never see each other's KV.
+- **A restart or reschedule empties the cache.** → The PVC-backed tier outlives the
+  pod; a restarted replica starts with its L3 full.
+- **Per-replica file caches don't share and die with the pod** (and SGLang's file
+  backend has no eviction cap by default). → A pooled, quota-capped store outside the
+  serving pods.
+- **Nobody can see whether the cache is helping.** → The dashboard: pool capacity,
+  keys, clients, throughput, and each model replica's own cache hit rate.
+- **Cache capacity is bounded by one node's RAM.** → Pooling across N store pods on
+  network storage, with per-PVC quotas.
+
+## 3. How it fits in PCAI
+
+| Direction | What |
+|---|---|
+| Depends on | the PCAI gateway (`istio-system/ezaf-gateway`) for the dashboard URL; a storage class for the PVC tier (G2: `gl4f-filesystem`) |
+| What depends on it | model deployments patched into **clients** — a per-model change, not a chart value ([DEPLOYMENT.md §5](documentation/DEPLOYMENT.md#5-pointing-a-model-deployment-at-the-store)) |
+| What it does not do | no GPU work, no model serving, no data loss on evict — it is a cache tier |
+
+The chart is PCAI-ported: `ezua` block, VirtualService, optional oauth2-proxy SSO
+gate, `hpe-ezua/` labels — see [helm/PORTING.md](helm/PORTING.md).
+
+## 4. Capabilities, by theme
+
+One line each with the design rationale; depth in [documentation/FEATURES.md](documentation/FEATURES.md).
+
+- **A shared pool any model deployment can join** — key-prefix isolation, tenant
+  scoping, pool-wide SSD quota; eviction and client-TTL make a shared pool safe
+  ([FEATURES: the pool](documentation/FEATURES.md#the-pool-a-control-plane-plus-data-pods)).
+- **Two sizing tiers, not one** — DRAM hot tier (`segmentSize`) + PVC capacity tier
+  (`persistence.size`); a PVC is a quota, not a reservation
+  ([FEATURES: the two sizing tiers](documentation/FEATURES.md#the-two-sizing-tiers-dram-hot-pvc-capacity)).
+- **Transport is one decision for the whole pool** — TCP default (no devices, no
+  silent failure) or RDMA (throughput, plus the silent-fallback trap); shipped as
+  profile files, chosen last on the command line
+  ([FEATURES: transport](documentation/FEATURES.md#transport-one-decision-for-the-whole-pool)).
+- **A read-only dashboard** — discovers clients by their env var, renders pool and
+  per-replica cache state, reads PVCs for the honest disk denominator, ships reader
+  RBAC, SSO-gateable
+  ([FEATURES: the dashboard](documentation/FEATURES.md#the-read-only-dashboard)).
+- **An optional metadata token** — the embedded metadata server's fail-closed
+  default, wired as one Secret reaching master, stores and clients
+  ([FEATURES: the metadata token](documentation/FEATURES.md#the-metadata-token-optional-fail-closed-by-construction)).
+- **PCAI-native theming** — Auto/Light/Dark matching the operator UI
+  ([THEMING.md](documentation/THEMING.md)).
+
+## 5. Deploy on PCAI (one screen)
+
+The PCAI path is: import the packaged chart once, then the only operator surface is
+the values editor. Full procedure: [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
+
+1. **Prerequisites** — a storage class (G2: `gl4f-filesystem`); for RDMA only, the
+   Kyverno client policy (`deploy/kyverno-mlis-mooncake-rdma.yaml`) and nodes with
+   the RDMA device plugin. No Secrets are required for the TCP default.
+2. **Import the chart** — AI Essentials → Tools & Frameworks → Import Framework,
+   upload `mooncake-0.2.4.tar.gz` (rebuild with `./automation.sh`).
+3. **Set the values** — the Helm Values editor; start from
+   [`helm/local/values.g2.yaml`](helm/local/values.g2.yaml) (the G2 demo shape:
+   3 × 350Gi, 16 GB DRAM per pod, TCP) or
+   [`helm/values-examples/values.g2.yaml`](helm/values-examples/values.g2.yaml)
+   (generic template, 3 × 1Ti), plus a transport profile.
+4. **Apply** — PCAI creates the namespace, renders the templates, substitutes the
+   domain, and installs.
+5. **Verify** — pods and PVCs up; the master log shows its storage line; open
+   `https://mooncake.<your-domain>` and the dashboard loads
+   ([DEPLOYMENT.md §4](documentation/DEPLOYMENT.md#4-import-and-install)).
+
+## 6. Prerequisites at a glance
+
+**Secrets** (create with `kubectl create secret`; details in
+[DEPLOYMENT.md §2](documentation/DEPLOYMENT.md#2-prerequisites)):
+
+| Secret | Keys | Used by | Purpose | Failure mode |
+|---|---|---|---|---|
+| *(none required — TCP default)* | — | — | — | — |
+| master metadata token (optional) | `metadata-token` (name set by `master.metadata.existingSecretKey`) | master + store pods + every client (`MC_METADATA_HTTP_TOKEN`) | authenticates the transfer-engine metadata server | half-configured token → clients register but cannot transfer; missing token with `allowInsecure: false` → master refuses to bind |
+
+**Patches / cluster objects:**
+
+| Object | Why it is needed | What breaks without it | Verify |
+|---|---|---|---|
+| A storage class (G2: `gl4f-filesystem`) | the PVC capacity tier | store PVCs stay `Pending`, pods stuck in `ContainerCreating` | `kubectl get sc`; PVCs `Bound` after install |
+| `deploy/kyverno-mlis-mooncake-rdma.yaml` (mutating policy) | injects the per-pod identity fields the client recipe uses | client boots, transfer fails at dial time | server-side dry run — [deploy/README.md](deploy/README.md) |
+| (RDMA only) NVIDIA RDMA shared-device plugin + nodes advertising `rdma/rdma_shared_device_a` + `/dev/infiniband` on the nodes | the device the store and clients register | pod `Pending` on the resource limit, or **silent** TCP fallback — serving with a cache that is never used | `ibv_devices` inside a store pod; set `MC_FORCE_HCA=true` on clients to make a fallback a boot error |
+| (clients only) Knative feature gates `kubernetes.podspec-fieldref` and `kubernetes.podspec-securitycontext` **closed** | the Kyverno policy is the only path to per-pod podSpec identity on this platform | — | `kubectl -n knative-serving get cm config-knative-serving` (G2: closed) |
+
+**External dependencies:** model deployments running **SGLang v0.5.22 or newer**
+whose image ships the `mooncake` python module (check:
+`python3 -c "import mooncake; print(mooncake.__version__)"` from inside the
+cluster), reachable at `mooncake-master.<ns>.svc.cluster.local`.
+
+## 7. Day-2
+
+- **Upgrade** — import the new chart version, keep your values, re-apply. The pool
+  keeps serving; clients miss until the pool refills.
+- **Health** — the dashboard (capacity, keys, clients, hit rate);
+  `kubectl -n <ns> logs deploy/mooncake-master | tail` (the storage line);
+  `curl /metrics/summary` via port-forward on 9003.
+- **Logs** — master (control plane), store pods (transfers), UI (scrapes).
+- **Uninstall** — deletes the pool, including the PVCs. There is no backup/restore by
+  design; cache state is worth its read-back rate.
+- **Troubleshooting** — the failure-mode table in
+  [DEPLOYMENT.md §9](documentation/DEPLOYMENT.md#9-troubleshooting);
+  [PRODUCTION.md](documentation/PRODUCTION.md) for transport, availability, capacity
+  and the known gaps.
+
+## 8. Documentation map
+
+| File | Answers |
+|---|---|
+| [README.md](README.md) | what it is, how to deploy it, where to go deeper |
+| [documentation/FEATURES.md](documentation/FEATURES.md) | every capability and the reason it is designed that way |
+| [documentation/ARCHITECTURE.md](documentation/ARCHITECTURE.md) | components, data flow, the two storage tiers, thin-pool physics |
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | PCAI-way deployment, prerequisites, values, the client recipe, upgrades, troubleshooting |
+| [documentation/PRODUCTION.md](documentation/PRODUCTION.md) | transport decisions, availability, capacity, known gaps |
+| [documentation/THEMING.md](documentation/THEMING.md) | the Auto/Light/Dark pattern (reusable in other apps) |
+| [documentation/CLIENT-DEEPSEEK-V4.1.md](documentation/CLIENT-DEEPSEEK-V4.1.md) | a worked, minimal client diff for the live G2 predictor |
+| [helm/PORTING.md](helm/PORTING.md) | what was changed from the upstream chart, and why |
+| [deploy/README.md](deploy/README.md) | the Kyverno client policy and how to verify it fires |
+| [helm/values-examples/README.md](helm/values-examples/README.md) | the paste-ready site values and the transport profiles |
+| [helm/local/README.md](helm/local/README.md) | where your real site values live (never packaged) |
+
+## 9. Developing and releasing (not the deployment path)
+
+`helm install` / `helm upgrade` / plain `kubectl apply` are the developer and
+secondary paths — on PCAI the chart is imported and only its values are edited.
 
 ```bash
-# site values: 3 store pods x 350Gi (~1.05 TiB), gl4f-filesystem, 16 GB DRAM/pod
-# then a transport profile: tcp (the default) — values.transport-rdma.yaml for RDMA
-helm install mooncake ./helm \
-  --namespace mooncake --create-namespace \
+# developer install with the G2 demo shape + the TCP profile
+helm install mooncake ./helm --namespace mooncake --create-namespace \
   -f helm/local/values.g2.yaml \
   -f helm/values-examples/values.transport-tcp.yaml
 ```
 
-That file is the **demo** footprint (3 x 350Gi). `helm/values-examples/values.g2.yaml` is
-the same shape sized as a generic template (3 x 1Ti) with a placeholder host and class,
-for sharing.
+- **Releasing** — `./automation.sh release` rebuilds the root
+  `mooncake-<chart version>.tar.gz`, bumps nothing manually (the version comes from
+  `helm/Chart.yaml`), and prunes stale archives. The PCAI artifact lives in
+  `ezapp/` (EzAppConfig + logo + values override).
+- **Delivery mirror** — the repo is mirrored into
+  `../pcai-solutions/tools/mooncake-pcai` by the shared hardlinker
+  (`python3 hardlinker.py -c hardlink_config.json`, dry-run by default). The mirror
+  is built from **hardlinks**: an edit in either tree is the same inode — never copy
+  files between them, and never rewrite one with a temp-file-and-rename. It carries
+  the chart, docs, the ezapp artifact and the packaged tarball; `helm/local/`,
+  caches and stale archives are ignored. Each run is gated by
+  `pcai_utils/secret_scan.sh`, and `bash ../pcai_utils/fleet_drift_check.sh` proves
+  the shared files are still true hardlinks (this repo is in that gate's scan set).
 
-Then open `https://mooncake.<your-domain>` (or port-forward the UI service) and follow
-[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) to add a model deployment as
-a client.
+## 10. Repository layout
 
-### Import the PCAI way
-
-```bash
-helm package ./helm                             # -> ./mooncake-<version>.tgz (repo root)
-# upload that archive in AI Essentials -> Tools & Frameworks -> Import Framework
-#   (./automation.sh <version> does this and the pruning: helm-p yields
-#    mooncake-<version>.tar.gz, plain helm package yields .tgz),
-# or apply the pre-built artifact:
-kubectl apply -f ezapp/ezappconfig-mooncake.yaml
 ```
-
-The artifact installs into the `mooncake` namespace and publishes
-`mooncake.${DOMAIN_NAME}`. Its values are `ezapp/values-override.yaml`; change them and
-re-run `python3 ezapp/make_ezappconfig.py` to regenerate.
-
-## Sizing: two tiers, not one
-
-| Tier | Value | What it is |
-|---|---|---|
-| DRAM hot cache | `store.segmentSize` (default `8gb`) | registered host memory **inside the store pod**. The store serves pages from here at memory speed. **Not pod storage — a PVC cannot replace it.** |
-| PVC capacity | `store.persistence.size` (default `500Gi`) | one PVC per store pod, from the StatefulSet volume claim template. The bulk of the pool. Survives restarts. |
-
-Pool ≈ `replicaCount x (segmentSize + PVC size)`, independent of how many models or
-replicas use it.
-
-| | 3 pods give |
-|---|---|
-| Chart defaults (`values.yaml`) | 24 GB DRAM + 1.5 TiB PVC |
-| G2 site file (`helm/local/values.g2.yaml`) | 48 GB DRAM + **~1.05 TiB PVC** |
-
-## The dashboard
-
-Two panels, refreshed from a cached snapshot every 30 s in the browser and re-read from
-the cluster every `ui.refreshIntervalSeconds` (default 1800 s = 30 min) in the backend,
-with a **Refresh** button for an immediate re-read:
-
-- **Store** — capacity, used %, keys, clients, segments, evictions, allocation failures.
-- **Models** — per model deployment: replicas, node, KV pool size (tokens), used tokens,
-  token-usage %, cache-hit rate. Models are auto-discovered: pods carrying a
-  `MOONCAKE_MASTER` env var, grouped by the `serving.kserve.io/inferenceservice` label.
-
-> Per-model *store* usage (how many keys a model holds) is **not** exposed by Mooncake:
-> the master reports pool-wide counters only. The Models panel therefore shows each
-> replica's own cache state, which is what actually predicts behaviour.
-
-## Limitations worth knowing
-
-- **Single master = single point of failure.** HA needs etcd and is out of scope; a
-  master restart empties the pool metadata (the PVC data survives, the index does not).
-- **It is a cache, not storage.** Losing a store pod loses its DRAM share; the PVC
-  survives, but objects whose metadata died with the master are misses.
-- **Protocol is one-size.** The store sets it at install time and every client must match
-  it. TCP is the default and what the G2 site file pins; RDMA is a supported one-file switch
-  (`helm/values-examples/values.transport-rdma.yaml`) that needs the device mounted on the
-  store pods and the client policy in place — see
-  [documentation/DEPLOYMENT.md §4.0](documentation/DEPLOYMENT.md).
-- **Network storage latency.** The PVCs are network-attached (VAST CSI today): fine for a cache
-  tier, but restore latency is higher than local NVMe. Keep the DRAM segment big enough
-  to absorb the hot set.
-
-## Releasing
-
-`./automation.sh <version>` is the fleet-standard release entry point (same
-`bump -> package -> prune` interface as the other PCAI repos):
-
-```bash
-./automation.sh 0.2.3      # bump chart -> helm-p -> prune old chart archives
+MooncakePCAI/
+├── README.md
+├── helm/                       # the chart (packaged from here)
+│   ├── Chart.yaml              # mooncake 0.2.4
+│   ├── values.yaml             # base values; read the storage-model header
+│   ├── PORTING.md              # what was changed for PCAI, and why
+│   ├── files/app.py            # the dashboard app (stdlib Python, ConfigMap-mounted)
+│   ├── templates/              # master, store StatefulSet, UI, RBAC, VirtualService...
+│   ├── values-examples/        # site overlays: values.g2.yaml + transport profiles
+│   └── local/                  # your real site values — never packaged
+├── documentation/              # FEATURES, ARCHITECTURE, DEPLOYMENT, PRODUCTION,
+│                               # THEMING, CLIENT-DEEPSEEK-V4.1 (a worked client diff)
+├── deploy/                     # kyverno-mlis-mooncake-rdma.yaml + its README
+├── scripts/
+│   └── patch-model-mooncake.py # make an InferenceService a client (tcp or rdma)
+├── ezapp/                      # PCAI import artifact (EzAppConfig + logo + values)
+├── automation.sh               # release pipeline (build + prune + scan)
+└── hardlinker.py               # delivery-mirror tooling (pcai_utils)
 ```
-
-It bumps `helm/Chart.yaml` `version`/`appVersion` through the shared
-`bump_version.sh`, packages the chart with `helm-p` (falling back to plain
-`helm package` when that wrapper is not on `PATH`), and prunes stale
-`mooncake-*.tar.gz` / `*.tgz` archives from the repo root with the shared
-`prune_charts.py` (newest per chart kept). The script fails closed if the
-chart version did not actually move.
-
-There is **no image build step**: the chart deploys the upstream
-`kvcacheai/mooncake` image, and its `image.tag` (`0.3.14-cuda12`) is a
-third-party pin — a mooncake release moves the chart version only.
-
-## Delivery mirror
-
-The repo is mirrored into `../pcai-solutions/tools/mooncake-pcai` (the
-git-tracked delivery tree) by the shared hardlinker:
-
-```bash
-python3 hardlinker.py -c hardlink_config.json          # preview (config is dry_run: true)
-python3 hardlinker.py -c hardlink_config.json --run    # apply; add --prune to drop orphans
-```
-
-The mirror is built from **hardlinks**, so an edit in either tree is the same
-inode — never copy files between them, and never rewrite one with a
-temp-file-and-rename. It carries the chart, docs, the ezapp artifact and the
-packaged `mooncake-<version>.tar.gz`; `automation.sh` and stale
-`helm/*.tgz` archives are ignored, as are the shared base rules
-(`helm/local/`, caches, `__pycache__`, and the pcai_utils toolkit files).
-Each run is gated by `pcai_utils/secret_scan.sh`, and
-`bash ../pcai_utils/fleet_drift_check.sh` proves the shared files are still
-true hardlinks (this repo is in that gate's scan set).

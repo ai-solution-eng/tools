@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src" / "model_downloader"))
+sys.path.insert(0, str(REPO / "src" / "model_manager"))
 
 from app.catalog import (  # noqa: E402
     Catalog,
@@ -33,7 +33,7 @@ from app.catalog import (  # noqa: E402
     model_node_name,
 )
 
-SEED = json.loads((REPO / "src" / "model_downloader" / "app" / "seed_catalog.json").read_text())
+SEED = json.loads((REPO / "src" / "model_manager" / "app" / "seed_catalog.json").read_text())
 
 
 def _catalog(entries):

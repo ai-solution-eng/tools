@@ -5,6 +5,37 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## Documentation waves
+
+- **2026-11-11 doc wave.** README.md restructured to the fleet's ten-section
+  spine (what it is → problem → fit → capabilities → deploy → prerequisites →
+  day-2 → doc map). FEATURES.md gains the policy-plane sections
+  (argument-level destination policy, URL guard, read+egress separation,
+  upstream credential resolution) and the 4.0/4.1 feature sections
+  (team-leader tier, agent profiles, context-window discovery and request
+  fit, response cache, OTLP/Langfuse spans, unit-aware pricing, distiller
+  playbook emission, cached-token rate prediction); the Ledger schema and
+  API group maps are reconciled with `db/schema.py`. DEPLOYMENT.md opens
+  with the deployment contract, gains the prerequisites tables (Secrets /
+  cluster objects / external dependencies) and a symptom → cause → fix
+  troubleshooting section.
+- **2026-10-07 doc wave** (relocated from a banner that used to open
+  DEPLOYMENT.md — reference docs carry the current truth, not the diff
+  history): the SSO self-mint surfaces were documented end-to-end —
+  `GET /v1/identity`, `POST /v1/keys/for-me` (one key per browser identity
+  + rotate) and the `X-API-Key` envelope — with the coupled ordered rollout
+  that turns them ON (DEPLOYMENT.md § SSO self-mint rollout). The two
+  AuthorizationPolicy relief rules were rewritten from the live-verified G2
+  findings: `allowMetricsScrape` is an ANY-SOURCE rule scoped to
+  `/metrics` (a namespace-scoped rule cannot work over raw pod IPs), and
+  `allowInClusterApi` admits unmeshed in-cluster callers with
+  `/v1/identity` + `/v1/keys/for-me` staying edge-only. The
+  `${DOMAIN_NAME}` CLI gotcha was live-verified (raw `helm upgrade` passes
+  the literal, istio's webhook DENIES the VirtualService and the release
+  fails while the AuthorizationPolicy still applies — sed-resolve first).
+  The G2-specific runbook is
+  [`changelogs/SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
+
 ## 4.0.0 — 2026-11-10
 
 - **Audit 2026-11-10 remediation wave: 8 P1, 36 P2, 47 P3 closed, plus a
