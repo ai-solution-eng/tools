@@ -158,6 +158,12 @@ dsh:
 
 provisioning:
   aptPackages: "bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"
+  # pnpm version. Three consumers must agree: docker/user/Dockerfile bakes it
+  # (ARG PNPM_VERSION, passed by scripts/build-user-image.sh from this value),
+  # and the router's init container installs it as a fallback when a unit runs
+  # on a vanilla node image. dsh-plugin-manager shells out to the bare `pnpm`
+  # command, so a unit without one cannot install plugins.
+  pnpmVersion: "9.15.9"
   # Loading screen shown while a user's pod is being provisioned/assigned.
   # When disabled the router reverts to the original blocking behavior.
   loadingUI:

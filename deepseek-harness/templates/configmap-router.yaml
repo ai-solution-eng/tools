@@ -149,10 +149,21 @@ data:
     // iframe; the edit dialog gains a Source/Rendered toggle so .md and .html
     // stay editable. Bumped so existing units re-stamp onto the new
     // data_manager.mjs + data_manager.html (subPath mounts never refresh).
+    // 45 (0.4.38): the baked dsh tree became authoritative for EXISTING units
+    // too. dsh-startup.sh re-pointed /usr/local/bin/dsh at the PVC copy on every
+    // boot, silently undoing the init container's baked-tree decision, so a
+    // version bump re-stamped a unit while it kept running the old dsh from the
+    // PVC. init now renames a real /var/dsh/data/npm aside (npm.pre-<version>)
+    // and aliases it to /opt/dsh/npm; startup prefers the PVC copy only when the
+    // image ships no baked dsh.
+    // 46 (0.4.39): dsh 0.2.2-rc.1 on node:24.22.2 (dsh declares
+    // engines.node >= 24.9.0), pnpm baked into /opt/dsh/npm for the plugin
+    // manager, and the isLoopback patch applied to EVERY lib/client*.js.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
-    // reconcile — no chart edit needed. Defaults to 42 so an install that
-    // does not set it keeps the historical value (no surprise rollout).
+    // reconcile — no chart edit needed. The code default stays frozen at 44 so an
+    // install that never sets RUNTIME_REV keeps its historical value (no
+    // surprise rollout); values.yaml ships 46.
     const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
@@ -1761,6 +1772,12 @@ data:
         // the .bashrc entry /var/dsh/data/npm/bin resolves through the alias.
         '$RUN_AS_USER sh -c \'if [ -f /opt/dsh/npm/.dsh-version ] && [ "$(cat /opt/dsh/npm/.dsh-version 2>/dev/null)" = "${DSH_VERSION}" ]; then if [ -d /var/dsh/data/npm ] && [ ! -L /var/dsh/data/npm ]; then PREV="$(cat /var/dsh/.dsh-version 2>/dev/null || echo unknown)"; DEST="/var/dsh/data/npm.pre-$PREV"; if [ -e "$DEST" ]; then DEST="$DEST.$(date +%s)"; fi; mv /var/dsh/data/npm "$DEST" 2>/dev/null || true; fi; if [ ! -e /var/dsh/data/npm ]; then ln -sfn /opt/dsh/npm /var/dsh/data/npm 2>/dev/null || true; fi; ln -sf /opt/dsh/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true; elif [ ! -f /var/dsh/data/npm/bin/dsh ] || [ "$(cat /var/dsh/.dsh-version 2>/dev/null)" != "${DSH_VERSION}" ]; then if [ -L /var/dsh/data/npm ] && [ ! -e /var/dsh/data/npm ]; then rm -f /var/dsh/data/npm; fi; HOME=/var/dsh/home npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --prefix /var/dsh/data/npm && echo "${DSH_VERSION}" > /var/dsh/.dsh-version && (ln -sf /var/dsh/data/npm/bin/dsh /usr/local/bin/dsh 2>/dev/null || true); fi\'',
         '$RUN_AS_USER sh -c \'if [ ! -x /var/dsh/bin/ttyd ] && [ ! -x /opt/dsh/bin/ttyd ]; then arch="$(uname -m)"; case "$arch" in x86_64|amd64) ttyd_asset=ttyd.x86_64 ;; aarch64|arm64) ttyd_asset=ttyd.aarch64 ;; armv7l|armhf) ttyd_asset=ttyd.armhf ;; arm*) ttyd_asset=ttyd.arm ;; *) echo "unsupported architecture for ttyd: $arch" >&2; exit 1 ;; esac; curl -fsSL --retry 3 -o /var/dsh/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${ttyd_asset}" && chmod 0755 /var/dsh/bin/ttyd; fi\'',
+        // pnpm: dsh-plugin-manager shells out to the bare `pnpm` command (see
+        // the Dockerfile). The baked image ships one under /opt/dsh/npm; a
+        // vanilla node image must still end up with one, so install it into the
+        // state PVC prefix when no pnpm exists anywhere. No-op on the baked
+        // image, and the version mirrors provisioning.pnpmVersion.
+        '$RUN_AS_USER sh -c \'if [ ! -x /opt/dsh/npm/bin/pnpm ] && [ ! -x /var/dsh/data/npm/bin/pnpm ] && [ ! -x /var/dsh/bin/pnpm ]; then HOME=/var/dsh/home npm install -g "pnpm@{{ .Values.provisioning.pnpmVersion }}" --prefix /var/dsh/data/npm 2>/dev/null || true; ln -sf /var/dsh/data/npm/bin/pnpm /usr/local/bin/pnpm 2>/dev/null || true; fi\'',
         // Compat symlinks on the state PVC: dsh-startup.sh execs
         // /var/dsh/bin/ttyd directly (and PATH carries /var/dsh/bin), so
         // alias any baked binary into /var/dsh/bin when the PVC copy is

@@ -87,11 +87,16 @@ if [ -z "$DSH_VERSION" ]; then
   echo "ERROR: could not parse dsh.version from $VALUES" >&2
   exit 1
 fi
+# provisioning.pnpmVersion — mirrors docker/user/Dockerfile's ARG PNPM_VERSION
+# and the router's init-container fallback, so all three stay on one version.
+PNPM_VERSION="$(grep -E '^  pnpmVersion:' "$VALUES" | head -1 | sed -e 's/^  pnpmVersion:[[:space:]]*//' -e 's/^"//' -e 's/"[[:space:]]*$//' || true)"
+[ -n "$PNPM_VERSION" ] || PNPM_VERSION="9.15.9"
 TAG="${TAG:-$DSH_VERSION}-dind"
 
 echo "==> values:        $VALUES"
 echo "==> dsh.version:   $DSH_VERSION"
 echo "==> ttyd version:  $TTYD_VERSION"
+echo "==> pnpm version:  $PNPM_VERSION"
 echo "==> apt packages:  $APT_PACKAGES"
 echo "==> image:         ${IMAGE_REPO}:${TAG} (${PLATFORM})"
 echo
@@ -101,6 +106,7 @@ BUILD_ARGS=(
   --build-arg "DSH_VERSION=${DSH_VERSION}"
   --build-arg "TTYD_VERSION=${TTYD_VERSION}"
   --build-arg "APT_PACKAGES=${APT_PACKAGES}"
+  --build-arg "PNPM_VERSION=${PNPM_VERSION}"
   -t "${IMAGE_REPO}:${TAG}"
 )
 
