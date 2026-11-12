@@ -115,6 +115,31 @@ else
   skip "node floor undetermined (commander '${CMDR:-none}', pinned '${PINNED_NODE:-none}')"
 fi
 
+# --- dsh's own engine floor -------------------------------------------------
+# The commander check above is NOT a substitute: it is a dependency's floor, and
+# it PASSED on a Node-22 base for a release that declares engines.node >= 24.9.0.
+# Releases without engines (<= 0.2.1-rc.2) report SKIP.
+ENGINES_NODE="$(python3 -c "
+import json
+d=json.load(open('$ROOT/package.json'))
+print((d.get('engines') or {}).get('node',''))
+")"
+say "==> engines.node requirement: ${ENGINES_NODE:-<none>}"
+EN_FLOOR="$(printf '%s' "$ENGINES_NODE" | sed -n 's/[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+if [ -n "$EN_FLOOR" ] && [ -n "$PINNED_NODE" ]; then
+  if python3 -c "
+import sys
+def t(v): return tuple(int(x) for x in v.split('.')[:3])
+sys.exit(0 if t('$PINNED_NODE') >= t('$EN_FLOOR') else 1)"; then
+    ok "node ${PINNED_NODE} satisfies engines.node ${ENGINES_NODE}"
+  else
+    bad "node ${PINNED_NODE} < engines.node ${ENGINES_NODE} - bump the FROM line in docker/user/Dockerfile"
+  fi
+else
+  skip "engines.node undetermined ('${ENGINES_NODE:-none}', pinned '${PINNED_NODE:-none}')"
+fi
+
+
 # --------------------------------------------------- transitive patch target --
 # The isLoopback patch targets @deepseek-ai/dsh-client-connection, pulled in by
 # @deepseek-ai/dsh-web-app. Resolve it the way the image's node_modules tree

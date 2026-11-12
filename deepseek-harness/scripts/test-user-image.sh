@@ -8,7 +8,7 @@
 #   2. replaying the router's REAL init guards (extracted from
 #      templates/configmap-router.yaml) against an EMPTY simulated state PVC
 #      takes the baked path — no npm install, no downloads, PVC aliases created
-#   3. an EXISTING simulated PVC (own npm copy, matching version) is respected
+#   3. an EXISTING simulated PVC (own npm copy, matching version) is migrated onto the baked
 #   4. a version-mismatched PVC falls back to the runtime npm install
 set -euo pipefail
 
@@ -105,7 +105,7 @@ mkdir -p "$SIM/empty/bin" "$SIM/empty/data" "$SIM/empty/home" "$SIM/empty/state"
 '
 
 echo
-echo "==> [3/4] existing PVC with matching dsh → respected, not clobbered"
+echo "==> [3/4] existing PVC with matching dsh → migrated onto the baked prefix"
 mkdir -p "$SIM/owned/data/npm/bin" "$SIM/owned/bin" "$SIM/owned/home"
 printf '#!/bin/sh\necho pvc-dsh\n' > "$SIM/owned/data/npm/bin/dsh"
 chmod 0755 "$SIM/owned/data/npm/bin/dsh"
@@ -114,9 +114,10 @@ echo "$DSH_VERSION" > "$SIM/owned/.dsh-version"
   -e DSH_VERSION="$DSH_VERSION" -e TTYD_VERSION=1.7.7 -e RUN_AS_USER= \
   -v "$SIM/guards.sh:/guards.sh:ro" "$IMAGE" bash -ec '
   sh /guards.sh >/dev/null 2>&1
-  [ -d /var/dsh/data/npm ] && [ ! -L /var/dsh/data/npm ] || { echo "FAIL: existing PVC npm dir was clobbered"; exit 1; }
-  [ -x /var/dsh/data/npm/bin/dsh ] || { echo "FAIL: PVC dsh removed"; exit 1; }
-  echo "  PASS: PVC copy untouched (version-consistent)"
+  [ -L /var/dsh/data/npm ] || { echo "FAIL: existing PVC npm dir was not migrated onto the baked alias"; exit 1; }
+  [ "$(readlink /var/dsh/data/npm)" = "/opt/dsh/npm" ] || { echo "FAIL: alias target wrong"; exit 1; }
+  [ -x "/var/dsh/data/npm.pre-$DSH_VERSION/bin/dsh" ] || { echo "FAIL: previous PVC tree not preserved"; exit 1; }
+  echo "  PASS: PVC tree migrated, previous copy preserved at npm.pre-$DSH_VERSION"
 '
 
 echo
