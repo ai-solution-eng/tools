@@ -41,7 +41,7 @@ os.environ["MANUAL_DELETE_SECRET_NAME"] = "model-delete-key"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from model_downloader.app import main as md  # noqa: E402
+from model_manager.app import main as md  # noqa: E402
 
 ADMIN = {"X-Auth-Request-Preferred-Username": "andrew"}
 GROUP_ADMIN = {"X-Auth-Request-Preferred-Username": "jane", "X-Auth-Request-Groups": "staff, mlis-admins"}
@@ -341,15 +341,30 @@ def test_secret_mode_rejects_empty_and_wrong(client, monkeypatch):
 
     monkeypatch.setattr(md, "_expected_delete_key", no_key)
     # no usable key configured => refuse, never "no gate"
-    assert client.post("/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": "x"}).status_code == 403
+    assert (
+        client.post(
+            "/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": "x"}
+        ).status_code
+        == 403
+    )
 
     async def good_key():
         return "s3cret"
 
     monkeypatch.setattr(md, "_expected_delete_key", good_key)
     assert client.post("/api/admin/deletions/preview", json={"targets": [PATH_A]}).status_code == 401
-    assert client.post("/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": ""}).status_code == 401
-    assert client.post("/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": "wrong"}).status_code == 403
+    assert (
+        client.post(
+            "/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": ""}
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": "wrong"}
+        ).status_code
+        == 403
+    )
     ok = client.post("/api/admin/deletions/preview", json={"targets": [PATH_A]}, headers={"X-Delete-Key": "s3cret"})
     assert ok.status_code == 200, ok.text
 
@@ -360,7 +375,9 @@ def test_secret_mode_rejects_empty_and_wrong(client, monkeypatch):
 
 
 def test_target_not_in_scan_is_rejected(client):
-    r = client.post("/api/admin/deletions/preview", json={"targets": ["/mnt/large-models/models--evil--X"]}, headers=ADMIN)
+    r = client.post(
+        "/api/admin/deletions/preview", json={"targets": ["/mnt/large-models/models--evil--X"]}, headers=ADMIN
+    )
     assert r.status_code == 422
     assert "not in the current scan" in r.json()["detail"]
 

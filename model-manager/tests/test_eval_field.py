@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src" / "model_downloader"))
+sys.path.insert(0, str(REPO / "src" / "model_manager"))
 
 from app.catalog import (  # noqa: E402
     Catalog,
@@ -37,7 +37,7 @@ from app.catalog import (  # noqa: E402
     validate_eval,
 )
 
-SEED = json.loads((REPO / "src" / "model_downloader" / "app" / "seed_catalog.json").read_text())
+SEED = json.loads((REPO / "src" / "model_manager" / "app" / "seed_catalog.json").read_text())
 
 VALID_EVAL = {
     "suite": "mmlu",
@@ -260,9 +260,9 @@ def test_config_node_carries_eval_and_badge_flag():
 
 def _import_main(tmp_path, monkeypatch):
     """Import app.main the way the wiring tests do (psycopg2 shim + env)."""
-    if "model_downloader" not in sys.modules:
+    if "model_manager" not in sys.modules:
         try:
-            import model_downloader  # noqa: F401
+            import model_manager  # noqa: F401
         except ModuleNotFoundError:
             sys.path.insert(0, str(REPO / "src"))
     import types
@@ -282,7 +282,7 @@ def _import_main(tmp_path, monkeypatch):
     monkeypatch.setenv("JOB_TEMPLATE_CONFIGMAP_NAMESPACE", "test-ns")
     monkeypatch.setenv("CATALOG_PATH", str(tmp_path / "push-test-catalog.json"))
     monkeypatch.setenv("STORAGE_BACKEND", "pvc")
-    from model_downloader.app import main as md
+    from model_manager.app import main as md
 
     return md
 
@@ -321,7 +321,7 @@ def test_push_warns_only_on_unvalidated_quant(monkeypatch, tmp_path, caplog):
         "uri": "pvc://m/l/Qwen/Qwen3.8-27B?containerPath=/mnt/models",
     }
 
-    with caplog.at_level(logging.WARNING, logger="model_downloader.app.main"):
+    with caplog.at_level(logging.WARNING, logger="model_manager.app.main"):
         out = asyncio.run(md.push_models(_Req([fp8_bad, fp8_good, bf16_plain])))
 
     # the warning never blocks: all three still push

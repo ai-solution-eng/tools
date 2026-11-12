@@ -32,8 +32,8 @@ fullnameOverride: ""
 
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
-  repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v2.1.2
+  repository: ghcr.io/ai-solution-eng/model-manager
+  tag: v2.2.0
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -341,7 +341,7 @@ catalog:
   size: 100Mi
   storageClassName: ""
   # Raw URL of the seed catalog JSON; the "Refresh from GitHub" button hides when empty.
-  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_downloader/app/seed_catalog.json"
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_manager/app/seed_catalog.json"
   # Project recorded on a packaged model that names none (empty = leave it
   # blank, the historical behaviour).  The target is MLIS's "project" filter:
   # a row with an empty project only shows under "All projects".  PCAI projects
@@ -382,7 +382,7 @@ ezua:
   domainName: "${DOMAIN_NAME}"
 
   virtualService:
-    endpoint: "model-downloader.${DOMAIN_NAME}"
+    endpoint: "model-manager.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 300s
 

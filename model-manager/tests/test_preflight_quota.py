@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from model_downloader.app.preflight import (
+from model_manager.app.preflight import (
     PreflightConfig,
     PreflightError,
     PreflightService,
@@ -26,7 +26,7 @@ from model_downloader.app.preflight import (
     repo_id_from_cache_dir,
     usage_by_namespace,
 )
-from model_downloader.app.queue import JobQueue
+from model_manager.app.queue import JobQueue
 
 # ---------------------------------------------------------------------------
 # pure math: disk preflight

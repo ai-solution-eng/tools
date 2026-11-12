@@ -1,8 +1,10 @@
 # Manual deletion of downloaded models — design note
 
-**Status:** proposal for review. No code written; nothing in the repo changed.
+**Status:** implemented and verified on the G2 cluster — see [§18 Implementation status](#18-implementation-status) for what shipped, the deltas from this design, and how to enable it.
 **Audience:** Andrew + the colleague who raised the feature.
-**Goal:** agree the shape before any `rm` exists.
+**Goal:** record the shape the feature agreed on before any `rm` existed.
+
+> **Naming note:** this design note predates the Model Downloader -> Model Manager rename, so the identifiers below use the old `model-downloader` names. The code now writes `model-manager/*` and still accepts the legacy keys on read — see [DEPLOYMENT.md §4](DEPLOYMENT.md#4-upgrade-rollback-uninstall).
 
 ---
 
@@ -20,13 +22,13 @@ deletion on request instead of on a cron schedule.
 
 - **Not a checkbox column on the Downloaded models table.** That table is a
   dedupe-by-`model_name` merge of three sources
-  ([storage.py](src/model_downloader/app/storage.py#L64-L104)), so rows can
+  ([storage.py](../src/model_manager/app/storage.py#L64-L104)), so rows can
   have an empty `cachepath`, two different directories can collapse into one
   row, and the whole `tbody` is rebuilt every 10 s
-  ([app.js](src/model_downloader/app/static/app.js#L611-L656)) which would
+  ([app.js](../src/model_manager/app/static/app.js#L611-L656)) which would
   destroy checkbox state mid-flow. The GC report rows are already
   per-cache-directory with a path, a size and a reason
-  ([gc.py](src/model_downloader/app/gc.py#L207-L237)) — that is the right
+  ([gc.py](../src/model_manager/app/gc.py#L207-L237)) — that is the right
   surface for a destructive action.
 - **Not S3 deletion.** `README.md` already scopes S3 eviction out; this stays
   consistent. A row that still lists after a PVC delete must say so in the UI.
@@ -40,9 +42,9 @@ deletion on request instead of on a cron schedule.
 
 `/api/downloaded` lists every model on the shared model PVC, cluster-wide:
 one `PVC_NAME`, one `PVC_SUBPATH`, no ownership check
-([main.py](src/model_downloader/app/main.py#L492-L538)). The app has no identity
+([main.py](../src/model_manager/app/main.py#L492-L538)). The app has no identity
 model — the only gate is an Istio `CUSTOM` AuthorizationPolicy delegating to
-oauth2-proxy ([values.yaml](helm/values.yaml#L286)), which authenticates a user
+oauth2-proxy ([values.yaml](../helm/values.yaml#L286)), which authenticates a user
 but says nothing about which models are theirs.
 
 So a plain checkbox-and-delete button would mean *any authenticated user can
@@ -156,7 +158,7 @@ per-request acknowledgement (§4), never as configuration.
 
 ### 5.1 Env wiring
 
-Same shape as the GC block ([deployment.yaml](helm/templates/deployment.yaml#L118-L133)):
+Same shape as the GC block ([deployment.yaml](../helm/templates/deployment.yaml#L118-L133)):
 values → env var → module constant in `main.py`, with the `{{- if }}` guards
 only where a zero value is meaningful.
 
@@ -174,12 +176,12 @@ only where a zero value is meaningful.
 | `manualDelete.auth.admins` | `MANUAL_DELETE_ADMINS` (comma-joined, as `GC_PROTECTED` does) |
 
 Only the Secret *name/namespace/key* cross the boundary — never the value,
-matching `AIOLI_DB_SECRET_NAME` ([deployment.yaml](helm/templates/deployment.yaml#L179-L184)).
+matching `AIOLI_DB_SECRET_NAME` ([deployment.yaml](../helm/templates/deployment.yaml#L179-L184)).
 
 `manualDelete.auth.secret.namespace: ""` must be rendered as
 `.Release.Namespace` **in the template**, not left empty for the app to
 resolve: `read_secret()` passes the namespace straight through to the API and
-an empty string fails ([k8s.py](src/model_downloader/app/k8s.py#L465-L470)).
+an empty string fails ([k8s.py](../src/model_manager/app/k8s.py#L465-L470)).
 
 ---
 
@@ -198,10 +200,10 @@ Different credential. Same *pattern*.
 
 ### 6.2 The pattern to follow
 
-`aioli.dbPasswordSecret` ([values.yaml](helm/values.yaml#L259-L262)) is the
+`aioli.dbPasswordSecret` ([values.yaml](../helm/values.yaml#L259-L262)) is the
 house style: the chart names a Secret it never creates, the operator creates it,
 and the app reads it at runtime through the Kubernetes API
-([db.py](src/model_downloader/app/db.py#L81) → [k8s.py](src/model_downloader/app/k8s.py#L465))
+([db.py](../src/model_manager/app/db.py#L81) → [k8s.py](../src/model_manager/app/k8s.py#L465))
 so the value never appears in the pod spec or in values.
 
 ```bash
@@ -277,7 +279,7 @@ Prefer (2). The raw material is already present — oauth2-proxy injects
 fleet's ratified machinery for exactly this.
 
 **Cost, stated plainly:** this app has no `pcai_utils` dependency today
-([docker/requirements.txt](docker/requirements.txt) is eight packages). That
+([docker/requirements.txt](../docker/requirements.txt) is eight packages). That
 module reaches consumers through the hardlink mesh with a drift gate, not
 `pip install`, so adopting it is a fleet-integration step. If that is too much
 for v1, ship with (1), require the Service to be ingress-only, and record the
@@ -334,7 +336,7 @@ POST /api/admin/deletions/preview
      401  missing/blank key
      403  wrong key / not in admins
      400  feature disabled — house convention is 400 + detail, as _require_gc()
-          does ([main.py](src/model_downloader/app/main.py#L544-L546))
+          does ([main.py](../src/model_manager/app/main.py#L544-L546))
      422  malformed target, or > maxTargets
 
 POST /api/admin/deletions
@@ -350,7 +352,7 @@ GET  /api/admin/deletions/{job_name}
 ```
 
 The status endpoint reads the Job's pod logs through the Kubernetes API
-directly ([k8s.py](src/model_downloader/app/k8s.py#L434)) — a delete Job is not
+directly ([k8s.py](../src/model_manager/app/k8s.py#L434)) — a delete Job is not
 a queue `JobRecord`, so `queue.get_logs()` does not apply to it.
 
 **Two modes on one endpoint.** An empty `targets` list is *list mode*: the
@@ -361,11 +363,11 @@ non-empty list is *pin mode* and issues the `verdict_id` described below.
 **`verdict_id` is the important part.** The preview resolves the selection to a
 concrete, ordered set of absolute paths and stores it server-side for a short
 TTL, in memory, single process — the same pattern as `gc_report_cache` at
-[main.py](src/model_downloader/app/main.py#L564).
+[main.py](../src/model_manager/app/main.py#L564).
 
 The clock starts when the preview **finishes**, not when it starts: the preview
 may itself run a scanner Job with a 300 s timeout
-([main.py](src/model_downloader/app/main.py#L580)), so a TTL measured from
+([main.py](../src/model_manager/app/main.py#L580)), so a TTL measured from
 request time can expire before the operator ever sees the result. Size it above
 the scan timeout (900 s), bind the id to the presenting actor so one key cannot
 consume another's preview, and cap the store (e.g. 32 entries, oldest evicted) —
@@ -380,7 +382,7 @@ so one pin authorises exactly one Job and a replayed commit cannot spawn a
 duplicate delete against directories the first Job already removed.
 
 This relies on the deployment being **one replica** (hardcoded at
-[deployment.yaml](helm/templates/deployment.yaml#L9)). If that ever changes,
+[deployment.yaml](../helm/templates/deployment.yaml#L9)). If that ever changes,
 the pinned set must move to a shared store before the second replica ships, or
 a delete can 409 on a preview the user just made.
 
@@ -391,7 +393,7 @@ programmatic POST cannot delete. The modal shows the count and total bytes.
 
 ## 8. Verdict function
 
-New pure function in [gc.py](src/model_downloader/app/gc.py), next to
+New pure function in [gc.py](../src/model_manager/app/gc.py), next to
 `build_gc_plan`, sharing its helpers (`uri_matches_cache_dir`,
 `live_job_protects`, `glob_protected`):
 
@@ -435,8 +437,8 @@ Verdict rules:
 
 **Fail-open trap to avoid.** The existing report path swallows a live-jobs
 listing failure and proceeds with an empty list
-([main.py](src/model_downloader/app/main.py#L610-L614)); the CronJob correctly
-fails closed instead ([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L121-L125)).
+([main.py](../src/model_manager/app/main.py#L610-L614)); the CronJob correctly
+fails closed instead ([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L121-L125)).
 The manual path must follow the CronJob, not the report: a jobs-API failure
 blocks every target and says why.
 
@@ -445,20 +447,20 @@ blocks every target and says why.
 ## 9. The delete Job
 
 A new `manual-delete-job.yaml` entry in the Job-template ConfigMap
-([configmap-job-template.yaml](helm/templates/configmap-job-template.yaml)),
+([configmap-job-template.yaml](../helm/templates/configmap-job-template.yaml)),
 rendered only when `manualDelete.enabled`.
 
 Admission is copied verbatim from the GC CronJob and the scan Job —
 `hpe-ezua/app: mlis`, `hpe-ezua/disable-sc: "true"`, `runAsUser: 0`,
 `sidecar.istio.io/inject: "false"` — and it must be a **Job**, not a Pod: the
 job-controller is the creator that satisfies the platformwide Kyverno
-`protect-models-pvc` policy ([configmap-job-template.yaml](helm/templates/configmap-job-template.yaml#L665-L672)).
+`protect-models-pvc` policy ([configmap-job-template.yaml](../helm/templates/configmap-job-template.yaml#L665-L672)).
 
 Differences from the scan Job, all deliberate:
 
 | | scan Job | delete Job |
 |---|---|---|
-| PVC mount | `readOnly: true` ([L854](helm/templates/configmap-job-template.yaml#L854)) | read-write, as the GC Job |
+| PVC mount | `readOnly: true` ([L854](../helm/templates/configmap-job-template.yaml#L854)) | read-write, as the GC Job |
 | targets | derived from the scan root | explicit list, `MD_TARGETS` (base64 JSON) env |
 | managed-by label | `model-downloader-scan` | `model-downloader-delete` |
 | annotations | scan flag | `model-downloader/delete-actor` only — **no `cache-root`** (below) |
@@ -469,7 +471,7 @@ Differences from the scan Job, all deliberate:
 
 The read-write mount is **not speculative**: the GC CronJob already mounts the
 same PVC read-write (no `readOnly` flag,
-[gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L322-L325)) under the same
+[gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L322-L325)) under the same
 admission labels and `runAsUser: 0`, and it is the thing that does the deleting
 today. This Job is that mount, on request, with a target list.
 
@@ -495,11 +497,11 @@ dropped from the live-job list entirely (`gc.drop_delete_jobs`).
 GC cannot see a delete in progress and the downloaded list treats it as a
 normal job:
 
-- [k8s.py](src/model_downloader/app/k8s.py#L652) `list_managed_jobs_by_annotation`
-- [gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L109) (the selector is a hardcoded string in the python pass)
+- [k8s.py](../src/model_manager/app/k8s.py#L652) `list_managed_jobs_by_annotation`
+- [gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L109) (the selector is a hardcoded string in the python pass)
 
 `gc.concurrencyPolicy: Forbid` only serializes GC-vs-GC
-([values.yaml](helm/values.yaml#L159)); it does not cover this Job. A concurrent
+([values.yaml](../helm/values.yaml#L159)); it does not cover this Job. A concurrent
 GC pass removing a directory first just fails structural validation and aborts
 the run, which is safe.
 
@@ -510,14 +512,14 @@ properties of that template make it a trap:
 
 The pod is deliberately as dumb as a download Job. It runs the **app image**
 (`python3 -m app.delete_targets`, resolved from the image's `WORKDIR /app`
-because the Dockerfile flattens `src/model_downloader/app/` to `/app/app/`),
+because the Dockerfile flattens `src/model_manager/app/` to `/app/app/`),
 mounts the PVC read-write, and makes **no Kubernetes API calls and no database
 calls**. That is exactly what lets it run in the PVC's namespace under the
 `default` ServiceAccount.
 
 The GC CronJob's shape is a trap here for two opposite reasons. It runs the
 scanner image and probes `import kubernetes`
-([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L79-L84)); and it sets no
+([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L79-L84)); and it sets no
 `serviceAccountName` at all, so its own cross-checks fail-safe to "keep
 everything". Copying the first would leave the pod without the clients it
 needs; copying the second *and* naming the app SA leaves it Pending
@@ -529,12 +531,12 @@ time, immediately before creating the Job, using the RBAC it already has. The
 pod's own checks are structural only (§9.1.1).
 
 **Payload:** `MD_TARGETS` as **base64-encoded** JSON. Template substitution is
-a literal `.replace()` ([k8s.py](src/model_downloader/app/k8s.py#L523-L527));
+a literal `.replace()` ([k8s.py](../src/model_manager/app/k8s.py#L523-L527));
 splicing raw JSON into a double-quoted YAML env value breaks on a quote or a
 newline in any path. Base64 makes the payload YAML-inert.
 
 Hosted trials need the same job-controller `NotEquals` platform patch the GC
-Job documents ([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L8-L9)).
+Job documents ([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L8-L9)).
 
 ### 9.1.1 In-pod algorithm (structural only; abort-all before any `rmtree`)
 
@@ -572,7 +574,7 @@ signal. It must stay comfortably above the slowest `rmtree`.
 The provenance `manifest.json` lives **inside** the cache directory
 (`${CACHE_ROOT}/${CACHE_ID}/manifest.json`) and dies with the `rmtree`, so
 the app's "traceability record" claim in
-[gc.py](src/model_downloader/app/gc.py#L25-L27) only holds until deletion. A
+[gc.py](../src/model_manager/app/gc.py#L25-L27) only holds until deletion. A
 manual delete therefore needs a record of its own:
 
 - **stdout JSON line per deletion**, before the `rmtree`:
@@ -596,10 +598,10 @@ created, invalidate the scanner-backed caches so the next poll is honest:
 
 - `DownloadedModelsCache` — serves PVC rows for `PVC_REFRESH_INTERVAL` and,
   with `PVC_SCAN_ENABLED` off, **never** refreshes on its own
-  ([storage.py](src/model_downloader/app/storage.py#L475-L480)). Force a rescan.
-- `gc_report_cache` — 120 s TTL ([main.py](src/model_downloader/app/main.py#L124)).
+  ([storage.py](../src/model_manager/app/storage.py#L475-L480)). Force a rescan.
+- `gc_report_cache` — 120 s TTL ([main.py](../src/model_manager/app/main.py#L124)).
 - preflight usage/size caches — 120 s / 300 s
-  ([main.py](src/model_downloader/app/main.py#L110-L111)). Freed bytes reach
+  ([main.py](../src/model_manager/app/main.py#L110-L111)). Freed bytes reach
   quota checks late; that errs toward refusal, not over-admission, so it is
   acceptable. Document it rather than fix it.
 
@@ -679,7 +681,7 @@ Helm render (`tests/test_helm_render.py` pattern):
    `app/delete_targets.py`. `./automation.sh <version>` already does this in
    the right order — it bumps the chart version and the values tag first, then
    builds and pushes the image from the bumped tree
-   ([automation.sh](automation.sh#L10-L17)). Enabling `manualDelete` against an
+   ([automation.sh](../automation.sh#L10-L17)). Enabling `manualDelete` against an
    older tag yields a Job that dies with `ModuleNotFoundError`, which is the
    one failure mode that looks like a design bug but is an ordering bug.
 1. Create the Secret (§6.2).
@@ -746,17 +748,17 @@ changes what "the GC already handles this" means.
 As shipped, the GC CronJob pod:
 
 - runs as the **`default`** service account — its pod spec sets no
-  `serviceAccountName` ([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L53-L56)),
+  `serviceAccountName` ([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L53-L56)),
   while the chart's ClusterRole is bound only to the app service account
-  ([rbac.yaml](helm/templates/rbac.yaml#L47-L49)). So its live-job list and its
+  ([rbac.yaml](../helm/templates/rbac.yaml#L47-L49)). So its live-job list and its
   AIOLI secret read are both RBAC-denied.
 - runs `downloadList.scanImage`, a basic Ubuntu image
-  ([values.yaml](helm/values.yaml#L98)) that almost certainly lacks
+  ([values.yaml](../helm/values.yaml#L98)) that almost certainly lacks
   `kubernetes` and `psycopg2`. The template itself probes for the first and
-  expects it to be absent ([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L79-L84)).
+  expects it to be absent ([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L79-L84)).
 
 Both failures land in documented fail-safes that keep everything
-([gc-cronjob.yaml](helm/templates/gc-cronjob.yaml#L264-L270)). Net effect: even
+([gc-cronjob.yaml](../helm/templates/gc-cronjob.yaml#L264-L270)). Net effect: even
 with `gc.dryRun: false` the GC Job would delete nothing, and the report would
 read as "everything is protected" rather than "the cross-checks are broken".
 
@@ -783,14 +785,14 @@ Default off; nothing can delete until `manualDelete.enabled` is flipped.
 
 | File | Role |
 |---|---|
-| [gc.py](src/model_downloader/app/gc.py) | `evaluate_manual_targets` (the verdict), `drop_delete_jobs` |
-| [delete_targets.py](src/model_downloader/app/delete_targets.py) | the in-pod module: decode, validate structurally, tombstone, rename, `rmtree` |
-| [main.py](src/model_downloader/app/main.py) | the two gates (verified identity, verdict), list/pin preview, commit-time re-verify, status |
-| [oidc_identity.py](src/model_downloader/app/oidc_identity.py) | vendored `pcai_utils` RS256/JWKS verifier (SHA-guarded) |
-| [k8s.py](src/model_downloader/app/k8s.py) | `create_delete_job`, `parse_job_templates`, `model-downloader-delete` in the live-job selector |
-| [admin_delete.html](src/model_downloader/app/templates/admin_delete.html), [admin_delete.js](src/model_downloader/app/static/admin_delete.js) | the page |
-| [values.yaml](helm/values.yaml), [deployment.yaml](helm/templates/deployment.yaml), [configmap-job-template.yaml](helm/templates/configmap-job-template.yaml) | `manualDelete` + `oidc` blocks, env wiring, the Job template |
-| [test_manual_delete_plan.py](tests/test_manual_delete_plan.py), [test_manual_delete_wiring.py](tests/test_manual_delete_wiring.py), [test_delete_targets.py](tests/test_delete_targets.py), [test_job_templates.py](tests/test_job_templates.py), [test_oidc_vendored.py](tests/test_oidc_vendored.py) | 93 tests: verdict, HTTP surface, in-pod guards, template wiring, vendored-module drift |
+| [gc.py](../src/model_manager/app/gc.py) | `evaluate_manual_targets` (the verdict), `drop_delete_jobs` |
+| [delete_targets.py](../src/model_manager/app/delete_targets.py) | the in-pod module: decode, validate structurally, tombstone, rename, `rmtree` |
+| [main.py](../src/model_manager/app/main.py) | the two gates (verified identity, verdict), list/pin preview, commit-time re-verify, status |
+| [oidc_identity.py](../src/model_manager/app/oidc_identity.py) | vendored `pcai_utils` RS256/JWKS verifier (SHA-guarded) |
+| [k8s.py](../src/model_manager/app/k8s.py) | `create_delete_job`, `parse_job_templates`, `model-downloader-delete` in the live-job selector |
+| [admin_delete.html](../src/model_manager/app/templates/admin_delete.html), [admin_delete.js](../src/model_manager/app/static/admin_delete.js) | the page |
+| [values.yaml](../helm/values.yaml), [deployment.yaml](../helm/templates/deployment.yaml), [configmap-job-template.yaml](../helm/templates/configmap-job-template.yaml) | `manualDelete` + `oidc` blocks, env wiring, the Job template |
+| [test_manual_delete_plan.py](../tests/test_manual_delete_plan.py), [test_manual_delete_wiring.py](../tests/test_manual_delete_wiring.py), [test_delete_targets.py](../tests/test_delete_targets.py), [test_job_templates.py](../tests/test_job_templates.py), [test_oidc_vendored.py](../tests/test_oidc_vendored.py) | 93 tests: verdict, HTTP surface, in-pod guards, template wiring, vendored-module drift |
 
 ### Deltas from the design as written — and the bugs they fixed
 

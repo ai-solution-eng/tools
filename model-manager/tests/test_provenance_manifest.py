@@ -118,7 +118,7 @@ def test_manifest_fields_and_files():
     assert proc.returncode == 0, proc.stderr
     m = _manifest(root)
 
-    assert m["schema"] == "model-downloader.provenance/1.0"
+    assert m["schema"] == "model-manager.provenance/1.0"
     assert m["repo"] == REPO_ID
     assert m["revision"] == commit and m["revision_requested"] == "main" and m["revision_resolved"] is True
     assert m["license"] == "llama3.2"

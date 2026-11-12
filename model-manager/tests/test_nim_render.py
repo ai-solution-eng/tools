@@ -130,9 +130,9 @@ class TestTemplateKey:
         assert template["metadata"]["annotations"]["sidecar.istio.io/inject"] == "false"
         assert template["metadata"]["annotations"]["hpe-ezua/disable-sc"] == "true"
         assert template["metadata"]["labels"]["hpe-ezua/app"] == "mlis"
-        assert template["metadata"]["labels"]["model-downloader/source"] == "nim"
-        assert job["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "model-downloader"
-        assert job["metadata"]["labels"]["model-downloader/source"] == "nim"
+        assert template["metadata"]["labels"]["model-manager/source"] == "nim"
+        assert job["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "model-manager"
+        assert job["metadata"]["labels"]["model-manager/source"] == "nim"
 
         pod = _pod_spec(job)
         assert pod["restartPolicy"] == "OnFailure"

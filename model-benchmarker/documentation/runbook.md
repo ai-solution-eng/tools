@@ -1,9 +1,9 @@
 # Runbook — benchmarking playbooks
 
-Command-first playbooks for the three benchmarking use cases. For flag-level
-reference see the README (Part 1: universal tool, Part 2: chat tool) and
-[`cli-reference.md`](cli-reference.md). Executable source of truth:
-`--help` on either entry point.
+Command-first playbooks for the benchmarking use cases. For flag-level
+reference see [`cli-reference.md`](cli-reference.md) (chat) and
+[`endpoint-benchmarker.md`](endpoint-benchmarker.md) (universal tool). Executable
+source of truth: `--help` on either entry point.
 
 ## Which tool when
 

@@ -1,12 +1,16 @@
 # The ModelBenchmarker web app (PCAI deployment)
 
-One image, one chart, three pages:
+One image, one chart: a public estimator as the default page, two
+API-key-gated benchmark launcher pages, a public results page, and the
+/unlock key form browsers land on first:
 
 | Page | Path | Access | What it does |
 |---|---|---|---|
 | **LLM memory estimator** (the default page) | / | public | Deterministic fit / KV-token / concurrency math from a model's config.json + your serving parameters. The same math as the memory-estimate CLI. |
-| **Chat benchmark** | /benchmark/chat | API key | Fire benchmark_chat (TTFT / tokens-s / ITL / TPOT / goodput) at an allowlisted OpenAI-compatible endpoint -- closed- or open-loop. |
-| **Endpoint benchmark** | /benchmark/endpoint | API key | Fire endpoint_benchmarker (any REST endpoint or MCP server, sweeps, GPU scaling curve) at an allowlisted target. |
+| **Chat benchmark** | /benchmark/chat | API key | Fire benchmark_chat (TTFT / tokens-s / ITL / TPOT / goodput) at an OpenAI-compatible endpoint -- closed- or open-loop. |
+| **Endpoint benchmark** | /benchmark/endpoint | API key | Fire endpoint_benchmarker (any REST endpoint or MCP server, sweeps, GPU scaling curve) at a validated target. |
+| **Results** | /results | public | Every run on the PVC + the committed library, the compare flow and the atom browser (measurement store). |
+| **Unlock** | /unlock | public | The key form browsers use once; stores the key in the mb-key cookie. |
 
 The benchmark pages replace the notebook flow: fill a form, launch, watch the
 log tail, download the artifacts (report.md, report.html, run.json, run.csv,
@@ -15,19 +19,25 @@ the documented CLIs; nothing about the bench engines changes.
 
 ## Deployment (PCAI)
 
-1. Import the packaged chart (model-benchmarker-<version>.tgz) into PCAI once.
-2. Create the key Secret (or let the chart auto-generate one -- see the release NOTES):
+1. Import the packaged chart (model-benchmarker-1.1.2.tar.gz) into PCAI once.
+2. Create the web-key Secret (or let the chart auto-generate one on first
+   install -- DEPLOYMENT.md, Section Required Secrets):
 
         kubectl -n <ns> create secret generic bench-platform-keys \
           --from-literal=BENCH_API_KEYS="$(openssl rand -hex 16)"
 
 3. Open the release's **Helm Values** editor and paste
    helm/values-examples/values.g2.yaml (or values.hosted-trial.yaml), then adjust
-   the "# SITE:" lines -- above all **bench.endpoints**, the allowlist of
-   benchmarkable targets, and security.existingSecret for the key.
+   the site lines -- above all **ezua.virtualService.endpoint** (keep the
+   placeholder), **bench.suggestions** (the curated target combobox), the
+   endpoint keys (bench.endpointApiKeys or the endpoint-key Secret) and
+   security.existingSecret for the key.
 4. Apply. PCAI substitutes the ${DOMAIN_NAME} placeholder before rendering.
 
-Operators with cluster access can render-check first:
+Full deployment reference -- required Secrets, cluster-object prerequisites,
+the complete values walkthrough, auth/SSO, storage lifecycle:
+[DEPLOYMENT.md](DEPLOYMENT.md). Operators with cluster access can
+render-check first:
 
     helm template <release> helm/ -f helm/values-examples/values.g2.yaml
 
@@ -42,6 +52,15 @@ controls so the estimate starts from the real deployment shape. Like the
 target suggestions, it is ADVICE ONLY: any HF repo id or local path stays
 typeable, and pasting a config.json still works offline. Config fetches are
 cached on the work dir (.hf-cache on the PVC).
+
+### The measured panel (measured beats estimated)
+
+When the committed library contains a run matching the estimator's query
+(model + context + users), the page shows the **measured** numbers with
+provenance below the estimate (measured.py's find_measured). Measured
+rows are never interpolated into the estimate itself -- the estimate stays
+its own deterministic math; the panel just tells you what was actually
+measured for this shape.
 
 ## The model dropdown (chat benchmark)
 
@@ -213,25 +232,62 @@ no latency rows). Deployed images without a `results/` tree simply hide
 the section; `BENCH_RESULTS_DIR` points at an explicit tree (an
 explicit-but-absent value disables the library).
 
-## The two gates
+### The measurement store (MB-DB) and the atom browser
 
-**1. The web-app API key** (your Secret, BENCH_API_KEYS) protects the
-benchmark surface: /benchmark/chat, /benchmark/endpoint, /api/runs*,
-/api/targets, /api/models. The fleet mcp_auth middleware enforces it (constant-time
-compare, X-API-Key or Authorization: Bearer), and keys are re-read **per
-request**, so rotating the Secret takes effect without a restart. A browser
-without the key gets a 401; the page asks for the key once and keeps it in
-sessionStorage for the tab (it never lands in a URL or a cookie). The
-estimator page and its /api/estimate are deliberately public -- deterministic
+Every completed run is decomposed into **atoms** -- one row per
+(model, ctx, users, task, ...) measurement -- and stored in a SQLite DB
+on the PVC (store.py; content-hash idempotent, so re-running a run never
+duplicates rows; SCHEMA_VERSION 1). The atom browser on /results facets
+the whole measurement corpus (model x task x context x concurrency) with
+counts, so "has anything ever measured this?" is a filter, not an
+archaeology project; when the store is still empty it falls back to the
+flat /api/results/atoms listing. Read-only APIs: GET /api/store,
+/api/store/facets, /api/store/query.
+
+## Gating and the target model
+
+**The web-app API key** (BENCH_API_KEYS -- your Secret, or the chart's
+auto-generated one) protects exactly the surface that *starts or mutates*
+work:
+
+- **Gated:** the launcher pages (`/benchmark/chat`, `/benchmark/endpoint`);
+  `POST /api/runs` (launch); `POST /api/runs/{id}/cancel`; `GET /api/targets`
+  (the launch-advice catalog); `POST /api/models` (the chat page's model-list
+  probe -- same trust as a launch); `POST /api/results/hidden` (hiding
+  entries changes the shared page for every viewer).
+- **Public by design** -- reports are the point, so links can be shared
+  without handing out the launch key: the estimator page and `/api/estimate`,
+  `/api/status`, `/results` and **every read of past runs** (GET
+  `/api/runs/{id}`, log tail, artifact downloads), `/api/results/compare`,
+  `/api/results/atoms`, `/api/store*`, `/api/catalog`, `/api/gpus`,
+  `/api/target-aliases`, `/api/models/search`, `/healthz`, `/readyz`,
+  `/unlock`.
+
+The fleet mcp_auth middleware enforces it (constant-time compare;
+X-API-Key or Authorization: Bearer, or the SSO-forwarded
+X-Auth-Request-Access-Token compared as a key envelope -- it is never
+trusted as identity), and the key set is re-read **per request**, so
+rotating the Secret to "oldkey,newkey" takes effect without a restart.
+Browser flow: a top-level navigation to a gated page without the key is
+redirected to `/unlock` (the branded sign-in); the form stores the key in
+the **mb-key cookie** for that origin, which the app lifts into X-API-Key
+on subsequent navigations. In-page fetches pass the header directly and get
+the JSON 401 the page JS handles. API clients just send the header.
+The estimator page and its API are deliberately public -- deterministic
 math, no secrets, no cluster access.
 
-**2. The endpoint allowlist** (bench.endpoints) decides *what* can be
-benchmarked. Targets are configured by the operator in chart values; the
-browser can never supply a URL. An **empty allowlist disables benchmarking
-outright** (fail-closed) while the estimator page keeps working. Endpoint API
-keys (bench.endpointApiKeys / endpointApiKeysExistingSecret) are injected
-into the bench subprocess environment (PCAI_API_KEY / a Bearer header) and
-are never served back to the browser -- the API redacts them.
+**The target model** (what can be benchmarked): the launcher comboboxes
+offer `bench.suggestions` (operator-curated name/url/kind entries) --
+**ADVICE ONLY**. Any http(s) URL is acceptable free text: validated for
+scheme + host, no embedded credentials, length-capped; malformed suggestion
+entries are skipped loudly at startup. Note: `bench.endpoints` is documented
+in values.yaml as a fail-closed target allowlist, but in chart 1.1.2 no
+template renders it and the app reads no matching env var -- it is a no-op,
+and target restriction today comes from the API-key gate plus this
+validation. Endpoint API keys (bench.endpointApiKeys /
+endpointApiKeysExistingSecret) are a JSON object of exact target origin to
+key, injected into the bench subprocess environment (PCAI_API_KEY / a Bearer
+header) and never served back to the browser -- the API redacts them.
 
 ## One endpoint at a time
 
@@ -255,14 +311,15 @@ window -- the hosted-trial scaling curve -- exactly as the CLI's --prom-url.
 
 | Values key | Meaning |
 |---|---|
-| bench.endpoints[] | The allowlist (name/url/kind). Empty = benchmarks disabled. |
+| bench.suggestions[] | The curated target combobox entries (name/url/kind). Advice only -- free text stays allowed. |
+| bench.endpoints[] | Documented as the fail-closed target allowlist, but not wired in chart 1.1.2 (no template renders it) -- see Section Gating and the target model. |
 | bench.endpointApiKeys | JSON object of target keys (Secret-sourced; never served back). |
 | bench.prometheusUrl | Operator Prometheus for the GPU join (empty = latency-only). |
 | security.existingSecret | Your Secret holding BENCH_API_KEYS (recommended). |
 | security.apiKey | Inline seed for the auto-managed release Secret (first install). |
 | persistence.* | Run-artifact PVC (kept on release delete: resource-policy: keep). |
 | extraEnv | Pass-through: BENCH_MAX_CONCURRENT_RUNS, BENCH_MAX_RUN_SECONDS. |
-| proxy.http/.https/.noProxy | Per-key corporate-proxy wiring for the estimator's outbound fetches — each key injected only when non-empty; `proxy: {}` = direct egress, nothing rendered. |
+| proxy.http/.https/.noProxy | Per-key corporate-proxy wiring for the estimator's outbound fetches — only `.noProxy` (no_proxy/NO_PROXY) and `.https` (https_proxy/HTTPS_PROXY + http_proxy/HTTP_PROXY) render; `.http` is not read by the chart (drift, flagged in the wave report). Each key injected only when non-empty; `proxy: {}` = direct egress, nothing rendered. |
 | pcai.enabled | PCAI feature gate; defaults to false — set it explicitly (it no longer follows proxy config). |
 
 ## Runs and artifacts
@@ -274,6 +331,15 @@ Every run writes to <persistence.mountPath>/runs/<run-id>/:
 - run.log -- the CLI's full log (streamed as a tail in the UI);
 - chat: report.md -- the results-tree artifact;
 - endpoint: run.json, run.csv, report.md, report.html.
+
+## The sequencer (MB-SEQ)
+
+`model-benchmarker-seq` runs a committed **plan** (JSON: ordered runs with
+their parameters, settle delays between runs, stop-on-failure) against the
+web app's API with its own key (MB_API_KEY) -- the scripted version of
+"run the whole capacity suite overnight" without a browser. Each plan
+step is exactly what a browser launch would do: same gating, same
+one-endpoint-at-a-time rules, same artifacts.
 
 ## Honest boundaries
 

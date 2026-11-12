@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from model_downloader.app.k8s import K8sClient
-from model_downloader.app.storage import DownloadedModel, merge_models, parse_scan_line
+from model_manager.app.k8s import K8sClient
+from model_manager.app.storage import DownloadedModel, merge_models, parse_scan_line
 
 REPO = Path(__file__).resolve().parents[1]
 HELM_DIR = REPO / "helm"

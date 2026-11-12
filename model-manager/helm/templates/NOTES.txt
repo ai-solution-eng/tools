@@ -1,15 +1,15 @@
 Model Manager installed in namespace "{{ .Release.Namespace }}".
 
 Proxy env (per-key):  {{ if .Values.proxy }}WIRED{{ else }}NOT CONFIGURED (proxy: {}){{ end }}
-Kyverno policy: {{ include "model-downloader.kyvernoEnabled" . }}
-Ezua ingress:   {{ include "model-downloader.ezuaEnabled" . }}
+Kyverno policy: {{ include "model-manager.kyvernoEnabled" . }}
+Ezua ingress:   {{ include "model-manager.ezuaEnabled" . }}
 Storage:        {{ .Values.storage.backend }} (default: {{ .Values.storage.default }})
 Max downloads:  {{ .Values.maxConcurrency }}
 
-Service:  {{ include "model-downloader.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+Service:  {{ include "model-manager.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
 
 Port-forward to use the UI:
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "model-downloader.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "model-manager.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
   open http://localhost:{{ .Values.service.port }}
 
 {{- if .Values.proxy }}
@@ -19,7 +19,7 @@ Proxy env vars on downloader Jobs / debug pods / the app pod: NOT CONFIGURED
 {{- end }}
 
 The downloader Job manifest is rendered from a ConfigMap
-({{ include "model-downloader.fullname" . }}-job-template). To change the Job
+({{ include "model-manager.fullname" . }}-job-template). To change the Job
 definition, edit .Values.downloader.* / .Values.proxy / .Values.s3.* and
 re-run helm upgrade.
 

@@ -1,7 +1,8 @@
 # ============================================================================
 # pcai-llm-gateway — Hosted-trial site values (EXAMPLE — sanitized, no creds)
 # Full guide: documentation/DEPLOYMENT.md.
-# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>
+# Contributors: Francesco Caliva <francesco.caliva@hpe.com>, Bryan Lliguicota <bryan.lliguicota@hpe.com>
 # Lives in helm/values-examples/ (hardlink-synced to GitHub): intentionally SECRET-FREE.
 # ============================================================================
 

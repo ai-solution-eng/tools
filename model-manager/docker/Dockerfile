@@ -9,6 +9,6 @@ COPY docker/requirements.txt requirements.txt
 # boto3/botocore pairs without settling; upgrading first is cheap insurance.
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
-COPY src/model_downloader/app/ ./app/
+COPY src/model_manager/app/ ./app/
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

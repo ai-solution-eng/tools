@@ -98,7 +98,7 @@ async def _overlay_emit_playbook(
     outcome may be stored but is stamped outcome_source="unverified" -
     "inferred" is reserved for labels derived from trace signals.
     """
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     try:
         from .playbook import (
@@ -161,7 +161,7 @@ async def _overlay_emit_playbook(
                 "failure_modes": list(playbook.get("failure_modes") or []),
                 "outcome": outcome,
                 "outcome_source": outcome_source,
-                "last_validated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "last_validated": datetime.now(UTC).isoformat(timespec="seconds"),
                 "success_count": 0,
                 "fail_count": 0,
                 "evidence_thread": session_id,

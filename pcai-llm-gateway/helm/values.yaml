@@ -3,7 +3,8 @@
 # keys with ledger budgets, an OpenAI-compatible proxy over model endpoint
 # pools, federated MCP with per-tool ACLs.
 # Full guide: documentation/DEPLOYMENT.md.
-# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>
+# Contributors: Francesco Caliva <francesco.caliva@hpe.com>, Bryan Lliguicota <bryan.lliguicota@hpe.com>
 # ============================================================================
 
 # ### REQUIRED ### — key material lives in Secrets you own, NOT in values
@@ -59,7 +60,7 @@ image:
   #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
   # (the reference renders as repository:tag@sha256:...); for tag-only
   # sites the alternative is pullPolicy: Always (re-checks every pull).
-  tag: v4.0.2
+  tag: v4.1.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

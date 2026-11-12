@@ -1,7 +1,7 @@
 # Example values files (shareable · secret-free)
 
 This folder holds **sanitized, paste-ready example values files** for the
-`model-downloader` chart. It is hardlinked into the public delivery tree
+Model Manager chart (`model-manager`). It is hardlinked into the public delivery tree
 (`pcai-solutions/tools/model-manager/`), so everything here must be
 safe to publish:
 
@@ -34,7 +34,7 @@ values.
 ## Using a file on PCAI
 
 1. **Import the chart once** into PCAI (the packaged chart, e.g.
-   `model-downloader-1.7.0.tar.gz`). PCAI users never run `helm install` /
+   `model-manager-2.1.2.tar.gz`). PCAI users never run `helm install` /
    `kubectl apply` — deployment is values-only after the import.
 2. **Open the chart's Helm Values editor** in PCAI and paste the whole file
    (both files are *full values* documents — they stand alone and do not
@@ -45,10 +45,11 @@ values.
    placeholders untouched.
 
 On SE G2, apply `values.g2.yaml` as-is after filling the `# SITE:` lines. On a
-hosted trial, read the top-level README's **"Kyverno on hosted trial systems"**
-section first — the chart's downloader Jobs must be admitted by the
-platform-wide `protect-models-pvc` Kyverno policy, and `kyverno.enabled` must
-stay `true`.
+hosted trial, read the hosted-trial prerequisite in
+[documentation/DEPLOYMENT.md §1.2](../../documentation/DEPLOYMENT.md#12-cluster-objects-and-patches)
+first — the chart's downloader Jobs must be admitted by the
+platform-wide `protect-models-pvc` Kyverno policy (the customer admin may need
+to apply the job-controller patch), and `kyverno.enabled` must stay `true`.
 
 ## Sanity-checking a render (operators)
 

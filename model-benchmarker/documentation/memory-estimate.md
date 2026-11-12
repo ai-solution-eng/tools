@@ -2,9 +2,9 @@
 
 Complete flag reference for
 [`src/model_benchmarker/memory_model/cli.py`](../src/model_benchmarker/memory_model/cli.py).
-For the math (weights / KV-per-token / capacity formulas per attention
-structure) and worked examples see the repo
-[`README.md`](../README.md) (Part 3); for the artifact's place in the
+The math (weights / KV-per-token / capacity formulas per attention
+structure), worked examples and the interactive calculator are in this
+document (§ How the math works); for the artifact's place in the
 results tree and the report's Memory tab see
 [`results-and-report.md`](results-and-report.md).
 
@@ -15,6 +15,93 @@ PYTHONPATH=src python -m model_benchmarker.memory_model --help
 # or, after `pip install -e .`:
 memory-estimate --help
 ```
+
+## How the math works
+
+A deterministic GPU-memory estimator for the "can I deploy this model?"
+question that precedes every benchmark run: does it fit, how many KV tokens
+fit in GPU memory, and how many concurrent N-token requests does that
+support. Zero load, no endpoint — and its Markdown artifacts land in the
+results tree like every other tool's (the report's **Memory** tab).
+
+The formula chain (all three answers, one chain):
+
+```
+weights_per_gpu   = weight_bytes / tp_size          # all MoE experts are resident
+usable_per_gpu    = vram_gib x 1024^3 x mem_fraction - overhead
+kv_pool_per_gpu   = usable_per_gpu - weights_per_gpu
+kv_tokens_total   = sum over GPUs of (kv_pool_per_gpu / kv_bytes_per_token)
+concurrency(ctx)  = floor(kv_tokens_total / ctx)    # vLLM's "Maximum concurrency" line, predicted
+```
+
+The one number people get wrong is **KV bytes per token**, and it depends on
+the attention structure — which is why the structure comes from the model's
+own `config.json`, not from a hardcoded table:
+
+| Structure | KV bytes/token/layer | Models |
+|---|---|---|
+| MHA | `2 x heads x head_dim x B` | (rare, dense) |
+| GQA | `2 x kv_heads x head_dim x B` — the naive `hidden/heads` formula overestimates by the head-grouping factor (Llama-3-8B: 128 KiB/token, not 512) | Qwen3.x, Llama, GLM |
+| MLA | `(kv_lora_rank + qk_rope_head_dim) x B` — one compressed latent per layer | DeepSeek-V2/V3 |
+| MQA + sparse (CSA/HCA/DSA) | per-token MQA footprint; sparse selection changes what attention *reads*, not what the pool holds | DeepSeek-V4, GLM-DSA |
+| linear-attention hybrid | linear layers carry **no** per-token KV (recurrent state only) | Qwen3-Next |
+| sliding-window layers | budgeted at full per-token cost (conservative; engine reuse only frees memory) | Gemma |
+
+`--kv-dtype fp8_e4m3` halves the KV figure (the seed catalog already
+serves DeepSeek and Qwen this way).
+
+### Worked examples
+
+```bash
+# the seed-catalog DeepSeek deployment: H200 x4, TP4, fp8 KV, mem-fraction 0.8
+PYTHONPATH=src python -m model_benchmarker.memory_model \
+    --model deepseek-v4-flash-0731 --catalog-id seed-h200-deepseek
+
+# explicit shape + TP sweep + context grid -> artifact for the report's Memory tab
+PYTHONPATH=src python -m model_benchmarker.memory_model --model Qwen/Qwen3-8B \
+    --gpu "RTX Pro 6000" --gpus 1 --grid --output results/Qwen3.8-27B/memory.md
+```
+
+Exit codes: `0` fits (or a scenario grid was produced), `2` config error
+(model/config.json not found, unknown catalog id). A run that cannot fit
+still writes the artifact (the grid shows which TP level starts to fit).
+
+### Interactive HTML deployment check — for users
+
+```bash
+PYTHONPATH=src python -m model_benchmarker.memory_model --calculator
+```
+
+writes `results/memory_check.html` — a self-contained page (no server, no
+external assets; put it up or share the file by itself) where a user
+validates **their deployment configuration** before submitting it: paste
+the engine launch arguments
+(`sglang serve ... --tp-size 4 --kv-cache-dtype fp8_e4m3 --hicache-ratio
+2`), drop a `seed_catalog.json` on the file input, or fill the controls by
+hand. The page answers the deployment questions with the same capacity math
+(model structures from `config.json` are embedded at generation time;
+`--add-model REF` adds more, `--no-fetch` goes offline):
+
+- **Does it fit?** — fit verdict with a stacked VRAM bar (weights / KV pool / overhead).
+- **Tokens in GPU memory** — the hot KV pool, per replica and total.
+- **Tokens in HiCache** — host-tier tokens (ratio mode or fixed host-RAM mode), and the concurrency table with a "with HiCache tier" row (addressable ≠ hot).
+- **A deterministic PASS/WARN/FAIL checklist** — weights fit, pool size, largest selected context vs pool, mem-fraction band (PCAI catalogs use 0.8–0.92), TP schedulability, NVLink-group crossing, MoE-without-EP, MTP/speculative consistency, HiCache tier sanity.
+- Model picker with embedded structures (GQA/MLA/sparse/linear-hybrid aware), custom model form, TP sweep cards, light/dark.
+
+The JS math is cross-checked against the Python estimator (node smoke tests
+pin the catalog DeepSeek/GLM numbers); regeneration refreshes the embedded
+models.
+
+### Honest boundaries
+
+- Deterministic capacity math only — no throughput/latency prediction, no
+  "optimal config" guessing; pair it with `benchmark_chat` for the
+  performance story.
+- Parameter counts are shape-derived (all experts counted; MTP module and
+  multimodal towers excluded — both stated in the artifact).
+- The activation overhead is a knob, not a law: calibrate it against a live
+  server's reported KV pool (`max_total_num_tokens` / `GPU KV cache
+  size`) and record the predicted-vs-actual delta in the artifact.
 
 Exit codes: `0` fits (or scenario grid produced), `2` config error
 (model/config.json not found, unknown catalog id).
@@ -38,7 +125,7 @@ Exit codes: `0` fits (or scenario grid produced), `2` config error
 | `--weight-dtype DT` | Weights dtype (`bf16`, `fp8`, `nvfp4`, ...). Default: `quantization_config.quant_method`, falling back to `torch_dtype`, in the model's config. |
 | `--kv-dtype DT` | KV cache dtype (`fp16`/`bf16` default; `fp8_e4m3` halves it). |
 | `--mem-fraction F` | Engine `mem-fraction-static` (default 0.9; catalog entries override with their own value). |
-| `--overhead GIB` | Per-GPU activation/CUDA-graph reserve (default 2). The honesty knob — see README Part 3. |
+| `--overhead GIB` | Per-GPU activation/CUDA-graph reserve (default 2). The honesty knob — see § Honest boundaries above. |
 | `--speculative N` | N active MTP/draft layers: adds their KV bytes per token (capped by the checkpoint's `num_nextn_predict_layers`). |
 | `--hicache ratio\|size` | Enable the hierarchical KV cache (SGLang HiCache) L2 host tier: `ratio` sizes it from `--hicache-ratio` (× the device KV pool), `size` from `--hicache-size` (GiB per replica). |
 | `--hicache-ratio X` | L2 = X × the device KV pool, per replica (with `--hicache ratio`; the engines' `--hicache-ratio`). |

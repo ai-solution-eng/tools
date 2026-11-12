@@ -29,8 +29,8 @@ fullnameOverride: ""
 
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
-  repository: ghcr.io/ai-solution-eng/model-downloader
-  tag: v2.1.2
+  repository: ghcr.io/ai-solution-eng/model-manager
+  tag: v2.2.0
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -234,7 +234,7 @@ catalog:
   enabled: true
   size: 100Mi
   storageClassName: ""
-  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_downloader/app/seed_catalog.json"
+  githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_manager/app/seed_catalog.json"
   # MITM proxy presents an untrusted cert — bypassed deliberately; default is verify-on.
   githubVerifyTls: false
 
@@ -262,13 +262,13 @@ kyverno:
   enabled: true
 
 # On PCAI, ${DOMAIN_NAME} is resolved by the platform before rendering; the UI is
-# served at https://model-downloader.${DOMAIN_NAME} behind oauth2-proxy SSO.
+# served at https://model-manager.${DOMAIN_NAME} behind oauth2-proxy SSO.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"  # informational only — no template reads it
 
   virtualService:
-    endpoint: "model-downloader.${DOMAIN_NAME}"
+    endpoint: "model-manager.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 300s
 

@@ -25,9 +25,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEX_HTML = ROOT / "src" / "model_downloader" / "app" / "templates" / "index.html"
-APP_JS = ROOT / "src" / "model_downloader" / "app" / "static" / "app.js"
-STYLE_CSS = ROOT / "src" / "model_downloader" / "app" / "static" / "style.css"
+INDEX_HTML = ROOT / "src" / "model_manager" / "app" / "templates" / "index.html"
+APP_JS = ROOT / "src" / "model_manager" / "app" / "static" / "app.js"
+STYLE_CSS = ROOT / "src" / "model_manager" / "app" / "static" / "style.css"
 
 
 def _read(path: Path) -> str:
@@ -63,7 +63,7 @@ def _install_psycopg2_shim() -> None:
 def md():
     _install_psycopg2_shim()
     try:
-        from model_downloader.app import main as md
+        from model_manager.app import main as md
     except Exception as e:  # pragma: no cover - environment-dependent
         pytest.skip(f"app import failed in this environment: {e}")
     return md

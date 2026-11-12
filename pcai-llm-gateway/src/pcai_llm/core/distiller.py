@@ -34,12 +34,13 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
+
 # --- pcai-llm-playbook overlay BEGIN (idempotent patch; integrations/pcai_llm_playbook) ---
 # Optional-section contract + the prompt addendum. The overlay module is
 # copied next to this file by apply_playbook_patch.py; if it is ever
 # removed, the stubs below degrade the distiller to its stock behaviour.
 try:
-    from .playbook import OPTIONAL_SECTIONS, PLAYBOOK_PROMPT  # noqa: F401
+    from .playbook import OPTIONAL_SECTIONS, PLAYBOOK_PROMPT
 except ImportError:  # pragma: no cover - overlay module removed: stock behaviour
     OPTIONAL_SECTIONS = ()  # type: ignore[assignment]
     PLAYBOOK_PROMPT = ""

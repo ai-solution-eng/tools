@@ -7,7 +7,7 @@ equality) and the dry-run report shape the UI renders. Each test in the
 matrix flips exactly one key to prove every missing key blocks deletion.
 """
 
-from model_downloader.app.gc import (
+from model_manager.app.gc import (
     aioli_protected_dirs,
     build_gc_plan,
     cache_dir_name,

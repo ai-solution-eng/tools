@@ -2,8 +2,8 @@
 
 Complete flag, environment and failure-behavior reference for
 [`src/model_benchmarker/benchmark_chat.py`](../src/model_benchmarker/benchmark_chat.py).
-For the tool's purpose and worked scenarios see the repo
-[`README.md`](../README.md); for result files and the HTML report see
+For the tool's purpose and philosophy see
+[FEATURES.md](FEATURES.md); for result files and the HTML report see
 [`results-and-report.md`](results-and-report.md).
 
 Run by path from anywhere in the repo (the script bootstraps `sys.path`):
@@ -15,6 +15,70 @@ python src/model_benchmarker/benchmark_chat.py --help
 Flag style is mixed: most flags use underscores exactly as written
 (`--model_class_name`, `--number_users`); `--no-nonce` is the only
 dash-style flag.
+
+## How it works
+
+```
+benchmark_chat.py
+  ├─ resolve endpoint ── --model_class_name (registered entry in utils/pcai_models.py)
+  │                      or --url (any OpenAI-compatible root, no /v1; served model id
+  │                        auto-discovered via GET /v1/models when not set)
+  │                      --remote switches the in-cluster service URL to the public one
+  ├─ for each --context_length level   (optional --prewarm first)
+  │    ├─ for each --number_users level
+  │    │    ├─ default (closed-loop):  N asyncio users × requests_per_user requests
+  │    │    ├─ --arrival_mode open:    requests on a Poisson/gamma schedule at
+  │    │    │                          --request_rate; levels are --level_duration windows
+  │    │    ├─ --multiturn:            each user runs N turns of ONE growing conversation
+  │    │    └─ --separate_tasks:       one clean pass per task (no cross-task mixing)
+  │    └─ per (ctx, users, task): P50/P95/P99/P100 for TTFT, tokens/s, ITL, TPOT
+  │                                (+ goodput fraction per --goodput SLOs)
+  └─ print table to stdout + rewrite --output Markdown after every completed level
+```
+
+Each request is one **streamed** chat completion (`stream_options.include_usage`). The metrics:
+
+| Metric | Definition |
+|---|---|
+| **TTFT (ms)** | Time from request send to the first chunk carrying any text delta — `content`, `reasoning_content`, or any other non-empty string delta field, so exotic stream shapes never read TTFT = 0. |
+| **tokens/s** | `usage.completion_tokens / (stream_end − first_token)` — generation throughput **excluding TTFT**. Falls back to counting content+reasoning chunks when the stream carries no `usage`, and to the full request time when the response arrives in one burst (short generations). |
+| **ITL (ms)** | Inter-token latency: gaps between consecutive text-bearing deltas, collected into a fixed **log-spaced histogram** per request (96 buckets over 0.1 ms–60 s — memory stays O(buckets) even at 64 users × 24 576 tokens) plus an exact running **max stall**, merged per level. Recorded whenever *any* text-bearing delta arrives, independent of the content/reasoning branch order (a dual-field delta counts once). |
+| **TPOT (ms)** | Time per output token per request: `(stream_end − first_token) / (tokens − 1)`, same usage-token precedence as tokens/s. Burst-guarded requests (single-burst responses) get *approximate* TPOT — flagged, and excluded from TPOT percentiles and goodput's TPOT predicate. ITL stays raw (never inherits the burst fallback). |
+| **goodput** | With `--goodput "ttft<=2000,tpot<=50"`: the fraction of *successful* requests meeting **every** SLO (thresholds in ms). Failed requests are not goodput (counted in `failed`, vLLM convention); thresholds are stamped in the artifact header; the summary names the max goodput-satisfying load. |
+
+Percentile semantics: for TTFT the percentiles are ascending (P100 = slowest request, bigger = worse); for tokens/s they are **inverted** (P100 = slowest stream), so higher is better everywhere on that block. ITL/TPOT ascend like TTFT.
+
+**Pipe/redirect stdout only together with `--quiet`** — a backpressured stdout stall lands in every inter-token gap, distorting ITL/TPOT even more than TTFT (documented in the flag's help).
+
+### Built-in workloads
+
+`--tasks` selects from a fixed registry (`coding` = production-grade Python LRU-cache module, `creative` = a 1,500–2,000-word literary story, `mixed` = both in one response) plus `custom` (your `--prompt` with `--max_tokens`/`--temperature`/`--top_p`). Output caps: coding 8192, creative 16384, mixed 24576 tokens. The fixed prompts are what make runs comparable across machines and time.
+
+### Cache regimes — why the nonce matters
+
+By default every request gets a unique random nonce prepended, so no two requests share prefix tokens: prefix caches (RadixAttention, SGLang radix cache, HiCache tiers) never hit, and every measurement is a cold prefill — the deliberate worst case. Three flags explore the cache-friendly regimes:
+
+- `--multiturn` — each user runs `--requests_per_user` turns of one growing conversation (full history replayed each turn, assistant `content` only — reasoning tokens are not resent, matching real chat clients). Turns 2+ reuse the shared prefix, giving the `turn1` vs `TTFT-post` split.
+- `--no-nonce` — all requests (across all users) share one identical fixed prefix, so the server can reuse its prefix cache across users. Compare against the same run without it to price cache sharing.
+- `--prewarm` — before each context level, fire one shared-prefix request per task so the prefix graph is resident *before* users arrive. Pairs with `--no-nonce`; alone it warms a prefix nothing will reuse.
+
+### Open-loop arrivals — measuring queueing, not just saturation
+
+Closed-loop (default) measures how the server behaves when N users each fire back-to-back requests. **Open-loop** (`--arrival_mode open --request_rate 5`) instead issues requests on a **schedule** — Poisson exponential inter-arrivals at `--burstiness inf`, gamma-shaped (mean 1/R, cv = 1/b) at any finite b — so **server-side queueing shows up in TTFT by design**: that is the point. Levels become time windows (`--level_duration`, default 30 s); the drain tail (requests issued inside the window but finishing after it) is part of the measurement.
+
+- Open-loop runs are stamped everywhere: `MODE: arrival=open` run-header line, `arrival=open` in the report data, and the `_ol` filename token (closed-loop files stay unmarked). The HTML compare view **refuses** mixing closed- and open-loop setups side by side.
+- Multiturn is closed-loop only (a turn needs the previous reply) — the contradiction guard exits before any traffic.
+- In-flight cap ≈ `min(request_rate × read-timeout, MODEL_POOL_MAX_CONNECTIONS)` is surfaced; exceed the pool and arrivals queue client-side, polluting the arrival process (the run warns).
+- Prewarm is still valid; "users all start simultaneously" no longer holds.
+
+## What problem it solves
+
+- **Compare serving configurations before committing to one.** The same model on different hardware counts, engines (vLLM vs SGLang), speculative-decoding/MTP configs, weight formats (FP8/NVFP4), HiCache tiering or replica counts, measured on identical workloads — exactly what the committed artifacts in `results/` encode per file.
+- **Measure sustained concurrency.** How TTFT and tokens/s degrade as concurrent users scale (e.g. 1 → 4 → 32 → 64) and as the input prefill grows (0 → 8k → 32k → 64k tokens).
+- **Measure inter-token smoothness, not just averages.** ITL histograms (P99/max-stall) and per-request TPOT expose stalls (prefill pauses, KV eviction, decode hiccups) that TTFT/tokens-s averages hide; goodput turns them into one SLO number.
+
+Command-first worked scenarios (capacity suite, shared-prefix agentic, context
+padding, thinking budgets, …): [runbook.md](runbook.md) §1.
 
 ## Model / endpoint selection
 

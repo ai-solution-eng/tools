@@ -6,9 +6,9 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 rules:
 - apiGroups: ["batch"]
   resources: ["jobs", "jobs/status"]
@@ -36,45 +36,45 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
 subjects:
 - kind: ServiceAccount
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
   namespace: {{ .Release.Namespace }}
 ---
 # Namespaced Role to read the Job-template ConfigMap (lives in the release namespace).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-template-reader
+  name: {{ include "model-manager.fullname" . }}-template-reader
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   resourceNames:
-  - {{ include "model-downloader.fullname" . }}-job-template
+  - {{ include "model-manager.fullname" . }}-job-template
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-template-reader
+  name: {{ include "model-manager.fullname" . }}-template-reader
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "model-downloader.fullname" . }}-template-reader
+  name: {{ include "model-manager.fullname" . }}-template-reader
 subjects:
 - kind: ServiceAccount
-  name: {{ include "model-downloader.fullname" . }}
+  name: {{ include "model-manager.fullname" . }}
   namespace: {{ .Release.Namespace }}

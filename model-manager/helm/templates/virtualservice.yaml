@@ -1,11 +1,11 @@
-{{- if eq (include "model-downloader.ezuaEnabled" .) "true" }}
+{{- if eq (include "model-manager.ezuaEnabled" .) "true" }}
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
 metadata:
-  name: {{ include "model-downloader.fullname" . }}-vs
+  name: {{ include "model-manager.fullname" . }}-vs
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "model-downloader.labels" . | nindent 4 }}
+    {{- include "model-manager.labels" . | nindent 4 }}
     hpe-ezua/app: {{ .Chart.Name }}
     hpe-ezua/type: vendor-service
 spec:
@@ -19,7 +19,7 @@ spec:
             prefix: /
       route:
         - destination:
-            host: {{ include "model-downloader.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            host: {{ include "model-manager.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
             port:
               number: {{ .Values.service.port }}
       timeout: {{ .Values.ezua.virtualService.timeout }}
