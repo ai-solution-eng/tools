@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Terminal, Data Manager and login shortcuts",
+    "description": "Adds Terminal, Data Manager and Login buttons at the sidebar foot that open each page in a new tab."
+  }
+}

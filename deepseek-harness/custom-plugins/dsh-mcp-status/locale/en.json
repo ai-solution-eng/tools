@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Status",
+    "description": "Shows which MCP servers are connected, with live probe results, and the upstream MCP servers behind a federating one."
+  }
+}

@@ -8,6 +8,8 @@ apply/
 scripts/
 docker/
 docs/
+# Contributed UI plugins (npm packages installed into a user profile, not chart content)
+custom-plugins/
 # NFS silly-rename temp files (nfs server rename artifacts)
 .nfs*
 __pycache__/

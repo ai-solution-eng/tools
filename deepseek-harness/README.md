@@ -328,6 +328,7 @@ The first login after logout used to strand the user on the login menu ("Signed 
 |---|---|
 | `/var/dsh/home/.dsh/settings.yaml` | dsh config (editable, hot-reloaded) |
 | `/var/dsh/home/.dsh/profiles/web/cordis.patch.yml` | Profile patch layer (from `dshCordisPatch`, watched + validated) |
+| `/var/dsh/home/.dsh/profiles/web/package.json` | Profile plugin dependencies (`link:` paths) + `dsh.profile.bundles` |
 | `/var/dsh/home/.dsh/skills/` | Skills (user-managed; dsh hot-refreshes natively) |
 | `/workspace/personal/AGENTS.md` | Agent instructions (user-managed; auto-loaded when present — no longer chart-seeded) |
 | `/workspace/create-server.sh` | Preview server launcher |
@@ -348,6 +349,31 @@ The first login after logout used to strand the user on the login menu ("Signed 
 - `scripts/user_manager.ipynb` — bulk user admin against the router API
 - `scripts/pre-upgrade-check.sh` — preflight/record/verify around an upgrade. Asserts `KEEP_PVC_ON_DELETE=true` (a blocker if not — that setting is what stops an uninstall deleting user PVCs), reports the live `storage.nameVersion` prefix (a bump mints **fresh empty** volumes), and inventories the PVCs that must survive. On uninstall+install it notes the accurate picture: with `keepPvcOnDelete=true` the router's `ensurePersistentVolumeClaim()` finds existing claims and reuses the **same** volumes, so nothing is re-provisioned — the VAST quota-collision hazard only appears if a PVC is actually deleted first (`keepPvcOnDelete=false`, a manual `kubectl delete pvc`, or a `storage.nameVersion` bump; the VAST quota name `csi:<ns>:<pvc>:pvc-<uid>` is truncated at 64 chars, cutting off the UID, so a re-create reuses the same quota name). `--out DIR` records a manifest (namespace/name/UID/volumeName/phase); `--verify DIR` afterwards proves every PVC kept the **same UID and volumeName** — the check that catches a silent re-bind to an empty volume. The dump is a **record, not a backup**: PVs here use `reclaimPolicy: Delete`, so deleting a PVC destroys its data.
 - `scripts/cleanup-dsh-web-helm-stale-quotas.sh` — VAST quota cleanup (dry-run default)
+
+## Custom plugins
+
+`custom-plugins/` holds contributed `dsh web` UI plugins, one directory per plugin, each a
+standalone Cordis bundle — see the [plugin guide + install steps](custom-plugins/README.md).
+
+| Plugin | Adds |
+|---|---|
+| `dsh-app-shortcuts` | Terminal / Data Manager / Login shortcuts at the sidebar foot |
+| `dsh-mcp-status` | Live MCP server status row under the composer (real handshake probe, not a flag) |
+
+The directory is **not chart content**: `.helmignore` excludes it, no value references it, and the
+chart never installs a plugin into a user pod. Installation is per profile (`web`) — Plugins page →
+`plugin_manager install_bundle`, target = the plugin directory — and the resulting absolute
+`link:` dependency plus `dsh.profile.bundles` entry live in
+`/var/dsh/home/.dsh/profiles/web/package.json` on the user's state PVC. That survives pod restarts
+but is per user, not per release.
+
+Two consequences worth knowing:
+
+- The profile stores an **absolute** path, so moving a plugin directory breaks that profile until
+  it is re-linked, and the path must be readable from inside the pod (a `/mnt/shared/...` source
+  only works where that mount exists).
+- A Host-side plugin change is only re-imported when the dsh process restarts; the browser half
+  hot-reloads.
 
 ## Known follow-ups
 

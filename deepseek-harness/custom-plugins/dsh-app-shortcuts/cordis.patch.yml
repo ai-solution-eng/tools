@@ -1,0 +1,14 @@
+# App shortcuts bundle.
+#
+# One Host row with no configuration and no Host-side behaviour: the browser
+# half (declared by `dsh.client` in package.json) renders three buttons at the
+# sidebar foot that open the environment's Terminal (/terminal), Data Manager
+# (/data-manager) and the main login page (/) in a new tab.
+#
+# The buttons are ADDITIVE. They occupy `sidebar.footer.action`, a list slot
+# declared by @deepseek-ai/dsh-client-ui-sidebar, so the Harness' own right
+# sidebar terminal (ui-sidebar-terminal) and workspace file tree
+# (ui-sidebar-files) keep working untouched.
+- insert:
+    - id: app-shortcuts
+      name: '@local/dsh-app-shortcuts'

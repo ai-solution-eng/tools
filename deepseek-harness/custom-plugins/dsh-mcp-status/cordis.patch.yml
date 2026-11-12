@@ -1,0 +1,18 @@
+# MCP status bundle.
+#
+# One Host row: it reads the resolved config of every `@deepseek-ai/dsh-mcp-client`
+# row in the Loader, probes each endpoint with a real MCP handshake, and serves the
+# result on an authenticated route under /api. The browser half (declared by
+# `dsh.client` in package.json) renders the row below the composer.
+- insert:
+    - id: mcp-status
+      name: '@local/dsh-mcp-status'
+      # Every value below is optional; the defaults shown are what the plugin uses.
+      # config:
+      #   routePath: /api/mcp-status   # authenticated route the browser half reads
+      #   probeTimeoutMs: 4000         # budget for one endpoint probe
+      #   connectionTtlMs: 5000        # how long one probe result is reused
+      #   upstreamTtlMs: 60000         # how long a federating server's catalog is reused
+      #   catalogTool: mcp_catalog     # tool that lists a federating server's upstream servers
+      #   maxToolsListed: 24           # tool names included per connection
+      #   maxUpstreamServers: 64       # upstream rows included per connection
