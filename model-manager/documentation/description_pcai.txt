@@ -1,0 +1,1 @@
+Model Manager is a web UI and FastAPI service for HPE Private Cloud AI that downloads HuggingFace models in parallel and mirrors NVIDIA NIM profiles into shared PCAI storage (PVC and/or S3) without holding any GPUs. It ships a curated catalog of verified model configurations that push straight into MLIS/AIOLI, and gives administrators a UI for deleting model caches.

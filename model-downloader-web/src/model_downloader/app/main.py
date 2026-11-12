@@ -24,7 +24,7 @@ from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, field_validator, model_validator
 
 from . import oidc_identity
-from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog
+from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog, entry_quant, entry_unvalidated
 from .db import AioliDB
 from .gc import (
     VERDICT_BLOCK,
@@ -1632,6 +1632,18 @@ async def push_models(req: Request, project: str = ""):
         configs = [configs]  # single {MODEL_CONFIGURATION} — same as a 1-element array
     if not isinstance(configs, list):
         raise HTTPException(400, "expected a JSON object or a JSON array of model configs")
+    # EVAL: warn (never block) when pushing a quantised variant with no
+    # recorded eval block — MLIS will serve it as equivalent to the bf16
+    # model whether or not it actually is, and the log line is the only
+    # trace that the gap was known.
+    for cfg in configs:
+        if isinstance(cfg, dict) and entry_unvalidated(cfg):
+            log.warning(
+                "pushing UNVALIDATED quantised variant %r (%s) to MLIS — no eval block "
+                "recorded; MLIS will treat it as equivalent to the bf16 model",
+                cfg.get("name") or "<unnamed>",
+                entry_quant(cfg),
+            )
     results = await aioli_db.push_batch(configs, project=project)
     pushed = sum(1 for r in results if r["status"] == "pushed")
     skipped = sum(1 for r in results if r["status"] == "skipped")

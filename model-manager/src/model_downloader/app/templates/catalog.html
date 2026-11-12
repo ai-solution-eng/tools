@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Catalog — Model Manager</title>
+  <link rel="icon" type="image/jpeg" href="/static/favicon.jpg?v={{ assets['favicon.jpg'] }}">
+  <link rel="stylesheet" href="/static/style.css?v={{ assets['style.css'] }}">
+  <script>
+    // Theme — Auto (default, follows the OS) / Light / Dark, remembered per browser.
+    var THEME_KEY = 'md-theme';
+
+    // Pre-paint resolver: apply the saved choice before first paint.
+    (function () {
+      var t = 'auto';
+      try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+
+    function applyTheme(t) {
+      if (t !== 'light' && t !== 'dark') t = 'auto';
+      document.documentElement.setAttribute('data-theme', t);
+      try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-theme-btn') === t;
+        btns[i].classList.toggle('on', on);
+        btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+
+    // Auto resolves to the OS scheme — no consumer may treat data-theme as binary.
+    function effectiveTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (t === 'light' || t === 'dark') return t;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+
+    function initTheme() {
+      var btns = document.querySelectorAll('[data-theme-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () {
+          applyTheme(this.getAttribute('data-theme-btn'));
+        });
+      }
+      var saved = 'auto';
+      try { saved = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+      applyTheme(saved);
+      // The palette is pure CSS, so an OS flip while in Auto needs no re-render;
+      // the listener stays as the hook for any follow-up added later.
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+          if (document.documentElement.getAttribute('data-theme') !== 'auto') return;
+          document.dispatchEvent(new CustomEvent('md-theme-change', { detail: { theme: effectiveTheme() } }));
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', initTheme);
+  </script>
+</head>
+<body>
+  <header class="brandbar">
+    <span class="wordmark"><span class="bar"></span>HPE</span>
+    <span class="app-title">Model Manager</span>
+    <nav class="main-nav">
+      <a href="/" class="nav-link">Download</a>
+      <a href="/catalog" class="nav-link active" aria-current="page">Model Catalog</a>
+      {%- if manual_delete_enabled %}
+      <a href="/admin/delete" class="nav-link">Manual Deletion</a>
+      {%- endif %}
+    </nav>
+    <span class="spacer"></span>
+    <div class="theme-seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-btn="auto">Auto</button>
+      <button type="button" data-theme-btn="light">Light</button>
+      <button type="button" data-theme-btn="dark">Dark</button>
+    </div>
+    <span class="tag">Parallel models: {{ max_concurrency }}</span>
+  </header>
+  <main>
+    <h1>Model Catalog</h1>
+    <p class="hint">Configurations grouped by model lab, then model, then the configuration itself. Expand a lab to see its models; expand a model to see every configuration it ships with (GPU class, serving framework, quantization, GPU count, HiCache, Mooncake L3, shared-GPU). Select configurations and push to MLIS, or add your own.</p>
+    <fieldset class="gpu-filter" id="gpu-filter">
+      <legend class="gpu-filter-legend">GPU class</legend>
+      <label class="gpu-option">
+        <input type="radio" name="gpu-class" value="" checked>
+        <span>All</span>
+      </label>
+      {% for t in tiers %}
+      <label class="gpu-option">
+        <input type="radio" name="gpu-class" value="{{ t }}">
+        <span>{{ tier_labels[t] }}</span>
+        <span class="gpu-spec">{{ tier_info[t].quants|join('/') }} · {{ tier_info[t].vram_gb }} GB</span>
+      </label>
+      {% endfor %}
+    </fieldset>
+    <div class="catalog-search">
+      <input id="catalog-search-input" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Search models and configurations — e.g. deepseek, nvfp4, sglang, hicache, mooncake, 8 gpu"
+             aria-label="Search the model catalog">
+      <button id="catalog-search-clear" type="button" class="secondary-btn" hidden>Clear</button>
+      <span id="catalog-search-summary" class="search-summary" role="status" aria-live="polite"></span>
+    </div>
+    <div class="catalog-controls">
+      <button id="add-model-btn" type="button" class="secondary-btn">+ Add Model</button>
+      <label class="push-project" title="Optional: file the pushed models under this project. In PCAI a project is a namespace, so this offers the same project-user-* list as the download page; the project- prefix is stripped before the push (MLIS files by project name, e.g. user-andrew-bydlon). Empty = the config's own project, else the chart default, else unfiled (MLIS shows unfiled models only under All projects).">
+        <span>Project</span>
+        <div class="combo">
+          <input id="push-project-input" autocomplete="off" spellcheck="false"
+                 placeholder="project-user-… (optional)"
+                 pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?">
+          <button type="button" id="push-project-toggle" class="combo-toggle" aria-label="Project suggestions">&#9662;</button>
+          <div id="push-project-menu" class="combo-menu" hidden></div>
+        </div>
+        <span id="push-project-effective" class="push-project-effective" hidden></span>
+      </label>
+      <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
+      {% if catalog_github_url %}
+      <button id="refresh-github-btn" type="button" class="secondary-btn">Refresh from GitHub</button>
+      {% endif %}
+      <button id="refresh-catalog-btn" type="button" class="secondary-btn">Refresh</button>
+      <span id="catalog-status" class="ctl-status" role="status" aria-live="polite"></span>
+    </div>
+    <div id="catalog-tiers"></div>
+    <div id="catalog-msg" class="msg"></div>
+
+    <h2>Push JSON Directly</h2>
+    <p class="hint">Paste a single model configuration or a JSON array of them to push to MLIS without saving to the catalog, or add them to the catalog above.
+      When adding to the catalog, set <code>"tier"</code> to <code>"h200"</code>, <code>"rtx-pro-6000"</code>, or <code>"l40s"</code> to choose the GPU class
+      ({% for t in tiers %}{{ tier_labels[t] }}: {{ tier_info[t].quants|join(', ') }} · {{ tier_info[t].vram_gb }} GB{% if not loop.last %} — {% endif %}{% endfor %}) — a missing or misspelled tier silently defaults to <code>h200</code>.
+      The tier shows up as part of the configuration's label under its model; the lab and model grouping is derived from the model itself, not from <code>tier</code>.
+      <code>tier</code> is not pushed to MLIS (MLIS-side GPU class is <code>resource_gpu_type</code>).
+      Note: entries are deduplicated by <code>name</code> + configuration, so re-adding the same configuration is skipped while a different configuration of the same model is kept. <code>version</code> is assigned by MLIS on push, not authored here.</p>
+    <textarea id="direct-json" class="json-input" rows="12" placeholder='{"name": "my-model", ...}  — or —  [{"name": "mc1", ...}, {"name": "mc2", ...}]'></textarea>
+    <button id="push-direct-btn" type="button">Push to MLIS</button>
+    <button id="add-direct-btn" type="button" class="secondary-btn">Add to Catalog</button>
+    <div id="push-results"></div>
+
+    <div id="add-modal" class="modal" hidden>
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel modal-wide">
+        <div class="modal-header">
+          <span>Add Model Configuration</span>
+          <button class="modal-close" type="button">&times;</button>
+        </div>
+        <div class="modal-body-scroll">
+          <form id="add-model-form" autocomplete="off">
+            <p class="hint">Version is assigned by MLIS at push time: <code>v1</code> for a model name MLIS has not seen, otherwise one above the highest version MLIS already holds for that name. Re-pushing an identical configuration is skipped.</p>
+            <div class="form-grid">
+              <label>
+                <span>Tier</span>
+                <select name="tier">
+                  {% for t in tiers %}
+                  <option value="{{ t }}">{{ tier_labels[t] }} — {{ tier_info[t].quants|join('/') }} · {{ tier_info[t].vram_gb }} GB</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>
+                <span>Name *</span>
+                <input name="name" required placeholder="my-model">
+              </label>
+              <label class="full-width">
+                <span>Description</span>
+                <input name="description" placeholder="Optional description">
+              </label>
+              <label>
+                <span>Project (optional)</span>
+                <input name="project" placeholder="user-andrew-bydlon (or its project- namespace)"
+                       title="The project- namespace prefix is stripped when the config is pushed to MLIS.">
+              </label>
+              <label class="full-width">
+                <span>URI</span>
+                <input name="uri" placeholder="pvc://models-pvc/large-models/...?containerPath=/mnt/models">
+              </label>
+              <label class="full-width">
+                <span>Chat template path (optional)</span>
+                <input name="chat_template_path" placeholder="chat_template.jinja">
+              </label>
+              <label class="full-width">
+                <span>Chat template contents (optional)</span>
+                <textarea name="chat_template_contents" rows="5"
+                          placeholder="{% raw %}{% for message in messages %}...{% endfor %}{% endraw %}"></textarea>
+              </label>
+              <label>
+                <span>Model Format</span>
+                <select name="model_format">
+                  <option value="custom">custom</option>
+                  <option value="vllm">vllm</option>
+                  <option value="nim">nim</option>
+                  <option value="openllm">openllm</option>
+                  <option value="bento-archive">bento-archive</option>
+                </select>
+              </label>
+              <label class="full-width">
+                <span>Image *</span>
+                <input name="image" required placeholder="vllm/vllm-openai:latest">
+              </label>
+              <label class="full-width">
+                <span>Arguments (one per line)</span>
+                <textarea name="arguments" rows="5" placeholder="--tensor-parallel-size&#10;4&#10;--port&#10;8080"></textarea>
+              </label>
+              <label class="full-width">
+                <span>Environment (KEY=VALUE per line)</span>
+                <textarea name="environment" rows="4" placeholder="HF_TOKEN=hf_...&#10;AIOLI_DISABLE_LOGGER=1"></textarea>
+              </label>
+              <label>
+                <span>Request CPU</span>
+                <input name="resource_request_cpu" placeholder="4">
+              </label>
+              <label>
+                <span>Request Memory</span>
+                <input name="resource_request_memory" placeholder="32Gi">
+              </label>
+              <label>
+                <span>Request GPU</span>
+                <input name="resource_request_gpu" placeholder="1">
+              </label>
+              <label>
+                <span>Limit CPU</span>
+                <input name="resource_limit_cpu" placeholder="8">
+              </label>
+              <label>
+                <span>Limit Memory</span>
+                <input name="resource_limit_memory" placeholder="64Gi">
+              </label>
+              <label>
+                <span>Limit GPU</span>
+                <input name="resource_limit_gpu" placeholder="1">
+              </label>
+              <label>
+                <span>GPU Type</span>
+                <input name="resource_gpu_type" placeholder="">
+              </label>
+              <label class="checkbox-label">
+                <input name="caching_enabled" type="checkbox">
+                <span>Caching Enabled</span>
+              </label>
+              <label class="full-width">
+                <span>Metadata (JSON)</span>
+                <textarea name="metadata" rows="3" placeholder='{"tags": "", "modelCategory": "llm"}'>{"tags": "", "modelCategory": "other"}</textarea>
+              </label>
+            </div>
+            <button type="submit">Save to Catalog</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div id="details-modal" class="modal" hidden>
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <span id="details-title">Model Configuration</span>
+          <button class="modal-close" type="button">&times;</button>
+        </div>
+        <p class="hint">version is assigned by MLIS on push: <code>v1</code> for a new name, otherwise one above the highest version MLIS already holds for that name.</p>
+        <pre id="details-body"></pre>
+      </div>
+    </div>
+  </main>
+  <script src="/static/catalog.js?v={{ assets['catalog.js'] }}"></script>
+</body>
+</html>

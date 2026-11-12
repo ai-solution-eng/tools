@@ -1,0 +1,1074 @@
+# Job templates the app substitutes placeholders into and creates via the k8s
+# API. The PVC job template carries an optional provenance step (MD-A1):
+# when provenance.enabled is on, a successful download is followed by a
+# second python pass that pins the revision, hashes every downloaded file
+# (streamed 1MB reads) and writes manifest.json next to the cache dir —
+# atomically (.partial + os.replace) and idempotently (a backoffLimit re-run
+# re-hashes whatever is already on disk instead of failing). The scanner job
+# reports whether that manifest exists next to each models--* dir.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-job-template
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+data:
+  job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.downloader.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.downloader.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: downloader
+            securityContext:
+            {{- with .Values.downloader.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            image: {{ .Values.downloader.image.repository }}:{{ .Values.downloader.image.tag }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              export CACHE_ROOT="__CACHE_ROOT__"
+              export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}"
+              export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
+              mkdir -p "${CACHE_ROOT}"
+              CACHE_ID="models--$(echo "${MODEL_NAME}" | sed 's|/|--|')"
+              # Provenance: the revision this Job pins the download to
+              # (provenance.revision, default "main"). Drives both what
+              # snapshot_download fetches and what the manifest records.
+              PROV_REV="{{ .Values.provenance.revision | default "main" }}"
+              REV_FILE="${CACHE_ROOT}/${CACHE_ID}/refs/${PROV_REV}"
+              echo "Completing HF cache for ${MODEL_NAME}"
+              echo "Cache root (HUGGINGFACE_HUB_CACHE): ${CACHE_ROOT}"
+              echo "Repo cache dir: ${CACHE_ROOT}/${CACHE_ID}"
+              BEFORE_REV="none"
+              if [ -f "${REV_FILE}" ]; then BEFORE_REV="$(cat "${REV_FILE}")"; fi
+              echo "refs/${PROV_REV} before: ${BEFORE_REV}"
+              if [ -d "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" ]; then
+                echo "=== Existing snapshot contents ==="
+                ls -la "${CACHE_ROOT}/${CACHE_ID}/snapshots/${BEFORE_REV}" || true
+              fi
+              python3 -c "
+              import os, httpx
+              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              _orig = httpx.Client
+              class _Client(_orig):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.Client = _Client
+              _oa = httpx.AsyncClient
+              class _AsyncClient(_oa):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.AsyncClient = _AsyncClient
+              {{- end }}
+              import huggingface_hub.constants as _c
+              _c.MAX_HTTP_DOWNLOAD_SIZE = 500 * 1000 * 1000 * 1000
+              from huggingface_hub import snapshot_download
+              {{- if .Values.provenance.enabled }}
+              # Revision pinning rides the provenance gate: provenance off
+              # means the job downloads exactly as before (default branch,
+              # revision=None) and the manifest step is omitted entirely.
+              path = snapshot_download(
+                  os.environ['MODEL_NAME'],
+                  revision=os.environ['PROVENANCE_REVISION'] or None,
+                  cache_dir=os.environ['HUGGINGFACE_HUB_CACHE'],
+                  max_workers=8,
+              )
+              {{- else }}
+              path = snapshot_download(
+                  os.environ['MODEL_NAME'],
+                  cache_dir=os.environ['HUGGINGFACE_HUB_CACHE'],
+                  max_workers=8,
+              )
+              {{- end }}
+              print('Completed (full snapshot) at:', path)
+              "
+              AFTER_REV="$(cat "${REV_FILE}" 2>/dev/null || echo "${BEFORE_REV}")"
+              SNAP_DIR="${CACHE_ROOT}/${CACHE_ID}/snapshots/${AFTER_REV}"
+              echo "=== Verifying resolved snapshot: ${SNAP_DIR} (refs/${PROV_REV}=${AFTER_REV}) ==="
+              ls -la "${SNAP_DIR}"
+              if [ -f "${SNAP_DIR}/config.json" ]; then
+                echo "SUCCESS: config.json is now present in the cache."
+              else
+                echo "FAILURE: config.json still missing after download."
+                exit 1
+              fi
+              {{- if .Values.provenance.enabled }}
+              # ---- Provenance manifest (MD-A1) ----
+              # Runs AFTER the SUCCESS check so a failed download never emits
+              # a manifest. Export the runtime vars the python pass needs
+              # (CACHE_ID/SNAP_DIR are plain shell vars, not env), then pin
+              # the revision, hash every snapshot file (streamed 1MB reads,
+              # following the cache's blobs/ symlinks) and write
+              # ${CACHE_ROOT}/${CACHE_ID}/manifest.json atomically
+              # (.partial + os.replace). Idempotent under backoffLimit re-runs:
+              # a retry finds the blobs already on disk and simply re-hashes
+              # and replaces the manifest.
+              export CACHE_ID SNAP_DIR
+              python3 - <<'PROV_EOF'
+              import hashlib
+              import json
+              import os
+              import time
+
+              cache_root = os.environ["CACHE_ROOT"]
+              cache_id = os.environ["CACHE_ID"]
+              snap_dir = os.environ["SNAP_DIR"]
+              repo = os.environ["MODEL_NAME"]
+              requested_ref = os.environ.get("PROVENANCE_REVISION") or "main"
+              job_id = os.environ.get("JOB_ID", "")
+              namespace = os.environ["JOB_NAMESPACE"]
+              submitted_by = os.environ.get("SUBMITTED_BY", "")
+
+              # ---- revision pinning: refs/<requested> -> resolved commit ----
+              refs_dir = os.path.join(cache_root, cache_id, "refs")
+              revision = ""
+              if os.path.isdir(refs_dir):
+                  for name in sorted(os.listdir(refs_dir)):
+                      if name.lower() == requested_ref.lower():
+                          with open(os.path.join(refs_dir, name)) as fh:
+                              revision = fh.read().strip()
+                          break
+              if not revision and os.path.isdir(snap_dir):
+                  # A commit-sha pin downloads into snapshots/<sha> without a
+                  # refs entry, so the snapshot dir is the only resolver —
+                  # but only when the REQUESTED ref is itself commit-like
+                  # (40-hex git sha1 / 64-hex sha256-class id). Pinning
+                  # "v2.1" must never adopt whatever snapshot a previous
+                  # run left behind.
+                  req = requested_ref.lower()
+                  if 40 <= len(req) <= 64 and all(c in "0123456789abcdef" for c in req):
+                      actual = os.path.basename(os.path.realpath(snap_dir))
+                      if actual.lower() == req:
+                          revision = actual
+              manifest_revision = revision or requested_ref
+              print("PROVENANCE: revision %s resolved to %s" % (requested_ref, manifest_revision))
+
+              # ---- Hub metadata cross-check (best effort, non-fatal) ----
+              # HfApi().model_info(files_metadata=True) exposes the Hub-side
+              # sha256 for LFS-backed blobs only; non-LFS files have no
+              # Hub-side digest, so their manifest entry carries the local
+              # hash alone (stated in the schema notes below).
+              lfs_shas = {}
+              hub_metadata_fetched = False
+              try:
+                  from huggingface_hub import HfApi
+                  info = HfApi().model_info(repo, files_metadata=True)
+                  for sibling in info.siblings or []:
+                      lfs = getattr(sibling, "lfs", None)
+                      if lfs and getattr(lfs, "sha256", None):
+                          lfs_shas[sibling.rfilename] = lfs.sha256
+                  hub_metadata_fetched = True
+                  print("PROVENANCE: Hub metadata fetched (%d files, %d LFS digests)" % (len(info.siblings or []), len(lfs_shas)))
+              except Exception as exc:
+                  print("PROVENANCE: Hub metadata unavailable (%s); lfs_sha256_verified omitted" % exc)
+
+              # ---- per-file sha256 + size (streamed 1MB reads) ----
+              def sha256_of(path):
+                  digest = hashlib.sha256()
+                  with open(path, "rb") as fh:
+                      for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  return digest.hexdigest()
+
+              files = []
+              for root, dirs, names in os.walk(snap_dir):
+                  dirs.sort()
+                  for name in sorted(names):
+                      full = os.path.join(root, name)
+                      # Snapshot entries are symlinks into blobs/ — follow
+                      # them (open/getsize do) but skip dangling links.
+                      if not os.path.exists(full) or not os.path.isfile(full):
+                          continue
+                      entry = {
+                          "path": os.path.relpath(full, snap_dir),
+                          "sha256": sha256_of(full),
+                          "size": os.path.getsize(full),
+                      }
+                      hub_sha = lfs_shas.get(entry["path"])
+                      if hub_sha:
+                          entry["lfs_sha256"] = hub_sha
+                          entry["lfs_sha256_verified"] = entry["sha256"] == hub_sha
+                      files.append(entry)
+
+              # ---- license: config.json first, then the model card front matter ----
+              license_id = ""
+              config_path = os.path.join(snap_dir, "config.json")
+              if os.path.isfile(config_path):
+                  try:
+                      with open(config_path) as fh:
+                          cfg = json.load(fh)
+                  except (OSError, ValueError):
+                      cfg = {}
+                  lic = cfg.get("license") or cfg.get("license_title") or cfg.get("license_name") or ""
+                  if isinstance(lic, str):
+                      license_id = lic.strip()
+              if not license_id:
+                  card_path = os.path.join(snap_dir, "README.md")
+                  if os.path.isfile(card_path):
+                      try:
+                          with open(card_path, errors="replace") as fh:
+                              head = [line.strip() for line in fh.read(8192).splitlines()]
+                      except OSError:
+                          head = []
+                      if head and head[0] == "---":
+                          for line in head[1:]:
+                              if line == "---":
+                                  break
+                              if line.lower().startswith("license:"):
+                                  license_id = line.split(":", 1)[1].strip().strip('"').strip("'")
+                                  break
+
+              manifest = {
+                  "schema": "model-downloader.provenance/1.0",
+                  "repo": repo,
+                  "revision": manifest_revision,
+                  "revision_requested": requested_ref,
+                  "revision_resolved": bool(revision),
+                  "files": files,
+                  "license": license_id,
+                  "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "job_id": job_id,
+                  "namespace": namespace,
+                  "submitted_by": submitted_by,
+                  "hub_metadata_fetched": hub_metadata_fetched,
+                  "notes": (
+                      "sha256 values are local hashes of the downloaded files. "
+                      "For LFS-backed files lfs_sha256 is the Hub-side digest "
+                      "and lfs_sha256_verified records the byte-for-byte match "
+                      "against it; non-LFS files have no Hub-side digest, so "
+                      "their integrity rests on the local hash alone."
+                  ),
+              }
+              manifest_dir = os.path.join(cache_root, cache_id)
+              os.makedirs(manifest_dir, exist_ok=True)
+              partial = os.path.join(manifest_dir, "manifest.json.partial")
+              final = os.path.join(manifest_dir, "manifest.json")
+              with open(partial, "w") as fh:
+                  json.dump(manifest, fh, indent=2, sort_keys=True)
+                  fh.write("\n")
+              os.replace(partial, final)
+              print("PROVENANCE: manifest written to %s (%d files)" % (final, len(files)))
+              PROV_EOF
+              {{- end }}
+              {{- if .Values.gate.enabled }}
+              # ---- ModelScan provenance gate (MD-A2) ----
+              # Scans the resolved snapshot for unsafe serialization
+              # formats (.bin/.pt/.pth/.ckpt + pickle-class files).
+              # safetensors needs no scan and is skipped by modelscan itself
+              # (unsupported extension -> skipped, not failed). GATE_MODE
+              # decides the outcome: warn records the verdict and proceeds;
+              # block exits 1 on an UNSAFE VERDICT so the Job fails and the
+              # reason surfaces in the Jobs table's Error column. A scanner
+              # ERROR (tool crash, exit 2) is always warn-only — a broken
+              # scanner must not take downloads down; only a positive unsafe
+              # verdict can block. The verdict is written into manifest.json
+              # (scan block) after the scan, so the PVC scanner's 6th column
+              # and the GC report pick it up.
+              export GATE_MODE="{{ .Values.gate.mode }}"
+              export GATE_THRESHOLD="{{ .Values.gate.threshold }}"
+              python3 - <<'GATE_EOF'
+              import fnmatch
+              import json
+              import os
+              import subprocess
+              import sys
+
+              snap_dir = os.environ["SNAP_DIR"]
+              # manifest sits next to the models--* dir:
+              #   SNAP_DIR = <cache_root>/<cache_id>/snapshots/<rev>
+              # so the cache dir is dirname(dirname(SNAP_DIR)).
+              cache_root = os.environ["CACHE_ROOT"]
+              cache_id = os.path.basename(os.path.dirname(os.path.dirname(snap_dir)))
+              manifest_path = os.path.join(cache_root, cache_id, "manifest.json")
+              mode = os.environ.get("GATE_MODE", "warn").strip().lower()
+              threshold = os.environ.get("GATE_THRESHOLD", "low").strip().lower()
+
+              UNSAFE_EXTS = (".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle", ".joblib", ".dill", ".dat", ".data", ".h5", ".pb", ".keras", ".npy")
+              SEVERITY_ORDER = ["low", "medium", "high", "critical"]
+
+              def max_severity(issues):
+                  worst = ""
+                  for sev in issues:
+                      s = str(sev).lower()
+                      if s in SEVERITY_ORDER and (not worst or SEVERITY_ORDER.index(s) > SEVERITY_ORDER.index(worst)):
+                          worst = s
+                  return worst
+
+              target_files = []
+              for root, dirs, names in os.walk(snap_dir):
+                  dirs.sort()
+                  for name in sorted(names):
+                      if name.lower().endswith(UNSAFE_EXTS):
+                          target_files.append(os.path.join(root, name))
+
+              if not target_files:
+                  verdict = "skipped"
+                  detail = "no unsafe-format files present (safetensors-only snapshot)"
+                  print("GATE: %s — %s" % (verdict, detail))
+              else:
+                  print("GATE: scanning %d unsafe-format file(s) with modelscan" % len(target_files))
+                  proc = subprocess.run(
+                      [sys.executable, "-m", "modelscan.cli", "scan", "-r", "json", "-p", snap_dir],
+                      capture_output=True, text=True, timeout=3600,
+                  )
+                  # modelscan's stdout mixes banner lines ("No settings file
+                  # ...", "Scanning ...") with the JSON report — take the
+                  # JSON object line, not the whole stream.
+                  findings = []
+                  report = None
+                  for line in reversed((proc.stdout or "").splitlines()):
+                      line = line.strip()
+                      if line.startswith("{"):
+                          try:
+                              report = json.loads(line)
+                              break
+                          except ValueError:
+                              continue
+                  if report is None:
+                      try:
+                          report = json.loads(proc.stdout or "{}")
+                      except ValueError:
+                          report = None
+                  if report is not None:
+                      for issue in report.get("issues", []):
+                          sev = issue.get("severity", "")
+                          desc = issue.get("description", issue.get("code", ""))
+                          src = issue.get("source", issue.get("filename", ""))
+                          findings.append((sev, src, desc))
+                  else:
+                      findings = [("error", "", (proc.stderr or "unparseable modelscan output")[:300])]
+                  worst = max_severity(s for s, _src, _d in findings)
+                  # threshold: severities AT OR BELOW the threshold downgrade
+                  # to clean (e.g. threshold=medium keeps LOW findings from
+                  # blocking); anything above keeps its level.
+                  below = worst in SEVERITY_ORDER and worst in SEVERITY_ORDER[: max(SEVERITY_ORDER.index(threshold), 0)] if threshold in SEVERITY_ORDER else False
+                  tool_error = proc.returncode == 2 or (proc.returncode not in (0, 1) and not report)
+                  if not findings:
+                      verdict = "clean"
+                      detail = "modelscan exit %s, no findings" % proc.returncode
+                  elif tool_error:
+                      verdict = "error"
+                      detail = "modelscan failed (exit %s): %s" % (proc.returncode, (proc.stderr or "")[:300])
+                  elif below:
+                      verdict = "clean"
+                      detail = "modelscan findings at or below threshold %s: %s" % (threshold, findings[:5])
+                  else:
+                      verdict = "suspicious"
+                      detail = "modelscan findings (max severity %s): %s" % (worst or "unknown", findings[:5])
+                  print("GATE: %s — %s" % (verdict, detail))
+
+              # Record the verdict in manifest.json (atomic replace, same
+              # pattern as the manifest writer). A manifest-less run (older
+              # provenance disabled) writes a small sidecar instead so the
+              # scanner still has a verdict to surface.
+              entry = {"verdict": verdict, "mode": mode, "threshold": threshold, "detail": detail}
+              if os.path.isfile(manifest_path):
+                  with open(manifest_path) as fh:
+                      manifest = json.load(fh)
+                  manifest["scan"] = entry
+                  partial = manifest_path + ".partial"
+                  with open(partial, "w") as fh:
+                      json.dump(manifest, fh, indent=2, sort_keys=True)
+                      fh.write("\n")
+                  os.replace(partial, manifest_path)
+                  print("GATE: verdict recorded in %s" % manifest_path)
+              else:
+                  # No manifest (provenance disabled): write the verdict
+                  # NEXT TO the cache dir (models--*/ level, where the
+                  # scanner looks), not inside the snapshot.
+                  sidecar = os.path.join(cache_root, cache_id, "scan-verdict.json")
+                  with open(sidecar, "w") as fh:
+                      json.dump(entry, fh, indent=2)
+                  print("GATE: no manifest present; verdict sidecar written to %s" % sidecar)
+
+              if verdict == "suspicious" and mode == "block":
+                  print("GATE: BLOCK MODE — failing the Job on unsafe scan verdict")
+                  sys.exit(1)
+              GATE_EOF
+              {{- end }}
+              if [ -n "${CHAT_TEMPLATE_B64}" ]; then
+                CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_PATH}"
+                case "${CHAT_TEMPLATE_FILE}" in
+                  /*) ;;
+                  *) CHAT_TEMPLATE_FILE="${CACHE_ROOT}/${CHAT_TEMPLATE_FILE}" ;;
+                esac
+                mkdir -p "$(dirname "${CHAT_TEMPLATE_FILE}")"
+                printf '%s' "${CHAT_TEMPLATE_B64}" | base64 -d > "${CHAT_TEMPLATE_FILE}"
+                echo "SUCCESS: chat template written to ${CHAT_TEMPLATE_FILE}"
+              fi
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            - name: MODEL_NAME
+              value: __MODEL_NAME__
+            - name: CHAT_TEMPLATE_B64
+              value: "__CHAT_TEMPLATE_B64__"
+            - name: CHAT_TEMPLATE_PATH
+              value: "__CHAT_TEMPLATE_PATH__"
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
+            - name: no_proxy
+              value: {{ . | quote }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
+            - name: https_proxy
+              value: {{ . | quote }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
+            - name: http_proxy
+              value: {{ . | quote }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.downloader.user | quote }}
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: {{ .Values.downloader.hf.downloadTimeout | quote }}
+            - name: HF_HUB_ETAG_TIMEOUT
+              value: {{ .Values.downloader.hf.etagTimeout | quote }}
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: {{ .Values.downloader.hf.enableHfTransfer | quote }}
+            - name: HF_HUB_DISABLE_XET
+              value: {{ .Values.downloader.hf.disableXet | quote }}
+            {{- if .Values.provenance.enabled }}
+            - name: PROVENANCE_REVISION
+              value: {{ .Values.provenance.revision | quote }}
+            - name: JOB_ID
+              value: "__JOB_ID__"
+            - name: JOB_NAMESPACE
+              value: __NAMESPACE__
+            - name: SUBMITTED_BY
+              value: "__SUBMITTED_BY__"
+            {{- end }}
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+            resources:
+            {{- toYaml .Values.downloader.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: {{ .Values.downloader.pvcName }}
+  job-s3.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.downloader.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.downloader.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.downloader.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: downloader
+            securityContext:
+            {{- with .Values.downloader.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            image: {{ .Values.downloader.image.repository }}:{{ .Values.downloader.image.tag }}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              export WORK_CACHE="{{ .Values.downloader.s3WorkPath }}/${MODEL_NAME}"
+              export HF_HUB_DISABLE_XET={{ .Values.downloader.hf.disableXet | quote }}
+              mkdir -p "${WORK_CACHE}"
+              DEST_PATH="${MODEL_NAME}"
+              if [ -n "${S3_PREFIX}" ]; then DEST_PATH="${S3_PREFIX}/${MODEL_NAME}"; fi
+              echo "Downloading ${MODEL_NAME} directly to S3 (s3://${S3_BUCKET}/${DEST_PATH})"
+              echo "Scratch (WORK_CACHE): ${WORK_CACHE}"
+              python3 -c "
+              import os, shutil, threading
+              from concurrent.futures import ThreadPoolExecutor, as_completed
+              {{- if eq (include "model-downloader.skipTlsVerification" .) "true" }}
+              import httpx
+              _orig = httpx.Client
+              class _Client(_orig):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.Client = _Client
+              _oa = httpx.AsyncClient
+              class _AsyncClient(_oa):
+                  def __init__(self, *a, **kw):
+                      kw['verify'] = False
+                      super().__init__(*a, **kw)
+              httpx.AsyncClient = _AsyncClient
+              {{- end }}
+              import huggingface_hub.constants as _c
+              _c.MAX_HTTP_DOWNLOAD_SIZE = 500 * 1000 * 1000 * 1000
+              from huggingface_hub import list_repo_files, hf_hub_download
+              from pathlib import Path
+              import boto3
+              from boto3.s3.transfer import TransferConfig
+
+              model = os.environ['MODEL_NAME']
+              bucket = os.environ['S3_BUCKET']
+              prefix = os.environ['S3_PREFIX']
+              work_root = Path(os.environ['WORK_CACHE'])
+              dest_prefix = '%s/%s' % (prefix, model) if prefix else model
+
+              kws = {}
+              if os.environ.get('AWS_ENDPOINT_URL'):
+                  kws['endpoint_url'] = os.environ['AWS_ENDPOINT_URL']
+              s3 = boto3.client('s3', **kws)
+              cfg = TransferConfig(multipart_threshold=64*1024*1024, max_concurrency=8)
+
+              files = sorted(f for f in list_repo_files(model) if not f.endswith('/'))
+              if not files:
+                  raise SystemExit('no files found for ' + model)
+              print('Uploading %d file(s) to s3://%s/%s' % (len(files), bucket, dest_prefix))
+
+              _local = threading.local()
+
+              def upload_one(file):
+                  if not getattr(_local, 'cache', None):
+                      _local.cache = work_root / ('w' + threading.current_thread().name.replace('ThreadPoolExecutor-', ''))
+                      _local.cache.mkdir(parents=True, exist_ok=True)
+                  local = Path(hf_hub_download(repo_id=model, filename=file, cache_dir=str(_local.cache)))
+                  s3.upload_file(str(local), bucket, '%s/%s' % (dest_prefix, file), Config=cfg)
+                  shutil.rmtree(_local.cache, ignore_errors=True)
+                  return file
+
+              failed = []
+              with ThreadPoolExecutor(max_workers=8) as ex:
+                  futures = {ex.submit(upload_one, f): f for f in files}
+                  for fut in as_completed(futures):
+                      f = futures[fut]
+                      try:
+                          fut.result()
+                      except Exception as e:
+                          failed.append(f)
+                          print('FAILED %s: %s' % (f, e), flush=True)
+              if failed:
+                  raise SystemExit('failed to upload: %s' % ', '.join(failed))
+              print('SUCCESS: %d file(s) uploaded to s3://%s/%s' % (len(files), bucket, dest_prefix))
+              "
+              echo "SUCCESS: snapshot uploaded to s3://${S3_BUCKET}/${DEST_PATH}"
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            - name: MODEL_NAME
+              value: __MODEL_NAME__
+            - name: S3_BUCKET
+              value: "__S3_BUCKET__"
+            - name: S3_PREFIX
+              value: "__S3_PREFIX__"
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.s3.endpointUrl | quote }}
+            {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.s3.secretAccessKey | quote }}
+            {{- end }}
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
+            - name: no_proxy
+              value: {{ . | quote }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
+            - name: https_proxy
+              value: {{ . | quote }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
+            - name: http_proxy
+              value: {{ . | quote }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.downloader.user | quote }}
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: {{ .Values.downloader.hf.downloadTimeout | quote }}
+            - name: HF_HUB_ETAG_TIMEOUT
+              value: {{ .Values.downloader.hf.etagTimeout | quote }}
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: {{ .Values.downloader.hf.enableHfTransfer | quote }}
+            - name: HF_HUB_DISABLE_XET
+              value: {{ .Values.downloader.hf.disableXet | quote }}
+            volumeMounts:
+            - name: work-storage
+              mountPath: /mnt/
+            resources:
+            {{- toYaml .Values.downloader.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: work-storage
+            {{- if .Values.downloader.s3WorkPvcName }}
+            persistentVolumeClaim:
+              claimName: {{ .Values.downloader.s3WorkPvcName }}
+            {{- else }}
+            emptyDir:
+              sizeLimit: {{ .Values.downloader.s3WorkSize | quote }}
+            {{- end }}
+  # NIM profile mirror (MD-NIM). The app substitutes the __PLACEHOLDER__ names
+  # below, then appends "--profiles <id> [<id> ...]" to the args list. Gated on
+  # nim.enabled: a missing key maps to None in the app, which then refuses NIM
+  # submissions with a "upgrade the chart" error instead of failing at Job
+  # creation. No nvidia.com/gpu: `mirror s3` only downloads and uploads.
+  {{- if .Values.nim.enabled }}
+  job-nim.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        app.kubernetes.io/managed-by: model-downloader
+        model-downloader/source: "nim"
+    spec:
+      ttlSecondsAfterFinished: {{ .Values.nim.ttlSecondsAfterFinished }}
+      backoffLimit: {{ .Values.nim.backoffLimit }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.nim.disableSecurityContext | quote }}
+          labels:
+            hpe-ezua/app: mlis
+            model-downloader/source: "nim"
+        spec:
+          {{- with .Values.nim.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.nim.imagePullSecrets }}
+          imagePullSecrets:
+          {{- range . }}
+          - name: {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          containers:
+          - name: nim-mirror
+            image: "__NIM_IMAGE__"
+            imagePullPolicy: IfNotPresent
+            securityContext:
+            {{- with .Values.nim.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            # mirror downloads each profile into the local NIM cache, then
+            # uploads it to the bucket ROOT with the percent-encoded keys
+            # NIM_REPOSITORY_OVERRIDE=s3://<bucket> expects. The app appends
+            # --profiles <id> ... when the user names profiles (empty = the
+            # image's default profile).
+            args:
+            - "mirror"
+            - "s3"
+            - "-b"
+            - "__NIM_BUCKET__"
+            - "--manifest-file"
+            - {{ .Values.nim.manifestPath | quote }}
+            - "--model-cache-path"
+            - "/opt/nim/.cache"
+            env:
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: __NGC_SECRET__
+                  key: NGC_API_KEY
+            {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.s3.secretAccessKey | quote }}
+            {{- end }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.s3.endpointUrl | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.nim.region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.nim.region | quote }}
+            - name: AWS_S3_USE_PATH_STYLE
+              value: {{ .Values.nim.pathStyle | quote }}
+            - name: NIM_CACHE_PATH
+              value: "/opt/nim/.cache"
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
+            - name: no_proxy
+              value: {{ . | quote }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
+            - name: https_proxy
+              value: {{ . | quote }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
+            - name: http_proxy
+              value: {{ . | quote }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            volumeMounts:
+            - name: nim-cache
+              mountPath: /opt/nim/.cache
+            resources:
+            {{- toYaml .Values.nim.resources | nindent 14 }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: nim-cache
+            {{- if .Values.nim.workPvcName }}
+            persistentVolumeClaim:
+              claimName: {{ .Values.nim.workPvcName }}
+            {{- else }}
+            emptyDir:
+              sizeLimit: {{ .Values.nim.workSize | quote }}
+            {{- end }}
+  {{- end }}
+  # Debug shell launched from the UI ("Launch debug pod"). Deliberately a Job,
+  # not a bare Pod: the Job's Pod is then created by the kube-system
+  # job-controller — the exact same admission path as the downloader Jobs —
+  # whereas a Pod created directly by the model-downloader ServiceAccount is
+  # denied by the platformwide protect-models-pvc Kyverno policy
+  # (prevent-unauthorized-create-with-mlis: "Insufficient authorization to set
+  # the 'hpe-ezua/app' label to 'mlis'"). With the job-controller as creator,
+  # the same labels/annotations as downloader pods are admitted as-is.
+  debug-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value so the download-jobs reconciliation
+        # (selector app.kubernetes.io/managed-by=model-downloader) never
+        # picks debug jobs up into the Jobs table.
+        app.kubernetes.io/managed-by: model-downloader-debug
+    spec:
+      # tail -f /dev/null never exits; a restart only matters when the pod
+      # dies (node drain etc.) and 0 avoids masking a Failed state for long.
+      backoffLimit: 0
+      # Only applies once the Job finishes/fails, so a dead debug job
+      # self-cleans instead of lingering forever.
+      ttlSecondsAfterFinished: {{ .Values.debugPod.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: {{ .Values.debugPod.disableSecurityContext | quote }}
+          labels:
+            app.kubernetes.io/managed-by: model-downloader-debug
+            model-downloader/debug-pod: "true"
+            hpe-ezua/app: mlis
+        spec:
+          {{- with .Values.downloader.nodeSelector }}
+          nodeSelector:
+          {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+          {{- end }}
+          {{- end }}
+          restartPolicy: OnFailure
+          containers:
+          - name: debug
+            image: __IMAGE__
+            imagePullPolicy: {{ .Values.debugPod.image.pullPolicy }}
+            # Keeps the container running indefinitely so you can `kubectl exec` in.
+            command: ["tail", "-f", "/dev/null"]
+            securityContext:
+            {{- with .Values.debugPod.securityContext }}
+            {{- toYaml . | nindent 14 }}
+            {{- end }}
+            env:
+            {{- with .Values.proxy }}
+            {{- with .noProxy }}
+            - name: no_proxy
+              value: {{ . | quote }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .https }}
+            - name: https_proxy
+              value: {{ . | quote }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .http }}
+            - name: http_proxy
+              value: {{ . | quote }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: USER
+              value: {{ .Values.debugPod.user | quote }}
+            - name: HUGGINGFACE_HUB_CACHE
+              value: {{ .Values.debugPod.cachePath | quote }}
+            # Optional HF token (empty Secret when the user leaves the field blank)
+            # so huggingface-cli / hf download work inside the pod.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __HF_TOKEN_SECRET__
+                  key: HF_TOKEN
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: {{ .Values.debugPod.pvcName | default .Values.downloader.pvcName }}
+  # Short-lived scanner Job used to list model directories on the PVC.
+  # Runs a simple shell script that finds directories containing a config.json
+  # and prints "model_name<TAB>mtime" to stdout.
+  scan-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value (like debug shells) so list_managed_jobs()
+        # never picks scanner Jobs into the Downloads table.
+        app.kubernetes.io/managed-by: model-downloader-scan
+        model-downloader/scan: "true"
+    spec:
+      ttlSecondsAfterFinished: 120
+      backoffLimit: 0
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: "true"
+          labels:
+            hpe-ezua/app: mlis
+            model-downloader/scan: "true"
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: scanner
+            image: __IMAGE__
+            command:
+            - /bin/sh
+            - -c
+            - |
+              ROOT="__SCAN_ROOT__"
+              if [ ! -d "$ROOT" ]; then
+                echo "SCAN ERROR: $ROOT not present in scanner container (volume mount problem?)" >&2
+                exit 0
+              fi
+              # Every completed HF download leaves a models--<org>--<Repo>
+              # cache dir, at whatever depth the chosen cache root implies.
+              # Glob those directly — no dependency on config.json or the
+              # snapshot layout. The cache dir NAME is the true repo id
+              # (the path above it is just where the user cached it).
+              # Column 4: whether a provenance manifest.json (MD-A1) sits
+              # next to the cache dir — the UI's future Verified badge and
+              # GC's ownership record key off this one field.
+              {{- if or .Values.preflight.enabled .Values.gate.enabled }}
+              # Column 5 (MD-B, chart >= 1.7): du -sb of the whole cache dir
+              # — per-dir used bytes. The app's preflight/quota sums these
+              # (attributed by namespace) and the GC report shows sizes.
+              # Column 6 (MD-A2, chart >= 1.7): the ModelScan verdict from
+              # the manifest's scan block ("clean"/"suspicious"/...; empty
+              # = not scanned). Read with python (the scanner image has no
+              # jq) guarded to a single small read per dir.
+              {{- end }}
+              # NOT under a .locks/ dir: huggingface_hub keeps per-repo locks at
+              # <cache_root>/.locks/<cache id>/, and that leaf is named
+              # models--<org>--<repo> like a real cache dir. Without this, deleting
+              # a model leaves its lock dir behind and the scanner reports the
+              # deleted model forever as a 0-byte phantom.
+              find "$ROOT" -type d -name 'models--*--*' ! -path '*/.locks/*' 2>/dev/null | while IFS= read -r d; do
+                cache="${d##*/}"
+                model="$(printf '%s' "${cache#models--}" | sed 's|--|/|')"
+                [ -n "$model" ] || continue
+                mtime=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+                if [ -f "$d/manifest.json" ]; then manifest="true"; else manifest="false"; fi
+                {{- if or .Values.preflight.enabled .Values.gate.enabled }}
+                bytes=$(du -sb "$d" 2>/dev/null | awk '{print $1}')
+                scanned=""
+                if [ -f "$d/manifest.json" ]; then
+                  # Single small manifest read per dir; python (not jq — the
+                  # scanner image has none). One python -c with the body kept
+                  # at the shell block's indentation (col-0 lines would end
+                  # the YAML literal block).
+                  scanned=$(MODELSCAN_VERDICT_FILE="$d/manifest.json" python3 -c '
+                                            import json, os
+                                            try:
+                                                m = json.load(open(os.environ["MODELSCAN_VERDICT_FILE"]))
+                                                s = m.get("scan") if isinstance(m, dict) else None
+                                                print((s or {}).get("verdict", "") if isinstance(s, dict) else "")
+                                            except Exception:
+                                                print("")' 2>/dev/null)
+                fi
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$model" "$mtime" "$d" "$manifest" "$bytes" "$scanned"
+                {{- else }}
+                printf '%s\t%s\t%s\t%s\n' "$model" "$mtime" "$d" "$manifest"
+                {{- end }}
+              done
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            resources:
+              requests:
+                cpu: "50m"
+                memory: 64Mi
+              limits:
+                cpu: "200m"
+                memory: 128Mi
+            volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/
+              readOnly: true
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: __PVC_NAME__
+{{- if .Values.manualDelete.enabled }}
+  # One-shot manual-delete Job (MD-D), created by the app after a human
+  # approves per-dir verdicts in the UI. The app substitutes the placeholders
+  # below and creates the Job via the k8s API; __TARGETS_B64__ is ALWAYS a
+  # base64-of-JSON env value — raw JSON is never spliced into the manifest.
+  #
+  # The pod's admission pattern is copied VERBATIM from the scanner/GC Jobs
+  # (hpe-ezua/app: mlis, hpe-ezua/disable-sc: "true",
+  # sidecar.istio.io/inject: "false", runAsUser/runAsGroup: 0) so the
+  # job-controller-created pod is admitted by the protect-models-pvc Kyverno
+  # policy. UNLIKE the GC CronJob, this pod spec sets serviceAccountName
+  # EXPLICITLY to the app ServiceAccount: the Job reads the AIOLI Secret and
+  # lists managed Jobs via the k8s API, and both are granted to the app SA
+  # (rbac.yaml) — never to the namespace default SA. The PVC mount is
+  # READ-WRITE: app.delete_targets writes tombstones and removes exactly the
+  # directories the server-side verdict resolved (no walking, no wildcards).
+  manual-delete-job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: __JOB_NAME__
+      namespace: __NAMESPACE__
+      labels:
+        # Distinct managed-by value (like debug/scan Jobs) so the
+        # download-jobs reconciliation (selector
+        # app.kubernetes.io/managed-by=model-downloader) never picks delete
+        # Jobs into the Downloads table.
+        app.kubernetes.io/managed-by: model-downloader-delete
+        model-downloader/delete: "true"
+      # NO model-downloader/cache-root annotation, deliberately. The GC/live-job
+      # cross-check treats any managed Job whose cache-root covers an entry's
+      # parent as pinning that entry, and it ignores Job status — so annotating
+      # this Job with the scan root made it pin EVERY model on the PVC: the
+      # delete Job blocked its own targets, and a finished one kept every later
+      # preview fully blocked for the whole jobTtlSeconds. The Job needs no tree
+      # pin; it re-validates each path in-pod, and a concurrent GC removing a
+      # directory first just fails validation and aborts the run.
+    spec:
+      ttlSecondsAfterFinished: __JOB_TTL__
+      backoffLimit: 0
+      # A pod that never schedules stays Pending forever: Pending is not a
+      # failure, so backoffLimit never fires and the Job hangs with no signal.
+      # The deadline converts that into a visible Failed Job — but it must be
+      # generous: removing a 50 GiB model tree over network storage can take
+      # many minutes, and killing the process mid-rmtree is worse than waiting.
+      # (Deletion renames the dir to .deleting-<name> first, so a kill leaves
+      # junk rather than a half-deleted model in the listing.)
+      activeDeadlineSeconds: __JOB_DEADLINE__
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            hpe-ezua/disable-sc: "true"
+          labels:
+            hpe-ezua/app: mlis
+            app.kubernetes.io/managed-by: model-downloader-delete
+            model-downloader/delete: "true"
+        spec:
+          # NO serviceAccountName on purpose: this Job runs in the namespace
+          # that OWNS models-pvc (defaultNamespace), where the app's SA does not
+          # exist — a cross-namespace SA reference is impossible, and naming one
+          # that is absent leaves the pod Pending forever. It uses `default`,
+          # exactly like the download and scan Jobs, because it needs no cluster
+          # RBAC: the AIOLI and live-job checks run in the app at commit time,
+          # where that RBAC already lives.
+          restartPolicy: Never
+          containers:
+          - name: delete
+            image: __IMAGE__
+            command: ["python3", "-m", "app.delete_targets"]
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            env:
+            - name: MD_TARGETS_B64
+              value: "__TARGETS_B64__"
+            - name: MD_SCAN_ROOT
+              value: __SCAN_ROOT__
+            - name: MD_JOB_NAME
+              value: __JOB_NAME__
+            - name: MD_ACTOR
+              value: "__ACTOR__"
+            - name: POD_NAMESPACE
+              value: __NAMESPACE__
+            volumeMounts:
+            - name: model-storage
+              mountPath: __MOUNT_PATH__
+          volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: __PVC_NAME__
+{{- end }}

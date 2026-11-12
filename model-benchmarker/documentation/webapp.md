@@ -50,13 +50,36 @@ POST /api/models: as soon as a target URL is entered, the page asks that
 endpoint for `GET {target}/v1/models` and lists the ids it advertises. This is
 the same probe the engine runs when the field is left empty (auto-discovery),
 so it costs nothing extra; the API-key field is used exactly as it is for a
-launch, and the probe follows the chat engine's own URL resolution --
-benchmark_chat is launched without `--remote`, so `.serving.` targets are
-always resolved to their in-cluster form (the LOCAL/REMOTE toggle still
-governs endpoint runs and the run record's target identity). It is ADVICE ONLY -- free text always
+launch, and the probe follows the toggle exactly as the chat run does now:
+checked (local) rewrites `.serving.` URLs in-cluster and uses the system-TLS
+client; unchecked (remote) keeps the URL as typed and uses the engine's remote
+client (TLS-unverified by default, or `REMOTE_CA_BUNDLE` when the operator
+pins the platform CA). It is ADVICE ONLY -- free text always
 wins, an endpoint that lists nothing (or is unreachable) just leaves a hint
 with a retry link, and leaving the field empty still means auto-discover. The
 list is capped at 500 ids; the ⟳ button re-probes without changing the target.
+
+### "could not list models"
+
+The hint (and the open dropdown) carries the endpoint's own reason. Two
+failures look alike but are different:
+
+- **HTTP 401 from the PCAI LLM gateway** -- the URL is fine; the key is not.
+  `/v1/models` requires a gateway **virtual key** (`hllm-…`, scope
+  `proxy`), created in the gateway's `/admin` console. The gateway's
+  **admin key**, this app's own unlock key, a key from another environment,
+  or a revoked/expired key all answer 401 ("invalid, revoked, or expired
+  key"). A pasted `Bearer ` prefix is stripped by the server; a key that is
+  valid but lacks the `proxy` scope answers 403 instead.
+- **Connection/TLS errors** -- the app pod cannot reach the hostname, or
+  does not trust its certificate. Uncheck **In-cluster address** for a PCAI
+  ingress: remote mode uses the engine's remote client (TLS-unverified by
+  default, or `REMOTE_CA_BUNDLE` when the operator pins the platform CA).
+  Only `.serving.` URLs can be rewritten in-cluster; an app ingress such as
+  the LLM gateway has no derivable namespace, so its in-cluster Service URL
+  must be supplied explicitly (e.g.
+  `http://pcai-llm-gateway-service.<namespace>.svc.cluster.local:<port>`)
+  and allowed by that app's NetworkPolicy.
 
 ### HiCache tiers on the memory page
 

@@ -135,6 +135,9 @@ settings:
   rateLimitExcludeCachedTokens: true
   budgetCachedExemptFraction: 0.9
   toolRelayEnabled: true
+  # Progressive disclosure (2026-11-10): "hybrid" = one pcai_tools discovery tool; "full" inlines
+  # all 111 tool definitions (34,459 prompt tokens). g2 runs hybrid in production.
+  toolRelaySurface: hybrid
   toolRelayMaxIterations: 16
   toolRelayWallClockS: 900
   toolRelayGrantMode: explicit    # 'explicit' | 'scope' (legacy: mcp-scoped keys get the policy-admitted fleet)
@@ -172,9 +175,10 @@ settings:
   # Agents as routing candidates (off by default): the key's OFFERED agents join
   # the router's window; a pick applies the agent's surface + prompt for the turn.
   routingAgentsEnabled: false
-  # MCP federation surface: flat per-tool exposure (`{server}__{tool}`) on /mcp; false = legacy
-  # two-tool surface (mcp_catalog + mcp_call only).
-  mcpFlatTools: true
+  # MCP federation surface: false = two-tool surface (mcp_catalog + mcp_call), which pays
+  # ~4.6-6k tokens ONCE on discovery; true = flat per-tool exposure (`{server}__{tool}`) that
+  # inlines every granted tool into every request. Default false since 2026-11-10.
+  mcpFlatTools: false
   mcpCatalogCacheS: 60.0
   mcpFailoverAttempts: 2
   # Per-model fallback chains are admin-curated at runtime (nothing to preset in values);

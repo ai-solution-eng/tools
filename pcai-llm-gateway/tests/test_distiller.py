@@ -59,7 +59,7 @@ def test_prompt_carries_index_contract() -> None:
 
 
 def test_prompt_version_is_set() -> None:
-    assert dist_mod.PROMPT_VERSION == "dsh-2026-10-09"
+    assert dist_mod.PROMPT_VERSION == "dsh-2026-11-10"  # playbook overlay bump
 
 
 def test_build_transcript_roles_and_header() -> None:

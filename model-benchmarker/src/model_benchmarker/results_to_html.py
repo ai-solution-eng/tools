@@ -149,6 +149,7 @@ def _parse_md_chat_row(stripped: str, header: list[str] | None = None) -> dict |
         return bool(group) and all(t in ("-", "—") for t in group)
 
     segs: dict[str, list[float] | None] = {}
+    cache_hit_pct: float | None = None
     if header:
         # Header-driven: locate each known metric group by its header names.
         # TWO layouts parse here: the legacy WIDE files (one column per
@@ -160,8 +161,15 @@ def _parse_md_chat_row(stripped: str, header: list[str] | None = None) -> dict |
         # clipping the row header). Both produce identical row dicts.
         groups: dict[str, list[int]] = {}
         compact: dict[str, int] = {}
+        cache_idx: int | None = None
         for i, h in enumerate(header):
             hl = h.strip().lower()
+            if hl == "cache hit %":
+                # MB-CACHE: single number (cached prompt tokens / prompt
+                # tokens, as a percent; "-" cell = unmeasurable).  A scalar,
+                # not a percentile block, so it gets its own index.
+                cache_idx = i
+                continue
             # COMPACT headers FIRST: "TTFT turn1 P50/P95/P99/P100 (ms)" also
             # matches the wide "P<digit>" prefix, so the compact test has to
             # win the elif chain.
@@ -213,6 +221,16 @@ def _parse_md_chat_row(stripped: str, header: list[str] | None = None) -> dict |
                 segs[name] = [float(t) for t in raw.split("/")]
             except ValueError:
                 return None
+        # MB-CACHE's scalar column: one number, "-" cell = None.
+        if cache_idx is not None:
+            raw = cells[cache_idx].strip() if cache_idx < len(cells) else ""
+            if raw not in ("-", "\u2014", ""):
+                try:
+                    cache_hit_pct = float(raw)
+                except ValueError:
+                    return None  # header promised a number the cell lacks
+            else:
+                cache_hit_pct = None
     else:
         # No header context (fixed-width legacy rows feed this too): keep the
         # historical reading — every 4-column block after the leading keys is
@@ -265,6 +283,9 @@ def _parse_md_chat_row(stripped: str, header: list[str] | None = None) -> dict |
         "tokens": tokens,
         "itl": segs.get("itl"),
         "tpot": segs.get("tpot"),
+        # MB-CACHE: percent of prompt tokens served from the server cache
+        # (None for legacy files without the column, or "-" cells).
+        "cache_hit_pct": cache_hit_pct if header is not None else None,
     }
 
 
@@ -322,9 +343,11 @@ def parse_chat_table(text: str) -> tuple[str, list[dict]]:
     Returns (mode, rows).  mode is "multiturn", "single" or "unknown"
     ("multiturn" is surfaced per setup as ``multiturn: True`` by the caller).
     Each row: {ctx, users, task, failed, ttft:[..4], post:[..4] or None,
-    tokens:[..4], itl:[..4] or None, tpot:[..4] or None} — the ITL/TPOT
-    groups are present only in newer artifacts (MB-A) and read back as None
-    for legacy files.
+    tokens:[..4], itl:[..4] or None, tpot:[..4] or None, cache_hit_pct: float
+    or None} — the ITL/TPOT groups are present only in newer artifacts (MB-A)
+    and read back as None for legacy files; cache_hit_pct (MB-CACHE, percent
+    of prompt tokens served from the server cache) likewise reads back as
+    None for files without the "cache hit %" column.
 
     Markdown rows are parsed header-driven: the ``| ctx | ... |`` header row
     names each percentile group, so files with or without the newer column

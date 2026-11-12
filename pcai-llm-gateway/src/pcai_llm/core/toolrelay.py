@@ -35,7 +35,18 @@ import anyio
 import httpx2
 
 from ..config import clamp_max_tokens, settings
-from . import clientside, effective, mcp_weights, offpeak, tool_surface, toolcompress, traces, tracing
+from . import (
+    clientside,
+    effective,
+    mcp_weights,
+    offpeak,
+    tool_injection,
+    tool_pin,
+    tool_surface,
+    toolcompress,
+    traces,
+    tracing,
+)
 from . import metrics as _metrics
 from .budgets import check_budgets, settle
 from .canonical import thread_key
@@ -174,6 +185,58 @@ def _relay_content(content: Any) -> str:
     return _cap_tool_content(_serialize_tool_content(content))
 
 
+def _screen_tool_text(text: str, *, server: str, tool: str, unwrapped: str = "") -> str:
+    """Apply the tool-result injection screen to ONE model-facing result.
+
+    WHERE: every in-cluster / meta-tool / client result passes through here
+    (via _prepare_tool_content) before it is appended to relay_msgs, and the
+    compressed-original retrieval path calls it directly — the last point at
+    which the gateway still owns the text the model is about to read.
+
+    WHY: guardrails cover user text pre-call and assistant text post-call, so
+    a tool RESULT (attacker-controlled document/page/log text a server hands
+    back) was the unguarded channel into the model's context.
+
+    TWO FORMS, WORST WINS (2026-11-10, cross-validation P1): the model-facing
+    text is normally a JSON envelope, where a REAL newline rides as the two
+    characters backslash-n. The role-label and prompt-tag detectors anchor on
+    a real blank line, so the same injected text scored HIGH raw and NONE
+    inside the envelope. The unwrapped argument is the text block inside the
+    envelope (the compression candidate); when given it is screened too and
+    the worst severity of the two is used.
+
+    Modes (settings.tool_injection_screen): "off" is inert; "warn" logs and
+    passes the result through; "annotate" prepends a provenance header and
+    keeps the content; "block" substitutes a short refusal. NEVER raises and
+    never drops the call: a screening fault returns the text untouched.
+    """
+    mode = tool_injection.resolve_mode(getattr(settings, "tool_injection_screen", tool_injection.DEFAULT_MODE))
+    if mode == tool_injection.MODE_OFF or not text:
+        return text
+    try:
+        result = tool_injection.scan(text)
+        if unwrapped and unwrapped != text:
+            result = tool_injection.combine(result, tool_injection.scan(unwrapped))
+        if result.severity == tool_injection.SEVERITY_NONE:
+            return text
+        reasons = "; ".join(result.reasons)
+        if mode == tool_injection.MODE_BLOCK:
+            log.error("relay: tool-result injection screen WITHHELD %s/%s (%s)", server, tool, reasons)
+        elif mode == tool_injection.MODE_ANNOTATE:
+            log.info("relay: tool-result injection screen annotated %s/%s (%s)", server, tool, reasons)
+        else:
+            log.warning(
+                "relay: tool-result injection screen hit on %s/%s (%s) — passing through (warn)",
+                server,
+                tool,
+                reasons,
+            )
+        return tool_injection.render(text, result, server=server, tool=tool, mode=mode)
+    except Exception:
+        log.exception("relay: tool-result injection screen failed (%s/%s) — passing the result through", server, tool)
+        return text
+
+
 def _compressible_text(content: Any) -> tuple[str, str]:
     """(model_facing_serialized, text_to_compress) for one tool result.
 
@@ -287,7 +350,15 @@ async def _prepare_tool_content(
                 outcome=outcome,
                 saved=result.stats.chars_before - result.stats.chars_after,
             )
-    return _cap_tool_content(text), stats
+    # Injection screening is LAST: it must see exactly the text the model
+    # will read (post-compression, post-cap), and a "block" refusal must not
+    # be re-truncated by the cap afterwards. The UNWRAPPED candidate is
+    # screened too (cross-validation P1): the model-facing envelope escapes
+    # real newlines as backslash-n, which hides every blank-line-anchored
+    # detector from the raw text.
+    final_text = _cap_tool_content(text)
+    unwrapped = _cap_tool_content(candidate) if candidate != text else ""
+    return _screen_tool_text(final_text, server=server, tool=tool, unwrapped=unwrapped), stats
 
 
 @dataclass
@@ -379,6 +450,238 @@ def tools_payload(catalog: list[dict]) -> list[dict]:
         }
         for t in catalog
     ]
+
+
+# ONE process-wide pin store. A pin must OUTLIVE the request that recorded it
+# (remembering the approved definition is the whole point), so it is a module
+# singleton rather than per-turn state.
+_PIN_STORE = tool_pin.PinStore()
+
+
+def pin_catalog(catalog: list[dict]) -> list[dict]:
+    """Observe every tool definition's fingerprint; drop rug-pulled tools.
+
+    WHERE: the per-server listing is fetched and TTL-cached by the routes
+    layer (api/routes_mcp.py) and reaches the relay as `catalog` — the relay's
+    only view of it — so the pin is observed HERE, once per relay request,
+    over exactly the definitions the model is about to be offered.
+
+    WHY: a grant approves a NAME. A server may rewrite a tool's description,
+    inputSchema or ANNOTATIONS (destructiveHint/readOnlyHint — the
+    security-relevant one) after that approval and keep the grant, so the
+    model is offered a definition nobody reviewed (the "rug-pull"). The first
+    listing is recorded silently; a later mismatch is CHANGED.
+
+    MODES (settings.tool_pin_mode): "off" inert; "warn" logs the old -> new
+    digest and keeps the tool; "block" removes the changed tool from the
+    OFFERED surface (the grant itself is untouched — a definition change is
+    not an ACL change). NEVER raises and never drops a tool on a fault:
+    pinning is a defence, not a dependency.
+
+    This is the OFFER half of the defence. pin_catalog_with_verdicts returns
+    the same list PLUS the per-tool verdicts the DISPATCH gate
+    (pin_dispatch_refusal) consults — dropping a tool from the offer is not a
+    gate, because a model can still name it from conversation history.
+    """
+    return pin_catalog_with_verdicts(catalog)[0]
+
+
+def _surface_vanished(
+    grants: set[tuple[str, str]],
+    verdicts: dict[tuple[str, str], tool_pin.PinVerdict],
+    mode: str,
+) -> None:
+    """Report pinned tools that are ABSENT from the listing they belong in.
+
+    WHY (2026-11-10, cross-validation P0): the ACL approves a NAME and the pin
+    used to be consulted only for tools PRESENT in the listing. A server could
+    pin a harmless definition, rewrite it, then OMIT the tool from tools/list
+    (or fail the listing): no verdict was recorded, the dispatch gate found no
+    entry, and the rewritten definition ran ungated forever. This is the OFFER
+    pass surfacing that shape; block mode ALSO records a VANISHED verdict so
+    the dispatch gate refuses even without a store lookup. The gate still
+    checks the store, so an EMPTY catalog (the failed-listing shape) is
+    covered too.
+
+    grants is the set of (server, tool) pairs this turn EXPECTS to see. A pin
+    for a tool outside it belongs to another key's grant (the store is
+    process-wide), not to a disappearance, so it is skipped.
+    """
+    try:
+        pinned_keys = _PIN_STORE.pinned_keys()
+    except Exception:
+        log.exception("relay: tool-pin vanished check failed — offering the catalog unchanged")
+        return
+    for server, tool in pinned_keys:
+        key = (server, tool)
+        if key in verdicts or key not in grants:
+            continue
+        approved = _PIN_STORE.pinned(server, tool)
+        if not approved:
+            continue
+        if mode == tool_pin.MODE_BLOCK:
+            log.error(
+                "relay: tool VANISHED from the listing since it was pinned (WITHHELD) %s/%s (approved %s)",
+                server,
+                tool,
+                approved,
+            )
+            verdicts[key] = tool_pin.PinVerdict(tool_pin.VANISHED, approved, "")
+        else:
+            log.warning(
+                "relay: tool VANISHED from the listing since it was pinned %s/%s (approved %s)",
+                server,
+                tool,
+                approved,
+            )
+
+
+def pin_catalog_with_verdicts(
+    catalog: list[dict],
+    grants: set[tuple[str, str]] | None = None,
+) -> tuple[list[dict], dict[tuple[str, str], tool_pin.PinVerdict]]:
+    """pin_catalog plus the per-tool verdicts the DISPATCH gate needs.
+
+    WHY THE VERDICTS ARE RETURNED (2026-11-10, GAP 2): removing a changed tool
+    from the OFFERED surface does not stop a model that names it from
+    CONVERSATION HISTORY (a replayed tool_calls turn, a definition it read
+    before the rewrite): the offer is not the executor's gate. The relay keeps
+    this map for the turn and re-checks it when a call ARRIVES
+    (pin_dispatch_refusal) — one fingerprint comparison, at the last moment
+    the gateway can still say no.
+
+    Returns (offered_catalog, verdicts) where verdicts maps every (server,
+    tool) OBSERVED this turn — plus, in block mode, every pinned tool that
+    VANISHED from the listing — to its PinVerdict. A tool with neither an
+    observation nor a live pin was never seen (first run, pinning off, a
+    fingerprint fault) and is not gated: the defence fails OPEN, because a
+    pinning fault must never break a turn.
+
+    grants (optional) is the set of (server, tool) pairs this turn EXPECTS to
+    be listed; it is what lets the OFFER pass notice a pinned tool that
+    vanished from the listing. None = unknown expectation, so only observed
+    tools gate here (pin_dispatch_refusal still checks the store directly).
+    """
+    mode = tool_pin.resolve_mode(getattr(settings, "tool_pin_mode", tool_pin.DEFAULT_MODE))
+    verdicts: dict[tuple[str, str], tool_pin.PinVerdict] = {}
+    if mode == tool_pin.MODE_OFF:
+        return catalog, verdicts
+    try:
+        _PIN_STORE.ttl_s = float(getattr(settings, "tool_pin_ttl_s", 0.0) or 0.0)
+        kept: list[dict] = []
+        for entry in catalog:
+            server = str(entry.get("server") or "")
+            tool = str(entry.get("tool") or "")
+            try:
+                fp = tool_pin.fingerprint(
+                    tool,
+                    entry.get("description"),
+                    entry.get("inputSchema"),
+                    entry.get("annotations"),
+                )
+                verdict = _PIN_STORE.observe(server, tool, fp)
+            except Exception:
+                log.exception("relay: tool pin failed (%s/%s) — offering the tool", server, tool)
+                kept.append(entry)
+                continue
+            verdicts[(server, tool)] = verdict
+            if not verdict.changed:
+                kept.append(entry)
+                continue
+            if mode == tool_pin.MODE_BLOCK:
+                log.error(
+                    "relay: tool definition changed since it was pinned (WITHHELD) %s/%s %s -> %s",
+                    server,
+                    tool,
+                    verdict.previous,
+                    verdict.current,
+                )
+                continue
+            log.warning(
+                "relay: tool definition changed since it was pinned %s/%s %s -> %s",
+                server,
+                tool,
+                verdict.previous,
+                verdict.current,
+            )
+            kept.append(entry)
+        if grants:
+            _surface_vanished(grants, verdicts, mode)
+        return kept, verdicts
+    except Exception:
+        log.exception("relay: tool pinning failed — offering the catalog unchanged")
+        return catalog, {}
+
+
+def pin_dispatch_refusal(server: str, tool: str, verdicts: dict[tuple[str, str], tool_pin.PinVerdict]) -> str | None:
+    """The tool-result text that REFUSES one dispatch, or None to dispatch.
+
+    WHERE: the relay's dispatch loop, AFTER the per-call ACL admits the call
+    and BEFORE the executor runs — the last point at which the gateway can
+    still say no.
+
+    WHY (2026-11-10, GAP 2): block mode excluded a changed tool from the
+    OFFERED surface only. A model that names the tool from conversation
+    history never consults the offer, so the executor was still reachable — a
+    defence bypassable by history replay is a speed bump, not a defence. This
+    re-checks the fingerprint the listing just computed against the pin, at
+    dispatch time, and refuses a CHANGED tool.
+
+    VANISHED (2026-11-10, cross-validation P0): a tool that was pinned and is
+    now ABSENT from the listing is refused too. Otherwise the ACL's name-based
+    approval is bypassable by "rewrite the definition, then omit the tool":
+    the verdict map has no entry, so the gate used to dispatch the rewritten
+    definition forever. A tool that was NEVER pinned still fails open (first
+    run / restart), which is why the store lookup is a fallback and not the
+    primary signal.
+
+    MODES: "block" refuses; "warn"/"off" return None and dispatch exactly as
+    before (pin_catalog already logged the change). NEVER raises: any fault
+    returns None (dispatch normally), because a defence that can break a turn
+    is a liability.
+    """
+    try:
+        mode = tool_pin.resolve_mode(getattr(settings, "tool_pin_mode", tool_pin.DEFAULT_MODE))
+        if mode != tool_pin.MODE_BLOCK:
+            return None
+        verdict = verdicts.get((str(server), str(tool)))
+        if verdict is not None:
+            if verdict.vanished:
+                log.error(
+                    "relay: REFUSED dispatch of a tool that VANISHED from the listing since it was"
+                    " pinned %s/%s (approved %s)",
+                    server,
+                    tool,
+                    verdict.previous,
+                )
+                return tool_pin.vanished_refusal(server, tool, verdict.previous)
+            if not verdict.changed:
+                return None
+            log.error(
+                "relay: REFUSED dispatch of a tool whose definition changed since it was pinned %s/%s %s -> %s",
+                server,
+                tool,
+                verdict.previous,
+                verdict.current,
+            )
+            return tool_pin.dispatch_refusal(server, tool, verdict)
+        # No observation this turn. A tool the store still holds a LIVE pin for
+        # is the vanished-tool bypass: the ACL approved the NAME, the listing
+        # no longer carries the definition, so what would execute is not what
+        # the grant approved.
+        approved = _PIN_STORE.pinned(server, tool)
+        if not approved:
+            return None
+        log.error(
+            "relay: REFUSED dispatch of a tool that VANISHED from the listing since it was pinned %s/%s (approved %s)",
+            server,
+            tool,
+            approved,
+        )
+        return tool_pin.vanished_refusal(server, tool, approved)
+    except Exception:
+        log.exception("relay: tool-pin dispatch check failed (%s/%s) — dispatching", server, tool)
+        return None
 
 
 def shadow_client_mcp(client_tools: list[dict], catalog: list[dict]) -> tuple[list[dict], dict[str, str]]:
@@ -1390,6 +1693,15 @@ async def relay_stream(
         # is a legacy ROUND count, charged at the neutral weight.
         spent_prior=float(max(0, int(iterations_prior or 0))),
     )
+    # --- TOOL-DEFINITION PINNING (rug-pull defence) ----------------------
+    # A grant approves a NAME; a server can rewrite the definition behind it
+    # after approval. The listing arrives as `catalog`, so the pins are
+    # observed here, once per request, over what the model will be offered.
+    # block -> a changed tool leaves the offer; warn -> logged and kept.
+    # The verdicts are kept for the DISPATCH gate: a model that names a
+    # withheld tool from conversation history never sees the offer, so the
+    # offer alone cannot refuse it (pin_dispatch_refusal, below).
+    catalog, _pin_verdicts = pin_catalog_with_verdicts(catalog, grants)
     # --- TOOL SURFACE (2026-10-28) ---------------------------------------
     # Inlining every granted tool cost 34,459 prompt tokens for a 111-tool /
     # 10-server catalogue (measured) -- a floor on EVERY relayed request, and
@@ -3121,7 +3433,7 @@ async def relay_stream(
                     {
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "content": _relay_content(_retrieve_text),
+                        "content": _screen_tool_text(_relay_content(_retrieve_text), server=server, tool=tool),
                     }
                 )
                 yield _pcai(
@@ -3275,6 +3587,51 @@ async def relay_stream(
                 )
                 _emit_tool_span(server, tool, _denied_ms, "denied")
                 mcp_summaries.append(f"[tool result] {server}__{tool} → denied by ACL\n")
+                continue
+            # --- dispatch-time tool-pin gate (GAP 2, 2026-11-10) ----------
+            # The ACL admits the NAME; the pin decides whether the DEFINITION
+            # is still the one the grant approved. This is deliberately AFTER
+            # the grant check (an ungranted tool is an ACL denial, never a pin
+            # report) and BEFORE the executor: block mode removed a changed
+            # tool from the OFFERED surface, but a call replayed from
+            # conversation history never consults the offer, and this is the
+            # last point at which the gateway can still refuse it. The
+            # refusal is an ORDINARY role=tool error — same shape as every
+            # other in-loop tool error — so the loop keeps iterating and the
+            # model can self-correct instead of the turn dying.
+            _pin_refusal = pin_dispatch_refusal(server, tool, _pin_verdicts)
+            if _pin_refusal is not None:
+                _pin_vanished = "vanished from the listing" in _pin_refusal
+                _pin_detail = (
+                    "vanished from the listing since approval" if _pin_vanished else "definition changed since approval"
+                )
+                relay_msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": _pin_refusal})
+                yield _pcai(
+                    {
+                        "pcai": {
+                            "event": "tool_error",
+                            "id": tc.get("id", ""),
+                            "server": server,
+                            "tool": tool,
+                            "detail": _pin_detail,
+                            "args": args,
+                        }
+                    }
+                )
+                yield _reasoning_trace(
+                    server, tool, args, "vanished from listing" if _pin_vanished else "definition changed"
+                )
+                _pin_ms = int((time.monotonic() - started) * 1000)
+                await _trace_step(
+                    iteration,
+                    "tool",
+                    server=server,
+                    tool=tool,
+                    ms=_pin_ms,
+                    status="error",
+                )
+                _emit_tool_span(server, tool, _pin_ms, "error")
+                mcp_summaries.append(f"[tool result] {server}__{tool} → refused: {_pin_detail}\n")
                 continue
             try:
                 # Bound the tool execution to the REMAINING wall-clock budget:

@@ -92,6 +92,7 @@ def test_chat_builder_defaults(tmp_path):
     assert argv[1:3] == ["-m", "model_benchmarker.benchmark_chat"]
     assert "--url" in argv and _url() in argv
     assert "--quiet" in argv  # piped stdout: per-request prints distort TTFT
+    assert "--remote" not in argv  # default (local) keeps the in-cluster client
     assert "PCAI_API_KEY" not in env
     assert meta == {}
 
@@ -120,6 +121,15 @@ def test_chat_builder_full(tmp_path):
     assert "--multiturn" in argv and "--no-nonce" in argv
     assert env["PCAI_API_KEY"] == "sk-test"
     assert "api_key" not in json.dumps(meta)
+
+
+def test_chat_builder_remote_usage_passes_remote_flag(tmp_path):
+    """The LOCAL/REMOTE toggle must reach benchmark_chat, or it is inert: the
+    engine defaults to model_usage=local (in-cluster URL + system-TLS client)."""
+    local_argv, _, _ = R.build_chat_argv(_url(), {"target_usage": "local"}, tmp_path)
+    assert "--remote" not in local_argv
+    remote_argv, _, _ = R.build_chat_argv(_url(), {"target_usage": "remote"}, tmp_path)
+    assert "--remote" in remote_argv
 
 
 def test_chat_builder_open_requires_rate(tmp_path):
@@ -330,20 +340,21 @@ def test_list_models_for_target_non_serving_url_and_user_key_wins(monkeypatch):
     out = R.list_models_for_target("https://gpu.example.net:8443", {"target_usage": "remote"}, api_key="sk-user")
     assert seen["base_url"] == "https://gpu.example.net:8443/v1"
     assert seen["api_key"] == "sk-user"
-    # chat runs never pass --remote, so the engine's plain client is used even
-    # when the page's toggle says remote
-    assert seen["remote"] is False
+    # the toggle's remote half: the engine's remote client (TLS-unverified by
+    # default), matching what --remote makes the run use
+    assert seen["remote"] is True
     assert out["models"] == ["a", "b"]  # gateway aliases repeating an id collapse
     assert "sk-user" not in json.dumps(out)
 
 
-def test_list_models_for_target_remote_toggle_still_resolves_in_cluster(monkeypatch):
-    """Parity with the run: benchmark_chat runs without --remote, so a
-    .serving. URL is rewritten in-cluster even when the toggle says remote."""
+def test_list_models_for_target_remote_toggle_uses_the_ingress_form(monkeypatch):
+    """Parity with the run: --remote makes benchmark_chat use the URL as typed
+    and the remote client, so the probe must do the same."""
     seen = _fake_discovery(monkeypatch)
     out = R.list_models_for_target("https://m.serving.pcai.example.net", {"target_usage": "remote"})
-    assert seen["base_url"] == "http://m.svc.cluster.local/v1"
-    assert out["target_url"] == "http://m.svc.cluster.local"
+    assert seen["base_url"] == "https://m.serving.pcai.example.net/v1"
+    assert seen["remote"] is True
+    assert out["target_url"] == "https://m.serving.pcai.example.net"
 
 
 def test_list_models_for_target_reachable_but_empty(monkeypatch):
@@ -371,6 +382,16 @@ def test_list_models_for_target_redacts_the_key_from_errors(monkeypatch):
     assert "***" in out["error"]
 
 
+def test_list_models_for_target_defaults_to_local_like_the_engine(monkeypatch):
+    """No target_usage (API client): the chat engine defaults to local (no
+    --remote), so the probe must rewrite in-cluster and use the local client."""
+    seen = _fake_discovery(monkeypatch)
+    out = R.list_models_for_target("https://m.serving.pcai.example.net", {})
+    assert seen["base_url"] == "http://m.svc.cluster.local/v1"
+    assert seen["remote"] is False
+    assert out["target_url"] == "http://m.svc.cluster.local"
+
+
 def test_list_models_for_target_fails_soft(monkeypatch):
     _fake_discovery(monkeypatch, ids=(), error="ConnectError: refused")
     out = R.list_models_for_target("http://h:8000", {})
@@ -378,6 +399,19 @@ def test_list_models_for_target_fails_soft(monkeypatch):
     assert out["error"] == "ConnectError: refused"
     # default usage is remote; a non-serving URL passes through unchanged
     assert out["target_url"] == "http://h:8000"
+
+
+def test_list_models_for_target_strips_a_pasted_bearer_prefix(monkeypatch):
+    seen = _fake_discovery(monkeypatch)
+    R.list_models_for_target("http://h:8000", {"target_usage": "local"}, api_key="Bearer hllm-abc")
+    assert seen["api_key"] == "hllm-abc"
+
+
+def test_builders_strip_a_pasted_bearer_prefix(tmp_path):
+    _argv, env, _ = R.build_chat_argv(_url(), {"api_key": "Bearer sk-abc"}, tmp_path)
+    assert env["PCAI_API_KEY"] == "sk-abc"
+    argv2, _env2, _ = R.build_endpoint_argv(_url(), {"mode": "rest", "api_key": "bearer tok-1"}, tmp_path)
+    assert "Authorization=Bearer tok-1" in " ".join(argv2)
 
 
 def test_list_models_for_target_flattens_the_error(monkeypatch):

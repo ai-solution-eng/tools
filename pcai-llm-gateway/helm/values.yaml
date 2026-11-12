@@ -59,7 +59,7 @@ image:
   #   tag: v3.6.5@sha256:<64-hex from `docker buildx build --metadata-file`>
   # (the reference renders as repository:tag@sha256:...); for tag-only
   # sites the alternative is pullPolicy: Always (re-checks every pull).
-  tag: v4.0.0
+  tag: v4.0.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -235,10 +235,12 @@ settings:
   #             DIRECTORY (name + mcp_servers.description). `list` returns
   #             tool summaries; `describe` returns full schemas and promotes
   #             that server so its tools are directly callable next turn.
-  # Default full: the surface is what the model can SEE, and a model that
-  # cannot see a tool will not call it. Flip per site after watching a turn
-  # actually discover and use a server.
-  toolRelaySurface: full
+  # Default hybrid (2026-11-10). The 34,459-token inline floor was the reason
+  # "full" was kept, but that number was measured against the OLD two-tool
+  # payload; the 2026-10-28 catalog rewrite cut discovery to ~4.6-6k tokens for
+  # all 10 servers / 111 tools (~2-3k for one). g2 has run hybrid in production.
+  # Set "full" per site only for a client that cannot do discover-then-call.
+  toolRelaySurface: hybrid
   toolRelayMaxIterations: 32
   toolRelayWallClockS: 900
   # Bounded model-call retries PER RELAY TURN; spends only the REMAINING wall clock
@@ -286,11 +288,14 @@ settings:
   toolRelayRenderDeltas: false
   toolRelayRenderIndexBase: 1000
   # Deterministic, model-free compression of oversized tool results
-  # (request header X-PCAI-Compress-Tools: 0|1|shadow). Default off; "shadow"
-  # measures the saving on real traffic without rewriting anything. Compressed
-  # results carry a digest marker; the synthetic pcai__retrieve tool expands
-  # them from the TTL-bound original store. No LLM, no extra request.
-  toolCompressDefault: "off"
+  # (request header X-PCAI-Compress-Tools: 0|1|shadow). Default "shadow"
+  # (2026-11-10): it computes and reports the saving on real traffic WITHOUT
+  # rewriting anything, so every site accumulates its own ratio in telemetry
+  # before anyone flips it to "on". "on" stays a deliberate per-site second
+  # step, not a default. Compressed results carry a digest marker; the synthetic
+  # pcai__retrieve tool expands them from the TTL-bound original store.
+  # No LLM, no extra request.
+  toolCompressDefault: "shadow"
   toolCompressMinChars: 4096
   toolCompressRatioFloor: 0.15
   toolCompressStoreTtlS: 86400
@@ -326,8 +331,13 @@ settings:
   # turn. Off by default; it changes what the router may choose.
   routingAgentsEnabled: false
   # MCP federation (/mcp): tools/list returns the key's GRANTED tools as individual
-  # `{server}__{tool}` tools; false = legacy two-tool surface.
-  mcpFlatTools: true
+  # `{server}__{tool}` tools; false = two-tool surface (mcp_catalog + mcp_call).
+  # Default false (2026-11-10): the flat surface inlines every granted tool into
+  # every MCP client's context (34,459 tokens for 111 tools / 10 servers, a floor
+  # on every request). The two-tool surface pays ~4.6-6k ONCE on discovery and
+  # g2 has run it in production. Set true only for a client that cannot do
+  # discover-then-call.
+  mcpFlatTools: false
   mcpCatalogCacheS: 60.0
   # Cross-replica registry convergence (2026-10-30). The gateway caches
   # mcp_servers + model_endpoints in PROCESS memory; with the HPA at 2+ pods a

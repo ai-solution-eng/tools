@@ -367,6 +367,7 @@ function metricSel(){
     '<option value="ttft_post_p50">TTFT-post P50</option>'+
     '<option value="ttft_post_p95">TTFT-post P95</option>'+
     '<option value="failed">failed requests</option>'+
+    '<option value="cache_hit_pct">cache hit % (higher=better)</option>'+
   '</select></label>';
 }
 function renderCompare(){
@@ -404,7 +405,10 @@ function renderCompare(){
     tokens_p50:['tokens','50'], tokens_p95:['tokens','95'],
     ttft_p50:['ttft','50'], ttft_p95:['ttft','95'],
     ttft_post_p50:['ttft_post','50'], ttft_post_p95:['ttft_post','95'],
-    failed:['failed','0']
+    failed:['failed','0'],
+    // MB-CACHE: scalar per workload (not a percentile block); '0' reuses the
+    // failed-metric trick of leaving pidx unused.
+    cache_hit_pct:['cache_hit_pct','0']
   };
   const [colKey, pct] = cfgMap[mval]||['tokens','50'];
   const pidx = pct==='0' ? -1 : PCTS.indexOf('P'+pct);
@@ -434,6 +438,7 @@ function renderCompare(){
       if (r){
         if (colKey==='failed') v=r.failed;
         else if (colKey==='ttft_post') v=r.ttft_post ? r.ttft_post[pidx] : null;
+        else if (colKey==='cache_hit_pct') v=(r.cache_hit_pct===undefined||r.cache_hit_pct===null) ? null : r.cache_hit_pct;
         else v=r[colKey][pidx];
       }
       values.push(v);
@@ -441,7 +446,7 @@ function renderCompare(){
     }
     const num=values.filter(v=>v!==null&&v!==undefined);
     if (num.length>=2){
-      const better=(a,b)=> colKey==='failed' ? a<b : (colKey==='tokens' ? a>b : a<b);
+      const better=(a,b)=> colKey==='failed' ? a<b : ((colKey==='tokens'||colKey==='cache_hit_pct') ? a>b : a<b);
       let best=num[0],worst=num[0];
       for (const v of num){ if (better(v,best)) best=v; if (better(worst,v)) worst=v; }
       values.forEach((v,i)=>{

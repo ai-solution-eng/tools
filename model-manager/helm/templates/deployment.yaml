@@ -1,0 +1,273 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "model-downloader.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app.kubernetes.io/name: {{ include "model-downloader.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "model-downloader.fullname" . }}
+      containers:
+      - name: app
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.port }}
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: JOB_TEMPLATE_CONFIGMAP
+          value: {{ include "model-downloader.fullname" . }}-job-template
+        - name: JOB_TEMPLATE_CONFIGMAP_NAMESPACE
+          value: {{ .Release.Namespace }}
+        - name: MAX_CONCURRENCY
+          value: {{ .Values.maxConcurrency | quote }}
+        - name: PVC_NAME
+          value: {{ .Values.downloader.pvcName | quote }}
+        - name: CONTAINER_PATH
+          value: "/mnt/models"
+        - name: PVC_SUBPATH
+          value: "large-models"
+        - name: STORAGE_BACKEND
+          value: {{ .Values.storage.backend | quote }}
+        - name: STORAGE_DEFAULT
+          value: {{ .Values.storage.default | quote }}
+        - name: DEFAULT_NAMESPACE
+          value: {{ .Values.defaultNamespace | quote }}
+        - name: DEBUG_POD_ENABLED
+          value: {{ .Values.debugPod.enabled | quote }}
+        - name: DEBUG_POD_IMAGE
+          value: "{{ .Values.debugPod.image.repository }}:{{ .Values.debugPod.image.tag }}"
+        # S3 config only reaches the pod when the storage backend actually
+        # includes s3. With backend: pvc (an S3-less cluster) the app gets no
+        # bucket/endpoint at all: the submit form hides the s3 option (it
+        # already keys off STORAGE_BACKEND), the downloaded-models list stops
+        # claiming "s3 automatic scanning enabled.", and no poll wastes a
+        # boto3 listing against a MinIO endpoint that doesn't exist here.
+        {{- if ne .Values.storage.backend "pvc" }}
+        - name: S3_BUCKET
+          value: {{ .Values.s3.bucket | quote }}
+        - name: S3_PREFIX
+          value: {{ .Values.s3.prefix | quote }}
+        - name: S3_ENDPOINT_URL
+          value: {{ .Values.s3.endpointUrl | quote }}
+        - name: S3_ACCESS_KEY_ID
+          value: {{ .Values.s3.accessKeyId | quote }}
+        - name: S3_SECRET_ACCESS_KEY
+          value: {{ .Values.s3.secretAccessKey | quote }}
+        {{- end }}
+        # NIM profile mirroring (values: nim.*). Same S3 gate as the block
+        # above: a pvc-only site has no bucket to mirror into, so the app must
+        # see NIM as unavailable there. NIM_BUCKET empty = nim.bucket unset, so
+        # fall back to the downloader's bucket (NIM serves from the same one).
+        {{- if and .Values.nim.enabled (ne .Values.storage.backend "pvc") }}
+        - name: NIM_ENABLED
+          value: "true"
+        - name: NIM_BUCKET
+          value: {{ .Values.nim.bucket | default .Values.s3.bucket | quote }}
+        - name: NIM_REGION
+          value: {{ .Values.nim.region | quote }}
+        {{- end }}
+        - name: DOWNLOAD_LIST_ENABLED
+          value: {{ .Values.downloadList.enabled | quote }}
+        - name: PVC_SCAN_IMAGE
+          value: {{ .Values.downloadList.scanImage | quote }}
+        - name: PVC_SCAN_ENABLED
+          value: {{ .Values.downloadList.pvcScanEnabled | quote }}
+        - name: PVC_REFRESH_INTERVAL
+          value: {{ .Values.downloadList.pvcRefreshInterval | quote }}
+        {{- if .Values.preflight.enabled }}
+        # MD-B preflight + per-namespace quota (values: preflight.*, quota.*).
+        {{- if .Values.preflight.safetyMargin }}
+        - name: PREFLIGHT_SAFETY_MARGIN
+          value: {{ .Values.preflight.safetyMargin | quote }}
+        {{- end }}
+        {{- if ne (toString .Values.preflight.mode) "refuse" }}
+        - name: PREFLIGHT_MODE
+          value: {{ .Values.preflight.mode | quote }}
+        {{- end }}
+        {{- if ne (int .Values.preflight.usageTtl) 120 }}
+        - name: PREFLIGHT_USAGE_TTL
+          value: {{ .Values.preflight.usageTtl | quote }}
+        {{- end }}
+        {{- if ne (int .Values.preflight.sizeTtl) 300 }}
+        - name: PREFLIGHT_SIZE_TTL
+          value: {{ .Values.preflight.sizeTtl | quote }}
+        {{- end }}
+        {{- if .Values.quota.default }}
+        - name: QUOTA_DEFAULT
+          value: {{ .Values.quota.default | quote }}
+        {{- end }}
+        {{- with .Values.quota.namespaces }}
+        - name: QUOTA_NAMESPACES
+          # "ns:bytes,ns2:bytes" — rendered from the quota.namespaces map.
+          value: {{ $nslist := list }}{{ range $ns, $bytes := . }}{{ $nslist = append $nslist (printf "%s:%s" $ns (toString $bytes)) }}{{ end }}{{ join "," $nslist | quote }}
+        {{- end }}
+        {{- if ne (toString .Values.quota.mode) "refuse" }}
+        - name: QUOTA_MODE
+          value: {{ .Values.quota.mode | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.gc.enabled }}
+        # MD-C GC report settings (the deletion itself runs in the CronJob;
+        # the app only serves the dry-run report + these settings to the UI).
+        - name: GC_ENABLED
+          value: {{ .Values.gc.enabled | quote }}
+        - name: GC_TTL_DAYS
+          value: {{ .Values.gc.ttlDays | quote }}
+        - name: GC_DRY_RUN
+          value: {{ .Values.gc.dryRun | quote }}
+        {{- if .Values.gc.minKeep }}
+        - name: GC_MIN_KEEP
+          value: {{ .Values.gc.minKeep | quote }}
+        {{- end }}
+        {{- with .Values.gc.protectedModels }}
+        - name: GC_PROTECTED
+          value: {{ join "," . | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.manualDelete.enabled }}
+        # MD-D manual delete settings (values: manualDelete.*). The app reads
+        # the manual-delete-job.yaml template from JOB_TEMPLATE_CONFIGMAP,
+        # substitutes placeholders (targets as base64, never raw JSON) and
+        # creates the Job via the k8s API.
+        - name: MANUAL_DELETE_ENABLED
+          value: {{ .Values.manualDelete.enabled | quote }}
+        - name: MANUAL_DELETE_MAX_TARGETS
+          value: {{ .Values.manualDelete.maxTargets | quote }}
+        - name: MANUAL_DELETE_JOB_TTL
+          value: {{ .Values.manualDelete.jobTtlSeconds | quote }}
+        - name: MANUAL_DELETE_JOB_DEADLINE
+          value: {{ .Values.manualDelete.jobDeadlineSeconds | quote }}
+        - name: MANUAL_DELETE_VERDICT_TTL
+          value: {{ .Values.manualDelete.verdictTtlSeconds | quote }}
+        # Empty manualDelete.image falls back to the app image: the delete
+        # module lives in the app, and the scanner image has no kubernetes
+        # client for the AIOLI/job cross-checks.
+        - name: MANUAL_DELETE_IMAGE
+          value: {{ .Values.manualDelete.image | default (printf "%s:%s" .Values.image.repository .Values.image.tag) | quote }}
+        - name: MANUAL_DELETE_AUTH_MODE
+          value: {{ .Values.manualDelete.auth.mode | quote }}
+        - name: MANUAL_DELETE_ADMIN_GROUPS
+          value: {{ join "," .Values.manualDelete.auth.adminGroups | quote }}
+        - name: MANUAL_DELETE_ADMINS
+          value: {{ join "," .Values.manualDelete.auth.admins | quote }}
+        - name: MANUAL_DELETE_SECRET_NAME
+          value: {{ .Values.manualDelete.auth.secret.name | quote }}
+        # Empty namespace = the release namespace.
+        - name: MANUAL_DELETE_SECRET_NAMESPACE
+          value: {{ .Values.manualDelete.auth.secret.namespace | default .Release.Namespace | quote }}
+        - name: MANUAL_DELETE_SECRET_KEY
+          value: {{ .Values.manualDelete.auth.secret.key | quote }}
+        {{- end }}
+        # Canonical fleet names (OIDC_*). The chart is the adapter so values
+        # stay app-neutral and the vendored module stays byte-identical.
+        {{- if .Values.oidc.enabled }}
+        - name: OIDC_ENABLED
+          value: "true"
+        - name: OIDC_ISSUER
+          value: {{ .Values.oidc.issuer | quote }}
+        - name: OIDC_AUDIENCE
+          value: {{ .Values.oidc.audience | quote }}
+        {{- with .Values.oidc.jwksUrl }}
+        - name: OIDC_JWKS_URL
+          value: {{ . | quote }}
+        {{- end }}
+        - name: OIDC_IDENTITY_CLAIM
+          value: {{ .Values.oidc.identityClaim | quote }}
+        {{- end }}
+        {{- if .Values.catalog.enabled }}
+        - name: CATALOG_PATH
+          value: "/mnt/catalog/catalog.json"
+        {{- if .Values.catalog.githubUrl }}
+        - name: CATALOG_GITHUB_URL
+          value: {{ .Values.catalog.githubUrl | quote }}
+        # The app pod itself must traverse the corporate proxy for the GitHub
+        # fetch (the Jobs get the same env via the job template). urllib picks
+        # these up automatically. Proxy env is wired per-key from the
+        # top-level proxy: dict (each key only when non-empty). TLS verify
+        # defaults to ON (verify); set catalog.githubVerifyTls: false ONLY
+        # behind a corporate MITM proxy with an untrusted cert.
+        {{- with .Values.proxy }}
+        {{- with .noProxy }}
+        - name: no_proxy
+          value: {{ . | quote }}
+        - name: NO_PROXY
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .https }}
+        - name: https_proxy
+          value: {{ . | quote }}
+        - name: HTTPS_PROXY
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with .http }}
+        - name: http_proxy
+          value: {{ . | quote }}
+        - name: HTTP_PROXY
+          value: {{ . | quote }}
+        {{- end }}
+        {{- end }}
+        - name: CATALOG_GITHUB_VERIFY_TLS
+          value: {{ include "model-downloader.catalogGithubVerifyTls" . | quote }}
+        {{- end }}
+        {{- end }}
+        - name: AIOLI_DB_HOST
+          value: {{ .Values.aioli.dbHost | quote }}
+        - name: AIOLI_DB_PORT
+          value: {{ .Values.aioli.dbPort | quote }}
+        - name: AIOLI_DB_NAME
+          value: {{ .Values.aioli.dbName | quote }}
+        - name: AIOLI_DB_USER
+          value: {{ .Values.aioli.dbUser | quote }}
+        - name: AIOLI_DB_SECRET_NAME
+          value: {{ .Values.aioli.dbPasswordSecret.name | quote }}
+        - name: AIOLI_DB_SECRET_NS
+          value: {{ .Values.aioli.dbPasswordSecret.namespace | quote }}
+        - name: AIOLI_DB_SECRET_KEY
+          value: {{ .Values.aioli.dbPasswordSecret.key | quote }}
+        - name: CATALOG_DEFAULT_PROJECT
+          value: {{ .Values.catalog.defaultProject | default "" | quote }}
+        livenessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.catalog.enabled }}
+        volumeMounts:
+        - name: catalog-storage
+          mountPath: /mnt/catalog
+        {{- end }}
+      {{- if .Values.catalog.enabled }}
+      volumes:
+      - name: catalog-storage
+        persistentVolumeClaim:
+          claimName: {{ include "model-downloader.fullname" . }}-catalog
+      {{- end }}

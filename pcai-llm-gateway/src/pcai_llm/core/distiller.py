@@ -34,11 +34,21 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
+# --- pcai-llm-playbook overlay BEGIN (idempotent patch; integrations/pcai_llm_playbook) ---
+# Optional-section contract + the prompt addendum. The overlay module is
+# copied next to this file by apply_playbook_patch.py; if it is ever
+# removed, the stubs below degrade the distiller to its stock behaviour.
+try:
+    from .playbook import OPTIONAL_SECTIONS, PLAYBOOK_PROMPT  # noqa: F401
+except ImportError:  # pragma: no cover - overlay module removed: stock behaviour
+    OPTIONAL_SECTIONS = ()  # type: ignore[assignment]
+    PLAYBOOK_PROMPT = ""
+# --- pcai-llm-playbook overlay END ---
 
 # Prompt version stamped into every memory metadata payload - rebuild and
 # audit attribution ("which prompt produced this memory"). Bump on ANY
 # prompt change.
-PROMPT_VERSION = "dsh-2026-10-09"
+PROMPT_VERSION = "dsh-2026-11-10"  # playbook overlay bump
 
 # Ported constants (dsh session-memory-distiller). The transcript cap is
 # far above anything the conversations store can hold (MAX_MSGS x
@@ -187,6 +197,8 @@ DISTILL_SYSTEM_PROMPT = (
     " complete document beats a long one that runs out of room before '## How to proceed'.\n"
     "- Preserve exact commands, paths, digests, error messages, and config values"
     " verbatim - but pick the few that carry recall value, not every one seen."
+
+    + PLAYBOOK_PROMPT
 )
 
 MAP_SYSTEM_PROMPT = (

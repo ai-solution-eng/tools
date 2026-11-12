@@ -1,0 +1,23 @@
+{{- if eq (include "model-downloader.ezuaEnabled" .) "true" }}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "model-downloader.fullname" . }}-auth-policy
+  namespace: {{ .Values.ezua.authorizationPolicy.namespace }}
+  labels:
+    {{- include "model-downloader.labels" . | nindent 4 }}
+    hpe-ezua/app: {{ .Chart.Name }}
+    hpe-ezua/type: vendor-service
+spec:
+  action: CUSTOM
+  provider:
+    name: {{ .Values.ezua.authorizationPolicy.providerName }}
+  rules:
+    - to:
+      - operation:
+          hosts:
+          - {{ .Values.ezua.virtualService.endpoint }}
+  selector:
+    matchLabels:
+      istio: "ingressgateway"
+{{- end }}
