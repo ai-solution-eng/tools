@@ -2,68 +2,159 @@
 
 Two parts: (1) install the store, (2) point model deployments at it. Part 2 is the one
 people get wrong, because a serving pod needs **per-pod identity** that a static values
-file cannot express — see §4.3.
+file cannot express — see §5.3.
 
 ---
 
-## 1. Prerequisites
+## 1. The deployment contract
 
-- A PCAI unit with the ezua gateway (`istio-system/ezaf-gateway`).
-- `helm` 3.x on the machine you deploy from (or use the PCAI import flow, §2.2).
-- Model deployments on **SGLang v0.5.22 or newer** whose image ships the `mooncake`
-  python module. Check once per image:
+**Deployment is a values problem.** The chart is packaged once
+(`./automation.sh release` → `mooncake-0.2.4.tar.gz`), imported into PCAI once, and the
+operator's only surface after that is the chart's values in the PCAI **Helm Values**
+editor. No template edits, no post-render patches, no `helm upgrade` on PCAI: a new
+chart *version* means importing the new package, a new *configuration* means editing
+values.
 
-  ```bash
-  python3 -c "import mooncake; print(mooncake.__version__)"
-  ```
+What PCAI does for you (the chart is already PCAI-ported — [helm/PORTING.md](../helm/PORTING.md)):
 
-- No GPU is required for the store itself. The dashboard is a 50m-CPU pod.
+- substitutes the domain into `ezua.virtualService.endpoint` before rendering;
+- creates the application in the namespace you choose;
+- the chart carries the `ezua` block (gateway `istio-system/ezaf-gateway`), the
+  VirtualService, the optional oauth2-proxy AuthorizationPolicy, and the `hpe-ezua/`
+  labels the platform uses to route and manage the objects.
 
----
+Everything that cannot be a value is an explicit prerequisite, and on this chart that
+list is short:
 
-## 2. Install
+- **No Secret is required for the default TCP deployment.** The only Secret the chart
+  can consume is the optional master metadata token (§2.A).
+- **Cluster objects** — a storage class for the PVC tier, and the Kyverno client
+  policy (§5); RDMA adds the device plugin. All in §2.B.
+- **One external dependency** — the SGLang model deployments that will become clients
+  (§2.C). They are *consumers* of this deployment, not preconditions: the store comes
+  up fine with zero clients.
 
-### 2.1 Helm (direct)
+Two things are deliberately **not** values and stay out-of-band:
 
-```bash
-helm install mooncake ./helm \
-  --namespace mooncake --create-namespace \
-  --set ezua.virtualService.endpoint=mooncake.${DOMAIN_NAME} \
-  --set store.persistence.storageClassName=gl4f-filesystem   # or your X10000 class
-```
+1. **Pointing a model at the store** (§5) needs per-pod podSpec fields (a
+   `fieldRef` hostname, a node label, and for RDMA a device limit + capability) that
+   a static values file cannot express. That is a per-model patch, documented as a
+   procedure with its own verification — never "just set it in values".
+2. **Transport is one pool-wide decision** (§5.0): the store's protocol and every
+   client's `MOONCAKE_PROTOCOL` must agree; a mismatch surfaces only at transfer
+   time.
 
-Useful overrides:
-
-```bash
---set store.replicaCount=5 \
---set store.persistence.size=2Ti \
---set store.persistence.storageClassName=gl4f-filesystem \
---set store.segmentSize=32gb \
---set ui.refreshIntervalSeconds=900 \
---set ezua.authorizationPolicy.enabled=true
-```
-
-The transport is a whole-pool decision, not a per-model one — see §4.0. `--set store.protocol=tcp`
-is the low-risk start and the chart default; `rdma` needs the device mounted on the store pods
-plus the client plumbing in §4.3.
-
-Or use the G2 overlay plus a transport profile from `helm/values-examples/`:
-`-f helm/values-examples/values.g2.yaml -f helm/values-examples/values.transport-tcp.yaml`
-(§4.0).
-
-### 2.2 PCAI import (EzAppConfig)
-
-Package the chart and import it through **AI Essentials → Tools & Frameworks → Import
-Framework** (or apply the generated `EzAppConfig` CR). The chart is already PCAI-ported:
-it carries the `ezua` block, the VirtualService and the `hpe-ezua` labels.
-
-```bash
-helm package ./helm                   # -> ./mooncake-<version>.tgz (repo root)
-```
+**Upgrade path:** re-import the new chart version with the same values; the pool keeps
+serving and clients refill after. **Uninstalling deletes the pool, PVCs included** —
+there is no backup/restore by design (cache state is worth its read-back rate).
 
 ---
 
-## 3. Verify the store
+## 2. Prerequisites
+
+### 2.A Secrets the operator creates
+
+| Secret | Keys | Consumer | Purpose | Failure mode | Create with |
+|---|---|---|---|---|---|
+| *(none for the default TCP deployment)* | — | — | — | — | — |
+| master metadata token — **optional** | `metadata-token` by default (`master.metadata.existingSecretKey`) | master (binds the metadata server), the store pods, and every model client (`MC_METADATA_HTTP_TOKEN`) | authenticates the transfer-engine metadata server; the embedded server refuses to bind a non-loopback address without a token | set on the master but missing on clients → clients register but transfers fail; `allowInsecure: false` with no Secret → the master fails to start | `kubectl -n <ns> create secret generic <name> --from-literal=metadata-token=<token>`, then `master.metadata.existingSecret: <name>` in values + the env on clients. No template file ships with the chart; the name is yours to choose. |
+
+### 2.B Patches and cluster objects
+
+| Object | Why it is needed | What breaks without it | Verify |
+|---|---|---|---|
+| A storage class (G2: `gl4f-filesystem`, VAST CSI) | the PVC capacity tier (§4.3) | store PVCs stay `Pending`, pods stuck in `ContainerCreating` | `kubectl get sc`; PVCs `Bound` after install |
+| `istio-system/ezaf-gateway` (platform-managed) | the dashboard URL | dashboard unreachable, 404 at the gateway | `kubectl -n istio-system get gateway` |
+| `deploy/kyverno-mlis-mooncake-rdma.yaml` — a Kyverno **ClusterPolicy** (mutating) | the only path to the per-pod identity fields every client recipe uses (a `fieldRef` hostname, a node label) | clients boot, but peer transfers fail at dial time — the classic "model is up, cache never works" | server-side dry run per [deploy/README.md](../deploy/README.md) |
+| (RDMA only) the `k8s-rdma-shared-dev-plugin` DaemonSet + nodes advertising `rdma/rdma_shared_device_a` + `/dev/infiniband` on the nodes | the device the store and clients register against | pod `Pending` on the resource limit, or — worse — a **silent** TCP fallback: the model serves, nothing alarms, and the cache is quietly never used | `ibv_devices` inside a store pod; set `MC_FORCE_HCA=true` on clients so a fallback becomes a boot error |
+| (clients only) the Knative feature gates `kubernetes.podspec-fieldref` and `kubernetes.podspec-securitycontext` **closed** | precondition for the Kyverno policy being the *only* identity path on this platform | — | `kubectl -n knative-serving get cm config-knative-serving` (G2: both closed) |
+
+### 2.C External dependencies
+
+Model deployments on **SGLang v0.5.22 or newer** whose image ships the `mooncake`
+python module — the client code is in the serving image, not in this chart. Check once
+per image, from inside the cluster:
+
+```bash
+python3 -c "import mooncake; print(mooncake.__version__)"
+```
+
+They must be able to reach `mooncake-master.<ns>.svc.cluster.local` (50051/8080/9003).
+The client sets `MOONCAKE_CHECK_SERVER=1`, so a model whose store is unreachable
+refuses to boot — a deliberate fail-fast: it is cheaper to find an unreachable store
+at model boot than to serve with a dead cache.
+
+The store itself needs no GPU. The dashboard is a 50m-CPU pod.
+
+---
+
+## 3. Values
+
+`helm/values.yaml` is the complete base (read its storage-model header — the DRAM vs
+PVC distinction is the whole sizing story). Site files:
+[`helm/local/values.g2.yaml`](../helm/local/values.g2.yaml) (G2 demo shape, 3 × 350Gi,
+16 GB DRAM per pod, TCP) and
+[`helm/values-examples/values.g2.yaml`](../helm/values-examples/values.g2.yaml)
+(generic template, 3 × 1Ti) — plus a transport profile, last on the command line
+([helm/values-examples/README.md](../helm/values-examples/README.md)).
+
+**Must set per site:**
+
+| Value | Default | Why |
+|---|---|---|
+| `ezua.virtualService.endpoint` | `mooncake.${DOMAIN_NAME}` | the dashboard host; must be unique on the shared gateway — two VirtualServices claiming one host split traffic |
+| `store.persistence.storageClassName` | `gl4f-filesystem` | the class the cluster actually exposes; wrong name → PVCs `Pending` |
+| `store.replicaCount` | 3 | pool replicas; also the PVC count |
+| `store.persistence.size` | 500Gi | per-PVC **quota** (the class is thin — a quota, not a reservation) |
+| `store.segmentSize` | 8gb | the DRAM hot tier per pod; `store.resources.requests.memory` must cover it + the local buffer + interpreter overhead |
+
+**Optional, with defaults that are already right for most sites:**
+
+| Value | Default | What it does |
+|---|---|---|
+| `store.protocol` | `tcp` | whole-pool transport; pick the RDMA profile instead of editing this by hand (§5.0) |
+| `store.rdma.deviceResource` / `infinibandHostPath` | `rdma/rdma_shared_device_a` / `/dev/infiniband` | the device limit and the belt-and-braces hostPath, applied only when `protocol: rdma` |
+| `master.enableOffload` | true | the master must accept disk segments; off → the PVC tier silently does nothing (`UNABLE_OFFLOAD`) |
+| `master.quotaBytes` | 0 (= 90% of the mounted volume) | the SSD-tier quota, **pool-wide**; Mooncake has no per-client cap |
+| `master.evictionHighWatermarkRatio` | 0.95 | eviction begins past this fraction of capacity |
+| `master.clientTtlSeconds` | 10 | a silent client's segment is unmounted after this |
+| `master.metadata.allowInsecure` | true | set `false` + `existingSecret` for the tokened metadata path (§2.A) |
+| `ui.refreshIntervalSeconds` | 1800 | dashboard backend re-read cadence (the page polls a 30 s snapshot) |
+| `ui.discovery.namespaces` | release namespace | where the dashboard looks for clients (`MOONCAKE_MASTER` pods) |
+| `ui.rbac.create` | true | create the read-only Role (pods + PVCs) in the release + discovery namespaces |
+| `ezua.authorizationPolicy.enabled` | false | the oauth2-proxy SSO gate in front of the dashboard |
+| `store.pdb.enabled` / `store.pdb.minAvailable` | true / 2 | keep the pool serving through node drains |
+| `store.podAntiAffinity` | true | soft spread of store pods across nodes |
+| `imagePullSecrets` | [] | for a private registry |
+| `nodeSelector` / `tolerations` / `affinity` / `podAnnotations` | — | standard placement pass-throughs, merged with the chart's own rules |
+
+---
+
+## 4. Import and install
+
+### 4.1 Import (the PCAI path)
+
+1. **Package** — `./automation.sh release` (or `helm package ./helm`) produces
+   `mooncake-<version>.tgz` at the repo root.
+2. **Import** — AI Essentials → **Tools & Frameworks → Import Framework**, upload the
+   tarball. Alternatively apply the generated artifact:
+   `kubectl apply -f ezapp/ezappconfig-mooncake.yaml` (it pins the chart and the
+   values override; regenerate it with `python3 ezapp/make_ezappconfig.py` after any
+   values change).
+3. **Create the application** — PCAI asks for the target namespace and shows the
+   **Helm Values** editor; paste the full values document (start from
+   `helm/local/values.g2.yaml` + the TCP profile).
+4. **Deploy** — PCAI resolves the domain, renders the templates, and creates the
+   master Deployment, store StatefulSet (+PVCs), UI, the reader RBAC, and the
+   VirtualService.
+
+*(Developer path — not the PCAI one:)* `helm install mooncake ./helm -n mooncake
+--create-namespace -f helm/local/values.g2.yaml
+-f helm/values-examples/values.transport-tcp.yaml`. On a plain install you must
+substitute the domain by hand in `ezua.virtualService.endpoint`; PCAI does it for you
+on import.
+
+### 4.2 Verify the store
 
 ```bash
 kubectl -n mooncake get pods
@@ -85,7 +176,10 @@ curl -s localhost:9003/metrics/summary
 curl -s localhost:9003/get_all_segments | head -c 400
 ```
 
-### 3.1 The PVC tier (the capacity tier)
+Then open `https://mooncake.<your-domain>` — the dashboard should show pool capacity
+and zero models (until you add a client in §5).
+
+### 4.3 The PVC tier (the capacity tier)
 
 Each store pod owns one PVC, created from the StatefulSet volume claim template, so it
 survives pod restarts and reschedules:
@@ -109,331 +203,236 @@ The SSD tier needs two things and will silently do nothing without either:
 By default the backend claims 90% of the mounted volume (`Bucket backend max_total_size not
 set; using 90% of disk capacity`), so a 350Gi claim yields ~315 GiB of usable tier.
 
-The claim template is **immutable**: changing `store.persistence.size` on an existing
-release does not resize the claims. Either expand the PVCs in place
-(`kubectl -n mooncake patch pvc ssd-mooncake-store-0 -p '{"spec":{"resources":{"requests":{"storage":"2Ti"}}}}'`
-— only if the storage class allows expansion), or scale the StatefulSet out so new pods
-get the new size, or reinstall.
-
-Watch the two tiers on the master:
-
-```
-Storage: 12.34 GB / 150.00 GB (8.2%) | SSD Storage: 40.1 GB | Keys: 12345 | Clients: 3
-```
-
-`Storage` is the DRAM tier (sum of `segmentSize`), `SSD Storage` is what the pods have
-offloaded to their PVCs. If `SSD Storage` stays at 0 while objects are being written, the
-offload flags did not take effect — check that the store pod's args carry
-`-Denable_ssd_offload=true` and `-Dssd_offload_path=<mountPath>`, and that
-`store.persistence.mountPath` is writable in the pod.
+The claim template is **immutable**: changing `store
+.persistence.accessModes` or `storageClassName` after the StatefulSet exists fails
+(`persistentvolumeclaimtemplates is immutable`). To change them you must delete the store
+PVCs **and** the StatefulSet with `--cascade=orphan` (delete the StatefulSet *first* with
+that flag so it does not delete the PVCs with it). Changing `store.persistence.size` is
+safe in place — the class supports expand, so the existing claims grow.
 
 ---
 
-## 4. Point a model deployment at it
+## 5. Pointing a model deployment at the store
 
-A serving replica needs three things: the **client env**, two **serve flags**, and a
-**per-pod hostname** (the pod IP) — plus a transport that matches the store.
+This part is a **per-model, per-deployment patch**, not a chart value — for the reason
+in §5.3. It takes four inputs:
 
-> Worked example, with the live command and env vars: [CLIENT-DEEPSEEK-V4.1.md](CLIENT-DEEPSEEK-V4.1.md).
-
-### 4.0 Choose the transport first: TCP or RDMA
-
-The transport belongs to the **store** (`store.protocol`, set at install time) and
-**every client must match it** — a TCP client cannot transfer to an RDMA segment, and a
-mixed pool does not work. So it is one decision for the whole pool, not a per-model
-choice.
-
-| | **TCP** | **RDMA** |
+| Input | From | Example (this store, TCP) |
 |---|---|---|
-| Store | `store.protocol: tcp` (chart default, and the G2 site file) | `store.protocol: rdma` (the RDMA transport profile) |
-| Client pod needs | the env and the flags | those **plus** a device limit, `IPC_LOCK` and `/dev/infiniband` |
-| Who can enable a client | MLIS access alone, once the fieldRef gap is closed (§4.3) | MLIS **plus** a cluster admin for the policy in `deploy/`, or the script |
-| Node requirement | none | the node must advertise `rdma/rdma_shared_device_a` |
-| Cost | one memcpy per page: more CPU, less throughput | zero-copy |
-| When it goes wrong | no pod-level failure mode: the memcpy path always works | boot failure (`Failed to register buffer`), or a silent TCP fallback that then cannot talk to an RDMA store |
+| master address | `store.service` + release namespace | `mooncake-master.mooncake.svc.cluster.local:50051` |
+| metadata address | `master.metadataPort` | `http://mooncake-master.mooncake.svc.cluster.local:8080/metadata` |
+| protocol | `store.protocol` | `tcp` or `rdma` — **must match the store** |
+| model name | the InferenceService | `deepseek-v41-flash-offload` |
 
-**TCP is the default and the safe bring-up.** No device plugin, no added capability, no
-`hostPath`, no cluster-admin policy, and nothing that can fail at boot. What it costs is CPU
-and throughput on the transfer, not correctness. The chart defaults to `tcp` and the G2 site
-file pins it.
+### 5.0 The transport decision (read this first)
 
-**RDMA is a supported upgrade, gated on three things:** the store pods actually mounting
-`/dev/infiniband` (`store.rdma.infinibandHostPath`), the client policy in `deploy/` verified
-to fire (§4.3), and the pool proven on TCP first. The plugin on this unit is not
-CDI-enabled, so the device nodes are not something to assume — the chart mounts
-`/dev/infiniband` explicitly. Without a working device an RDMA store falls back to TCP while
-every client is told RDMA — a mismatched pool that never alerts. The checks are in
-[PRODUCTION.md](PRODUCTION.md) §1.
+**The transport is one decision for the whole pool, and every client must match the
+store.** The store's `store.protocol` and each client's `MOONCAKE_PROTOCOL` are
+independent settings that the transfer engine only reconciles at *transfer time*.
+A client/store mismatch therefore does not fail boot: the model starts, serves, and
+then fails on its first Mooncake transfer — `Failed to register buffer, error code: N`
+or, for a protocol mismatch, `Failed to submit all transfers ... NotSupportedTransport`.
+That is the "model is up but the cache never works" failure, and it is invisible
+unless you check the logs.
 
-The transport is one overlay file from `helm/values-examples/` (`values.transport-tcp.yaml`
-or `values.transport-rdma.yaml`), applied **after** the site file — later `-f` wins, so it
-overrides a site file's inline `store.protocol`. Moving a running pool to RDMA is a
-maintenance-window change, because it touches the store **and** every client
-([PRODUCTION.md](PRODUCTION.md) §5).
+- **TCP** is the chart default, the G2 install, and the low-risk start: no device, no
+  `IPC_LOCK`, no `/dev/infiniband`, and no silent-fallback mode. A TCP failure is
+  almost certainly configuration (master address, `MOONCAKE_PROTOCOL`, flags), which
+  makes it cheap to debug.
+- **RDMA** is the throughput upgrade (the G2 nodes advertise
+  `rdma/rdma_shared_device_a: 240`). It needs the device **and** `/dev/infiniband` on
+  both the store pods and the client pods, plus `IPC_LOCK` (the store `mlock()`s its
+  registered segment; without it you get `mlock: cannot allocate memory` at boot).
+  It also has a failure mode with no alert: **if no HCA is found the transfer engine
+  falls back to TCP silently**, so set `MC_FORCE_HCA=true` on RDMA clients to make a
+  fallback a loud boot error instead.
+- **Switching transport is a maintenance-window change.** It touches the store
+  *and* every client (repatch all of them with the new `--protocol`), and it is not a
+  rolling operation.
 
-### 4.1 The client env
+The two profiles in `helm/values-examples/` encode exactly this:
+`values.transport-tcp.yaml` (no device, no capability, no fallback) and
+`values.transport-rdma.yaml` (device limit + `/dev/infiniband` + `IPC_LOCK`, with the
+prerequisites listed in the file). Apply one, last on the command line — a later
+`-f` wins.
 
-```yaml
-env:
-  - name: MOONCAKE_MASTER
-    value: "mooncake-master.<namespace>.svc.cluster.local:50051"
-  - name: MOONCAKE_TE_META_DATA_SERVER
-    value: "http://mooncake-master.<namespace>.svc.cluster.local:8080/metadata"
-  - name: MOONCAKE_PROTOCOL
-    value: "rdma"                # tcp | rdma — MUST equal the store setting
-  - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
-    value: "0"                   # pure client: the store pods hold the memory
-  - name: MOONCAKE_CHECK_SERVER
-    value: "1"                   # block boot until the master answers
-  - name: MOONCAKE_LOCAL_HOSTNAME
-    valueFrom:
-      fieldRef:
-        fieldPath: status.podIP  # REQUIRED - see 4.3
-  - name: MOONCAKE_HOST_ID
-    valueFrom:
-      fieldRef:
-        fieldPath: spec.nodeName
-```
+### 5.1 The environment (per serving pod)
 
-If the store was installed with a metadata token (`master.metadata.existingSecret`), add
-`MC_METADATA_HTTP_TOKEN` from the same Secret to **every** client and store pod.
+| Variable | Value | Why |
+|---|---|---|
+| `MOONCAKE_MASTER` | `<master svc>.<ns>.svc.cluster.local:50051` | the store endpoint, host:port, no scheme |
+| `MOONCAKE_TE_META_DATA_SERVER` | `http://<master svc>.<ns>.svc.cluster.local:8080/metadata` | the transfer-engine metadata server — keep the `/metadata` path |
+| `MOONCAKE_PROTOCOL` | `tcp` **or** `rdma` — must equal `store.protocol` | mismatch = silent failure at transfer time (§5.0) |
+| `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `0` | **pure client** — this pod contributes no segment; the store pods hold the memory |
+| `MOONCAKE_CHECK_SERVER` | `1` | block boot until the master answers `/get_all_segments` |
+| `MOONCAKE_LOCAL_HOSTNAME` | `valueFrom: fieldRef: status.podIP` | **per-pod** transfer endpoint; a literal breaks peer dialing |
+| `MOONCAKE_HOST_ID` | `valueFrom: fieldRef: spec.nodeName` | node identity, used by `allocationStrategy: local_first` |
 
-### 4.2 The serve flags
-
-Add to the existing `sglang serve` args (they sit under the HiCache tiers you already run):
+### 5.2 The flags (per InferenceService)
 
 ```
 --hicache-storage-backend mooncake
 --hicache-storage-prefetch-policy timeout
 ```
 
-Keep `--enable-hierarchical-cache`, `--hicache-ratio`, `--hicache-mem-layout page_first`
-and `--hicache-io-backend kernel`. **Do not** add `--hicache-size` on DeepSeek-V4 (it is
-rejected) and **do not** add `--enable-unified-cache-external-linker` (mutually exclusive
-with HiCache).
+`timeout` bounds how long a prefill waits on a storage read before computing anyway —
+the right default for a cache tier. The backend requires a page-first HiCache layout;
+`--hicache-io-backend kernel` resolves to it (see
+[CLIENT-DEEPSEEK-V4.1.md](CLIENT-DEEPSEEK-V4.1.md) for a complete, worked example
+against the live G2 predictor, including the exact env var names in the fork).
 
-#### Do you still need the host (L2) tier?
+### 5.3 Why a patch script and not values: the Knative catalog gap
 
-**Physically yes.** The storage backend registers the host pool buffers and moves pages
-through them — GPU → host → store. There is no path that writes GPU memory straight to
-Mooncake, so `--enable-hierarchical-cache` and a host pool stay.
+The `MOONCAKE_LOCAL_HOSTNAME` and `MOONCAKE_HOST_ID` entries are **per-pod values**:
+each replica must advertise *its own* IP and node. In the raw InferenceService spec
+that is `valueFrom: fieldRef` — expressible, but the PCAI **catalog** (the model
+deployment the user edits in the UI) only offers per-replica *static* env vars: no
+`fieldRef`, no `valueFrom` of any kind.
 
-**Its role can change.** `--hicache-host-memory-mode buffer_only` makes the host pool a
-transfer buffer instead of a cache tier, so all reuse comes from the store. It requires a
-storage backend (Mooncake qualifies) and is rejected with `--disaggregation-mode decode`.
-It does **not** free the memory: the pool is still sized by `--hicache-ratio`, whose default
-in this mode is 1.2 rather than 2.0.
+That gap is structural on this platform, and it is why this section exists:
 
-What it changes is latency, not footprint: an L2 hit is DRAM, an L3 hit is network storage.
-Keeping a modest L2 (ratio 2) is usually both the better demo and the better service; shrink
-the ratio first if RAM is the pressure.
+1. The catalog cannot express `fieldRef`. The two gates that would have been needed
+   are **closed** on G2 (`kubernetes.podspec-fieldref`,
+   `kubernetes.podspec-securitycontext` in `config-knative-serving`) — verified
+   2026-11-05, and re-verify per unit.
+2. So a per-pod value has exactly **one** path: a **Kyverno mutating policy** that
+   injects it at admission. That policy is
+   [`deploy/kyverno-mlis-mooncake-rdma.yaml`](../deploy/kyverno-mlis-mooncake-rdma.yaml)
+   — it adds `MOONCAKE_LOCAL_HOSTNAME` (podIP `fieldRef`) and `MOONCAKE_HOST_ID`
+   (nodeName `fieldRef`) to any pod in a namespace carrying the label
+   `mooncake-client: "true"`, and for `rdma` clients also the device limit,
+   `IPC_LOCK` and the `/dev/infiniband` mount. It is applied once per cluster
+   (`kubectl apply -f deploy/kyverno-mlis-mooncake-rdma.yaml`), not per model.
+   Verify it actually fires before blaming the model:
+   ```bash
+   kubectl create --dry-run=server -f <rendered-pod.yaml> -o yaml   # expect the fieldRefs
+   ```
+   If the pod renders **without** the fields, the policy is not firing (label,
+   namespace, or policy absent) — the model will then fail with
+   `Failed to register buffer, error code: N`.
+3. A static `MOONCAKE_LOCAL_HOSTNAME` (one value shared by all replicas) would
+   "work" for one replica and break every other peer dial — never use a literal.
 
+### 5.4 Apply it
 
-### 4.3 What a catalog entry cannot express — and where it has to come from
+```bash
+# 1. the cluster-wide policy, once
+kubectl apply -f deploy/kyverno-mlis-mooncake-rdma.yaml
 
-MLIS accepts an image, `arguments`, `environment`, `/dev/shm` size and one PVC. The gap
-is small and well defined — but there is a second wall behind it.
+# 2. label the model's namespace
+kubectl label namespace <model-ns> mooncake-client=true
 
-| The pod needs | Catalog (MLIS) | Where it comes from |
+# 3. patch the InferenceService (adds env + flags +, for rdma, the device plumbing)
+python3 scripts/patch-model-mooncake.py --namespace <model-ns> \
+  --name <inferenceservice> --protocol tcp \
+  --master mooncake-master.mooncake.svc.cluster.local:50051
+```
+
+The script prints the `env`, `args` and (rdma) `resources.limits` / `volumeMounts`
+blocks it applies, and refuses to run if the deployment already has a conflicting
+`--hicache-storage-backend`.
+
+### 5.5 Verify the client is actually using the store
+
+```bash
+# store side: Clients count climbs
+kubectl -n mooncake port-forward svc/mooncake-master 9003:9003 &
+curl -s localhost:9003/metrics/summary | python3 -m json.tool
+
+# client side: the register line, then real transfers
+kubectl -n <model-ns> logs deploy/<model>-predictor-<hash> | \
+  grep -Ei "mooncake|hicache" | tail -30
+```
+
+You want to see the client's register log followed by put/get activity; the dashboard
+Models panel then lists the replica with its cache hit rate.
+
+### 5.6 Per-model capping (how to stop one tenant from filling the pool)
+
+Mooncake has **no per-client size cap** — `quotaBytes` is pool-wide. A large model
+can fill the pool and evict another model's cache (a miss, not a failure, but
+noisy). The levers, in descending strength:
+
+| Lever | Scope | How |
 |---|---|---|
-| the two serve flags | yes — `arguments` | the catalog |
-| the five static env vars | yes — `environment` | the catalog |
-| `MOONCAKE_LOCAL_HOSTNAME` + `MOONCAKE_HOST_ID` | **no** | the Kyverno policy, at pod create |
-| RDMA plumbing (device limit, `IPC_LOCK`, `/dev/infiniband`) | **no** | the Kyverno policy, at pod create |
+| `MOONCAKE_TENANT` (client env) | per tenant | different tenants get separate quota namespaces; set it per model so each has its own `quotaBytes` bucket |
+| `master.quotaBytes` | per tenant/pool, bytes | the SSD-tier quota; 0 = 90% of the mounted volume |
+| per-model `MOONCAKE_*` overrides | per client | e.g. a different prefetch policy or a smaller working set for a small model |
 
-**Knative is the reason for that second column.** A KServe Serverless predictor is a
-Knative Revision, and Knative validates that revision template far more strictly than it
-validates a Pod:
+Practical default: give each *model* its own `MOONCAKE_TENANT` and size
+`master.quotaBytes` to the biggest one.
 
-| Field | Knative |
+---
+
+## 6. Per-model notes (live fleet)
+
+- **DeepSeek-V4.1-Flash-1017 (G2 predictor, SGLang v0.5.23, TP4/EP4)** — the reference
+  client. Full diff in [CLIENT-DEEPSEEK-V4.1.md](CLIENT-DEEPSEEK-V4.1.md): two args,
+  seven env vars, nothing removed; `page_first` layout + `kernel` IO + `timeout`
+  prefetch policy; TCP.
+- **GLM-5.3-Flash (the v2 fork image)** — keep the file backend. The v2 fork
+  **refuses** the mooncake backend at boot (it carries the stock 0.5.22/0.5.23
+  `#38031` corruption class), so for this model "mooncake for Qwen and DeepSeek" is
+  the correct statement, never "never use file".
+- **SGLang versions** — the `#38031` corruption fix and the mooncake backend both
+  need v0.5.22+. On the G2 fork, confirm `import mooncake` in the image before
+  patching.
+
+## 7. Several models, one store
+
+- **Isolation is by key prefix** (the model name), so models never see each other's
+  KV — no config needed for coexistence.
+- **They share one eviction pool.** A busy model evicts a quiet one's pages: that is a
+  cache miss, never an error. If it hurts, give models separate `MOONCAKE_TENANT`
+  values (§5.6).
+- **The dashboard scans per namespace.** Add each model's namespace to
+  `ui.discovery.namespaces` (and the chart creates the reader Role there), or the
+  Models panel will not show it.
+- **One transport for all of them** — a new model joining an existing pool must take
+  the pool's `MOONCAKE_PROTOCOL`, not its own preference (§5.0).
+
+---
+
+## 8. Upgrade, rollback, uninstall
+
+### 8.1 The PCAI path
+
+- **Upgrade:** import the new chart version, keep your values, re-apply. The store
+  rolls; the PVC tier survives (it is a quota, and the StatefulSet keeps its
+  volumes). Clients see a refill window, not an outage.
+- **Rollback:** point the application back at the previous imported version with the
+  same values.
+- **Uninstall:** deletes the pool **including the PVCs**. There is no backup/restore
+  by design — a cache is worth its read-back rate, and resurrecting KV pages from a
+  snapshot is not a supported operation.
+
+### 8.2 Plain Helm (developer path — not the PCAI one)
+
+```bash
+helm upgrade mooncake ./helm -n mooncake -f helm/local/values.g2.yaml \
+  -f helm/values-examples/values.transport-tcp.yaml
+helm rollback mooncake -n mooncake
+helm uninstall mooncake -n mooncake        # deletes the pool AND the PVCs
+```
+
+---
+
+## 9. Troubleshooting
+
+| Symptom (where) | Meaning |
 |---|---|
-| `hostPath` volume | never allowed |
-| `env[].valueFrom.fieldRef` | gated by `kubernetes.podspec-fieldref` |
-| `securityContext.capabilities` | gated by `kubernetes.podspec-securitycontext` |
-
-Both feature gates are **closed** on this unit. Patching an ISVC with those fields does
-not work: `validation.webhook.serving.knative.dev` rejects the update, the ISVC stops
-reconciling, and the previous revision keeps serving while no new one is ever created.
-The only injection point downstream of that validation is the Pod — which is what
-[deploy/kyverno-mlis-mooncake-rdma.yaml](../deploy/README.md) mutates.
-
-So the client config is split in two, and both halves are needed:
-
-1. **The catalog entry** carries the two flags, the five literal env vars, and
-   `MOONCAKE_RDMA=true` for an RDMA store. All of it is expressible there.
-2. **The policy** adds the two `fieldRef` vars for any Mooncake client, and the device,
-   `IPC_LOCK` and `/dev/infiniband` when `MOONCAKE_RDMA=true`.
-
-`MOONCAKE_LOCAL_HOSTNAME` must be **each pod's own routable IP** — it is the transfer
-endpoint the store dials. The catalog holds literal strings only, so it cannot carry
-that; unset or fixed, every pod advertises the same address (or loopback) and transfer
-fails. That is precisely what rule 1 of the policy is for.
-
-If the ISVC is already deployed and you would rather not redeploy it from the catalog:
-
-```bash
-python3 scripts/patch-model-mooncake.py --isvc <isvc> --protocol rdma --dry-run
-python3 scripts/patch-model-mooncake.py --isvc <isvc> --protocol rdma
-```
-
-It writes only the catalog-expressible part into the ISVC, sets `MOONCAKE_RDMA=true`, and
-removes anything an earlier run left behind that Knative would reject. It also lowers the
-outgoing revision's `minScale` to 0 and waits for its pod to terminate before applying,
-so you never run two copies of the model.
-
-The manual equivalent, if you would rather not run the script:
-
-```bash
-NS=<model-namespace>; ISVC=<isvc-name>; STORE_NS=mooncake; PROTOCOL=rdma   # or tcp
-MASTER="mooncake-master.${STORE_NS}.svc.cluster.local"
-
-kubectl -n "$NS" patch isvc "$ISVC" --type=json -p "[
-  {"op":"add","path":"/spec/predictor/containers/0/args/-","value":"--hicache-storage-backend"},
-  {"op":"add","path":"/spec/predictor/containers/0/args/-","value":"mooncake"},
-  {"op":"add","path":"/spec/predictor/containers/0/args/-","value":"--hicache-storage-prefetch-policy"},
-  {"op":"add","path":"/spec/predictor/containers/0/args/-","value":"timeout"},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_MASTER","value":"${MASTER}:50051"}},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_TE_META_DATA_SERVER","value":"http://${MASTER}:8080/metadata"}},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_PROTOCOL","value":"${PROTOCOL}"}},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_GLOBAL_SEGMENT_SIZE","value":"0"}},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_CHECK_SERVER","value":"1"}},
-  {"op":"add","path":"/spec/predictor/containers/0/env/-","value":{"name":"MOONCAKE_RDMA","value":"true"}}
-]
-```
-
-Note what is *not* in that patch: no `fieldRef`, no capability, no volume. Knative would
-reject all three, and the policy adds them at the pod instead.
-
-Either way this rolls a new revision: the pod restarts and reloads weights. Schedule it.
-
-### 4.4 Verify the client
-
-```bash
-kubectl -n "$NS" logs <new-predictor-pod> -c kserve-container \
-  | grep -iE "mooncake|hierarchical|rdma|memcpy"
-```
-
-`-c kserve-container` is required: these pods also carry the logger, the queue proxy and
-the Istio sidecar, so an unqualified `kubectl logs` refuses with "a container name must
-be specified".
-
-The only unambiguous "L3 is live" pair is:
-
-```
-Mooncake store setup successfully.
-Mooncake store warmup successfully.
-```
-
-Then confirm the transport the client actually chose matches the store:
-
-- **RDMA store** — `Found 1 HCAs` and `Using RDMA transport`, and **not**
-  `TCP-only environment, memcpy enabled`. A silent TCP fallback still serves traffic, so
-  nothing alerts you; this line is the check.
-- **TCP store** — `TCP-only environment, memcpy enabled` is expected and correct.
-
-For RDMA, also confirm the policy actually fired. The env vars are in the ISVC, but the
-device and the capability are not — they only exist if the pod was mutated:
-
-```bash
-kubectl -n "$NS" get pod <new-predictor-pod> -o jsonpath='{.spec.containers[0].securityContext}{"\n"}{.spec.containers[0].resources.limits}{"\n"}{.spec.volumes[*].name}{"\n"}'
-```
-
-You want `IPC_LOCK`, `rdma/rdma_shared_device_a`, and `infiniband` in the volume list. If
-they are missing, rule 2 of the policy did not match and the client will fail at
-`Failed to register buffer` rather than at boot.
-
-Do **not** trust Mooncake's storage counters on DeepSeek-V4: they are fed only by the v1
-code path, which returns early on that model's logical KV anchor. They stay at zero even
-when L3 works. Use `--enable-cache-report` and `usage.prompt_tokens_details.cached_tokens`
-instead — the dashboard's Models panel reads the same server.
-
----
-
-
----
-
-## 4.5 Capping how much one model can take
-
-The file backend had two per-process knobs — `SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE` and
-`..._MIN_FREE_SPACE` — because it wrote to a local directory the process owned. **Mooncake
-has no per-client equivalent, and cannot have one**: a serving replica contributes no storage
-(`MOONCAKE_GLOBAL_SEGMENT_SIZE=0`), so there is nothing local to cap. The data lives in the
-store pods' segments, which are shared.
-
-What exists, weakest to strongest:
-
-| Mechanism | Scope | How |
-|---|---|---|
-| `master.quotaBytes` | **whole pool** | quota for the SSD tier in bytes; `0` = 90% of the mounted volume. The closest analogue of `MAX_SIZE`. |
-| `master.evictionHighWatermarkRatio` | whole pool | when the DRAM tier starts evicting (default 0.95). |
-| `MOONCAKE_TENANT_ID` per model + master `--enable_multi_tenants` | **per model** | the only real per-model cap: the master admits per-tenant memory against a quota connector (`--tenant_quota_connector_type file\|etcd`). Requires a quota file, and SGLang raises if the installed Mooncake lacks tenant support. |
-| one store per model | **per model** | absolute isolation: its own namespace, master, store pods and quota. Blunt but it is what I would use for anything customer-facing. |
-
-So: "max size" has a pool-level equivalent (`quotaBytes`); "min free space" is implicit in the
-90% default (the backend reserves the rest). A per-model cap needs either tenants or separate
-stores.
-
-If you want tenants, the store side needs:
-
-```yaml
-master:
-  args: ["--enable_multi_tenants=true", "--tenant_quota_connector_type=file",
-         "--tenant_quota_connector_file=/etc/mooncake/quotas.json"]
-```
-
-and each model adds `MOONCAKE_TENANT_ID=<model>` to its env. `scratch/add_mooncake_seed_entries.py
---tenants` writes those env vars into the catalog entries.
-
-## 5. Per-model notes on this fleet
-
-| Model | Status |
-|---|---|
-| **DeepSeek-V4.1-Flash** | supported: purpose-built pool map, rank-replicated pool so the rank-0 single writer is correct. Unproven end-to-end — soak before trusting. |
-| **GLM-5.3-Flash** | blocked today: it needs the v2 fork image for the DSA host-load-back fix, and that fork refuses the mooncake backend at boot. Stock v0.5.22 **and v0.5.23** boot it but carry the #38031 corruption class, which is still open — its fix PR was closed unmerged, and the DSA fixes that did land in 0.5.23 are speculative-decode path only. Its **file** L3 tier is the safe one until the fork learns mooncake. |
-| **Qwen3.8-27B** | at TP1 its GDN state is unsharded, so both file and mooncake are structurally safe; verify the module exists in its dev image. |
-
----
-
-## 6. Several models, one store
-
-Point as many deployments at the master as you like. Isolation is by key prefix
-(`<backend-tag>_<model-name>`), so:
-
-- same model + same parallelism → **shares** cache across replicas (the feature);
-- different models → **never collide**, and never share KV (tokenizers differ);
-- same model at different parallelism/quantization → same prefix: partition with
-  `--hicache-storage-backend-extra-config '{"extra_backend_tag":"tp4"}'`.
-
-They do compete for one pool: eviction is global, and the master is one SPOF for all of
-them. One store per model family is the cleaner operational boundary.
-
----
-
-## 7. Upgrade and uninstall
-
-```bash
-helm upgrade mooncake ./helm -n mooncake
-helm uninstall mooncake -n mooncake          # the pool contents go with it
-```
-
-Upgrading the **store** restarts pods and loses their shares (cache-miss semantics).
-Upgrading a **client** costs nothing to the pool.
-
----
-
-## 8. Troubleshooting
-
-| Symptom | Cause |
-|---|---|
-| `Invalid HA backend entry: http://...` | `MOONCAKE_MASTER` carries a URL scheme. It must be plain `host:port`; only `MOONCAKE_TE_META_DATA_SERVER` takes `http://.../metadata` |
-| `MountLocalDiskSegment failed, error code is UNABLE_OFFLOAD` | the master was started without `--enable_offload=true` (`master.enableOffload`) |
-| `Storage root directory is not set. persisting data is disabled.` | the store pod has no `-Dssd_offload_path`; the SSD tier is off |
-| `Failed to setup Mooncake store, error code: N` | wrong master address / protocol / device |
-| `Failed to register buffer, error code: N` | transport problem — often `Requested address ... not found` when RDMA is selected without `/dev/infiniband` |
-| `Launch mooncake store server timeout` | the client cannot reach `:9003/get_all_segments` (DNS, NetworkPolicy, master down) |
-| `Warmup put failed after 10 attempts` | store reachable but unusable — transport again |
+| store pods stuck `ContainerCreating`, PVC `Pending` | `storageClassName` names a class the cluster does not expose (or cannot provision) — `kubectl get sc` |
+| store pods crash with `mlock: cannot allocate memory` | `IPC_LOCK` missing (RDMA) — the policy only adds it for `--protocol rdma` |
+| master: `MountLocalDiskSegment failed ... UNABLE_OFFLOAD` | `master.enableOffload` is false — the PVC tier is dead, silently |
+| store PVC stays empty with no errors | `enableOffload` true but `store.persistence.enabled` false (or the `-D` flags absent) |
+| client: `Failed to register buffer, error code: N` | wrong master address / protocol / device |
+| client: `Failed to submit all transfers ... NotSupportedTransport` | **client/store protocol mismatch** — a TCP client against an RDMA store (or reverse) |
+| model serves, cache never reused, no errors | RDMA selected but no HCA — the transfer engine **fell back to TCP silently**. Check for the fallback line, `ibv_devices` in the pod, set `MC_FORCE_HCA=true` on clients to make it a boot error |
+| client: `Failed to register buffer, error code: N` with `Requested address ... not found` | RDMA selected without `/dev/infiniband` in the pod |
+| client: `Launch mooncake store server timeout` | the client cannot reach `":9003/get_all_segments"` (DNS, NetworkPolicy, master down) |
+| client: `Warmup put failed after 10 attempts` | store reachable but unusable — transport again |
 | no `Mooncake Configuration loaded ...` line | `--hicache-storage-backend mooncake` never reached the scheduler |
-| dashboard Models panel empty | the client pods have no `MOONCAKE_MASTER` env, or the UI Role lacks `list pods` in that namespace |
+| dashboard Models panel empty | the client pods have no `MOONCAKE_MASTER` env, or the UI Role lacks `list pods` in that namespace (add it to `ui.discovery.namespaces`) |
 
 A pod with no `/dev/infiniband` cannot join an RDMA store, and setting the client to
 `MOONCAKE_PROTOCOL=tcp` does not fix that — it only works if the store is tcp too. Give
