@@ -374,6 +374,105 @@ data:
     const webPort = Number(process.env.OPENWORK_PORT || '8787')
     const webHost = process.env.OPENWORK_HOST || '127.0.0.1'
     const portCheckHost = '127.0.0.1'
+    // Workspace convergence — WHY this exists: server.json lives on the unit's
+    // state PVC and the unit init only SEEDS it when missing (`[ ! -f ... ] &&
+    // cp /opt/openwork-defaults/openwork-server.json`). A fresh unit therefore
+    // gets the chart-declared workspaces, but an EXISTING unit keeps whatever
+    // stale file it had — after a chart upgrade it would still show the old
+    // workspace set. So instead of seeding once we CONVERGE on every supervisor
+    // start: the required set is every workspace the chart declares (read from
+    // the seeded defaults, the single source of truth rendered from values.yaml
+    // — never hardcoded here) PLUS, for a platform/SSO unit, the two Kubeflow
+    // PVC workspaces.
+    //
+    // The platform half is per-unit because server.json is CHART-WIDE (rendered
+    // once and mounted into every unit pod) and so can only declare the
+    // workspaces every unit gets. Platform/SSO units additionally mount the
+    // Kubeflow PVCs at /mnt/shared and /mnt/user (see platformIntegration in
+    // values.yaml and platformVolumes / platformVolumeMounts in
+    // templates/configmap-router.yaml) and their users must keep all FOUR
+    // workspaces in the picker. The router stamps OPENCODE_PLATFORM_ROOTS
+    // ('mounted' | 'pending' | 'off') per unit; only 'mounted' adds the two
+    // platform entries, so classic units and platform units whose PVCs are not
+    // mounted yet ('pending') keep exactly the chart-declared set.
+    //
+    // Contract:
+    //  - merge keyed on `path`: idempotent, no duplicates; existing entries are
+    //    never removed and never reordered, and user-added entries survive.
+    //    Missing chart entries are appended in chart order, then the platform
+    //    ones — so a stale {personal} file converges to the chart order;
+    //  - the file is rewritten (temp file + rename(), atomic) ONLY when an
+    //    entry was actually added — no write, no churn otherwise;
+    //  - missing/unparseable DEFAULTS => log once and converge with the platform
+    //    entries only (never invent base paths); missing/unparseable
+    //    server.json => log and skip: the supervisor must never crash here.
+    //
+    // Called BEFORE `lastConfigSignature = readConfigSignature()` below: the
+    // supervisor watches server.json, so a write AFTER the signature snapshot
+    // would look like an external config change and restart the web process in
+    // a loop.
+    //
+    // Deliberately self-contained (only process.env + the fs/path modules
+    // imported above, no supervisor state): the body is extracted verbatim
+    // into the behavioural test harness (see the task-2 evidence).
+    function ensurePlatformWorkspaces() {
+      const result = { changed: false, added: [] }
+      const configPath = process.env.OPENWORK_SERVER_CONFIG || '/var/openwork/home/.config/openwork/server.json'
+      const defaultsPath = process.env.OPENWORK_DEFAULTS_CONFIG || '/opt/openwork-defaults/openwork-server.json'
+      // Required set: the chart-declared workspaces first (so the picker order
+      // matches values.yaml), then the platform ones for a mounted SSO unit.
+      const required = []
+      let defaults = null
+      try {
+        defaults = JSON.parse(fs.readFileSync(defaultsPath, 'utf8'))
+      } catch (error) {
+        console.error(`[opencode] workspace convergence: cannot read chart defaults ${defaultsPath}: ${error.message} (converging without them)`)
+      }
+      if (defaults && typeof defaults === 'object' && Array.isArray(defaults.workspaces)) {
+        for (const entry of defaults.workspaces) {
+          if (entry && typeof entry === 'object' && entry.path) required.push(entry)
+        }
+      }
+      if (process.env.OPENCODE_PLATFORM_ROOTS === 'mounted') {
+        required.push({ path: process.env.PLATFORM_SHARED_MOUNT || '/mnt/shared', name: 'platform-shared', workspaceType: 'local' })
+        required.push({ path: process.env.PLATFORM_USER_MOUNT || '/mnt/user', name: 'platform-user', workspaceType: 'local' })
+      }
+      if (required.length === 0) return result
+      let config
+      try {
+        config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+      } catch (error) {
+        console.error(`[opencode] workspace convergence: skipping, cannot read ${configPath}: ${error.message}`)
+        return result
+      }
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        console.error(`[opencode] workspace convergence: skipping, ${configPath} is not a JSON object`)
+        return result
+      }
+      const workspaces = Array.isArray(config.workspaces) ? config.workspaces : []
+      const knownPaths = new Set(
+        workspaces.map((entry) => (entry && typeof entry === 'object' && entry.path ? String(entry.path) : '')),
+      )
+      for (const entry of required) {
+        if (knownPaths.has(entry.path)) continue
+        workspaces.push(entry)
+        knownPaths.add(entry.path)
+        result.added.push(entry.name || entry.path)
+      }
+      if (result.added.length === 0) return result
+      config.workspaces = workspaces
+      const tempPath = `${configPath}.workspaces.tmp`
+      try {
+        fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`)
+        fs.renameSync(tempPath, configPath)
+        result.changed = true
+      } catch (error) {
+        console.error(`[opencode] workspace convergence: cannot write ${configPath}: ${error.message}`)
+        try { fs.unlinkSync(tempPath) } catch {}
+      }
+      return result
+    }
+
     // Workspace precedence (upstream 0.18.60): the precedence chain is
     //   --workspace CLI  >  OPENWORK_WORKSPACES env  >  server.json workspaces
     // and openwork-server's `web` command AUTO-PUSHES process.cwd() as a
@@ -391,6 +490,21 @@ data:
     // keeps the per-workspace NAMES (personal / shared / platform-*), which the
     // path-only CLI/env routes cannot preserve.
     const serverConfigPath = process.env.OPENWORK_SERVER_CONFIG || '/var/openwork/home/.config/openwork/server.json'
+    // Converge server.json with the chart-declared workspace set (+ the two
+    // platform workspaces when this unit has the Kubeflow PVCs mounted) BEFORE
+    // it is read below and BEFORE lastConfigSignature is snapshotted (the
+    // supervisor watches server.json, so a write after the snapshot would look
+    // like an external config change and restart-loop the web process). Never
+    // fatal: ensurePlatformWorkspaces handles its own errors, and this guard
+    // keeps a bug there from taking the supervisor down with it.
+    try {
+      const workspaceConvergence = ensurePlatformWorkspaces()
+      if (workspaceConvergence.changed) {
+        console.error(`[opencode] server.json workspaces converged, added: ${workspaceConvergence.added.join(', ')}`)
+      }
+    } catch (error) {
+      console.error(`[opencode] workspace convergence failed (continuing): ${error.message}`)
+    }
     let serverConfigWorkspaces = []
     try { serverConfigWorkspaces = (JSON.parse(fs.readFileSync(serverConfigPath, 'utf8')).workspaces || []) } catch {}
     if (serverConfigWorkspaces.length > 0 && !process.env.OPENWORK_WORKSPACES) {

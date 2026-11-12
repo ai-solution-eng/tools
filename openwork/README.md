@@ -79,3 +79,32 @@ markdown is escaped before parsing, HTML is isolated twice over.
 The server (`data_manager.mjs`, port 7682, zero dependencies) clamps every operation to the
 navigable roots, writes through a temp file + `rename()`, and refuses to follow symlinks out of a
 root.
+
+## Workspaces
+
+Every unit exposes exactly two workspaces, declared chart-wide in `openworkConfig.serverJson`
+(rendered into `<release>-project-config` → `openwork-server.json`, copied onto the unit's state PVC
+on first boot):
+
+| Workspace | Path | Backing |
+|---|---|---|
+| **personal** | `/workspace/personal` | the user's own workspace PVC |
+| **shared** | `/workspace/shared` | the release-wide shared PVC |
+
+SSO/platform units (`platformIntegration.enabled`) additionally get **platform-shared**
+(`/mnt/shared`, `kubeflow-shared-pvc`) and **platform-user** (`/mnt/user`, `user-pvc`). Those two are
+not in `server.json` — that file is chart-wide and shared by classic and platform units — so
+`opencode_supervisor.mjs` (`templates/configmap-preview.yaml`) merges them into the unit's own copy at
+start when `OPENCODE_PLATFORM_ROOTS === 'mounted'`: chart workspaces first (so picker order follows
+`values.yaml`), then the platform pair, deduplicated by path. The same idempotent merge converges a
+pre-upgrade unit whose state PVC still carries an older `server.json` (init only seeds that file when
+missing), so existing units pick up both chart workspaces on their next restart without losing
+workspaces a user added.
+
+Precedence inside openwork-server: `--workspace` CLI > `OPENWORK_WORKSPACES` env > `workspaces` in the
+`--config` file. Its `web` command auto-pushes `process.cwd()` as the only workspace when the CLI list
+is empty **and** `OPENWORK_WORKSPACES` is unset — which would expose `/workspace` (the parent of
+`personal/` and `shared/`) and lose the per-workspace names. Both the supervisor (when `server.json`
+declares workspaces; otherwise it falls back to `--workspace /workspace/personal`) and
+`docker/user/entrypoint.sh` suppress that fallback by exporting a whitespace-only `OPENWORK_WORKSPACES`
+(`parseList()` returns `[]`, but the variable is defined), keeping `server.json` authoritative.

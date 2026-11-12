@@ -93,7 +93,7 @@ npm-based, mirroring upstream's packaging Dockerfile [V: upstream ships one]:
   - platform identity block: root-only chown/useradd + `setpriv --reuid --regid --init-groups --` **with the early-exit when admission already forced the tenant uid** [V: tr211 lesson in sibling];
   - seed-if-missing config from `/opt/openwork-defaults` (never clobber user edits);
   - symlink org skills from `/workspace/shared/_org/skills/*` (and `/mnt/shared/_org/skills` when platform integration is on);
-  - `exec openwork-server web --host 127.0.0.1 --port 8787 --workspace /workspace/personal --config <server.json> --approval <mode>`.
+  - `export OPENWORK_WORKSPACES=' '` — only when it is unset **and** the seeded `server.json` declares a non-empty `workspaces` array (defined-but-empty: `parseList()` yields `[]`, which suppresses the cwd-push fallback without injecting paths; the guard keeps the cwd fallback on a bare image with no config, which would otherwise be left with zero workspaces), then `exec openwork-server web --host 127.0.0.1 --port 8787 --config <server.json> --approval <mode>` — deliberately no `--workspace` flag, so the seeded `server.json` workspaces stay authoritative.
 - Ports: 8787 loopback (server), 8082 nginx (only non-loopback listener), 7681 ttyd, ephemeral managed engine.
 
 ---
@@ -141,7 +141,7 @@ Path B (Vite+server split with an in-container forwarder) is documented under `d
 ## 6. Config surface
 
 - `opencodeConfig` reuse unchanged: values → `<release>-project-config` `opencode.json` → `/opt/openwork-defaults` → copy-if-missing to `$XDG_CONFIG_HOME/opencode/opencode.json`; `scripts/push-config.sh --apply --backup` for bulk propagation. **[U] Config precedence (S4):** openwork-server passes its own runtime `OPENCODE_CONFIG` to the engine — verify the chart's providers/MCP defaults still apply; else deliver via the runtime config path.
-- `openwork-server.json` (new key in configmap-project.yaml): host/port/approval/workspaces/corsOrigins/`authorizedRoots: [/workspace, /mnt/shared, /mnt/user]`/readOnly/logFormat. `${DOMAIN_NAME}` rendered by Helm as a value, never into JS template literals.
+- `openwork-server.json` (new key in configmap-project.yaml): host/port/approval/workspaces (`personal` → /workspace/personal, `shared` → /workspace/shared)/corsOrigins/`authorizedRoots: [/workspace, /mnt/shared, /mnt/user]`/readOnly/logFormat. `${DOMAIN_NAME}` rendered by Helm as a value, never into JS template literals. Those two are the only workspaces in the file — it is chart-wide and shared by classic and platform units — so `opencode_supervisor.mjs` merges `platform-shared` (/mnt/shared) + `platform-user` (/mnt/user) into the unit's own copy at start when `OPENCODE_PLATFORM_ROOTS === 'mounted'` (idempotent by path: user-added workspaces survive, and a pre-upgrade state PVC converges on its next restart).
 - Skills/MCP sharing: org layer on shared PVC (`_org/skills/*`, `_org/mcp/*`) symlinked into the engine's skill dir at every boot (warm pool included); user layer via OpenWork's own workspace skills/MCP APIs; chart `mcp` defaults via opencode.json.
 - auth.json (engine provider keys) stays per-user on the state PVC, never chart-managed; fleet-wide provider keys go through opencode.json (ConfigMap-readable — document; optional `existingSecret` enhancement). OpenWork tokens auto-generated, persisted on state PVC; never handed to the router (approval authority stays in the pod).
 

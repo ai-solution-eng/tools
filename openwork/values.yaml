@@ -131,7 +131,9 @@ openwork:
   tokenSecret: ""
 
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
-RUNTIME_REV: 24
+# r25: workspace convergence — the supervisor converges server.json to the chart's workspaces
+#      (personal + shared, plus platform-shared/platform-user on mounted SSO units).
+RUNTIME_REV: 25
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
@@ -240,8 +242,10 @@ opencodeConfig: |
 
 # ============================================================
 # OpenWork server config (new surface — openwork-server web itself)
-# Single origin on 127.0.0.1:8787; platform volumes are authorized roots so
-# SSO users can reach /mnt/shared and /mnt/user through the app.
+# Single origin on 127.0.0.1:8787. Every unit exposes two workspaces here:
+# /workspace/personal ("personal") + /workspace/shared ("shared"); SSO/platform
+# units additionally get /mnt/shared + /mnt/user, injected at unit start by the
+# supervisor (templates/configmap-preview.yaml).
 # ============================================================
 openworkConfig:
   serverJson: |
@@ -249,7 +253,7 @@ openworkConfig:
       "host": "127.0.0.1",
       "port": 8787,
       "approval": { "mode": "auto", "timeoutMs": 30000 },
-      "workspaces": [ { "path": "/workspace/personal", "name": "personal", "workspaceType": "local" } ],
+      "workspaces": [ { "path": "/workspace/personal", "name": "personal", "workspaceType": "local" }, { "path": "/workspace/shared", "name": "shared", "workspaceType": "local" } ],
       "authorizedRoots": ["/workspace", "/mnt/shared", "/mnt/user"],
       "readOnly": false,
       "logFormat": "json",

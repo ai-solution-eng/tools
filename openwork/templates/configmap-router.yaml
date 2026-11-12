@@ -132,7 +132,13 @@ data:
     // sandboxed iframe, with a Source/Rendered toggle in the edit dialog.
     // Bumped so existing units re-stamp onto the new data_manager.mjs +
     // data_manager.html: subPath mounts never refresh on their own.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 24 }}'
+    // r25 (RUNTIME_REV): the unit supervisor converges server.json to the
+    // chart's workspace set (personal + shared, plus platform-shared /
+    // platform-user when the platform PVCs are mounted), so existing units pick
+    // up the second workspace on their next start — a supervisor change, hence
+    // a re-stamp: opencode_supervisor.mjs is a subPath mount, so a running pod
+    // keeps the old copy and the merge only converges on restart.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 25 }}'
     const userTemplateVersion = `terminal-tab-v21-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
@@ -1933,6 +1939,16 @@ data:
                     ...platformIdentityEnv,
                     { name: 'OPENCODE_PLATFORM_ROOTS', value: platformRootsMode },
                     { name: 'OPENCODE_PLATFORM_ROOTS_READONLY', value: platformReadOnly ? 'true' : 'false' },
+                    // Platform mount PATHS for the unit container (the same
+                    // values the platformVolumes above are mounted at). The
+                    // supervisor uses them to merge the platform-shared /
+                    // platform-user workspaces into server.json for SSO units,
+                    // and data_manager.mjs already reads them for its platform
+                    // roots list — without them it only ever saw its own /mnt/*
+                    // defaults, so a customised platformIntegration mountPath
+                    // silently diverged between the mount and the UI listing.
+                    { name: 'PLATFORM_SHARED_MOUNT', value: platformSharedMount },
+                    { name: 'PLATFORM_USER_MOUNT', value: platformUserMount },
                     {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
                     {{- range .Values.certificatesPolicy.env }}
                     { name: '{{ .name }}', value: '{{ .value }}' },
