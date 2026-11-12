@@ -103,6 +103,31 @@ BUILD_ARGS=(
   --build-arg "APT_PACKAGES=${APT_PACKAGES}"
   -t "${IMAGE_REPO}:${TAG}"
 )
+
+# Proxy: forward the whole family EXPLICITLY as build args. BuildKit's implicit
+# forwarding does not reliably reach RUN steps when the daemon is remote or
+# Docker-in-Docker — the symptom is exactly "image pulls work, apt/npm/curl time
+# out": the apt step dials deb.debian.org directly and fails with
+# "Failed to fetch ... connection timed out", then "Unable to locate package".
+# Only explicit --build-arg values are guaranteed to be in the RUN environment.
+PROXY_SET=0
+for _pv in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  eval "_pval=\${$_pv:-}"
+  if [ -n "${_pval:-}" ]; then
+    BUILD_ARGS+=(--build-arg "${_pv}=${_pval}")
+    PROXY_SET=1
+  fi
+done
+# A proxied build also needs the host network: the build container's default
+# bridge cannot reach the corporate proxy.
+if [ "$PROXY_SET" = 1 ]; then
+  BUILD_ARGS+=(--network host)
+  echo "==> proxy:         forwarded as build args (+ --network host)"
+else
+  echo "==> proxy:         none set in the environment"
+fi
+echo
+
 [ "$PUSH" = 1 ] && BUILD_ARGS+=(--push)
 [ "$LOAD" = 1 ] && BUILD_ARGS+=(--load)
 

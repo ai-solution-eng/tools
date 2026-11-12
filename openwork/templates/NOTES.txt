@@ -1,0 +1,77 @@
+openwork-web-helm {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) — namespace {{ .Release.Namespace }}
+{{- $secretName := include "openwork-web.authSecretName" . }}
+{{- $ns := .Release.Namespace }}
+{{- $legacy := printf "%s-auth" .Release.Name }}
+
+App:    https://{{ .Values.ezua.virtualService.endpoint }}
+{{- if .Values.existingAuthSecret }}
+
+==========================================================================
+ ACTION REQUIRED — the credentials live in a Secret you own
+==========================================================================
+
+This release reads its five credential keys from
+
+    Secret "{{ $secretName }}" in namespace "{{ $ns }}"
+
+The chart does not render that Secret, and the router pod will not start
+until it exists.
+
+FIRST INSTALL — create it:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secretName }} \
+    --from-literal=SESSION_SECRET="$(openssl rand -hex 32)" \
+    --from-literal=OPENCODE_SERVER_USERNAME='opencode' \
+    --from-literal=OPENCODE_SERVER_PASSWORD='<openwork token>' \
+    --from-literal=ADMIN_USERNAME='admin-user' \
+    --from-literal=ADMIN_PASSWORD='<admin password>'
+
+UPGRADING FROM A RELEASE THAT RENDERED ITS OWN SECRET (<= 0.1.28)?
+Helm deletes "{{ $legacy }}" during the upgrade. Copy the values out FIRST and
+reuse them, otherwise every logged-in user is signed out:
+
+  kubectl -n {{ $ns }} get secret {{ $legacy }} -o jsonpath='{.data}' > /tmp/auth.json
+  # then create {{ $secretName }} with the SAME SESSION_SECRET / ADMIN_* values
+
+A unit whose pod restarts before its user's next request will sit in
+CreateContainerConfigError until that request re-stamps it (re-stamp is
+on-demand, not a boot sweep).
+
+Required keys (all five):
+    SESSION_SECRET             signs the oc_sess and oc_admin cookies
+    OPENCODE_SERVER_USERNAME   OpenWork bearer/bootstrap token (username half)
+    OPENCODE_SERVER_PASSWORD   the token itself — the preview proxy forwards the
+                               browser's Authorization header, so this is what the
+                               UI presents; it is NOT used as Basic auth
+    ADMIN_USERNAME             admin console login
+    ADMIN_PASSWORD
+
+  * Not managed by Helm: it survives helm upgrade and helm uninstall.
+  * ROTATION needs a router restart — the router reads these as env at
+    container start, so a patched Secret alone changes nothing:
+      kubectl -n {{ $ns }} rollout restart deploy/{{ .Release.Name }}
+    Rotating SESSION_SECRET additionally requires bumping RUNTIME_REV: each
+    unit's auth sidecar carries a literal SESSION_KEY derived from it, and only
+    a re-stamp refreshes that.
+  * Platform (SSO) units get only OPENCODE_SERVER_USERNAME / _PASSWORD
+    mirrored into their project namespace — never SESSION_SECRET.
+  * Router pod stuck in CreateContainerConfigError => the Secret, or one of
+    its keys, is missing (the router logs "[mirror] source secret ... not found"
+    if it cannot read it for a platform unit).
+{{- else }}
+
+Credentials are rendered by the chart from values.yaml because
+existingAuthSecret is empty. Point it at a Secret you manage to keep the
+passwords out of values.yaml.
+{{- end }}
+
+Verify the rollout
+
+  # every unit should carry the -r{{ .Values.RUNTIME_REV | default 26 }} marker
+  kubectl -n {{ $ns }} get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.openwork-web-helm/user-template-version}{"\n"}{end}'
+
+  # the unit INIT (not the router) fails fast if the baked OpenCode engine is
+  # not the pinned one:
+  #   FATAL: baked opencode engine v… != pinned … - wrong image for this chart version
+  kubectl -n <unit-namespace> logs deploy/openwork-user-<slug> | head -20

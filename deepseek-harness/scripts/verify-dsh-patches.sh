@@ -187,23 +187,28 @@ PY
     if [ -z "$CANDIDATES" ]; then
       bad "patch 1 (isLoopback): no lib/client*.js in dsh-client-connection@${CC_VER}"
     else
-      TARGET=""
+      # The Dockerfile patches EVERY lib/client*.js carrying the expression, so the
+      # guard must assert every one of them. Checking only the first match is what
+      # let 0.2.1-rc.2-dind ship with client.browser.js unpatched while this script
+      # still reported PASS.
+      TARGETS=""
       for f in $CANDIDATES; do
-        if grep -Fq "$EXPR" "$f"; then TARGET="$f"; break; fi
+        if grep -Fq "$EXPR" "$f"; then TARGETS="$TARGETS $f"; fi
       done
-      if [ -z "$TARGET" ]; then
+      TARGETS="${TARGETS# }"
+      if [ -z "$TARGETS" ]; then
         bad "patch 1 (isLoopback): expression NOT found in: $(printf '%s ' $CANDIDATES)"
         say "       upstream changed the expression — update the Dockerfile patch"
       else
-        ok "patch 1 (isLoopback): expression found in $(basename "$TARGET")"
-        # Prove the substitution is unambiguous (exactly one occurrence) and
-        # that the result is still the intended marker.
-        COUNT="$(grep -Fo "$EXPR" "$TARGET" | wc -l | tr -d ' ')"
-        if [ "$COUNT" = "1" ]; then
-          ok "patch 1 (isLoopback): exactly 1 occurrence — sed substitution is unambiguous"
-        else
-          bad "patch 1 (isLoopback): ${COUNT} occurrences — sed would only rewrite the first"
-        fi
+        say "       expression present in $(printf '%s\n' $TARGETS | wc -l | tr -d ' ') file(s); all must be patched"
+        for f in $TARGETS; do
+          COUNT="$(grep -Fo "$EXPR" "$f" | wc -l | tr -d ' ')"
+          if [ "$COUNT" = "1" ]; then
+            ok "patch 1 (isLoopback): $(basename "$f") — exactly 1 occurrence, sed is unambiguous"
+          else
+            bad "patch 1 (isLoopback): $(basename "$f") — ${COUNT} occurrences — sed would only rewrite the first"
+          fi
+        done
       fi
     fi
   fi

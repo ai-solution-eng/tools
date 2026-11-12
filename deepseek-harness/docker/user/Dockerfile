@@ -28,12 +28,13 @@
 #      HELM_VERSION is intentionally NOT mirrored anywhere: helm has no
 #      runtime-install fallback (offline packaging tool only), so its pin
 #      lives here alone.
-# Pinned Node minor: dsh >= 0.2.1 depends on commander@15 which requires
-# node >= 22.12.0 (node:22-bookworm-slim floats, so a rebuild could silently
-# land on a different patch). 22.23.3 = latest 22.x LTS "Jod".
-FROM node:22.23.3-bookworm-slim
+# Pinned Node minor: dsh >= 0.2.2 declares engines.node >= 24.9.0 (0.2.1
+# declared none, and only commander@15's 22.12 floor applied). Pinned rather
+# than floating so a rebuild cannot silently land on another patch.
+# 24.22.2 = latest 24.x LTS at the 0.2.2-rc.1 bump.
+FROM node:24.22.2-bookworm-slim
 
-ARG DSH_VERSION=0.2.1-rc.2
+ARG DSH_VERSION=0.2.2-rc.1
 ARG TTYD_VERSION=1.7.7
 # helm: OFFLINE ONLY (package/template/lint) — user pods carry no
 # kubeconfig/ServiceAccount, so helm upgrade stays on the deploy host.
@@ -70,6 +71,19 @@ RUN mkdir -p /opt/dsh/bin /opt/dsh/npm \
  && npm cache clean --force \
  && ln -sf /opt/dsh/npm/bin/dsh /usr/local/bin/dsh
 
+# --- pnpm (plugin manager runtime) -------------------------------------------
+# dsh-plugin-manager shells out to the bare `pnpm` command (execa("pnpm")) to
+# install, update and inspect plugins, and has an explicit pnpm-missing error
+# path. Nothing in the base image provided it, so every plugin install failed
+# unless the user hand-installed pnpm into their PVC (and then had to symlink it
+# onto PATH, because /var/dsh/data/pnpm/bin is not on the dsh PATH).
+# Baked into the same prefix as dsh; /usr/local/bin is on the supervisor PATH.
+ARG PNPM_VERSION=9.15.9
+RUN npm install -g --silent "pnpm@${PNPM_VERSION}" --prefix /opt/dsh/npm \
+ && ln -sf /opt/dsh/npm/bin/pnpm /usr/local/bin/pnpm \
+ && pnpm --version
+
+
 # --- dsh-web-helm multi-user patch: settings mirror --------------------------
 # dsh web assumes a laptop deployment: the browser-side settings mirror only
 # syncs with the host for "loopback" pages — its persistence is chosen as
@@ -98,11 +112,25 @@ RUN mkdir -p /opt/dsh/bin /opt/dsh/npm \
 # lib/client*.js and applies to whichever file still contains the expression.
 # Guards unchanged: no matching file, or a changed upstream expression, still
 # fails the build loudly.
-RUN PKG="$(grep -Fl 'isLoopback: transport?.ownsHost === true' $(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-connection/lib/client*.js' -print) | head -1)" \
- && test -n "$PKG" \
- && grep -Fq "isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)" "$PKG" \
- && sed -i "s#isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)#isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */#" "$PKG" \
- && grep -Fq "isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */" "$PKG"
+# 2026-11-12 (0.2.2-rc.1 prep): the package ships the expression in BOTH
+# lib/client.browser.js and lib/client.node.js, and the previous version of this
+# step patched only the first one found ("| head -1"). find order is not stable
+# across builds: the 0.2.1-rc.2-dind image ended up with the marker in
+# client.node.js and the UNPATCHED expression still in client.browser.js, so the
+# browser bundle never got the multi-user settings fix — and both the build guard
+# and scripts/verify-dsh-patches.sh passed anyway. Patch EVERY matching file and
+# assert the marker in each; a changed upstream expression still fails loudly.
+RUN FILES="$(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-connection/lib/client*.js' -print)" \
+ && TARGETS="$(grep -Fl 'isLoopback: transport?.ownsHost === true' $FILES)" \
+ && test -n "$TARGETS" \
+ && for f in $TARGETS; do \
+      grep -Fq "isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)" "$f" \
+        || { echo "dsh-web-helm: isLoopback expression missing or changed in $f" >&2; exit 1; }; \
+      sed -i "s#isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)#isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */#" "$f"; \
+      grep -Fq "isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */" "$f" \
+        || { echo "dsh-web-helm: isLoopback patch did not apply to $f" >&2; exit 1; }; \
+    done \
+ && echo "dsh-web-helm: isLoopback patched in: $TARGETS"
 
 # --- uv + ttyd under /opt/dsh/bin ---
 # Same ttyd asset selection as the router's init container (x86_64/aarch64;
