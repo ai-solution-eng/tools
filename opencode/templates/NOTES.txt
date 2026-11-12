@@ -1,0 +1,59 @@
+opencode-web-helm {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) — namespace {{ .Release.Namespace }}
+{{- $secretName := include "opencode-web.authSecretName" . }}
+{{- $ns := .Release.Namespace }}
+
+App:    https://{{ .Values.ezua.virtualService.endpoint }}
+Admin:  https://{{ .Values.ezua.virtualService.endpoint }}/__oc_admin
+{{- if .Values.existingAuthSecret }}
+
+==========================================================================
+ ACTION REQUIRED — the credentials live in a Secret you own
+==========================================================================
+
+This release reads its five credential keys from
+
+    Secret "{{ $secretName }}" in namespace "{{ $ns }}"
+
+The chart does not render that Secret, and the router pod will not start
+until it exists. On a first install, create it:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secretName }} \
+    --from-literal=SESSION_SECRET="$(openssl rand -hex 32)" \
+    --from-literal=OPENCODE_SERVER_USERNAME='opencode' \
+    --from-literal=OPENCODE_SERVER_PASSWORD='<opencode password>' \
+    --from-literal=ADMIN_USERNAME='admin-user' \
+    --from-literal=ADMIN_PASSWORD='<admin password>'
+
+Required keys (all five):
+    SESSION_SECRET             signs the oc_sess and oc_admin cookies
+    OPENCODE_SERVER_USERNAME   in-pod nginx -> opencode basic auth
+    OPENCODE_SERVER_PASSWORD
+    ADMIN_USERNAME             admin console login
+    ADMIN_PASSWORD
+
+  * Already exists? Leave it alone — recreating it rotates SESSION_SECRET and
+    logs every user out. To change a single value:
+      kubectl -n {{ $ns }} patch secret {{ $secretName }} --type merge \
+        -p '{"stringData":{"ADMIN_PASSWORD":"<new>"}}'
+  * Not managed by Helm: it survives helm upgrade and helm uninstall, and a
+    rotated value takes effect on the next unit start.
+  * Platform (SSO) units get only OPENCODE_SERVER_USERNAME / _PASSWORD
+    mirrored into their project namespace — never SESSION_SECRET.
+  * Router pod stuck in CreateContainerConfigError => the Secret, or one of
+    its keys, is missing.
+{{- else }}
+
+Credentials are rendered by the chart from values.yaml because
+existingAuthSecret is empty. Point it at a Secret you manage to keep the
+passwords out of values.yaml.
+{{- end }}
+
+Verify the rollout
+
+  # every unit should carry the -r{{ .Values.RUNTIME_REV | default 25 }} marker
+  kubectl -n {{ $ns }} get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.opencode-web-helm/user-template-version}{"\n"}{end}'
+
+  # the supervisor log prints the resolved pair WITH versions, e.g.
+  #   [opencode] binaries: opencode=/var/opencode/data/npm/bin/opencode (1.19.4) ...
+  kubectl -n {{ $ns }} logs deploy/{{ .Release.Name }} | head -20

@@ -143,13 +143,20 @@ data:
     // "HTTP 500".
     //
     // v24: unit-start fixes from the 1.2.25 field report — apply-defaults
-    // writes valid JSON again (a literal backslash-n corrupted every profile
-    // it touched; a repair pass heals files 1.2.25 already broke) and the
-    // supervisor resolves the configured opencode/openchamber from the state
-    // PVC instead of the image's baked copies (the /usr/local/bin relink needs
-    // root and silently fails on forced-uid clusters). Also drops the unused
+    // writes valid JSON again (a literal backslash-n corrupted every profile it
+    // touched) and the supervisor prefers the state-PVC opencode/openchamber
+    // over the image's baked copies (the /usr/local/bin relink needs root and
+    // silently fails on forced-uid clusters). Also drops the unused
     // personal/logo.png, which the personal ConfigMap never rendered and the
     // init loop logged a cp error for on every start.
+    // r25: second round on the same field report. apply-defaults now repairs a
+    // 1.2.25-broken profile even though it already carries reportUsage:false
+    // (the repair pass runs before the reportUsage policy block) and never
+    // rewrites a profile it could not read. The npm guard no longer installs
+    // through the baked-image alias, stops keeping a stale real prefix after
+    // the image catches up, and restores the alias when an install fails so a
+    // boot always yields a runnable binary. The supervisor logs the resolved
+    // package versions and survives a spawn error.
     // r23: re-stamp bump — rolls every existing unit onto the current
     // chart-rendered pod template on the next router reconcile.
     // r24: the data manager now renders markdown and HTML — a new /api/preview
@@ -159,11 +166,11 @@ data:
     // existing units re-stamp onto the new data_manager.mjs + data_manager.html:
     // subPath mounts never refresh on their own.
     // RUNTIME_REV is part of the marker, same contract as the dsh and openwork
-    // charts: the shipped default is 24 and it is ALWAYS appended, so bumping
+    // charts: the shipped default is 25 and it is ALWAYS appended, so bumping
     // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
     // the next reconcile — no chart edit needed.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 24 }}'
-    const userTemplateVersion = `terminal-tab-v24-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 25 }}'
+    const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1652,7 +1659,7 @@ data:
       // only fires when OPENCHAMBER_INSTALL=true is stamped (chamber mode, as
       // before). PATH keeps working because the .bashrc entry
       // /var/opencode/data/npm/bin resolves through the alias.
-      const npmBakedGuardCommand = '$RUN_AS_USER sh -c \'if [ -f /opt/opencode/npm/.opencode-version ] && [ "$(cat /opt/opencode/npm/.opencode-version 2>/dev/null)" = "${OPENCODE_VERSION}" ] && [ -f /opt/opencode/npm/.openchamber-version ] && [ "$(cat /opt/opencode/npm/.openchamber-version 2>/dev/null)" = "${OPENCHAMBER_VERSION}" ]; then if [ ! -e /var/opencode/data/npm ]; then ln -sfn /opt/opencode/npm /var/opencode/data/npm; fi; ln -sf /opt/opencode/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true; else if [ ! -f /var/opencode/data/npm/bin/opencode ] || [ "$(cat /var/opencode/.opencode-version 2>/dev/null)" != "${OPENCODE_VERSION}" ]; then HOME=/var/opencode/home npm install -g "opencode-ai@${OPENCODE_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCODE_VERSION}" > /var/opencode/.opencode-version && (ln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true); fi; if [ -n "$OPENCHAMBER_INSTALL" ] && { [ ! -f /var/opencode/data/npm/bin/openchamber ] || [ "$(cat /var/opencode/.openchamber-version 2>/dev/null)" != "${OPENCHAMBER_VERSION}" ]; }; then HOME=/var/opencode/home npm install -g "@openchamber/web@${OPENCHAMBER_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCHAMBER_VERSION}" > /var/opencode/.openchamber-version && (ln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true); fi; fi\''
+      const npmBakedGuardCommand = '$RUN_AS_USER sh -c \'if [ -f /opt/opencode/npm/.opencode-version ] && [ "$(cat /opt/opencode/npm/.opencode-version 2>/dev/null)" = "${OPENCODE_VERSION}" ] && [ -f /opt/opencode/npm/.openchamber-version ] && [ "$(cat /opt/opencode/npm/.openchamber-version 2>/dev/null)" = "${OPENCHAMBER_VERSION}" ] && { [ ! -e /var/opencode/data/npm ] || [ -L /var/opencode/data/npm ]; }; then ln -sfn /opt/opencode/npm /var/opencode/data/npm; ln -sf /opt/opencode/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true; else if [ -L /var/opencode/data/npm ]; then rm -f /var/opencode/data/npm || true; fi; if [ ! -f /var/opencode/data/npm/bin/opencode ] || [ "$(cat /var/opencode/.opencode-version 2>/dev/null)" != "${OPENCODE_VERSION}" ]; then HOME=/var/opencode/home npm install -g "opencode-ai@${OPENCODE_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCODE_VERSION}" > /var/opencode/.opencode-version && (ln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true) || echo "[npm-guard] opencode install failed; leaving the existing binary in place" >&2; fi; if [ -n "$OPENCHAMBER_INSTALL" ] && { [ ! -f /var/opencode/data/npm/bin/openchamber ] || [ "$(cat /var/opencode/.openchamber-version 2>/dev/null)" != "${OPENCHAMBER_VERSION}" ]; }; then HOME=/var/opencode/home npm install -g "@openchamber/web@${OPENCHAMBER_VERSION}" --prefix /var/opencode/data/npm && echo "${OPENCHAMBER_VERSION}" > /var/opencode/.openchamber-version && (ln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true) || echo "[npm-guard] openchamber install failed; leaving the existing binary in place" >&2; fi; if [ -f /opt/opencode/npm/.opencode-version ] && [ "$(cat /opt/opencode/npm/.opencode-version 2>/dev/null)" = "${OPENCODE_VERSION}" ] && [ -f /opt/opencode/npm/.openchamber-version ] && [ "$(cat /opt/opencode/npm/.openchamber-version 2>/dev/null)" = "${OPENCHAMBER_VERSION}" ] && { [ ! -x /var/opencode/data/npm/bin/opencode ] || [ "$(cat /var/opencode/.opencode-version 2>/dev/null)" != "${OPENCODE_VERSION}" ] || { [ -n "$OPENCHAMBER_INSTALL" ] && { [ ! -x /var/opencode/data/npm/bin/openchamber ] || [ "$(cat /var/opencode/.openchamber-version 2>/dev/null)" != "${OPENCHAMBER_VERSION}" ]; }; }; }; then echo "[npm-guard] state prefix is not the configured pair; using the image copy" >&2; rm -rf /var/opencode/data/npm 2>/dev/null; ln -sfn /opt/opencode/npm /var/opencode/data/npm 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; ln -sf /opt/opencode/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true; fi; if [ ! -x /var/opencode/data/npm/bin/opencode ] && [ -x /opt/opencode/npm/bin/opencode ]; then echo "[npm-guard] no usable state binary; using the image copy" >&2; rm -rf /var/opencode/data/npm 2>/dev/null; ln -sfn /opt/opencode/npm /var/opencode/data/npm 2>/dev/null || true; fi; fi\''
       const initCommandParts = [
         'mkdir -p /workspace/personal /workspace/shared /var/opencode/home/.config/opencode/agents /var/opencode/home/.config/opencode/skills /var/opencode/data /var/opencode/state /var/opencode/cache /var/opencode/bin',
         // --- Platform identity (platform integration): when USER_INFO_* is
@@ -1759,7 +1766,7 @@ data:
         // the platform unix identity, byte-identical to a Kubeflow notebook.
         // Without identity (classic local units) it runs as root, exactly as
         // before.
-        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\nln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): on clusters where admission forces the tenant uid onto the pod we are ALREADY that uid - groupadd/useradd cannot run and setpriv --init-groups fails (no passwd entry), so the unit crash-loops. Start the stack directly instead.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
+        "printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\nexport PATH=\"/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\nmissing=0\nfor cmd in bash curl git script tmux; do\n  command -v \"$cmd\" >/dev/null 2>&1 || missing=1\ndone\nif [ \"$missing\" = \"1\" ]; then\n  apt-get update -qq || true\n  apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || {\n    echo \"WARNING: toolchain apt install failed; retrying once in 15s\" >&2\n    sleep 15\n    apt-get update -qq || true\n    apt-get install -y -qq --no-install-recommends {{ .Values.provisioning.aptPackages }} || echo \"WARNING: continuing with degraded toolchain; full install retries on next restart\" >&2\n  }\n  rm -rf /var/lib/apt/lists/* || true\nfi\nrm -f /usr/lib/python*/EXTERNALLY-MANAGED\nln -sf /usr/bin/vi /usr/local/bin/vim 2>/dev/null || true\nln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true\nln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true\nln -sf /usr/bin/pip3 /usr/local/bin/pip 2>/dev/null || true\nif ! command -v xdg-open >/dev/null 2>&1; then\n  printf \"#!/bin/sh\\nexit 0\\n\" > /usr/local/bin/xdg-open\n  chmod 0755 /usr/local/bin/xdg-open\nfi\nln -sf /var/opencode/bin/uv /usr/local/bin/uv 2>/dev/null || true\nln -sf /var/opencode/bin/uvx /usr/local/bin/uvx 2>/dev/null || true\n[ -x /var/opencode/data/npm/bin/opencode ] && ln -sf /var/opencode/data/npm/bin/opencode /usr/local/bin/opencode 2>/dev/null || true\n[ -x /var/opencode/data/npm/bin/openchamber ] && ln -sf /var/opencode/data/npm/bin/openchamber /usr/local/bin/openchamber 2>/dev/null || true\nstart_services() {\n  /var/opencode/bin/ttyd -p 7681 -i 0.0.0.0 -W -a -T xterm-256color -w /workspace -b /term -t titleFixed=\"OpenCode Terminal\" -t fontSize=14 -t fontFamily=\"menlo,consolas,dejavu sans mono,monospace\" bash /opt/preview/tty-attach-session.sh &\n  node /opt/preview/port_watcher.mjs &\n  node /opt/preview/data_manager.mjs &\n  node /opt/preview/terminal_manager.js &\n  exec node /opt/preview/opencode_supervisor.mjs\n}\nif [ -n \"$USER_INFO_UID\" ] && [ \"$USER_INFO_UID\" != \"0\" ] && command -v setpriv >/dev/null 2>&1; then\n  # Admission-forced identity (tr211): on clusters where admission forces the tenant uid onto the pod we are ALREADY that uid - groupadd/useradd cannot run and setpriv --init-groups fails (no passwd entry), so the unit crash-loops. Start the stack directly instead.\n  if [ \"$(id -u)\" = \"$USER_INFO_UID\" ]; then\n    start_services\n    exit 0\n  fi\n  getent group \"$USER_INFO_GID\" >/dev/null 2>&1 || groupadd -g \"$USER_INFO_GID\" \"${USER_INFO_GROUP:-opencodeuser}\" || true\n  getent passwd \"$USER_INFO_UID\" >/dev/null 2>&1 || useradd -M -u \"$USER_INFO_UID\" -g \"$USER_INFO_GID\" -d \"${USER_INFO_HOMEDIR:-/var/opencode/home}\" -s /bin/bash \"${USER_INFO_USERNAME:-opencodeuser}\" || true\n  export -f start_services\n  exec setpriv --init-groups --reuid=\"$USER_INFO_UID\" --regid=\"$USER_INFO_GID\" /bin/bash -c \"start_services\"\nfi\nstart_services\n' > /var/opencode/bin/opencode-startup.sh",
         "chmod 0755 /var/opencode/bin/opencode-startup.sh",
       ]
       const initCommand = initCommandParts.join(' && ')
@@ -1898,7 +1905,7 @@ data:
                       name: 'OPENCODE_SERVER_USERNAME',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "opencode-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_USERNAME',
                         },
                       },
@@ -1907,7 +1914,7 @@ data:
                       name: 'OPENCODE_SERVER_PASSWORD',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "opencode-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_PASSWORD',
                         },
                       },
@@ -2011,6 +2018,21 @@ data:
                   name: 'opencode-preview-proxy',
                   image: 'nginx:1.27-alpine',
                   imagePullPolicy: 'IfNotPresent',
+                  // The upstream Basic-auth header is built here, at container
+                  // start, from the secret-backed env — it is never baked into
+                  // the rendered nginx.conf, so no credential lands in the pod
+                  // spec or in the chart values.
+                  command: ['/bin/sh', '-c', `printf 'proxy_set_header Authorization "Basic %s";' "$(printf '%s:%s' "$OPENCODE_SERVER_USERNAME" "$OPENCODE_SERVER_PASSWORD" | base64)" > /tmp/opencode-upstream-auth.conf && echo >> /tmp/opencode-upstream-auth.conf && exec nginx -g "daemon off;"`],
+                  env: [
+                    {
+                      name: 'OPENCODE_SERVER_USERNAME',
+                      valueFrom: { secretKeyRef: { name: '{{ include "opencode-web.authSecretName" . }}', key: 'OPENCODE_SERVER_USERNAME' } },
+                    },
+                    {
+                      name: 'OPENCODE_SERVER_PASSWORD',
+                      valueFrom: { secretKeyRef: { name: '{{ include "opencode-web.authSecretName" . }}', key: 'OPENCODE_SERVER_PASSWORD' } },
+                    },
+                  ],
                   ports: [
                     { name: 'http-preview', containerPort: 8082, protocol: 'TCP' },
                   ],
@@ -2422,7 +2444,7 @@ data:
     // The router never reads a mirror back: create, then strategic-merge
     // patch on 409 — the platform ClusterRole therefore grants NO secret
     // read, preserving the "never touches platform secrets" contract.
-    const unitAuthSecretName = '{{ .Release.Name }}-auth'
+    const unitAuthSecretName = '{{ include "opencode-web.authSecretName" . }}'
     const unitAuthSecretKeys = ['OPENCODE_SERVER_USERNAME', 'OPENCODE_SERVER_PASSWORD']
 
     async function mirrorSecretIntoUnitNs(unitNs, secretName, keys, ownerRefs) {

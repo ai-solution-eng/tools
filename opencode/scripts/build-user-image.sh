@@ -17,11 +17,12 @@
 #   - apt package list:   provisioning.aptPackages in the selected values file
 #   - opencode version:   opencode.version in the selected values file
 #   - openchamber version: openchamber.version in the selected values file
-#   - image repo name:    ghcr.io/ai-solution-eng/opencode-<opencode.version>\
-#                         -openchamber-<openchamber.version> (override --repo)
-#   - image tag:          --tag (default 0.0.1) — the image revision; an app
-#                         version bump mints a new repo name, --tag iterates
-#                         image-only fixes
+#   - image repo name:    ghcr.io/ai-solution-eng/opencode-openchamber
+#                         (override --repo)
+#   - image tag:          <opencode.version>-<openchamber.version>-dind
+#                         (override --tag) — an app version bump mints a new
+#                         tag; keep images.user/images.init in values.yaml in
+#                         step with it
 #   - ttyd version:       --ttyd-version flag (default 1.7.7; must mirror the
 #                         ttydVersion const in templates/configmap-router.yaml)
 #   - helm version:       provisioning.helmVersion in the values file (default
@@ -139,7 +140,6 @@ if [ -z "$HELM_VERSION" ]; then
 fi
 HELM_VERSION="${HELM_VERSION:-3.22.0}"
 
-# IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}}"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/ai-solution-eng/opencode-openchamber}"
 TAG="${TAG:-${OPENCODE_VERSION}-${OPENCHAMBER_VERSION}}-dind"
 

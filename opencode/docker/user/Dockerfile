@@ -13,10 +13,13 @@
 # below).
 #
 # Build (canonical invocation, also wrapped by scripts/build-user-image.sh
-# which reads the versions + apt list from the values file and defaults the
-# repo name to ghcr.io/ai-solution-eng/opencode-<opencode>-openchamber-<openchamber>):
+# which reads the versions + apt list from the values file):
 #   docker buildx build --platform linux/amd64 \
-#     -t ghcr.io/ai-solution-eng/opencode-1.18.11-openchamber-1.17.2:0.0.1 --push docker/user
+#     -t ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind --push docker/user
+#
+# The repo name is fixed; the tag encodes BOTH app versions plus the image
+# flavour (-dind), so `opencode.version` / `openchamber.version` and
+# `images.user` / `images.init` in values.yaml always move together.
 #
 # IMPORTANT — the chart's runtime install steps remain in place as GUARDED
 # FALLBACKS: on this image they no-op (everything they look for is present),
@@ -34,8 +37,8 @@
 #      build script reads values.yaml so there is a single source of truth.
 FROM node:22-bookworm-slim
 
-ARG OPENCODE_VERSION=1.18.32
-ARG OPENCHAMBER_VERSION=2.0.2
+ARG OPENCODE_VERSION=1.19.4
+ARG OPENCHAMBER_VERSION=1.24.2
 ARG TTYD_VERSION=1.7.7
 ARG HELM_VERSION=3.22.0
 ARG APT_PACKAGES="bash ca-certificates curl dnsutils fd-find gh git jq less make nano ncurses-term openssh-client python3 python3-pip python3-venv procps ripgrep tini tmux tree unzip util-linux vim-tiny zip zstd xz-utils lsof"

@@ -129,7 +129,10 @@ data:
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection $connection_upgrade;
-          proxy_set_header Authorization "Basic {{ printf "%s:%s" .Values.auth.username .Values.auth.password | b64enc }}";
+          # The upstream Basic-auth header is generated at container start from
+          # the secret-backed OPENCODE_SERVER_USERNAME/PASSWORD env (see the
+          # preview-proxy command), so no credential is baked into this file.
+          include /tmp/opencode-upstream-auth.conf;
           proxy_buffering off;
           proxy_read_timeout 660s;
           proxy_send_timeout 660s;
@@ -382,9 +385,31 @@ data:
       } catch {}
       return `/usr/local/bin/${name}`
     }
+    // The resolved path alone does not prove which pair is running: a PVC copy
+    // and the baked copy share the same path through the npm-prefix alias.
+    // Log the package version too, so a drifted unit is visible in the log.
+    // npm links bin/<name> into ../lib/node_modules/<pkg>/, so realpathSync lands
+    // on the package's own bin script, not on <prefix>/bin/<name>. Walk up until
+    // the manifest is found rather than assuming a fixed depth.
+    function binaryVersion(binaryPath, packageName) {
+      try {
+        let dir = path.dirname(fs.realpathSync(binaryPath))
+        for (let depth = 0; depth < 6; depth += 1) {
+          try {
+            return JSON.parse(fs.readFileSync(path.join(dir, 'node_modules', packageName, 'package.json'), 'utf8')).version
+          } catch {}
+          const parent = path.dirname(dir)
+          if (parent === dir) break
+          dir = parent
+        }
+        return 'unknown'
+      } catch {
+        return 'unknown'
+      }
+    }
     const opencodeBinary = resolveBinary('opencode')
     const openchamberBinary = resolveBinary('openchamber')
-    console.log(`[opencode] binaries: opencode=${opencodeBinary} openchamber=${openchamberBinary}`)
+    console.log(`[opencode] binaries: opencode=${opencodeBinary} (${binaryVersion(opencodeBinary, 'opencode-ai')}) openchamber=${openchamberBinary} (${binaryVersion(openchamberBinary, '@openchamber/web')})`)
     const opencodeArgs = isChamber
       ? ['--print-logs', 'serve', '--port', String(webPort), '--hostname', '127.0.0.1']
       : ['--print-logs', 'web', '--port', String(webPort), '--hostname', webHost]
@@ -726,6 +751,21 @@ data:
       })
       child = proc
 
+      // Without this handler an ENOENT/EACCES spawn error is an uncaught
+      // exception in the supervisor (the container's main process) and the unit
+      // dies in a restart loop. startChamber() already carries the same guard.
+      proc.on('error', (error) => {
+        console.error(`[opencode] failed to spawn opencode: ${error.message}`)
+        if (child === proc) child = null
+        if (!stopping && !restartInProgress) {
+          const delay = restartBackoffMs
+          restartBackoffMs = Math.min(restartBackoffMs * 2, 15000)
+          setTimeout(() => {
+            if (child === null) startOpencode().catch((err) => console.error('[opencode] restart failed', err))
+          }, delay)
+        }
+      })
+
       proc.on('exit', (code, signal) => {
         if (child === proc) child = null
         if (!stopping && !restartInProgress) {
@@ -765,7 +805,10 @@ data:
           signalProcessGroup(proc, 'SIGKILL')
         }, 8000)
 
+        // A child that fails to spawn emits 'error' + 'close' and never 'exit',
+        // so waiting on 'exit' alone would hang the stop path until SIGKILL.
         proc.once('exit', finish)
+        proc.once('close', finish)
 
         try {
           signalProcessGroup(proc, 'SIGTERM')

@@ -39,9 +39,10 @@ OPENCHAMBER_VERSION="$(read_section_value openchamber version)"
 }
 HELM_VERSION="$(read_section_value provisioning helmVersion)"
 HELM_VERSION="${HELM_VERSION:-3.22.0}"
-# Default image repo/tag follow the build script's convention:
-# repo encodes both app versions, tag is the image revision (0.0.1).
-IMAGE="${1:-ghcr.io/ai-solution-eng/opencode-${OPENCODE_VERSION}-openchamber-${OPENCHAMBER_VERSION}:0.0.1}"
+# Default image repo/tag follow the build script's convention: the repo is
+# fixed and the tag encodes both app versions, so this matches images.user /
+# images.init in values.yaml.
+IMAGE="${1:-ghcr.io/ai-solution-eng/opencode-openchamber:${OPENCODE_VERSION}-${OPENCHAMBER_VERSION}-dind}"
 
 # Resolve docker the same way build-user-image.sh does.
 DOCKER="$(command -v docker || true)"

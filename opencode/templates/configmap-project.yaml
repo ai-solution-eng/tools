@@ -21,15 +21,10 @@ data:
     const configHome = process.env.CONFIG_HOME || '/var/opencode/home/.config'
     const disableUsageReport = process.env.OPENCHAMBER_REPORT_USAGE !== 'true'
 
-    function readJson(file) {
-      let text
-      try { text = fs.readFileSync(file, 'utf8') } catch { return null }
-      try { return JSON.parse(text) } catch {}
-      // 1.2.25 and earlier appended a literal backslash-n after the document;
-      // strip it so a profile those versions broke parses again and is
-      // rewritten as valid JSON below.
-      try { return JSON.parse(text.trimEnd().replace(/(?:\\n)+$/, '')) } catch { return null }
-    }
+    const chDir = path.join(configHome, 'openchamber')
+    const settingsFile = path.join(chDir, 'settings.json')
+    const prefsFile = path.join(chDir, 'preferences.json')
+
     function writeJson(file, value) {
       fs.mkdirSync(path.dirname(file), { recursive: true })
       const tmp = `${file}.tmp-${process.pid}`
@@ -37,16 +32,84 @@ data:
       fs.renameSync(tmp, file)
     }
 
+    // Read + parse one profile file, repairing the trailing literal backslash-n
+    // that 1.2.25 and earlier appended. States:
+    //   absent     - no file, safe to create
+    //   unreadable - present but we cannot read it: never write over it
+    //   corrupt    - readable but not a JSON object: moved aside, then rewritten
+    //   ok         - parsed; repaired=true when only the stripped form parsed
+    function parseProfile(text) {
+      try {
+        return { value: JSON.parse(text), repaired: false }
+      } catch {}
+      try {
+        return { value: JSON.parse(text.trimEnd().replace(/(?:\\n)+$/, '')), repaired: true }
+      } catch {}
+      return null
+    }
+    function load(file) {
+      let text
+      try {
+        text = fs.readFileSync(file, 'utf8')
+      } catch (error) {
+        if (error && error.code === 'ENOENT') return { state: 'absent', value: null }
+        console.error(`[apply-defaults] cannot read ${file}: ${error.message}`)
+        return { state: 'unreadable', value: null }
+      }
+      const parsed = parseProfile(text)
+      if (!parsed) {
+        console.error(`[apply-defaults] cannot parse ${file}`)
+        return { state: 'corrupt', value: null }
+      }
+      if (parsed.value === null || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+        console.error(`[apply-defaults] ${file} is not a JSON object`)
+        return { state: 'corrupt', value: null }
+      }
+      return { state: 'ok', value: parsed.value, repaired: parsed.repaired }
+    }
+
+    // Repair pass: independent of the reportUsage policy below. A file this
+    // version had to re-parse is invalid on disk; only a write fixes that, and a
+    // 1.2.25-broken file already carries reportUsage:false, so the policy block
+    // below would never rewrite it.
+    const settingsState = load(settingsFile)
+    const prefsState = load(prefsFile)
+    for (const [file, loaded] of [[settingsFile, settingsState], [prefsFile, prefsState]]) {
+      if (loaded.state !== 'ok' || !loaded.repaired) continue
+      try {
+        writeJson(file, loaded.value)
+        console.error(`[apply-defaults] repaired ${file}`)
+      } catch (error) {
+        console.error(`[apply-defaults] repair ${file}: ${error.message}`)
+      }
+    }
+
     if (disableUsageReport) {
-      const chDir = path.join(configHome, 'openchamber')
-      const settingsFile = path.join(chDir, 'settings.json')
-      const prefsFile = path.join(chDir, 'preferences.json')
-      const settings = readJson(settingsFile) || {}
-      const prefs = readJson(prefsFile)
+      // A profile we can read but not parse is moved aside (never deleted) so a
+      // fresh one can be written. Leaving it in place would keep the user's
+      // OpenChamber broken and reportUsage unenforced forever.
+      for (const [file, loaded] of [[settingsFile, settingsState], [prefsFile, prefsState]]) {
+        if (loaded.state !== 'corrupt') continue
+        try {
+          fs.renameSync(file, `${file}.broken-${Date.now()}`)
+          console.error(`[apply-defaults] moved unparseable ${file} aside`)
+          loaded.state = 'absent'
+          loaded.value = null
+        } catch (error) {
+          console.error(`[apply-defaults] cannot move ${file} aside: ${error.message}`)
+        }
+      }
+      const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+      const settings = isObject(settingsState.value) ? settingsState.value : {}
+      const prefs = isObject(prefsState.value) ? prefsState.value : null
       const current = prefs?.fields?.reportUsage?.value ?? settings.reportUsage
       if (current !== false) {
         try {
-          writeJson(settingsFile, { ...settings, reportUsage: false })
+          // Only create/rewrite a file we could read or that we moved aside: an
+          // unreadable profile must not be replaced by { reportUsage: false }.
+          if (settingsState.state === 'absent' || settingsState.state === 'ok') {
+            writeJson(settingsFile, { ...settings, reportUsage: false })
+          }
           if (prefs && typeof prefs.fields === 'object' && prefs.fields !== null) {
             prefs.fields.reportUsage = { updatedAt: Date.now(), value: false }
             writeJson(prefsFile, prefs)

@@ -21,6 +21,42 @@ data manager, and previews directly from your own pod. Access is gated by the
 signed session cookie issued at login, so each user can only reach their own
 pod.
 
+### Credentials (pre-created Secret)
+
+The chart does **not** store credentials in `values.yaml`. It reads them from a
+Secret you create in the release namespace and names via
+`existingAuthSecret` (default `opencode-web-helm-credentials`). Create it
+**before** `helm install`/`helm upgrade`:
+
+```sh
+kubectl -n <namespace> create secret generic opencode-web-helm-credentials \
+  --from-literal=SESSION_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=OPENCODE_SERVER_USERNAME='opencode' \
+  --from-literal=OPENCODE_SERVER_PASSWORD='<password>' \
+  --from-literal=ADMIN_USERNAME='admin-user' \
+  --from-literal=ADMIN_PASSWORD='<password>'
+```
+
+All five keys are required:
+
+| Key | Used for |
+|---|---|
+| `SESSION_SECRET` | Signs the `oc_sess` login cookie and the `oc_admin` console cookie |
+| `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | Basic auth between the in-pod nginx preview proxy and the unit's opencode server |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Admin console login |
+
+For platform (SSO) units the router mirrors only the two `OPENCODE_SERVER_*`
+keys into the unit's project namespace — never `SESSION_SECRET`, which would
+allow forging any user's cookie. The router's Role grants namespace-wide
+`get` on Secrets, so the Secret does not need a specific name beyond what
+`existingAuthSecret` says.
+
+The Secret is **not** managed by Helm: it survives `helm upgrade` and
+`helm uninstall`, and rotating a value takes effect on the next unit start.
+Leaving `existingAuthSecret` empty falls back to a chart-managed Secret built
+from `sessionSecret`/`auth`/`admin` — all five must then be non-empty or the
+render fails.
+
 ### URL scheme
 
 Everything lives on the single main host; each user's environment is addressed
@@ -100,11 +136,12 @@ All configuration lives in `values.yaml`:
 | `opencodeConfig` | The `opencode.json` config (models, providers, MCP servers, permissions) |
 | `opencodeSkills` | Skill markdown files seeded into `~/.config/opencode/skills/` |
 | `opencodeAgents` | Agent markdown files seeded into `~/.config/opencode/agents/` |
-| `opencode.version` | The opencode npm version to install (e.g. `1.18.11`) |
+| `opencode.version` | The opencode npm version to install (e.g. `1.19.4`) |
 | `openchamber.version` | The OpenChamber npm version to install (used when `ui.mode: openchamber`) |
 | `ui.mode` | `opencode` (default, built-in web UI) or `openchamber` (OpenChamber frontend) |
 | `sessionCookieTtlDays` | How long a login lasts, in **days** (default `180`; historically hardcoded to 7). It sets the signed `oc_sess` cookie's `Max-Age` and its `exp` claim, so it controls only **when a user must log in again** — it deletes nothing. Conversations (`opencode.db`), workspace files, `opencode.json`/agents/skills and `auth.json` all survive. Invalid values (`0`, negative, non-numeric) fall back to 7 so a typo cannot lock everyone out, and the result is clamped to [1 hour, 400 days] — 400 days is the hard cap browsers put on cookie lifetime (RFC 6265bis §5.5), so a larger number would just be truncated client-side. The expiry is baked in at issue time, so raising this does not retroactively extend cookies already in users' browsers — they pick it up at their next login. |
-| `RUNTIME_REV` | **Bump this to force every user unit to re-stamp** onto the current chart-rendered pod template (nginx.conf, supervisor, probes, env) on the next router reconcile — no chart or template edit needed. It is folded into the `opencode-web-helm/user-template-version` annotation as the `-r<value>` suffix; when the value changes the router patches each Deployment and the unit rolls. The chart ships a default (`23`), so it is always part of the marker — same contract as the dsh and openwork charts. Also settable from an EzAppConfig values blob. |
+| `existingAuthSecret` | Name of the pre-created Secret holding the five credential keys (see [Credentials](#credentials-pre-created-secret)). Empty = chart-managed Secret from `sessionSecret`/`auth`/`admin`. |
+| `RUNTIME_REV` | **Bump this to force every user unit to re-stamp** onto the current chart-rendered pod template (nginx.conf, supervisor, probes, env) on the next router reconcile — no chart or template edit needed. It is folded into the `opencode-web-helm/user-template-version` annotation as the `-r<value>` suffix; when the value changes the router patches each Deployment and the unit rolls. The chart ships a default (`25`), so it is always part of the marker — same contract as the dsh and openwork charts. Also settable from an EzAppConfig values blob. |
 | `nginx.clientMaxBodySize` | max request body the in-pod nginx accepts (default `64m`). nginx's own default is **1 MB**, which rejects a pasted/dropped image with **HTTP 413** once the browser base64-encodes it into a prompt body — the request never reaches the app. Raise it if users paste very large images. The platform gateway in front of the pod may impose its own, separate limit. |
 | `dataManager.clientMaxBodySize` | nginx body cap for the `/data-manager` locations only (default `2g`). The `http{}`-level `nginx.clientMaxBodySize` stays as the UI cap (pasted images); raise both if users need bigger single files. |
 | `dataManager.maxUploadMb` | server-side per-file guard (`DATA_MANAGER_MAX_UPLOAD_MB`, default `2048`). Keep it at or above `dataManager.clientMaxBodySize` so nginx stays the binding limit and an oversized file fails before it is streamed. |

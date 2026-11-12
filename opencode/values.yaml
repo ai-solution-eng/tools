@@ -20,7 +20,10 @@ previewDomain: "${DOMAIN_NAME}"
 
 # Session cookie signing secret (also used by each user pod to validate the
 # session cookie that gates access to that pod's UI/terminal/previews).
-sessionSecret: "9xT2mQvR4pS7kL1nW8yB5dF3hJ6cZ0aG"
+#
+# NOT SET HERE — see existingAuthSecret below. Credentials live in a Secret you
+# create in this namespace, so this file never carries them.
+sessionSecret: ""
 
 # How long a login lasts, in days. The router issues a signed 'oc_sess' cookie
 # at login and each user pod's nginx auth gate validates it; this value is the
@@ -87,7 +90,7 @@ dataManager:
 # changes the router patches each Deployment and the unit rolls.
 # Always rendered into the marker as the '-r<value>' suffix (same contract as
 # the dsh and openwork charts). Bump it whenever the pod template changes.
-RUNTIME_REV: 24
+RUNTIME_REV: 25
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
@@ -99,18 +102,16 @@ images:
   # existing units re-stamp automatically on upgrade. Set both entries back to
   # node:22-bookworm-slim to revert to install-on-boot behavior.
   #
-  # NOTE (opencode 1.19.4 + openchamber 1.24.2): the tag still names
-  # 1.18.11-1.17.2 on purpose. The baked image for the new pair does not exist
-  # yet, and pointing at a missing tag would put every user pod into
-  # ImagePullBackOff. With the tag left as-is the router's npm guard sees BOTH
-  # baked markers (.opencode-version 1.18.11, .openchamber-version 1.17.2)
-  # differ from OPENCODE_VERSION 1.19.4 / OPENCHAMBER_VERSION 1.24.2, so it
-  # installs opencode-ai@1.19.4 AND @openchamber/web@1.24.2 into the state PVC
-  # at boot — the documented fallback (the openchamber install fires because
-  # ui.mode: openchamber stamps OPENCHAMBER_INSTALL=true). After
-  # building+pushing the new image, set BOTH lines to
-  # ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind to get the
-  # fast baked path back.
+  # NOTE (opencode 1.19.4 + openchamber 1.24.2): both lines below name the image
+  # that bakes this exact pair, so the router's npm guard takes the fast path —
+  # the baked markers match OPENCODE_VERSION / OPENCHAMBER_VERSION and the unit
+  # runs the baked copies without touching the registry. Keep these two lines in
+  # step with opencode.version / openchamber.version. If the tag and the
+  # configured pair ever disagree, the guard installs the configured versions
+  # into the state PVC at boot, which needs registry access; when that fails it
+  # logs `[npm-guard] ... install failed; leaving the existing binary in place`
+  # and, if the image bakes the configured pair, converges the unit onto the
+  # image copy instead of leaving it on an older version.
   user: ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind
   init: ghcr.io/ai-solution-eng/opencode-openchamber:1.19.4-1.24.2-dind
   # imagePullSecret in the release namespace, for PRIVATE ghcr.io packages.
@@ -227,14 +228,40 @@ provisioning:
     heading: "Setting up your account\u2026"
     subtext: "This usually takes a few minutes on first launch. Please wait."
 
+# --- Credentials -------------------------------------------------------------
+# Name of a Secret that ALREADY EXISTS in this namespace. When set (the default)
+# the chart renders no Secret of its own and the router, every unit and the
+# preview proxy read the five keys from yours:
+#
+#   SESSION_SECRET  OPENCODE_SERVER_USERNAME  OPENCODE_SERVER_PASSWORD
+#   ADMIN_USERNAME  ADMIN_PASSWORD
+#
+#   kubectl -n <namespace> create secret generic opencode-web-helm-credentials \
+#     --from-literal=SESSION_SECRET='...' \
+#     --from-literal=OPENCODE_SERVER_USERNAME='opencode' \
+#     --from-literal=OPENCODE_SERVER_PASSWORD='...' \
+#     --from-literal=ADMIN_USERNAME='admin-user' \
+#     --from-literal=ADMIN_PASSWORD='...'
+#
+# For platform (SSO) units the router mirrors the two OPENCODE_SERVER_* keys into
+# the unit's project namespace, so the Secret must be readable by the router's
+# ServiceAccount in THIS namespace.
+#
+# Leave this empty only to fall back to a chart-managed Secret built from the
+# values below — all five must then be non-empty (the chart fails the render
+# otherwise).
+existingAuthSecret: "opencode-web-helm-credentials"
+
+# Ignored while existingAuthSecret is set. Used only for the chart-managed
+# fallback above.
 auth:
-  username: opencode
-  password: "7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N"
+  username: ""
+  password: ""
 
 # Admin console credentials (admin page to create/delete user accounts).
 admin:
-  username: admin-user
-  password: "admin-password"
+  username: ""
+  password: ""
 
 # ============================================================
 # Opencode config (model, provider, MCP servers)
