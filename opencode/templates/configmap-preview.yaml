@@ -1069,18 +1069,36 @@ data:
       return cur
     }
     
+    // Trim a stem so stem + tail + ext still fits NAME_MAX (255 BYTES, not
+    // characters — a long-but-legal name must be de-duplicable instead of
+    // failing with ENAMETOOLONG).
+    function fitStem(stem, ext, tail) {
+      const budget = 255 - Buffer.byteLength(ext) - Buffer.byteLength(tail)
+      if (Buffer.byteLength(stem) <= budget) return stem
+      let out = ''
+      for (const ch of stem) {
+        if (Buffer.byteLength(out + ch) > budget) break
+        out += ch
+      }
+      return out || '_'
+    }
+    
     // "report.txt" -> "report (1).txt"; a timestamp suffix if 999 attempts
-    // somehow all collide.
-    async function uniqueTarget(target) {
+    // somehow all collide. A DIRECTORY has no extension: "v1.2" must become
+    // "v1.2 (1)", not "v1 (1).2".
+    async function uniqueTarget(target, isDir) {
       if (!(await pathExists(target))) return target
       const dir = path.dirname(target)
-      const ext = path.extname(target)
-      const stem = path.basename(target, ext)
+      const base = path.basename(target)
+      const ext = isDir ? '' : path.extname(base)
+      const stem = base.slice(0, base.length - ext.length)
       for (let i = 1; i < 1000; i += 1) {
-        const candidate = path.join(dir, stem + ' (' + i + ')' + ext)
+        const tail = ' (' + i + ')'
+        const candidate = path.join(dir, fitStem(stem, ext, tail) + tail + ext)
         if (!(await pathExists(candidate))) return candidate
       }
-      return path.join(dir, stem + '-' + Date.now() + ext)
+      const tail = '-' + Date.now()
+      return path.join(dir, fitStem(stem, ext, tail) + tail + ext)
     }
     
     // Map a filesystem error onto the HTTP shape the SPA understands.
@@ -1136,6 +1154,324 @@ data:
         segs.push(path.basename(cur))
         cur = parent
       }
+    }
+    
+    // ─── Copy / move / duplicate ────────────────────────
+    // A transfer always starts from two paths that already passed
+    // resolveSafe(): a source inside a navigable root, and a destination
+    // DIRECTORY inside one. The copy is a hand-rolled walk rather than fs.cp so
+    // the symlink policy is explicit — a link is recreated as a link and never
+    // followed. That is what stops a link pointing outside the workspace from
+    // being dereferenced into a real copy of /etc, and what makes a copied tree
+    // unable to loop. fsp.copyFile keeps a large file a kernel-side copy.
+    const MAX_TRANSFER_ITEMS = 200
+    const MAX_COPY_DEPTH = 128
+    
+    // True when child is parent or sits underneath it (both already resolved).
+    function isInside(parent, child) {
+      return child === parent || child.startsWith(parent + path.sep)
+    }
+    
+    function codedError(message, code) {
+      const err = new Error(message)
+      err.code = code
+      return err
+    }
+    
+    // One guard per request: bounds the total number of entries copied (the
+    // archive extractor uses the same 20k ceiling) and lets a client that
+    // closed its tab stop the walk instead of leaving it running on a
+    // single-threaded server whose requestTimeout is disabled.
+    const MAX_COPY_ENTRIES = 20000
+    
+    function makeTransferGuard(res) {
+      const guard = { entries: 0, cancelled: false }
+      res.on('close', () => {
+        // 'close' also fires when the response completes normally; only a close
+        // BEFORE the response finished means the client went away.
+        if (!res.writableEnded) guard.cancelled = true
+      })
+      return guard
+    }
+    
+    // Recreate src at dst, depth-first. Directory modes and mtimes are applied
+    // AFTER the children, so a read-only directory mode cannot block its own
+    // copy (mkdir honours the umask, hence the explicit chmod).
+    async function copyTree(src, dst, depth, guard) {
+      const level = depth || 0
+      if (guard) {
+        guard.entries += 1
+        if (guard.cancelled) throw codedError('Transfer cancelled', 'ECANCELED')
+        if (guard.entries > MAX_COPY_ENTRIES) {
+          throw codedError('Too many entries (max ' + MAX_COPY_ENTRIES + ')', 'ETOOMANY')
+        }
+      }
+      if (level > MAX_COPY_DEPTH) {
+        throw codedError('Folder nesting too deep (max ' + MAX_COPY_DEPTH + ' levels)', 'EDEEP')
+      }
+      const st = await fsp.lstat(src)
+      if (st.isSymbolicLink()) {
+        await fsp.symlink(await fsp.readlink(src), dst)
+        return
+      }
+      if (st.isDirectory()) {
+        await fsp.mkdir(dst)
+        const names = await fsp.readdir(src)
+        for (const name of names) {
+          await copyTree(path.join(src, name), path.join(dst, name), level + 1, guard)
+        }
+        await fsp.chmod(dst, st.mode & 0o777)
+        await fsp.utimes(dst, st.atime, st.mtime)
+        return
+      }
+      if (!st.isFile()) {
+        throw codedError('Unsupported file type: ' + path.basename(src), 'EUNSUPPORTED')
+      }
+      await fsp.copyFile(src, dst)
+      // 0o777, not 0o7777: a copy is not the place to propagate setuid/setgid.
+      await fsp.chmod(dst, st.mode & 0o777)
+      await fsp.utimes(dst, st.atime, st.mtime)
+    }
+    
+    // A destination name that must not be visible until the copy is complete.
+    function stagePath(dir) {
+      return path.join(dir, '.dm-stage-' + process.pid + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8))
+    }
+    
+    // Remove a stage. A copy that failed AFTER completing a subdirectory has
+    // already applied that directory's real mode, and a 0555 directory cannot
+    // be walked by rm -rf — so retry once after making every directory in the
+    // tree writable. Without this a failed copy leaves a complete, invisible
+    // copy of the user's data in the destination for good.
+    async function discardPath(p) {
+      try {
+        await fsp.rm(p, { recursive: true, force: true })
+        return
+      } catch {
+        // fall through to the chmod walk
+      }
+      try {
+        const stack = [p]
+        while (stack.length) {
+          const cur = stack.pop()
+          let st = null
+          try {
+            st = await fsp.lstat(cur)
+          } catch {
+            continue
+          }
+          if (!st.isDirectory()) continue
+          try {
+            await fsp.chmod(cur, 0o700)
+          } catch {
+            // unreadable directory: nothing more we can do for its children
+          }
+          let names = []
+          try {
+            names = await fsp.readdir(cur)
+          } catch {
+            names = []
+          }
+          for (const n of names) stack.push(path.join(cur, n))
+        }
+        await fsp.rm(p, { recursive: true, force: true })
+      } catch {
+        // last resort: a leftover .dm-stage entry is inert (handleList hides it)
+      }
+    }
+    
+    // Publish a finished stage at its final name WITHOUT ever replacing an
+    // entry that appeared meanwhile. rename() is not that primitive — it
+    // silently replaces an existing file and returns success — so a file is
+    // published with link()+unlink(): link() is atomic and fails EEXIST, so the
+    // guard covers the whole copy, not just the instant before the rename. A
+    // directory cannot be hard-linked, but rename() refuses a NON-EMPTY
+    // directory target (ENOTEMPTY), so only an empty directory can be replaced
+    // in a race.
+    async function publishStage(stage, target, isDir) {
+      if (isDir) {
+        await fsp.rename(stage, target)
+        return
+      }
+      try {
+        await fsp.link(stage, target)
+      } catch (err) {
+        // A filesystem without hard links falls back to rename, accepting the
+        // (much narrower) chance of replacing a same-name file that appeared
+        // while the copy was running.
+        if (err.code === 'EPERM' || err.code === 'ENOSYS' || err.code === 'EOPNOTSUPP' || err.code === 'EXDEV') {
+          await fsp.rename(stage, target)
+          return
+        }
+        throw err
+      }
+      await fsp.unlink(stage)
+    }
+    
+    // Copy src to target. The copy always lands at a stage name beside the
+    // target and is published from there, so a failed copy leaves the previous
+    // entry intact and a symlink planted at the target can never redirect the
+    // write: copyFile() would follow such a link, link()/rename() never do.
+    async function copyEntry(src, target, overwrite, guard) {
+      const st = await fsp.lstat(src)
+      const isDir = st.isDirectory()
+      const stage = stagePath(path.dirname(target))
+      try {
+        await copyTree(src, stage, 0, guard)
+      } catch (err) {
+        await discardPath(stage)
+        throw err
+      }
+      if (!overwrite) {
+        try {
+          await publishStage(stage, target, isDir)
+        } catch (err) {
+          await discardPath(stage)
+          throw err
+        }
+        return
+      }
+      // Overwrite: move the old entry aside, swap the new one in, drop the old
+      // one. If the swap fails the old entry is renamed back, so a failed
+      // overwrite never destroys what was there.
+      const backup = stagePath(path.dirname(target))
+      try {
+        await fsp.rename(target, backup)
+      } catch (err) {
+        await discardPath(stage)
+        throw err
+      }
+      try {
+        await fsp.rename(stage, target)
+      } catch (err) {
+        await fsp.rename(backup, target).catch(() => {})
+        await discardPath(stage)
+        throw err
+      }
+      await discardPath(backup)
+    }
+    
+    // Once the destination exists the move HAS happened. A failure to remove the
+    // source is a warning on a successful item, never a failed item: reporting
+    // failure invites a retry, and the retry makes a third copy.
+    async function dropSource(src) {
+      try {
+        await fsp.rm(src, { recursive: true, force: true })
+        return null
+      } catch (err) {
+        return 'moved, but the original could not be removed: ' + transferErrorText(err)
+      }
+    }
+    
+    async function moveEntry(src, target, overwrite, guard) {
+      if (!overwrite) {
+        try {
+          await fsp.rename(src, target)
+          return {}
+        } catch (err) {
+          // rename() cannot cross a filesystem boundary: personal and shared
+          // can sit on different mounts, and a platform PVC always does. Copy
+          // first, delete second — in that order, so a failed copy never loses
+          // the source.
+          if (err.code !== 'EXDEV') throw err
+          await copyEntry(src, target, false, guard)
+          const warn = await dropSource(src)
+          return warn ? { crossDevice: true, warning: warn } : { crossDevice: true }
+        }
+      }
+      // Overwrite. rename(2) replaces an existing FILE atomically, so a
+      // same-filesystem overwrite-move stays a metadata operation instead of a
+      // full byte copy; only a DIRECTORY target (which rename refuses when it
+      // is not empty) needs the staged copy below.
+      let targetIsDir = false
+      try {
+        targetIsDir = (await fsp.lstat(target)).isDirectory()
+      } catch {
+        targetIsDir = false
+      }
+      if (!targetIsDir) {
+        try {
+          await fsp.rename(src, target)
+          return {}
+        } catch (err) {
+          // EXDEV: different filesystems. ENOTDIR: the source is a directory
+          // and the target is a file — rename refuses that, so fall through to
+          // the staged copy, which replaces the file with the tree.
+          if (err.code !== 'EXDEV' && err.code !== 'ENOTDIR') throw err
+        }
+      }
+      await copyEntry(src, target, true, guard)
+      const warn = await dropSource(src)
+      return warn ? { staged: true, warning: warn } : { staged: true }
+    }
+    
+    // "report.txt" -> "report (copy).txt" -> "report (copy 2).txt". A folder
+    // named "v1.2" keeps its dot: the extension split is for files only.
+    async function duplicateTarget(src, isDir) {
+      const dir = path.dirname(src)
+      const base = path.basename(src)
+      const ext = isDir ? '' : path.extname(base)
+      const stem = base.slice(0, base.length - ext.length)
+      const tail0 = ' (copy)'
+      const first = path.join(dir, fitStem(stem, ext, tail0) + tail0 + ext)
+      if (!(await pathExists(first))) return first
+      for (let i = 2; i < 1000; i += 1) {
+        const tail = ' (copy ' + i + ')'
+        const candidate = path.join(dir, fitStem(stem, ext, tail) + tail + ext)
+        if (!(await pathExists(candidate))) return candidate
+      }
+      const tailN = ' (copy ' + Date.now() + ')'
+      return path.join(dir, fitStem(stem, ext, tailN) + tailN + ext)
+    }
+    
+    // Filesystem errors, phrased for the SPA's toast (which shows the first one).
+    function transferErrorText(err) {
+      const code = err && err.code
+      if (code === 'ENOSPC') return 'No space left on device'
+      if (code === 'EDQUOT') return 'Quota exceeded'
+      if (code === 'EROFS') return 'Read-only file system'
+      if (code === 'EACCES' || code === 'EPERM') return 'Permission denied'
+      if (code === 'ENAMETOOLONG') return 'Path too long'
+      if (code === 'ENOENT') return 'Not found'
+      if (code === 'EEXIST') return 'An item with that name appeared while copying — nothing was overwritten'
+      if (code === 'ECANCELED') return 'Transfer cancelled'
+      if (code === 'EUNSUPPORTED' || code === 'EDEEP' || code === 'ETOOMANY') return err.message
+      return (err && err.message) || 'Transfer failed'
+    }
+    
+    // resolveSafe() answers null both for a path outside the workspace and for
+    // one whose parent does not exist. Say which, so a row that another tab
+    // deleted reads as "gone" rather than "forbidden".
+    async function missingOrForbidden(p) {
+      const lexical = path.resolve(String(p || ''))
+      const inside = NAVIGABLE_PATHS.some((rp) => lexical === rp || lexical.startsWith(rp + path.sep))
+      // Only a path inside the workspace can be "missing"; answering "not found"
+      // for anything else would turn the endpoint into an existence oracle for
+      // the whole filesystem.
+      if (!inside) return 'Forbidden'
+      try {
+        await fsp.lstat(lexical)
+        return 'Forbidden'
+      } catch (err) {
+        return err.code === 'ENOENT' ? 'Not found' : 'Forbidden'
+      }
+    }
+    
+    function parseTransferBody(body) {
+      const paths = body && body.paths
+      if (!Array.isArray(paths) || paths.length === 0) return { error: 'No paths specified' }
+      if (paths.length > MAX_TRANSFER_ITEMS) return { error: 'Too many items (max ' + MAX_TRANSFER_ITEMS + ')' }
+      for (const p of paths) {
+        if (typeof p !== 'string' || p.length === 0) return { error: 'Invalid path' }
+      }
+      return { paths }
+    }
+    
+    // Conflict policy for copy/move. Deliberately NOT normalizeConflict(),
+    // whose upload default is "overwrite": a transfer handed no policy must
+    // keep both, never replace silently.
+    function transferConflict(raw) {
+      return raw === 'skip' || raw === 'overwrite' ? raw : 'rename'
     }
     
     function formatBytes(bytes) {
@@ -1218,7 +1554,11 @@ data:
           sendError(res, 400, 'Not a directory')
           return
         }
-        const entries = await fsp.readdir(safePath, { withFileTypes: true })
+        // A copy's in-flight .dm-stage-* entry is not a user file: showing it
+        // invites a rename or delete that breaks the copy with a confusing
+        // ENOENT.
+        const entries = (await fsp.readdir(safePath, { withFileTypes: true }))
+          .filter((e) => !e.name.startsWith('.dm-stage-'))
         const items = await Promise.all(
           entries
             .map(async (e) => {
@@ -1904,12 +2244,28 @@ data:
       if (/^[a-z][a-z0-9+.-]*:/i.test(url.replace(/[\u0000-\u0020]/g, ''))) return url
       // Anything synthesized here is HTML, so '&' is written as '&amp;' (mdAttr
       // only escapes quotes — values from the source already carry entities).
-      const clean = url.replace(/[?#].*$/, '')
-      const suffix = url.slice(clean.length)
-      const abs = path.posix.join(ctx.baseDir, clean) + suffix
-      if (kind === 'image') return BASE + '/api/download?inline=1&amp;path=' + encodeURIComponent(abs)
-      if (/\.(md|markdown|mdown|mkd|html?)$/i.test(clean)) return BASE + '/api/preview?path=' + encodeURIComponent(abs)
-      return url
+      //
+      // The fragment/query is split off BEFORE joining: encodeURIComponent()
+      // would otherwise fold "#top" into the path parameter, and the server
+      // would then look for a file literally named "ONE-PAGER.md#top" (404). A
+      // fragment is re-attached to the generated href so the browser can still
+      // anchor; a query string is dropped — it means nothing to these endpoints.
+      const cut = url.search(/[?#]/)
+      const clean = cut < 0 ? url : url.slice(0, cut)
+      const suffix = cut < 0 ? '' : url.slice(cut)
+      const hash = suffix.startsWith('#') ? suffix : ''
+      const abs = path.posix.join(ctx.baseDir, clean)
+      const enc = encodeURIComponent(abs)
+      if (kind === 'image') return BASE + '/api/download?inline=1&amp;path=' + enc
+      if (/\.(md|markdown|mdown|mkd|html?)$/i.test(clean)) return BASE + '/api/preview?path=' + enc + hash
+      // A folder has no byte endpoint: hand it to the SPA, which accepts
+      // ?path=<dir> and opens that folder (see loadRoots()).
+      if (clean.endsWith('/')) return BASE + '/?path=' + enc
+      // Every other file (PDF, zip, dataset, …) resolves through the byte
+      // endpoint: ?inline=1 serves a previewable type inline and falls back to a
+      // plain attachment otherwise, so the link works instead of 404ing against
+      // /data-manager/api/.
+      return BASE + '/api/download?inline=1&amp;path=' + enc
     }
     
     function mdRestore(out, tokens) {
@@ -2270,12 +2626,29 @@ data:
         '</head>\n<body>\n<article class="md">\n' + body + '\n</article>\n</body>\n</html>\n'
     }
     
+    // Explain a refusal WITHOUT weakening it: the clamp is unchanged, but a bare
+    // "Forbidden path" makes a symlink that leaves the workspace look like a
+    // renderer bug, and the browser is showing this response as a raw JSON page.
+    async function forbiddenReason(inputPath) {
+      if (typeof inputPath !== 'string' || inputPath.length === 0) return 'Forbidden path: no path given'
+      const resolved = path.resolve(inputPath)
+      const lexical = NAVIGABLE_PATHS.some((rp) => resolved === rp || resolved.startsWith(rp + path.sep))
+      if (!lexical) return 'Forbidden path: ' + resolved + ' is outside the workspace roots'
+      try {
+        const real = await fsp.realpath(resolved)
+        return 'Forbidden path: ' + resolved + ' resolves to ' + real +
+          ', which is outside the workspace roots — a symlink or bind mount leaves the workspace'
+      } catch {
+        return 'Forbidden path: ' + resolved + ' does not exist'
+      }
+    }
+    
     async function handlePreviewDoc(req, res, url) {
       const filePath = url.searchParams.get('path')
       const theme = url.searchParams.get('theme') === 'dark' ? 'dark' : 'light'
       const safePath = await resolveSafe(filePath)
       if (!safePath) {
-        sendError(res, 403, 'Forbidden path')
+        sendError(res, 403, await forbiddenReason(filePath))
         return
       }
       try {
@@ -2428,6 +2801,12 @@ data:
           deleted.push({ path: p, error: 'Forbidden' })
           continue
         }
+        if (NAVIGABLE_PATHS.includes(safe)) {
+          // A root is not a file: rm -rf here would take the whole workspace
+          // (or the cluster-wide shared volume) with it.
+          deleted.push({ path: p, error: 'Cannot delete a workspace root' })
+          continue
+        }
         const blocked = platformWriteBlocked(safe)
         if (blocked) {
           deleted.push({ path: p, error: blocked })
@@ -2464,6 +2843,200 @@ data:
       } catch (err) {
         sendError(res, 500, err.message)
       }
+    }
+    
+    // ─── Copy / move / duplicate handlers ───────────────
+    // Copy and move share one routine: resolve the destination ONCE, then walk
+    // the sources, refusing per item so one bad path cannot sink the batch.
+    async function handleTransfer(req, res, body, verb) {
+      const parsed = parseTransferBody(body)
+      if (parsed.error) {
+        sendError(res, 400, parsed.error)
+        return
+      }
+      // The destination must EXIST: resolveSafe() falls back to the parent's
+      // realpath for a missing path, and a lexical path must never reach
+      // platformWriteBlocked()'s prefix test.
+      const destReal = await resolveSafe(body.dest)
+      if (!destReal) {
+        sendError(res, 403, 'Forbidden destination')
+        return
+      }
+      let destStat = null
+      try {
+        destStat = await fsp.stat(destReal)
+      } catch {
+        destStat = null
+      }
+      if (!destStat) {
+        sendError(res, 404, 'Destination not found')
+        return
+      }
+      if (!destStat.isDirectory()) {
+        sendError(res, 400, 'Destination is not a directory')
+        return
+      }
+      const destBlocked = platformWriteBlocked(destReal)
+      if (destBlocked) {
+        sendError(res, 403, destBlocked)
+        return
+      }
+      const onConflict = transferConflict(body.onConflict)
+      const guard = makeTransferGuard(res)
+      const results = []
+      for (const p of parsed.paths) {
+        if (guard.cancelled) break
+        const src = await resolveSafe(p)
+        if (!src) {
+          results.push({ path: p, error: await missingOrForbidden(p) })
+          continue
+        }
+        if (NAVIGABLE_PATHS.includes(src)) {
+          results.push({ path: p, error: 'Cannot ' + verb + ' a workspace root' })
+          continue
+        }
+        const srcBlocked = verb === 'move' ? platformWriteBlocked(src) : null
+        if (srcBlocked) {
+          results.push({ path: p, error: srcBlocked })
+          continue
+        }
+        let st = null
+        try {
+          st = await fsp.lstat(src)
+        } catch {
+          results.push({ path: p, error: 'Not found' })
+          continue
+        }
+        // A directory transferred into itself (or into its own subtree) would
+        // recurse forever on copy and delete itself on move.
+        if (st.isDirectory() && isInside(src, destReal)) {
+          results.push({ path: p, error: 'Cannot ' + verb + ' a folder into itself' })
+          continue
+        }
+        const target0 = path.join(destReal, path.basename(src))
+        // The item already lives in the destination folder.
+        if (target0 === src) {
+          if (verb === 'move') {
+            // Moving a file into the folder it is already in has nothing to do
+            // (and "replacing itself" would be meaningless).
+            results.push({ path: p, target: target0, ok: true, noop: true })
+            continue
+          }
+          if (onConflict === 'skip') {
+            results.push({ path: p, target: target0, skipped: true })
+            continue
+          }
+          if (onConflict === 'overwrite') {
+            // Replacing an item with itself would delete the thing being copied.
+            results.push({ path: p, error: 'Source and destination are the same' })
+            continue
+          }
+          // Keep-both: a copy pasted into its own folder is a duplicate, which
+          // is what every file manager does. Fall through to the rename policy.
+        }
+        let target = target0
+        let renamed = false
+        if (await pathExists(target)) {
+          if (onConflict === 'skip') {
+            results.push({ path: p, target, skipped: true })
+            continue
+          }
+          if (onConflict === 'rename') {
+            target = await uniqueTarget(target, st.isDirectory())
+            renamed = true
+          }
+        }
+        let overwrite = false
+        if (!renamed && (await pathExists(target))) {
+          // Hard links and bind mounts make "different path, same inode"
+          // possible; replacing it would delete the source mid-copy.
+          let same = false
+          try {
+            const tst = await fsp.lstat(target)
+            same = tst.dev === st.dev && tst.ino === st.ino
+          } catch {
+            // vanished between the two calls — treat it as absent
+          }
+          if (same) {
+            results.push({ path: p, error: 'Source and destination are the same' })
+            continue
+          }
+          overwrite = true
+        }
+        try {
+          if (verb === 'move') {
+            const extra = await moveEntry(src, target, overwrite, guard)
+            results.push({ path: p, target, ok: true, renamed, ...extra })
+          } else {
+            // "keep both" must actually keep both: if another tab takes the
+            // name between uniqueTarget() and the atomic publish, take the next
+            // free name instead of failing the item.
+            for (let attempt = 0; ; attempt += 1) {
+              try {
+                await copyEntry(src, target, overwrite, guard)
+                break
+              } catch (err) {
+                if (err.code === 'EEXIST' && onConflict === 'rename' && !overwrite && attempt < 3) {
+                  target = await uniqueTarget(path.join(destReal, path.basename(src)), st.isDirectory())
+                  renamed = true
+                  continue
+                }
+                throw err
+              }
+            }
+            results.push({ path: p, target, ok: true, renamed })
+          }
+        } catch (err) {
+          results.push({ path: p, target, error: transferErrorText(err) })
+        }
+      }
+      json(res, 200, { ok: true, results })
+    }
+    
+    async function handleCopy(req, res, body) {
+      return handleTransfer(req, res, body, 'copy')
+    }
+    
+    async function handleMove(req, res, body) {
+      return handleTransfer(req, res, body, 'move')
+    }
+    
+    // Duplicate is always a sibling with a fresh name: no destination, no
+    // conflict policy, and nothing it could overwrite.
+    async function handleDuplicate(req, res, body) {
+      const parsed = parseTransferBody(body)
+      if (parsed.error) {
+        sendError(res, 400, parsed.error)
+        return
+      }
+      const guard = makeTransferGuard(res)
+      const results = []
+      for (const p of parsed.paths) {
+        if (guard.cancelled) break
+        const src = await resolveSafe(p)
+        if (!src) {
+          results.push({ path: p, error: await missingOrForbidden(p) })
+          continue
+        }
+        if (NAVIGABLE_PATHS.includes(src)) {
+          results.push({ path: p, error: 'Cannot duplicate a workspace root' })
+          continue
+        }
+        const blocked = platformWriteBlocked(src)
+        if (blocked) {
+          results.push({ path: p, error: blocked })
+          continue
+        }
+        try {
+          const st = await fsp.lstat(src)
+          const target = await duplicateTarget(src, st.isDirectory())
+          await copyEntry(src, target, false, guard)
+          results.push({ path: p, target, ok: true })
+        } catch (err) {
+          results.push({ path: p, error: transferErrorText(err) })
+        }
+      }
+      json(res, 200, { ok: true, results })
     }
     
     async function handleStorage(req, res) {
@@ -2629,6 +3202,29 @@ data:
         for await (const chunk of req) chunks.push(chunk)
         const body = JSON.parse(Buffer.concat(chunks).toString())
         return handleRename(req, res, body)
+      }
+    
+      // Copy / move / duplicate. Same JSON-body shape as /api/rename and
+      // /api/delete; a batch answers 200 with per-item results.
+      if (subPath === '/api/copy' && req.method === 'POST') {
+        const chunks = []
+        for await (const chunk of req) chunks.push(chunk)
+        const body = JSON.parse(Buffer.concat(chunks).toString())
+        return handleCopy(req, res, body)
+      }
+    
+      if (subPath === '/api/move' && req.method === 'POST') {
+        const chunks = []
+        for await (const chunk of req) chunks.push(chunk)
+        const body = JSON.parse(Buffer.concat(chunks).toString())
+        return handleMove(req, res, body)
+      }
+    
+      if (subPath === '/api/duplicate' && req.method === 'POST') {
+        const chunks = []
+        for await (const chunk of req) chunks.push(chunk)
+        const body = JSON.parse(Buffer.concat(chunks).toString())
+        return handleDuplicate(req, res, body)
       }
     
       if (subPath === '/api/storage' && req.method === 'GET') {
@@ -2922,6 +3518,37 @@ data:
     #selection-bar.active { display: flex; }
     #selection-count { flex: 1; font-size: 13px; color: var(--text-muted); }
     
+    /* Row context menu (right-click) */
+    #ctx-menu {
+      position: fixed;
+      display: none;
+      min-width: 190px;
+      padding: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+      z-index: 950;
+    }
+    #ctx-menu.open { display: block; }
+    #ctx-menu .ctx-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 10px;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #ctx-menu .ctx-item:hover { background: var(--accent-soft); color: var(--accent); }
+    #ctx-menu .ctx-item.danger { color: var(--red); }
+    #ctx-menu .ctx-item.danger:hover { background: rgba(220, 38, 38, 0.12); color: var(--red); }
+    #ctx-menu .ctx-sep { height: 1px; margin: 4px 2px; background: var(--border); }
+    #ctx-menu .ctx-key { margin-left: auto; font-size: 11px; color: var(--text-muted); }
+    /* The destination path in the paste dialog is long and has no spaces. */
+    #paste-summary { word-break: break-word; }
+    
     /* Toasts */
     #toasts {
       position: fixed;
@@ -3073,6 +3700,7 @@ data:
       <button class="btn" id="btn-upload-folder">Upload folder</button>
       <button class="btn" id="btn-new-folder">New Folder</button>
       <button class="btn" id="btn-new-file">New File</button>
+      <button class="btn" id="btn-paste" disabled title="Nothing to paste — select items and use Copy or Move first">Paste</button>
       <button class="btn" id="btn-refresh">Refresh</button>
     </div>
     
@@ -3095,10 +3723,14 @@ data:
     
     <div id="selection-bar">
       <span id="selection-count">0 selected</span>
+      <button class="btn" id="btn-copy-sel">Copy</button>
+      <button class="btn" id="btn-move-sel">Move</button>
+      <button class="btn" id="btn-dup-sel">Duplicate</button>
       <button class="btn" id="btn-download-sel">Download</button>
       <button class="btn btn-danger" id="btn-delete-sel">Delete</button>
     </div>
     
+    <div id="ctx-menu" role="menu"></div>
     <div id="toasts"></div>
     
     <!-- Edit Dialog -->
@@ -3187,6 +3819,26 @@ data:
       <div class="dlg-footer">
         <button class="btn" id="newfile-cancel">Cancel</button>
         <button class="btn btn-primary" id="newfile-confirm">Create</button>
+      </div>
+    </dialog>
+    
+    <!-- Paste (copy / move) Dialog: the destination is whatever folder is open -->
+    <dialog id="paste-dialog">
+      <div class="dlg-header" id="paste-title">Paste</div>
+      <div class="dlg-body">
+        <p id="paste-summary" style="font-size:13px;line-height:1.5;margin:0 0 12px;"></p>
+        <div class="dlg-field">
+          <label for="paste-conflict">If an item already exists</label>
+          <select id="paste-conflict">
+            <option value="rename" selected>Keep both — rename the new item</option>
+            <option value="skip">Skip it</option>
+            <option value="overwrite">Overwrite it</option>
+          </select>
+        </div>
+      </div>
+      <div class="dlg-footer">
+        <button class="btn" id="paste-cancel">Cancel</button>
+        <button class="btn btn-primary" id="paste-confirm">Paste</button>
       </div>
     </dialog>
     
@@ -3341,8 +3993,18 @@ data:
         sel.appendChild(opt);
       });
       if (roots.length > 0) {
-        currentRoot = roots[0];
-        currentPath = roots[0].path;
+        // ?path=<dir> opens that folder directly. A rendered markdown link to a
+        // folder uses it, and so does a bookmark; without it the SPA always
+        // started at the first root, which made a folder link look broken.
+        const want = (function () {
+          try { return new URLSearchParams(window.location.search).get('path'); } catch (e) { return null; }
+        })();
+        const linked = want
+          ? roots.find(function (r) { return want === r.path || want.indexOf(r.path + '/') === 0; })
+          : null;
+        currentRoot = linked || roots[0];
+        currentPath = linked ? want : roots[0].path;
+        if (linked) sel.value = linked.path;
         await loadDir(currentPath);
       }
     }
@@ -3359,6 +4021,7 @@ data:
     // ─── Breadcrumb ─────────────────────────────────────
     function renderBreadcrumb() {
       syncUploadButtons();
+      syncClipboardUi();
       const bc = document.getElementById('breadcrumb');
       bc.innerHTML = '';
       if (!currentRoot) return;
@@ -3396,6 +4059,7 @@ data:
     
     // ─── File Listing ───────────────────────────────────
     async function loadDir(dirPath) {
+      hideContextMenu();
       currentPath = dirPath;
       const data = await api('/list?path=' + encodeURIComponent(dirPath));
       renderBreadcrumb();
@@ -3469,7 +4133,8 @@ data:
           else openEditor(fullPath, entry);
         };
     
-        // Right-click for context menu (rename/delete)
+        // Right-click: select the row if it is not already part of the
+        // selection, then open the row menu at the pointer.
         tr.oncontextmenu = (e) => {
           e.preventDefault();
           if (!selectedPaths.has(fullPath)) {
@@ -3478,7 +4143,7 @@ data:
             renderTable(entries);
             updateSelectionBar();
           }
-          showRenameDialog(fullPath);
+          showContextMenu(e.clientX, e.clientY, entry, fullPath);
         };
     
         tbody.appendChild(tr);
@@ -3525,6 +4190,218 @@ data:
         bar.classList.remove('active');
       }
     }
+    
+    // ─── Clipboard: copy / move ─────────────────────────
+    // Copy and Move fill an in-page clipboard and Paste applies it to whatever
+    // folder is open — the desktop file-manager gesture, and the reason there is
+    // no destination picker: the destination is where you navigated to. The
+    // clipboard is per-tab and in memory only, so a reload drops it.
+    let clipboard = null;
+    
+    function pasteAllowed() {
+      return !currentRoot || currentRoot.writable !== false;
+    }
+    
+    function syncClipboardUi() {
+      const btn = document.getElementById('btn-paste');
+      if (!btn) return;
+      const n = clipboard ? clipboard.paths.length : 0;
+      btn.textContent = n > 0 ? 'Paste (' + n + ')' : 'Paste';
+      btn.disabled = n === 0 || !pasteAllowed();
+      btn.title = n === 0
+        ? 'Nothing to paste — select items and use Copy or Move first'
+        : (pasteAllowed()
+          ? 'Paste ' + n + ' item(s) here' + (clipboard.mode === 'move' ? ' (move)' : '')
+          : 'This location is read-only');
+    }
+    
+    function setClipboard(mode) {
+      const paths = Array.from(selectedPaths);
+      if (paths.length === 0) { toast('Select something first', 'info'); return; }
+      clipboard = { mode: mode, paths: paths };
+      syncClipboardUi();
+      toast((mode === 'move' ? 'Cut ' : 'Copied ') + paths.length + ' item(s) — open a folder and click Paste', 'success');
+    }
+    
+    // One toast per batch, not one per item: a 40-item paste must not bury the
+    // toolbar. The first failure is surfaced verbatim.
+    function reportTransfer(results, verb) {
+      const ok = results.filter(function (r) { return r.ok; });
+      const renamed = ok.filter(function (r) { return r.renamed; });
+      const skipped = results.filter(function (r) { return r.skipped; });
+      const failed = results.filter(function (r) { return r.error; });
+      const warned = ok.filter(function (r) { return r.warning; });
+      const bits = [ok.length + ' ' + verb];
+      if (renamed.length) bits.push(renamed.length + ' renamed to keep both');
+      if (skipped.length) bits.push(skipped.length + ' skipped');
+      if (failed.length) bits.push(failed.length + ' failed');
+      const note = failed.length ? ' — ' + failed[0].error : (warned.length ? ' — ' + warned[0].warning : '');
+      toast(bits.join(', ') + note, failed.length ? 'error' : 'success');
+    }
+    
+    // A moved file is the same file at a new path: keep the open editor (and
+    // its Save target) pointed at it instead of silently writing the old path.
+    function remapEditorPath(results) {
+      if (!editorCurrentPath) return;
+      results.forEach(function (r) {
+        if (!r.ok || !r.target) return;
+        if (editorCurrentPath === r.path || editorCurrentPath.indexOf(r.path + '/') === 0) {
+          editorCurrentPath = r.target + editorCurrentPath.slice(r.path.length);
+          if (editorCurrentEntry) {
+            // The dialog title and the language hint read the entry, not the
+            // path, so a rename-on-conflict move would otherwise keep the old
+            // basename on screen.
+            const nm = editorCurrentPath.split('/').pop();
+            editorCurrentEntry.name = nm;
+            editorCurrentEntry.ext = nm.indexOf('.') > 0 ? nm.split('.').pop().toLowerCase() : '';
+          }
+        }
+      });
+    }
+    
+    // The server accepts at most 200 paths per request. Select-all on a big
+    // folder is one click, so a paste is split into batches instead of being
+    // rejected outright; results are merged so the toast still summarises the
+    // whole gesture.
+    const TRANSFER_CHUNK = 200;
+    
+    async function postTransfer(endpoint, paths, dest, onConflict) {
+      const results = [];
+      for (let i = 0; i < paths.length; i += TRANSFER_CHUNK) {
+        const body = { paths: paths.slice(i, i + TRANSFER_CHUNK) };
+        if (dest) body.dest = dest;
+        if (onConflict) body.onConflict = onConflict;
+        const data = await api(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        (data.results || []).forEach(function (r) { results.push(r); });
+      }
+      return results;
+    }
+    
+    function openPasteDialog() {
+      if (!clipboard || clipboard.paths.length === 0) return;
+      if (!pasteAllowed()) { toast('This location is read-only', 'error'); return; }
+      const moving = clipboard.mode === 'move';
+      const verb = moving ? 'Move' : 'Copy';
+      const names = clipboard.paths.map(function (p) { return p.split('/').pop(); });
+      const shown = names.slice(0, 6).join(', ') + (names.length > 6 ? ', …' : '');
+      document.getElementById('paste-title').textContent = verb + ' into ' + (currentPath.split('/').pop() || currentPath);
+      document.getElementById('paste-summary').textContent =
+        verb + ' ' + clipboard.paths.length + ' item(s) into ' + currentPath + ': ' + shown +
+        (moving ? ' — the originals will be removed.' : '.');
+      document.getElementById('paste-confirm').textContent = verb;
+      document.getElementById('paste-dialog').showModal();
+    }
+    
+    async function runPaste() {
+      const dlg = document.getElementById('paste-dialog');
+      if (!clipboard || clipboard.paths.length === 0) { dlg.close(); return; }
+      const moving = clipboard.mode === 'move';
+      const paths = clipboard.paths.slice();
+      const dest = currentPath;
+      const onConflict = document.getElementById('paste-conflict').value;
+      dlg.close();
+      toast(moving ? 'Moving…' : 'Copying…', 'info');
+      try {
+        const results = await postTransfer(moving ? '/move' : '/copy', paths, dest, onConflict);
+        reportTransfer(results, moving ? 'moved' : 'copied');
+        if (moving) remapEditorPath(results);
+        // The clipboard is ONE-SHOT, for a copy as well as a move: once a paste
+        // has been made the gesture is finished, so Paste greys out instead of
+        // staying armed for the rest of the session. Copying the same items
+        // somewhere else is a deliberate re-selection. (Only a request that
+        // never reached the server keeps the clipboard, so a failed paste can
+        // be retried without re-selecting.)
+        clipboard = null;
+        selectedPaths.clear();
+        syncClipboardUi();
+        await loadDir(currentPath);
+        loadStorage();
+      } catch (e) {
+        toast((moving ? 'Move' : 'Copy') + ' failed: ' + e.message, 'error');
+      }
+    }
+    
+    async function duplicateSelection() {
+      const paths = Array.from(selectedPaths);
+      if (paths.length === 0) return;
+      if (!pasteAllowed()) { toast('This location is read-only', 'error'); return; }
+      try {
+        const results = await postTransfer('/duplicate', paths, null, null);
+        reportTransfer(results, 'duplicated');
+        selectedPaths.clear();
+        await loadDir(currentPath);
+        loadStorage();
+      } catch (e) {
+        toast('Duplicate failed: ' + e.message, 'error');
+      }
+    }
+    
+    // ─── Row context menu ───────────────────────────────
+    // Right-click used to jump straight into the rename dialog, which hid every
+    // other per-row action. The menu now carries the whole set and is clamped to
+    // the viewport, so a row at the bottom edge does not open it off-screen.
+    function hideContextMenu() {
+      const menu = document.getElementById('ctx-menu');
+      if (menu) menu.classList.remove('open');
+    }
+    
+    function ctxItem(label, hint, run, extraClass) {
+      const el = document.createElement('div');
+      el.className = 'ctx-item' + (extraClass ? ' ' + extraClass : '');
+      el.setAttribute('role', 'menuitem');
+      // textContent, never innerHTML: a file name can contain quotes, angle
+      // brackets or newlines and must not become markup.
+      const text = document.createElement('span');
+      text.textContent = label;
+      el.appendChild(text);
+      if (hint) {
+        const key = document.createElement('span');
+        key.className = 'ctx-key';
+        key.textContent = hint;
+        el.appendChild(key);
+      }
+      el.onclick = function () { hideContextMenu(); run(); };
+      return el;
+    }
+    
+    function showContextMenu(x, y, entry, fullPath) {
+      const menu = document.getElementById('ctx-menu');
+      menu.innerHTML = '';
+      menu.appendChild(entry.type === 'dir'
+        ? ctxItem('Open', '', function () { navigateTo(fullPath); })
+        : ctxItem('Edit', '', function () { openEditor(fullPath, entry); }));
+      menu.appendChild(ctxItem('Download', '', function () { checkSingleFile(fullPath); }));
+      menu.appendChild(ctxItem('Rename', '', function () { showRenameDialog(fullPath); }));
+      menu.appendChild(ctxItem('Duplicate', '', duplicateSelection));
+      menu.appendChild(ctxItem('Copy', 'Ctrl+C', function () { setClipboard('copy'); }));
+      menu.appendChild(ctxItem('Move', 'Ctrl+X', function () { setClipboard('move'); }));
+      const sep = document.createElement('div');
+      sep.className = 'ctx-sep';
+      menu.appendChild(sep);
+      menu.appendChild(ctxItem('Delete', '', function () { askDelete(Array.from(selectedPaths)); }, 'danger'));
+      menu.classList.add('open');
+      // Measure only after display, then clamp.
+      const box = menu.getBoundingClientRect();
+      menu.style.left = Math.max(8, Math.min(x, window.innerWidth - box.width - 8)) + 'px';
+      menu.style.top = Math.max(8, Math.min(y, window.innerHeight - box.height - 8)) + 'px';
+    }
+    
+    document.addEventListener('click', function (e) {
+      const menu = document.getElementById('ctx-menu');
+      if (menu && menu.classList.contains('open') && !menu.contains(e.target)) hideContextMenu();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') hideContextMenu();
+    });
+    window.addEventListener('resize', hideContextMenu);
+    // The menu is anchored to viewport coordinates: any scroll detaches it from
+    // the row it belongs to, so dismiss it (capture: the scrolling element is
+    // #main, not the window).
+    window.addEventListener('scroll', hideContextMenu, true);
     
     // ─── Storage Panel ──────────────────────────────────
     async function loadStorage() {
@@ -4256,15 +5133,18 @@ data:
     document.getElementById('dl-cancel').onclick = () => document.getElementById('download-dialog').close();
     
     // ─── Delete ─────────────────────────────────────────
-    document.getElementById('btn-delete-sel').onclick = function() {
-      const paths = Array.from(selectedPaths);
-      if (paths.length === 0) return;
+    function askDelete(paths) {
+      if (!paths || paths.length === 0) return;
       const msg = paths.length === 1
         ? 'Delete "' + paths[0].split('/').pop() + '"? This cannot be undone.'
         : 'Delete ' + paths.length + ' items? This cannot be undone.';
       document.getElementById('confirm-message').textContent = msg;
       document.getElementById('confirm-dialog').dataset.paths = JSON.stringify(paths);
       document.getElementById('confirm-dialog').showModal();
+    }
+    
+    document.getElementById('btn-delete-sel').onclick = function() {
+      askDelete(Array.from(selectedPaths));
     };
     
     document.getElementById('confirm-yes').onclick = async function() {
@@ -4382,6 +5262,44 @@ data:
     };
     
     document.getElementById('rename-cancel').onclick = () => document.getElementById('rename-dialog').close();
+    
+    // ─── Copy / Move / Duplicate wiring ─────────────────
+    document.getElementById('btn-copy-sel').onclick = function () { setClipboard('copy'); };
+    document.getElementById('btn-move-sel').onclick = function () { setClipboard('move'); };
+    document.getElementById('btn-dup-sel').onclick = duplicateSelection;
+    document.getElementById('btn-paste').onclick = openPasteDialog;
+    document.getElementById('paste-confirm').onclick = runPaste;
+    document.getElementById('paste-cancel').onclick = function () { document.getElementById('paste-dialog').close(); };
+    
+    // Ctrl/Cmd+C / X / V act on the file selection, but only when they cannot
+    // mean "copy this text": collapsed selection, no input focused, no Monaco
+    // editor and no open dialog. Otherwise the browser keeps the shortcut.
+    function typingTarget(el) {
+      if (!el) return false;
+      const tag = String(el.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+      if (el.isContentEditable) return true;
+      return !!(el.closest && el.closest('.monaco-editor'));
+    }
+    
+    document.addEventListener('keydown', function (e) {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      const key = String(e.key || '').toLowerCase();
+      if (key !== 'c' && key !== 'x' && key !== 'v') return;
+      if (typingTarget(e.target)) return;
+      if (document.querySelector('dialog[open]')) return;
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (key !== 'v' && sel && sel.isCollapsed === false && String(sel).length > 0) return;
+      if (key === 'v') {
+        if (!clipboard || clipboard.paths.length === 0) return;
+        e.preventDefault();
+        openPasteDialog();
+        return;
+      }
+      if (selectedPaths.size === 0) return;
+      e.preventDefault();
+      setClipboard(key === 'x' ? 'move' : 'copy');
+    });
     
     // ─── Refresh ────────────────────────────────────────
     document.getElementById('btn-refresh').onclick = function() {

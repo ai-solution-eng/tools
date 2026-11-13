@@ -165,11 +165,25 @@ data:
     // iframe, with a Source/Rendered toggle in the edit dialog. Bumped so
     // existing units re-stamp onto the new data_manager.mjs + data_manager.html:
     // subPath mounts never refresh on their own.
+    // r25: the data manager gains copy / move / duplicate for files and folders
+    // — POST /api/copy, /api/move and /api/duplicate, a selection-bar
+    // Copy/Move/Duplicate, a Paste button with a confirm dialog, a row context
+    // menu and Ctrl/Cmd+C/X/V. /api/delete also stops accepting a navigable
+    // workspace root. The markdown preview's relative links are fixed too: a
+    // "#fragment" no longer corrupts the path, non-.md files link to the byte
+    // endpoint, folder links open the SPA at ?path=<dir>, and a refused path
+    // says why. Bumped so existing units re-stamp onto the new
+    // data_manager.mjs + data_manager.html: subPath mounts never refresh on
+    // their own.
+    // r26: the data-manager clipboard is one-shot — a paste consumes it for a
+    // COPY as well as a move, so Paste greys out instead of staying armed, and
+    // the same items can only be pasted again after a fresh Copy/Move. A
+    // re-stamp, because data_manager.html is a subPath mount.
     // RUNTIME_REV is part of the marker, same contract as the dsh and openwork
-    // charts: the shipped default is 25 and it is ALWAYS appended, so bumping
+    // charts: the shipped default is 27 and it is ALWAYS appended, so bumping
     // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
     // the next reconcile — no chart edit needed.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 25 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 27 }}'
     const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
