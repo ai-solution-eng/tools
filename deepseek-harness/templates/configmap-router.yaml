@@ -175,7 +175,18 @@ data:
     // values blob) to force every user unit to re-stamp on the next
     // reconcile — no chart edit needed. The code default stays frozen at 44 so an
     // install that never sets RUNTIME_REV keeps its historical value (no
-    // surprise rollout); values.yaml ships 48.
+    // 49 (0.4.43): markdown previews are framed SAME-ORIGIN. A sandboxed
+    // (opaque-origin) preview made every link clicked inside it a cross-site
+    // navigation, so the SameSite=Lax cookies were dropped and the click hit the
+    // ingress without a session (403) while the initial preview rendered fine.
+    // Raw .html previews keep the full sandbox.
+    // 50 (0.4.44): rendered pages carry a "back to <page>" bar (ancestor trail in
+    // the 'from' parameter, so it works at any depth and the root has none) and
+    // links keep the theme. Server-rendered; the preview CSP still forbids scripts.
+    // 51 (0.4.45): the edit dialog adopts the page the preview navigated to, so
+    // Source / Rename / Delete / Save follow the document on screen instead of
+    // the one the dialog was opened with.
+    // surprise rollout); values.yaml ships 51.
     const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:
