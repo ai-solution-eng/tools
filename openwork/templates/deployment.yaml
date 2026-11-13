@@ -77,27 +77,27 @@ spec:
             - name: OPENCODE_SERVER_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-auth
+                  name: {{ include "openwork-web.authSecretName" . }}
                   key: OPENCODE_SERVER_USERNAME
             - name: OPENCODE_SERVER_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-auth
+                  name: {{ include "openwork-web.authSecretName" . }}
                   key: OPENCODE_SERVER_PASSWORD
             - name: SESSION_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-auth
+                  name: {{ include "openwork-web.authSecretName" . }}
                   key: SESSION_SECRET
             - name: ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-auth
+                  name: {{ include "openwork-web.authSecretName" . }}
                   key: ADMIN_USERNAME
             - name: ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-auth
+                  name: {{ include "openwork-web.authSecretName" . }}
                   key: ADMIN_PASSWORD
             - name: USER_REGISTRY_SECRET
               value: {{ .Release.Name }}-users

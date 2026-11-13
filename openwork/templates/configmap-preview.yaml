@@ -778,6 +778,23 @@ data:
       })
       child = proc
 
+      // Without this handler an ENOENT/EACCES spawn error is an uncaught
+      // exception in the supervisor (the container's main process) and the unit
+      // dies in a restart loop. Deliberately NOT gated on restartInProgress: a
+      // spawn failure inside scheduleRestart() happens while that flag is still
+      // set, and gating here would swallow the only retry attempt.
+      proc.on('error', (error) => {
+        console.error(`[opencode] failed to spawn openwork-server: ${error.message}`)
+        if (child === proc) child = null
+        if (!stopping) {
+          const delay = restartBackoffMs
+          restartBackoffMs = Math.min(restartBackoffMs * 2, 15000)
+          setTimeout(() => {
+            if (child === null) startOpencode().catch((err) => console.error('[opencode] restart failed', err))
+          }, delay)
+        }
+      })
+
       proc.on('exit', (code, signal) => {
         if (child === proc) child = null
         if (!stopping && !restartInProgress) {
@@ -817,7 +834,10 @@ data:
           signalProcessGroup(proc, 'SIGKILL')
         }, 8000)
 
+        // A child that fails to spawn emits 'error' + 'close' and never 'exit',
+        // so waiting on 'exit' alone would hang the stop path until SIGKILL.
         proc.once('exit', finish)
+        proc.once('close', finish)
 
         try {
           signalProcessGroup(proc, 'SIGTERM')

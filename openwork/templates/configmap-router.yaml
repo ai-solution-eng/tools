@@ -138,8 +138,13 @@ data:
     // up the second workspace on their next start — a supervisor change, hence
     // a re-stamp: opencode_supervisor.mjs is a subPath mount, so a running pod
     // keeps the old copy and the merge only converges on restart.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 25 }}'
-    const userTemplateVersion = `terminal-tab-v21-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+    // r26 (RUNTIME_REV): credentials come from a pre-created Secret
+    // (existingAuthSecret) instead of a chart-rendered one, and the supervisor
+    // gains a spawn 'error' handler plus a 'close' handler on the stop path.
+    // Both are pod-template changes, hence a re-stamp; the marker prefix also
+    // moved v21 -> v22 so a pinned RUNTIME_REV cannot suppress the rollout.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 26 }}'
+    const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1606,8 +1611,6 @@ data:
         { name: 'platform-shared', mountPath: platformSharedMount },
         { name: 'platform-user', mountPath: platformUserMount },
       ] : []
-      // Baked image contract (see Dockerfile): when the image ships
-      // baked copies under /opt/openwork/npm whose version markers match
       // Baked OpenWork contract (D5): the unit image carries the OpenCode engine
       // binary at /usr/local/bin/opencode and openwork-server globally. The guard
       // verifies the baked engine's version matches the pin and FAILS LOUDLY on
@@ -1858,7 +1861,7 @@ data:
                       name: 'OPENCODE_SERVER_USERNAME',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "openwork-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_USERNAME',
                         },
                       },
@@ -1867,7 +1870,7 @@ data:
                       name: 'OPENCODE_SERVER_PASSWORD',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "openwork-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_PASSWORD',
                         },
                       },
@@ -1890,7 +1893,7 @@ data:
                       name: 'OPENWORK_TOKEN',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "openwork-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_PASSWORD',
                         },
                       },
@@ -1899,7 +1902,7 @@ data:
                       name: 'OPENWORK_HOST_TOKEN',
                       valueFrom: {
                         secretKeyRef: {
-                          name: '{{ .Release.Name }}-auth',
+                          name: '{{ include "openwork-web.authSecretName" . }}',
                           key: 'OPENCODE_SERVER_PASSWORD',
                         },
                       },
@@ -2406,12 +2409,17 @@ data:
     // The router never reads a mirror back: create, then strategic-merge
     // patch on 409 — the platform ClusterRole therefore grants NO secret
     // read, preserving the "never touches platform secrets" contract.
-    const unitAuthSecretName = '{{ .Release.Name }}-auth'
+    const unitAuthSecretName = '{{ include "openwork-web.authSecretName" . }}'
     const unitAuthSecretKeys = ['OPENCODE_SERVER_USERNAME', 'OPENCODE_SERVER_PASSWORD']
 
     async function mirrorSecretIntoUnitNs(unitNs, secretName, keys, ownerRefs) {
       const src = await k8sRequest('GET', `/api/v1/namespaces/${namespace}/secrets/${secretName}`)
-      if (!src?.data) return
+      if (!src?.data) {
+        // Operator-supplied name: a typo or a Secret in the wrong namespace would
+        // otherwise leave the unit in CreateContainerConfigError with no log.
+        console.warn(`[mirror] source secret ${namespace}/${secretName} not found; unit ${unitNs} will not start`)
+        return
+      }
       const desiredData = {}
       if (keys) {
         for (const key of keys) {

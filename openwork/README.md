@@ -10,6 +10,61 @@ a shared workspace enables team collaboration.
 > (rendered router/preview JS passes `node --check`). Remaining before deploy: S1/S2 spikes
 > (loopback/Origin behavior + headless UI flows) and config-surface wiring (P5).
 
+## Credentials (pre-created Secret)
+
+The chart does **not** store credentials in `values.yaml`. It reads them from a
+Secret you create in the release namespace and name via `existingAuthSecret`
+(default `openwork-web-helm-credentials`). Create it **before**
+`helm install`/`helm upgrade`:
+
+```sh
+kubectl -n <namespace> create secret generic openwork-web-helm-credentials \
+  --from-literal=SESSION_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=OPENCODE_SERVER_USERNAME='opencode' \
+  --from-literal=OPENCODE_SERVER_PASSWORD='<token>' \
+  --from-literal=ADMIN_USERNAME='admin-user' \
+  --from-literal=ADMIN_PASSWORD='<password>'
+```
+
+All five keys are required:
+
+| Key | Used for |
+|---|---|
+| `SESSION_SECRET` | Signs the `oc_sess` login cookie and the `oc_admin` console cookie |
+| `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | OpenWork's bearer/bootstrap token — the preview proxy forwards the browser's `Authorization` header, so this is the token the UI presents, not a Basic credential |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Admin console login |
+
+For platform (SSO) units the router mirrors only the `OPENCODE_SERVER_*` keys
+into the unit's project namespace — never `SESSION_SECRET`. The Secret is not
+managed by Helm: it survives `helm upgrade` and `helm uninstall`. Leaving
+`existingAuthSecret` empty falls back to a chart-managed Secret built from
+`sessionSecret`/`auth`/`admin` — all five must then be non-empty or the render
+fails.
+
+**Rotating a value needs a router restart**, because the router reads these as
+env at container start — a patched Secret alone changes nothing:
+
+```sh
+kubectl -n <namespace> rollout restart deploy/<release>
+```
+
+Rotating `SESSION_SECRET` additionally requires bumping `RUNTIME_REV`: each
+unit's auth sidecar carries a literal `SESSION_KEY` derived from it, and only a
+re-stamp refreshes that.
+
+**Upgrading from a release that rendered its own Secret (<= 0.1.28):** Helm
+deletes `<release>-auth` during the upgrade. Copy the values out first and reuse
+the same `SESSION_SECRET`, or every logged-in user is signed out:
+
+```sh
+kubectl -n <namespace> get secret <release>-auth -o jsonpath='{.data}' > /tmp/auth.json
+```
+
+Note on the image: the unit init **fails fast** if the baked OpenCode engine
+version differs from the pinned `opencode.version` (`FATAL: baked opencode engine
+… != pinned …`). Bumping `opencode.version` therefore requires rebuilding and
+pushing the user image; there is no runtime install fallback in this chart.
+
 ## Requirements / build spec
 
 The full DS×GLM cross-validated build spec lives in [`REQUIREMENTS.md`](REQUIREMENTS.md):
