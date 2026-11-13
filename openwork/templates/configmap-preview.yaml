@@ -2295,7 +2295,14 @@ data:
       const abs = path.posix.join(ctx.baseDir, clean)
       const enc = encodeURIComponent(abs)
       if (kind === 'image') return BASE + '/api/download?inline=1&amp;path=' + enc
-      if (/\.(md|markdown|mdown|mkd|html?)$/i.test(clean)) return BASE + '/api/preview?path=' + enc + hash
+      if (/\.(md|markdown|mdown|mkd|html?)$/i.test(clean)) {
+        // Keep the theme (a dark preview must not turn light on navigation) and
+        // record which page we came from, so the target can render a link back.
+        let href = BASE + '/api/preview?path=' + enc +
+          '&amp;theme=' + (ctx.theme === 'dark' ? 'dark' : 'light')
+        if (ctx.filePath) href += '&amp;from=' + trailParam([ctx.filePath].concat(ctx.trail || []))
+        return href + hash
+      }
       // A folder has no byte endpoint: hand it to the SPA, which accepts
       // ?path=<dir> and opens that folder (see loadRoots()).
       if (clean.endsWith('/')) return BASE + '/?path=' + enc
@@ -2624,7 +2631,17 @@ data:
     // Markdown is OUR escaped output, so remote https images (README badges) are
     // allowed. A raw .html file is untrusted, so it may load nothing remote at all:
     // no beacon, no exfil, no third-party script even if the sandbox were bypassed.
-    const MD_PREVIEW_CSP = "sandbox; default-src 'none'; img-src 'self' data: https:; media-src 'self' https:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; frame-ancestors 'self'"
+    // NOTE the missing 'sandbox' directive: a rendered .md keeps its REAL origin.
+    // A sandboxed (opaque-origin) document makes every link clicked inside it a
+    // cross-site navigation, so SameSite=Lax cookies (the platform SSO cookie and
+    // the unit's own session cookie) are dropped and the click lands on the
+    // ingress without a session — the user sees 403 / a login page while the
+    // initial preview (a parent-initiated navigation, same-site) renders fine.
+    // Same-origin is safe here because the markdown page cannot execute script:
+    // the source is HTML-escaped before any parsing, every tag is written by
+    // this file, and default-src 'none' blocks scripts outright.
+    // Raw .html previews keep the full sandbox (see HTML_PREVIEW_CSP).
+    const MD_PREVIEW_CSP = "default-src 'none'; img-src 'self' data: https:; media-src 'self' https:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; frame-ancestors 'self'"
     const HTML_PREVIEW_CSP = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; frame-ancestors 'self'"
     
     const MD_PAGE_CSS = [
@@ -2639,6 +2656,12 @@ data:
       '.md h3{font-size:1.2em}.md h4{font-size:1.05em}',
       '.md p{margin:.75em 0}',
       '.md a{color:var(--link);text-decoration:none}.md a:hover{text-decoration:underline}',
+      // "up" affordance: a rendered page opened FROM another page carries a link
+      // back to it, so walking into a folder tree is reversible without the
+      // browser's back button (and without any script — the CSP has none).
+      '.md-back{margin:0 0 4px;font-size:.86em}',
+      '.md-back a{display:inline-block;padding:3px 9px;border:1px solid var(--bd);border-radius:999px;color:var(--muted);background:var(--code)}',
+      '.md-back a:hover{color:var(--link);border-color:var(--link);text-decoration:none}',
       '.md code{background:var(--code);border-radius:4px;padding:.15em .4em;font-size:.9em;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}',
       '.md pre.md-pre{background:var(--code);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;overflow:auto}',
       '.md pre.md-pre code{background:none;padding:0;font-size:.88em}',
@@ -2654,6 +2677,50 @@ data:
       '.md th{background:var(--code);font-weight:600}',
       '.md .md-notice{padding:18px;border:1px solid var(--bd);border-radius:8px;color:var(--muted)}',
     ].join('\n')
+    
+    // The trail of pages you clicked through to get here, nearest ancestor first.
+    // Each entry is URI-encoded and joined with '|', which encodeURIComponent
+    // escapes — so a path can never forge a separator, and a comma or a pipe in a
+    // real filename is harmless.
+    const MD_TRAIL_MAX = 8
+    
+    function parseTrail(raw) {
+      if (typeof raw !== 'string' || !raw) return []
+      const out = []
+      for (const part of raw.split('|').slice(0, MD_TRAIL_MAX)) {
+        if (!part) continue
+        try {
+          out.push(decodeURIComponent(part))
+        } catch {
+          // a malformed entry is simply dropped: the trail is a convenience,
+          // never a capability
+        }
+      }
+      return out
+    }
+    
+    function trailParam(trail) {
+      return trail.map((p) => encodeURIComponent(p)).join('|')
+    }
+    
+    // "back to <page>" — only ever a path that passed resolveSafe() and only ever
+    // another previewable document, so the bar can never be turned into a link
+    // to somewhere the workspace clamp would refuse. Walking back one level at a
+    // time works at any depth because each page hands its own ancestors on.
+    async function backBar(fromParam, currentPath, theme) {
+      const trail = parseTrail(fromParam)
+      if (trail.length === 0) return ''
+      const parent = await resolveSafe(trail[0])
+      if (!parent || parent === currentPath) return ''
+      const ext = path.extname(parent).slice(1).toLowerCase()
+      if (!DOC_MD_EXT.has(ext) && !DOC_HTML_EXT.has(ext)) return ''
+      const rest = trail.slice(1)
+      let href = BASE + '/api/preview?path=' + encodeURIComponent(parent) +
+        '&amp;theme=' + (theme === 'dark' ? 'dark' : 'light')
+      if (rest.length) href += '&amp;from=' + trailParam(rest)
+      return '<div class="md-back"><a href="' + href + '" title="' + mdEscText(parent) + '">\u2190 ' +
+        mdEscText(path.basename(parent)) + '</a></div>\n'
+    }
     
     function mdPage(title, body, theme) {
       const t = theme === 'dark' ? 'dark' : 'light'
@@ -2717,15 +2784,24 @@ data:
           const src = await fsp.readFile(safePath, 'utf8')
           let body
           try {
-            body = mdRender(src, { baseDir: path.dirname(safePath) })
+            // filePath/theme travel with the context so every link this page
+            // emits can carry them: the theme keeps a dark preview dark when you
+            // navigate, and the path lets the NEXT page offer a way back.
+            body = mdRender(src, {
+              baseDir: path.dirname(safePath),
+              filePath: safePath,
+              theme,
+              trail: parseTrail(url.searchParams.get('from')),
+            })
           } catch (err) {
             // A renderer bug must degrade to escaped source, never to a 500: the
             // preview is the only way to look at the file from the browser.
             console.error('[data_manager] markdown render failed:', err)
             body = '<pre class="md-pre"><code>' + mdEscText(src) + '</code></pre>'
           }
+          const back = await backBar(url.searchParams.get('from'), safePath, theme)
           res.writeHead(200, headers)
-          res.end(mdPage(filename, body, theme))
+          res.end(mdPage(filename, back + body, theme))
           return
         }
     
@@ -5404,12 +5480,16 @@ data:
         el = document.createElement('audio');
         el.controls = true;
       } else if (kind === 'markdown' || kind === 'html') {
-        // Rendered document. The response already carries a CSP 'sandbox', and
-        // the empty sandbox attribute keeps every restriction on (no scripts,
-        // no same-origin, no forms, no top navigation): a hostile .html file
-        // cannot run code or reach this page's DOM.
+        // Rendered document. MARKDOWN is our own generated, escaped HTML: it is
+        // framed same-origin ('allow-same-origin' without 'allow-scripts' — no
+        // script can run, so it cannot reach this page's DOM) so that a link
+        // clicked inside it is a SAME-SITE navigation and keeps the session
+        // cookies. A sandboxed iframe would drop them and every in-document link
+        // would bounce off the ingress.
+        // RAW .html is arbitrary user markup, so it keeps the empty sandbox: no
+        // scripts, no same-origin, no forms, no top navigation.
         el = document.createElement('iframe');
-        el.setAttribute('sandbox', '');
+        el.setAttribute('sandbox', kind === 'markdown' ? 'allow-same-origin' : '');
         el.title = name || 'Document preview';
       } else {
         // PDF: native viewer via <iframe>. Range support on the endpoint lets
@@ -5423,6 +5503,13 @@ data:
       el.className = (kind === 'markdown' || kind === 'html')
         ? 'preview-el preview-doc'
         : 'preview-el preview-' + kind;
+      if (kind === 'markdown' || kind === 'html') {
+        // A rendered document navigates on its own (in-document links, the back
+        // chip). Track it, so Source / Rename / Delete / Save act on the page
+        // being displayed instead of the file the dialog was opened with.
+        previewFrame = el;
+        el.addEventListener('load', syncEditorFromFrame);
+      }
       el.onerror = () => {
         wrap.innerHTML = '';
         const msg = document.createElement('div');
@@ -5439,6 +5526,31 @@ data:
     // and only that mode can Save.
     let editorViewMode = 'preview';
     let editorCurrentEntry = null;
+    let previewFrame = null;
+    
+    // The iframe is same-origin for markdown, so its current URL is readable. It
+    // is only adopted when it really is a preview page (not the file browser the
+    // folder deep-link opens), and the dialog is NOT re-rendered here — the frame
+    // is already showing that document.
+    function syncEditorFromFrame() {
+      if (!previewFrame || !editorCurrentPath) return;
+      let target = null;
+      try {
+        const u = new URL(previewFrame.contentWindow.location.href);
+        if (!/\/api\/preview$/.test(u.pathname)) return;
+        target = u.searchParams.get('path');
+      } catch (e) {
+        return; // opaque origin (.html preview): nothing readable, nothing to do
+      }
+      if (!target || target === editorCurrentPath) return;
+      editorCurrentPath = target;
+      const nm = target.split('/').pop() || target;
+      const ext = (nm.split('.').pop() || '').toLowerCase();
+      editorCurrentEntry = { name: nm, ext: ext, type: 'file' };
+      document.getElementById('edit-title').textContent = nm;
+      const kind = previewKind(ext);
+      document.getElementById('edit-meta').textContent = kind ? kind.toUpperCase() + ' preview' : '';
+    }
     
     async function openEditor(filePath, entry) {
       if (editorCurrentPath !== filePath) editorViewMode = 'preview';
@@ -5576,6 +5688,7 @@ data:
     
     document.getElementById('btn-editor-close').onclick = function() {
       if (monacoEditor) { monacoEditor.dispose(); monacoEditor = null; }
+      previewFrame = null;
       editorCurrentPath = null;
       document.getElementById('edit-dialog').close();
     };

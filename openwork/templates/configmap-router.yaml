@@ -154,7 +154,15 @@ data:
     // r28 (RUNTIME_REV): the data-manager clipboard is one-shot — a paste
     // consumes it for a COPY as well as a move, so Paste greys out instead of
     // staying armed. A re-stamp, because data_manager.html is a subPath mount.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 28 }}'
+    // r29 (RUNTIME_REV): markdown previews are framed same-origin so links
+    // clicked inside them keep the session cookies (a sandboxed preview dropped
+    // them and every in-document link bounced off the ingress). Raw .html
+    // previews keep the full sandbox.
+    // r30 (RUNTIME_REV): rendered pages carry a "back to <page>" bar driven by an
+    // ancestor trail in the 'from' parameter, and links keep the theme.
+    // r31 (RUNTIME_REV): the edit dialog adopts the page the preview navigated to,
+    // so Source / Rename / Delete / Save follow the document on screen.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 31 }}'
     const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
