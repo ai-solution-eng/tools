@@ -162,7 +162,7 @@ openwork:
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
 # r25: workspace convergence — the supervisor converges server.json to the chart's workspaces
 #      (personal + shared, plus platform-shared/platform-user on mounted SSO units).
-RUNTIME_REV: 26
+RUNTIME_REV: 28
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)

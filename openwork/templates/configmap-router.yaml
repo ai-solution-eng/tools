@@ -143,7 +143,18 @@ data:
     // gains a spawn 'error' handler plus a 'close' handler on the stop path.
     // Both are pod-template changes, hence a re-stamp; the marker prefix also
     // moved v21 -> v22 so a pinned RUNTIME_REV cannot suppress the rollout.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 26 }}'
+    // r27 (RUNTIME_REV): the data manager gains copy / move / duplicate for
+    // files and folders — POST /api/copy, /api/move and /api/duplicate, a
+    // selection-bar Copy/Move/Duplicate, a Paste button with a confirm dialog, a
+    // row context menu and Ctrl/Cmd+C/X/V; /api/delete also stops accepting a
+    // navigable workspace root. The markdown preview's relative links are fixed
+    // too (#fragment handling, non-.md targets, folder deep links, a 403 that
+    // says why). A re-stamp, because data_manager.mjs/.html are subPath mounts
+    // that never refresh on their own.
+    // r28 (RUNTIME_REV): the data-manager clipboard is one-shot — a paste
+    // consumes it for a COPY as well as a move, so Paste greys out instead of
+    // staying armed. A re-stamp, because data_manager.html is a subPath mount.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 28 }}'
     const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the

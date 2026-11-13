@@ -124,16 +124,74 @@ audio and video render inline, and **markdown and HTML now render too** — ever
 opens as text in Monaco. `.md` is rendered server-side by `/api/preview` inside `data_manager.mjs`:
 escape-first, zero dependencies, **no raw-HTML passthrough** (a `<script>` written in a `.md` file is
 displayed as text, never executed), with GFM tables, task lists, nested lists, fenced code and relative
-links/images resolved against the file's own folder. `.html` is served **verbatim**, so an exported
-report keeps its own markup, but under `Content-Security-Policy: sandbox` — opaque origin, scripts
-cannot run, nothing remote may load — inside an iframe that also carries `sandbox=""`. Both are
+links/images resolved against the file's own folder. As of 0.1.31 those links resolve to working
+endpoints instead of staying relative to `/data-manager/api/`: a `#fragment` stays a real fragment
+(it used to be folded into the path, so `ONE-PAGER.md#top` 404'd), a `.md`/`.html` target opens the
+preview, any other file (PDF, zip, dataset) opens through the byte endpoint inline-or-download, and
+a folder link opens the Data Manager at that folder via the new `?path=<dir>` deep link; a path the
+workspace clamp refuses now answers with the reason (the resolved path, and that a symlink or bind
+mount leaves the workspace) instead of a bare *Forbidden path*. `.html` is served **verbatim**, so
+an exported report keeps its own markup, but under `Content-Security-Policy: sandbox` — opaque origin,
+scripts cannot run, nothing remote may load — inside an iframe that also carries `sandbox=""`. Both are
 read-only previews; a **Source / Rendered** toggle in the dialog switches back to Monaco so `.md` and
 `.html` stay editable. Nothing on this path can execute file content in the data-manager origin:
-markdown is escaped before parsing, HTML is isolated twice over.
+markdown is escaped before parsing, HTML is isolated twice over. In-flight copy stages
+(`.dm-stage-*`) are filtered out of the listing, so a copy in progress never appears as a file you
+can rename or delete.
 
 The server (`data_manager.mjs`, port 7682, zero dependencies) clamps every operation to the
 navigable roots, writes through a temp file + `rename()`, and refuses to follow symlinks out of a
 root.
+
+**Copy / move / duplicate (0.1.31).** Tick rows to raise the selection bar (*Copy*, *Move*, *Duplicate*
+beside *Download* / *Delete*); *Copy* and *Move* fill an in-page clipboard and the toolbar's
+**Paste (N)** button (disabled while the clipboard is empty or the current root is read-only)
+opens a confirm dialog naming the destination directory, the item count and the conflict policy
+(*Overwrite* / *Keep both* / *Skip*), then POSTs `/api/copy` or `/api/move`. A paste consumes the
+clipboard — for a *copy* as well as a *move* — so the toolbar's **Paste (N)** button greys out once
+the items are pasted and the same selection can only be pasted again after a fresh *Copy* / *Move*
+(a deliberate re-selection, so a stale clipboard can never paste something the user has forgotten
+about). A paste whose request never reached the server keeps the clipboard so it can be retried.
+*Duplicate* acts on the selection immediately, with no dialog. Right-clicking a row opens a context
+menu (*Open/Edit*, *Download*, *Rename*, *Duplicate*, *Copy*, *Move*, *Delete*) — the old
+right-click-equals-rename behaviour is gone — and **Ctrl/Cmd+C** / **X** / **V** work while the
+selection is collapsed and focus is not in an input, textarea, contenteditable or Monaco.
+
+The server side is three JSON endpoints: `POST /api/copy` and `POST /api/move`
+(`{paths: [...], dest, onConflict}`) and `POST /api/duplicate` (`{paths: [...]}`). A processed
+request answers `200` even when individual items fail — `{ok: true, results: [{path, target?,
+renamed?, skipped?, noop?, error?}]}` — so one bad path never aborts the batch; a request that
+cannot be honoured at all (empty or non-string `paths`, a `dest` that does not exist or is not a
+directory, a forbidden destination) is refused up front with `4xx` and `{error}`, before anything
+is written. `POST /api/delete` now refuses a navigable root outright
+(`Cannot delete a workspace root`) — a pre-existing hole this release closes.
+
+Both ends resolve through the same `resolveSafe()` clamp, so source and destination must each
+land inside a navigable root — a source that *is* a root is refused per item. Refused per item:
+a missing source; a destination inside the source directory or equal to it (*cannot copy a folder
+into itself*); a destination on a read-only platform volume (`platformIntegration.readOnly`); a
+move whose source sits on such a volume; a socket/fifo/device source. `onConflict` defaults to
+**keep both** — the first free `name (N).ext` — so nothing is overwritten unless *Overwrite* was
+chosen; `skip` leaves an existing target untouched (`skipped: true`). Outside an overwrite a file
+is published with `link()` + `unlink()`, not `rename()`: `link()` is atomic and fails `EEXIST`,
+so *keep both* can never silently replace a file that appeared while the copy was running — that
+item fails with *An item with that name appeared while copying — nothing was overwritten*
+instead. An overwrite moves the old entry aside and renames the staged copy into its place,
+renaming the old back if that swap fails, so a failed overwrite never destroys what was there.
+
+Symlinks are never dereferenced: a link inside a copied tree is recreated as a link, while a
+link named directly as the source is resolved first (`resolveSafe()` realpaths its input), so
+the copy is the target's content under the target's name — and a link that leaves the workspace
+is refused outright (`Forbidden`). Copies keep file mode and mtime and work for files and whole
+trees; a transfer stops at 20,000 entries (the archive extractor's ceiling) or when the browser
+goes away mid-copy, both reported per item. A move is `rename()` first with a copy + delete
+fallback on `EXDEV`, so cross-volume moves work; moving an item into its own parent directory is
+a no-op success (`noop: true`), and an open editor follows the file. *Duplicate* creates a
+sibling — `report.txt` → `report (copy).txt` → `report (copy 2).txt`, a folder `proj` →
+`proj (copy)` — and never overwrites. The listing and the storage panel reload afterwards, and a
+toast summarises the batch (N copied/moved/duplicated, M skipped, K renamed, plus the first
+error). This release also bumps `RUNTIME_REV` to 28, so existing units re-stamp onto the new
+`data_manager.mjs` / `data_manager.html` on the next reconcile — no user action needed.
 
 ## Workspaces
 
