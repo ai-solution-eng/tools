@@ -1544,6 +1544,9 @@ async def _proxy_json(
         _uid = _span_user_id(key)
         if _uid:
             _span_attrs["user.id"] = _uid
+        _key_name = getattr(key, "name", "")
+        if _key_name:
+            _span_attrs["key.name"] = str(_key_name)
         tracing.start_span(
             "chat",
             _span_attrs,
@@ -3043,6 +3046,9 @@ async def _relay_sse(
     _uid = _span_user_id(getattr(ledger, "_key", None))
     if _uid:
         _span_attrs["user.id"] = _uid
+    _key_name = getattr(getattr(ledger, "_key", None), "name", "")
+    if _key_name:
+        _span_attrs["key.name"] = str(_key_name)
     span = tracing.start_span("chat", _span_attrs)
 
     try:
@@ -6014,6 +6020,7 @@ async def chat_completions(
                         model,
                         key_id=key.id,
                         user_id=key.user_id,
+                        key_name=key.name,
                         key_fraction=off_base,
                         # GOVERNED PER PROFILE (2026-11-03): the relay cap is a
                         # BUDGET IN UNITS, not a round count. The profile's

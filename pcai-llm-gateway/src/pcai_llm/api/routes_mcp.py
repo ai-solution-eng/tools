@@ -1599,8 +1599,9 @@ class _GatewayMCPServer(MCPServer):
             _span_uid = getattr(_span_key, "user_id", None)
             if _span_uid:
                 _span_attrs["user.id"] = str(_span_uid)
+            _span_name = flat_tool_name(_span_server, _span_tool) if _span_server else name
             tracing.start_span(
-                name,
+                _span_name,
                 _span_attrs,
                 start_ns=time.time_ns() - _span_ms * 1_000_000,
             ).end()
