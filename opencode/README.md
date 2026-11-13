@@ -52,7 +52,19 @@ allow forging any user's cookie. The router's Role grants namespace-wide
 `existingAuthSecret` says.
 
 The Secret is **not** managed by Helm: it survives `helm upgrade` and
-`helm uninstall`, and rotating a value takes effect on the next unit start.
+`helm uninstall`. **Rotating a value needs a router restart** — the router reads
+these as env at container start, so a patched Secret alone changes nothing:
+
+```sh
+kubectl -n <namespace> rollout restart deploy/<release>
+```
+
+Rotating `SESSION_SECRET` additionally requires bumping `RUNTIME_REV`: each
+unit's auth sidecar carries a literal `SESSION_KEY` derived from it.
+
+**Upgrading from a release that rendered its own Secret (<= 1.2.29):** Helm
+deletes `<release>-auth` during the upgrade. Copy the values out first and reuse
+the same `SESSION_SECRET`, or every logged-in user is signed out.
 Leaving `existingAuthSecret` empty falls back to a chart-managed Secret built
 from `sessionSecret`/`auth`/`admin` — all five must then be non-empty or the
 render fails.
@@ -424,17 +436,24 @@ A web-based file manager is served at:
 https://opencode.{DOMAIN_NAME}/u-{slug}/data-manager
 ```
 
-It provides a full UI for navigating, uploading, downloading, and editing files across the **Personal**, **Shared**, and **Config** (`~/.config`) roots:
+It provides a full UI for navigating, uploading, downloading, copying, moving, and editing files across the **Personal**, **Shared**, and **Config** (`~/.config`) roots:
 
 - **Browse** — Folder tree with breadcrumb navigation across **Personal**, **Shared**, and **Config** (`~/.config`) roots. Hidden dotfiles (`.config`, `.git`, `.bashrc`, …) are shown in all roots.
 - **Upload** — Drag-and-drop (files **and** folders) or click-to-select. *Upload* also accepts compressed archives (.zip, .tar, .tar.gz, .tar.xz, .tar.zst) and unpacks them server-side in one request unless *Extract archives* is unticked; *Upload folder* keeps the tree (`webkitdirectory`). Per-file streamed uploads with progress, cancel and retry; the dialog sets the conflict policy (keep both / skip / overwrite), the permission policy (644/664/755/775) and hidden/temporary-entry skipping (`.git`, `.venv`, `~$…` Office lock files, `Thumbs.db` — on by default). Per-file ceiling `dataManager.clientMaxBodySize` (default `2g`).
 - **Download** — Single files download directly (with optional rename); multiple files or folders are archived as ZIP or TAR.GZ with a custom filename.
+- **Copy / Move / Duplicate** — Tick rows to raise the selection bar (*Copy*, *Move*, *Duplicate*, beside *Download* and *Delete*). *Copy* and *Move* fill an in-page clipboard and the toolbar's **Paste (N)** button opens a confirm dialog naming the destination directory, the item count and the conflict policy (*Overwrite* / *Keep both* / *Skip*) before it POSTs; a *move* empties the clipboard, a *copy* keeps it, so one selection can be pasted into several places. *Duplicate* acts on the selection immediately — no dialog. Right-clicking a row opens a context menu (*Open/Edit*, *Download*, *Rename*, *Duplicate*, *Copy*, *Move*, *Delete*), and **Ctrl/Cmd+C** / **X** / **V** work whenever the selection is collapsed and focus is not in an input, textarea, contenteditable or Monaco.
 - **Edit** — Double-click any text file to open it in the Monaco editor (VS Code's editor engine) with syntax highlighting and save support. Binary or large files show metadata with a download option.
 - **Preview** — Double-clicking a previewable file renders it inline instead of opening the editor: images, PDF (native viewer with Range seeks), audio and video, and as of 1.2.29 **markdown and HTML** too. `.md` is rendered server-side by `/api/preview` — escape-first, zero dependencies, **no raw-HTML passthrough** (a `<script>` written in a `.md` file is displayed as text and never executed) — with GFM tables, task lists, nested lists, fenced code and relative links/images resolved against the file's own folder. `.html` is served **verbatim**, so an exported report keeps its own markup, but under `Content-Security-Policy: sandbox` — opaque origin, scripts cannot run, nothing remote may load — inside an iframe that also carries `sandbox=""`. Both are read-only; a **Source / Rendered** toggle in the dialog footer returns to Monaco, so `.md` and `.html` stay editable.
 - **CRUD** — Create folders, create files, rename/move, and delete (recursive for directories).
 - **Storage Status** — A collapsible panel shows real-time PVC usage (bytes + inodes) for Personal, Shared, and State volumes, with color-coded usage bars.
 
 The data manager runs as a zero-dependency Node.js process (`data_manager.mjs`) inside the user pod on port 7682, alongside ttyd and the opencode supervisor. All file operations are path-traversal-protected (clamped to `/workspace/personal`, `/workspace/shared`, and `/var/opencode/home/.config`). Uploads stream to a temp file beside the destination and `rename()` into place, so a partial transfer never appears as a file; `.zip` extraction validates every entry before writing anything and never installs symlinks.
+
+**Copy, move and duplicate** are three JSON endpoints next to the rest of the API — `POST /api/copy` and `POST /api/move` take `{paths: [...], dest, onConflict}` (`onConflict` is `rename` | `overwrite` | `skip`), `POST /api/duplicate` takes `{paths: [...]}`. A request that is processed answers `200` even when some items fail — `{ok: true, results: [{path, target?, renamed?, skipped?, noop?, error?}]}` — so one bad path never aborts the batch; a request that cannot be honoured at all (empty or non-string `paths`, a `dest` that does not exist or is not a directory, a forbidden destination) is rejected up front with a `4xx` and `{error}`, before anything is written.
+
+Both ends of every operation go through the same `resolveSafe()` clamp as the rest of the UI, so a source and its destination must each land inside a navigable root (Personal, Shared, Config, plus the platform roots when mounted) — a source that *is* a navigable root is refused per item. Refused per item, not per request: a missing source; a destination inside the source directory (or equal to it — *cannot copy a folder into itself*); a destination on a read-only platform volume (`platformIntegration.readOnly`); a move whose source sits on such a volume; a socket/fifo/device source. The conflict policy defaults to **keep both** (`rename`), which picks the first free `name (N).ext`; `skip` leaves an existing target untouched and reports `skipped: true`; only an explicit `overwrite` replaces a target, and even then the new content is staged under a temporary name in the destination and `rename()`d over the old entry, so a failed overwrite never destroys what was there. Copies never follow symlinks (a link is copied as a link), preserve file mode and mtime, and work for a single file or a whole tree.
+
+A move is `rename()` first and falls back to copy + delete on `EXDEV`, so cross-volume moves (Personal ↔ Shared, or onto a platform root) work; moving an item into its own parent directory is a no-op success (`noop: true`) rather than an error, and an open editor follows the file — the client rewrites its current path after the move. *Duplicate* never asks: it creates a sibling — `report.txt` → `report (copy).txt` → `report (copy 2).txt`, a folder `proj` → `proj (copy)` — and never overwrites. After any of the three the listing and the storage panel reload, and a toast summarises the batch (N copied/moved/duplicated, M skipped, K renamed, plus the first error).
 
 Previewed documents never execute in the data-manager origin. Markdown is HTML-escaped **before** any parsing — there is no sanitizer to keep in sync and no raw-HTML branch, and every tag in the rendered page is written by `data_manager.mjs` itself — while link and image targets are limited to http(s), mailto and relative paths, so a `javascript:` URL is dropped and shown as plain text. HTML files are isolated twice over: the CSP `sandbox` directive makes the document an opaque origin that cannot run script or reach the parent frame, and the iframe carries `sandbox=""` as well. Blockquote/list nesting is capped at `MD_MAX_DEPTH` (12) levels and deeper structures are flattened, so a pathological file cannot stall the single-threaded server; a `.md` above the 5 MiB text cap renders a "too large to render — use Download" notice instead of the document.
 

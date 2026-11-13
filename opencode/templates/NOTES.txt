@@ -35,8 +35,16 @@ Required keys (all five):
     logs every user out. To change a single value:
       kubectl -n {{ $ns }} patch secret {{ $secretName }} --type merge \
         -p '{"stringData":{"ADMIN_PASSWORD":"<new>"}}'
-  * Not managed by Helm: it survives helm upgrade and helm uninstall, and a
-    rotated value takes effect on the next unit start.
+  * Not managed by Helm: it survives helm upgrade and helm uninstall.
+  * ROTATION needs a router restart — the router reads these as env at
+    container start, so a patched Secret alone changes nothing:
+      kubectl -n {{ $ns }} rollout restart deploy/{{ .Release.Name }}
+    Rotating SESSION_SECRET additionally requires bumping RUNTIME_REV: each
+    unit's auth sidecar carries a literal SESSION_KEY derived from it.
+  * UPGRADING from a release that rendered its own Secret (<= 1.2.29)? Helm
+    deletes "{{ .Release.Name }}-auth" on upgrade. Copy the values out FIRST
+    (kubectl -n {{ $ns }} get secret {{ .Release.Name }}-auth -o jsonpath='{.data}')
+    and reuse the same SESSION_SECRET, or every logged-in user is signed out.
   * Platform (SSO) units get only OPENCODE_SERVER_USERNAME / _PASSWORD
     mirrored into their project namespace — never SESSION_SECRET.
   * Router pod stuck in CreateContainerConfigError => the Secret, or one of
