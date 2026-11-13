@@ -1561,10 +1561,15 @@ class _GatewayMCPServer(MCPServer):
         # a tool error into a tracing error.
         _span_started = time.monotonic()
         _span_ok = True
+        # Two-tool mode passes "mcp_call" as the name; the real target is in the
+        # arguments. Flat mode overwrites this below with the resolved split.
+        _span_server = str(arguments.get("server") or "") if name == "mcp_call" else ""
+        _span_tool = str(arguments.get("tool") or name) if name == "mcp_call" else name
         try:
             if settings.mcp_flat_tools and name not in _GATEWAY_TOOLS:
                 servers = await registry.mcp_servers()
                 server, tool = resolve_flat_name(name, [s["name"] for s in servers])
+                _span_server, _span_tool = server, tool
                 result = await _gated_mcp_call(server, tool, arguments, failover=True)
                 return CallToolResult(content=[TextContent(type="text", text=result)])
             return await super().call_tool(name, arguments, context)
@@ -1575,16 +1580,29 @@ class _GatewayMCPServer(MCPServer):
             raise
         finally:
             _span_ms = int((time.monotonic() - _span_started) * 1000)
+            _span_attrs: dict[str, Any] = {
+                "langfuse.observation.type": "span",
+                "langfuse.trace.name": "tool",
+                "mcp.tool": _span_tool,
+                "mcp.surface": "mcp",
+                "duration_ms": _span_ms,
+                "tool.status": "ok" if _span_ok else "error",
+            }
+            if _span_server:
+                _span_attrs["mcp.server"] = _span_server
+            # _caller.get(), not _current_key(): the latter raises when unset,
+            # and a span may never raise.
+            _span_key = _caller.get()
+            _key_name = getattr(_span_key, "name", "")
+            if _key_name:
+                _span_attrs["mcp.key_name"] = str(_key_name)
+            _span_uid = getattr(_span_key, "user_id", None)
+            if _span_uid:
+                _span_attrs["user.id"] = str(_span_uid)
+            _span_name = flat_tool_name(_span_server, _span_tool) if _span_server else name
             tracing.start_span(
-                name,
-                {
-                    "langfuse.observation.type": "span",
-                    "langfuse.trace.name": "tool",
-                    "mcp.tool": name,
-                    "mcp.surface": "mcp",
-                    "duration_ms": _span_ms,
-                    "tool.status": "ok" if _span_ok else "error",
-                },
+                _span_name,
+                _span_attrs,
                 start_ns=time.time_ns() - _span_ms * 1_000_000,
             ).end()
 

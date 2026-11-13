@@ -1434,6 +1434,9 @@ async def relay_stream(
     model: str,
     key_id: uuid.UUID | None = None,
     user_id: uuid.UUID | None = None,
+    # The calling key's LABEL (admin-set, not a person's name). Rides the
+    # chat span so a trace is readable without resolving the UUID.
+    key_name: str = "",
     # the KEY's configured off-peak base (profile fraction ?? env default);
     # effective() applies the CURRENT demand state at each settle moment
     key_fraction: float = 1.0,
@@ -2016,6 +2019,8 @@ async def relay_stream(
         # unknown so no blank user rows are created.
         if user_id:
             _span_attrs["user.id"] = str(user_id)
+        if key_name:
+            _span_attrs["key.name"] = str(key_name)
         # Conversation grouping. thread_id is the gateway's OWN fingerprint of
         # the message history (canonical.thread_key), so every turn of one
         # conversation groups into the same Langfuse session — no client change
