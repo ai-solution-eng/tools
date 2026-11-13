@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Remote ASR endpoint">
+  <g fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="24" y="6" width="16" height="30" rx="8"/>
+    <path d="M48 30v4a16 16 0 0 1-32 0v-4"/>
+    <path d="M32 50v8"/>
+    <path d="M24 58h16"/>
+  </g>
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity="0.6">
+    <path d="M52 22a10 10 0 0 1 0 14"/>
+    <path d="M57 17a17 17 0 0 1 0 24"/>
+  </g>
+</svg>

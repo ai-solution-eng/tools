@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote ASR endpoint",
+    "description": "Sends voice recordings to an HTTP speech-recognition endpoint instead of the local recognizer. The endpoint, protocol, credentials and request shape are configured in cordis.patch.yml."
+  }
+}

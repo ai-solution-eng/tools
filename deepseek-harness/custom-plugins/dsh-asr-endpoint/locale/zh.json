@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "远程 ASR 端点",
+    "description": "将录音发送到 HTTP 语音识别端点，而不是使用本地识别器。端点、协议、凭据和请求结构均在 cordis.patch.yml 中配置。"
+  }
+}

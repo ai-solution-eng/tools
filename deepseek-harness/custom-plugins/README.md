@@ -13,6 +13,7 @@ shared between users.
 |---|---|---|---|
 | [`dsh-app-shortcuts`](dsh-app-shortcuts/README.md) | Terminal / Data Manager / Login buttons at the sidebar foot (`sidebar.footer.action`) | none — `apply()` has no behaviour | three same-origin links, opened in a new tab |
 | [`dsh-mcp-status`](dsh-mcp-status/README.md) | An `MCP` row below the composer: which MCP servers are connected, probe latency, tool counts, and the upstream servers behind a federating one | discovers the `@deepseek-ai/dsh-mcp-client` rows, probes each endpoint with a real MCP handshake, serves `GET /api/mcp-status` | the composer-dock row and its expandable panel |
+| [`dsh-asr-endpoint`](dsh-asr-endpoint/README.md) | Voice input that transcribes through **your own HTTP ASR endpoint** instead of the local SenseVoice model — URL, protocol, credentials and request shape all set in `cordis.patch.yml` | registers one remote `ctx.speechToText` provider (`location: 'cloud'`, no `preparation`); posts the recording as OpenAI-compatible multipart, whisper.cpp multipart, base64 JSON or raw WAV | none — the mic comes from the upstream `client-ui-voice-input` row this bundle inserts |
 
 ## Anatomy of a plugin
 

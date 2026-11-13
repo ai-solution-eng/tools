@@ -1,0 +1,86 @@
+# Remote ASR endpoint bundle.
+#
+# Replaces the local SenseVoice recognizer with a provider that sends the
+# recording to an HTTP endpoint. Four rows are required:
+#
+#   1. asr-speech-to-text     the provider registry itself; `defaultProvider`
+#                             must equal the provider id in row 2
+#   2. asr-endpoint           this plugin: registers the remote provider
+#   3. asr-api-speech-to-text the speech/* Remote routes the browser calls
+#   4. asr-ui-voice-input     the microphone in the composer
+#
+# Rows 1, 3 and 4 are upstream packages that ship with dsh; only row 2 is this
+# plugin. Row ids are `asr-*` prefixed on purpose: a profile patch targets rows
+# by id, so reusing the upstream ids (`speech-to-text`, `api-speech-to-text`,
+# `ui-voice-input`) would silently retarget a later install of
+# `@deepseek-ai/dsh-experimental-voice-input-bundle`.
+#
+# Do NOT install `@deepseek-ai/dsh-experimental-voice-input-bundle` alongside
+# this bundle: it would mount the same packages and the same service rows twice,
+# which fails at activation ("Speech provider already registered", or
+# "package X resolves from multiple active Loader sources").
+- insert:
+    - id: asr-speech-to-text
+      name: '@deepseek-ai/dsh-experimental-speech-to-text'
+      config:
+        # Must equal `providerId` on the asr-endpoint row below.
+        defaultProvider: asr-endpoint
+        # Must be present in the provider's `languages` list.
+        language: auto
+    - id: asr-endpoint
+      name: '@local/dsh-asr-endpoint'
+      config:
+        # Required. Absolute http(s) URL of the transcription endpoint.
+        # This default points at the in-cluster PCAI LLM gateway, whose
+        # /v1/audio/transcriptions is OpenAI-compatible passthrough. Replace it
+        # with your own server, or override this row in the profile patch.
+        endpoint: http://pcai-llm-gateway-service.pcai-llm.svc.cluster.local:9200/v1/audio/transcriptions
+        protocol: openai
+        # Deliberately empty. The gateway forwards the multipart body VERBATIM
+        # to the voice upstream, so a `model` field here reaches the upstream
+        # and is rejected ("The model `cohere-transcribe` does not exist").
+        # Name the model out-of-band instead (header or ?model=) and send no
+        # multipart model field. Set this only for a server that needs it.
+        model: ''
+        # The gateway's own model-resolution channel (it also accepts ?model=).
+        # Delete this and set `model` above for a plain OpenAI-compatible server.
+        headers:
+          X-PCAI-Model: cohere-transcribe
+        # Read from the environment at request time; leave empty for no auth.
+        apiKeyEnv: PCAI_LLM_KEY
+        # Every value below is optional; the defaults shown are what the plugin
+        # uses. Uncomment a line to override it.
+        #
+        # protocol: openai            # openai | whisper-cpp | json | raw
+        # model: ''                   # sent as the `model` field; empty omits it
+        # apiKey: ''                  # literal key (discouraged; prefer apiKeyEnv)
+        # apiKeyEnv: PCAI_LLM_KEY     # env var name, read at request time
+        # authHeader: Authorization   # header carrying the key
+        # authScheme: 'Bearer '       # prefix before the key (trailing space kept)
+        # headers: {}                 # extra request headers
+        # providerId: asr-endpoint    # registration id; must equal defaultProvider
+        # displayName: ''             # shown in the voice UI; defaults to the host name
+        # languages:                  # accepted language hints; `auto` must be present
+        #   - auto
+        #   - en
+        #   - zh
+        #   - de
+        #   - fr
+        #   - es
+        #   - it
+        #   - pt
+        #   - ja
+        #   - ko
+        # requestTimeoutMs: 120000    # per-request deadline
+        # maxAudioBytes: 16777216     # reject larger recordings before sending
+        # responsePath: text          # dot path into a JSON response; `choices.0.text` works
+        # audioField: file            # multipart field name for the audio
+        # languageField: language     # field name for the language hint
+        # modelField: model           # field name for the model
+        # responseFormat: json        # multipart `response_format` value
+        # sendLanguageWhenAuto: false # send `language` even when it is `auto`
+        # extraFields: {}             # extra multipart / JSON fields
+    - id: asr-api-speech-to-text
+      name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
+    - id: asr-ui-voice-input
+      name: '@deepseek-ai/dsh-experimental-client-ui-voice-input'

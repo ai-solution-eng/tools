@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-asr-endpoint",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Remote HTTP speech recognition for the Harness voice input: point the endpoint at an OpenAI-compatible, whisper.cpp, JSON or raw transcription server, configured in cordis.patch.yml.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "test/*.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
