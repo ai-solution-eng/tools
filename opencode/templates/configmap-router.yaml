@@ -183,7 +183,21 @@ data:
     // charts: the shipped default is 27 and it is ALWAYS appended, so bumping
     // it in values.yaml (or an EzAppConfig values blob) re-stamps every unit on
     // the next reconcile — no chart edit needed.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 27 }}'
+    // r27: markdown previews are framed SAME-ORIGIN. A sandboxed (opaque-origin)
+    // preview made every link clicked inside it a cross-site navigation, so the
+    // SameSite=Lax SSO + unit session cookies were dropped and the click landed
+    // on the ingress without a session (403 / login page) while the initial
+    // preview rendered fine. Raw .html previews keep the full sandbox.
+    // r28: a rendered page opened from another page carries a "back to <page>"
+    // bar, and every link it emits keeps the theme. The ancestor trail rides in
+    // the 'from' query parameter, so walking back works at any depth and the
+    // root of the chain has no bar. Server-rendered: the preview CSP still
+    // forbids scripts.
+    // r29: the edit dialog follows the preview. A rendered document navigates on
+    // its own (in-document links, the back chip); the dialog now adopts the page
+    // it is actually showing, so Source / Rename / Delete / Save act on THAT file
+    // instead of the one the dialog was opened with.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 30 }}'
     const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the

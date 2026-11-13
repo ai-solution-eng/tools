@@ -90,7 +90,7 @@ dataManager:
 # changes the router patches each Deployment and the unit rolls.
 # Always rendered into the marker as the '-r<value>' suffix (same contract as
 # the dsh and openwork charts). Bump it whenever the pod template changes.
-RUNTIME_REV: 27
+RUNTIME_REV: 30
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
