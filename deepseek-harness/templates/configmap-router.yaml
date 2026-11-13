@@ -159,11 +159,23 @@ data:
     // 46 (0.4.39): dsh 0.2.2-rc.1 on node:24.22.2 (dsh declares
     // engines.node >= 24.9.0), pnpm baked into /opt/dsh/npm for the plugin
     // manager, and the isLoopback patch applied to EVERY lib/client*.js.
+    // 47 (0.4.41): the data manager gains copy / move / duplicate for files and
+    // folders — POST /api/copy, /api/move and /api/duplicate, a selection-bar
+    // Copy/Move/Duplicate, a Paste button with a confirm dialog, a row context
+    // menu and Ctrl/Cmd+C/X/V; /api/delete also stops accepting a navigable
+    // workspace root. The markdown preview's relative links are fixed too
+    // (#fragment handling, non-.md targets, folder deep links, a 403 that says
+    // why). A re-stamp, because data_manager.mjs/.html are subPath mounts that
+    // never refresh on their own.
+    // 48 (0.4.42): the data-manager clipboard is one-shot — a paste consumes it
+    // for a COPY as well as a move, so Paste greys out instead of staying armed
+    // and the same items can only be pasted again after a fresh Copy/Move. A
+    // re-stamp, because data_manager.html is a subPath mount.
     // Operator-tunable: set RUNTIME_REV in values.yaml (or an EzAppConfig
     // values blob) to force every user unit to re-stamp on the next
     // reconcile — no chart edit needed. The code default stays frozen at 44 so an
     // install that never sets RUNTIME_REV keeps its historical value (no
-    // surprise rollout); values.yaml ships 46.
+    // surprise rollout); values.yaml ships 48.
     const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:

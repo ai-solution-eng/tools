@@ -17,7 +17,7 @@ Below is a list of the available tools.
 | [skills/pcai-app-import](skills/pcai-app-import/README.md) | Experimental skill that deploys a ported Helm chart to PCAI, given the existing installation of the ezapp-deploy MCP server. |
 | [s3-browser](s3-browser/README.md) | Web-based browser for navigating S3-compatible object storage.|
 | [opencode](opencode/README.md) | Deploy and manage multiple isolated [opencode](https://opencode.ai) coding-agent environments on PCAI. |
-| [deepseek-harness](deepseek-harness/README.md) | Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.com/deepseek-ai/deepseek-harness) coding-agent environments on PCAI. |
+| [deepseek-harness](deepseek-harness/README.md) | Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.com/deepseek-ai/deepseek-harness) coding-agent environments on PCAI. Contributed `dsh` UI plugins live in [custom-plugins](deepseek-harness/custom-plugins/README.md). |
 | [agents-bar](agents-bar/README.md) | A room where agents from different organizations meet and talk. Table mode: invite-only seats, a deterministic bartender, turn packets, org-run patrons. Wire mode: each org brings an OpenAI-compatible `/v1` endpoint and the bar is an async message bus with durable mailboxes, one step in flight per agent, and a hash-chained transcript. |
 
 ## How to push container images to GitHub
