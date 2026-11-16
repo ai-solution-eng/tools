@@ -1,0 +1,20 @@
+# Configuration file bundle.
+#
+# One Host row. It registers an authenticated, read-only Fetch route that answers
+# the active profile's configuration file: the absolute path and its text, read
+# from ctx.settings.prepareDocument() (falling back to ctx.configEditor.documentPath).
+#
+# The browser half (declared by `dsh.client` in package.json) replaces the Settings
+# header action "Open configuration file" with one that renders that text inside the
+# Web UI. It registers the shipped cell id `open-document` at a lower priority, which
+# is how a list-slot cell is shadowed, so there is still exactly one such button.
+#
+# The route accepts no path parameter and never writes: it can only ever answer the
+# one document the Host's own settings service prepares.
+- insert:
+    - id: config-document
+      name: '@local/dsh-config-document'
+      # Both values below are optional; the defaults shown are what the plugin uses.
+      # config:
+      #   routePath: /api/config-document   # authenticated route the browser half reads
+      #   maxBytes: 1048576                 # response cap; larger documents are truncated and flagged

@@ -1,0 +1,17 @@
+# MCP servers bundle.
+#
+# One Host row. Its `servers` field is the live list the Settings page edits;
+# each enabled entry becomes a `@deepseek-ai/dsh-mcp-client` child mounted from
+# this row, so the server's tools appear as mcp__<serverName>__<tool>.
+#
+# The browser half (declared by `dsh.client` in package.json) renders the page
+# at Settings -> MCP servers.
+#
+# Editing this list by hand works too: the plugin reconciles on load and on
+# every volatile update. Prefer the page, which validates names and endpoints
+# and writes through the config editor (comments preserved).
+- insert:
+    - id: mcp-servers
+      name: '@local/dsh-mcp-servers'
+      config:
+        servers: []
