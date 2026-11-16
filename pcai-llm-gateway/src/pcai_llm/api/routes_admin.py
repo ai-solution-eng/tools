@@ -4885,12 +4885,26 @@ def _fold_unit_rows(rows: list[Any], group_cols: tuple[str, ...]) -> list[dict[s
     """
     folded: list[dict[str, Any]] = []
     by_unit: dict[tuple[Any, ...], dict[str, float]] = {}
+    seen: set[tuple[Any, ...]] = set()
     for r in rows:
         d = dict(r)
         unit_kind = d.pop("unit_kind", None)
         unit_units = d.pop("unit_units", None)
         key = tuple(d.get(c) for c in group_cols)
         if unit_kind is None:
+            # DEFENCE IN DEPTH (2026-11-13 duplicate-row report): GROUPING
+            # SETS emits the (group) total AND, when the data carries NULL
+            # unit_kinds, a (group, unit_kind) row whose unit_kind is also
+            # NULL. For an all-NULL group the two are IDENTICAL; for a mixed
+            # group the second is a PARTIAL wearing the total's name (the
+            # live 18-vs-5 cohere-transcribe pair). The SQL's HAVING is the
+            # primary fix (it never returns the phantom); this guard keeps a
+            # reverted/older query from resurrecting the duplicate. Only the
+            # total and the NULL subrow can share a key, so dropping a
+            # repeated key is safe.
+            if key in seen:
+                continue
+            seen.add(key)
             folded.append(d)
         else:
             by_unit.setdefault(key, {})[str(unit_kind)] = float(unit_units or 0.0)
@@ -5002,7 +5016,14 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
                -- total row's billable_units_by_unit object in Python.
                COALESCE(SUM(billable_units), 0)::float             AS unit_units
         FROM usage_ledger{_cond}
+        -- GROUPING SETS is a UNION ALL of the grouping sets: for rows whose
+        -- unit_kind is NULL (every ordinary chat row) the (model, unit_kind)
+        -- set emits a group that DUPLICATES the (model) total — and for a
+        -- mixed group it emits a PARTIAL with the same name (the 2026-11-13
+        -- "every usage row twice" report). Keep only the true total row and
+        -- the real per-unit subrows.
         GROUP BY GROUPING SETS ((model), (model, unit_kind))
+        HAVING GROUPING(unit_kind) = 1 OR unit_kind IS NOT NULL
         ORDER BY model, unit_kind NULLS FIRST
         """,
         *_win,
@@ -5047,7 +5068,11 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
         LEFT JOIN api_keys k ON k.id = l.key_id
         LEFT JOIN users u ON u.id = k.user_id
         {_cond_l}
+        -- Same NULL-subrow trap as the by-model rollup (see above): the
+        -- (k.name, u.name, unit_kind) set re-emits the total row when
+        -- unit_kind is NULL, which is every chat row.
         GROUP BY GROUPING SETS ((k.name, u.name), (k.name, u.name, l.unit_kind))
+        HAVING GROUPING(l.unit_kind) = 1 OR l.unit_kind IS NOT NULL
         ORDER BY k.name, u.name, l.unit_kind NULLS FIRST
         """,
         *_win,

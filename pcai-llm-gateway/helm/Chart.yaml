@@ -10,8 +10,8 @@ description: >-
   health/failover, federated MCP (/mcp) with per-tool ACLs, and virtual
   API keys with day/week/month token budgets and an atomic usage ledger.
 type: application
-version: 4.1.0
-appVersion: "v4.1.0"
+version: 4.1.3
+appVersion: "v4.1.3"
 keywords:
   - llm
   - gateway

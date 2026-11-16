@@ -41,7 +41,7 @@ Model Manager is a web UI plus a FastAPI service (a Python ASGI web application)
 ### Serving preparation
 
 - **NIM profile mirror** — runs the NIM 2.x image's own `mirror s3` as a Job, with a per-submission NGC key (deleted with the Job) and no GPU request, so an air-gapped cluster can serve from a pre-seeded bucket. [Design and operations](documentation/FEATURES.md#nim-profile-mirror)
-- **Model catalog + Push to MLIS** — a seeded, editable lab → model → configuration tree with composable filters; **versions are assigned by MLIS, not authored in the catalog**, so a catalog moved between instances does not carry stale version numbers; projects are canonicalized (the `project-` namespace prefix is stripped) and Mooncake/RDMA caveats are derived from the serving arguments rather than stored. [Why](documentation/FEATURES.md#the-model-catalog)
+- **Model catalog + Push to MLIS** — a seeded, editable lab → model → configuration tree with composable filters (GPU class, a GPU-count min/max window defaulting to what fits one node, full-text search), a link to the deployment's MLIS home page, and push feedback in the status line; **versions are assigned by MLIS, not authored in the catalog**, so a catalog moved between instances does not carry stale version numbers; projects are canonicalized (the `project-` namespace prefix is stripped) and Mooncake/RDMA caveats are derived from the serving arguments rather than stored. [Why](documentation/FEATURES.md#the-model-catalog)
 
 ### Inventory and integrity
 

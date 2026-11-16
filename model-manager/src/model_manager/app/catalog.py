@@ -264,21 +264,68 @@ MOONCAKE_RDMA_CAVEAT: dict = {
 }
 
 
+# Catalog-only caveat attached to the Local Inference Lab vLLM containers.
+# DERIVED for the same reason as the Mooncake caveat: one authored into
+# seed_catalog.json would never reach a catalog that already holds the entry
+# (the seed merge only ADDS), and it would ride into the Push-to-MLIS payload.
+#
+# NVIDIA publishes this container family's recipes as `docker run` commands
+# that pass POD-level settings the AIOLI packaged_models row has no column for
+# (db.COLUMNS carries no shm/ipc/volume field): --ipc host, --shm-size 16-32g,
+# and a writable /cache volume.  A default Kubernetes pod gets 64 MiB of
+# /dev/shm -- which breaks NCCL and vLLM's shared-memory paths -- and a
+# read-only rootfs fails on /cache.  MLIS, not this catalog, builds the pod.
+LOCAL_INFERENCE_POD_CAVEAT: dict = {
+    "id": "local-inference-pod",
+    "chip": "shm + /cache",
+    "title": "This container needs host IPC and a writable /cache",
+    "body": (
+        "The published recipe runs under `docker run --ipc host --shm-size 32g` "
+        "and mounts a named volume at /cache, but the catalog has no field for "
+        "pod-level settings -- MLIS builds the pod from its own template. A "
+        "default pod gives /dev/shm 64 MiB, which breaks NCCL and vLLM's "
+        "shared-memory paths, and a read-only rootfs fails on /cache. Check the "
+        "deployed predictor, then have MLIS supply hostIPC (or a memory-backed "
+        "emptyDir of at least 32Gi at /dev/shm) and a writable /cache."
+    ),
+    "commands": [
+        {
+            "label": "inspect the predictor pod",
+            "command": "kubectl -n <ns> get pod <predictor-pod> -o jsonpath='{.spec.hostIPC} {.spec.volumes}'",
+        },
+        {
+            "label": "check /dev/shm and /cache inside the pod",
+            "command": "kubectl -n <ns> exec <predictor-pod> -- df -h /dev/shm /cache",
+        },
+    ],
+}
+
+
+def entry_local_inference_pod(entry: dict) -> bool:
+    """True for the Local Inference Lab vLLM container family."""
+    return "local-inference-lab/vllm" in str(entry.get("image") or "").lower()
+
+
 def entry_caveats(entry: dict) -> list[dict]:
     """Operational caveats the UI shows for a configuration (never pushed).
 
     A caveat is something the catalog cannot express in the config itself, so
     the user has to do it by hand after deploy.  Returned as a copy so callers
-    cannot mutate the module constant.
+    cannot mutate the module constants.
     """
-    if not entry_mooncake(entry):
-        return []
-    return [
-        dict(
-            MOONCAKE_RDMA_CAVEAT,
-            commands=[dict(command) for command in MOONCAKE_RDMA_CAVEAT["commands"]],
-        )
-    ]
+    caveats: list[dict] = []
+    for detected, template in (
+        (entry_mooncake(entry), MOONCAKE_RDMA_CAVEAT),
+        (entry_local_inference_pod(entry), LOCAL_INFERENCE_POD_CAVEAT),
+    ):
+        if detected:
+            caveats.append(
+                dict(
+                    template,
+                    commands=[dict(command) for command in template["commands"]],
+                )
+            )
+    return caveats
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +482,25 @@ def entry_gpus(entry: dict) -> str:
     return "0"
 
 
+def entry_gpu_count(entry: dict) -> int:
+    """Integer GPU count a configuration reserves (0 when it reserves none).
+
+    The resource fields are free-form JSON (a string "4" or a number 4 both
+    occur), so an unparseable or negative value degrades to 0 -- the same
+    fail-safe as entry_gpus, which keeps a rogue entry from crashing the tree
+    render or the GPU-count filter.  The count is DERIVED, never stored, and
+    drives the catalog's min/max window: 0 means a shared configuration that
+    reserves no whole GPU, not a configuration without a GPU.
+    """
+    try:
+        value = float(entry_gpus(entry))
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value)
+
+
 def entry_publisher(entry: dict) -> str:
     """Org segment of the model path (the repo the weights came from).
 
@@ -485,6 +551,22 @@ TIER_INFO = {
     "h200": {"quants": ["FP8"], "vram_gb": 141},
     "rtx-pro-6000": {"quants": ["FP8", "NVFP4"], "vram_gb": 96},
     "l40s": {"quants": ["FP8"], "vram_gb": 48},
+}
+
+# Default GPU-count window for the catalog's min/max filter, per GPU class.
+# H200 nodes are provisioned with four GPUs and RTX Pro 6000 / L40S nodes with
+# two, so the catalog opens on the configurations that fit one of those nodes
+# instead of every configuration in the file.  The "" key is the All view.
+# These are DEFAULTS ONLY: the page's two number inputs are editable, blank
+# means that end is unbounded, and the UI re-seeds them from here whenever the
+# GPU class changes.  A count of 0 (a shared configuration that reserves no
+# whole GPU) sits outside the default window, so it is reached by lowering the
+# minimum to 0.
+GPU_COUNT_DEFAULTS: dict[str, dict[str, int]] = {
+    "": {"min": 1, "max": 4},
+    "h200": {"min": 1, "max": 4},
+    "rtx-pro-6000": {"min": 1, "max": 2},
+    "l40s": {"min": 1, "max": 2},
 }
 
 
@@ -669,6 +751,9 @@ class Catalog:
                     "unvalidated": entry_unvalidated(entry),
                     "shared_gpu": entry_shared_gpu(entry),
                     "gpus": entry_gpus(entry),
+                    # Numeric form of "gpus" for the min/max window: the UI
+                    # filters on this, not on the display string.
+                    "gpu_count": entry_gpu_count(entry),
                     "publisher": entry_publisher(entry),
                     "model_id": extract_model_id(entry),
                     "entry": entry,

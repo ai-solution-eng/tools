@@ -24,7 +24,15 @@ from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, field_validator, model_validator
 
 from . import oidc_identity
-from .catalog import TIER_INFO, TIER_LABELS, TIERS, Catalog, entry_quant, entry_unvalidated
+from .catalog import (
+    GPU_COUNT_DEFAULTS,
+    TIER_INFO,
+    TIER_LABELS,
+    TIERS,
+    Catalog,
+    entry_quant,
+    entry_unvalidated,
+)
 from .db import AioliDB
 from .gc import (
     VERDICT_BLOCK,
@@ -101,6 +109,22 @@ CATALOG_GITHUB_URL = os.environ.get("CATALOG_GITHUB_URL", "")
 # verify-on; behind a corporate MITM proxy with an untrusted cert a site
 # sets it false explicitly.
 CATALOG_GITHUB_VERIFY_TLS = os.environ.get("CATALOG_GITHUB_VERIFY_TLS", "true").strip().lower() == "true"
+
+
+def _resolve_mlis_url(raw: str) -> str:
+    """The MLIS home-page URL, or "" when unset or still an unresolved placeholder.
+
+    The chart default is https://mlis.${DOMAIN_NAME}; PCAI substitutes the
+    domain before rendering.  A render outside PCAI leaves the literal
+    placeholder, which is not a link -- hide it rather than shipping a dead one.
+    """
+    url = (raw or "").strip()
+    return "" if "${" in url else url
+
+
+# MLIS home page linked from the catalog (chart: catalog.mlisUrl).  Empty = no
+# link: the catalog page hides the button rather than pointing nowhere.
+MLIS_URL = _resolve_mlis_url(os.environ.get("MLIS_URL", ""))
 # Namespace dropdown search on the front page: only namespaces with this
 # prefix are offered (empty prefix offers every namespace).
 NAMESPACE_PREFIX = os.environ.get("NAMESPACE_PREFIX", "project-user-")
@@ -506,6 +530,12 @@ async def _page_context(request: Request | None = None) -> dict:
         "tier_labels": TIER_LABELS,
         "tier_info": TIER_INFO,
         "tiers": TIERS,
+        # Per-GPU-class default min/max GPU count, rendered onto the catalog
+        # page's filter controls (and onto each class radio, so the browser
+        # re-seeds the inputs from the server's numbers instead of its own).
+        "gpu_count_defaults": GPU_COUNT_DEFAULTS,
+        # MLIS home page linked from the catalog ("" = hide the link).
+        "mlis_url": MLIS_URL,
         "storage_backend": STORAGE_BACKEND,
         "storage_default": _storage_default(),
         "storage_options": _storage_allowed(STORAGE_BACKEND),
@@ -1500,6 +1530,10 @@ async def get_catalog():
         "tiers": catalog.list_by_tier(),
         "tier_labels": TIER_LABELS,
         "tier_info": TIER_INFO,
+        # The catalog page's GPU-count window defaults: one per GPU class plus
+        # the "" (All) entry.  Shipped with the tree so a client that reloads
+        # the catalog in place keeps the same numbers the template rendered.
+        "gpu_count_defaults": GPU_COUNT_DEFAULTS,
         "tree": catalog.tree(),
     }
 

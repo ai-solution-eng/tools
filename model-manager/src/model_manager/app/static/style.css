@@ -537,6 +537,34 @@ tr.status-failed td:nth-child(4) { color: var(--hpe-critical); }
 }
 .secondary-btn:hover { background: var(--hpe-green-tint); }
 
+/* Link to the MLIS home page: an anchor styled like the secondary buttons
+   beside it, so the control bar stays one row of equal-weight actions (and
+   middle-click / copy-address keep working, which a button would not). */
+.mlis-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 11px 18px;
+  border: 1px solid var(--hpe-border);
+  border-radius: 4px;
+  background: var(--hpe-surface);
+  color: var(--hpe-green-dark);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.mlis-link:hover { background: var(--hpe-green-tint); }
+.mlis-link:focus-visible { outline: 2px solid var(--hpe-focus); outline-offset: 2px; }
+/* Same link inside the push-result summary line (the page sets no global <a>
+   style, so it needs the palette explicitly). */
+.mlis-link-inline { color: var(--hpe-green-dark); font-weight: 700; }
+
+/* A push is a round-trip to the MLIS database: show it is in flight and stop
+   a second click from firing a second push. */
+#push-selected-btn:disabled,
+#push-direct-btn:disabled { opacity: 0.6; cursor: progress; }
+
 /* ---- Tier sections ---- */
 .tier-section {
   background: var(--hpe-surface);
@@ -768,6 +796,44 @@ tr.push-err td { background: var(--hpe-critical-tint); }
   color: var(--hpe-text-soft);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- Catalog GPU-count filter ---- */
+/* The class pills choose the hardware; these two numbers narrow it to what
+   fits a node.  A plain flex row rather than a fieldset: the visible label is
+   the group name, because the pills above are self-describing but "1 - 4"
+   alone is not. */
+.gpu-count-filter { margin-top: -4px; }
+.gpu-count-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--hpe-text-soft);
+}
+.gpu-count-input {
+  width: 64px;
+  padding: 6px 8px;
+  font-size: 13px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+/* No spinners: the range is typed, and a stray scroll over the field must not
+   silently change what the catalog is showing. */
+.gpu-count-input::-webkit-outer-spin-button,
+.gpu-count-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.gpu-count-input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+.gpu-count-dash { color: var(--hpe-text-soft); }
+.gpu-count-reset {
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+.gpu-count-default,
+.gpu-count-note {
+  font-size: 12px;
+  color: var(--hpe-text-soft);
+  font-variant-numeric: tabular-nums;
+}
+.gpu-count-note { opacity: 0.85; }
 
 /* ---- Catalog search ---- */
 .catalog-search {

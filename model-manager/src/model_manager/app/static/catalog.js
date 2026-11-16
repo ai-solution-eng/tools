@@ -38,7 +38,46 @@ async function loadCatalog() {
 // open state is tracked in openKeys and restored afterwards, so refreshing
 // the catalog does not collapse everything the user had opened.
 const openKeys = new Set();
-const searchState = { query: '', tier: '' };
+// GPU-count window: null on either end means unbounded.  The defaults are per
+// GPU class and are rendered onto the class radios by the template from
+// catalog.GPU_COUNT_DEFAULTS, so the browser keeps no second copy of them.
+const searchState = { query: '', tier: '', minGpu: null, maxGpu: null };
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// GPU counts are non-negative integers.  A typed "2.7" or a hand-crafted
+// ?gmin=2.7 must not leave the box and the filter disagreeing.
+function gpuCountOrNull(value) {
+  const n = numberOrNull(value);
+  return n === null ? null : Math.max(0, Math.trunc(n));
+}
+
+const gpuClassDefaults = {};
+document.querySelectorAll('input[name="gpu-class"]').forEach(radio => {
+  gpuClassDefaults[radio.value] = {
+    min: numberOrNull(radio.dataset.gpuMin),
+    max: numberOrNull(radio.dataset.gpuMax),
+  };
+});
+
+function gpuDefaultFor(tier) {
+  return gpuClassDefaults[tier || ''] || { min: null, max: null };
+}
+
+// Human-readable form of the active window, used by the summary line and the
+// empty state: "1–4 GPUs", "3+ GPUs", "up to 2 GPUs", "" when unbounded.
+function gpuRangeLabel() {
+  const lo = searchState.minGpu;
+  const hi = searchState.maxGpu;
+  if (lo === null && hi === null) return '';
+  if (lo !== null && hi !== null) return lo + '\u2013' + hi + ' GPUs';
+  if (lo !== null) return lo + '+ GPUs';
+  return 'up to ' + hi + ' GPUs';
+}
 
 // Configurations ticked for push, keyed by catalog_id.  This is the SOURCE OF
 // TRUTH, not the DOM: filtering re-renders the tree and removes rows from the
@@ -56,7 +95,15 @@ const selectedIds = new Set();
     const q = params.get('q');
     if (q) searchState.query = q;
     const gpu = params.get('gpu');
-    if (gpu) searchState.tier = gpu;
+    // Only accept a class the radios actually offer, so the defaults looked up
+    // below are the ones for the class the page will show checked.
+    if (gpu && Object.prototype.hasOwnProperty.call(gpuClassDefaults, gpu)) searchState.tier = gpu;
+    // Seed the window from the class default, then let an explicit ?gmin /
+    // ?gmax override it.  An EMPTY value (?gmax=) means unbounded -- that is
+    // how a link reproduces a cleared box instead of falling back to default.
+    const dflt = gpuDefaultFor(searchState.tier);
+    searchState.minGpu = params.has('gmin') ? gpuCountOrNull(params.get('gmin')) : dflt.min;
+    searchState.maxGpu = params.has('gmax') ? gpuCountOrNull(params.get('gmax')) : dflt.max;
   } catch (e) { /* no URL support: fall back to an unfiltered view */ }
 })();
 
@@ -81,6 +128,14 @@ function configMatches(cfg, q) {
     const tier = String((cfg.entry || {}).tier || '');
     if (tier !== searchState.tier) return false;
   }
+  // GPU-count window: exact numeric bounds on the GPUs the configuration
+  // reserves.  cfg.gpu_count is derived server-side; cfg.gpus is the string
+  // fallback for a page cached against a server that predates the field.
+  const gpus = cfg.gpu_count === undefined || cfg.gpu_count === null
+    ? (numberOrNull(cfg.gpus) || 0)
+    : Number(cfg.gpu_count);
+  if (searchState.minGpu !== null && gpus < searchState.minGpu) return false;
+  if (searchState.maxGpu !== null && gpus > searchState.maxGpu) return false;
   if (!q) return true;
   const e = cfg.entry || {};
   // notes carries the long-form operational detail that no longer fits in the
@@ -179,10 +234,22 @@ function renderCatalog() {
     catalogTiers.appendChild(labEl);
   }
 
-  if (shownConfigs === 0 && q) {
+  if (shownConfigs === 0) {
+    // Any filter can empty the tree now: the GPU-count window has a default,
+    // so a class whose configurations all sit outside it legitimately matches
+    // nothing.  Name the filters that are on instead of blaming only the text.
     const none = document.createElement('p');
     none.className = 'tier-empty';
-    none.textContent = 'No configurations match "' + searchState.query.trim() + '".';
+    const bits = [];
+    if (searchState.tier) {
+      bits.push('GPU class ' + ((catalogData.tier_labels || {})[searchState.tier] || searchState.tier));
+    }
+    const range = gpuRangeLabel();
+    if (range) bits.push(range);
+    if (searchState.query.trim()) bits.push('"' + searchState.query.trim() + '"');
+    none.textContent = bits.length
+      ? 'No configurations match: ' + bits.join(' \u00b7 ') + '.'
+      : 'No configurations match the current filters.';
     catalogTiers.appendChild(none);
   }
 
@@ -345,15 +412,19 @@ function syncSelectionToDom() {
 function updateSearchSummary(q, shown, total) {
   const el = document.getElementById('catalog-search-summary');
   if (!el) return;
-  const filtered = q || searchState.tier;
-  if (!filtered) {
+  // The count window is part of the summary, not a hidden default: the page
+  // opens with one active, so "N of M" must say what narrowed it.
+  const range = gpuRangeLabel();
+  const filtered = q || searchState.tier || range;
+  if (!filtered || total === 0) {
     el.textContent = total + ' configurations in ' + (catalogData.tree || []).length + ' labs';
     return;
   }
   const scope = searchState.tier
     ? ((catalogData.tier_labels || {})[searchState.tier] || searchState.tier)
-    : 'all GPUs';
-  el.textContent = shown + ' of ' + total + ' configurations (' + scope + ')';
+    : 'all GPU classes';
+  el.textContent = shown + ' of ' + total + ' configurations (' + scope +
+    (range ? ' \u00b7 ' + range : '') + ')';
 }
 
 // ---- Model details modal (full config that will be included) ----
@@ -609,12 +680,34 @@ document.getElementById('push-direct-btn').addEventListener('click', async () =>
   await doPush(configs);
 });
 
+// A push is a database round-trip, and its per-model table renders at the
+// BOTTOM of the page.  Without a status line beside the button (and a scroll to
+// the table) a push that worked looked like nothing had happened.
+function setPushBusy(busy) {
+  for (const id of ['push-selected-btn', 'push-direct-btn']) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = busy;
+    btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+}
+
+function pushStatusText(data) {
+  const parts = [data.pushed + ' pushed'];
+  if (data.skipped) parts.push(data.skipped + ' skipped');
+  if (data.errors) parts.push(data.errors + ' errored');
+  return 'Push to MLIS: ' + parts.join(', ') + '.';
+}
+
 async function doPush(configs) {
   const project = selectedProject();
   if (project === null) return;
   const url = '/api/push' + (project ? '?project=' + encodeURIComponent(project) : '');
   pushResults.innerHTML = '<p class="hint">Pushing ' + configs.length + ' model(s) to MLIS' +
     (project ? ' under <strong>' + esc(project) + '</strong>' : '') + '...</p>';
+  setStatus('Pushing ' + configs.length + ' model(s) to MLIS' +
+    (project ? ' under ' + project : '') + '...', '');
+  setPushBusy(true);
   try {
     const r = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -623,18 +716,29 @@ async function doPush(configs) {
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
     renderPushResults(data, project);
+    setStatus(pushStatusText(data), data.errors ? 'error' : 'ok');
+    pushResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     pushResults.innerHTML = '<p class="msg error">Error: ' + esc(e.message || e) + '</p>';
+    setStatus('Push to MLIS failed: ' + (e.message || e), 'error');
+  } finally {
+    setPushBusy(false);
   }
 }
 
 function renderPushResults(data, project) {
   const { results, pushed, skipped, errors } = data;
   const bumped = results.filter(r => r.bumped).length;
+  // The pushed rows are in MLIS now, so give the user the way there.  The link
+  // is absent when the deployment has no catalog.mlisUrl.
+  const mlis = document.getElementById('mlis-link');
   let html = '<div class="push-summary">Pushed: <strong>' + pushed + '</strong>' +
     ' | Skipped: <strong>' + skipped + '</strong>' +
     ' | Errors: <strong>' + errors + '</strong>' +
-    (project ? ' | Project: <strong>' + esc(project) + '</strong>' : '') + '</div>';
+    (project ? ' | Project: <strong>' + esc(project) + '</strong>' : '') +
+    (mlis ? ' | <a class="mlis-link-inline" href="' + esc(mlis.href) +
+      '" target="_blank" rel="noopener noreferrer">Open MLIS \u2197</a>' : '') +
+    '</div>';
   if (bumped) {
     html += '<p class="msg">' + bumped + ' configuration' + (bumped === 1 ? '' : 's') +
       ' landed as a NEW version: MLIS already has that model name with a different configuration. ' +
@@ -758,8 +862,22 @@ function syncUrl() {
     else url.searchParams.delete('q');
     if (searchState.tier) url.searchParams.set('gpu', searchState.tier);
     else url.searchParams.delete('gpu');
+    // The count window rides the URL only when it differs from the class
+    // default, so ?gpu=l40s stays short and still restores 1-2.  A cleared
+    // box is written as an EMPTY value (?gmax=) so the link reproduces it.
+    const dflt = gpuDefaultFor(searchState.tier);
+    setCountParam(url, 'gmin', searchState.minGpu, dflt.min);
+    setCountParam(url, 'gmax', searchState.maxGpu, dflt.max);
     window.history.replaceState(null, '', url);
   } catch (e) { /* non-fatal: the filter still applies */ }
+}
+
+function setCountParam(url, name, value, dflt) {
+  if (value === dflt) {
+    url.searchParams.delete(name);
+    return;
+  }
+  url.searchParams.set(name, value === null ? '' : String(value));
 }
 
 function applySearch(value) {
@@ -770,7 +888,19 @@ function applySearch(value) {
 }
 
 function applyTier(value) {
+  // The window defaults are per GPU class.  An untouched default follows the
+  // class; a range the user typed is theirs and survives the switch.
+  const previous = gpuDefaultFor(searchState.tier);
+  const untouched = searchState.minGpu === previous.min && searchState.maxGpu === previous.max;
   searchState.tier = value;
+  if (untouched) {
+    const next = gpuDefaultFor(value);
+    searchState.minGpu = next.min;
+    searchState.maxGpu = next.max;
+  }
+  // Re-sync even when a custom range is kept: the "default N-M" hint belongs
+  // to the newly selected class, and the boxes must show the range in force.
+  syncGpuCountInputs();
   syncUrl();
   renderCatalog();
 }
@@ -812,6 +942,62 @@ if (gpuRadios.length) {
     else searchState.tier = '';
   }
 }
+
+// ---- GPU count filter ----
+// After load the two inputs are the window's source of truth; the class radios
+// re-seed them (applyTier) and Reset restores the selected class's default.
+const gpuMinInput = document.getElementById('gpu-count-min');
+const gpuMaxInput = document.getElementById('gpu-count-max');
+const gpuResetBtn = document.getElementById('gpu-count-reset');
+const gpuDefaultHint = document.getElementById('gpu-count-default');
+
+function syncGpuCountInputs() {
+  if (gpuMinInput) gpuMinInput.value = searchState.minGpu === null ? '' : String(searchState.minGpu);
+  if (gpuMaxInput) gpuMaxInput.value = searchState.maxGpu === null ? '' : String(searchState.maxGpu);
+  if (gpuDefaultHint) {
+    const dflt = gpuDefaultFor(searchState.tier);
+    gpuDefaultHint.textContent = dflt.min === null || dflt.max === null
+      ? ''
+      : 'default ' + dflt.min + '\u2013' + dflt.max;
+  }
+}
+
+function applyGpuCount(key, raw) {
+  searchState[key] = gpuCountOrNull(raw);
+  syncUrl();
+  renderCatalog();
+}
+
+if (gpuMinInput) {
+  gpuMinInput.addEventListener('input', () => applyGpuCount('minGpu', gpuMinInput.value));
+  // On commit, reflect the clamped value the filter actually used (typing
+  // "-3" or "2.7" must not leave the box disagreeing with the tree).
+  gpuMinInput.addEventListener('change', () => {
+    applyGpuCount('minGpu', gpuMinInput.value);
+    syncGpuCountInputs();
+  });
+}
+if (gpuMaxInput) {
+  gpuMaxInput.addEventListener('input', () => applyGpuCount('maxGpu', gpuMaxInput.value));
+  gpuMaxInput.addEventListener('change', () => {
+    applyGpuCount('maxGpu', gpuMaxInput.value);
+    syncGpuCountInputs();
+  });
+}
+if (gpuResetBtn) {
+  gpuResetBtn.addEventListener('click', () => {
+    const dflt = gpuDefaultFor(searchState.tier);
+    searchState.minGpu = dflt.min;
+    searchState.maxGpu = dflt.max;
+    syncGpuCountInputs();
+    syncUrl();
+    renderCatalog();
+  });
+}
+// The template renders the All-class defaults; a ?gpu= / ?gmin= / ?gmax= deep
+// link must win, so push the seeded state into the inputs before the first
+// render.
+syncGpuCountInputs();
 
 if (searchInput && searchState.query) {
   searchInput.value = searchState.query;

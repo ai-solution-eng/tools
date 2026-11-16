@@ -43,6 +43,7 @@ class _RollupDB:
 
     def __init__(self) -> None:
         self.by_key_sql = ""
+        self.by_model_sql = ""
 
     async def fetchrow(self, sql: str, *a: Any):
         return {"requests": 0}
@@ -62,6 +63,8 @@ class _RollupDB:
         # grouping assertions below. `AS generations` is unique to the parent.
         if "AS generations" in sql:
             self.by_key_sql = sql
+        elif "GROUPING SETS ((model)" in sql:
+            self.by_model_sql = sql
         return []
 
 
@@ -147,3 +150,48 @@ def test_ledger_rows_project_cached_tokens_and_cost() -> None:
     # the pre-existing identity columns must survive the addition
     for col in ("l.prompt_tokens", "l.completion_tokens", "l.total_tokens", "k.name AS key_name"):
         assert col in sql
+
+
+# ---------------------------------------------------------------------------
+# Unit-aware rollups must not emit the GROUPING SETS NULL subrow twice
+# ---------------------------------------------------------------------------
+
+
+def test_rollup_sql_drops_the_null_unit_subrow() -> None:
+    """REPORTED 2026-11-13: every By-model and By-key row rendered TWICE.
+
+    Both rollups group by GROUPING SETS ((group), (group, unit_kind)) so the
+    per-unit sums can be folded into `billable_units_by_unit`. GROUPING SETS
+    is a UNION ALL of the two groupings and does NOT deduplicate: ordinary
+    chat rows carry unit_kind IS NULL, so the (group, unit_kind) set emits a
+    group identical to the (group) total, and `_fold_unit_rows` appended both.
+    The HAVING clause keeps the true total (GROUPING = 1) and the real
+    per-unit subrows, and drops the phantom NULL subrow.
+    """
+    fake = _RollupDB()
+    t = _client(fake)
+    assert t.get("/admin/usage/summary", headers=HEADERS).status_code == 200
+
+    by_model = " ".join(fake.by_model_sql.split())
+    by_key = " ".join(fake.by_key_sql.split())
+    assert "HAVING GROUPING(unit_kind) = 1 OR unit_kind IS NOT NULL" in by_model, by_model
+    assert "HAVING GROUPING(l.unit_kind) = 1 OR l.unit_kind IS NOT NULL" in by_key, by_key
+
+
+def test_fold_unit_rows_does_not_duplicate_the_null_unit_subrow() -> None:
+    """The fold keeps ONE row per group: total + NULL subrow + real subrow.
+
+    This is the cohere-transcribe shape from the live report: a total of 18
+    requests, a phantom NULL-unit partial of 5, and a real 'second' subrow.
+    Before the fix the fold returned TWO rows (18 and 5) for one model.
+    """
+    rows = [
+        {"model": "cohere-transcribe", "requests": 18, "unit_kind": None, "unit_units": 0.0},
+        {"model": "cohere-transcribe", "requests": 5, "unit_kind": None, "unit_units": 0.0},
+        {"model": "cohere-transcribe", "requests": 18, "unit_kind": "second", "unit_units": 30.0},
+    ]
+    folded = routes_admin._fold_unit_rows(rows, ("model",))
+
+    assert len(folded) == 1, f"one row per model — got {folded}"
+    assert folded[0]["requests"] == 18
+    assert folded[0]["billable_units_by_unit"] == {"second": 30.0}
