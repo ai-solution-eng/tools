@@ -24,6 +24,7 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -595,11 +596,31 @@ def refresher(config, stop_event):
         stop_event.wait(15 if had_errors else config["interval"])
 
 
+# Favicon: a crescent moon, inlined as an SVG data: URI.
+#
+# app.py is ConfigMap-mounted onto a read-only root filesystem, so there is no
+# static directory to drop an icon in - and the UI sits behind the PCAI SSO
+# AuthorizationPolicy, which would intercept a separate /favicon.svg request.
+# Inlining keeps the icon to a single attribute: no route, no volume, no
+# unauthenticated path. The two fills are the page's own accent pair (THEMING.md);
+# the media query resolves against the OS colour scheme, which is the tab
+# strip's signal - not the in-page Auto/Light/Dark toggle.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    "<style>@media (prefers-color-scheme:dark){.moon{fill:#2ed3a8}}</style>"
+    '<defs><mask id="b"><rect width="32" height="32" fill="#fff"/>'
+    '<circle cx="20.81" cy="11.19" r="12.2" fill="#000"/></mask></defs>'
+    '<circle class="moon" cx="16" cy="16" r="13.5" fill="#01a982" mask="url(#b)"/>'
+    "</svg>"
+)
+FAVICON_URI = "data:image/svg+xml," + urllib.parse.quote(FAVICON_SVG, safe="")
+
 PAGE = """<!doctype html>
 <html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="__FAVICON__">
 <title>__TITLE__</title>
 <style>
 :root{
@@ -967,6 +988,12 @@ load();
 </body></html>"""
 
 
+def render_page(config):
+    """One render path for PAGE, so a placeholder added here cannot be
+    forgotten at one of the two call sites."""
+    return PAGE.replace("__TITLE__", config["title"]).replace("__FAVICON__", FAVICON_URI)
+
+
 def _json_safe(value):
     """Replace non-finite floats with null before encoding.
 
@@ -1005,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, PAGE.replace("__TITLE__", self.config["title"]), "text/html; charset=utf-8")
+            self._send(200, render_page(self.config), "text/html; charset=utf-8")
         elif self.path.startswith("/api/stats"):
             self._json(snapshot(self.config))
         elif self.path.startswith("/api/refresh"):
@@ -1111,7 +1138,7 @@ def main():
         print(json.dumps(selftest_data(), indent=2))
         return 0
     if args.selftest_html:
-        print(PAGE.replace("__TITLE__", config["title"]))
+        print(render_page(config))
         return 0
 
     stop_event = threading.Event()

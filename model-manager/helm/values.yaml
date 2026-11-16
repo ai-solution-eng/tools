@@ -33,7 +33,7 @@ fullnameOverride: ""
 # FastAPI service that serves the UI and submits downloader Jobs.
 image:
   repository: ghcr.io/ai-solution-eng/model-manager
-  tag: v2.2.0
+  tag: v2.2.2
   # IfNotPresent is the fleet default (releases ship new tags). A tag overwrite
   # alone is not enough: the job-template ConfigMap needs the chart upgrade too.
   pullPolicy: IfNotPresent
@@ -342,6 +342,11 @@ catalog:
   storageClassName: ""
   # Raw URL of the seed catalog JSON; the "Refresh from GitHub" button hides when empty.
   githubUrl: "https://raw.githubusercontent.com/ai-solution-eng/tools/main/model-manager/src/model_manager/app/seed_catalog.json"
+  # MLIS home page, linked from the catalog next to "Push Selected to MLIS".
+  # PCAI substitutes ${DOMAIN_NAME} before rendering, so the default follows
+  # the same domain as the ingress.  Set a full URL for an MLIS on another
+  # host, or "" to hide the link (e.g. a deployment with no MLIS).
+  mlisUrl: "https://mlis.${DOMAIN_NAME}"
   # Project recorded on a packaged model that names none (empty = leave it
   # blank, the historical behaviour).  The target is MLIS's "project" filter:
   # a row with an empty project only shows under "All projects".  PCAI projects

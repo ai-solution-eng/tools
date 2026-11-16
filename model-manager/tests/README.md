@@ -78,6 +78,18 @@ Run with the repo's app sources importable (no package install needed):
   unmodified (SHA-256 guard: edit it upstream and re-copy, never patch here),
   and the admin gate still calls the shared verifier rather than trusting a
   header.
+- `test_mlis_link.py` — the catalog's **Open MLIS** link and push feedback:
+  `catalog.mlisUrl` -> `MLIS_URL` env -> a real anchor (new tab, no opener)
+  that disappears when the value is empty or an unresolved `${DOMAIN_NAME}`,
+  plus the script's progress/outcome status, the disabled push buttons while a
+  request is in flight, and the scroll to the result table.
+- `test_gpu_count_filter.py` — the catalog's GPU-count min/max window: the
+  count is derived from `resource_limit_gpu`/`resource_request_gpu` (limit
+  first, numbers and strings both, garbage degrades to 0, `0` is a shared
+  configuration), every config node carries it numerically, each GPU class has
+  the requested default (1–4 H200/All, 1–2 RTX/L40S) and the window actually
+  narrows the seed without hiding it, plus the template/script/API wiring that
+  carries the defaults to the browser.
 
 Requires `helm` on PATH and pyyaml/pytest (`pip install pytest pyyaml`).
 `test_wave4_wiring.py` additionally imports the app (needs `psycopg2-binary`;

@@ -85,17 +85,35 @@
     <fieldset class="gpu-filter" id="gpu-filter">
       <legend class="gpu-filter-legend">GPU class</legend>
       <label class="gpu-option">
-        <input type="radio" name="gpu-class" value="" checked>
+        <input type="radio" name="gpu-class" value="" checked
+               data-gpu-min="{{ gpu_count_defaults[''].min }}" data-gpu-max="{{ gpu_count_defaults[''].max }}">
         <span>All</span>
       </label>
       {% for t in tiers %}
       <label class="gpu-option">
-        <input type="radio" name="gpu-class" value="{{ t }}">
+        <input type="radio" name="gpu-class" value="{{ t }}"
+               data-gpu-min="{{ gpu_count_defaults[t].min }}" data-gpu-max="{{ gpu_count_defaults[t].max }}">
         <span>{{ tier_labels[t] }}</span>
         <span class="gpu-spec">{{ tier_info[t].quants|join('/') }} · {{ tier_info[t].vram_gb }} GB</span>
       </label>
       {% endfor %}
     </fieldset>
+    <div class="gpu-filter gpu-count-filter" id="gpu-count-filter" role="group"
+         aria-label="GPU count filter"
+         title="Configurations are filtered by the number of GPUs they reserve (resource_limit_gpu, falling back to resource_request_gpu). 0 = shared / no reserved GPU; an empty box leaves that end unbounded. An untouched range re-seeds to the class default when the GPU class changes; a range you typed is kept.">
+      <span class="gpu-count-label">GPU count</span>
+      <input id="gpu-count-min" class="gpu-count-input" type="number" inputmode="numeric"
+             min="0" max="64" step="1" value="{{ gpu_count_defaults[''].min }}"
+             aria-label="Minimum GPUs per configuration">
+      <span class="gpu-count-dash" aria-hidden="true">&ndash;</span>
+      <input id="gpu-count-max" class="gpu-count-input" type="number" inputmode="numeric"
+             min="0" max="64" step="1" value="{{ gpu_count_defaults[''].max }}"
+             aria-label="Maximum GPUs per configuration">
+      <button id="gpu-count-reset" type="button" class="secondary-btn gpu-count-reset"
+              title="Restore the default GPU count range for the selected GPU class">Reset</button>
+      <span id="gpu-count-default" class="gpu-count-default"></span>
+      <span class="gpu-count-note">0 = shared GPU &middot; empty box = unbounded</span>
+    </div>
     <div class="catalog-search">
       <input id="catalog-search-input" type="search" autocomplete="off" spellcheck="false"
              placeholder="Search models and configurations — e.g. deepseek, nvfp4, sglang, hicache, mooncake, 8 gpu"
@@ -117,6 +135,10 @@
         <span id="push-project-effective" class="push-project-effective" hidden></span>
       </label>
       <button id="push-selected-btn" type="button">Push Selected to MLIS</button>
+      {% if mlis_url %}
+      <a id="mlis-link" class="mlis-link" href="{{ mlis_url }}" target="_blank" rel="noopener noreferrer"
+         title="Open the MLIS home page for this deployment">Open MLIS &#8599;</a>
+      {% endif %}
       {% if catalog_github_url %}
       <button id="refresh-github-btn" type="button" class="secondary-btn">Refresh from GitHub</button>
       {% endif %}

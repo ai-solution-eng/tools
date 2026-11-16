@@ -406,12 +406,52 @@ def test_seed_mooncake_entries_are_labelled_and_caveated():
         for model in lab["models"]:
             for cfg in model["configs"]:
                 if cfg["entry"]["catalog_id"] not in mooncake_ids:
-                    assert cfg["caveats"] == []
+                    # A non-Mooncake configuration may carry a DIFFERENT caveat
+                    # (e.g. the Local Inference Lab pod caveat); what must never
+                    # appear on it is the Mooncake RDMA one.
+                    assert "mooncake-rdma" not in [c["id"] for c in cfg["caveats"]]
                     continue
                 seen.add(cfg["entry"]["catalog_id"])
                 assert "Mooncake" in cfg["label"], cfg["label"]
                 assert [c["id"] for c in cfg["caveats"]] == ["mooncake-rdma"]
     assert seen == mooncake_ids
+
+
+def test_seed_local_inference_entry_carries_the_pod_caveat():
+    """The GLM-5.3-Flash FP4-Local seed runs the Local Inference Lab container,
+    whose published recipe needs pod-level --ipc host / --shm-size and a
+    writable /cache -- none of which the AIOLI packaged_models row can carry,
+    so the requirement has to surface as a caveat instead."""
+    entry = next(e for e in SEED if e["catalog_id"] == "seed-rtx-glm53-flash")
+    (caveat,) = entry_caveats(entry)
+    assert caveat["id"] == "local-inference-pod"
+    assert "/dev/shm" in caveat["body"] and "/cache" in caveat["body"]
+    commands = " ".join(cmd["command"] for cmd in caveat["commands"])
+    assert "/dev/shm" in commands
+    # It must be a caveat, never part of the pushed config.
+    assert "local-inference-pod" not in json.dumps(entry)
+
+
+def test_local_inference_pod_caveat_absent_for_stock_vllm():
+    entry = {
+        "catalog_id": "t-stock",
+        "tier": "rtx-pro-6000",
+        "name": "x",
+        "image": "vllm/vllm-openai:v0.23.0-cu129",
+        "arguments": [],
+        "environment": {},
+    }
+    assert entry_caveats(entry) == []
+
+
+def test_local_inference_pod_caveat_is_ui_only_and_copied():
+    entry = next(e for e in SEED if e["catalog_id"] == "seed-rtx-glm53-flash")
+    first = entry_caveats(entry)
+    first[0]["chip"] = "mutated"
+    first[0]["commands"][0]["command"] = "mutated"
+    second = entry_caveats(entry)
+    assert second[0]["chip"] == "shm + /cache"
+    assert second[0]["commands"][0]["command"] != "mutated"
 
 
 # ---- collision handling ----

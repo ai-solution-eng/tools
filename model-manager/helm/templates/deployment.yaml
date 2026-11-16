@@ -246,6 +246,13 @@ spec:
           value: {{ .Values.aioli.dbPasswordSecret.key | quote }}
         - name: CATALOG_DEFAULT_PROJECT
           value: {{ .Values.catalog.defaultProject | default "" | quote }}
+        # MLIS home page linked from the catalog (values: catalog.mlisUrl).
+        # Omitted when empty, so the UI hides the link instead of pointing at
+        # an unresolved ${DOMAIN_NAME} placeholder.
+        {{- if .Values.catalog.mlisUrl }}
+        - name: MLIS_URL
+          value: {{ .Values.catalog.mlisUrl | quote }}
+        {{- end }}
         livenessProbe:
           httpGet:
             path: /api/healthz

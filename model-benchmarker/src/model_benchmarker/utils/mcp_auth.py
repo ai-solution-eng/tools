@@ -50,6 +50,8 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import sys
+import threading
 from collections.abc import Awaitable, Callable, Iterable, MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -76,14 +78,119 @@ CALLER_HEADER_MAX_LENGTH = 256
 CALLER_VIA_MAX_LENGTH = 200
 
 
+#: Suffix of the env var that names the FILE carrying the same keys as the
+#: var it derives from (MCP_API_KEYS -> MCP_API_KEYS_FILE). The chart mounts
+#: the key Secret as a directory and points this at one key file; that file is
+#: the only key channel kubelet can refresh inside a running pod, and it WINS
+#: over the env value whenever it reads (see configured_keys).
+KEY_FILE_SUFFIX = "_FILE"
+
+#: path -> (st_mtime_ns, st_size, keys) for the last SUCCESSFUL read — the
+#: per-request call re-stats and re-reads only when the stamp moved.
+_KEY_FILE_CACHE: dict[str, tuple[int, int, tuple[str, ...]]] = {}
+
+#: Paths whose read failure was already reported (log once per path).
+_KEY_FILE_WARNED: set[str] = set()
+
+#: Guards both dicts — request handlers run on many threads.
+_KEY_FILE_LOCK = threading.Lock()
+
+
+def _split_keys(raw: str) -> list[str]:
+    """One keys source -> stripped, non-empty keys in order (duplicates
+    dropped). Splits on commas AND newlines: a mounted Secret key file is
+    newline-separated (often newline-terminated), an env var comma-separated."""
+    keys: list[str] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if chunk and chunk not in keys:
+            keys.append(chunk)
+    return keys
+
+
+def _file_keys_failure(path: str, exc: BaseException) -> tuple[str, ...]:
+    """A failed read is never fatal: keep the last GOOD keys for the path and
+    warn once, so a bad mount cannot take authentication down; with nothing
+    cached the caller falls back to the env value."""
+    with _KEY_FILE_LOCK:
+        cached = _KEY_FILE_CACHE.get(path)
+        first = path not in _KEY_FILE_WARNED
+        if first:
+            _KEY_FILE_WARNED.add(path)
+    if first:
+        print(
+            f"[mcp_auth] WARNING: cannot read key file {path!r} ({exc}) — keeping "
+            f"{len(cached[2]) if cached else 0} previously cached key(s)"
+            + ("" if cached else "; falling back to the env value"),
+            file=sys.stderr,
+            flush=True,
+        )
+    return cached[2] if cached else ()
+
+
+def _file_keys(path: str) -> tuple[str, ...]:
+    """Keys from the file at the given path, cached on (st_mtime_ns, st_size).
+
+    Per-request cost is ONE stat while the file is unchanged; the read happens
+    only when the stamp moved — exactly what a rotated Secret looks like under
+    a mounted volume. A GONE file (FileNotFoundError) is not a failure: it
+    returns no keys so the caller falls back to env, and drops the cached
+    entry so a re-created file is re-read. Any other failure never raises
+    either: see _file_keys_failure.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        with _KEY_FILE_LOCK:
+            _KEY_FILE_CACHE.pop(path, None)  # removed: no last-good to keep
+        return ()
+    except OSError as exc:
+        return _file_keys_failure(path, exc)
+    with _KEY_FILE_LOCK:
+        cached = _KEY_FILE_CACHE.get(path)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+    try:
+        with open(path, "rb") as fh:
+            stamp = os.fstat(fh.fileno())  # stamp the content we actually read
+            keys = tuple(_split_keys(fh.read().decode("utf-8")))
+    except (OSError, UnicodeDecodeError) as exc:
+        return _file_keys_failure(path, exc)
+    with _KEY_FILE_LOCK:
+        _KEY_FILE_CACHE[path] = (stamp.st_mtime_ns, stamp.st_size, keys)
+    return keys
+
+
 def configured_keys(env_names: Iterable[str] = ("MCP_API_KEYS",)) -> list[str]:
-    """Union of comma-separated keys from the given env vars (order kept,
-    duplicates dropped). Env is read on every call — rotation without restart."""
+    """Union of the API keys configured for the given env names (order kept,
+    duplicates dropped).
+
+    Each name X resolves to ONE source, in this order:
+
+    * the file named by X + "_FILE", when that var is set and the file reads
+      successfully with at least one key — THE LIVE SOURCE OF TRUTH: kubelet
+      refreshes a mounted Secret in place, so an added key is accepted and a
+      REMOVED key stops working on the next request, with no pod restart;
+    * otherwise the value of X (comma-separated) — the bootstrap/fallback for
+      local dev, a chart without the mount, and the window before the file
+      exists.
+
+    The file is never UNIONED with the env value: os.environ does NOT change
+    when a Kubernetes Secret is rotated (it is a snapshot taken at process
+    start), so a key deleted from the Secret would keep authenticating from
+    that snapshot until the pod restarted — the revocation hole this
+    precedence closes. Sets from DIFFERENT env names are still unioned. File
+    reads are cached per path on (st_mtime_ns, st_size), so a per-request call
+    costs one stat and no read until the file moves. A missing, unreadable or
+    corrupt file never raises: a gone file falls back to env, any other
+    failure keeps the last good keys for that path (logged once) and falls
+    back to env only when nothing was ever cached.
+    """
     keys: list[str] = []
     for name in env_names:
-        raw = os.environ.get(name, "")
-        for k in raw.split(","):
-            k = k.strip()
+        file_path = (os.environ.get(name + KEY_FILE_SUFFIX) or "").strip()
+        from_file: tuple[str, ...] = _file_keys(file_path) if file_path else ()
+        for k in from_file or _split_keys(os.environ.get(name, "")):
             if k and k not in keys:
                 keys.append(k)
     return keys
@@ -254,7 +361,9 @@ def _key_fingerprint(key: str) -> str:
 
 def _registry_names(clients_env: str | None) -> dict[str, str]:
     """Parse ``<clients_env>`` (``name:key;name:key;...``) into {key: name},
-    re-read PER REQUEST so a Secret rotation reaches a running pod. Malformed
+    re-read PER REQUEST. That reaches a running pod only through the mounted
+    *FILE* channel: os.environ is fixed at process start, so an env-only
+    registry (or key set) changes only when the pod is replaced. Malformed
     entries are refused loudly and skipped — the registry can never widen
     authentication (it only NAMES keys that configured_keys already matched;
     an unparseable registry degrades attribution to fp-only, never auth)."""
