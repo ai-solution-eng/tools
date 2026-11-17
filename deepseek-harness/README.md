@@ -323,6 +323,7 @@ The first login after logout used to strand the user on the login menu ("Signed 
 | **settings.yaml edits never picked up** | Supervisor's JSON validator rejected YAML | chart ≥0.1.8 (YAML-aware watcher; dsh also re-reads settings per request) |
 | Units **stuck NotReady** after 0.1.5 | Readiness probed dsh's nonexistent `/healthz` route | chart ≥0.1.7 (probe hits dsh root — 302 counts as ready); immediate unblock: revert readinessProbe to `tcpSocket 8082` |
 | PVCs hang Pending / VAST quota collisions | VAST CSI 64-char quota-name truncation | `scripts/cleanup-dsh-web-helm-stale-quotas.sh` (dry-run by default) |
+| **`dsh plugin add` / Plugins page: `ERR_PNPM_ADDING_TO_ROOT`** | the profile dir is a pnpm workspace root (dsh writes `profiles/web/pnpm-workspace.yaml` with `packages: [.]`) and `dsh plugin` forwards its arguments verbatim to pnpm | `echo 'ignore-workspace-root-check=true' >> ~/.dsh/profiles/web/.npmrc` (also fixes the UI; chart ≥0.4.47 seeds it), or pass `-w` to that one command |
 
 **Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. **`RUNTIME_REV` is operator-tunable** (`values.yaml` / EzAppConfig values blob): bump it to force every unit to re-stamp onto the current template without editing the chart. Defaults to the shipped value (48), so leaving it unset changes nothing. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
 
@@ -372,6 +373,33 @@ chart never installs a plugin into a user pod. Installation is per profile (`web
 `link:` dependency plus `dsh.profile.bundles` entry live in
 `/var/dsh/home/.dsh/profiles/web/package.json` on the user's state PVC. That survives pod restarts
 but is per user, not per release.
+
+### Installing a plugin from the terminal (`dsh plugin add`)
+
+`dsh plugin add <pkg>` forwards its arguments **verbatim** to pnpm (`lib/bin.js`), and the profile
+directory is deliberately a pnpm **workspace root** — dsh writes `profiles/web/pnpm-workspace.yaml`
+(`packages: [.]`) when it initializes the profile. A bare `pnpm add` therefore refuses:
+
+```
+ERR_PNPM_ADDING_TO_ROOT  Running this command will add the dependency to the workspace root,
+which might not be what you want - if you really meant it, make it explicit by running this
+command again with the -w flag (or --workspace-root).
+```
+
+Two ways round it, neither needing a chart change:
+
+```sh
+# one-off: pass the flag pnpm asks for
+dsh plugin add <package> -w
+
+# permanent, per profile: pnpm reads .npmrc from the project root, and dsh never writes one
+echo 'ignore-workspace-root-check=true' >> ~/.dsh/profiles/web/.npmrc
+```
+
+The second also fixes the **Plugins page** in the UI, which goes through the same plugin-manager
+path. **Chart ≥0.4.47 seeds that file on first boot** (seed-once, next to `cordis.patch.yml`), so a
+fresh unit needs nothing; units created before that only need the one line above. It is per user
+(the file lives on that user's state PVC), so it survives pod restarts and upgrades.
 
 Two consequences worth knowing:
 

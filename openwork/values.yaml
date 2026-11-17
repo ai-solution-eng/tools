@@ -162,7 +162,7 @@ openwork:
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
 # r25: workspace convergence — the supervisor converges server.json to the chart's workspaces
 #      (personal + shared, plus platform-shared/platform-user on mounted SSO units).
-RUNTIME_REV: 31
+RUNTIME_REV: 33
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
@@ -194,6 +194,32 @@ provisioning:
     enabled: true
     heading: "Setting up your account\u2026"
     subtext: "This usually takes a few minutes on first launch. Please wait."
+  # Container resources for the per-user unit pod (the router generates that pod
+  # template). EVERY container declares requests AND limits: a ResourceQuota
+  # that pins limits.cpu/limits.memory — the platform EzProject
+  # 'project-quotas' does this on some clusters — makes Kubernetes reject the
+  # whole ReplicaSet if any container, init containers included, omits them.
+  # The symptom is a Deployment that never gets a pod plus a router timeout
+  # ("Timed out waiting for deployment openwork-user-<user>").
+  #   web   openwork-web (the agent UI)
+  #   init  init-openwork-storage (apt/npm bootstrap — same ceiling as web)
+  #   proxy nginx preview proxy
+  #   auth  session/auth validator
+  # The CA init container is configured separately under
+  # certificatesPolicy.initContainer.resources.
+  unitResources:
+    web:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    init:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    proxy:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
+    auth:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
 
 auth:
   username: ""

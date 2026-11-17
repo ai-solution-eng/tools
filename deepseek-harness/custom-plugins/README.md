@@ -14,6 +14,8 @@ shared between users.
 | [`dsh-app-shortcuts`](dsh-app-shortcuts/README.md) | Terminal / Data Manager / Login buttons at the sidebar foot (`sidebar.footer.action`) | none — `apply()` has no behaviour | three same-origin links, opened in a new tab |
 | [`dsh-mcp-status`](dsh-mcp-status/README.md) | An `MCP` row below the composer: which MCP servers are connected, probe latency, tool counts, and the upstream servers behind a federating one | discovers the `@deepseek-ai/dsh-mcp-client` rows, probes each endpoint with a real MCP handshake, serves `GET /api/mcp-status` | the composer-dock row and its expandable panel |
 | [`dsh-asr-endpoint`](dsh-asr-endpoint/README.md) | Voice input that transcribes through **your own HTTP ASR endpoint** instead of the local SenseVoice model — URL, protocol, credentials and request shape all set in `cordis.patch.yml` | registers one remote `ctx.speechToText` provider (`location: 'cloud'`, no `preparation`); posts the recording as OpenAI-compatible multipart, whisper.cpp multipart, base64 JSON or raw WAV | none — the mic comes from the upstream `client-ui-voice-input` row this bundle inserts |
+| [`dsh-mcp-servers`](dsh-mcp-servers/README.md) | A **Settings → MCP servers** page, the MCP counterpart of Settings → Models: list, add (Streamable HTTP or stdio), edit, disable and remove MCP servers (`settings.section`, order 12) | keeps the list as a volatile field of its own row, mounts one `@deepseek-ai/dsh-mcp-client` child per enabled server and reconciles on change, serves `GET /api/mcp-servers` with fiber state and live tool counts | the page: rows, add/edit forms, live state, and the nav icon |
+| [`dsh-config-document`](dsh-config-document/README.md) | Makes the Settings header button **Open configuration file** work in a headless deployment: the profile's `cordis.patch.yml` opens *inside* the Web UI instead of in an OS editor on the Host (`settings.action`, replaces the shipped cell) | serves the prepared document's path and text on `GET /api/config-document`; read-only, accepts no path parameter | the modal: monospace content, path, line/size hints, Copy, Download, Reload, and an "Open in Host editor" fallback that reports the Host's failure |
 
 ## Anatomy of a plugin
 
@@ -66,6 +68,32 @@ Two ways to get there:
 2. **CLI**: `dsh plugin --profile web add <absolute-dir>` runs `pnpm add` in the profile and
    creates the `link:` dependency — but it does **not** touch `dsh.profile.bundles`, so add the
    package name there yourself or the bundle stays inert.
+
+### `ERR_PNPM_ADDING_TO_ROOT` when installing
+
+`dsh plugin …` forwards its arguments **verbatim** to pnpm, and the profile directory is
+deliberately a pnpm **workspace root** — dsh writes `profiles/web/pnpm-workspace.yaml`
+(`packages: [.]`) when it initializes the profile. So either install path can stop with:
+
+```
+ERR_PNPM_ADDING_TO_ROOT  Running this command will add the dependency to the workspace root,
+which might not be what you want - if you really meant it, make it explicit by running this
+command again with the -w flag (or --workspace-root).
+```
+
+Fix it once per profile — pnpm reads `.npmrc` from the project root, and dsh never writes that
+file (so nothing will overwrite it):
+
+```sh
+echo 'ignore-workspace-root-check=true' >> ~/.dsh/profiles/web/.npmrc
+```
+
+That also fixes **Harness UI → Plugins → install bundle**, which goes through the same
+plugin-manager path. For a single CLI call the `-w` flag is enough:
+`dsh plugin --profile web add <absolute-dir> -w`. **Chart ≥0.4.47 seeds that file on first boot**
+(seed-once, next to `cordis.patch.yml`), so a fresh unit needs nothing; units created before that
+need the one line above. The file lives on the user's state PVC, so it survives pod restarts and
+upgrades.
 
 Because the stored path is absolute, **moving a plugin directory breaks every profile that links
 it** — re-link after a move (`dsh plugin --profile web add <new-dir>`). Remove with

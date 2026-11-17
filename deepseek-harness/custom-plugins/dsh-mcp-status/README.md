@@ -22,6 +22,12 @@ count — plus, for a server that federates others, the upstream MCP servers it 
 
 ## Why a probe instead of a flag
 
+Two kinds of MCP server exist, and both are counted. Servers declared as their own
+`@deepseek-ai/dsh-mcp-client` Loader row are read from that row. Servers added through
+*Settings → MCP servers* are mounted as children of that page's row, so they are not Loader
+entries at all — they are read from the page row's own `servers` list and marked
+`managedBy: "mcp-servers"`; their registered tools are the connection signal.
+
 The bridge plugin (`@deepseek-ai/dsh-mcp-client`) publishes no status surface, and its Loader row
 stays `active` even when the server is down — `failOnStartupError` defaults to `false`. Activation
 state therefore cannot answer the question, so this plugin reads the **resolved** config of every MCP

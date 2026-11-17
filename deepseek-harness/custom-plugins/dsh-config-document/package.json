@@ -1,0 +1,35 @@
+{
+  "name": "@local/dsh-config-document",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Opens the profile configuration file (cordis.patch.yml) inside the Harness Web UI, with copy, download, reload, and a Host-editor fallback.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "test/*.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}
