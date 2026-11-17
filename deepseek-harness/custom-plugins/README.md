@@ -69,6 +69,32 @@ Two ways to get there:
    creates the `link:` dependency — but it does **not** touch `dsh.profile.bundles`, so add the
    package name there yourself or the bundle stays inert.
 
+### `ERR_PNPM_ADDING_TO_ROOT` when installing
+
+`dsh plugin …` forwards its arguments **verbatim** to pnpm, and the profile directory is
+deliberately a pnpm **workspace root** — dsh writes `profiles/web/pnpm-workspace.yaml`
+(`packages: [.]`) when it initializes the profile. So either install path can stop with:
+
+```
+ERR_PNPM_ADDING_TO_ROOT  Running this command will add the dependency to the workspace root,
+which might not be what you want - if you really meant it, make it explicit by running this
+command again with the -w flag (or --workspace-root).
+```
+
+Fix it once per profile — pnpm reads `.npmrc` from the project root, and dsh never writes that
+file (so nothing will overwrite it):
+
+```sh
+echo 'ignore-workspace-root-check=true' >> ~/.dsh/profiles/web/.npmrc
+```
+
+That also fixes **Harness UI → Plugins → install bundle**, which goes through the same
+plugin-manager path. For a single CLI call the `-w` flag is enough:
+`dsh plugin --profile web add <absolute-dir> -w`. **Chart ≥0.4.47 seeds that file on first boot**
+(seed-once, next to `cordis.patch.yml`), so a fresh unit needs nothing; units created before that
+need the one line above. The file lives on the user's state PVC, so it survives pod restarts and
+upgrades.
+
 Because the stored path is absolute, **moving a plugin directory breaks every profile that links
 it** — re-link after a move (`dsh plugin --profile web add <new-dir>`). Remove with
 `plugin_manager remove_bundle`, or `dsh plugin --profile web remove @local/<name>` plus dropping

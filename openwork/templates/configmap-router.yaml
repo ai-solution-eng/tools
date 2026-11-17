@@ -162,7 +162,7 @@ data:
     // ancestor trail in the 'from' parameter, and links keep the theme.
     // r31 (RUNTIME_REV): the edit dialog adopts the page the preview navigated to,
     // so Source / Rename / Delete / Save follow the document on screen.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 32 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 33 }}'
     const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- Unit-pod container resources -------------------------------------
@@ -1730,6 +1730,17 @@ data:
         "$RUN_AS_USER test -f /var/openwork/home/.bash_profile || $RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/openwork/home/.bash_profile",
         "$RUN_AS_USER test -f /var/openwork/home/.profile || $RUN_AS_USER cp /var/openwork/home/.bash_profile /var/openwork/home/.profile",
         "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/openwork/bin:/var/openwork/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/openwork/bin/openwork-bashrc",
+
+        // Forced-tenant-uid units (platform admission stamps the project uid
+        // into EVERY pod of project-user-*, so the container never runs as
+        // root) have NO /etc/passwd entry: useradd cannot run and /etc/passwd
+        // is not writable. bash then renders its user-name prompt escape as
+        // "I have no name!" and $USER/$LOGNAME are empty, which also breaks
+        // tools that read them. Give the shell an identity WITHOUT touching
+        // /etc: only when getent cannot resolve the uid, name it after the
+        // unit's slug and give bash a PS1 that avoids the uid lookup.
+        "$RUN_AS_USER printf '%s\\n' 'if ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  export USER=\"${PREVIEW_USER_SLUG:-user}\"' '  export LOGNAME=\"$USER\"' '  PS1=\"${PREVIEW_USER_SLUG:-user}@\\h:\\w:\\$ \"' 'fi' > /var/openwork/bin/openwork-identity.sh",
+        "$RUN_AS_USER grep -qs openwork-identity.sh /var/openwork/bin/openwork-bashrc || $RUN_AS_USER printf '%s\\n' '[ -f /var/openwork/bin/openwork-identity.sh ] && . /var/openwork/bin/openwork-identity.sh' >> /var/openwork/bin/openwork-bashrc",
         "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/openwork/bin/openwork-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/openwork/bin/openwork-login-shell",
         // ROOT chmod + ownership reconciliation: the `>` redirections above
         // are performed by the ROOT shell (setpriv only wraps the command

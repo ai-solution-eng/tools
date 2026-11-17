@@ -197,7 +197,7 @@ data:
     // its own (in-document links, the back chip); the dialog now adopts the page
     // it is actually showing, so Source / Rename / Delete / Save act on THAT file
     // instead of the one the dialog was opened with.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 31 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 32 }}'
     const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- Unit-pod container resources -------------------------------------
@@ -1779,6 +1779,17 @@ data:
         "$RUN_AS_USER test -f /var/opencode/home/.bash_profile || $RUN_AS_USER printf '[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\\n' > /var/opencode/home/.bash_profile",
         "$RUN_AS_USER test -f /var/opencode/home/.profile || $RUN_AS_USER cp /var/opencode/home/.bash_profile /var/opencode/home/.profile",
         "$RUN_AS_USER printf 'export PATH=\"$HOME/.local/bin:/var/opencode/bin:/var/opencode/data/npm/bin:$PATH\"\\nexport COLORTERM=truecolor\\nexport LANG=C.UTF-8\\nexport LC_ALL=C.UTF-8\\nexport LC_CTYPE=C.UTF-8\\n' > /var/opencode/bin/opencode-bashrc",
+
+        // Forced-tenant-uid units (platform admission stamps the project uid
+        // into EVERY pod of project-user-*, so the container never runs as
+        // root) have NO /etc/passwd entry: useradd cannot run and /etc/passwd
+        // is not writable. bash then renders its user-name prompt escape as
+        // "I have no name!" and $USER/$LOGNAME are empty, which also breaks
+        // tools that read them. Give the shell an identity WITHOUT touching
+        // /etc: only when getent cannot resolve the uid, name it after the
+        // unit's slug and give bash a PS1 that avoids the uid lookup.
+        "$RUN_AS_USER printf '%s\\n' 'if ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  export USER=\"${PREVIEW_USER_SLUG:-user}\"' '  export LOGNAME=\"$USER\"' '  PS1=\"${PREVIEW_USER_SLUG:-user}@\\h:\\w:\\$ \"' 'fi' > /var/opencode/bin/opencode-identity.sh",
+        "$RUN_AS_USER grep -qs opencode-identity.sh /var/opencode/bin/opencode-bashrc || $RUN_AS_USER printf '%s\\n' '[ -f /var/opencode/bin/opencode-identity.sh ] && . /var/opencode/bin/opencode-identity.sh' >> /var/opencode/bin/opencode-bashrc",
         "$RUN_AS_USER printf '#!/bin/sh\\nexport BASH_ENV=/var/opencode/bin/opencode-bashrc\\nexec /usr/bin/bash \"$@\"\\n' > /var/opencode/bin/opencode-login-shell",
         // ROOT chmod + ownership reconciliation: the `>` redirections above
         // are performed by the ROOT shell (setpriv only wraps the command
