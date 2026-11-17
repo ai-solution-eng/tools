@@ -1,6 +1,44 @@
 # Opencode harness deployment in PCAI
 # This app is very powerful, be responsible.
 
+# =============================================================================
+# CREDENTIALS — NOT applied from this file. They live in the Kubernetes Secret
+# "opencode-web-helm-credentials" in the release namespace (see
+# existingAuthSecret in values.yaml). Example values are listed here so operators can find them
+# without going into the cluster layer:
+#
+#   SESSION_SECRET            9xT2mQvR4pS7kL1nW8yB5dF3hJ6cZ0aG
+#   OPENCODE_SERVER_USERNAME  opencode
+#   OPENCODE_SERVER_PASSWORD  7Vf9mQ2xKp8tL4nR6wY1cB3hDz5sUa0N
+#   ADMIN_USERNAME            admin-user
+#   ADMIN_PASSWORD            admin-password
+#
+# Create it before `helm upgrade`:
+#   kubectl -n <namespace> create secret generic opencode-web-helm-credentials \
+#     --from-literal=SESSION_SECRET='...' \
+#     --from-literal=OPENCODE_SERVER_USERNAME='...' \
+#     --from-literal=OPENCODE_SERVER_PASSWORD='...' \
+#     --from-literal=ADMIN_USERNAME='admin-user' \
+#     --from-literal=ADMIN_PASSWORD='...'
+#
+# SECURITY: anyone who can read this file can read those credentials — the same
+# exposure the values had before, just moved. Drop the four lines above if this
+# file is shared more widely than the cluster.
+# =============================================================================
+
+# ============================================================
+# Opencode harness deployment in PCAI
+# This app is very powerful, be responsible.
+# OpenCode is an open-source, model-agnostic AI coding agent that runs directly in your terminal, desktop app, or IDE to help you write, refactor, and debug code
+# Owner Francesco Caliva
+# Admin password: admin-password
+# You can login using SSO, or create a user via admin account
+# SSO login grants you access to the kubeflow personal and shared PVCs
+# Visit https://opencode.pcai-se-ai-application.hst.rdlabs.hpecorp.net/terminal for a terminal
+# Visit https://opencode.pcai-se-ai-application.hst.rdlabs.hpecorp.net/data-manager for a file explorer
+# Note: We now support helm and docker functionalities.
+# ============================================================
+
 # ============================================================
 # EZUA settings
 # ============================================================
@@ -90,7 +128,7 @@ dataManager:
 # changes the router patches each Deployment and the unit rolls.
 # Always rendered into the marker as the '-r<value>' suffix (same contract as
 # the dsh and openwork charts). Bump it whenever the pod template changes.
-RUNTIME_REV: 30
+RUNTIME_REV: 31
 
 images:
   # Baked user image: carries the apt toolchain, opencode-ai,
@@ -227,6 +265,32 @@ provisioning:
     enabled: true
     heading: "Setting up your account\u2026"
     subtext: "This usually takes a few minutes on first launch. Please wait."
+  # Container resources for the per-user unit pod (the router generates that pod
+  # template). EVERY container declares requests AND limits: a ResourceQuota
+  # that pins limits.cpu/limits.memory — the platform EzProject
+  # 'project-quotas' does this on some clusters — makes Kubernetes reject the
+  # whole ReplicaSet if any container, init containers included, omits them.
+  # The symptom is a Deployment that never gets a pod plus a router timeout
+  # ("Timed out waiting for deployment opencode-user-<user>").
+  #   web   opencode-web (the agent UI)
+  #   init  init-opencode-storage (apt/npm bootstrap — same ceiling as web)
+  #   proxy nginx preview proxy
+  #   auth  session/auth validator
+  # The CA init container is configured separately under
+  # certificatesPolicy.initContainer.resources.
+  unitResources:
+    web:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    init:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    proxy:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
+    auth:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
 
 # --- Credentials -------------------------------------------------------------
 # Name of a Secret that ALREADY EXISTS in this namespace. When set (the default)

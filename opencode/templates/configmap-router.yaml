@@ -197,8 +197,34 @@ data:
     // its own (in-document links, the back chip); the dialog now adopts the page
     // it is actually showing, so Source / Rename / Delete / Save act on THAT file
     // instead of the one the dialog was opened with.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 30 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 31 }}'
     const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
+
+    // --- Unit-pod container resources -------------------------------------
+    // A ResourceQuota that pins limits.cpu/limits.memory (the platform EzProject
+    // 'project-quotas' does exactly that on some clusters) makes Kubernetes
+    // REQUIRE requests AND limits on EVERY container of the pod — init
+    // containers included. This router GENERATES the pod template, so a
+    // container that omits them makes the whole ReplicaSet fail admission
+    // ("failed quota: project-quotas: must specify limits.cpu for:
+    // init-opencode-storage"), no pod is ever created, and the router times out
+    // waiting for a Deployment that can never become available. Every container
+    // below therefore declares both. Tunable through
+    // values.provisioning.unitResources.<key> (and
+    // values.certificatesPolicy.initContainer.resources for the CA init); the
+    // defaults are the numbers opencode-web has always used.
+    // (dig() cannot take chartutil.Values, so these are guarded field accesses.)
+    {{- $ur := dict }}
+    {{- if and .Values.provisioning .Values.provisioning.unitResources }}{{ $ur = .Values.provisioning.unitResources }}{{ end }}
+    {{- $caRes := dict }}
+    {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.initContainer .Values.certificatesPolicy.initContainer.resources }}{{ $caRes = .Values.certificatesPolicy.initContainer.resources }}{{ end }}
+    const unitResources = {
+      web: {{ toJson (default (dict "requests" (dict "cpu" "250m" "memory" "512Mi") "limits" (dict "cpu" "2" "memory" "2Gi")) $ur.web) }},
+      init: {{ toJson (default (dict "requests" (dict "cpu" "250m" "memory" "512Mi") "limits" (dict "cpu" "2" "memory" "2Gi")) $ur.init) }},
+      proxy: {{ toJson (default (dict "requests" (dict "cpu" "25m" "memory" "32Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) $ur.proxy) }},
+      auth: {{ toJson (default (dict "requests" (dict "cpu" "25m" "memory" "64Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) $ur.auth) }},
+      caBundle: {{ toJson (default (dict "requests" (dict "cpu" "10m" "memory" "16Mi") "limits" (dict "cpu" "100m" "memory" "64Mi")) $caRes) }},
+    }
 
     // --- DinD daemon spec (single source for the in-pod sidecar AND the
     // --- per-user broker pods) ------------------------------------------
@@ -1852,6 +1878,9 @@ data:
                   image: '{{ .Values.certificatesPolicy.initContainer.image }}',
                   imagePullPolicy: 'IfNotPresent',
                   command: {{ toJson .Values.certificatesPolicy.initContainer.command }},
+                  // A quota that pins limits.cpu/memory requires them on init
+                  // containers too — omitting them rejects the whole pod.
+                  resources: unitResources.caBundle,
                   volumeMounts: [
                     {{- range .Values.certificatesPolicy.initVolumeMounts }}
                     { name: '{{ .name }}', mountPath: '{{ .mountPath }}'{{ if .subPath }}, subPath: '{{ .subPath }}'{{ end }}{{ if hasKey . "readOnly" }}, readOnly: {{ .readOnly }}{{ end }} },
@@ -1862,6 +1891,8 @@ data:
                 {
                   name: 'init-opencode-storage',
                   image: userInitImage,
+                  // Runs apt/npm, so it gets the same ceiling as opencode-web.
+                  resources: unitResources.init,
                   imagePullPolicy: 'Always',
                   command: ['/bin/sh', '-lc', initCommand],
                   env: [
@@ -2017,10 +2048,7 @@ data:
                     tcpSocket: { port: userIsChamber ? userChamberPort : userServerPort },
                     periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 18,
                   },
-                  resources: {
-                    requests: { cpu: '250m', memory: '512Mi' },
-                    limits: { cpu: '2', memory: '2Gi' },
-                  },
+                  resources: unitResources.web,
                   volumeMounts: [
                     { name: 'personal-workspace', mountPath: '/workspace/personal' },
                     { name: 'shared-workspace', mountPath: '/workspace/shared' },
@@ -2046,6 +2074,7 @@ data:
                   name: 'opencode-preview-proxy',
                   image: 'nginx:1.27-alpine',
                   imagePullPolicy: 'IfNotPresent',
+                  resources: unitResources.proxy,
                   // The upstream Basic-auth header is built here, at container
                   // start, from the secret-backed env — it is never baked into
                   // the rendered nginx.conf, so no credential lands in the pod
@@ -2078,6 +2107,7 @@ data:
                   name: 'opencode-auth',
                   image: userInstanceImage,
                   imagePullPolicy: 'Always',
+                  resources: unitResources.auth,
                   command: ['node', '/opt/preview/auth_validator.mjs'],
                   env: [
                     { name: 'SESSION_KEY', value: crypto.createHmac('sha256', sessionSecret).update(slug).digest('hex') },

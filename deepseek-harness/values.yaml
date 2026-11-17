@@ -69,7 +69,7 @@ dataManager:
 # changes, the router patches each Deployment and the unit rolls.
 # Historical values live as comments on the template constant (RUNTIME_REV in
 # templates/configmap-router.yaml); keep this in sync with the shipped default.
-RUNTIME_REV: 51
+RUNTIME_REV: 52
 
 images:
   # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
@@ -170,6 +170,32 @@ provisioning:
     enabled: true
     heading: "Setting up your account\u2026"
     subtext: "Usually ready in under a minute. Please wait."
+  # Container resources for the per-user unit pod (the router generates that pod
+  # template). EVERY container declares requests AND limits: a ResourceQuota
+  # that pins limits.cpu/limits.memory — the platform EzProject
+  # 'project-quotas' does this on some clusters — makes Kubernetes reject the
+  # whole ReplicaSet if any container, init containers included, omits them.
+  # The symptom is a Deployment that never gets a pod plus a router timeout
+  # ("Timed out waiting for deployment dsh-user-<user>").
+  #   web   dsh-web (the agent UI)
+  #   init  init-dsh-storage (apt/npm bootstrap — same ceiling as web)
+  #   proxy nginx preview proxy
+  #   auth  session/auth validator
+  # The CA init container is configured separately under
+  # certificatesPolicy.initContainer.resources.
+  unitResources:
+    web:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    init:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits:   {cpu: "2",  memory: 2Gi}
+    proxy:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
+    auth:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits:   {cpu: 200m, memory: 128Mi}
 
 auth:
   username: dsh
