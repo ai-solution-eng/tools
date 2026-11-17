@@ -4,7 +4,7 @@ Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.co
 
 Port of the `opencode` chart (`opencode-web-helm`): same router, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
-Chart: `dsh-web-helm` · current version **0.4.22** (dsh `0.2.1-rc.2`, Node 22.23.3 image).
+Chart: `dsh-web-helm` · current version **0.4.48** (dsh `0.2.2-rc.3`, Node 24.22.2 image).
 0.4.4 fixes the VAST quota-collision hang for long usernames: quota names are `csi:<ns>:<pvc>`
 **truncated to 64 chars** — with a long namespace (e.g. `project-user-XXX-XXX-XXX`)
 only the first ~20 chars of the PVC name survive, so a version *suffix* was invisible to VAST and
@@ -206,7 +206,7 @@ User pods previously ran vanilla `node:22-bookworm-slim` and installed everythin
 Design contract (see `docker/user/Dockerfile`):
 
 - Baked artifacts live under **`/opt/dsh`** (`/opt/dsh/npm`, `/opt/dsh/bin`) — never under `/var/dsh`, which the state PVC mounts and would shadow. The init container aliases the PVC paths (`/var/dsh/data/npm`, `/var/dsh/bin/{uv,uvx,ttyd}`) to the baked copies with guarded symlinks; `dsh-startup.sh` is unchanged.
-- **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:22-bookworm-slim` (or bump `dsh.version` without rebuilding) and the old install-on-boot behavior resumes.
+- **Every runtime install step remains as a guarded fallback.** On the baked image the guards no-op; set `images.user/init` back to `node:24-bookworm-slim` (or bump `dsh.version` without rebuilding) and the old install-on-boot behavior resumes. The base must stay >= 24.9 — dsh 0.2.2+ declares `engines.node >= 24.9.0`, so a node-22 base no longer works.
 - The image tag is folded into `user-template-version`, so a `helm upgrade` with a new tag re-stamps all existing units (dedicated) onto the new image automatically.
 - User pods pull with `IfNotPresent` — use immutable tags (no `latest`). If the registry package is private, set `images.pullSecret` to an imagePullSecret in the release namespace (public ghcr.io packages pull anonymously).
 
@@ -219,6 +219,42 @@ docker buildx build --platform linux/amd64 \
 ```
 
 Then `helm upgrade` (the values files already point at the matching tag).
+
+---
+
+## dsh 0.2.2-rc.3 (0.4.48)
+
+Bumps `@deepseek-ai/dsh` 0.2.2-rc.1 -> 0.2.2-rc.3 (npm `next`; `latest` is still rc.1) and the baked
+image to `:0.2.2-rc.3-dind`. Node stays `24.22.2` - rc.3 still declares `engines.node >= 24.9.0`.
+
+**Image tags are immutable.** Never rebuild+push over an existing tag: units pull `IfNotPresent`, so
+a re-push leaves already-pulled units on the old layers and destroys the rollback baseline. A
+rebuild gets a NEW tag (`0.2.2-rc.3-dind-r2`) and BOTH `images.user` and `images.init` move to it -
+the tag joins `userTemplateVersion`, so the fleet re-stamps on the next reconcile.
+
+**Patch guard hardened.** 0.2.2-rc.2 minified the browser bundle: the `isLoopback:` expression is
+unchanged but the whitespace is not (`isLoopback:transport?.ownsHost===true||...`), so the old
+spaced literal matched `client.node.js` only and the build still passed. Both the Dockerfile and
+`scripts/verify-dsh-patches.sh` now match whitespace-insensitively and fail if ANY `lib/client*.js`
+carrying an `isLoopback:` assignment is left unmarked - that bundle is what decides settings
+persistence in the UI, so an unpatched one shows "settings are unavailable in this browser".
+
+**CR blob drift fixed.** Regenerating `spec.values` from `values-g2.yaml` also brings in the CA-init
+`resources` block (10m/16Mi requests, 100m/64Mi limits) that the 0.4.47 blob lacked, so 0.4.48 changes that
+init container's resources on every unit as well as the dsh version.
+
+**Upstream migration items to check per unit** (rc.2 release notes): the web-search provider
+changed. The shipped patch already sets `- id: web / config: fetchProvider: http`, but
+`cordis.patch.yml` is **seed-once** — existing units keep their rc.1 copy and the chart cannot
+rewrite it — so the action is to edit `~/.dsh/profiles/web/cordis.patch.yml` per unit (or push it with
+`scripts/push_dsh_cordis_patch.sh`). AgentTeam moved to unified
+named subagents ("custom plugins and SDK integrations need migration"), custom overlay positioning
+changed, and the skills/dev-doc paths were reorganised. Both custom plugins
+(`dsh-app-shortcuts`, `dsh-mcp-status`) are UI overlays - re-test them after the upgrade.
+
+**Rollback:** ordinary sessions roll back to rc.1. Sessions that used team mode write a `team/mode`
+event (the 63rd session event type, new in rc.3) and will not be readable by rc.1 - freeze team
+mode during the soak window if rollback must stay clean.
 
 ---
 
@@ -325,7 +361,7 @@ The first login after logout used to strand the user on the login menu ("Signed 
 | PVCs hang Pending / VAST quota collisions | VAST CSI 64-char quota-name truncation | `scripts/cleanup-dsh-web-helm-stale-quotas.sh` (dry-run by default) |
 | **`dsh plugin add` / Plugins page: `ERR_PNPM_ADDING_TO_ROOT`** | the profile dir is a pnpm workspace root (dsh writes `profiles/web/pnpm-workspace.yaml` with `packages: [.]`) and `dsh plugin` forwards its arguments verbatim to pnpm | `echo 'ignore-workspace-root-check=true' >> ~/.dsh/profiles/web/.npmrc` (also fixes the UI; chart ≥0.4.47 seeds it), or pass `-w` to that one command |
 
-**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. **`RUNTIME_REV` is operator-tunable** (`values.yaml` / EzAppConfig values blob): bump it to force every unit to re-stamp onto the current template without editing the chart. Defaults to the shipped value (48), so leaving it unset changes nothing. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
+**Convergence:** per-user runtime changes roll automatically — the router stamps `dsh-web-helm/user-template-version` (RUNTIME_REV + dsh version + user image tag) and re-templates units whose annotation differs. **`RUNTIME_REV` is operator-tunable** (`values.yaml` / EzAppConfig values blob): bump it to force every unit to re-stamp onto the current template without editing the chart. The template's own fallback is 44 (used only when the value is unset); `values.yaml` ships 54. If ever needed: `kubectl -n <ns> rollout restart deploy -l dsh-user-managed=true`.
 
 ---
 

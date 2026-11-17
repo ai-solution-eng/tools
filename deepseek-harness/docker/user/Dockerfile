@@ -11,11 +11,11 @@
 # Build (canonical invocation, also wrapped by scripts/build-user-image.sh
 # which defaults the tag to dsh.version from values.yaml):
 #   docker buildx build --platform linux/amd64 \
-#     -t ghcr.io/ai-solution-eng/deepseek-harness:0.2.1-rc.2-dind --push docker/user
+#     -t ghcr.io/ai-solution-eng/deepseek-harness:0.2.2-rc.3-dind --push docker/user
 #
 # IMPORTANT — the chart's runtime install steps remain in place as GUARDED
 # FALLBACKS: on this image they no-op (everything they look for is present),
-# and on the vanilla node:22-bookworm-slim image they still work. Two rules
+# and on a vanilla node:24-bookworm-slim image they still work. Two rules
 # keep the two layers consistent:
 #   1. Baked artifacts live under /opt/dsh — NEVER under /var/dsh. The state
 #      PVC mounts at /var/dsh and would shadow any image content there. The
@@ -34,7 +34,7 @@
 # 24.22.2 = latest 24.x LTS at the 0.2.2-rc.1 bump.
 FROM node:24.22.2-bookworm-slim
 
-ARG DSH_VERSION=0.2.2-rc.1
+ARG DSH_VERSION=0.2.2-rc.3
 ARG TTYD_VERSION=1.7.7
 # helm: OFFLINE ONLY (package/template/lint) — user pods carry no
 # kubeconfig/ServiceAccount, so helm upgrade stays on the deploy host.
@@ -47,7 +47,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 LABEL org.opencontainers.image.title="deepseek-harness user unit" \
       org.opencontainers.image.description="Baked user-pod image for the dsh-web-helm chart: apt toolchain + @deepseek-ai/dsh + uv + ttyd + helm + docker CLI/buildx preinstalled" \
-      org.opencontainers.image.base.name="node:22-bookworm-slim"
+      org.opencontainers.image.base.name="node:24.22.2-bookworm-slim"
 
 # --- apt toolchain + the /usr/local/bin aliases dsh-startup.sh recreates ---
 # Mirrors the dsh-startup.sh toolchain block: same package list, same
@@ -120,17 +120,42 @@ RUN npm install -g --silent "pnpm@${PNPM_VERSION}" --prefix /opt/dsh/npm \
 # browser bundle never got the multi-user settings fix — and both the build guard
 # and scripts/verify-dsh-patches.sh passed anyway. Patch EVERY matching file and
 # assert the marker in each; a changed upstream expression still fails loudly.
+# 2026-11-16 (0.2.2-rc.3 prep): 0.2.2-rc.2 SHIPPED A MINIFIED BROWSER BUNDLE
+# (client.browser.js 55,175 -> 40,691 bytes; `files` now ships lib/*.js.map). The
+# expression is unchanged, the whitespace is not:
+#   client.node.js     isLoopback: transport?.ownsHost === true || ...
+#   client.browser.js  isLoopback:transport?.ownsHost===true||...
+# The old spaced literal therefore matched client.node.js ONLY; the build still
+# passed (TARGETS non-empty) and the browser bundle would have shipped unpatched
+# - re-introducing the "settings are unavailable in this browser" regression.
+# The match is now whitespace-insensitive, and the guard is inverted: EVERY
+# lib/client*.js carrying an `isLoopback:` assignment must end up marked.
 RUN FILES="$(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-connection/lib/client*.js' -print)" \
- && TARGETS="$(grep -Fl 'isLoopback: transport?.ownsHost === true' $FILES)" \
- && test -n "$TARGETS" \
- && for f in $TARGETS; do \
-      grep -Fq "isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)" "$f" \
-        || { echo "dsh-web-helm: isLoopback expression missing or changed in $f" >&2; exit 1; }; \
-      sed -i "s#isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)#isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */#" "$f"; \
-      grep -Fq "isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */" "$f" \
-        || { echo "dsh-web-helm: isLoopback patch did not apply to $f" >&2; exit 1; }; \
+ && { test -n "$FILES" || { echo "dsh-web-helm: no client*.js under /opt/dsh/npm" >&2; exit 1; }; } \
+ && EXPR_RE='isLoopback:[[:space:]]*transport\?\.[[:space:]]*ownsHost[[:space:]]*===[[:space:]]*true[[:space:]]*\|\|[[:space:]]*pageLocation[[:space:]]*===[[:space:]]*void[[:space:]]*0[[:space:]]*\|\|[[:space:]]*isLoopbackHostname\([[:space:]]*pageLocation\.hostname[[:space:]]*\)' \
+ && MARKER='isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */' \
+ && PATCHED="" \
+ && for f in $FILES; do \
+      if grep -Eq "$EXPR_RE" "$f"; then \
+        N="$(grep -Eo "$EXPR_RE" "$f" | wc -l | tr -d ' ')"; \
+        [ "$N" = "1" ] || { echo "dsh-web-helm: $N isLoopback expressions in $f (expected 1)" >&2; exit 1; }; \
+        sed -E -i "s#$EXPR_RE#$MARKER#" "$f"; \
+        PATCHED="$PATCHED $f"; \
+      fi; \
+      if grep -Fq 'isLoopback:' "$f"; then \
+        grep -Fq "$MARKER" "$f" \
+          || { echo "dsh-web-helm: $f carries an isLoopback assignment that is neither the expected expression nor the marker - upstream changed it" >&2; exit 1; }; \
+      fi; \
     done \
- && echo "dsh-web-helm: isLoopback patched in: $TARGETS"
+ && for f in $FILES; do \
+      case "$f" in \
+        *client.browser.js) \
+          grep -Fq "$MARKER" "$f" \
+            || { echo "dsh-web-helm: browser bundle left unmarked: $f" >&2; exit 1; } ;; \
+      esac; \
+    done \
+ && grep -Fq "$MARKER" $FILES \
+ && echo "dsh-web-helm: isLoopback patched in:${PATCHED:- (already marked)}"
 
 # --- uv + ttyd under /opt/dsh/bin ---
 # Same ttyd asset selection as the router's init container (x86_64/aarch64;
