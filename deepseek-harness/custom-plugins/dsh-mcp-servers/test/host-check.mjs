@@ -178,9 +178,11 @@ await check('apply() registers the settings opt-out and the status route', async
   start()
   assert.equal(state.settingsCalls.length, 1, 'the generated settings page must be disabled')
   assert.deepEqual(state.settingsCalls[0].options, { auto: false })
-  assert.equal(state.routes.length, 1)
+  assert.equal(state.routes.length, 2, 'status + test routes')
   assert.equal(state.routes[0].path, '/api/mcp-servers')
   assert.deepEqual(state.routes[0].methods, ['GET'])
+  assert.equal(state.routes[1].path, '/api/mcp-servers/test')
+  assert.deepEqual(state.routes[1].methods, ['POST'])
 })
 
 await check('apply() mounts one bridge child per enabled server', async () => {
@@ -201,6 +203,7 @@ await check('apply() mounts one bridge child per enabled server', async () => {
     url: 'https://one.example.com/mcp',
     toolCallTimeoutMs: 60000,
     failOnStartupError: false,
+    maxInstructionBytes: 262144,
   })
 })
 
@@ -362,6 +365,29 @@ await check('the snapshot reports fiber state and live tool counts', async () =>
   assert.equal(body.servers[1].toolCount, 1)
   assert.equal(body.servers[1].endpoint, 'npx')
   assert.equal(body.servers[1].transport, 'stdio')
+})
+
+await check('the test route probes a draft without mounting it', async () => {
+  const { state, start } = createContext({ servers: [] })
+  start()
+  await tick()
+  const route = state.routes.find((entry) => entry.path === '/api/mcp-servers/test')
+  assert.ok(route, 'the test route was not registered')
+
+  const bad = await route.fetch({
+    json: async () => ({ transport: 'streamable-http', url: 'ftp://example.com' }),
+  })
+  const badBody = await bad.json()
+  assert.equal(badBody.ok, false)
+  assert.match(badBody.error, /http/i)
+
+  const stdio = await route.fetch({
+    json: async () => ({ transport: 'stdio', command: 'definitely-not-a-real-binary-xyz' }),
+  })
+  const stdioBody = await stdio.json()
+  assert.equal(stdioBody.stdio, true)
+  assert.equal(stdioBody.commandFound, false)
+  assert.equal(state.mounts.length, 0, 'probing must never mount a child')
 })
 
 await check('external MCP rows are reported without their request headers', async () => {

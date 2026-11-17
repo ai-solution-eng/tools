@@ -275,7 +275,7 @@ window.__ModuleLoader__.load({
             : null,
         ),
         connection.endpoint ? h('div', { className: 'mcp-status-dock__endpoint' }, connection.endpoint) : null,
-        connection.note ? h('div', { className: 'mcp-status-dock__muted' }, t('note.stdio')) : null,
+        connection.note ? h('div', { className: 'mcp-status-dock__muted' }, connection.note) : null,
         connection.error ? h('div', { className: 'mcp-status-dock__error' }, connection.error) : null,
         h(UpstreamList, { connection, t }),
       )

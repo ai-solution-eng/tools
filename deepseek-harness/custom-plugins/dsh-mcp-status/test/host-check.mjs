@@ -8,7 +8,7 @@
 import { createServer } from 'node:http'
 import assert from 'node:assert/strict'
 import { probeMcpHttp, normalizeCatalog, readToolPayload } from '../probe.js'
-import { buildSnapshot, describeConnection, resolveSettings, summarize, toWire } from '../index.js'
+import { buildSnapshot, describeConnection, inject, resolveSettings, summarize, toWire } from '../index.js'
 
 const SESSION = 'session-abc'
 const SECRET = 'Bearer super-secret-token'
@@ -292,6 +292,66 @@ await record('snapshot: classifies every row', async () => {
   assert.equal(snapshot.summary.total, 4)
   assert.equal(snapshot.summary.probed, 2)
   assert.equal(snapshot.summary.connected, 1)
+})
+
+await record('services: the tools registry is injected', () => {
+  // Without 'tools' in inject, `ctx.tools` throws ("cannot get property
+  // \"tools\" without inject"), every tool lookup silently returns nothing, and
+  // every server is reported as unregistered — which is exactly how the
+  // page-managed servers came back as "configured" instead of "connected".
+  assert.ok(inject.includes('connection'), 'connection is required for the route')
+  assert.ok(inject.includes('tools'), 'tools is required to read registered tool names')
+})
+
+await record('snapshot: servers added through the MCP servers page are counted', async () => {
+  // The page mounts its servers as children of its own row, so they are not
+  // Loader entries. Only the row's `servers` list reveals them.
+  const managed = [
+    { id: 'litellm', serverName: 'aruba', transport: 'streamable-http', url: 'http://127.0.0.1:1/mcp', enabled: true },
+    { id: 'off', serverName: 'offpage', transport: 'streamable-http', url: 'http://127.0.0.1:1/mcp', enabled: false },
+  ]
+  // The page declares `servers` volatile, so a resolved config holds a
+  // reference object — NOT the array. Reading it with Array.isArray() silently
+  // returned zero rows and the panel under-counted every page-managed server.
+  const volatileRef = Object.freeze({
+    get: () => managed,
+    [Symbol.for('cosmokit.volatile.write')]: () => {},
+  })
+  const hostEntry = {
+    id: 'mcp-servers',
+    options: { id: 'mcp-servers', name: '@local/dsh-mcp-servers', config: { servers: volatileRef } },
+    fiber: { effectiveConfig: { servers: volatileRef }, state: 2 },
+    disabled: false,
+  }
+  const ctx = {
+    loader: { entries: () => [hostEntry][Symbol.iterator]() },
+    tools: { schemas: () => [{ name: 'mcp__aruba__health' }, { name: 'mcp__aruba__skills_list' }, { name: 'bash' }] },
+  }
+  const snapshot = await buildSnapshot(ctx, settings, caches(), false)
+  const byName = Object.fromEntries(snapshot.connections.map((item) => [item.serverName, item]))
+  assert.deepEqual(Object.keys(byName).sort(), ['aruba', 'offpage'])
+  assert.equal(byName.aruba.state, 'connected')
+  assert.equal(byName.aruba.toolCount, 2)
+  assert.equal(byName.aruba.managedBy, 'mcp-servers')
+  assert.deepEqual(byName.aruba.tools, ['health', 'skills_list'])
+  assert.equal(byName.offpage.state, 'disabled')
+  assert.equal(snapshot.summary.total, 2)
+  assert.equal(snapshot.summary.connected, 1)
+
+  // A plain array (an unresolved or hand-written config) must work too.
+  const plainHost = {
+    id: 'mcp-servers',
+    options: { id: 'mcp-servers', name: '@local/dsh-mcp-servers', config: { servers: managed } },
+    fiber: { effectiveConfig: { servers: managed }, state: 2 },
+    disabled: false,
+  }
+  const plainCtx = {
+    loader: { entries: () => [plainHost][Symbol.iterator]() },
+    tools: { schemas: () => [{ name: 'mcp__aruba__health' }, { name: 'mcp__aruba__skills_list' }] },
+  }
+  const plain = await buildSnapshot(plainCtx, settings, caches(), false)
+  assert.equal(plain.summary.total, 2)
+  assert.equal(plain.connections.find((item) => item.serverName === 'aruba').toolCount, 2)
 })
 
 await record('snapshot: upstream servers appear for the gateway', async () => {

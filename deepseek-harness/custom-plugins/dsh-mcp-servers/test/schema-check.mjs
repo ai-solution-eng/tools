@@ -33,6 +33,7 @@ import {
   factsOf,
   isHttpUrl,
   isVolatileRef,
+  messageOf,
   mountableServers,
   normalizeRows,
   readServersField,
@@ -143,6 +144,9 @@ check('normalization fills defaults and drops transport-only fields', () => {
   assert.equal(http.toolCallTimeoutMs, 60000)
   assert.equal(http.enabled, true)
   assert.equal(http.failOnStartupError, false)
+  assert.equal(http.maxInstructionBytes, 262144, 'defaults to the roomy cap')
+  assert.equal(normalizeRows([{ serverName: 'a', maxInstructionBytes: 262144 }])[0].maxInstructionBytes, 262144)
+  assert.equal(normalizeRows([{ serverName: 'a', maxInstructionBytes: 0 }])[0].maxInstructionBytes, 262144)
   const [stdio] = normalizeRows([{ serverName: 'b', transport: 'stdio', command: ' npx ', args: ['-y', 7], env: { TOKEN: 5 } }])
   assert.equal(stdio.command, 'npx')
   assert.deepEqual(stdio.args, ['-y', '7'])
@@ -176,6 +180,7 @@ check('bridgeConfigOf matches the bridge config contract', () => {
     headers: { Authorization: 'Bearer x' },
     toolCallTimeoutMs: 1000,
     failOnStartupError: true,
+    maxInstructionBytes: 262144,
   })
   const [stdio] = normalizeRows([{ serverName: 'local', transport: 'stdio', command: 'npx', args: ['-y', 'x'], cwd: '/tmp' }])
   assert.deepEqual(bridgeConfigOf(stdio), {
@@ -186,7 +191,19 @@ check('bridgeConfigOf matches the bridge config contract', () => {
     cwd: '/tmp',
     toolCallTimeoutMs: 60000,
     failOnStartupError: false,
+    maxInstructionBytes: 262144,
   })
+})
+
+check('messageOf keeps the actionable cause of a failed start', () => {
+  const inner = new Error('mcp-client(aruba): server instructions exceed maxInstructionBytes (32768)')
+  const outer = new Error('mcp-client(aruba): initial connection or tool synchronization failed', { cause: inner })
+  assert.equal(
+    messageOf(outer),
+    'mcp-client(aruba): initial connection or tool synchronization failed: mcp-client(aruba): server instructions exceed maxInstructionBytes (32768)',
+  )
+  assert.equal(messageOf('plain text'), 'plain text')
+  assert.equal(messageOf(undefined), 'unknown error')
 })
 
 check('factsOf ignores fields that do not need a new child', () => {
@@ -344,7 +361,7 @@ if (!existsSync(schemasteryPath) || !existsSync(cosmokitPath)) {
     const live = Config['~standard'].validate({ servers: [{ serverName: 'github', enabled: false }] }).value
     const projected = projectForm(form, plainConfig(live))
     assert.doesNotThrow(() => rehydrated(projected))
-    assert.deepEqual(projected, { servers: [{ serverName: 'github', enabled: false, id: 'github', transport: 'streamable-http', url: '', headers: {}, command: '', args: [], cwd: '', env: {}, toolCallTimeoutMs: 60000, failOnStartupError: false }] })
+    assert.deepEqual(projected, { servers: [{ serverName: 'github', enabled: false, id: 'github', transport: 'streamable-http', url: '', headers: {}, command: '', args: [], cwd: '', env: {}, toolCallTimeoutMs: 60000, failOnStartupError: false, maxInstructionBytes: 262144 }] })
   })
 
   check('interop: isVolatilePath() allows the servers field and nothing else', () => {

@@ -108,6 +108,12 @@ addresses the settings namespace `mcp-servers`.
     the `mcp__<name>__` tool prefix.
   - `Tool call timeout` defaults to 60000 ms. *Fail loudly when the server
     cannot start* maps to the bridge's `failOnStartupError`.
+  - `Instruction cap` bounds the server's instructions block that the bridge
+    injects into the system prompt, in bytes. It defaults to 262144, so a
+    server with a large instruction payload (the HPE networking MCP sends
+    ~121 KB) connects out of the box — the bridge's own default of 32768
+    fails such a server with `server instructions exceed
+    maxInstructionBytes`. Lower it to keep a verbose server out of the prompt.
 - **Edit** — reopens the same form. Changing the endpoint, transport, name or
   any connection field remounts that one server; other servers keep running.
 - **Disable / Enable** — keeps the configuration, drops or restores the
@@ -119,8 +125,8 @@ addresses the settings namespace `mcp-servers`.
 
 Validation runs twice: in the page before it writes (name charset and
 uniqueness, absolute http(s) URL, non-empty command, header/env key shape,
-positive timeout) and again in the Host before it mounts (the same rules,
-reported per row under *Cannot start*). A row that fails Host validation is
+positive timeout and instruction cap) and again in the Host before it mounts
+(the same rules, reported per row under *Cannot start*). A row that fails Host validation is
 kept in configuration and reported — it never breaks the page or the boot.
 
 ## Verify

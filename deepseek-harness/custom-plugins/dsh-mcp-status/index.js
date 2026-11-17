@@ -26,6 +26,18 @@ import { commandName, messageOf, probeMcpHttp, redactUrl } from './probe.js'
 /** Loader rows this plugin reports on. */
 const MCP_CLIENT_SPECIFIER = 'mcp-client'
 
+/**
+ * Loader row that owns the servers added through Settings -> MCP servers.
+ *
+ * Those servers are mounted as sub-fibers of that row, not as Loader rows of
+ * their own, so an entry walk can never see them. The row's own `servers` list
+ * is the only place they exist.
+ */
+const MCP_SERVERS_SPECIFIER = 'dsh-mcp-servers'
+
+/** Cosmokit's registered symbol for the shared volatile-reference protocol. */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
 /** Fiber lifecycle names, indexed by the Cordis `FiberState` value. */
 const FIBER_STATES = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
 
@@ -56,8 +68,14 @@ const BOUNDS = {
   maxUpstreamServers: [1, 500],
 }
 
-/** Services required before this plugin can answer. */
-export const inject = ['connection']
+/**
+ * Services required before this plugin can answer.
+ *
+ * `tools` is not optional: without it, reading the tool registry throws
+ * ("cannot get property \"tools\" without inject"), which silently reported every
+ * server as unregistered. `registeredToolCount`/`registeredToolNames` depend on it.
+ */
+export const inject = ['connection', 'tools']
 
 /**
  * Normalize a raw Loader config into accepted settings.
@@ -290,14 +308,142 @@ function applyProbe(connection, probe, settings) {
 }
 
 /**
- * Probe every configured MCP server.
+ * Tool names the bridge currently publishes for one server name.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {string} serverName - MCP server namespace.
+ * @returns {string[]} registered tool names, prefix stripped.
+ */
+function registeredToolNames(ctx, serverName) {
+  try {
+    const tools = ctx.tools
+    if (!tools || typeof tools.schemas !== 'function') return []
+    const schemas = tools.schemas()
+    if (!Array.isArray(schemas)) return []
+    const prefix = `mcp__${serverName}__`
+    return schemas
+      .map((schema) => schema?.name)
+      .filter((name) => typeof name === 'string' && name.startsWith(prefix))
+      .map((name) => name.slice(prefix.length))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Read the live list out of a resolved config field.
+ *
+ * The page declares `servers` as a *volatile* field, so a resolved config holds
+ * a reference object (`{ get(), [WRITE] }`) rather than the array itself.
+ * `Array.isArray()` on that object is false, which silently hid every
+ * page-managed server until this unwrap was added.
+ * @param {unknown} field - resolved `config.servers`.
+ * @returns {unknown[]} the configured rows.
+ */
+function readServersField(field) {
+  let value = field
+  try {
+    if (value && typeof value === 'object' && (VOLATILE_WRITE in value || typeof value.get === 'function')) {
+      value = typeof value.get === 'function' ? value.get() : value
+    }
+  } catch {
+    value = field
+  }
+  return Array.isArray(value) ? value : []
+}
+
+/**
+ * The MCP servers the Settings page manages, read from the owning row's config.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @returns {Array<{ hostEntry: any, row: Record<string, any> }>} managed rows.
+ */
+function managedRows(ctx) {
+  const found = []
+  for (const entry of readEntries(ctx)) {
+    const specifier = entry?.options?.name
+    if (typeof specifier !== 'string' || !specifier.includes(MCP_SERVERS_SPECIFIER)) continue
+    const config = resolvedConfigOf(entry)
+    const servers = readServersField(config?.servers)
+    for (const row of servers) {
+      if (!row || typeof row !== 'object') continue
+      if (typeof row.serverName !== 'string' || !row.serverName.trim()) continue
+      found.push({ hostEntry: entry, row })
+    }
+  }
+  return found
+}
+
+/**
+ * Build the internal view of one MCP server managed by the Settings page.
+ *
+ * Registered tools are the strongest available signal: they exist only after
+ * the child mounted and finished its handshake. When none are registered the
+ * endpoint is still probed, which separates "server is down" from "server is
+ * fine but the page did not mount it".
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {any} hostEntry - the page's Loader row.
+ * @param {Record<string, any>} row - one configured server.
+ * @param {typeof DEFAULT_SETTINGS} settings - resolved settings.
+ * @returns {Promise<Record<string, any>>} internal connection view.
+ */
+async function describeManagedConnection(ctx, hostEntry, row, settings) {
+  const serverName = row.serverName.trim()
+  const transport = row.transport === 'stdio' ? 'stdio' : 'streamable-http'
+  const connection = {
+    id: String(row.id ?? serverName),
+    serverName,
+    transport,
+    pluginState: pluginStateOf(hostEntry),
+    disabled: row.enabled === false,
+    managedBy: 'mcp-servers',
+  }
+  if (typeof row.url === 'string' && row.url.trim()) connection.endpoint = redactUrl(row.url.trim())
+  if (transport === 'stdio' && typeof row.command === 'string') connection.command = commandName(row.command)
+  if (connection.disabled) return { ...connection, state: 'disabled' }
+
+  const names = registeredToolNames(ctx, serverName)
+  if (names.length > 0) {
+    const hidden = Math.max(0, names.length - settings.maxToolsListed)
+    return {
+      ...connection,
+      state: 'connected',
+      toolCount: names.length,
+      tools: names.slice(0, settings.maxToolsListed),
+      toolsHidden: hidden > 0 ? hidden : undefined,
+      note: 'registered through the MCP servers page',
+    }
+  }
+
+  if (transport === 'streamable-http' && typeof row.url === 'string' && row.url.trim()) {
+    const probe = await probeMcpHttp({
+      url: row.url,
+      headers: row.headers,
+      timeoutMs: settings.probeTimeoutMs,
+    })
+    return {
+      ...connection,
+      state: probe.ok ? 'configured' : 'disconnected',
+      latencyMs: probe.latencyMs,
+      protocolVersion: probe.protocolVersion,
+      serverInfo: probe.serverInfo,
+      error: probe.ok ? undefined : probe.error,
+      note: probe.ok ? 'the endpoint answers, but the server is not mounted' : undefined,
+    }
+  }
+
+  return { ...connection, state: 'unknown', error: 'enabled, but no tools are registered for it' }
+}
+
+/**
+ * Probe every configured MCP server, including the ones the Settings page owns.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  * @param {typeof DEFAULT_SETTINGS} settings - resolved settings.
  * @returns {Promise<Array<Record<string, any>>>} connection views.
  */
 async function collectConnections(ctx, settings) {
   const entries = readEntries(ctx).filter((entry) => entry && !entry.options?.group && isMcpClientEntry(entry))
-  return Promise.all(entries.map((entry) => describeConnection(ctx, entry, settings)))
+  const native = entries.map((entry) => describeConnection(ctx, entry, settings))
+  const managed = managedRows(ctx).map(({ hostEntry, row }) => describeManagedConnection(ctx, hostEntry, row, settings))
+  return Promise.all([...native, ...managed])
 }
 
 /**
@@ -416,6 +562,7 @@ function toWire(connection) {
   if (connection.toolsHidden !== undefined) wire.toolsHidden = connection.toolsHidden
   if (connection.error !== undefined) wire.error = connection.error
   if (connection.note !== undefined) wire.note = connection.note
+  if (connection.managedBy !== undefined) wire.managedBy = connection.managedBy
   if (connection.upstream !== undefined) {
     wire.upstream = {
       generatedAt: connection.upstream.generatedAt,
@@ -487,4 +634,4 @@ export function apply(ctx, config) {
   }
 }
 
-export { buildSnapshot, describeConnection, resolveSettings, summarize, toWire }
+export { buildSnapshot, describeConnection, managedRows, readServersField, resolveSettings, summarize, toWire }

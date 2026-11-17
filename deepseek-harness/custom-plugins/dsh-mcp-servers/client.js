@@ -33,6 +33,9 @@ window.__ModuleLoader__.load({
     const NAMESPACE = 'mcp-servers'
     /** Host route that answers the live snapshot. */
     const ENDPOINT = 'api/mcp-servers'
+
+/** Route that probes one unsaved draft. */
+const TEST_ENDPOINT = 'api/mcp-servers/test'
     /** How often live state is re-read while the page is open. */
     const POLL_MS = 5000
     /** The bridge's `serverName` contract. */
@@ -43,6 +46,9 @@ window.__ModuleLoader__.load({
     const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
     /** Default per-call timeout, matching the bridge. */
     const DEFAULT_TIMEOUT_MS = 60000
+
+/** Cap on server instructions; generous so large-instruction servers work. */
+const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
 
     const EN = {
       'nav': 'MCP servers',
@@ -75,6 +81,16 @@ window.__ModuleLoader__.load({
       'action.save': 'Save server',
       'action.saving': 'Saving…',
       'action.cancel': 'Cancel',
+      'action.test': 'Test connection',
+      'action.testing': 'Testing…',
+      'test.connected': 'Connected in {ms} ms — {count} tools',
+      'test.connectedNoTools': 'Connected in {ms} ms — no tools listed',
+      'test.failed': 'Connection failed',
+      'test.server': 'Server: {name} {version}',
+      'test.stdio': 'stdio servers are not started for a connection test',
+      'test.commandFound': 'command found on PATH',
+      'test.commandMissing': 'command not found on PATH',
+      'test.cwdMissing': 'working directory not found',
       'action.addHeader': 'Add header',
       'action.addVariable': 'Add variable',
       'action.clear': 'Clear',
@@ -97,6 +113,9 @@ window.__ModuleLoader__.load({
       'field.env.hint': 'Optional. Variables merged over the scrubbed environment.',
       'field.timeout': 'Tool call timeout',
       'field.timeout.hint': 'Milliseconds. Default {ms}.',
+      'field.instructions': 'Instruction cap',
+      'field.instructions.hint':
+        'Bytes of server instructions allowed into the system prompt. Default {bytes}. Raise it when a server reports that its instructions exceed the cap.',
       'field.failOnStartup': 'Fail loudly when the server cannot start',
       'field.enabled': 'Enabled',
       'field.enabled.hint': 'Disabled servers keep their configuration and are not connected.',
@@ -116,6 +135,7 @@ window.__ModuleLoader__.load({
       'error.urlInvalid': 'Enter an absolute http or https URL.',
       'error.commandRequired': 'Enter the command to start.',
       'error.timeout': 'Enter a positive whole number of milliseconds.',
+      'error.instructions': 'Enter a positive whole number of bytes.',
       'error.headerName': 'Header names may only contain letters, digits and token characters.',
       'error.envName': 'Variable names may only contain letters, digits and underscore.',
       'error.duplicateKey': 'This name is already used above.',
@@ -162,6 +182,16 @@ window.__ModuleLoader__.load({
       'action.save': '保存服务器',
       'action.saving': '保存中…',
       'action.cancel': '取消',
+      'action.test': '测试连接',
+      'action.testing': '测试中…',
+      'test.connected': '已连接，耗时 {ms} 毫秒，{count} 个工具',
+      'test.connectedNoTools': '已连接，耗时 {ms} 毫秒，未列出工具',
+      'test.failed': '连接失败',
+      'test.server': '服务器：{name} {version}',
+      'test.stdio': 'stdio 服务器不会为连接测试而启动',
+      'test.commandFound': '在 PATH 中找到命令',
+      'test.commandMissing': '在 PATH 中未找到命令',
+      'test.cwdMissing': '工作目录不存在',
       'action.addHeader': '添加请求头',
       'action.addVariable': '添加变量',
       'action.clear': '清除',
@@ -184,6 +214,8 @@ window.__ModuleLoader__.load({
       'field.env.hint': '可选。合并到已清理的环境之上。',
       'field.timeout': '工具调用超时',
       'field.timeout.hint': '毫秒。默认 {ms}。',
+      'field.instructions': '指令上限',
+      'field.instructions.hint': '允许进入系统提示的服务器指令字节数。默认 {bytes}。当服务器报告指令超过上限时调高此值。',
       'field.failOnStartup': '服务器无法启动时报告失败',
       'field.enabled': '启用',
       'field.enabled.hint': '禁用的服务器保留配置，但不建立连接。',
@@ -203,6 +235,7 @@ window.__ModuleLoader__.load({
       'error.urlInvalid': '请输入绝对的 http 或 https URL。',
       'error.commandRequired': '请输入要启动的命令。',
       'error.timeout': '请输入正整数毫秒值。',
+      'error.instructions': '请输入正整数字节数。',
       'error.headerName': '请求头名称只能包含字母、数字和标记字符。',
       'error.envName': '变量名只能包含字母、数字和下划线。',
       'error.duplicateKey': '上面的列表中已存在该名称。',
@@ -271,6 +304,13 @@ window.__ModuleLoader__.load({
       '.dsh-mcp-servers__check input{margin:3px 0 0}',
       '.dsh-mcp-servers__fieldError{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}',
       '.dsh-mcp-servers__actions{display:flex;align-items:center;gap:8px;justify-content:flex-end}',
+      '.dsh-mcp-servers__testButton{margin-right:auto}',
+      '.dsh-mcp-servers__testResult{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base)}',
+      '.dsh-mcp-servers__testResult[data-tone="ok"]{border-color:var(--dsw-alias-state-success-primary)}',
+      '.dsh-mcp-servers__testResult[data-tone="error"]{border-color:var(--dsw-alias-state-error-primary)}',
+      '.dsh-mcp-servers__testText{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}',
+      '.dsh-mcp-servers__testResult[data-tone="ok"] .dsh-mcp-servers__testText{color:var(--dsw-alias-state-success-primary)}',
+      '.dsh-mcp-servers__testResult[data-tone="error"] .dsh-mcp-servers__testText{color:var(--dsw-alias-state-error-primary)}',
       '.dsh-mcp-servers__sectionTitle{margin:0;font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-secondary)}',
       '.dsh-mcp-servers__footer{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}',
       '.dsh-mcp-servers__external{display:flex;flex-direction:column;gap:8px}',
@@ -380,6 +420,7 @@ window.__ModuleLoader__.load({
         cwd: '',
         env: [],
         toolCallTimeoutMs: String(DEFAULT_TIMEOUT_MS),
+        maxInstructionBytes: String(DEFAULT_MAX_INSTRUCTION_BYTES),
         failOnStartupError: false,
         enabled: true,
       }
@@ -403,6 +444,7 @@ window.__ModuleLoader__.load({
         cwd: typeof row.cwd === 'string' ? row.cwd : '',
         env: pairsOf(row.env),
         toolCallTimeoutMs: String(row.toolCallTimeoutMs ?? DEFAULT_TIMEOUT_MS),
+        maxInstructionBytes: String(row.maxInstructionBytes ?? DEFAULT_MAX_INSTRUCTION_BYTES),
         failOnStartupError: row.failOnStartupError === true,
         enabled: row.enabled !== false,
       }
@@ -439,6 +481,11 @@ window.__ModuleLoader__.load({
         const parsed = Number(timeout)
         if (!Number.isInteger(parsed) || parsed <= 0) fields.toolCallTimeoutMs = t('error.timeout')
       }
+      const cap = String(draft.maxInstructionBytes ?? '').trim()
+      if (cap) {
+        const parsedCap = Number(cap)
+        if (!Number.isInteger(parsedCap) || parsedCap <= 0) fields.maxInstructionBytes = t('error.instructions')
+      }
       const checkPairs = (pairs, pattern, messageKey) => {
         const seen = new Set()
         for (const pair of pairs ?? []) {
@@ -468,11 +515,13 @@ window.__ModuleLoader__.load({
       const serverName = String(draft.serverName ?? '').trim()
       const id = draft.id || allocateId(serverName, takenIds)
       const timeout = Number(String(draft.toolCallTimeoutMs ?? '').trim() || DEFAULT_TIMEOUT_MS)
+      const cap = Number(String(draft.maxInstructionBytes ?? '').trim() || DEFAULT_MAX_INSTRUCTION_BYTES)
       const row = {
         id,
         serverName,
         transport: draft.transport === 'stdio' ? 'stdio' : 'streamable-http',
         toolCallTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.floor(timeout) : DEFAULT_TIMEOUT_MS,
+        maxInstructionBytes: Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : DEFAULT_MAX_INSTRUCTION_BYTES,
         failOnStartupError: draft.failOnStartupError === true,
         enabled: draft.enabled !== false,
       }
@@ -819,7 +868,53 @@ window.__ModuleLoader__.load({
     function ServerEditor(props) {
       const { draft, rows, t } = props
       const [errors, setErrors] = React.useState({ fields: {}, keys: {} })
+      const [probe, setProbe] = React.useState(null)
       const patch = (next) => props.onChange({ ...draft, ...next })
+      /**
+       * Probe the unsaved draft against its endpoint. The Host answers with the
+       * handshake result, the tool count and the server identity, so a wrong URL
+       * or a missing header is caught here instead of surfacing later as a row
+       * stuck in Failed.
+       */
+      const runTest = async () => {
+        setProbe({ status: 'running' })
+        try {
+          const payload = rowOfDraft(
+            { ...draft, id: draft.id || 'test', serverName: draft.serverName || 'test' },
+            [],
+          )
+          const response = await fetch(TEST_ENDPOINT, {
+            method: 'POST',
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify(payload),
+          })
+          const data = await response.json().catch(() => null)
+          if (!data || typeof data !== 'object') throw new Error(`HTTP ${response.status}`)
+          setProbe({ status: 'done', result: data })
+        } catch (error) {
+          setProbe({ status: 'done', result: { ok: false, error: messageOf(error) } })
+        }
+      }
+      const probeResult = probe && probe.status === 'done' ? probe.result : null
+      const probeTone = probeResult ? (probeResult.stdio ? 'info' : probeResult.ok ? 'ok' : 'error') : 'info'
+      let probeText = ''
+      if (probeResult) {
+        if (probeResult.stdio) {
+          probeText = `${t('test.stdio')} — ${probeResult.commandFound ? t('test.commandFound') : t('test.commandMissing')}`
+          if (probeResult.cwd === 'missing' || probeResult.cwd === 'not-a-directory') probeText += `, ${t('test.cwdMissing')}`
+        } else if (probeResult.ok) {
+          probeText = probeResult.toolCount > 0
+            ? t('test.connected', { ms: probeResult.latencyMs, count: probeResult.toolCount })
+            : t('test.connectedNoTools', { ms: probeResult.latencyMs })
+        } else {
+          probeText = `${t('test.failed')}: ${probeResult.error || 'unknown error'}`
+        }
+      }
+      const probeServer = probeResult && probeResult.serverInfo && probeResult.serverInfo.name
+        ? t('test.server', { name: probeResult.serverInfo.name, version: probeResult.serverInfo.version || '' })
+        : ''
       const submit = (event) => {
         if (event && typeof event.preventDefault === 'function') event.preventDefault()
         const found = validateDraft(draft, rows, t)
@@ -926,6 +1021,14 @@ window.__ModuleLoader__.load({
             error: errors.fields.toolCallTimeoutMs,
             onChange: (value) => patch({ toolCallTimeoutMs: value }),
           }),
+          h(TextField, {
+            id: 'maxInstructionBytes',
+            label: t('field.instructions'),
+            value: draft.maxInstructionBytes,
+            hint: t('field.instructions.hint', { bytes: DEFAULT_MAX_INSTRUCTION_BYTES }),
+            error: errors.fields.maxInstructionBytes,
+            onChange: (value) => patch({ maxInstructionBytes: value }),
+          }),
           h(CheckField, {
             id: 'failOnStartupError',
             label: t('field.failOnStartup'),
@@ -944,12 +1047,28 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dsh-mcp-servers__actions' },
           h('button', {
             type: 'button',
+            className: 'dsh-mcp-servers__ghost dsh-mcp-servers__testButton',
+            onClick: runTest,
+            disabled: probe !== null && probe.status === 'running',
+          }, probe !== null && probe.status === 'running' ? t('action.testing') : t('action.test')),
+          h('button', {
+            type: 'button',
             className: 'dsh-mcp-servers__ghost',
             onClick: () => props.onCancel(),
           }, t('action.cancel')),
           h('button', { type: 'submit', className: 'dsh-mcp-servers__primary', disabled: props.busy === true },
             props.busy ? t('action.saving') : t('action.save')),
         ),
+        probe === null
+          ? null
+          : h('div', { className: 'dsh-mcp-servers__testResult', 'data-tone': probe.status === 'running' ? 'info' : probeTone },
+              h('span', { className: 'dsh-mcp-servers__testText' },
+                probe.status === 'running' ? t('action.testing') : probeText),
+              probeServer ? h('span', { className: 'dsh-mcp-servers__hint' }, probeServer) : null,
+              probeResult && Array.isArray(probeResult.tools) && probeResult.tools.length > 0
+                ? h('span', { className: 'dsh-mcp-servers__hint' }, probeResult.tools.join(', '))
+                : null,
+            ),
       )
     }
 

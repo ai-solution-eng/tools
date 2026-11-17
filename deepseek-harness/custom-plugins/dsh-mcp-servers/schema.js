@@ -42,6 +42,17 @@ export const TRANSPORTS = ['streamable-http', 'stdio']
 /** Per-tool-call timeout default, matching the bridge's own default. */
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60000
 
+/**
+ * Cap on the server-instructions block the bridge accepts.
+ *
+ * The bridge defaults to 32,768 bytes, which silently fails any server that
+ * ships a large instruction block (the HPE networking MCP sends ~121 KB). A
+ * server added through this page has no way to know that, so rows managed here
+ * start at 262,144 — the value the profile's own MCP rows use — and the field
+ * is exposed in the editor for a server that needs less.
+ */
+export const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
+
 /** Largest value `setTimeout` and `AbortSignal` accept, so the bridge cap. */
 const MAX_TOOL_CALL_TIMEOUT_MS = 2147483647
 
@@ -58,6 +69,7 @@ const ROW_FIELDS = [
   'env',
   'toolCallTimeoutMs',
   'failOnStartupError',
+  'maxInstructionBytes',
   'enabled',
 ]
 
@@ -117,18 +129,33 @@ export function deepEqualJson(left, right) {
 
 /**
  * Coerce a thrown value into one short line of text.
+ *
+ * The bridge reports a failed start as a wrapper error ("initial connection or
+ * tool synchronization failed") and keeps the actionable reason — an
+ * instruction-cap overflow, a refused connection — in `cause`. Walking the
+ * chain is what makes the page show a reason a user can act on.
  * @param {unknown} error - thrown value.
- * @returns {string} readable message.
+ * @returns {string} readable message, wrapper plus causes.
  */
 export function messageOf(error) {
   if (error === undefined || error === null) return 'unknown error'
-  if (typeof error === 'string') return error
-  if (typeof error.message === 'string' && error.message) return error.message
-  try {
-    return String(error)
-  } catch {
-    return 'unknown error'
+  const parts = []
+  let current = error
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    let text
+    if (typeof current === 'string') text = current
+    else if (typeof current.message === 'string' && current.message) text = current.message
+    else {
+      try {
+        text = String(current)
+      } catch {
+        text = ''
+      }
+    }
+    if (text && !parts.includes(text)) parts.push(text)
+    current = typeof current === 'object' ? current.cause : undefined
   }
+  return parts.length > 0 ? parts.join(': ') : 'unknown error'
 }
 
 /* ------------------------------------------------------------------ *
@@ -258,6 +285,7 @@ export function normalizeRow(raw, index, taken) {
   }
   const transport = TRANSPORTS.includes(source.transport) ? source.transport : 'streamable-http'
   const timeout = Number(source.toolCallTimeoutMs)
+  const instructionCap = Number(source.maxInstructionBytes)
   const row = {
     ...source,
     id,
@@ -265,6 +293,10 @@ export function normalizeRow(raw, index, taken) {
     transport,
     enabled: source.enabled !== false,
     failOnStartupError: source.failOnStartupError === true,
+    maxInstructionBytes:
+      Number.isFinite(instructionCap) && instructionCap >= 1
+        ? Math.floor(instructionCap)
+        : DEFAULT_MAX_INSTRUCTION_BYTES,
     toolCallTimeoutMs:
       Number.isFinite(timeout) && timeout > 0
         ? Math.min(MAX_TOOL_CALL_TIMEOUT_MS, Math.floor(timeout))
@@ -338,6 +370,7 @@ export function factsOf(row) {
     row.env ?? {},
     row.toolCallTimeoutMs,
     row.failOnStartupError === true,
+    row.maxInstructionBytes,
   ])
 }
 
@@ -351,6 +384,7 @@ export function bridgeConfigOf(row) {
     serverName: row.serverName,
     toolCallTimeoutMs: row.toolCallTimeoutMs,
     failOnStartupError: row.failOnStartupError === true,
+    maxInstructionBytes: row.maxInstructionBytes,
   }
   if (row.transport === 'stdio') {
     const config = { ...base, transport: 'stdio', command: row.command, args: row.args ?? [] }

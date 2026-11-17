@@ -436,7 +436,7 @@ await check('servers configured elsewhere are listed read-only', () => {
 await check('the add form offers the streamable-http fields', () => {
   const draft = {
     id: '', serverName: '', transport: 'streamable-http', url: '', headers: [], command: '', argsText: '', cwd: '', env: [],
-    toolCallTimeoutMs: '60000', failOnStartupError: false, enabled: true,
+    toolCallTimeoutMs: '60000', maxInstructionBytes: '32768', failOnStartupError: false, enabled: true,
   }
   const tree = renderPage({ form: readyForm([]), overrides: { 2: draft } })
   const text = textOf(tree)
@@ -455,7 +455,7 @@ await check('the add form offers the streamable-http fields', () => {
 await check('the add form offers the stdio fields', () => {
   const draft = {
     id: '', serverName: 'local', transport: 'stdio', url: '', headers: [], command: '', argsText: '', cwd: '', env: [],
-    toolCallTimeoutMs: '60000', failOnStartupError: false, enabled: true,
+    toolCallTimeoutMs: '60000', maxInstructionBytes: '32768', failOnStartupError: false, enabled: true,
   }
   const tree = renderPage({ form: readyForm([]), overrides: { 2: draft } })
   const text = textOf(tree)

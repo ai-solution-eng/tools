@@ -34,13 +34,34 @@
  * @module
  */
 
-import { Config as McpServersConfig, messageOf, mountableServers, readServersField } from './schema.js'
+import { accessSync, constants as fsConstants, statSync } from 'node:fs'
+import { delimiter, isAbsolute, join } from 'node:path'
+
+import { probeMcpHttp } from './probe.js'
+import {
+  Config as McpServersConfig,
+  isHttpUrl,
+  isPlainObject,
+  messageOf,
+  mountableServers,
+  normalizeRows,
+  readServersField,
+} from './schema.js'
 
 /** Bridge package this plugin mounts one child of per configured server. */
 const BRIDGE_PACKAGE = '@deepseek-ai/dsh-mcp-client'
 
 /** Authenticated route the browser half reads. */
 const ROUTE_PATH = '/api/mcp-servers'
+
+/** Authenticated route that probes one unsaved draft server. */
+const TEST_ROUTE_PATH = '/api/mcp-servers/test'
+
+/** Budget for one draft probe: a browser request, so it stays short. */
+const PROBE_TIMEOUT_MS = 5000
+
+/** Tool names echoed back by a successful probe. */
+const MAX_TOOLS_REPORTED = 8
 
 /** Fiber lifecycle names, indexed by the Cordis `FiberState` value. */
 const FIBER_STATES = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
@@ -229,6 +250,96 @@ function externalRows(ctx) {
     rows.push(row)
   }
   return rows
+}
+
+/**
+ * Whether a stdio command names an executable this Host can start.
+ *
+ * A stdio server cannot be verified without spawning it, which a browser
+ * request must not do unbounded, so the cheap and common failure — a command
+ * that is not installed or not on `PATH` — is answered here instead.
+ * @param {unknown} command - configured command.
+ * @returns {'found' | 'missing'} whether the program is reachable.
+ */
+function commandState(command) {
+  const text = typeof command === 'string' ? command.trim() : ''
+  if (!text) return 'missing'
+  const candidates = isAbsolute(text)
+    ? [text]
+    : String(process.env.PATH ?? '')
+        .split(delimiter)
+        .filter(Boolean)
+        .map((directory) => join(directory, text))
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, fsConstants.X_OK)
+      return 'found'
+    } catch {
+      // Keep looking: the next PATH entry may hold the program.
+    }
+  }
+  return 'missing'
+}
+
+/**
+ * Whether a configured working directory is usable.
+ * @param {unknown} cwd - configured working directory.
+ * @returns {'unset' | 'ok' | 'missing' | 'not-a-directory'} state.
+ */
+function cwdState(cwd) {
+  const text = typeof cwd === 'string' ? cwd.trim() : ''
+  if (!text) return 'unset'
+  try {
+    return statSync(text).isDirectory() ? 'ok' : 'not-a-directory'
+  } catch {
+    return 'missing'
+  }
+}
+
+/**
+ * Probe one draft row without mounting it.
+ *
+ * This is the page's *Test connection* action: it answers "is this endpoint
+ * right?" before a row is saved, so a typo is caught in the form instead of
+ * showing up later as a row stuck in `Failed`.
+ * @param {Record<string, any>} draft - draft row from the editor.
+ * @returns {Promise<Record<string, any>>} probe result for the browser.
+ */
+async function probeDraft(draft) {
+  const source = isPlainObject(draft) ? draft : {}
+  const transport = source.transport === 'stdio' ? 'stdio' : 'streamable-http'
+  if (transport === 'stdio') {
+    // A status read must not spawn a process, so answer the cheap question —
+    // is the command on PATH? — and say plainly that the server was not started.
+    return {
+      ok: false,
+      transport,
+      stdio: true,
+      commandFound: commandState(source.command) === 'found',
+      cwd: cwdState(source.cwd),
+      note: 'stdio servers are not started for a connection test',
+    }
+  }
+  const url = typeof source.url === 'string' ? source.url.trim() : ''
+  if (!isHttpUrl(url)) return { ok: false, transport, error: 'enter an absolute http or https URL' }
+  const result = await probeMcpHttp({
+    url,
+    headers: isPlainObject(source.headers) ? source.headers : undefined,
+    timeoutMs: PROBE_TIMEOUT_MS,
+  })
+  const toolNames = Array.isArray(result.toolNames) ? result.toolNames : []
+  return {
+    ok: result.ok === true,
+    transport,
+    latencyMs: result.latencyMs,
+    protocolVersion: result.protocolVersion,
+    serverInfo: result.serverInfo,
+    capabilities: result.capabilities,
+    toolCount: result.ok ? toolNames.length : undefined,
+    tools: result.ok ? toolNames.slice(0, MAX_TOOLS_REPORTED) : undefined,
+    error: result.ok ? undefined : result.error,
+    timedOut: result.timedOut === true ? true : undefined,
+  }
 }
 
 /**
@@ -478,6 +589,26 @@ export function apply(ctx, config) {
         },
       }
       child.effect(() => child.connection.fetch.register(route), 'mcp-servers: status route')
+
+      const testRoute = {
+        path: TEST_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let draft
+          try {
+            draft = await request.json()
+          } catch {
+            return jsonResponse({ ok: false, error: 'expected a JSON body' }, 400)
+          }
+          try {
+            return jsonResponse(await probeDraft(draft))
+          } catch (error) {
+            return jsonResponse({ ok: false, error: messageOf(error) }, 500)
+          }
+        },
+      }
+      child.effect(() => child.connection.fetch.register(testRoute), 'mcp-servers: test route')
     })
   } catch (error) {
     warn('could not register the status route', error)
