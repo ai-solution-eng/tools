@@ -134,8 +134,8 @@ spec:
     # with noProxy, or add your unit's CIDR if it differs. Known follow-ups
     # a site must append via networkPolicy.egress or lose: the corporate
     # proxy when proxy.https is set (a DNS name outside the cluster — allow
-    # its IPs), the Keycloak JWKS endpoint when settings.tokenValidation is
-    # on, and — for pods WITH an injected Istio sidecar — istiod in
+    # its IPs), the Keycloak JWKS endpoint when settings.auth.tokenValidation
+    # is on, and — for pods WITH an injected Istio sidecar — istiod in
     # istio-system (15012/15014) or the sidecar loses xDS.
     {{- with .Values.networkPolicy.inClusterEgressCidrs }}
     - to:

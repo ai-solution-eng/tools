@@ -6,7 +6,7 @@
 # Prerequisites (each one load-bearing, NOT boilerplate):
 # * metrics-server (or a compatible Metrics API provider) must serve
 #   metrics.k8s.io — the HPA reads resource metrics through it.
-# * The gateway's DB-touching paths are already bounded (dbPoolMin/Max,
+# * The gateway's DB-touching paths are already bounded (settings.dbPool.min/max,
 #   PoolUnavailable -> 503 fail-fast), so extra replicas only ADD capacity;
 #   they do not queue behind a shared bottleneck.
 #
@@ -18,7 +18,7 @@
 # signals a leak, and autoscaling a leak multiplies it.
 #
 # `maxReplicas` bounds spend and, more importantly for a shared-DB gateway,
-# bounds aggregate Postgres connection demand (dbPoolMax per replica).
+# bounds aggregate Postgres connection demand (settings.dbPool.max per replica).
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

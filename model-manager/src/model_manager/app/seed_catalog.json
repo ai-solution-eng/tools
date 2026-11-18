@@ -752,7 +752,8 @@
       "--max-model-len",
       "32768",
       "--kv-cache-dtype",
-      "fp8"
+      "fp8",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_TOKEN": "",
@@ -795,7 +796,8 @@
       "--port",
       "8080",
       "--max-model-len",
-      "32768"
+      "32768",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_TOKEN": "",
@@ -846,7 +848,8 @@
       "--gpu-memory-utilization",
       "0.275",
       "--kv-cache-dtype",
-      "fp8"
+      "fp8",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_TOKEN": "",
@@ -895,7 +898,8 @@
       "--hf_overrides",
       "{\"architectures\":[\"Qwen3VLForSequenceClassification\"],\"classifier_from_token\":[\"no\",\"yes\"],\"is_original_qwen3_reranker\":true}",
       "--chat-template",
-      "/mnt/models/templates/qwen3_vl_reranker.jinja"
+      "/mnt/models/templates/qwen3_vl_reranker.jinja",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_TOKEN": "",
@@ -1446,7 +1450,8 @@
       "--max-model-len",
       "32768",
       "--kv-cache-dtype",
-      "fp8"
+      "fp8",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_HUB_OFFLINE": "1",
@@ -1496,7 +1501,8 @@
       "--max-model-len",
       "32768",
       "--kv-cache-dtype",
-      "fp8"
+      "fp8",
+      "--trust-request-mm-kwargs"
     ],
     "environment": {
       "HF_HUB_OFFLINE": "1",
@@ -2520,11 +2526,13 @@
     "name": "GLM-5.3-Flash-vllm-FP4-Local",
     "version": 1,
     "description": "GLM-5.3-Flash (320B total / 18B active, native 1M context) as NVIDIA's FP4-Local QAD NVFP4 build on 2x RTX Pro 6000, vLLM TP2 with B12X kernels, fp8 KV cache and MTP speculative decoding. The official FP8 checkpoint (305.7 GiB) needs 4 cards; this 164.6 GiB build is the only GLM-5.3-Flash that fits two 96 GB cards.",
-    "notes": "GLM-5.3-Flash on 2x RTX Pro 6000 Blackwell (SM120, PCIe, no NVLink) -- the ONLY GLM-5.3-Flash precision that fits two 96 GB cards. VERIFIED SIZES (HF safetensors index): official FP8 zai-org/GLM-5.3-Flash = 328,250,014,584 B (305.7 GiB) -> needs 4 cards; this nvidia/GLM-5.3-Flash-FP4-Local QAD NVFP4 build = ~176.8 GB (164.6 GiB: U8 165.66 GB + F8_E4M3 8.07 GB + BF16 2.32 GB) -> fits 2x96 GB, leaving ~26 GiB for KV/graphs at --gpu-memory-utilization 0.985. VALIDATED CELL: NVIDIA's card lists '2 x NVIDIA RTX PRO 6000 Blackwell with 1.8M tokens of FP8 KV Cache' (and 2x DGX Spark 128 GB). ACCURACY (card, bf16 -> FP4-Local): GPQA Diamond 92.1% -> 91.3%; ToolEvalBench 91.9% -> 92.4%. CONTAINER IS DELIBERATELY NOT STOCK vLLM: the NVFP4 scale factors use a lossless compression format upstream vLLM does not yet parse, so the card requires the Local Inference Lab community container. ghcr.io/local-inference-lab/vllm:release-10152026 is the tag NVIDIA's own recommended_catalog.json pins for RTX PRO 6000 recipes (confirmed against its deepseek-v4-flash-0731 rtx-pro-2gpu recipe). Do NOT 'upgrade' this to vllm/vllm-openai until the scale format lands upstream. The image entrypoint is 'vllm serve', so ARGUMENTS START AT THE MODEL PATH; if a future image changes the entrypoint, prepend 'serve'. B12X KERNELS ARE SM120-SPECIFIC (CUTE_DSL_ARCH=sm_120a, TORCH_CUDA_ARCH_LIST=12.0a) -- do not reuse this env block on H200 (SM90) or GB300 (sm_103a); the community log records b12x failing on sm_103a with 'expects sm_120a/120f/121a/121f'. NO eval BLOCK ON PURPOSE: tests/test_eval_field.py::test_seed_entries_have_no_eval_and_load_unchanged asserts seed entries carry none, so the GPQA/ToolEval numbers are recorded here instead. If that invariant is ever relaxed, this entry is the natural first candidate for one. RESOURCES mirror seed-rtx-deepseek-v4 (32Gi/64Gi); raise the limit if the pod OOMs during instanttensor load. PCIe TP2 on this pair: decode all-reduce is nearly free, prefill pays ~8% -- if this box ever runs 4 GPUs, prefer 2x TP2 replicas over 1x TP4. RUNTIME REQUIREMENTS THE CATALOG CANNOT EXPRESS (the card's docker commands carry them; db.COLUMNS has no shm/ipc/volume field): (a) the container needs --ipc host and --shm-size 32g (simplified) / 16g (verbose) -- default k8s /dev/shm is 64 MiB, which breaks NCCL and vLLM's shared-memory paths, so confirm the MLIS predictor pod gets hostIPC or a large /dev/shm emptyDir; (b) it needs a WRITABLE /cache -- the recipe mounts the named volume glm53-runtime there for the runtime/compile cache, while this entry mounts only the model PVC at /mnt/models, so a read-only rootfs will fail unless MLIS adds a writable emptyDir at /cache. TAG CAVEAT: the card's header line reads release-10142026 but BOTH of its run commands read release-10152026; this entry uses 10152026 (matches the commands and NVIDIA's recommended_catalog.json). Confirm with 'docker manifest inspect ghcr.io/local-inference-lab/vllm:release-10152026' before the first pull -- if 10142026 is the real tag it is a one-line image change. WEIGHTS MUST ALREADY BE ON models-pvc: the card's verbose path sets HF_TOKEN and pulls from the Hub, whereas this entry runs offline (HF_HUB_OFFLINE=1) against the PVC mount.",
+    "notes": "GLM-5.3-Flash on 2x RTX Pro 6000 Blackwell (SM120, PCIe, no NVLink) -- the ONLY GLM-5.3-Flash precision that fits two 96 GB cards. VERIFIED SIZES (HF safetensors index): official FP8 zai-org/GLM-5.3-Flash = 328,250,014,584 B (305.7 GiB) -> needs 4 cards; this nvidia/GLM-5.3-Flash-FP4-Local QAD NVFP4 build = ~176.8 GB (164.6 GiB: U8 165.66 GB + F8_E4M3 8.07 GB + BF16 2.32 GB) -> fits 2x96 GB, leaving ~26 GiB for KV/graphs at --gpu-memory-utilization 0.985. VALIDATED CELL: NVIDIA's card lists '2 x NVIDIA RTX PRO 6000 Blackwell with 1.8M tokens of FP8 KV Cache' (and 2x DGX Spark 128 GB). ACCURACY (card, bf16 -> FP4-Local): GPQA Diamond 92.1% -> 91.3%; ToolEvalBench 91.9% -> 92.4%. CONTAINER IS DELIBERATELY NOT STOCK vLLM: the NVFP4 scale factors use a lossless compression format upstream vLLM does not yet parse, so the card requires the Local Inference Lab community container. ghcr.io/local-inference-lab/vllm:release-10152026 is the tag NVIDIA's own recommended_catalog.json pins for RTX PRO 6000 recipes (confirmed against its deepseek-v4-flash-0731 rtx-pro-2gpu recipe). Do NOT 'upgrade' this to vllm/vllm-openai until the scale format lands upstream. The image entrypoint is /opt/venv/bin/lil-runtime-bootstrap, a shell passthrough that execs its arguments, so ARGUMENTS START WITH 'vllm serve'. CORRECTED 2026-11-18: this note previously claimed the entrypoint was 'vllm serve' and that args start at the model path -- a 2x RTX Pro 6000 deploy died on exactly that, 'lil-runtime-bootstrap: line 19: /workspace/nvidia/GLM-5.3-Flash-FP4-Local: No such file or directory' (the bootstrap execs args[0], resolved against /workspace), and prepending 'vllm serve' booted it. The model id still resolves as a hub repo id through HUGGINGFACE_HUB_CACHE=/mnt/models + HF_HUB_OFFLINE=1; only the argv prefix was wrong. Do not drop the prefix again. B12X KERNELS ARE SM120-SPECIFIC (CUTE_DSL_ARCH=sm_120a, TORCH_CUDA_ARCH_LIST=12.0a) -- do not reuse this env block on H200 (SM90) or GB300 (sm_103a); the community log records b12x failing on sm_103a with 'expects sm_120a/120f/121a/121f'. NO eval BLOCK ON PURPOSE: tests/test_eval_field.py::test_seed_entries_have_no_eval_and_load_unchanged asserts seed entries carry none, so the GPQA/ToolEval numbers are recorded here instead. If that invariant is ever relaxed, this entry is the natural first candidate for one. RESOURCES mirror seed-rtx-deepseek-v4 (32Gi/64Gi); raise the limit if the pod OOMs during instanttensor load. PCIe TP2 on this pair: decode all-reduce is nearly free, prefill pays ~8% -- if this box ever runs 4 GPUs, prefer 2x TP2 replicas over 1x TP4. RUNTIME REQUIREMENTS THE CATALOG CANNOT EXPRESS (the card's docker commands carry them; db.COLUMNS has no shm/ipc/volume field): (a) the container needs --ipc host and --shm-size 32g (simplified) / 16g (verbose) -- default k8s /dev/shm is 64 MiB, which breaks NCCL and vLLM's shared-memory paths, so confirm the MLIS predictor pod gets hostIPC or a large /dev/shm emptyDir; (b) it needs a WRITABLE /cache -- the recipe mounts the named volume glm53-runtime there for the runtime/compile cache, while this entry mounts only the model PVC at /mnt/models, so a read-only rootfs will fail unless MLIS adds a writable emptyDir at /cache. TAG CAVEAT: the card's header line reads release-10142026 but BOTH of its run commands read release-10152026; this entry uses 10152026 (matches the commands and NVIDIA's recommended_catalog.json). Confirm with 'docker manifest inspect ghcr.io/local-inference-lab/vllm:release-10152026' before the first pull -- if 10142026 is the real tag it is a one-line image change. WEIGHTS MUST ALREADY BE ON models-pvc: the card's verbose path sets HF_TOKEN and pulls from the Hub, whereas this entry runs offline (HF_HUB_OFFLINE=1) against the PVC mount.",
     "uri": "pvc://models-pvc/large-models/nvidia/GLM-5.3-Flash-FP4-Local?containerPath=/mnt/models",
     "image": "ghcr.io/local-inference-lab/vllm:release-10152026",
     "model_format": "custom",
     "arguments": [
+      "vllm",
+      "serve",
       "nvidia/GLM-5.3-Flash-FP4-Local",
       "--host",
       "0.0.0.0",

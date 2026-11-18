@@ -126,7 +126,7 @@ time rather than after the first incident.
 | Model endpoints (vLLM/SGLang / MLIS) | The `/v1` proxy pools | Admin console Models tab `test` button — a real `GET /v1/models` with the endpoint's own credential (`POST /admin/models/{name}/probe`); the result (latency, error) renders in the row |
 | MCP servers | `/mcp` federation + the tool relay | `GET /admin/mcp-servers/{name}/tools` — a real `list_tools`, 15 s bound; or the MCP tab's test button |
 | Prometheus — only for off-peak billing, model groups, endpoint metrics | Demand evaluators, live-load snapshots, KV-cache strips | Admin ▸ Off-peak shows a live sample or a named error; `GET /admin/endpoint-metrics` returns non-null `kv_*` fields |
-| Keycloak JWKS — only when `settings.tokenValidation.*` is set | JWT validation (identity Phase B) | The JWKS URL is fetched by the POD and cached (`jwksCacheS`, default 300 s) — it must be reachable from the release namespace, not just from your laptop |
+| Keycloak JWKS — only when `settings.auth.tokenValidation.*` is set | JWT validation (identity Phase B) | The JWKS URL is fetched by the POD and cached (`jwksCacheS`, default 300 s) — it must be reachable from the release namespace, not just from your laptop |
 
 ### Keys the chart refuses to render without
 
@@ -230,7 +230,7 @@ one smoke check (full battery in [`VERIFICATION.md`](changelogs/VERIFICATION.md)
   on (console Keys ▸ edit) — or verify the header path with
   `-H 'X-PCAI-Execute-Tools: 1'` and watch for `X-PCAI-Relay: streaming`
   plus `data: {"pcai": ...}` events.
-- **Off-peak tab**: with `offpeakEnabled: true` and the Prometheus MCP
+- **Off-peak tab**: with `settings.offpeak.enabled: true` and the Prometheus MCP
   registered, Admin ▸ Off-peak shows live state (enabled/active/fraction/
   last sample or error); it auto-refreshes only while the tab is visible.
 - **Creds dialog (per-user MCP headers)**: Admin ▸ Keys ▸ `creds` on a key
@@ -270,6 +270,15 @@ paste it into the *Helm Values* editor, adjust the `# SITE:` lines, apply.
 | Autoscaling | ON (min 2 / max 4 @ CPU 70%) — maxReplicas sized against the embedded PG's `max_connections` | OFF (trial default) |
 | Kyverno vendor labels | OFF — the chart stamps the `hpe-ezua` labels statically; the ClusterPolicy needs cluster-admin | OFF — same; locked-down customer clusters may not permit ClusterPolicy creation at all |
 
+A third example,
+[`values.hosted-trial-sso-prometheus.yaml`](../helm/values-examples/values.hosted-trial-sso-prometheus.yaml),
+ships the hosted-trial profile with the two features that carry deploy-time
+prerequisites already applied — SSO self-mint (§ SSO self-mint rollout) and
+off-peak billing (§ Off-peak billing) — with `settings.auth.tokenShadow.tenantId` and the
+per-model PromQL left as `REPLACE_WITH_*`. Read its header before applying: the
+edge chain must be live before the flags, and `prometheus` must already be a
+registered MCP server.
+
 The G2-specific, live-verified execution of the SSO + policy posture (exact
 values, exact commands, verified starting state, per-step verification) is
 [`SSO-ROLLOUT-G2.md`](changelogs/SSO-ROLLOUT-G2.md).
@@ -283,7 +292,7 @@ values, exact commands, verified starting state, per-step verification) is
 | `database.existingSecret` / `existingSecretKey` | **EXTERNAL mode only** (`database.embedded.enabled=false`, the default) — the Postgres URL (carries credentials) comes from the Secret by reference; the chart never renders a connection string. Ignored in embedded mode. | `pcai-llm-gateway-db` / `database-url` |
 | `ezua.enabled` + `ezua.virtualService.endpoint` | Gateway exposure through the PCAI Istio gateway: routes `/v1`, `/mcp`, `/admin`, `/health`, `/ready`, (`/metrics` when enabled), `/ui`, `/` (chat UI). `endpoint` is **required exactly** when enabled — the literal route host (PCAI resolves `${DOMAIN_NAME}` before rendering; CLI deploys must sed-resolve it first — § Gateway exposure). | `false` (ClusterIP-only) |
 | `ingress.enabled` / `className` / `host` / `tlsSecretName` | Alternative plain-k8s Ingress flavor (ADDITIVE, off by default) — for non-PCAI units with an Ingress controller. Enable only together with `ezua.enabled: false`; `host` is required when enabled; `/admin` is intentionally not routed. | `false` / `nginx` / `""` / `""` |
-| `settings.*` | Runtime knobs rendered as `PCAI_LLM_*` env (complete list in the env table below): `host`, `port` (9200), `logLevel`, `upstreamTimeoutS` (900), `upstreamCaBundle` ("" — private-CA sites, § Upstream CA bundle), `retentionTraceDays`/`retentionConversationDays`/`retentionCanonicalDays` (0/0/0 — traces + conversations + distilled-only canonical-store TTL prunes; the ledger is never pruned), `endpointFailureThreshold` (5), `endpointCooldownS` (60), `maxBodyBytes` (32 MiB), `dbPoolMin`/`dbPoolMax`/`dbAcquireTimeoutS` (5/25/2), `embeddingCacheEnabled`/`MaxInputBytes`, `toolRelay*` (incl. `toolRelayGrantMode`: `explicit` default \| `scope` legacy, `toolRelayStreamWireTools`: false), `clientToolDispatch`/`TimeoutS` (false/120 — client tool-server dispatch), `routing*` (complexity-routing pseudo-models, on by default), `mcpFlatTools`/`mcpCatalogCacheS`/`mcpFailoverAttempts` (the `/mcp` flat per-tool surface), `modelFallbackMax` (2 — per-model fallback chains) + `zeroCompletionRetry` (false), `offpeak*` (all, default-off, incl. `offpeakModelPromql` per-model queries), `trustProxyIdentity` + `mcpCallerAttribution` (identity Phase A), `tokenValidation.*` (issuer/jwksUrl/audience/jwksCacheS/leewayS — Keycloak JWT validation, INERT until all three of issuer+jwksUrl+audience are set), `tokenShadowKeys`/`tokenShadowTenantId`/`tokenShadowKeyName`/`tokenShadowRateLimitRpm`/`Tpm` (lazy key provisioning for first-seen token subjects; default off), `ssoKeyCreateEnabled` (POST /v1/keys/for-me; default off), `adminGroups` (browser-identity admin path; default empty = bearer-only), `enrollMemoryDefault`/`Server`/`NameRetries` (enrollment-time memory datasets; default false / mm-rag / 3), `distiller*` (the session memory distiller: `distillerEnabled` false, memory server/tool/probe-tool, `distillerGateBackoffS` 900, `distillerRawFallback` true — full rows in the env table below). | sane defaults; rarely touched |
+| `settings.*` | Runtime knobs rendered as `PCAI_LLM_*` env, grouped by subsystem (complete list in the env table below): `server.*` (`host`, `port` 9200, `logLevel`, `keepAliveTimeoutS`, `limitConcurrency`, `maxBodyBytes` 32 MiB), `upstream.*` (`timeoutS` 900, `caBundle` "" — private-CA sites, § Upstream CA bundle, `breakerFailureThreshold` 5, `breakerCooldownS` 60, `failoverTtftS` 45, `zeroCompletionRetry` false), `dbPool.*` (`min`/`max`/`acquireTimeoutS` 5/25/2), `retention.*` (`traceDays`/`conversationDays`/`canonicalDays` 0/0/0 — traces + conversations + distilled-only canonical-store TTL prunes; the ledger is never pruned), `cache.*` (`embedding.enabled`/`.maxInputBytes`, `response.mode`/`.ttlS`, `metering.*`), `relay.*` (incl. `grantMode`: `explicit` default \| `scope` legacy, `streamWireTools`: false, `compress.*`, `clientDispatch.enabled`/`.timeoutS` false/120 — client tool-server dispatch), `mcp.*` (`flatTools`/`catalogCacheS`/`failoverAttempts` — the `/mcp` flat per-tool surface, `callerAttribution`, `argPolicy.*`, `selfService`), `routing.*` (complexity-routing pseudo-models, on by default; `fallbackMax` 2 — per-model fallback chains), `models.maxTokensCeiling`, `healthProbe.*`, `auth.*` (`trustProxyIdentity` + `adminGroups` — identity Phase A, `tokenValidation.*` — issuer/jwksUrl/audience/jwksCacheS/leewayS, INERT until all three of issuer+jwksUrl+audience are set, `tokenShadow.*` — lazy key provisioning for first-seen token subjects, default off, `ssoKeyCreate.enabled` — POST /v1/keys/for-me, default off), `memory.*` (`enroll.provisionDataset`/`.server`/`.nameRetries` — enrollment-time memory datasets, default false / mm-rag / 3; `distiller.*` — the session memory distiller: `enabled` false, server/tool/probe-tool, `gateBackoffS` 900, `rawFallback` true — full rows in the env table below), `offpeak.*` (all, default-off, incl. `modelPromql` per-model queries), `audio.*`, `tracing.*` — full rows in the env table below; flat-layout site files: § Values migration. | sane defaults; rarely touched |
 | `metrics.enabled` / `interval` | **ADDITIVE and OFF by default** — `false` renders NOTHING (no ServiceMonitor, no `/metrics` VirtualService route; the default render stays byte-identical to the baseline). This key also gates the app: `PCAI_LLM_METRICS_ENABLED` is rendered from it unconditionally — **chart-off = app-off**. `true` ships the prometheus-operator ServiceMonitor; the server serves `/metrics` on the same port and exports the app's own series (`gateway_requests_total{model,status,kind}`, latency/TTFT histograms, breaker/budget/rate/ACL counters — defined in `src/pcai_llm/core/metrics.py`). Requires the ServiceMonitor CRD in-cluster. | `false` / `30s` |
 | `metrics.prometheusRule.enabled` / `.rules` | PrometheusRule for the gateway's OWN series — ADDITIVE and OFF by default; requires `metrics.enabled: true` AND the prometheus-operator PrometheusRule CRD. `rules: []` renders the default ruleset (GatewayHighErrorRatio, GatewayBreakerOpen, GatewayBudgetRejectionsSpike); a non-empty `rules:` list replaces it wholesale. The default ruleset is spelled out in `helm/values.yaml`'s comment block; the hosted-trial example enables it. | `false` / `[]` |
 | `replicaCount` | Stateless (all state in Postgres) — replicas share the ledger with no coordination; raise freely (see [Sizing](#sizing-and-scale-signals) for when to). | `1` |
@@ -337,70 +346,70 @@ touch these directly. Every app knob in `src/pcai_llm/config.py` is
 
 | Env var | Rendered from |
 |---|---|
-| `PCAI_LLM_HOST` / `PCAI_LLM_PORT` | `settings.host` / `settings.port` |
-| `PCAI_LLM_LOG_LEVEL` | `settings.logLevel` |
-| `PCAI_LLM_KEEP_ALIVE_TIMEOUT_S` / `PCAI_LLM_LIMIT_CONCURRENCY` | `settings.keepAliveTimeoutS` / `settings.limitConcurrency` — uvicorn keep-alive idle timeout (default 75s, matches LB idle windows; the 5s default caused constant TLS re-handshakes for pooled consumers) and the concurrency cap (default 0 = unbounded; a cap sheds load with 503, the same fail-fast discipline as pool exhaustion) |
-| `PCAI_LLM_UPSTREAM_TIMEOUT_S` | `settings.upstreamTimeoutS` (chart default 900 — timeout for a single upstream model call, chat/embeddings) |
-| `PCAI_LLM_ENDPOINT_FAILURE_THRESHOLD` | `settings.endpointFailureThreshold` |
-| `PCAI_LLM_ENDPOINT_COOLDOWN_S` | `settings.endpointCooldownS` |
-| `PCAI_LLM_MAX_BODY_BYTES` | `settings.maxBodyBytes` |
-| `PCAI_LLM_DB_POOL_MIN` / `PCAI_LLM_DB_POOL_MAX` / `PCAI_LLM_DB_ACQUIRE_TIMEOUT_S` | `settings.dbPoolMin` / `settings.dbPoolMax` / `settings.dbAcquireTimeoutS` — Postgres pool bounds (defaults 5 / 25) and bounded acquire in seconds (default 2): under saturation a request fails fast (503 `database busy`) instead of queueing forever |
-| `PCAI_LLM_EMBEDDING_CACHE_ENABLED` | `settings.embeddingCacheEnabled` (default true) |
-| `PCAI_LLM_EMBEDDING_CACHE_MAX_INPUT_BYTES` | `settings.embeddingCacheMaxInputBytes` (default 65536) |
-| `PCAI_LLM_TOOL_RELAY_ENABLED` | `settings.toolRelayEnabled` (default true) |
-| `PCAI_LLM_TOOL_RELAY_MAX_ITERATIONS` | `settings.toolRelayMaxIterations` (default 16 — one iteration is ONE model round, which may batch several parallel tool calls; the cap bounds ONE user turn's relay loop — a handback-continuation request resumes the turn's counter, a fresh user message resets it) |
-| `PCAI_LLM_TOOL_RELAY_WALL_CLOCK_S` | `settings.toolRelayWallClockS` (chart default 900 — the whole-turn relay budget; the APP default in `config.py` is 600, and in code the budget is clamped to `upstreamTimeoutS − 30s` so the relay can always close its stream cleanly before the ingress shoots it down) |
-| `PCAI_LLM_TOOL_RELAY_CALL_RETRIES` | `settings.toolRelayCallRetries` (default 1) — TOTAL extra attempts per relay turn for a bounded model call that expired on timeout (prefill-queueing resilience: the retry re-runs the call instead of closing the turn when the queue was about to drain). The retry spends only the REMAINING wall clock (never extends it) and only fires when ≥10s of it is left; only the timeout failure class retries — an answered call is never re-rolled. `0` = fail on the first timeout |
-| `PCAI_LLM_TOOL_RELAY_GRANT_MODE` | `settings.toolRelayGrantMode` — `explicit` (default; a key sees ONLY its held (server, tool) pairs: the profile's live-grant presets ∪ its own ACL rows — the profile is the envelope, and the self-service panel lists nothing else) or `scope` (legacy, opt-in: mcp-scoped keys get the policy-admitted tools of enabled servers — incompatible with profile least-privilege when self-mint stamps the mcp scope on every key) |
-| `PCAI_LLM_RELAY_STREAM_WIRE_TOOLS` | `settings.toolRelayStreamWireTools` (default **false**) — native wire visibility: re-emit the model's `tool_call` deltas as native OpenAI chunks DURING the relay loop (no `finish_reason` — that stays at the turn's true end). **Keep false for DSH**: its stream client EXECUTES any tool_call delta it sees, so the informational re-emission double-executes the call in-cluster + client-side, and for flat `<server>__<tool>` names DSH holds no registration, so the harness errors `unknown tool` and feeds the phantom back to the model while the relay's real result dies with the stream (observed 2026-09-21). In-cluster visibility survives as the `[tool] server__tool → ok (ms)` reasoning trace + `pcai` SSE events. Handback deltas for client-offered tools are emitted unconditionally and are NOT affected. Set true only for clients that render deltas without executing them |
-| `PCAI_LLM_CLIENT_TOOL_DISPATCH` / `PCAI_LLM_CLIENT_TOOL_DISPATCH_TIMEOUT_S` | `settings.clientToolDispatch` (default **false**) / `settings.clientToolDispatchTimeoutS` (default 120.0) — client tool-server dispatch (ROADMAP §7 wave B2): when on, a key may REGISTER its local tools (`POST /v1/dispatch/register`, answered via the `/v1/dispatch/poll` + `/v1/dispatch/result` long-poll channel) and the relay merges `client__<tool>` into the model toolset per key, returning results INTO the running loop. Fail-safe: routes 404 while off; keys without a live offer see byte-for-byte today's handback behavior. The timeout bounds ONE dispatch — an offline/busy client produces a tool ERROR after this long, never a hang; per-tool `timeout_s` values from an offer are clamped to `[1, this]` |
-| `PCAI_LLM_ROUTING_ENABLED` | `settings.routingEnabled` (default true) — master switch for the complexity-routing pseudo-models (`routing` / `routing__X`, see FEATURES.md § Routing); the per-profile `routing_policy` still gates WHO participates. `false` makes an opted-in profile behave exactly like `off` — its `X-PCAI-Route` header reads `off` so the state stays visible |
-| `PCAI_LLM_ROUTING_AGENTS_ENABLED` | `settings.routingAgentsEnabled` (default **false**) — agents as routing candidates: the calling key's OFFERED agents join the router's candidate window (an agent is a hard model: tool surface + pinned model/cascade), `routing__<agent>` is a legal ceiling, and a pick applies the agent's surface + prompt for the whole turn (routing runs before the request is prepared). Agents are PER-KEY (the profile's agent menu), so they are not in the global routing allowlist; they join at the cheap end (undeclared capability). Off = the router's model/group ladder is byte-identical |
-| `PCAI_LLM_ROUTING_TIER1_TOKENS` / `PCAI_LLM_ROUTING_TIER2_TOKENS` | `settings.routingTier1Tokens` / `settings.routingTier2Tokens` (defaults 1500 / 6000) — the two cut points mapping the request's complexity score onto the profile's cheap-first ladder: below tier 1 serves the floor (`routing_min_model`), below tier 2 the middle of the floor..ceiling window, at/above tier 2 the ceiling. The score is prompt text (chars/4) + a flat per-image charge + a per-turn adder + capped `max_tokens`; tool definitions are deliberately NOT scored (an agent harness ships the same catalog every turn, so they are a constant, not a signal). Tune per fleet from the shadow-ledger data |
-| `PCAI_LLM_ROUTING_TURN_ADDER_TOKENS` | `settings.routingTurnAdderTokens` (default 100) — score adder per message beyond the first (conversation state demands capability even when the latest turn is short) |
-| `PCAI_LLM_MCP_FLAT_TOOLS` | `settings.mcpFlatTools` (default true) — `/mcp` tools/list re-exposes the calling key's GRANTED upstream tools as individual `{server}__{tool}` MCP tools (upstream inputSchemas + annotations, ACL-filtered per request; the gateway tools `mcp_catalog`/`mcp_call` stay listed first). `0` = kill switch back to the exact pre-flat two-tool surface |
-| `PCAI_LLM_REGISTRY_WATCH_S` | `settings.registryWatchS` (default 5) — cross-replica registry convergence: each replica polls `(count(*), max(updated_at))` over `mcp_servers` + `model_endpoints` on this cadence and refreshes its in-memory snapshot only when the watermark moved (the stamps are maintained by a DB trigger, so out-of-band SQL edits converge too). `0` disables the poll — correct ONLY on a single replica; with the HPA at 2+ pods, disabling it restores the "registered on one pod, 404 on the other" bug |
-| `PCAI_LLM_REGISTRY_ADMIN_FRESH_S` | `settings.registryAdminFreshS` (default 1) — the admin console's `GET /admin/mcp-servers` and `GET /admin/mcp-servers/{name}/tools` (the "test" button) re-check the watermark on read, at most once per this interval; fail-open (a watermark failure keeps the current snapshot and never 500s the read). `0` disables the fast path, leaving the console on the watcher cadence |
-| `PCAI_LLM_MCP_CATALOG_CACHE_S` | `settings.mcpCatalogCacheS` (default 60) — TTL seconds for the per-server upstream tool-listing cache (key-independent payload, server-level auth only, invalidated on every registry mutation, stale listing served on upstream error) |
-| `PCAI_LLM_MCP_FAILOVER_ATTEMPTS` | `settings.mcpFailoverAttempts` (default 2) — retries AFTER the primary when a FLATTENED `{server}__{tool}` call hits a transport failure (next priority-ordered enabled server with an explicit key grant + policy-admitted tool in its cached listing); explicit `mcp_call` targets never fail over |
-| `PCAI_LLM_MCP_ARG_POLICY` | `settings.mcpArgPolicy` (default **enforce**) — argument-level destination policy, the P0-1 stage that runs on BOTH MCP paths (`/mcp`'s gate chain and the RELAY executor, i.e. the tool calls a model makes during a chat turn). `enforce` \| `warn` \| `off`; an unrecognised value fails CLOSED to `enforce`. It blocks *where* a tool may send a request, not *what* it sends — exfiltration by URL payload survives this stage by design |
+| `PCAI_LLM_HOST` / `PCAI_LLM_PORT` | `settings.server.host` / `settings.server.port` |
+| `PCAI_LLM_LOG_LEVEL` | `settings.server.logLevel` |
+| `PCAI_LLM_KEEP_ALIVE_TIMEOUT_S` / `PCAI_LLM_LIMIT_CONCURRENCY` | `settings.server.keepAliveTimeoutS` / `settings.server.limitConcurrency` — uvicorn keep-alive idle timeout (default 75s, matches LB idle windows; the 5s default caused constant TLS re-handshakes for pooled consumers) and the concurrency cap (default 0 = unbounded; a cap sheds load with 503, the same fail-fast discipline as pool exhaustion) |
+| `PCAI_LLM_UPSTREAM_TIMEOUT_S` | `settings.upstream.timeoutS` (chart default 900 — timeout for a single upstream model call, chat/embeddings) |
+| `PCAI_LLM_ENDPOINT_FAILURE_THRESHOLD` | `settings.upstream.breakerFailureThreshold` |
+| `PCAI_LLM_ENDPOINT_COOLDOWN_S` | `settings.upstream.breakerCooldownS` |
+| `PCAI_LLM_MAX_BODY_BYTES` | `settings.server.maxBodyBytes` |
+| `PCAI_LLM_DB_POOL_MIN` / `PCAI_LLM_DB_POOL_MAX` / `PCAI_LLM_DB_ACQUIRE_TIMEOUT_S` | `settings.dbPool.min` / `settings.dbPool.max` / `settings.dbPool.acquireTimeoutS` — Postgres pool bounds (defaults 5 / 25) and bounded acquire in seconds (default 2): under saturation a request fails fast (503 `database busy`) instead of queueing forever |
+| `PCAI_LLM_EMBEDDING_CACHE_ENABLED` | `settings.cache.embedding.enabled` (default true) |
+| `PCAI_LLM_EMBEDDING_CACHE_MAX_INPUT_BYTES` | `settings.cache.embedding.maxInputBytes` (default 65536) |
+| `PCAI_LLM_TOOL_RELAY_ENABLED` | `settings.relay.enabled` (default true) |
+| `PCAI_LLM_TOOL_RELAY_MAX_ITERATIONS` | `settings.relay.maxIterations` (default 16 — one iteration is ONE model round, which may batch several parallel tool calls; the cap bounds ONE user turn's relay loop — a handback-continuation request resumes the turn's counter, a fresh user message resets it) |
+| `PCAI_LLM_TOOL_RELAY_WALL_CLOCK_S` | `settings.relay.wallClockS` (chart default 900 — the whole-turn relay budget; the APP default in `config.py` is 600, and in code the budget is clamped to `settings.upstream.timeoutS − 30s` so the relay can always close its stream cleanly before the ingress shoots it down) |
+| `PCAI_LLM_TOOL_RELAY_CALL_RETRIES` | `settings.relay.callRetries` (default 1) — TOTAL extra attempts per relay turn for a bounded model call that expired on timeout (prefill-queueing resilience: the retry re-runs the call instead of closing the turn when the queue was about to drain). The retry spends only the REMAINING wall clock (never extends it) and only fires when ≥10s of it is left; only the timeout failure class retries — an answered call is never re-rolled. `0` = fail on the first timeout |
+| `PCAI_LLM_TOOL_RELAY_GRANT_MODE` | `settings.relay.grantMode` — `explicit` (default; a key sees ONLY its held (server, tool) pairs: the profile's live-grant presets ∪ its own ACL rows — the profile is the envelope, and the self-service panel lists nothing else) or `scope` (legacy, opt-in: mcp-scoped keys get the policy-admitted tools of enabled servers — incompatible with profile least-privilege when self-mint stamps the mcp scope on every key) |
+| `PCAI_LLM_RELAY_STREAM_WIRE_TOOLS` | `settings.relay.streamWireTools` (default **false**) — native wire visibility: re-emit the model's `tool_call` deltas as native OpenAI chunks DURING the relay loop (no `finish_reason` — that stays at the turn's true end). **Keep false for DSH**: its stream client EXECUTES any tool_call delta it sees, so the informational re-emission double-executes the call in-cluster + client-side, and for flat `<server>__<tool>` names DSH holds no registration, so the harness errors `unknown tool` and feeds the phantom back to the model while the relay's real result dies with the stream (observed 2026-09-21). In-cluster visibility survives as the `[tool] server__tool → ok (ms)` reasoning trace + `pcai` SSE events. Handback deltas for client-offered tools are emitted unconditionally and are NOT affected. Set true only for clients that render deltas without executing them |
+| `PCAI_LLM_CLIENT_TOOL_DISPATCH` / `PCAI_LLM_CLIENT_TOOL_DISPATCH_TIMEOUT_S` | `settings.relay.clientDispatch.enabled` (default **false**) / `settings.relay.clientDispatch.timeoutS` (default 120.0) — client tool-server dispatch (ROADMAP §7 wave B2): when on, a key may REGISTER its local tools (`POST /v1/dispatch/register`, answered via the `/v1/dispatch/poll` + `/v1/dispatch/result` long-poll channel) and the relay merges `client__<tool>` into the model toolset per key, returning results INTO the running loop. Fail-safe: routes 404 while off; keys without a live offer see byte-for-byte today's handback behavior. The timeout bounds ONE dispatch — an offline/busy client produces a tool ERROR after this long, never a hang; per-tool `timeout_s` values from an offer are clamped to `[1, this]` |
+| `PCAI_LLM_ROUTING_ENABLED` | `settings.routing.enabled` (default true) — master switch for the complexity-routing pseudo-models (`routing` / `routing__X`, see FEATURES.md § Routing); the per-profile `routing_policy` still gates WHO participates. `false` makes an opted-in profile behave exactly like `off` — its `X-PCAI-Route` header reads `off` so the state stays visible |
+| `PCAI_LLM_ROUTING_AGENTS_ENABLED` | `settings.routing.agentsEnabled` (default **false**) — agents as routing candidates: the calling key's OFFERED agents join the router's candidate window (an agent is a hard model: tool surface + pinned model/cascade), `routing__<agent>` is a legal ceiling, and a pick applies the agent's surface + prompt for the whole turn (routing runs before the request is prepared). Agents are PER-KEY (the profile's agent menu), so they are not in the global routing allowlist; they join at the cheap end (undeclared capability). Off = the router's model/group ladder is byte-identical |
+| `PCAI_LLM_ROUTING_TIER1_TOKENS` / `PCAI_LLM_ROUTING_TIER2_TOKENS` | `settings.routing.tier1Tokens` / `settings.routing.tier2Tokens` (defaults 1500 / 6000) — the two cut points mapping the request's complexity score onto the profile's cheap-first ladder: below tier 1 serves the floor (`routing_min_model`), below tier 2 the middle of the floor..ceiling window, at/above tier 2 the ceiling. The score is prompt text (chars/4) + a flat per-image charge + a per-turn adder + capped `max_tokens`; tool definitions are deliberately NOT scored (an agent harness ships the same catalog every turn, so they are a constant, not a signal). Tune per fleet from the shadow-ledger data |
+| `PCAI_LLM_ROUTING_TURN_ADDER_TOKENS` | `settings.routing.turnAdderTokens` (default 100) — score adder per message beyond the first (conversation state demands capability even when the latest turn is short) |
+| `PCAI_LLM_MCP_FLAT_TOOLS` | `settings.mcp.flatTools` (default true) — `/mcp` tools/list re-exposes the calling key's GRANTED upstream tools as individual `{server}__{tool}` MCP tools (upstream inputSchemas + annotations, ACL-filtered per request; the gateway tools `mcp_catalog`/`mcp_call` stay listed first). `0` = kill switch back to the exact pre-flat two-tool surface |
+| `PCAI_LLM_REGISTRY_WATCH_S` | `settings.mcp.registryWatchS` (default 5) — cross-replica registry convergence: each replica polls `(count(*), max(updated_at))` over `mcp_servers` + `model_endpoints` on this cadence and refreshes its in-memory snapshot only when the watermark moved (the stamps are maintained by a DB trigger, so out-of-band SQL edits converge too). `0` disables the poll — correct ONLY on a single replica; with the HPA at 2+ pods, disabling it restores the "registered on one pod, 404 on the other" bug |
+| `PCAI_LLM_REGISTRY_ADMIN_FRESH_S` | `settings.mcp.registryAdminFreshS` (default 1) — the admin console's `GET /admin/mcp-servers` and `GET /admin/mcp-servers/{name}/tools` (the "test" button) re-check the watermark on read, at most once per this interval; fail-open (a watermark failure keeps the current snapshot and never 500s the read). `0` disables the fast path, leaving the console on the watcher cadence |
+| `PCAI_LLM_MCP_CATALOG_CACHE_S` | `settings.mcp.catalogCacheS` (default 60) — TTL seconds for the per-server upstream tool-listing cache (key-independent payload, server-level auth only, invalidated on every registry mutation, stale listing served on upstream error) |
+| `PCAI_LLM_MCP_FAILOVER_ATTEMPTS` | `settings.mcp.failoverAttempts` (default 2) — retries AFTER the primary when a FLATTENED `{server}__{tool}` call hits a transport failure (next priority-ordered enabled server with an explicit key grant + policy-admitted tool in its cached listing); explicit `mcp_call` targets never fail over |
+| `PCAI_LLM_MCP_ARG_POLICY` | `settings.mcp.argPolicy.mode` (default **enforce**) — argument-level destination policy, the P0-1 stage that runs on BOTH MCP paths (`/mcp`'s gate chain and the RELAY executor, i.e. the tool calls a model makes during a chat turn). `enforce` \| `warn` \| `off`; an unrecognised value fails CLOSED to `enforce`. It blocks *where* a tool may send a request, not *what* it sends — exfiltration by URL payload survives this stage by design |
 | `PCAI_LLM_MCP_ARG_POLICY_EXEMPT` | comma-separated `server.tool` globs exempt from the argument stage (empty = none). Prefer an exemption over turning the stage off |
 | `PCAI_LLM_MCP_ARG_EGRESS_SERVERS` | comma-separated egress-class server globs (empty = the federation egress class, `searxng`). Only these deny cluster-internal names and resolve hostnames |
 | `PCAI_LLM_MCP_ARG_DENY_CLUSTER_HOSTS` | default `true` — deny `.svc` / `.svc.cluster.local` / `.cluster.local` targets on egress-class servers (a web fetcher has no business reading the cluster control plane) |
 | `PCAI_LLM_MCP_ARG_POLICY_RESOLVE` | default `true` — resolve egress-class hostnames (2 s bound) and deny a name that maps into a denied range. A resolution FAILURE allows (a resolver that cannot answer says nothing about the name) |
 | `PCAI_LLM_MCP_ARG_TELEMETRY` | default `true` — observe base64-blob / long-query / long-path argument shapes (`gateway_mcp_arg_telemetry_total`). Metric only, never refuses |
-| `PCAI_LLM_MODEL_FALLBACK_MAX` | `settings.modelFallbackMax` (default 2) — caps how many fallback MODELS are tried per request: a model's admin-curated fallback chain (managed via `GET/PUT /admin/models/{name}/fallbacks`, tried FIRST) plus, for ALIAS requests (`auto`), the profile ordering's tail (appended AFTER the chain). The walk engages when the serving model cannot serve (`pool.pick()==None`) or answers with an upstream 5xx / transport error; every hop re-runs the budget gate — a fallback is never a budget bypass. `0` = runtime model failover is never walked (kill switch). See FEATURES.md § Router extras |
-| `PCAI_LLM_MODEL_GROUPS_ENABLED` | `settings.modelGroupsEnabled` (default **false**) — master switch for model groups: named sets of equivalent chat models whose member is chosen by LIVE LOAD (power-of-two over queue depth) instead of a fixed order (FEATURES.md § Model groups). Off = a group name is not routable and routing is byte-identical; the admin API still stores and curates the rows either way |
-| `PCAI_LLM_MODEL_GROUP_LOAD_REFRESH_S` | `settings.modelGroupLoadRefreshS` (default 5) — how often the BACKGROUND load snapshot refreshes from Prometheus (running / waiting / kv_cache_pct per endpoint). Prometheus dependency note: the snapshot is a background task and the pick reads the in-memory view — Prometheus is NEVER queried on the request path. Needs a reachable Prometheus, same dependency class as the off-peak evaluator |
-| `PCAI_LLM_MODEL_GROUP_LOAD_STALE_S` | `settings.modelGroupLoadStaleS` (default 30) — a snapshot older than this is treated as "no data": member selection degrades to random rather than routing on stale load. Fail-open by design — a Prometheus outage must never stop model selection |
-| `PCAI_LLM_ZERO_COMPLETION_RETRY` | `settings.zeroCompletionRetry` (default **false**) — zero-completion insurance: when a chat call answers 2xx with EMPTY content, zero completion tokens and `finish_reason=stop`, retry the identical call EXACTLY once (both attempts settle under the shared `request_id` — the first was real GPU spend). Non-streaming JSON path + the relay's final answer only; plain streaming is never buffered/re-rolled. Flip on after observing the empty-completion rate in the ledger |
-| `PCAI_LLM_OFFPEAK_ENABLED` | `settings.offpeakEnabled` (default **false**) — demand-shaped billing: when avg GPU util (PromQL below) is under `ENTER_PCT`, new requests settle with `billing_fraction` = the key's fraction; budget gates consume `tokens × fraction` / `USD × fraction` (ledger keeps true usage). Needs a Prometheus reachable through the registered MCP server named `OFFPEAK_MCP_SERVER` — enable ONLY where that MCP is deployed. Fail-safe: any evaluator failure bills normal. Console: Admin ▸ Off-peak shows live state |
-| `PCAI_LLM_OFFPEAK_CHECK_S` | `settings.offpeakCheckS` (default 30) — evaluator cadence seconds |
-| `PCAI_LLM_OFFPEAK_ENTER_PCT` / `PCAI_LLM_OFFPEAK_EXIT_PCT` | `settings.offpeakEnterPct` / `settings.offpeakExitPct` (defaults 20 / 35) — hysteresis thresholds: enter the low-demand state below enter, exit only above exit, so billing never flaps at the boundary |
-| `PCAI_LLM_OFFPEAK_PROMQL` | `settings.offpeakPromql` (default `avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL[5m]))` — DCGM exporter; adjust per cluster: vLLM-only sites may prefer a queue-depth metric) — the GLOBAL demand query, used by every model without a per-model entry |
-| `PCAI_LLM_OFFPEAK_FRACTION` | `settings.offpeakFraction` (default 0.5 — budgets last 2× during off-peak). PER-PROFILE override: set `offpeak_fraction` on a profile (Admin ▸ Profiles — console-editable, live immediately); keys under that profile bill at its fraction during low-demand windows, all others use this default |
-| `PCAI_LLM_OFFPEAK_MCP_SERVER` / `PCAI_LLM_OFFPEAK_TOOL` | `settings.offpeakMcpServer` / `settings.offpeakTool` (defaults `prometheus` / `prom_query`) — which registered MCP server + tool serves the query |
-| `PCAI_LLM_OFFPEAK_MODEL_PROMQL` | `settings.offpeakModelPromql` (default `{}`) — per-model off-peak queries, JSON object: model name → PromQL returning a 0-100 load percentage for THE RESOURCES THAT MODEL SERVES ON. A model with an entry bills by its OWN hysteresis state; models without one fall back to the global `offpeakPromql`. WHY: the global GPU query averages EVERY GPU in the cluster — idle nodes, training jobs and other tenants dilute a busy model's utilization below the enter threshold while its own GPUs are pegged. DCGM series carry NO pod label — scope by `Hostname` + device range (or `exported_namespace`), and validate the query in Prometheus FIRST (a scoped query matching zero series fails safe to FULL price). Keys must match registered model names EXACTLY. Omitted from the render entirely when unset (default render byte-identical). See FEATURES.md § Off-peak billing |
-| `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR` | `settings.endpointMetricsDiskSelector` (default `""`) — the Off-peak tab's all-models cache summary DISK tier: a PromQL label selector over `kubelet_volume_stats_*` naming the volumes backing the KV cache's L3 store (the inference engine exports no storage-occupancy gauge). Two extra Prometheus queries per snapshot ONLY when set; unset/empty/unknown reads null, never 0%. G2 example: `'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'` (Mooncake SSD offload, 3 × 350 Gi) |
+| `PCAI_LLM_MODEL_FALLBACK_MAX` | `settings.routing.fallbackMax` (default 2) — caps how many fallback MODELS are tried per request: a model's admin-curated fallback chain (managed via `GET/PUT /admin/models/{name}/fallbacks`, tried FIRST) plus, for ALIAS requests (`auto`), the profile ordering's tail (appended AFTER the chain). The walk engages when the serving model cannot serve (`pool.pick()==None`) or answers with an upstream 5xx / transport error; every hop re-runs the budget gate — a fallback is never a budget bypass. `0` = runtime model failover is never walked (kill switch). See FEATURES.md § Router extras |
+| `PCAI_LLM_MODEL_GROUPS_ENABLED` | `settings.routing.modelGroups.enabled` (default **false**) — master switch for model groups: named sets of equivalent chat models whose member is chosen by LIVE LOAD (power-of-two over queue depth) instead of a fixed order (FEATURES.md § Model groups). Off = a group name is not routable and routing is byte-identical; the admin API still stores and curates the rows either way |
+| `PCAI_LLM_MODEL_GROUP_LOAD_REFRESH_S` | `settings.routing.modelGroups.loadRefreshS` (default 5) — how often the BACKGROUND load snapshot refreshes from Prometheus (running / waiting / kv_cache_pct per endpoint). Prometheus dependency note: the snapshot is a background task and the pick reads the in-memory view — Prometheus is NEVER queried on the request path. Needs a reachable Prometheus, same dependency class as the off-peak evaluator |
+| `PCAI_LLM_MODEL_GROUP_LOAD_STALE_S` | `settings.routing.modelGroups.loadStaleS` (default 30) — a snapshot older than this is treated as "no data": member selection degrades to random rather than routing on stale load. Fail-open by design — a Prometheus outage must never stop model selection |
+| `PCAI_LLM_ZERO_COMPLETION_RETRY` | `settings.upstream.zeroCompletionRetry` (default **false**) — zero-completion insurance: when a chat call answers 2xx with EMPTY content, zero completion tokens and `finish_reason=stop`, retry the identical call EXACTLY once (both attempts settle under the shared `request_id` — the first was real GPU spend). Non-streaming JSON path + the relay's final answer only; plain streaming is never buffered/re-rolled. Flip on after observing the empty-completion rate in the ledger |
+| `PCAI_LLM_OFFPEAK_ENABLED` | `settings.offpeak.enabled` (default **false**) — demand-shaped billing: when avg GPU util (PromQL below) is under `ENTER_PCT`, new requests settle with `billing_fraction` = the key's fraction; budget gates consume `tokens × fraction` / `USD × fraction` (ledger keeps true usage). Needs a Prometheus reachable through the registered MCP server named `OFFPEAK_MCP_SERVER` — enable ONLY where that MCP is deployed. Fail-safe: any evaluator failure bills normal. Console: Admin ▸ Off-peak shows live state |
+| `PCAI_LLM_OFFPEAK_CHECK_S` | `settings.offpeak.checkS` (default 30) — evaluator cadence seconds |
+| `PCAI_LLM_OFFPEAK_ENTER_PCT` / `PCAI_LLM_OFFPEAK_EXIT_PCT` | `settings.offpeak.enterPct` / `settings.offpeak.exitPct` (defaults 20 / 35) — hysteresis thresholds: enter the low-demand state below enter, exit only above exit, so billing never flaps at the boundary |
+| `PCAI_LLM_OFFPEAK_PROMQL` | `settings.offpeak.promql` (default `avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL[5m]))` — DCGM exporter; adjust per cluster: vLLM-only sites may prefer a queue-depth metric) — the GLOBAL demand query, used by every model without a per-model entry |
+| `PCAI_LLM_OFFPEAK_FRACTION` | `settings.offpeak.fraction` (default 0.5 — budgets last 2× during off-peak). PER-PROFILE override: set `offpeak_fraction` on a profile (Admin ▸ Profiles — console-editable, live immediately); keys under that profile bill at its fraction during low-demand windows, all others use this default |
+| `PCAI_LLM_OFFPEAK_MCP_SERVER` / `PCAI_LLM_OFFPEAK_TOOL` | `settings.offpeak.mcpServer` / `settings.offpeak.tool` (defaults `prometheus` / `prom_query`) — which registered MCP server + tool serves the query |
+| `PCAI_LLM_OFFPEAK_MODEL_PROMQL` | `settings.offpeak.modelPromql` (default `{}`) — per-model off-peak queries, JSON object: model name → PromQL returning a 0-100 load percentage for THE RESOURCES THAT MODEL SERVES ON. A model with an entry bills by its OWN hysteresis state; models without one fall back to the global `settings.offpeak.promql`. WHY: the global GPU query averages EVERY GPU in the cluster — idle nodes, training jobs and other tenants dilute a busy model's utilization below the enter threshold while its own GPUs are pegged. DCGM series carry NO pod label — scope by `Hostname` + device range (or `exported_namespace`), and validate the query in Prometheus FIRST (a scoped query matching zero series fails safe to FULL price). Keys must match registered model names EXACTLY. Omitted from the render entirely when unset (default render byte-identical). See FEATURES.md § Off-peak billing |
+| `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR` | `settings.offpeak.diskSelector` (default `""`) — the Off-peak tab's all-models cache summary DISK tier: a PromQL label selector over `kubelet_volume_stats_*` naming the volumes backing the KV cache's L3 store (the inference engine exports no storage-occupancy gauge). Two extra Prometheus queries per snapshot ONLY when set; unset/empty/unknown reads null, never 0%. G2 example: `'namespace="mooncake",persistentvolumeclaim=~"ssd-mooncake-store-.*"'` (Mooncake SSD offload, 3 × 350 Gi) |
 | `PCAI_LLM_URL_DENY_CIDRS` | extra SSRF-deny CIDRs for admin-registered upstream URLs, JSON array env (e.g. `'["10.0.0.0/8"]'`). Loopback + link-local/metadata (169.254.169.254) are ALWAYS denied; RFC1918 and `*.svc.cluster.local` stay ALLOWED by default — in-cluster upstreams ARE private addresses here. Not rendered by the chart (app default `[]`); set via env only on stricter sites |
 | `PCAI_LLM_METRICS_ENABLED` | `metrics.enabled` — always rendered (chart-off = app-off; this row appears once — the app env and the ServiceMonitor gate are the same key) |
-| `PCAI_LLM_TOKEN_ISSUER` / `PCAI_LLM_TOKEN_JWKS_URL` / `PCAI_LLM_TOKEN_AUDIENCE` | `settings.tokenValidation.issuer` / `.jwksUrl` / `.audience` (all default `""`) — identity Phase B: validate Keycloak-issued JWTs on the `Authorization: Bearer` header via the IdP's JWKS endpoint. **ALL THREE must be set** for the token rung to engage; empty (the default) leaves it INERT — every request resolves exactly as before. An invalid/expired token falls through the ladder when a virtual key is also presented (the ~30-min token TTL stays invisible to headless key holders); it 401s only when the token was the sole credential. The gateway only VALIDATES tokens — it never issues, refreshes, or stores them |
-| `PCAI_LLM_TOKEN_JWKS_CACHE_S` / `PCAI_LLM_TOKEN_LEEWAY_S` | `settings.tokenValidation.jwksCacheS` (default 300.0) / `.leewayS` (default 5.0) — TTL seconds for the cached JWKS signing keys, and clock leeway seconds for JWT exp/nbf checks |
-| `PCAI_LLM_TOKEN_SHADOW_KEYS` / `PCAI_LLM_TOKEN_SHADOW_TENANT_ID` / `PCAI_LLM_TOKEN_SHADOW_KEY_NAME` | `settings.tokenShadowKeys` (default **false**) / `.tokenShadowTenantId` (default `""`) / `.tokenShadowKeyName` (default `token-shadow`) — token shadow-keys: a first-seen VALID token subject lazily gets a user + ledger key (`bound_via='token-shadow'`, scopes proxy+mcp) so usage attribution keeps its `key_id` anchor. Requires `tokenShadowTenantId` — without it the flag is inert. Off = tokens validate but never provision (anonymous-fp posture) |
-| `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_RPM` / `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_TPM` | `settings.tokenShadowRateLimitRpm` / `.tokenShadowRateLimitTpm` (defaults 60 / 100000) — the rate limits stamped on lazily-provisioned shadow keys (config-sourced; the console can tighten them per key afterwards, exactly like enrollment-created keys) |
-| `PCAI_LLM_SSO_KEY_CREATE_ENABLED` | `settings.ssoKeyCreateEnabled` (default **false**) — `POST /v1/keys/for-me`: a trusted browser identity may mint a key bound to its OWN subject (`sso-create`). Requires `trustProxyIdentity=true`; 403 otherwise. Scopes/limits are fixed (proxy+mcp, 60 rpm / 100k tpm); grants stay admin-controlled. The tenant's SSO profiles (default + admin tier, `sso_default_profile_id` / `sso_admin_profile_id` / `sso_admin_groups`) are tenant-scoped DB state set via `PUT /admin/tenants/{id}/sso-default-profile` — NO env vars |
-| `PCAI_LLM_TRUST_PROXY_IDENTITY` | `settings.trustProxyIdentity` (default **false**) — trust the oauth2-proxy identity headers (`X-Auth-Request-User` / `X-Email` / `X-Auth-Request-Groups`) on the gateway's browser identity rung. The headers are client-spoofable at the pod — set this ONLY where an enforcing proxy overwrites them on every request AND an Istio AuthorizationPolicy keeps unauthenticated callers from bypassing the proxy (pcai-helm-lib `_authorizationpolicy.tpl`) |
-| `PCAI_LLM_TRUST_FORWARDED_GROUPS` | `settings.trustForwardedGroups` (default **false**) — consult `X-Forwarded-Groups` for browser-rung groups. Fail closed: the platform oauth2-proxy does NOT inject that header (see the Platform oauth2-proxy facts below), so an arriving value is client-supplied — a groupless proxy identity could otherwise self-grant `PCAI_LLM_ADMIN_GROUPS` by adding it (audit r5 #4, 2026-10-30). Enable ONLY for chains whose proxy injects and overwrites the forwarded header on every request |
-| `PCAI_LLM_MCP_CALLER_ATTRIBUTION` | `settings.mcpCallerAttribution` (default true) — stamp `X-MCP-Caller` (`<subject or key-fp>@gateway`) plus, when a real subject resolved, the companions `X-MCP-Caller-Subject` / `X-MCP-Caller-Class` on every upstream fleet MCP call (attribution-never-authorization; upstreams may record it in their audit chain, never authorize off it). All three names are RESERVED — tenants cannot supply them via per-key MCP credential overrides (400) and the gateway stamp overwrites any stale value after the last-wins merge |
-| `PCAI_LLM_MCP_SEPARATE_READ_EGRESS` | `settings.mcpSeparateReadEgress` (default `warn`) — read+egress separation (P0-3): flag or refuse a key whose grant set holds BOTH a read-class server (k8s-ops, logsearch, mm-rag, prometheus, seaborn, sqlhandler read tools) and an egress-class server (searxng) — the read-data-then-send-it combination. Server classes come from ONE constant, `mcpf/federation.py::MCP_SERVER_CLASSES`. **`warn` (default):** the call PROCEEDS; ticks metric `gateway_mcp_policy_blocked_total{reason="read+egress-warn"}` (the `-warn` suffix is deliberate — the series name says *blocked* and warn does not block) + one WARNING naming the key id and the offending (read, egress) pair. **`enforce`:** ticks `{reason="read+egress"}` and refuses EVERY call from a both-classes key (the whole grant set is the violation — the key is mis-scoped, not the individual call), so the rollout order is: run `warn`, review the flagged pairs, RE-SCOPE/split the keys (preset stamps via POST /admin/profiles `mcp_grant_preset`, or per-key PUT /admin/keys/{id}/mcp-grants) until warn is silent, THEN flip to `enforce`. `off` disables. The admin-tool hard stop (sqlhandler `admin_*` refused on the MCP surface unless the key carries `mcp_admin=TRUE`, default FALSE) is NOT behind this knob — it is unconditional |
-| `PCAI_LLM_ADMIN_GROUPS` | `settings.adminGroups` (default `""`) — admin gate second path: a trusted browser identity in ANY of these groups (comma-separated) may call the admin API. Empty = the group path is off; the bearer admin-key path is unchanged and always works. Same deployment precondition as `trustProxyIdentity` |
-| `PCAI_LLM_ENROLL_MEMORY_DEFAULT` / `PCAI_LLM_ENROLL_MEMORY_SERVER` / `PCAI_LLM_ENROLL_MEMORY_NAME_RETRIES` *(see [MEMORY.md](MEMORY.md) for the end-to-end configuration walkthrough)* | `settings.enrollMemoryDefault` (default **false**) / `.enrollMemoryServer` (default `mm-rag`) / `.enrollMemoryNameRetries` (default 3) — enrollment-time per-user memory datasets (FEATURES.md § Enrollment-time memory datasets): when a redeemer opts in (`POST /v1/enroll` `memory_opt_in`, or a profile `"memory": {"provision": true}` preset), the gateway creates a private RAG dataset `mem-<tenant>-<user>-<key6>` and stamps `X-Memory-Dataset` / `X-Dataset-Password` onto the key's per-server credential row. The server name resolves through the `mcp_servers` REGISTRY (its URL is admin-registered + SSRF-guarded — no free-form RAG URL env); the row must be registered and enabled for provisioning to work. Provisioning failure never fails a redemption; requires `PCAI_LLM_SECRETS_MASTER_KEY` (without it nothing is created and the response says so) |
-| `PCAI_LLM_RETENTION_TRACE_DAYS` / `PCAI_LLM_RETENTION_CONVERSATION_DAYS` | `settings.retentionTraceDays` / `.retentionConversationDays` (defaults 0/0 = disabled, the same opt-in contract) — TTL prunes for the OPERATIONAL tables (relay-step traces / saved chat transcripts). The usage LEDGER is never pruned — it is the audit/budget artifact |
-| `PCAI_LLM_RETENTION_CANONICAL_DAYS` | `settings.retentionCanonicalDays` (default 0 = disabled) — TTL prune for `canonical_conversations`, the distiller's INPUT store (full message history as JSONB; the biggest table on a busy gateway, pruned by nothing else). **DISTILLED-ONLY**: a row is deleted only once a `canonical_distills` marker proves a memory was written for it, so un-distilled conversations are never lost. 0 = keep forever, same opt-in contract as the two knobs above |
-| `PCAI_LLM_DISTILLER_ENABLED` | `settings.distillerEnabled` (default **false**) — master switch for the session memory distiller surface (§ FEATURES.md "Session memory distiller"). `false` renders no distiller attachment and `/v1/distill` answers inert no-ops |
-| `PCAI_LLM_DISTILLER_MEMORY_SERVER` / `PCAI_LLM_DISTILLER_MEMORY_TOOL` / `PCAI_LLM_DISTILLER_MEMORY_PROBE_TOOL` | `settings.distillerMemoryServer` / `.distillerMemoryTool` / `.distillerMemoryProbeTool` (defaults `mm-rag` / `add_memory` / `memory_status`) — which registered MCP server writes memories for the distiller, which tool writes them, and which capability probe gates attachment (any backend with an identity-routed write tool integrates, not just mm-rag) |
-| `PCAI_LLM_DISTILLER_GATE_BACKOFF_S` | `settings.distillerGateBackoffS` (default 900; 0 = retry every pass, not recommended) — skip backoff (2026-10-09 stall fix): a row the engine skips (memory gate down, transcript collapsed) leaves the oldest-first due window for this long before retry, so a broken dependency can no longer pin the window and starve newer rows. NOT a distilled marker: the row returns to the due set when the window lapses |
-| `PCAI_LLM_DISTILLER_RAW_FALLBACK` | `settings.distillerRawFallback` (default **true**) — raw-transcript fallback when a distill FAILS after the gates passed. `true` = the historical DSH contract: write the raw transcript as `session_history` so a session is never lost to a model error (caveat: mm-rag CHUNKS a raw transcript — measured 126 chunks from one session — which dilutes recall). `false` = leave the row due and retry next sweep; the conversation is still in `canonical_conversations`, so nothing is lost and the memory store only ever receives distilled summaries. The shipped G2 example sets it `false` |
+| `PCAI_LLM_TOKEN_ISSUER` / `PCAI_LLM_TOKEN_JWKS_URL` / `PCAI_LLM_TOKEN_AUDIENCE` | `settings.auth.tokenValidation.issuer` / `.jwksUrl` / `.audience` (all default `""`) — identity Phase B: validate Keycloak-issued JWTs on the `Authorization: Bearer` header via the IdP's JWKS endpoint. **ALL THREE must be set** for the token rung to engage; empty (the default) leaves it INERT — every request resolves exactly as before. An invalid/expired token falls through the ladder when a virtual key is also presented (the ~30-min token TTL stays invisible to headless key holders); it 401s only when the token was the sole credential. The gateway only VALIDATES tokens — it never issues, refreshes, or stores them |
+| `PCAI_LLM_TOKEN_JWKS_CACHE_S` / `PCAI_LLM_TOKEN_LEEWAY_S` | `settings.auth.tokenValidation.jwksCacheS` (default 300.0) / `.leewayS` (default 5.0) — TTL seconds for the cached JWKS signing keys, and clock leeway seconds for JWT exp/nbf checks |
+| `PCAI_LLM_TOKEN_SHADOW_KEYS` / `PCAI_LLM_TOKEN_SHADOW_TENANT_ID` / `PCAI_LLM_TOKEN_SHADOW_KEY_NAME` | `settings.auth.tokenShadow.enabled` (default **false**) / `.tenantId` (default `""`) / `.keyName` (default `token-shadow`) — token shadow-keys: a first-seen VALID token subject lazily gets a user + ledger key (`bound_via='token-shadow'`, scopes proxy+mcp) so usage attribution keeps its `key_id` anchor. Requires `auth.tokenShadow.tenantId` — without it the flag is inert. Off = tokens validate but never provision (anonymous-fp posture) |
+| `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_RPM` / `PCAI_LLM_TOKEN_SHADOW_RATE_LIMIT_TPM` | `settings.auth.tokenShadow.rateLimitRpm` / `.rateLimitTpm` (defaults 60 / 100000) — the rate limits stamped on lazily-provisioned shadow keys (config-sourced; the console can tighten them per key afterwards, exactly like enrollment-created keys) |
+| `PCAI_LLM_SSO_KEY_CREATE_ENABLED` | `settings.auth.ssoKeyCreate.enabled` (default **false**) — `POST /v1/keys/for-me`: a trusted browser identity may mint a key bound to its OWN subject (`sso-create`). Requires `settings.auth.trustProxyIdentity=true`; 403 otherwise. Scopes/limits are fixed (proxy+mcp, 60 rpm / 100k tpm); grants stay admin-controlled. The tenant's SSO profiles (default + admin tier, `sso_default_profile_id` / `sso_admin_profile_id` / `sso_admin_groups`) are tenant-scoped DB state set via `PUT /admin/tenants/{id}/sso-default-profile` — NO env vars |
+| `PCAI_LLM_TRUST_PROXY_IDENTITY` | `settings.auth.trustProxyIdentity` (default **false**) — trust the oauth2-proxy identity headers (`X-Auth-Request-User` / `X-Email` / `X-Auth-Request-Groups`) on the gateway's browser identity rung. The headers are client-spoofable at the pod — set this ONLY where an enforcing proxy overwrites them on every request AND an Istio AuthorizationPolicy keeps unauthenticated callers from bypassing the proxy (pcai-helm-lib `_authorizationpolicy.tpl`) |
+| `PCAI_LLM_TRUST_FORWARDED_GROUPS` | `settings.auth.trustForwardedGroups` (default **false**) — consult `X-Forwarded-Groups` for browser-rung groups. Fail closed: the platform oauth2-proxy does NOT inject that header (see the Platform oauth2-proxy facts below), so an arriving value is client-supplied — a groupless proxy identity could otherwise self-grant `PCAI_LLM_ADMIN_GROUPS` by adding it (audit r5 #4, 2026-10-30). Enable ONLY for chains whose proxy injects and overwrites the forwarded header on every request |
+| `PCAI_LLM_MCP_CALLER_ATTRIBUTION` | `settings.mcp.callerAttribution` (default true) — stamp `X-MCP-Caller` (`<subject or key-fp>@gateway`) plus, when a real subject resolved, the companions `X-MCP-Caller-Subject` / `X-MCP-Caller-Class` on every upstream fleet MCP call (attribution-never-authorization; upstreams may record it in their audit chain, never authorize off it). All three names are RESERVED — tenants cannot supply them via per-key MCP credential overrides (400) and the gateway stamp overwrites any stale value after the last-wins merge |
+| `PCAI_LLM_MCP_SEPARATE_READ_EGRESS` | `settings.mcp.argPolicy.separateReadEgress` (default `warn`) — read+egress separation (P0-3): flag or refuse a key whose grant set holds BOTH a read-class server (k8s-ops, logsearch, mm-rag, prometheus, seaborn, sqlhandler read tools) and an egress-class server (searxng) — the read-data-then-send-it combination. Server classes come from ONE constant, `mcpf/federation.py::MCP_SERVER_CLASSES`. **`warn` (default):** the call PROCEEDS; ticks metric `gateway_mcp_policy_blocked_total{reason="read+egress-warn"}` (the `-warn` suffix is deliberate — the series name says *blocked* and warn does not block) + one WARNING naming the key id and the offending (read, egress) pair. **`enforce`:** ticks `{reason="read+egress"}` and refuses EVERY call from a both-classes key (the whole grant set is the violation — the key is mis-scoped, not the individual call), so the rollout order is: run `warn`, review the flagged pairs, RE-SCOPE/split the keys (preset stamps via POST /admin/profiles `mcp_grant_preset`, or per-key PUT /admin/keys/{id}/mcp-grants) until warn is silent, THEN flip to `enforce`. `off` disables. The admin-tool hard stop (sqlhandler `admin_*` refused on the MCP surface unless the key carries `mcp_admin=TRUE`, default FALSE) is NOT behind this knob — it is unconditional |
+| `PCAI_LLM_ADMIN_GROUPS` | `settings.auth.adminGroups` (default `""`) — admin gate second path: a trusted browser identity in ANY of these groups (comma-separated) may call the admin API. Empty = the group path is off; the bearer admin-key path is unchanged and always works. Same deployment precondition as `settings.auth.trustProxyIdentity` |
+| `PCAI_LLM_ENROLL_MEMORY_DEFAULT` / `PCAI_LLM_ENROLL_MEMORY_SERVER` / `PCAI_LLM_ENROLL_MEMORY_NAME_RETRIES` *(see [MEMORY.md](MEMORY.md) for the end-to-end configuration walkthrough)* | `settings.memory.enroll.provisionDataset` (default **false**) / `.server` (default `mm-rag`) / `.nameRetries` (default 3) — enrollment-time per-user memory datasets (FEATURES.md § Enrollment-time memory datasets): when a redeemer opts in (`POST /v1/enroll` `memory_opt_in`, or a profile `"memory": {"provision": true}` preset), the gateway creates a private RAG dataset `mem-<tenant>-<user>-<key6>` and stamps `X-Memory-Dataset` / `X-Dataset-Password` onto the key's per-server credential row. The server name resolves through the `mcp_servers` REGISTRY (its URL is admin-registered + SSRF-guarded — no free-form RAG URL env); the row must be registered and enabled for provisioning to work. Provisioning failure never fails a redemption; requires `PCAI_LLM_SECRETS_MASTER_KEY` (without it nothing is created and the response says so) |
+| `PCAI_LLM_RETENTION_TRACE_DAYS` / `PCAI_LLM_RETENTION_CONVERSATION_DAYS` | `settings.retention.traceDays` / `.conversationDays` (defaults 0/0 = disabled, the same opt-in contract) — TTL prunes for the OPERATIONAL tables (relay-step traces / saved chat transcripts). The usage LEDGER is never pruned — it is the audit/budget artifact |
+| `PCAI_LLM_RETENTION_CANONICAL_DAYS` | `settings.retention.canonicalDays` (default 0 = disabled) — TTL prune for `canonical_conversations`, the distiller's INPUT store (full message history as JSONB; the biggest table on a busy gateway, pruned by nothing else). **DISTILLED-ONLY**: a row is deleted only once a `canonical_distills` marker proves a memory was written for it, so un-distilled conversations are never lost. 0 = keep forever, same opt-in contract as the two knobs above |
+| `PCAI_LLM_DISTILLER_ENABLED` | `settings.memory.distiller.enabled` (default **false**) — master switch for the session memory distiller surface (§ FEATURES.md "Session memory distiller"). `false` renders no distiller attachment and `/v1/distill` answers inert no-ops |
+| `PCAI_LLM_DISTILLER_MEMORY_SERVER` / `PCAI_LLM_DISTILLER_MEMORY_TOOL` / `PCAI_LLM_DISTILLER_MEMORY_PROBE_TOOL` | `settings.memory.distiller.server` / `.tool` / `.probeTool` (defaults `mm-rag` / `add_memory` / `memory_status`) — which registered MCP server writes memories for the distiller, which tool writes them, and which capability probe gates attachment (any backend with an identity-routed write tool integrates, not just mm-rag) |
+| `PCAI_LLM_DISTILLER_GATE_BACKOFF_S` | `settings.memory.distiller.gateBackoffS` (default 900; 0 = retry every pass, not recommended) — skip backoff (2026-10-09 stall fix): a row the engine skips (memory gate down, transcript collapsed) leaves the oldest-first due window for this long before retry, so a broken dependency can no longer pin the window and starve newer rows. NOT a distilled marker: the row returns to the due set when the window lapses |
+| `PCAI_LLM_DISTILLER_RAW_FALLBACK` | `settings.memory.distiller.rawFallback` (default **true**) — raw-transcript fallback when a distill FAILS after the gates passed. `true` = the historical DSH contract: write the raw transcript as `session_history` so a session is never lost to a model error (caveat: mm-rag CHUNKS a raw transcript — measured 126 chunks from one session — which dilutes recall). `false` = leave the row due and retry next sweep; the conversation is still in `canonical_conversations`, so nothing is lost and the memory store only ever receives distilled summaries. The shipped G2 example sets it `false` |
 | `PCAI_LLM_DB_HOST` / `PCAI_LLM_DB_PORT` / `PCAI_LLM_DB_USER` / `PCAI_LLM_DB_NAME` | **embedded mode only** — derived from `database.embedded.serviceName` + `auth.username`/`auth.database` |
 | `PCAI_LLM_DB_PASSWORD` | **embedded mode only** — `database.embedded.auth.existingSecret{,Key}` (secretKeyRef; the same Secret the Postgres StatefulSet uses) |
 | `PCAI_LLM_UPSTREAM_KEY__<SUFFIX>` | from `upstreamKeySecrets[]` — the by-reference env handle for `model_endpoints.api_key_secret` |
@@ -420,9 +429,9 @@ touch these directly. Every app knob in `src/pcai_llm/config.py` is
 > guidance is unchanged.
 
 **Long-turn fleets (agent workloads).** Three timeout knobs are COUPLED and
-must be raised together: `settings.upstreamTimeoutS` (the per-model-call
-cap — every relay model call is bounded by it), `settings.toolRelayWallClockS`
-(the whole-turn relay budget, clamped to `upstreamTimeoutS − 30s` so the
+must be raised together: `settings.upstream.timeoutS` (the per-model-call
+cap — every relay model call is bounded by it), `settings.relay.wallClockS`
+(the whole-turn relay budget, clamped to `settings.upstream.timeoutS − 30s` so the
 relay can always close its stream cleanly before the ingress shoots it
 down) and `ezua.virtualService.timeout` (the hard ingress deadline — it
 must exceed the wall clock). Ordering: per-call cap ≤ wall clock < VS
@@ -442,31 +451,256 @@ FEATURES.md coverage; the design rationale for each lives in
 
 | Values key (env) | Default | Why |
 |---|---|---|
-| `settings.responseCacheMode` / `responseCacheTtlS` (`PCAI_LLM_RESPONSE_CACHE_MODE` / `_TTL_S`) | `off` / 3600 | Exact-match response cache for non-streaming chat (`off \| shadow \| active`); `shadow` measures the hit rate without serving — run shadow first, then flip `active` (FEATURES.md § Response cache) |
-| `settings.toolCompressDefault` / `MinChars` / `RatioFloor` / `StoreTtlS` / `MaxStoreChars` (`PCAI_LLM_TOOL_COMPRESS_*`) | off / 4096 / 0.15 / 86400 / 1000000 | Relay tool-result compression defaults (the per-request `X-PCAI-Compress-Tools` header overrides; FEATURES.md § Tool-use relay) |
-| `settings.toolRelaySurface` (`PCAI_LLM_TOOL_RELAY_SURFACE`) | `hybrid` | Relay tool surface: `hybrid` offers a compact discover-then-call catalog (~4.6-6k tokens for the whole fleet); `full` re-offers every definition — only for a client that cannot discover-then-call |
-| `settings.toolRelayRenderDeltas` / `toolRelayRenderIndexBase` (`PCAI_LLM_TOOL_RELAY_RENDER_DELTAS` / `_INDEX_BASE`) | false / 1000 | Re-emit each in-cluster tool call as a NATIVE `tool_call` delta stamped `pcai.relay: true`; requires request header `X-PCAI-Relay-Deltas: 1` — the stamp blocks client execution (unlike `toolRelayStreamWireTools`, safe to enable) |
-| `settings.stickyRouting` / `stickyRoutingIdleResetS` (`PCAI_LLM_STICKY_ROUTING` / `_IDLE_RESET_S`) | false / 1800 | Conversation stickiness for the ROUTER (never-downgrade): a routed conversation holds a capability FLOOR, may escalate, never falls below; idle reset re-decides fresh (0 = never) |
-| `settings.sessionAffinityEnabled` / `sessionAffinityTtlS` (`PCAI_LLM_SESSION_AFFINITY_ENABLED` / `_TTL_S`) | false / 3600 | Endpoint stickiness (KV-cache reuse): a pin to the serving endpoint survives the turn — routing STATE, never policy; a pin that no longer qualifies is discarded on read |
-| `settings.rateLimitExcludeCachedTokens` / `rateLimitPredictCached` / `rateLimitPredictReconcile` (`PCAI_LLM_RATE_LIMIT_*`) | true / false / true | TPM accounting for prompt-cache hits: exclude cached tokens from the window, optionally PREDICT admission from the key's own cached-token history, and settle the predicted-vs-actual difference afterward (prediction decides WHEN, never HOW MANY) |
-| `settings.budgetCachedExemptFraction` (`PCAI_LLM_BUDGET_CACHED_EXEMPT_FRACTION`) | 0.9 | Discount cached tokens against day/week/month TOKEN budgets (1.0 = fully exempt, 0.0 = legacy full count); USD budgets unaffected (cache is already priced at `cached_per_m`) |
-| `settings.failoverTtftS` (`PCAI_LLM_FAILOVER_TTFT_S`) | 45 | TTFT failover budget: after a 2xx, the stream waits this long for the upstream's FIRST SSE data line (keepalives do not count); 0 disables — a wedged-but-200 upstream no longer holds the turn |
+| `settings.cache.response.mode` / `.ttlS` (`PCAI_LLM_RESPONSE_CACHE_MODE` / `_TTL_S`) | `off` / 3600 | Exact-match response cache for non-streaming chat (`off \| shadow \| active`); `shadow` measures the hit rate without serving — run shadow first, then flip `active` (FEATURES.md § Response cache) |
+| `settings.relay.compress.mode` / `.minChars` / `.ratioFloor` / `.storeTtlS` / `.maxStoreChars` (`PCAI_LLM_TOOL_COMPRESS_*`) | off / 4096 / 0.15 / 86400 / 1000000 | Relay tool-result compression defaults (the per-request `X-PCAI-Compress-Tools` header overrides; FEATURES.md § Tool-use relay) |
+| `settings.relay.surface` (`PCAI_LLM_TOOL_RELAY_SURFACE`) | `hybrid` | Relay tool surface: `hybrid` offers a compact discover-then-call catalog (~4.6-6k tokens for the whole fleet); `full` re-offers every definition — only for a client that cannot discover-then-call |
+| `settings.relay.renderDeltas` / `.renderIndexBase` (`PCAI_LLM_TOOL_RELAY_RENDER_DELTAS` / `_INDEX_BASE`) | false / 1000 | Re-emit each in-cluster tool call as a NATIVE `tool_call` delta stamped `pcai.relay: true`; requires request header `X-PCAI-Relay-Deltas: 1` — the stamp blocks client execution (unlike `settings.relay.streamWireTools`, safe to enable) |
+| `settings.routing.sticky.enabled` / `.idleResetS` (`PCAI_LLM_STICKY_ROUTING` / `_IDLE_RESET_S`) | false / 1800 | Conversation stickiness for the ROUTER (never-downgrade): a routed conversation holds a capability FLOOR, may escalate, never falls below; idle reset re-decides fresh (0 = never) |
+| `settings.routing.sessionAffinity.enabled` / `.ttlS` (`PCAI_LLM_SESSION_AFFINITY_ENABLED` / `_TTL_S`) | false / 3600 | Endpoint stickiness (KV-cache reuse): a pin to the serving endpoint survives the turn — routing STATE, never policy; a pin that no longer qualifies is discarded on read |
+| `settings.cache.metering.excludeCachedTokens` / `.predictCached` / `.predictReconcile` (`PCAI_LLM_RATE_LIMIT_*`) | true / false / true | TPM accounting for prompt-cache hits: exclude cached tokens from the window, optionally PREDICT admission from the key's own cached-token history, and settle the predicted-vs-actual difference afterward (prediction decides WHEN, never HOW MANY) |
+| `settings.cache.metering.budgetExemptFraction` (`PCAI_LLM_BUDGET_CACHED_EXEMPT_FRACTION`) | 0.9 | Discount cached tokens against day/week/month TOKEN budgets (1.0 = fully exempt, 0.0 = legacy full count); USD budgets unaffected (cache is already priced at `cached_per_m`) |
+| `settings.upstream.failoverTtftS` (`PCAI_LLM_FAILOVER_TTFT_S`) | 45 | TTFT failover budget: after a 2xx, the stream waits this long for the upstream's FIRST SSE data line (keepalives do not count); 0 disables — a wedged-but-200 upstream no longer holds the turn |
 | `settings.healthProbe.enabled` / `intervalS` / `timeoutS` / `failuresToTrip` (`PCAI_LLM_HEALTH_PROBE_*`) | false / 30 / 5 / 2 | Background proactive probe (`GET {base_url}/models` with the endpoint's OWN credential) that trips the breaker between requests; `Pool.healthy()` ignores a probe verdict that would empty a pool — degraded routing, never an outage |
-| `settings.effectivePromptCapture` / `effectivePromptRetainDays` (`PCAI_LLM_EFFECTIVE_PROMPT_CAPTURE` / `_RETAIN_S`) | true / 7 | Write a ≤64 KB preview of every REAL model call to `effective_prompts` (transparency/debugging; `GET /admin/effective-prompts`) |
-| `settings.maxTokensCeiling` (`PCAI_LLM_MAX_TOKENS_CEILING`, JSON object) | `{}` | Per-model `max_tokens` ceiling — silently LOWERS a client's larger value for that virtual model (never raises); the static complement of live context-window discovery (FEATURES.md § Context-window discovery) |
-| `settings.demandAwareExcludedModels` (`PCAI_LLM_DEMAND_AWARE_EXCLUDED_MODELS`) | `[]` | Models the conversation-start head must never pick (they stay on the plain `auto` ladder and the failover tail) |
-| `settings.routeDefaultModel` (`PCAI_LLM_ROUTE_DEFAULT_MODEL`) | false | Promote the legacy `auto` alias INTO routing — off by default so arming routing never silently changes what an existing client request does |
-| `settings.audioTtsCharsPerToken` / `audioAsrTokensPerSecond` (`PCAI_LLM_AUDIO_TTS_CHARS_PER_TOKEN` / `_ASR_TOKENS_PER_SECOND`) | 4 / 3.0 | Audio billing estimates (TTS/ASR report no token usage; a zero-token row would be a budget bypass) — superseded per model by unit-aware pricing (`model_costs.unit`) |
-| `settings.distillerMaxTokens` (`PCAI_LLM_DISTILLER_MAX_TOKENS`) | 4096 | Distill OUTPUT cap — an overrun is rejected whole by `document_is_complete()`, so the memory write is lost rather than shortened |
-| `settings.distillerDisableThinking` (`PCAI_LLM_DISTILLER_DISABLE_THINKING`) | true | Send `chat_template_kwargs {"enable_thinking": false}` to the summarizer (engines without the kwarg ignore it) |
-| `settings.canonicalSkipTitleRequests` (`PCAI_LLM_CANONICAL_SKIP_TITLE_REQUESTS`) | true | Never capture a title-generation request as a canonical conversation (it would distill a bogus "session summary" of a title string) |
-| `settings.mcpSelfService` (`PCAI_LLM_MCP_SELF_SERVICE`) | true | Keyed users manage their OWN key's per-server MCP credential overrides and toggle grants within their entitlement catalog (`/v1/mcp/creds`, `/v1/mcp/selfservice`); false hides the routes |
-| `settings.otelEnabled` / `otelEndpoint` / `otelHeaders` / `otelSampleRatio` / `otelServiceName` (`PCAI_LLM_OTEL_*`) | false / `http://otel-collector:4318` / "" / 1.0 / `pcai-llm-gateway` | OTLP/Langfuse spans (FEATURES.md § OTLP / Langfuse spans); `otelHeaders` is comma-separated `Key=Value` pairs for exporter auth; spans carry metadata only — never prompt/completion content |
-| `database.maxConnectionsBudget` (helm-only — consumed by `templates/NOTES.txt`, not an env) | 0 | The real external-Postgres `max_connections`: makes the post-install connection-budget arithmetic (`autoscaling.maxReplicas × settings.dbPoolMax`) print a WARNING instead of an informational NOTE; embedded mode uses `database.embedded.maxConnections` instead |
+| `settings.retention.effectivePromptCapture` / `.effectivePromptRetainDays` (`PCAI_LLM_EFFECTIVE_PROMPT_CAPTURE` / `_RETAIN_S`) | true / 7 | Write a ≤64 KB preview of every REAL model call to `effective_prompts` (transparency/debugging; `GET /admin/effective-prompts`) |
+| `settings.models.maxTokensCeiling` (`PCAI_LLM_MAX_TOKENS_CEILING`, JSON object) | `{}` | Per-model `max_tokens` ceiling — silently LOWERS a client's larger value for that virtual model (never raises); the static complement of live context-window discovery (FEATURES.md § Context-window discovery) |
+| `settings.routing.demandAwareExcludedModels` (`PCAI_LLM_DEMAND_AWARE_EXCLUDED_MODELS`) | `[]` | Models the conversation-start head must never pick (they stay on the plain `auto` ladder and the failover tail) |
+| `settings.routing.routeDefaultModel` (`PCAI_LLM_ROUTE_DEFAULT_MODEL`) | false | Promote the legacy `auto` alias INTO routing — off by default so arming routing never silently changes what an existing client request does |
+| `settings.audio.ttsCharsPerToken` / `.asrTokensPerSecond` (`PCAI_LLM_AUDIO_TTS_CHARS_PER_TOKEN` / `_ASR_TOKENS_PER_SECOND`) | 4 / 3.0 | Audio billing estimates (TTS/ASR report no token usage; a zero-token row would be a budget bypass) — superseded per model by unit-aware pricing (`model_costs.unit`) |
+| `settings.memory.distiller.maxTokens` (`PCAI_LLM_DISTILLER_MAX_TOKENS`) | 4096 | Distill OUTPUT cap — an overrun is rejected whole by `document_is_complete()`, so the memory write is lost rather than shortened |
+| `settings.memory.distiller.disableThinking` (`PCAI_LLM_DISTILLER_DISABLE_THINKING`) | true | Send `chat_template_kwargs {"enable_thinking": false}` to the summarizer (engines without the kwarg ignore it) |
+| `settings.memory.capture.skipTitleRequests` (`PCAI_LLM_CANONICAL_SKIP_TITLE_REQUESTS`) | true | Never capture a title-generation request as a canonical conversation (it would distill a bogus "session summary" of a title string) |
+| `settings.mcp.selfService` (`PCAI_LLM_MCP_SELF_SERVICE`) | true | Keyed users manage their OWN key's per-server MCP credential overrides and toggle grants within their entitlement catalog (`/v1/mcp/creds`, `/v1/mcp/selfservice`); false hides the routes |
+| `settings.tracing.enabled` / `.endpoint` / `.headers` / `.sampleRatio` / `.serviceName` (`PCAI_LLM_OTEL_*`) | false / `http://otel-collector:4318` / "" / 1.0 / `pcai-llm-gateway` | OTLP/Langfuse spans (FEATURES.md § OTLP / Langfuse spans); `tracing.headers` is comma-separated `Key=Value` pairs for exporter auth; spans carry metadata only — never prompt/completion content |
+| `database.maxConnectionsBudget` (helm-only — consumed by `templates/NOTES.txt`, not an env) | 0 | The real external-Postgres `max_connections`: makes the post-install connection-budget arithmetic (`autoscaling.maxReplicas × settings.dbPool.max`) print a WARNING instead of an informational NOTE; embedded mode uses `database.embedded.maxConnections` instead |
 | `podDisruptionBudget.enabled` / `minAvailable` / `maxUnavailable` (helm-only) | false / — / 1 | PDB so a node drain cannot take every replica at once; the template REFUSES `enabled` with a single replica (a PDB there blocks every drain forever) |
 | `topologySpreadConstraints` / `affinity` (helm-only passthrough) | `[]` / `{}` | Standard scheduling spread/anti-affinity for multi-replica posture (commented example in `helm/values.yaml`) |
 | `autoscaling.targetCPUUtilizationPercentage` (helm-only) | 70 | The HPA's CPU target (see § Sizing for why CPU and not memory) |
 | `networkPolicy.probeCidrs` / `probeExceptCidrs` / `ingressGatewayNamespace` (helm-only) | `[]` / `[]` / `istio-system` | NetworkPolicy rule (iii) node-CIDR allowance for kubelet probes — `0.0.0.0/0` in `probeCidrs` FAILS the render unless `probeExceptCidrs` carves the pod CIDR out |
+
+## Values migration (settings block)
+
+The `settings:` block is now grouped by subsystem (`settings.server`,
+`settings.upstream`, `settings.dbPool`, `settings.cache.*`, `settings.relay.*`,
+`settings.mcp.*`, `settings.routing.*`, …) instead of ~126 flat keys. Each key
+maps to the SAME `PCAI_LLM_*` env var and value, so behaviour is unchanged; a
+site file still written against the flat layout FAILS THE RENDER with an
+explicit message (`helm/templates/values-guard.yaml`) rather than silently
+configuring nothing. `settings.healthProbe.*` keeps its path.
+
+**Flat layout → grouped layout**, one table per new subsystem. The mapping is
+mechanical: the same value, the same env var, only the key path moves.
+
+**server** (6)
+
+| old | new |
+|---|---|
+| `settings.host` | `settings.server.host` |
+| `settings.port` | `settings.server.port` |
+| `settings.logLevel` | `settings.server.logLevel` |
+| `settings.keepAliveTimeoutS` | `settings.server.keepAliveTimeoutS` |
+| `settings.limitConcurrency` | `settings.server.limitConcurrency` |
+| `settings.maxBodyBytes` | `settings.server.maxBodyBytes` |
+
+**upstream** (6)
+
+| old | new |
+|---|---|
+| `settings.upstreamTimeoutS` | `settings.upstream.timeoutS` |
+| `settings.upstreamCaBundle` | `settings.upstream.caBundle` |
+| `settings.endpointFailureThreshold` | `settings.upstream.breakerFailureThreshold` |
+| `settings.endpointCooldownS` | `settings.upstream.breakerCooldownS` |
+| `settings.failoverTtftS` | `settings.upstream.failoverTtftS` |
+| `settings.zeroCompletionRetry` | `settings.upstream.zeroCompletionRetry` |
+
+**dbPool** (3)
+
+| old | new |
+|---|---|
+| `settings.dbPoolMin` | `settings.dbPool.min` |
+| `settings.dbPoolMax` | `settings.dbPool.max` |
+| `settings.dbAcquireTimeoutS` | `settings.dbPool.acquireTimeoutS` |
+
+**retention** (5)
+
+| old | new |
+|---|---|
+| `settings.effectivePromptCapture` | `settings.retention.effectivePromptCapture` |
+| `settings.effectivePromptRetainDays` | `settings.retention.effectivePromptRetainDays` |
+| `settings.retentionTraceDays` | `settings.retention.traceDays` |
+| `settings.retentionConversationDays` | `settings.retention.conversationDays` |
+| `settings.retentionCanonicalDays` | `settings.retention.canonicalDays` |
+
+**cache** (8)
+
+| old | new |
+|---|---|
+| `settings.embeddingCacheEnabled` | `settings.cache.embedding.enabled` |
+| `settings.embeddingCacheMaxInputBytes` | `settings.cache.embedding.maxInputBytes` |
+| `settings.responseCacheMode` | `settings.cache.response.mode` |
+| `settings.responseCacheTtlS` | `settings.cache.response.ttlS` |
+| `settings.rateLimitExcludeCachedTokens` | `settings.cache.metering.excludeCachedTokens` |
+| `settings.budgetCachedExemptFraction` | `settings.cache.metering.budgetExemptFraction` |
+| `settings.rateLimitPredictCached` | `settings.cache.metering.predictCached` |
+| `settings.rateLimitPredictReconcile` | `settings.cache.metering.predictReconcile` |
+
+**relay** (18)
+
+| old | new |
+|---|---|
+| `settings.toolRelayEnabled` | `settings.relay.enabled` |
+| `settings.toolRelaySurface` | `settings.relay.surface` |
+| `settings.toolRelayMaxIterations` | `settings.relay.maxIterations` |
+| `settings.toolRelayWallClockS` | `settings.relay.wallClockS` |
+| `settings.toolRelayCallRetries` | `settings.relay.callRetries` |
+| `settings.toolRelayGrantMode` | `settings.relay.grantMode` |
+| `settings.toolRelayStreamWireTools` | `settings.relay.streamWireTools` |
+| `settings.toolRelayRenderDeltas` | `settings.relay.renderDeltas` |
+| `settings.toolRelayRenderIndexBase` | `settings.relay.renderIndexBase` |
+| `settings.reasoningHistoryEnabled` | `settings.relay.reasoning.enabled` |
+| `settings.reasoningHistoryMaxChars` | `settings.relay.reasoning.maxChars` |
+| `settings.toolCompressDefault` | `settings.relay.compress.mode` |
+| `settings.toolCompressMinChars` | `settings.relay.compress.minChars` |
+| `settings.toolCompressRatioFloor` | `settings.relay.compress.ratioFloor` |
+| `settings.toolCompressStoreTtlS` | `settings.relay.compress.storeTtlS` |
+| `settings.toolCompressMaxStoreChars` | `settings.relay.compress.maxStoreChars` |
+| `settings.clientToolDispatch` | `settings.relay.clientDispatch.enabled` |
+| `settings.clientToolDispatchTimeoutS` | `settings.relay.clientDispatch.timeoutS` |
+
+**mcp** (14)
+
+| old | new |
+|---|---|
+| `settings.mcpFlatTools` | `settings.mcp.flatTools` |
+| `settings.mcpCatalogCacheS` | `settings.mcp.catalogCacheS` |
+| `settings.mcpFailoverAttempts` | `settings.mcp.failoverAttempts` |
+| `settings.mcpSelfService` | `settings.mcp.selfService` |
+| `settings.mcpCallerAttribution` | `settings.mcp.callerAttribution` |
+| `settings.registryWatchS` | `settings.mcp.registryWatchS` |
+| `settings.registryAdminFreshS` | `settings.mcp.registryAdminFreshS` |
+| `settings.mcpArgPolicy` | `settings.mcp.argPolicy.mode` |
+| `settings.mcpArgPolicyExempt` | `settings.mcp.argPolicy.exempt` |
+| `settings.mcpArgEgressServers` | `settings.mcp.argPolicy.egressServers` |
+| `settings.mcpArgDenyClusterHosts` | `settings.mcp.argPolicy.denyClusterHosts` |
+| `settings.mcpArgPolicyResolve` | `settings.mcp.argPolicy.resolve` |
+| `settings.mcpArgTelemetry` | `settings.mcp.argPolicy.telemetry` |
+| `settings.mcpSeparateReadEgress` | `settings.mcp.argPolicy.separateReadEgress` |
+
+**routing** (16)
+
+| old | new |
+|---|---|
+| `settings.routingEnabled` | `settings.routing.enabled` |
+| `settings.routingTier1Tokens` | `settings.routing.tier1Tokens` |
+| `settings.routingTier2Tokens` | `settings.routing.tier2Tokens` |
+| `settings.routingTurnAdderTokens` | `settings.routing.turnAdderTokens` |
+| `settings.routingAgentsEnabled` | `settings.routing.agentsEnabled` |
+| `settings.routeDefaultModel` | `settings.routing.routeDefaultModel` |
+| `settings.modelFallbackMax` | `settings.routing.fallbackMax` |
+| `settings.stickyRouting` | `settings.routing.sticky.enabled` |
+| `settings.stickyRoutingIdleResetS` | `settings.routing.sticky.idleResetS` |
+| `settings.loadAwareCascade.enabled` | `settings.routing.loadAwareCascade.enabled` |
+| `settings.demandAwareExcludedModels` | `settings.routing.demandAwareExcludedModels` |
+| `settings.sessionAffinityEnabled` | `settings.routing.sessionAffinity.enabled` |
+| `settings.sessionAffinityTtlS` | `settings.routing.sessionAffinity.ttlS` |
+| `settings.modelGroupsEnabled` | `settings.routing.modelGroups.enabled` |
+| `settings.modelGroupLoadRefreshS` | `settings.routing.modelGroups.loadRefreshS` |
+| `settings.modelGroupLoadStaleS` | `settings.routing.modelGroups.loadStaleS` |
+
+**models** (1)
+
+| old | new |
+|---|---|
+| `settings.maxTokensCeiling` | `settings.models.maxTokensCeiling` |
+
+**healthProbe** (4)
+
+| old | new |
+|---|---|
+| `settings.healthProbe.enabled` | `settings.healthProbe.enabled` |
+| `settings.healthProbe.intervalS` | `settings.healthProbe.intervalS` |
+| `settings.healthProbe.timeoutS` | `settings.healthProbe.timeoutS` |
+| `settings.healthProbe.failuresToTrip` | `settings.healthProbe.failuresToTrip` |
+
+**auth** (15)
+
+| old | new |
+|---|---|
+| `settings.trustProxyIdentity` | `settings.auth.trustProxyIdentity` |
+| `settings.trustForwardedGroups` | `settings.auth.trustForwardedGroups` |
+| `settings.adminGroups` | `settings.auth.adminGroups` |
+| `settings.ssoKeyCreateEnabled` | `settings.auth.ssoKeyCreate.enabled` |
+| `settings.ssoSignOutUrl` | `settings.auth.ssoSignOutUrl` |
+| `settings.tokenValidation.issuer` | `settings.auth.tokenValidation.issuer` |
+| `settings.tokenValidation.jwksUrl` | `settings.auth.tokenValidation.jwksUrl` |
+| `settings.tokenValidation.audience` | `settings.auth.tokenValidation.audience` |
+| `settings.tokenValidation.jwksCacheS` | `settings.auth.tokenValidation.jwksCacheS` |
+| `settings.tokenValidation.leewayS` | `settings.auth.tokenValidation.leewayS` |
+| `settings.tokenShadowKeys` | `settings.auth.tokenShadow.enabled` |
+| `settings.tokenShadowTenantId` | `settings.auth.tokenShadow.tenantId` |
+| `settings.tokenShadowKeyName` | `settings.auth.tokenShadow.keyName` |
+| `settings.tokenShadowRateLimitRpm` | `settings.auth.tokenShadow.rateLimitRpm` |
+| `settings.tokenShadowRateLimitTpm` | `settings.auth.tokenShadow.rateLimitTpm` |
+
+**memory** (13)
+
+| old | new |
+|---|---|
+| `settings.enrollMemoryDefault` | `settings.memory.enroll.provisionDataset` |
+| `settings.enrollMemoryServer` | `settings.memory.enroll.server` |
+| `settings.enrollMemoryNameRetries` | `settings.memory.enroll.nameRetries` |
+| `settings.distillerEnabled` | `settings.memory.distiller.enabled` |
+| `settings.distillerMaxTokens` | `settings.memory.distiller.maxTokens` |
+| `settings.distillerMemoryServer` | `settings.memory.distiller.server` |
+| `settings.distillerMemoryTool` | `settings.memory.distiller.tool` |
+| `settings.distillerMemoryProbeTool` | `settings.memory.distiller.probeTool` |
+| `settings.distillerGateBackoffS` | `settings.memory.distiller.gateBackoffS` |
+| `settings.distillerRawFallback` | `settings.memory.distiller.rawFallback` |
+| `settings.distillerMinDocChars` | `settings.memory.distiller.minDocChars` |
+| `settings.distillerDisableThinking` | `settings.memory.distiller.disableThinking` |
+| `settings.canonicalSkipTitleRequests` | `settings.memory.capture.skipTitleRequests` |
+
+**offpeak** (10)
+
+| old | new |
+|---|---|
+| `settings.offpeakEnabled` | `settings.offpeak.enabled` |
+| `settings.offpeakCheckS` | `settings.offpeak.checkS` |
+| `settings.offpeakPromql` | `settings.offpeak.promql` |
+| `settings.offpeakEnterPct` | `settings.offpeak.enterPct` |
+| `settings.offpeakExitPct` | `settings.offpeak.exitPct` |
+| `settings.offpeakFraction` | `settings.offpeak.fraction` |
+| `settings.offpeakMcpServer` | `settings.offpeak.mcpServer` |
+| `settings.offpeakTool` | `settings.offpeak.tool` |
+| `settings.offpeakModelPromql` | `settings.offpeak.modelPromql` |
+| `settings.endpointMetricsDiskSelector` | `settings.offpeak.diskSelector` |
+
+**audio** (2)
+
+| old | new |
+|---|---|
+| `settings.audioTtsCharsPerToken` | `settings.audio.ttsCharsPerToken` |
+| `settings.audioAsrTokensPerSecond` | `settings.audio.asrTokensPerSecond` |
+
+**tracing** (5)
+
+| old | new |
+|---|---|
+| `settings.otelEnabled` | `settings.tracing.enabled` |
+| `settings.otelEndpoint` | `settings.tracing.endpoint` |
+| `settings.otelServiceName` | `settings.tracing.serviceName` |
+| `settings.otelSampleRatio` | `settings.tracing.sampleRatio` |
+| `settings.otelHeaders` | `settings.tracing.headers` |
+
+**Migrating a site file.**
+
+1. Apply the table: the rename is mechanical — each flat `settings.<key>` line becomes the
+   new dotted path, with the SAME value.
+2. Or start from the grouped layout: delete the moved keys and re-add only what the
+   site actually overrides.
+3. Leave `settings.healthProbe.*` untouched — same path, same values.
+4. Render before applying: `helm template <release> helm -f <site-values>`.
+5. A leftover flat key fails that render with an explicit message — it never silently
+   configures nothing.
 
 ## Postgres
 
@@ -576,7 +810,7 @@ is CNI-layer; `ezua.authorizationPolicy.*` is mesh L7 (requires
     resolvers consume the browser-header rung (`routes_identity.py`,
     `routes_enroll.py`, `routes_admin.require_admin`), so they stay
     reachable ONLY from the edge namespace. That exclusion is what makes
-    `settings.trustProxyIdentity` safe: an in-cluster pod can never
+    `settings.auth.trustProxyIdentity` safe: an in-cluster pod can never
     deliver spoofed `X-Auth-Request-*` headers to a mint or an admin
     action. (Rule (ii)'s same-namespace leg carries the same `notPaths`
     set as this one — audit r5 #6.)
@@ -586,10 +820,54 @@ no separate probe port). Relief valve: `excludeInboundPorts: [9200]` stamps
 bypasses Envoy AND all AuthorizationPolicy rules (the ipBlock rule becomes
 its control); never exclude a port serving real traffic. Without this (or a
 platform-side probe-port exemption) probes fail.
-`settings.trustProxyIdentity` coupling: the oauth2-proxy identity headers
+`settings.auth.trustProxyIdentity` coupling: the oauth2-proxy identity headers
 are client-spoofable at the pod — the flag alone is NOT the control. Safe
 only where an enforcing proxy overwrites the headers on every request AND
 this AuthorizationPolicy keeps unauthenticated callers from bypassing it.
+
+## Off-peak billing (enable checklist)
+
+`settings.offpeak.enabled: true` starts a background evaluator that samples
+`settings.offpeak.promql` every `settings.offpeak.checkS` (30 s) through a REGISTERED MCP
+server and hysteresis-switches a low-demand state; while it is active, requests
+settle with `billing_fraction = profile offpeak_fraction ??
+settings.offpeak.fraction` (budgets stretch by 1/fraction; the ledger always keeps
+TRUE usage). Disabled, never-checked, idle, or ANY evaluator failure → 1.0: the
+discount never applies by accident.
+
+1. **The server must exist on the unit.** Deploy chart `prometheus-mcp` into its
+   own namespace with `prometheusUrl` pointing at the unit's Prometheus (the
+   kube-prometheus-stack default service name does not fit every install), and
+   prove a query returns data from in-cluster before wiring the gateway.
+2. **Register it — this is the step that is NOT a values key.** The evaluator
+   resolves `settings.offpeak.mcpServer` BY NAME from the enabled MCP registry
+   (`mcp_servers`, `enabled = TRUE`):
+   ```bash
+   curl -s $BASE/admin/mcp-servers -H "Authorization: Bearer $ADMIN_KEY" \
+     -H 'Content-Type: application/json' -d '{
+       "name": "prometheus",
+       "url": "http://prometheus-mcp-service.<ns>.svc.cluster.local:9095/mcp",
+       "tool_policy": "all", "enabled": true}'
+   ```
+   Add `auth_token` (panel token, Fernet-encrypted) or `auth_secret` (by-ref,
+   `mcpKeySecrets`) when the server gates `/mcp`. The evaluator calls with
+   SERVER-LEVEL credentials only — no key context — so a per-key override cannot
+   help it. The name must equal `settings.offpeak.mcpServer`; a disabled row behaves like
+   a missing one.
+3. **Verify.** `GET /admin/mcp-servers/prometheus/tools` must list
+   `settings.offpeak.tool` (`prom_query`), then `GET /admin/offpeak` clears
+   `last_error` and shows a numeric `last_value_pct` within one cadence. With
+   no row, the Off-peak tab shows *"MCP server 'prometheus' is not in the enabled
+   registry"* and billing stays at FULL price (fail-safe). The same row feeds the
+   Metrics tab's cache strips.
+4. **Validate the query, then prove it moves.** An empty result is NO SAMPLE,
+   not zero — it fails safe to full price. The default query needs a DCGM
+   exporter (`DCGM_FI_DEV_GPU_UTIL`); a per-model query (`settings.offpeak.modelPromql`)
+   must match the unit's GPU `Hostname`s and device range (DCGM carries no pod
+   label), and its key must match a REGISTERED model name exactly. Put load on a
+   model and watch the value cross `settings.offpeak.exitPct` → NORMAL, then idle back to
+   ACTIVE: a series stuck at 0 yields a permanent discount that still looks
+   healthy on the panel.
 
 ## SSO self-mint rollout (coupled, ordered)
 
@@ -629,6 +907,18 @@ each step.
    - `ezua.authorizationPolicy.excludeInboundPorts: [9200]` ONLY if your
      kubelet probes must bypass the mesh (see § Network isolation for the
      trade-off; NEVER a port serving real traffic).
+   - `ezua.authorizationPolicy.ingressGatewayPrincipals: [...]` — REQUIRED
+     before `settings.auth.trustProxyIdentity` goes on. With the list EMPTY the policy's
+     edge rule admits the ENTIRE `ingressNamespace` to every path, so any pod
+     there can forge the identity headers the app is about to trust (the
+     chart's NOTES.txt warns until it is set). Pin the SA that actually fronts
+     the host: `kubectl -n istio-system get pod -l 'istio=ingressgateway'
+     -o jsonpath='{.items[0].spec.serviceAccountName}'` (on dc15/G2:
+     `cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account`).
+     If the oauth2-proxy is a SEPARATE hop rather than an ext_authz/CUSTOM
+     policy on the ingress gateway, add its SA too — otherwise the chained
+     paths 403 at the mesh. `source.principals` needs mTLS, so this only
+     works once step 2 has landed.
 2. **Namespace sidecar injection + policy enabled — ATOMIC.** Label the
    release namespace for Istio injection (`istio-injection=enabled`) and
    set `ezua.authorizationPolicy.enabled: true` in the same change, then
@@ -669,14 +959,52 @@ each step.
        credentials on purpose — their identity IS the headers the chain
        injects; exposed unauthenticated, `for-me` mints keys for whoever
        asks.
-4. **App flags** — only once the chain above actually enforces:
-   `settings.trustProxyIdentity: true` and
-   `settings.ssoKeyCreateEnabled: true` (the mint flow's two gates);
-   `settings.tokenShadowKeys: true` (+ `tokenShadowTenantId`) is OPTIONAL
-   — needed only for token-only callers to get a ledger anchor. Flipping
-   any of them earlier than step 3 = trusting headers no proxy overwrites
-   (in-cluster forgery mints keys).
-5. **Homepage card lights up** — the SPA calls `GET /v1/identity` on
+   - **WHAT the chain IS, concretely** (verified live on G2 and on dc15): an
+     `AuthorizationPolicy` in `istio-system` — `action: CUSTOM`,
+     `provider.name: oauth2-proxy`, `selector.matchLabels.istio:
+     ingressgateway`, host+path scoped in `rules[].to`. Unmatched requests
+     fall through UNCHAINED; that IS the skip-auth half, by construction.
+     Two pre-checks before writing one:
+     `kubectl -n istio-system get authorizationpolicy -o
+     custom-columns='NAME:.metadata.name,ACTION:.spec.action,HOSTS:.spec.rules[*].to[*].operation.hosts[*]'`
+     (a CUSTOM row names an already-chained host to clone), and
+     `kubectl -n istio-system get configmap istio -o jsonpath='{.data.mesh}'`
+     (the provider must forward `x-auth-request-user` +
+     `x-auth-request-groups` upstream, or the app sees no identity and
+     `flags.self_mint` stays false). A host-only rule with no `paths` is the
+     MM RAG blanket-302 failure — scope the paths.
+     If there is NO `oauth2-proxy` provider (or no proxy deployment), the unit
+     has no platform SSO at all: that is platform work, and the flags stay OFF
+     until it exists.
+     `scripts/configure-sso-edge-gateway.sh --verify` runs the curl-triple
+     oracle against a host; `--manifest` prints that host's policy, ready for
+     `kubectl apply -f -`.
+4. **App flags + the mint's tenant** — only once the chain above actually
+   enforces:
+   - `settings.auth.trustProxyIdentity: true` and
+     `settings.auth.ssoKeyCreate.enabled: true` (the mint flow's two gates);
+   - `settings.auth.tokenShadow.tenantId: "<tenant uuid>"` — REQUIRED for the mint,
+     not only for shadow keys: `POST /v1/keys/for-me` creates the key under a
+     user in THIS tenant and answers 503 "no tenant" without it. The SPA hides
+     the card on ANY non-201/409 mint, so an unset id looks like "SSO is
+     broken" with no error anywhere — and the probe mirrors the same
+     precondition, so `flags.self_mint` is false. Create one if
+     `GET /admin/tenants` is empty (`POST /admin/tenants
+     {"name":"trial"}`). It is DEPLOYMENT-WIDE: every self-mint lands here.
+   - `settings.auth.tokenShadow.enabled: true` is OPTIONAL — only for token-only (JWT
+     bearer) callers to get a ledger anchor; it needs the same tenant id.
+   Flipping any of them earlier than step 3 = trusting headers no proxy
+   overwrites (in-cluster forgery mints keys).
+5. **Give mints a profile** — Admin ▸ Enroll ▸ "SSO self-mint default
+   profile": tenant + profile → Save
+   (`PUT /admin/tenants/{id}/sso-default-profile`). The mint stamps that
+   profile's budgets, MCP grants and rate presets onto the key (and binds the
+   user row). With NO profile configured, every mint gets the BARE grant —
+   60 rpm / 100k tpm, no budgets, no grants — which on a trial is an
+   uncapped-spend hole, not just a missing feature. The same card carries the
+   optional admin tier (admin profile + groups); "bind existing users"
+   backfills anyone who signed in before the default existed.
+6. **Homepage card lights up** — the SPA calls `GET /v1/identity` on
    boot; when the identity ladder resolves a browser-header identity AND
    the flags are on (`flags.self_mint: true`), the "Sign in with SSO"
    card renders. Verify with a browser session: mint → shown-once key →
@@ -761,7 +1089,7 @@ All state lives in Postgres; the pod itself is stateless and cheap.
   **503 `database busy`** (retryable) instead of queueing forever — that
   503 is your saturation signal, by design.
 - **Escalation order when you see it**:
-  1. `settings.dbPoolMax` (25 → 50+) — cheapest fix; watch the shared
+  1. `settings.dbPool.max` (25 → 50+) — cheapest fix; watch the shared
      Postgres' own `max_connections` (external mode: it serves other
      tenants too).
   2. Pod limits (`resources.limits`) if the loop is CPU-starved by SSE
@@ -778,7 +1106,7 @@ All state lives in Postgres; the pod itself is stateless and cheap.
      it is useful, so growth is staged), scale-DOWN sheds at most 25% per
      minute behind a 5-minute stabilization window (no thrash on bursty
      load). The same connection math as `replicaCount` applies: worst-case
-     Postgres demand is `maxReplicas × dbPoolMax` — pick them together.
+     Postgres demand is `maxReplicas × settings.dbPool.max` — pick them together.
      CPU (not memory) is the signal on purpose: this pod's per-request work
      is CPU-visible (TLS, JSON, SSE framing) while memory is flat, and an
      HPA on memory would autoscale a leak. Note the HPA cannot fix the
@@ -806,8 +1134,12 @@ Upgrades are a values edit + re-apply, not a redeploy:
 
 1. Import the newer chart package into PCAI (or update the chart source for
    operator installs).
-2. Re-apply your values document — the previous `# SITE:`-marked values carry
-   over unchanged (maps merge recursively; lists replace, not append).
+2. Re-apply your values document (maps merge recursively; lists replace, not
+   append). **A document written before the settings regroup must be migrated
+   FIRST**: the chart now FAILS THE RENDER on a flat-layout key
+   (`helm/templates/values-guard.yaml`) instead of silently ignoring it — see
+   § Values migration for the old → new table. `helm upgrade --reuse-values`
+   trips the same guard, because the STORED values are the old document.
 3. Image tags flow from the chart (`image.tag` is release-managed); a new
    chart version rolls the Deployment with the new tag.
 4. The Postgres schema is additive and idempotent — the ledger and budgets
@@ -880,8 +1212,9 @@ ask):
 
 ```yaml
 settings:
-  retentionTraceDays: 30          # relay-step traces
-  retentionConversationDays: 90   # saved chat transcripts
+  retention:
+    traceDays: 30          # relay-step traces
+    conversationDays: 90   # saved chat transcripts
 ```
 
 Prunes piggyback the registry-refresh housekeeping hook (errors swallowed,
@@ -894,7 +1227,8 @@ When your PCAI ingress presents a certificate from a PRIVATE CA, set:
 
 ```yaml
 settings:
-  upstreamCaBundle: /etc/pcai-ca/ca-bundle.crt
+  upstream:
+    caBundle: /etc/pcai-ca/ca-bundle.crt
 ```
 
 You must also mount the bundle file yourself (operator Secret + volume —
@@ -924,10 +1258,10 @@ schema startup in the log).
 | Prometheus target for the gateway stays `up == 0` even with a meshed scraper | A namespace-scoped policy rule cannot admit the scrape: kube-prometheus scrapes raw POD IPs — envoy passthrough, plaintext, no peer identity, even from a meshed pod (verified live on G2) | `allowMetricsScrape: true` — the ANY-SOURCE rule scoped to `/metrics` + `/metrics/` (§ Network isolation) |
 | Policy applied but nothing is enforced (spoofable headers reach the app) | Namespace labeled for injection but pods NOT restarted, or the label missing — AuthorizationPolicy without sidecars is a NO-OP | Move the `istio-injection=enabled` label AND `ezua.authorizationPolicy.enabled: true` in ONE change and restart the pods (§ SSO self-mint rollout step 2 — the pair is deliberately atomic) |
 | Pod NotReady: kubelet probes fail while the app answers fine through the gateway | Probes run outside the mesh (no separate probe port) — an enforcing AuthorizationPolicy denies the kubelet | `excludeInboundPorts: [9200]` (the ipBlock rule becomes the control) or a platform-side probe-port exemption; never exclude a port serving real traffic (§ Network isolation) |
-| `503 database busy` under load (retryable) | The Postgres pool is saturated — the bounded-acquire fail-fast is your saturation signal, by design | Escalation order: `settings.dbPoolMax` → pod limits → `replicaCount` → autoscaling; check the shared DB's `max_connections` — worst case is `maxReplicas × dbPoolMax` (§ Sizing; `templates/NOTES.txt` prints the arithmetic) |
-| A relay turn dies as `(model error: relay model call timed out)` | ONE model call exceeded `upstreamTimeoutS` — under agent fan-out the usual trigger is prefill queueing on the endpoint, not a wedged upstream | Raise the COUPLED trio together: `upstreamTimeoutS` ≤ `toolRelayWallClockS` < `ezua.virtualService.timeout` (e.g. 900 / 900 / 960) — the long-turn note above |
+| `503 database busy` under load (retryable) | The Postgres pool is saturated — the bounded-acquire fail-fast is your saturation signal, by design | Escalation order: `settings.dbPool.max` → pod limits → `replicaCount` → autoscaling; check the shared DB's `max_connections` — worst case is `maxReplicas × settings.dbPool.max` (§ Sizing; `templates/NOTES.txt` prints the arithmetic) |
+| A relay turn dies as `(model error: relay model call timed out)` | ONE model call exceeded `settings.upstream.timeoutS` — under agent fan-out the usual trigger is prefill queueing on the endpoint, not a wedged upstream | Raise the COUPLED trio together: `settings.upstream.timeoutS` ≤ `settings.relay.wallClockS` < `ezua.virtualService.timeout` (e.g. 900 / 900 / 960) — the long-turn note above |
 | A model/MCP registered on one pod 404s on another replica (HPA ≥ 2) | `PCAI_LLM_REGISTRY_WATCH_S: 0` disabled the cross-replica watermark poll — correct only on a single replica | Restore the watcher (default 5 s); out-of-band SQL edits converge too (the stamps are trigger-maintained) |
-| `/v1/keys/for-me` mints keys for unauthenticated callers | The identity endpoints were exposed without the SSO chain, or `trustProxyIdentity` / `ssoKeyCreateEnabled` were flipped before the chain enforced | Run the § SSO self-mint rollout IN ORDER; `for-me` + `/v1/identity` stay BEHIND oauth2-proxy, never skip-auth |
+| `/v1/keys/for-me` mints keys for unauthenticated callers | The identity endpoints were exposed without the SSO chain, or `settings.auth.trustProxyIdentity` / `settings.auth.ssoKeyCreate.enabled` were flipped before the chain enforced | Run the § SSO self-mint rollout IN ORDER; `for-me` + `/v1/identity` stay BEHIND oauth2-proxy, never skip-auth |
 | Admin console 401 behind the SSO chain with a valid admin key | The proxy overwrote the console's `Authorization: Bearer` with its id_token — not an admin key | The console already sends `X-API-Key` as the surviving envelope; alternatively keep `/admin` skip-auth, or use `PCAI_LLM_ADMIN_GROUPS` (§ SSO self-mint rollout step 3) |
 | Every request 401s or bounces to a login page after an SSO rollout | The edge chain 302s EVERYTHING to Keycloak (the MM RAG lesson, D25) — bare REST clients with `hllm-` keys cannot reach the app | Carve `/v1/*` + `/mcp/*` (and `/admin` unless using groups) as skip-auth at the edge; the app's key auth is the control (§ SSO self-mint rollout step 3) |
 <!-- VERIFY (blanket-302 row): the 302-everything failure mode is platform-edge

@@ -32,6 +32,95 @@ def _embedding_response_type() -> Any:
 __all__ = ["InputConversion", "MultiModalEmbeddings", "MultiModalReranker"]
 
 
+# --- per-request mm_processor_kwargs -----------------------------------------
+#
+# vLLM >= 0.31 refuses any request that carries mm_processor_kwargs unless the
+# server was started with --trust-request-mm-kwargs:
+#
+#   400: Per-request mm_processor_kwargs are disabled by default because they
+#   can change multimodal preprocessing resource usage.
+#
+# Sending the field is therefore OPT-IN (MODEL_SEND_MM_PROCESSOR_KWARGS) and off
+# by default: the key is omitted from the body entirely, which every vLLM
+# version accepts, hardened or not.
+
+_MM_KWARGS_ENV = "MODEL_SEND_MM_PROCESSOR_KWARGS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Keys this process has ALREADY enforced before the bytes reach the wire, so a
+# per-request copy is a no-op on tier-3 / pre-normalized media:
+#
+#   max_pixels, total_pixels -- InputConversion._resize_image and the tier-3
+#       ingest path cap every image at max_pixels, so the request carries bytes
+#       that already fit the budget.
+#   fps, max_frames -- InputConversion._fetch_video_frames samples client-side
+#       whenever max_frames > 0, so the request carries pre-sampled image parts
+#       instead of a video for the server to sample.
+#
+# min_pixels is deliberately NOT here: the client never upscales, so the
+# server-side floor is the only place it can still take effect.
+_CLIENT_ENFORCED_MM_KEYS = frozenset({"max_pixels", "total_pixels", "fps", "max_frames"})
+
+
+def _send_mm_processor_kwargs() -> bool:
+    """Whether per-request mm_processor_kwargs may be put on the wire.
+
+    Read per call (no cache) so the flag can be flipped without a rebuild.
+    """
+    return os.environ.get(_MM_KWARGS_ENV, "").strip().lower() in _TRUTHY
+
+
+def _media_processor_state(messages: Sequence[Any]) -> bool | None:
+    """Whether the server still has media preprocessing left to do.
+
+    Returns None when the request carries no image/video part at all (processor
+    kwargs cannot affect it), True when every part is already model-ready (a
+    data: image -- tier 3 or client-resized, so the budget was applied here),
+    and False when the server must still fetch or sample something (a remote
+    image, or any video).
+    """
+    state: bool | None = None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in message.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "image_url":
+                url = (part.get("image_url") or {}).get("url") or ""
+                if not url.startswith("data:"):
+                    return False
+                state = True
+            elif part_type == "video_url":
+                return False
+    return state
+
+
+def _mm_processor_kwargs_payload(mm_kwargs: Any, messages: Sequence[Any]) -> dict[str, Any]:
+    """The ``mm_processor_kwargs`` body fragment for one request, or ``{}``.
+
+    Gated in order: the opt-in flag, a non-empty configured dict, then the media
+    state -- a request with no image/video part gets nothing, and media this
+    process already normalized drops the keys the client enforced itself.
+    Returning ``{}`` (not ``{"mm_processor_kwargs": {}}``) keeps
+    the field out of the JSON body entirely.
+    """
+    if not _send_mm_processor_kwargs():
+        return {}
+    kwargs = dict(mm_kwargs or {})
+    if not kwargs:
+        return {}
+    state = _media_processor_state(messages)
+    if state is None:
+        return {}
+    if state:
+        kwargs = {key: value for key, value in kwargs.items() if key not in _CLIENT_ENFORCED_MM_KEYS}
+    if not kwargs:
+        return {}
+    return {"mm_processor_kwargs": kwargs}
+
+
 _MEDIA_KEY_PATTERN = re.compile(r"^(image|video|audio)$")
 
 
@@ -1348,6 +1437,15 @@ class MultiModalEmbeddings:
             self._embed_sems[loop] = sem
         return sem
 
+    def _mm_kwargs_payload(self, messages: Sequence[Any]) -> dict[str, Any]:
+        """Request-body fragment for per-request mm_processor_kwargs (may be empty).
+
+        Off unless MODEL_SEND_MM_PROCESSOR_KWARGS is truthy -- see
+        _mm_processor_kwargs_payload for the vLLM 0.31 trust gate and the
+        tier-3 reduction.
+        """
+        return _mm_processor_kwargs_payload(getattr(self.emb, "mm_processor_kwargs", None), messages)
+
     async def _embed_single_message_async(self, input_dict: list[dict[str, Any]]) -> list[float]:
         """Helper to hit your endpoint for a single input_dict fragment.
 
@@ -1372,7 +1470,7 @@ class MultiModalEmbeddings:
                 "encoding_format": "float",
                 "continue_final_message": True,
                 "add_special_tokens": True,
-                "mm_processor_kwargs": self.emb.mm_processor_kwargs,
+                **self._mm_kwargs_payload(input_dict),
             },
         )
         # Parse the vector array out of your specific CreateEmbeddingResponse structure
@@ -1690,6 +1788,15 @@ class MultiModalReranker:
 
         return adjusted_inputs[:N], adjusted_inputs[N:]
 
+    def _mm_kwargs_payload(self, messages: Sequence[Any]) -> dict[str, Any]:
+        """Request-body fragment for per-request mm_processor_kwargs (may be empty).
+
+        Off unless MODEL_SEND_MM_PROCESSOR_KWARGS is truthy -- see
+        _mm_processor_kwargs_payload for the vLLM 0.31 trust gate and the
+        tier-3 reduction.
+        """
+        return _mm_processor_kwargs_payload(getattr(self.emb, "mm_processor_kwargs", None), messages)
+
     async def _score_one_query(
         self,
         query: str | dict[str, Any],
@@ -1703,7 +1810,7 @@ class MultiModalReranker:
                 "model": self.emb.model_name,
                 "text_1": query,
                 "text_2": documents,
-                "mm_processor_kwargs": self.emb.mm_processor_kwargs,
+                **self._mm_kwargs_payload([query, *documents]),
             },
         )
         return [x["score"] for x in response["data"]]
@@ -1778,7 +1885,7 @@ class MultiModalReranker:
                 "model": self.emb.model_name,
                 "query": query,
                 "documents": documents,
-                "mm_processor_kwargs": self.emb.mm_processor_kwargs,
+                **self._mm_kwargs_payload([query, *documents]),
             },
         )
         return response["results"]

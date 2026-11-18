@@ -5,6 +5,71 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## 2026-11-18 — a model endpoint's API key now follows it across a base URL edit
+
+- **Data-loss fix, operator report (remote → local address switch).** A pool's
+  upsert identity is `(model_name, base_url)`, and "blank API key = keep the
+  stored credential" was implemented by OMITTING `auth_token_enc` from the
+  `ON CONFLICT (model_name, base_url) DO UPDATE SET` list. That keeps something
+  only when a row with the SAME `base_url` already exists. Editing an endpoint's
+  base URL is a NEW pair: the INSERT had no conflict, so `auth_token_enc` landed
+  NULL — and the replace-prune then DELETEd the old row, which held the only copy
+  of the ciphertext. The credential was not "not carried over", it was destroyed,
+  while the console's API key field still read "(unchanged)" (it painted the
+  placeholder once at edit-load and never re-evaluated it as the URL changed) and
+  the audit row recorded `panel_credential_set: false` — i.e. it looked like the
+  operator had cleared the key. Nothing in the trail, the logs or any endpoint
+  read carries the value, so the key had to be re-pasted from the operator's own
+  notes.
+- **Fix, both halves.** (a) The console now remembers each row's loaded
+  `base_url` (`data-orig-url`) and derives the key field's placeholder live: a
+  moved row says "carried over — paste to replace" instead of claiming
+  "(unchanged)". (b) The save names the old URL in a new `api_key_from` field,
+  and the server copies the stored CIPHERTEXT onto the new row inside the write's
+  own transaction (before the prune, so a concurrent delete cannot turn it into
+  the same silent no-op). The copy is verbatim — never decrypted, never
+  re-encrypted — so it leaks no plaintext and does not depend on the master key
+  that produced it still being loaded. A typed `api_key` still wins; `""` still
+  clears; a source that names no stored credential is a **400** rather than the
+  credential-less row this parameter exists to prevent; the audit row gains
+  `panel_credential_carried_from`. Same-URL edits are untouched (the tri-state
+  was never broken — the row identity was).
+- Tests: `tests/test_model_pool_credential_carryover.py` (control for the
+  same-URL keep path; the move; typed-key-wins; verbatim-ciphertext; the 400 and
+  that it writes/prunes nothing; explicit clear still clearing), plus console
+  source pins in `test_admin_ui.py`.
+
+## 2026-11-18 — values layout regrouped; admin console moves to a searchable rail
+
+- **Chart values, BREAKING for site files.** The ~126-key flat `settings:` map is
+  now grouped into 15 subsystem sections (`server`, `upstream`, `dbPool`,
+  `retention`, `cache`, `relay`, `mcp`, `routing`, `models`, `healthProbe`,
+  `auth`, `memory`, `offpeak`, `audio`, `tracing`). Every key still renders the
+  SAME `PCAI_LLM_*` env var with the same value — verified by a parsed-manifest
+  comparison against the pre-change chart for the chart defaults and all three
+  example overlays, and separately for the two `helm/local` site files.
+  A site values file written against the flat layout now FAILS THE RENDER
+  (`helm/templates/values-guard.yaml`, which names the offending keys) instead of
+  having them silently ignored by Helm's merge. Migration table:
+  DEPLOYMENT.md § Values migration.
+- **Values comments.** 474 → 251 comment lines in `helm/values.yaml`: the
+  per-knob failure-mode essays were aggregated into their section headers, and
+  the load-bearing warnings kept. The three examples were cut roughly in half
+  the same way, with every tuned value preserved byte-for-byte.
+- **Drift guard.** `tests/test_values_layout.py` pins the section list, forbids a
+  flat key from returning, proves every template settings reference resolves (a
+  missing path renders an EMPTY env value, Helm does not error), and proves the
+  render guard fires on a flat-layout site file.
+- **Admin console: the top tab bar became a rail.** 16 flat tabs under four
+  unlabelled rules are now a collapsible left rail with five labelled sections
+  (Access & safety · Models & routing · Agents & tools · Observability ·
+  Operations), collapsible section headers, a search box over label + keywords
+  + section name, a Section/item breadcrumb, and `#` deep links. Every
+  `data-tab` value is unchanged, so the activation contract did not move; the
+  header slims to the connection controls and the rail becomes an off-canvas
+  drawer under 900px. Design record + approved mockup:
+  `documentation/design/`. No backend change.
+
 ## Documentation waves
 
 - **2026-11-11 doc wave.** README.md restructured to the fleet's ten-section

@@ -8,7 +8,7 @@
 # ezua-exposed workload) and sidecar injection in the release namespace —
 # this is the MESH L7 control; the CNI-layer control is networkPolicy above.
 #
-# ⚠️ COUPLING (why this exists): settings.trustProxyIdentity
+# ⚠️ COUPLING (why this exists): settings.auth.trustProxyIdentity
 # (PCAI_LLM_TRUST_PROXY_IDENTITY) makes the gateway CONSUME the oauth2-proxy
 # identity headers — those headers are client-spoofable at the pod, so the
 # flag alone is NOT the control. It is safe ONLY where (a) an enforcing
@@ -130,7 +130,7 @@ spec:
     #      browser-header rung: routes_identity.py, routes_enroll.py
     #      POST /enroll, routes_admin.py require_admin; the old "two
     #      paths" claim was stale — audit #6) stay reachable ONLY from
-    #      the edge (rule i): with trustProxyIdentity on, an in-cluster
+    #      the edge (rule i): with settings.auth.trustProxyIdentity on, an in-cluster
     #      pod must never be able to deliver spoofed X-Auth-Request-*
     #      headers to a mint. BOTH spellings per path (see rule ii):
     #      the bare form is the literal path, the /* form the subtree

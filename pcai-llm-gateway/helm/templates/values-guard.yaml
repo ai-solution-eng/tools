@@ -1,0 +1,275 @@
+{{- /*
+  STALE-LAYOUT GUARD. The settings block was regrouped by subsystem
+  (server/upstream/dbPool/retention/cache/relay/mcp/routing/models/healthProbe/
+  auth/memory/offpeak/audio/tracing) and many keys lost the prefix the section
+  now carries. Helm's map merge IGNORES a key it does not know, so a site values
+  file written against the flat layout would silently boot on chart defaults -
+  a relay kill switch quietly reverting to on, a token-validation gate silently
+  inert. Fail the render instead, and name what to rename.
+
+  Two classes are caught:
+    1. a legacy TOP-LEVEL settings key (settings.dbPoolMax),
+    2. a legacy leaf name nested under a NEW section (settings.relay.toolRelayEnabled),
+       restricted to names whose new spelling DIFFERS - so a key that kept its
+       name (settings.healthProbe.*, settings.models.maxTokensCeiling) is never
+       flagged. The walk is bounded to the depth the tree actually has.
+
+  Migration table: documentation/DEPLOYMENT.md section "Values migration".
+*/ -}}
+{{- $settings := .Values.settings | default dict -}}
+{{- $legacyTop := list
+  "adminGroups"
+  "audioAsrTokensPerSecond"
+  "audioTtsCharsPerToken"
+  "budgetCachedExemptFraction"
+  "canonicalSkipTitleRequests"
+  "clientToolDispatch"
+  "clientToolDispatchTimeoutS"
+  "dbAcquireTimeoutS"
+  "dbPoolMax"
+  "dbPoolMin"
+  "demandAwareExcludedModels"
+  "distillerDisableThinking"
+  "distillerEnabled"
+  "distillerGateBackoffS"
+  "distillerMaxTokens"
+  "distillerMemoryProbeTool"
+  "distillerMemoryServer"
+  "distillerMemoryTool"
+  "distillerMinDocChars"
+  "distillerRawFallback"
+  "effectivePromptCapture"
+  "effectivePromptRetainDays"
+  "embeddingCacheEnabled"
+  "embeddingCacheMaxInputBytes"
+  "endpointCooldownS"
+  "endpointFailureThreshold"
+  "endpointMetricsDiskSelector"
+  "enrollMemoryDefault"
+  "enrollMemoryNameRetries"
+  "enrollMemoryServer"
+  "failoverTtftS"
+  "host"
+  "keepAliveTimeoutS"
+  "limitConcurrency"
+  "loadAwareCascade"
+  "logLevel"
+  "maxBodyBytes"
+  "maxTokensCeiling"
+  "mcpArgDenyClusterHosts"
+  "mcpArgEgressServers"
+  "mcpArgPolicy"
+  "mcpArgPolicyExempt"
+  "mcpArgPolicyResolve"
+  "mcpArgTelemetry"
+  "mcpCallerAttribution"
+  "mcpCatalogCacheS"
+  "mcpFailoverAttempts"
+  "mcpFlatTools"
+  "mcpSelfService"
+  "mcpSeparateReadEgress"
+  "modelFallbackMax"
+  "modelGroupLoadRefreshS"
+  "modelGroupLoadStaleS"
+  "modelGroupsEnabled"
+  "offpeakCheckS"
+  "offpeakEnabled"
+  "offpeakEnterPct"
+  "offpeakExitPct"
+  "offpeakFraction"
+  "offpeakMcpServer"
+  "offpeakModelPromql"
+  "offpeakPromql"
+  "offpeakTool"
+  "otelEnabled"
+  "otelEndpoint"
+  "otelHeaders"
+  "otelSampleRatio"
+  "otelServiceName"
+  "port"
+  "rateLimitExcludeCachedTokens"
+  "rateLimitPredictCached"
+  "rateLimitPredictReconcile"
+  "reasoningHistoryEnabled"
+  "reasoningHistoryMaxChars"
+  "registryAdminFreshS"
+  "registryWatchS"
+  "responseCacheMode"
+  "responseCacheTtlS"
+  "retentionCanonicalDays"
+  "retentionConversationDays"
+  "retentionTraceDays"
+  "routeDefaultModel"
+  "routingAgentsEnabled"
+  "routingEnabled"
+  "routingTier1Tokens"
+  "routingTier2Tokens"
+  "routingTurnAdderTokens"
+  "sessionAffinityEnabled"
+  "sessionAffinityTtlS"
+  "ssoKeyCreateEnabled"
+  "ssoSignOutUrl"
+  "stickyRouting"
+  "stickyRoutingIdleResetS"
+  "tokenShadowKeyName"
+  "tokenShadowKeys"
+  "tokenShadowRateLimitRpm"
+  "tokenShadowRateLimitTpm"
+  "tokenShadowTenantId"
+  "tokenValidation"
+  "toolCompressDefault"
+  "toolCompressMaxStoreChars"
+  "toolCompressMinChars"
+  "toolCompressRatioFloor"
+  "toolCompressStoreTtlS"
+  "toolRelayCallRetries"
+  "toolRelayEnabled"
+  "toolRelayGrantMode"
+  "toolRelayMaxIterations"
+  "toolRelayRenderDeltas"
+  "toolRelayRenderIndexBase"
+  "toolRelayStreamWireTools"
+  "toolRelaySurface"
+  "toolRelayWallClockS"
+  "trustForwardedGroups"
+  "trustProxyIdentity"
+  "upstreamCaBundle"
+  "upstreamTimeoutS"
+  "zeroCompletionRetry"
+-}}
+{{- $legacyLeaf := list
+  "audioAsrTokensPerSecond"
+  "audioTtsCharsPerToken"
+  "budgetCachedExemptFraction"
+  "canonicalSkipTitleRequests"
+  "clientToolDispatch"
+  "clientToolDispatchTimeoutS"
+  "dbAcquireTimeoutS"
+  "dbPoolMax"
+  "dbPoolMin"
+  "distillerDisableThinking"
+  "distillerEnabled"
+  "distillerGateBackoffS"
+  "distillerMaxTokens"
+  "distillerMemoryProbeTool"
+  "distillerMemoryServer"
+  "distillerMemoryTool"
+  "distillerMinDocChars"
+  "distillerRawFallback"
+  "embeddingCacheEnabled"
+  "embeddingCacheMaxInputBytes"
+  "endpointCooldownS"
+  "endpointFailureThreshold"
+  "endpointMetricsDiskSelector"
+  "enrollMemoryDefault"
+  "enrollMemoryNameRetries"
+  "enrollMemoryServer"
+  "mcpArgDenyClusterHosts"
+  "mcpArgEgressServers"
+  "mcpArgPolicy"
+  "mcpArgPolicyExempt"
+  "mcpArgPolicyResolve"
+  "mcpArgTelemetry"
+  "mcpCallerAttribution"
+  "mcpCatalogCacheS"
+  "mcpFailoverAttempts"
+  "mcpFlatTools"
+  "mcpSelfService"
+  "mcpSeparateReadEgress"
+  "modelFallbackMax"
+  "modelGroupLoadRefreshS"
+  "modelGroupLoadStaleS"
+  "modelGroupsEnabled"
+  "offpeakCheckS"
+  "offpeakEnabled"
+  "offpeakEnterPct"
+  "offpeakExitPct"
+  "offpeakFraction"
+  "offpeakMcpServer"
+  "offpeakModelPromql"
+  "offpeakPromql"
+  "offpeakTool"
+  "otelEnabled"
+  "otelEndpoint"
+  "otelHeaders"
+  "otelSampleRatio"
+  "otelServiceName"
+  "rateLimitExcludeCachedTokens"
+  "rateLimitPredictCached"
+  "rateLimitPredictReconcile"
+  "reasoningHistoryEnabled"
+  "reasoningHistoryMaxChars"
+  "responseCacheMode"
+  "responseCacheTtlS"
+  "retentionCanonicalDays"
+  "retentionConversationDays"
+  "retentionTraceDays"
+  "routingAgentsEnabled"
+  "routingEnabled"
+  "routingTier1Tokens"
+  "routingTier2Tokens"
+  "routingTurnAdderTokens"
+  "sessionAffinityEnabled"
+  "sessionAffinityTtlS"
+  "ssoKeyCreateEnabled"
+  "stickyRouting"
+  "stickyRoutingIdleResetS"
+  "tokenShadowKeyName"
+  "tokenShadowKeys"
+  "tokenShadowRateLimitRpm"
+  "tokenShadowRateLimitTpm"
+  "tokenShadowTenantId"
+  "toolCompressDefault"
+  "toolCompressMaxStoreChars"
+  "toolCompressMinChars"
+  "toolCompressRatioFloor"
+  "toolCompressStoreTtlS"
+  "toolRelayCallRetries"
+  "toolRelayEnabled"
+  "toolRelayGrantMode"
+  "toolRelayMaxIterations"
+  "toolRelayRenderDeltas"
+  "toolRelayRenderIndexBase"
+  "toolRelayStreamWireTools"
+  "toolRelaySurface"
+  "toolRelayWallClockS"
+  "upstreamCaBundle"
+  "upstreamTimeoutS"
+-}}
+{{- $found := list -}}
+{{- range $key := $legacyTop -}}
+{{- if hasKey $settings $key -}}
+{{- $found = append $found (printf "settings.%s" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- range $sec, $val := $settings -}}
+{{- if kindIs "map" $val -}}
+{{- range $key := $legacyLeaf -}}
+{{- if hasKey $val $key -}}
+{{- $found = append $found (printf "settings.%s.%s" $sec $key) -}}
+{{- end -}}
+{{- end -}}
+{{- range $sub, $sval := $val -}}
+{{- if kindIs "map" $sval -}}
+{{- range $key := $legacyLeaf -}}
+{{- if hasKey $sval $key -}}
+{{- $found = append $found (printf "settings.%s.%s.%s" $sec $sub $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $found -}}
+{{- $shown := $found -}}
+{{- $more := 0 -}}
+{{- if gt (len $found) 8 -}}
+{{- $shown = slice $found 0 8 -}}
+{{- $more = sub (len $found) 8 -}}
+{{- end -}}
+{{- $suffix := "" -}}
+{{- if gt $more 0 -}}
+{{- $suffix = printf " and %d more" $more -}}
+{{- end -}}
+{{- fail (printf "settings: %d key(s) use the OLD FLAT layout (%s%s). The settings block is grouped by subsystem (server, upstream, dbPool, retention, cache, relay, mcp, routing, models, healthProbe, auth, memory, offpeak, audio, tracing), so Helm IGNORES these keys and the pod would boot on chart defaults. Rename them per documentation/DEPLOYMENT.md section Values migration (old -> new table)." (len $found) (join ", " $shown) $suffix) -}}
+{{- end -}}

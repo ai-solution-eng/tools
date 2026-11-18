@@ -1,0 +1,382 @@
+# ============================================================================
+# pcai-llm-gateway — Hosted trial + SSO + off-peak/Prometheus (EXAMPLE)
+# Sanitized, no credentials. Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon <andrew.bydlon@hpe.com>
+# Contributors: Francesco Caliva <francesco.caliva@hpe.com>, Bryan Lliguicota <bryan.lliguicota@hpe.com>
+# Lives in helm/values-examples/ (hardlink-synced to GitHub): intentionally SECRET-FREE.
+# ============================================================================
+#
+# WHAT THIS PROFILE IS — values.hosted-trial.yaml + SSO self-mint (browser identity ->
+# key, POST /v1/keys/for-me) + OFF-PEAK billing via a Prometheus MCP server; every
+# site-specific value is a REPLACE_WITH_* and everything else is the hosted-trial profile.
+# ⚠️ PREREQUISITE 1 — `prometheus` MUST BE A REGISTERED, ENABLED MCP SERVER.
+#   settings.offpeak.mcpServer is a NAME LOOKUP in the gateway's MCP registry (Postgres
+#   mcp_servers, enabled = TRUE), never a values key: applying this file registers
+#   nothing. Register it once (Admin > MCP, or POST /admin/mcp-servers with name, url
+#   ...:9095/mcp, tool_policy "all", enabled true), then verify
+#   GET /admin/mcp-servers/prometheus/tools lists prom_query and GET /admin/offpeak
+#   clears last_error. Without that row the Off-peak tab says "not in the enabled
+#   registry" and billing stays at FULL price (fail-safe). No per-key MCP grant is
+#   needed, and a DCGM series stuck at 0 would discount forever — prove it MOVES.
+# ⚠️ PREREQUISITE 2 — SSO IS PLATFORM-SIDE AND THE ORDER IS LOAD-BEARING.
+#   This chart has NO login flow: the platform oauth2-proxy/Keycloak at the ezaf-gateway
+#   injects X-Auth-Request-User / -Groups and the gateway trusts them. The flags below
+#   are inert — or UNSAFE — without (a) the EDGE CHAIN on this host: `/`, `/ui`,
+#   `/v1/identity`, `/v1/keys/for-me` SSO-chained, every other path skip-auth (a
+#   blanket 302 breaks every API-key client); (b) SIDECAR INJECTION + the
+#   AuthorizationPolicy below, applied ATOMICALLY; (c) ingressGatewayPrincipals SET.
+#   Rollback: flags off hides every SSO surface. Runbook: DEPLOYMENT.md § SSO self-mint.
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (missing Secret = the pod refuses to start):
+#   1. adminApiKey.existingSecret — admin keys; /admin rejects everything without it
+#   2. database.embedded.auth.existingSecret — the Postgres password (embedded mode)
+#   3. ezua.virtualService.endpoint — the route host (render-guard when ezua.enabled)
+#   4. ingress.host — the route host (render-guard when ingress.enabled)
+#   5. upstreamKeySecrets[] / mcpKeySecrets[] — every entry needs secretName + secretKey
+
+# ### OPTIONAL ###
+# SSO self-mint is APPLIED here (settings.auth.trustProxyIdentity /
+# settings.auth.ssoKeyCreate.enabled / settings.auth.tokenShadow.tenantId, plus
+# ingressGatewayPrincipals and the relief rules) — read PREREQUISITE 2 first.
+# Chart-generated Secrets, embedded PG, metrics, scaling, network isolation: see below.
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
+# One replica serves all three surfaces (/v1, /mcp, /admin); the gateway is stateless.
+deployment:
+  name: pcai-llm-gateway
+  appName: pcai-llm-gateway
+  replicaCount: 1
+  rolloutOnUpgrade: false         # true + pullPolicy Always re-rolls pods on every apply
+
+image:
+  repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
+  tag: ""                         # empty = inherit Chart.yaml appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []            # only if the registry needs auth on your unit
+
+# ============================================================================
+# Secrets / Database
+# ============================================================================
+
+# Path A (default): operator creates the Secrets out-of-band. Path B (trial-friendly):
+# create: true and ONE helm install generates them (not for offline-render pipelines).
+adminApiKey:
+  existingSecret: pcai-llm-gateway-admin        # your admin-keys Secret name
+  existingSecretKey: admin-api-keys
+  create: false                  # true = chart generates/preserves (see NOTES)
+
+secretsMasterKey:
+  existingSecret: pcai-llm-gateway-secrets      # your master-key Secret name
+  existingSecretKey: master-key
+  create: false                  # true = chart generates/preserves
+
+# TRIAL DEFAULT: embedded Postgres in the release namespace (enabled=false = site DB).
+database:
+  existingSecret: pcai-llm-gateway-db           # used ONLY when embedded=false
+  existingSecretKey: database-url               # value: postgresql://... (in the Secret)
+
+  embedded:
+    enabled: true                 # false to use an external/site Postgres
+    image: postgres:16            # mirror if your unit cannot reach Docker Hub
+    serviceName: pcai-llm-gateway-pg
+
+    auth:
+      username: pcai_llm
+      database: pcai_llm
+      existingSecret: pcai-llm-gateway-pg-auth   # name (only when enabled)
+      existingSecretKey: password
+      create: false               # true = chart generates/preserves the password
+
+    persistence:
+      size: 5Gi
+      storageClass: ""            # your unit's StorageClass ('' = default)
+
+    # maxReplicas x settings.dbPool.max + PG's own sessions; 0 = image default (100).
+    maxConnections: 0
+
+    resources:                    # small trial sizing
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: 4, memory: 4Gi}
+
+# Upstream model-endpoint / MCP API keys — BY REFERENCE (a trial pastes them in the panel).
+upstreamKeySecrets: []
+
+mcpKeySecrets: []
+
+# ============================================================================
+# Runtime Settings
+# One PCAI_LLM_* env var per key, grouped by subsystem (see helm/values.yaml).
+# ============================================================================
+
+settings:
+
+  # --- Server: listener, body size, concurrency ------------------------------
+  server:
+    host: 0.0.0.0
+    port: 9200
+    logLevel: INFO
+    keepAliveTimeoutS: 75
+    limitConcurrency: 0             # 0 = unset/unbounded (the env is omitted)
+    maxBodyBytes: 33554432
+
+  # --- Upstream: timeouts, breaker, TLS --------------------------------------
+  upstream:
+    timeoutS: 900
+    caBundle: ""                    # private-CA bundle path; empty = system trust store
+    breakerFailureThreshold: 5
+    breakerCooldownS: 60
+    zeroCompletionRetry: true       # retry once on 2xx + empty content + finish_reason=stop
+
+  # --- Postgres pool ---------------------------------------------------------
+  dbPool:
+    min: 5
+    max: 25
+    acquireTimeoutS: 2
+
+  # --- Retention: operational tables (0 = never delete) ----------------------
+  retention:
+    traceDays: 0                    # e.g. 30 to bound an embedded-PG PVC
+    conversationDays: 0
+    canonicalDays: 0                # distiller INPUT store, DISTILLED-ONLY deletes
+
+  # --- Cache: embeddings, cache-aware metering ------------------------------
+  cache:
+    embedding:
+      enabled: true
+      maxInputBytes: 65536
+    # Cached tokens refunded from the TPM window, discounted vs period budgets
+    metering:
+      excludeCachedTokens: true
+      budgetExemptFraction: 0.9
+
+  # --- Relay: the model tool-calling loop -----------------------------------
+  relay:
+    enabled: true
+    surface: hybrid                 # one pcai_tools discovery tool; full inlines all 111 tools
+    maxIterations: 16
+    wallClockS: 900
+    grantMode: explicit             # explicit = hand-granted pairs; scope = policy-admitted fleet
+    # FALSE for DSH: its stream client EXECUTES any tool_call delta it sees.
+    streamWireTools: false
+    callRetries: 1                  # per turn; spends only the remaining wall clock
+    clientDispatch:
+      enabled: false
+      timeoutS: 120.0
+
+  # --- Endpoint health probe (active) --------------------------------------
+  # OFF until a site has seen its own fleet probed OK (GET /admin/endpoints).
+  healthProbe:
+    enabled: false
+    intervalS: 30
+    timeoutS: 5
+    failuresToTrip: 2
+
+  # --- Routing: pseudo-models, fallback ------------------------------------
+  routing:
+    enabled: true                   # per-profile routing_policy gates the behavior
+    tier1Tokens: 1500
+    tier2Tokens: 6000
+    turnAdderTokens: 100
+    agentsEnabled: false            # the key's OFFERED agents join the candidate window
+    fallbackMax: 2                  # chain hops walked; 0 = chains never walked
+
+  # --- MCP federation (/mcp) and the registry -------------------------------
+  mcp:
+    flatTools: false                # false = two-tool surface (mcp_catalog + mcp_call)
+    catalogCacheS: 60.0
+    failoverAttempts: 2
+    callerAttribution: true         # stamps X-MCP-Caller; upstreams RECORD it, never authorize off it
+
+  # --- Auth: identity rungs, tokens, SSO -----------------------------------
+  # ⚠️ PREREQUISITE 2 applies: these flags trust client-spoofable headers.
+  auth:
+    trustProxyIdentity: true
+    ssoKeyCreate:
+      enabled: true
+    tokenShadow:
+      # REQUIRED for the mint: POST /v1/keys/for-me answers 503 "no tenant" without it,
+      # and the SPA hides the SSO card on a non-201/409 mint (looks like "SSO is broken").
+      tenantId: "REPLACE_WITH_TENANT_UUID"
+    # NOT a values key: the profile every minted key receives is Admin > Enroll >
+    # "SSO self-mint default profile" (unset = bare grant, no budgets, no MCP grants).
+    adminGroups: ""                 # group-based /admin access instead of the bearer key
+    # Direct Keycloak-JWT callers need tokenValidation AND tokenShadow; both stay off
+    # for the browser-mint flow:
+    # tokenValidation:
+    #   issuer: ""                    # all three of issuer/jwksUrl/audience engage it
+    #   jwksUrl: ""
+    #   audience: ""
+    # tokenShadow: {enabled: false, keyName: "token-shadow", rateLimitRpm: 60, rateLimitTpm: 100000}
+    # Absolute platform sign-out URL, e.g. https://oauth2-proxy.<domain>/oauth2/sign_out;
+    # empty = local-only (the platform session survives). Prefer virtualService.ssoProxy.
+    ssoSignOutUrl: ""
+
+  # --- Off-peak billing (demand-shaped budget consumption) ------------------
+  # Evaluator only (the registry row is PREREQUISITE 1); the LEDGER keeps TRUE usage.
+  offpeak:
+    enabled: true
+    checkS: 30
+    promql: avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL[5m]))
+    enterPct: 20              # enter low-demand BELOW this
+    exitPct: 35               # leave it only ABOVE this (must be > enter)
+    fraction: 0.5             # gateway default; a profile's fraction wins
+    mcpServer: prometheus     # must match the registered server NAME exactly
+    tool: prom_query          # must be a tool that server actually exposes
+    # Per-model evaluators (recommended on a shared cluster): the global query averages
+    # EVERY GPU, so idle nodes dilute a busy model below enterPct. Keys must match
+    # registered names EXACTLY; DCGM has no pod label, so scope by Hostname + device, and
+    # a query matching zero series is NO SAMPLE (full price).
+    # modelPromql:
+    #   REPLACE_WITH_MODEL_NAME: 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname="REPLACE_WITH_GPU_HOST",device=~"nvidia[0-3]"}[5m]))'
+
+# ============================================================================
+# Service / Ingress
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9200
+  targetPort: 9200
+
+# Primary (PCAI) is the VirtualService below; a plain-k8s Ingress needs ezua.enabled: false.
+ingress:
+  enabled: false
+  className: nginx                # your IngressClass
+  host: ""                        # required when enabled (host override)
+  tlsSecretName: ""               # optional TLS Secret in the release namespace
+
+# ============================================================================
+# Resources / Autoscaling
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 1Gi}
+
+# Autoscaling OFF for the hosted-trial profile; see values.g2.yaml for the ENABLED shape.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# ============================================================================
+# Security / Service Account
+# ============================================================================
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+
+# The gateway makes NO Kubernetes API calls (no identity, no token).
+serviceAccount:
+  create: false
+  name: pcai-llm-gateway
+  automountServiceAccountToken: false
+
+rbac:
+  create: false
+
+# ============================================================================
+# Kyverno / Metrics
+# ============================================================================
+
+# Cluster-scoped (needs cluster-admin); the chart stamps hpe-ezua labels directly.
+kyverno:
+  enabled: false
+
+# ServiceMonitor + /metrics; this key ALSO gates PCAI_LLM_METRICS_ENABLED (chart-off = app-off).
+metrics:
+  enabled: true                   # TRIAL: observability on by default
+  interval: 30s
+  # Default ruleset: error ratio, breaker-open, budget-rejection spike.
+  prometheusRule:
+    enabled: true
+    rules: []
+
+# ============================================================================
+# Proxy
+# ============================================================================
+
+# Hosted trials run on customer clusters with their own egress — leave the proxy OFF.
+proxy: {}
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+ezua:
+  enabled: true
+  virtualService:
+    # keep ${DOMAIN_NAME} — PCAI envsubsts pasted values; a CLI deploy must sed-resolve
+    # it FIRST (istio DENIES the literal and fails the release).
+    endpoint: pcai-llm-gateway.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway      # verify this gateway exists on your unit
+    # >= settings.upstream.timeoutS (900s) or Istio 504s long streams
+    timeout: 960s
+    # SAME-ORIGIN SSO SIGN-OUT (recommended with SSO): routes /oauth2/ on THIS host to the
+    # platform oauth2-proxy so "Sign out" clears the domain-wide cookie (local-only otherwise).
+    #   kubectl -n oauth2-proxy get svc
+    # ssoProxy:
+    #   enabled: true
+    #   host: oauth2-proxy.oauth2-proxy.svc.cluster.local
+    #   port: 80
+
+  # SAFE only because authorizationPolicy.enabled=true below caller-gates the mesh.
+  routeAdmin: true
+
+  # Istio AuthorizationPolicy (mesh L7, needs sidecar injection) on the gateway pods.
+  # ⚠️ COUPLED with settings.auth.trustProxyIdentity — and a NO-OP without injection.
+  # Apply the namespace label and this block ATOMICALLY, then restart (pods read 2/2).
+  authorizationPolicy:
+    enabled: true                  # ALLOW-lists the edge + same-namespace + relief rules
+    ingressNamespace: istio-system
+    # REQUIRED while trustProxyIdentity is on. EMPTY admits the ENTIRE ingressNamespace to
+    # every path (identity reads, key mints, /admin) — NOTES.txt warns until you pin the SA:
+    #   kubectl -n istio-system get pod -l 'istio=ingressgateway' -o jsonpath='{.items[0].spec.serviceAccountName}'
+    # A separate oauth2-proxy hop needs its SA too, or the chained paths 403 at the mesh.
+    ingressGatewayPrincipals:
+      - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account   # verified on G2 — confirm on your unit
+    excludeInboundPorts: []        # NEVER a traffic port — an excluded port bypasses ALL rules
+    # REQUIRED with metrics.enabled: kube-prometheus scrapes raw POD IPs (no peer identity).
+    allowMetricsScrape: true
+    # Unmeshed in-cluster consumers calling the SERVICE directly: any source on the traffic
+    # port EXCEPT the identity/mint/admin paths, which stay edge-only.
+    allowInClusterApi: true
+    rules: []                      # non-empty REPLACES the baseline rules
+
+# Default-deny NetworkPolicy (CNI-layer, works without a sidecar) — trial exposure control.
+networkPolicy:
+  enabled: true                    # default-deny ingress/egress with the chart's baseline allows
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: ezaf-gateway              # verify with kubectl -n istio-system get pod -l 'app=ezaf-gateway'
+
+  # kubelet probes/port-forward come from the NODE (ipBlock — no selector matches).
+  probeCidrs:
+    - 0.0.0.0/0
+
+  # REQUIRED with 0.0.0.0/0: your pod CIDR, so pod traffic stays governed by (i)/(ii).
+  probeExceptCidrs:
+    - 10.0.0.0/8
+
+  inClusterEgressCidrs:
+    - 10.0.0.0/8                   # your pod/service CIDR — mirror proxy.noProxy
+  ingress: []                      # non-empty REPLACES the baseline rules
+  egress: []                       # non-empty REPLACES the baseline rules

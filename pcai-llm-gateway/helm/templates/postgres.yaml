@@ -88,8 +88,8 @@ spec:
           {{- if .Values.database.embedded.maxConnections }}
           # Postgres server tuning via the official image's passthrough
           # (postgres -c). Needed when the gateway AUTOSCALES: every replica
-          # carries its own pool (dbPoolMax), so worst-case demand is
-          # maxReplicas × dbPoolMax + this pod's own sessions — the image
+          # carries its own pool (settings.dbPool.max), so worst-case demand is
+          # maxReplicas × settings.dbPool.max + this pod's own sessions — the image
           # default (100) exhausts at 4 replicas × 25. Only applied when set
           # (default render byte-identical). CHANGING THIS RESTARTS THE
           # STATEFULSET (args are in the pod template) — a brief gateway

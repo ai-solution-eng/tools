@@ -4,14 +4,16 @@ import asyncio
 import base64
 import inspect
 import io
+import json
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -442,6 +444,7 @@ def _get_async_client(remote: bool = False) -> httpx2.AsyncClient:
 __all__ = [
     "BaseModel",
     "ChatModel",
+    "CurlOperation",
     "DecisionModel",
     "EmbeddingModel",
     "RerankerModel",
@@ -496,6 +499,48 @@ class ToolDefinition:
     description: str
     input_schema: dict[str, Any]
     handler: Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+@dataclass(frozen=True)
+class CurlOperation:
+    """One HTTP request behind a model class's base function.
+
+    A base function (chat, responses, embeddings, ...) is a thin wrapper over
+    exactly one request, so recording that request is enough to reproduce it
+    by hand. :meth:`BaseModel.curl_command` renders one of these as a
+    copy-pasteable curl command.
+
+    Fields
+    ------
+    name:
+        Short operation id used to select the command, e.g. "chat".
+    method:
+        HTTP method (GET, POST, ...).
+    url:
+        Absolute request URL, already resolved for the transport it was built
+        for (see ``usage`` on :meth:`BaseModel.base_curl_operations`).
+    python_call:
+        The model method this request backs, e.g. "llm_chat_function_call";
+        rendered as a comment so the command maps back to the API.
+    body:
+        JSON body for an ``application/json`` request.
+    form:
+        Multipart text fields (ASR), rendered as ``-F name=value``.
+    file_field:
+        Multipart file field as ``(field_name, local_path)``, rendered as
+        ``-F field_name=@local_path``.
+    note:
+        One-line caveat rendered as a comment (e.g. "returns audio bytes").
+    """
+
+    name: str
+    method: str
+    url: str
+    python_call: str = ""
+    body: dict[str, Any] | None = None
+    form: dict[str, str] = field(default_factory=dict)
+    file_field: tuple[str, str] | None = None
+    note: str = ""
 
 
 async def _get_mcp_servers(
@@ -746,13 +791,16 @@ class BaseModel:
 
         Only URLs containing the ``.serving.`` marker (PCAI serving hostnames)
         are rewritten; any other URL (e.g. a localhost test endpoint passed via
-        ``--url``) is returned unchanged instead of being mangled.
+        ``--url``, or a public https OpenAI-compatible API) is returned
+        unchanged instead of being mangled -- a public endpoint keeps its TLS
+        scheme, and so does the curl command rendered for it.
         """
-        new_path = path.replace("https", "http")
-        marker = new_path.find(".serving.")
+        scheme_end = path.find("://")
+        host_start = scheme_end + 3 if scheme_end != -1 else 0
+        marker = path.find(".serving.", host_start)
         if marker == -1:
-            return new_path
-        return new_path[:marker] + ".svc.cluster.local"
+            return path
+        return "http://" + path[host_start:marker] + ".svc.cluster.local"
 
     def _openai_client_kwargs(self, client_cls: Callable, http_client: Any) -> dict[str, Any]:
         """Keyword args shared by the sync/async OpenAI client constructors.
@@ -876,6 +924,249 @@ class BaseModel:
         """
         self.model_usage = "local"
         self._clear_cached_class_elements()
+
+    # -- curl recipes -----------------------------------------------------
+    # Every base function is one HTTP request, so each class can render the
+    # curl equivalent of its own API. The TLS posture is the real one: a local
+    # endpoint is plain in-cluster HTTP (no flags), a remote PCAI ingress is
+    # HTTPS with a self-signed certificate, so the command needs the pinned CA
+    # bundle (REMOTE_CA_BUNDLE) or curl -k.
+
+    #: Rendered when a class has no HTTP base functions to show.
+    _curl_empty_note = "no HTTP base functions to curl"
+
+    def _curl_root(self, usage: Literal["local", "remote"] | None = None) -> str:
+        """Endpoint root URL (without ``/v1``) for the requested transport.
+
+        Parameters
+        ----------
+        usage:
+            "local" or "remote"; defaults to this model's model_usage. Asking
+            for the other side renders that command WITHOUT calling local() /
+            remote(), so the memoized clients are left alone.
+
+        Returns
+        -------
+        str
+            The URL without a trailing slash ("" when unconfigured).
+        """
+        selected = usage or self.model_usage
+        if selected not in ("local", "remote"):
+            raise ValueError(f"usage must be 'local' or 'remote'; got {selected!r}.")
+        root = self.url_local if selected == "local" else self.url_remote
+        return (root or "").rstrip("/")
+
+    def _curl_url(self, path: str, usage: Literal["local", "remote"] | None = None) -> str:
+        """Join an endpoint path such as ``/v1/chat/completions`` onto the root."""
+        return f"{self._curl_root(usage)}{path}"
+
+    def _curl_tls(self, usage: Literal["local", "remote"] | None = None) -> tuple[list[str], str]:
+        """curl TLS flags (plus a one-line explanation) for this endpoint.
+
+        Mirrors the verification the real client uses (``_client_verify``):
+
+        * local, in-cluster HTTP -> no flags at all;
+        * HTTPS verified against the system CA store -> no flags;
+        * remote with REMOTE_CA_BUNDLE -> ``--cacert`` (``--capath`` for a dir);
+        * remote with verification disabled (the PCAI self-signed default) ->
+          ``-k``, curl's ``--insecure``.
+
+        May emit the one-time "remote TLS unverified" notice, exactly as
+        constructing a remote client does.
+
+        Returns
+        -------
+        tuple[list[str], str]
+            The flags to insert and a short human-readable TLS summary.
+        """
+        selected = usage or self.model_usage
+        if not self._curl_root(selected).lower().startswith("https"):
+            where = "in-cluster" if selected == "local" else "remote"
+            return [], f"{where} HTTP: no TLS flags needed"
+        verify = _client_verify(selected == "remote")
+        if verify is True:
+            return [], "HTTPS verified against the system CA store"
+        if isinstance(verify, str):
+            flag = "--capath" if os.path.isdir(verify) else "--cacert"
+            return [flag, verify], f"HTTPS verified against the pinned CA bundle {verify!r}"
+        reason = "self-signed PCAI ingress certificate"
+        if selected == "remote" and _REMOTE_CA_BUNDLE and not os.path.exists(_REMOTE_CA_BUNDLE):
+            reason = f"REMOTE_CA_BUNDLE={_REMOTE_CA_BUNDLE!r} does not exist"
+        return ["-k"], f"HTTPS with verification DISABLED ({reason}); -k is curl's --insecure"
+
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """The HTTP requests behind this model's base functions.
+
+        Parameters
+        ----------
+        usage:
+            "local" or "remote"; defaults to this model's model_usage. The
+            returned URLs are already resolved for it.
+
+        Returns
+        -------
+        dict[str, CurlOperation]
+            Ordered ``{operation name: request}``. BaseModel contributes the
+            model-list probe (a cheap connectivity/auth check); subclasses add
+            the endpoints their class serves (ChatModel: chat and responses,
+            VoiceModel: asr/tts/voices, ...). A class with no endpoint of its
+            own (SpeechFlowModel) delegates to the models it composes and
+            returns {} when they are unresolved.
+
+        Examples
+        --------
+        A ChatModel exposes the probe plus both LLM transports::
+
+            list(model.base_curl_operations())  # ['models', 'chat', 'responses']
+        """
+        return {
+            "models": CurlOperation(
+                name="models",
+                method="GET",
+                url=self._curl_url("/v1/models", usage),
+                python_call="discover_model_name / discover_model_ids",
+            )
+        }
+
+    def _render_curl(
+        self,
+        operation: CurlOperation,
+        usage: Literal["local", "remote"] | None,
+        include_api_key: bool,
+    ) -> str:
+        """Render one operation as a comment block plus a curl command."""
+        if not operation.url.lower().startswith(("http://", "https://")):
+            return (
+                f"# {type(self).__name__} {operation.name}: no endpoint URL configured "
+                f"(url_remote={self.url_remote!r}) - nothing to curl"
+            )
+        selected = usage or self.model_usage
+        flags, tls_summary = self._curl_tls(selected)
+        lines = [
+            f"# {type(self).__name__} {operation.name}"
+            + (f" - {operation.python_call}()" if operation.python_call else ""),
+            f"# transport: {selected} - {tls_summary}",
+        ]
+        if not self.api_key:
+            lines.append("# auth: none (this endpoint is key-less)")
+        elif include_api_key:
+            lines.append("# auth: bearer token inlined")
+        else:
+            lines.append("# auth: key redacted - export PCAI_API_KEY=<key> or pass include_api_key=True")
+        if operation.note:
+            lines.append(f"# note: {operation.note}")
+        command = [f"curl -sS -X {operation.method} {shlex.quote(operation.url)}"]
+        if self.api_key:
+            if include_api_key:
+                header = f"Authorization: Bearer {self.api_key}"
+                command.append(f"  -H {shlex.quote(header)}")
+            else:
+                command.append('  -H "Authorization: Bearer $PCAI_API_KEY"')
+        if operation.body is not None:
+            command.append("  -H 'Content-Type: application/json'")
+        if flags:
+            command.append("  " + " ".join(shlex.quote(flag) for flag in flags))
+        for name, value in operation.form.items():
+            command.append(f"  -F {shlex.quote(f'{name}={value}')}")
+        if operation.file_field is not None:
+            field_name, path = operation.file_field
+            command.append(f"  -F {shlex.quote(f'{field_name}=@{path}')}")
+        if operation.body is not None:
+            command.append(f"  -d {shlex.quote(json.dumps(operation.body))}")
+        lines.append(" \\\n".join(command))
+        return "\n".join(lines)
+
+    def curl_command(
+        self,
+        operation: str | None = None,
+        *,
+        usage: Literal["local", "remote"] | None = None,
+        include_api_key: bool = False,
+    ) -> str:
+        """Render the curl command(s) for this model's base functions.
+
+        Parameters
+        ----------
+        operation:
+            One operation name from :meth:`base_curl_operations` ("chat",
+            "responses", "embeddings", ...). Omit for every operation this
+            class exposes, separated by a blank line.
+        usage:
+            "local" or "remote"; defaults to this model's model_usage. The
+            command carries the matching TLS handling: none for in-cluster
+            HTTP, ``--cacert`` / ``--capath`` for a pinned CA bundle, ``-k``
+            when remote verification is disabled (the PCAI self-signed
+            default). Passing the other side does NOT switch the model.
+        include_api_key:
+            False (default) redacts the bearer token to ``$PCAI_API_KEY`` so
+            the text is safe to log; True inlines the model's api_key so the
+            command runs as-is.
+
+        Returns
+        -------
+        str
+            A comment block naming the class, the backing method, the
+            transport and its TLS posture, then the curl command with
+            backslash continuations.
+
+        Raises
+        ------
+        ValueError
+            operation is not one of this class's base functions, or usage is
+            neither "local" nor "remote".
+
+        Examples
+        --------
+        A runnable chat command against the remote ingress::
+
+            model.curl_command("chat", usage="remote", include_api_key=True)
+        """
+        operations = self.base_curl_operations(usage=usage)
+        if operation is None:
+            if not operations:
+                return f"# {type(self).__name__}: {self._curl_empty_note}"
+            return "\n\n".join(
+                self._render_curl(operation=op, usage=usage, include_api_key=include_api_key)
+                for op in operations.values()
+            )
+        selected = operations.get(operation)
+        if selected is None:
+            available = ", ".join(operations) or "none"
+            raise ValueError(f"{type(self).__name__} has no curl operation {operation!r}; available: {available}.")
+        return self._render_curl(operation=selected, usage=usage, include_api_key=include_api_key)
+
+    def print_curl_command(
+        self,
+        operation: str | None = None,
+        *,
+        usage: Literal["local", "remote"] | None = None,
+        include_api_key: bool = False,
+    ) -> str:
+        """Print (and return) the curl command(s) for this model's base functions.
+
+        Thin wrapper over :meth:`curl_command` for REPL / debugging use: the
+        text goes to stdout and is also returned, so a caller can log it or
+        assert on it.
+
+        Parameters
+        ----------
+        operation, usage, include_api_key:
+            As for :meth:`curl_command`.
+
+        Returns
+        -------
+        str
+            Exactly the text that was printed.
+
+        Examples
+        --------
+        Print every base function of a chat model at its current transport::
+
+            model.print_curl_command()
+        """
+        text = self.curl_command(operation, usage=usage, include_api_key=include_api_key)
+        print(text)
+        return text
 
     _REPR_SKIP = frozenset(
         {
@@ -1125,6 +1416,32 @@ class ChatModel(BaseModel):
             The raw response; output_text holds the concatenated text.
         """
         return self.llm_async_response_function(input=input, **chat_kwargs)
+
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """Chat Completions and Responses: the two LLM base functions.
+
+        ``chat`` is the transport the Agents SDK uses by default and the only
+        reliable tool-calling path on SGLang/vLLM; ``responses`` is the
+        /v1/responses API those servers reject for tool-result round-trips.
+        """
+        operations = super().base_curl_operations(usage=usage)
+        model = self.model_name or "<model-id>"
+        operations["chat"] = CurlOperation(
+            name="chat",
+            method="POST",
+            url=self._curl_url("/v1/chat/completions", usage),
+            python_call="llm_chat_function_call",
+            body={"model": model, "messages": [{"role": "user", "content": "Hello"}]},
+        )
+        operations["responses"] = CurlOperation(
+            name="responses",
+            method="POST",
+            url=self._curl_url("/v1/responses", usage),
+            python_call="llm_response_function_call",
+            body={"model": model, "input": "Hello"},
+            note="SGLang/vLLM reject tool-result round-trips here; chat is the default transport.",
+        )
+        return operations
 
     def agent(self, tool_json: dict[str, dict[str, Any]] | None = None):
         """Build an Agents SDK Agent bound to this model (blocking wrapper).
@@ -1501,6 +1818,46 @@ class VoiceModel(BaseModel):
         """
         return self.asr_async_function(file=file, **chat_kwargs)
 
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """ASR, TTS and the voice list, filtered by this model's model_type.
+
+        An ASR model has no synthesis endpoint and a TTS model has no
+        transcription endpoint (the ``*_function`` helpers assert the same), so
+        only the operations this model can actually serve are listed.
+        """
+        operations = super().base_curl_operations(usage=usage)
+        model = self.model_name or "<model-id>"
+        if self.model_type != "TTS":
+            operations["asr"] = CurlOperation(
+                name="asr",
+                method="POST",
+                url=self._curl_url("/v1/audio/transcriptions", usage),
+                python_call="asr_function_call",
+                form={"model": model},
+                file_field=("file", "audio.wav"),
+                note="replace audio.wav with the recording to transcribe",
+            )
+        if self.model_type != "ASR":
+            operations["tts"] = CurlOperation(
+                name="tts",
+                method="POST",
+                url=self._curl_url("/v1/audio/speech", usage),
+                python_call="tts_function_call",
+                body={
+                    "model": model,
+                    "input": "Hello from the PCAI model classes.",
+                    "voice": self.tts_voice,
+                },
+                note="returns audio bytes; add -o speech.mp3 to save them",
+            )
+            operations["voices"] = CurlOperation(
+                name="voices",
+                method="GET",
+                url=self._curl_url("/v1/audio/voices", usage),
+                python_call="_get_available_voices",
+            )
+        return operations
+
     def to_mcp_tools(self) -> list[ToolDefinition]:
         """Expose TTS as ``synthesize`` and/or ASR as ``transcribe``,
         depending on ``model_type``."""
@@ -1693,6 +2050,39 @@ class SpeechFlowModel(BaseModel):
                 handler=_audio_chat,
             )
         ]
+
+    _curl_empty_note = (
+        "sub-models are not resolved, so there is nothing to curl yet - build the flow through "
+        "build_model_from_source (or set asr_model/llm_model/tts_model)"
+    )
+
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """The three requests the flow chains: ASR -> chat -> TTS.
+
+        A flow has no endpoint of its own, so each step is rendered against the
+        sub-model that serves it -- and each keeps that sub-model's own
+        model_usage unless ``usage`` is given. Returns {} until the sub-models
+        are resolved.
+        """
+        operations: dict[str, CurlOperation] = {}
+        steps = (
+            ("asr", self.asr_model, "asr"),
+            ("llm", self.llm_model, "chat"),
+            ("tts", self.tts_model, "tts"),
+        )
+        for step, model, operation_name in steps:
+            if model is None:
+                continue
+            step_operations = model.base_curl_operations(usage=usage)
+            if operation_name not in step_operations:
+                continue
+            operation = step_operations[operation_name]
+            operations[step] = replace(
+                operation,
+                name=step,
+                python_call=f"{step} step - {operation.python_call}",
+            )
+        return operations
 
     async def _run_audio_chat(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run ASR → LLM → TTS over the input audio.
@@ -2000,6 +2390,19 @@ class EmbeddingModel(BaseModel):
             return MultiModalEmbeddings(self)
         return super().model
 
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """The embeddings call behind model.embed_documents / aembed_documents."""
+        operations = super().base_curl_operations(usage=usage)
+        operations["embeddings"] = CurlOperation(
+            name="embeddings",
+            method="POST",
+            url=self._curl_url("/v1/embeddings", usage),
+            python_call="model.embed_documents / model.aembed_documents",
+            body={"model": self.model_name or "<model-id>", "input": ["Hello world"]},
+            note="input items may be content-part dicts, not just strings, on multimodal embedders",
+        )
+        return operations
+
     def to_mcp_tools(self) -> list[ToolDefinition]:
         """Expose this embedder as a single ``embed`` tool."""
 
@@ -2071,6 +2474,31 @@ class RerankerModel(BaseModel):
     @cached_property
     def model(self) -> MultiModalReranker:
         return self.model_instantiation_class(self)  # type: ignore[return-value]
+
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """The rerank call behind model.rerank / model.arerank.
+
+        The route sits on the endpoint ROOT, not under /v1: the adapter strips
+        the /v1 suffix from base_url before posting "/rerank".
+        """
+        operations = super().base_curl_operations(usage=usage)
+        operations["rerank"] = CurlOperation(
+            name="rerank",
+            method="POST",
+            url=self._curl_url("/rerank", usage),
+            python_call="model.rerank / model.arerank",
+            body={
+                "model": self.model_name or "<model-id>",
+                "query": "What is the capital of France?",
+                "documents": [
+                    "Paris is the capital of France.",
+                    "Berlin is the capital of Germany.",
+                ],
+                "mm_processor_kwargs": dict(self.mm_processor_kwargs),
+            },
+            note="not part of the OpenAI API: the route is on the endpoint root (/rerank), not under /v1",
+        )
+        return operations
 
     def to_mcp_tools(self) -> list[ToolDefinition]:
         """Expose this reranker as a single ``rerank`` tool."""
@@ -2558,6 +2986,27 @@ class DecisionModel(BaseModel):
         )
         resp.raise_for_status()
         return resp.json()
+
+    def base_curl_operations(self, usage: Literal["local", "remote"] | None = None) -> dict[str, CurlOperation]:
+        """The System One call behind system_one / system_one_async.
+
+        A decision model has no /v1/chat/completions and no /v1/responses:
+        POST /v1/systemone answers typed questions about one state.
+        """
+        operations = super().base_curl_operations(usage=usage)
+        operations["systemone"] = CurlOperation(
+            name="systemone",
+            method="POST",
+            url=self._curl_url("/v1/systemone", usage),
+            python_call="system_one / system_one_async",
+            body={
+                "model": self.model_name or "<model-id>",
+                "state": "the invoice total is 42.00 USD",
+                "questions": {"paid": {"type": "noul", "instructions": "Is it paid?"}},
+            },
+            note="answers are calibrated probabilities, not text; see decide/choice/yes_no/score",
+        )
+        return operations
 
     # -- convenience wrappers --------------------------------------------
 

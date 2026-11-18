@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DESIGN PROPOSAL — Admin console navigation (sidebar + search)</title>
+<!--
+  DESIGN MOCKUP — approved and IMPLEMENTED 2026-11-18 in src/pcai_llm/ui/admin.html.
+  Kept as the design record; the live console is the authority.
+  Standalone and dependency-free: open it with file:// in any browser.
+  It reuses the real admin.html design tokens so what you see is what the
+  implemented console will look like. No data, no network, no admin key.
+
+  Proposed for: src/pcai_llm/ui/admin.html (the admin console).
+  Reviewed against the live page at /admin.
+-->
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0f1117; --panel:#1a1d27; --panel2:#151821; --border:#2a2e3d;
+    --text:#e6e8ee; --dim:#8b90a3; --accent:#01a982; --accent-contrast:#04110d;
+    --accent2:#4b8bbe; --err:#e05252; --warn:#d9a036; --focus:#01a98266;
+    --rail-w:252px; --rail-w-collapsed:62px; --header-h:52px;
+    --hover:rgba(255,255,255,.04); --active:rgba(1,169,130,.12);
+  }
+  @media (prefers-color-scheme: light){
+    :root[data-theme="auto"]{
+      color-scheme: light;
+      --bg:#ffffff; --panel:#f5f7fa; --panel2:#eef2f6; --border:#d8dde4;
+      --text:#191919; --dim:#5f6773; --accent:#00815f; --accent-contrast:#ffffff;
+      --accent2:#2c6a9e; --focus:#00815f55; --hover:rgba(0,0,0,.04);
+      --active:rgba(0,129,95,.10);
+    }
+  }
+  :root[data-theme="light"]{
+    color-scheme: light;
+    --bg:#ffffff; --panel:#f5f7fa; --panel2:#eef2f6; --border:#d8dde4;
+    --text:#191919; --dim:#5f6773; --accent:#00815f; --accent-contrast:#ffffff;
+    --accent2:#2c6a9e; --focus:#00815f55; --hover:rgba(0,0,0,.04);
+    --active:rgba(0,129,95,.10);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+  button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+  code,kbd,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  /* ---------------- shell ---------------- */
+  .app{display:grid;grid-template-columns:var(--rail-w) minmax(0,1fr);min-height:100vh;transition:grid-template-columns .16s ease}
+  body.collapsed .app{grid-template-columns:var(--rail-w-collapsed) minmax(0,1fr)}
+
+  /* ---------------- rail ---------------- */
+  .rail{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;
+        position:sticky;top:0;height:100vh;overflow:hidden}
+  .rail-head{display:flex;align-items:center;gap:8px;padding:0 10px;height:var(--header-h);
+             border-bottom:1px solid var(--border);flex:none}
+  .brand{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden}
+  .brand .hpe{color:var(--accent);letter-spacing:.02em}
+  .brand .sub{color:var(--dim);font-weight:400}
+  .rail-collapse{margin-left:auto;color:var(--dim);border:1px solid var(--border);border-radius:6px;
+                 width:26px;height:26px;display:grid;place-items:center;flex:none}
+  .rail-collapse:hover{color:var(--text);border-color:var(--accent)}
+  body.collapsed .brand,body.collapsed .rail-search,body.collapsed .navsec-h span.lbl,
+  body.collapsed .navitem .lbl,body.collapsed .rail-foot .lbl,body.collapsed .rail-collapse svg{display:none}
+  body.collapsed .rail-collapse{margin:0 auto;transform:rotate(180deg)}
+
+  .rail-search{padding:10px 10px 8px;flex:none}
+  .searchbox{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);
+             border-radius:8px;padding:6px 8px}
+  .searchbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 2px var(--focus)}
+  .searchbox input{background:none;border:0;outline:0;color:var(--text);font:inherit;font-size:13px;width:100%}
+  .searchbox input::placeholder{color:var(--dim)}
+  .searchbox .kbd{border:1px solid var(--border);border-radius:4px;color:var(--dim);font-size:10.5px;padding:0 4px;flex:none}
+  #searchtoggle{display:none;color:var(--dim);border:1px solid var(--border);border-radius:7px;
+                width:30px;height:30px;place-items:center;margin:0 auto}
+  #searchtoggle:hover{color:var(--text);border-color:var(--accent)}
+  body.collapsed .rail-search .searchbox{display:none}
+  body.collapsed #searchtoggle{display:grid}
+
+  nav{overflow-y:auto;overflow-x:hidden;padding:4px 8px 12px;flex:1}
+  .navsec{margin-top:6px}
+  .navsec-h{display:flex;align-items:center;gap:6px;width:100%;padding:6px 8px 4px;color:var(--dim);
+            font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}
+  .navsec-h:hover{color:var(--text)}
+  .navsec-h .chev{margin-left:auto;transition:transform .14s ease;flex:none;opacity:.7}
+  .navsec.closed .chev{transform:rotate(-90deg)}
+  .navsec.closed .navitems{display:none}
+  .navitems{display:flex;flex-direction:column;gap:1px}
+
+  .navitem{display:flex;align-items:center;gap:10px;width:100%;padding:7px 10px;border-radius:7px;
+           color:var(--dim);font-size:13px;text-align:left;white-space:nowrap;position:relative}
+  .navitem:hover{background:var(--hover);color:var(--text)}
+  .navitem.active{background:var(--active);color:var(--accent);font-weight:600}
+  .navitem.active::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:2px;
+                          border-radius:2px;background:var(--accent)}
+  .navitem .ico{flex:none;width:18px;height:18px;display:grid;place-items:center;opacity:.9}
+  .navitem svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.6;
+               stroke-linecap:round;stroke-linejoin:round}
+  .navitem .lbl{overflow:hidden;text-overflow:ellipsis}
+  .navitem .badge{margin-left:auto;font-size:10.5px;border:1px solid var(--border);border-radius:9px;
+                  padding:0 6px;color:var(--dim);flex:none}
+  body.collapsed .navitem{justify-content:center;padding:9px 0}
+  body.collapsed .navsec-h{justify-content:center;padding:8px 0 2px}
+  body.collapsed .navsec-h .lbl,body.collapsed .navsec-h .chev{display:none}
+  body.collapsed .navsec-h::after{content:"";display:block;width:18px;height:1px;background:var(--border)}
+
+  .rail-foot{flex:none;border-top:1px solid var(--border);padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+  .rail-foot a,.rail-foot button{color:var(--dim);font-size:12px;text-decoration:none;display:flex;
+      align-items:center;gap:8px;padding:4px 6px;border-radius:6px}
+  .rail-foot a:hover,.rail-foot button:hover{color:var(--text);background:var(--hover)}
+
+  /* ---------------- main column ---------------- */
+  .col{min-width:0;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:10px;padding:0 18px;height:var(--header-h);
+         background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:6}
+  header .hamburger{display:none;border:1px solid var(--border);border-radius:6px;width:28px;height:28px;
+                    place-items:center;color:var(--dim)}
+  header input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);
+      border-radius:6px;padding:5px 8px;font-size:13px;width:300px}
+  header .spacer{flex:1}
+  .btn{background:var(--accent);color:var(--accent-contrast);border-radius:7px;padding:6px 14px;
+       font-weight:600;font-size:13px}
+  .ghost{border:1px solid var(--border);border-radius:7px;padding:5px 11px;font-size:13px;color:var(--text)}
+  .ghost:hover{border-color:var(--accent2)}
+  .theme-seg{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden}
+  .theme-seg button{color:var(--dim);padding:4px 9px;font-size:12px}
+  .theme-seg button.on{background:var(--accent);color:var(--accent-contrast);font-weight:600}
+  .conn{font-size:12px;color:var(--dim)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:5px}
+
+  main{padding:16px 22px 60px;max-width:1240px;width:100%}
+  .crumb{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);margin-bottom:10px;
+         letter-spacing:.02em}
+  .crumb b{color:var(--text);font-weight:600}
+  .panel{display:none}
+  .panel.active{display:block}
+  h2{font-size:16px;margin:4px 0 12px}
+  h3{font-size:12px;margin:16px 0 8px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+  label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],select{background:var(--bg);color:var(--text);border:1px solid var(--border);
+      border-radius:6px;padding:6px 9px;font:inherit;font-size:13px}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:13px}
+  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;border:1px solid var(--border);color:var(--dim)}
+  .pill.on{color:var(--accent);border-color:var(--accent)}
+  .muted{color:var(--dim)}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+  .stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  .stat .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .stat .v{font-size:22px;font-weight:600;margin-top:4px}
+  .note{border-left:3px solid var(--accent2);background:var(--panel);padding:10px 14px;border-radius:0 8px 8px 0;
+        font-size:13px;color:var(--dim);margin-bottom:14px}
+  .note b{color:var(--text)}
+
+  /* ---------------- compare mode (today's shell) ---------------- */
+  #oldnav{display:none}
+  body.compare .app{grid-template-columns:minmax(0,1fr)}
+  body.compare .rail{display:none}
+  body.compare #oldnav{display:flex;flex-wrap:wrap;gap:4px;padding:8px 16px 0;background:var(--panel);
+                       border-bottom:1px solid var(--border);position:sticky;top:var(--header-h);z-index:4}
+  body.compare .navgroup{display:flex;gap:4px}
+  body.compare .navgroup + .navgroup{border-left:1px solid var(--accent);margin-left:10px;padding-left:10px}
+  body.compare #oldnav button{color:var(--dim);padding:8px 14px;font-size:14px;border-bottom:2px solid transparent}
+  body.compare #oldnav button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  body.compare .crumb{display:none}
+
+  /* ---------------- responsive ---------------- */
+  @media (max-width:900px){
+    .app{grid-template-columns:minmax(0,1fr)}
+    .rail{position:fixed;left:0;top:0;bottom:0;width:var(--rail-w);z-index:30;
+          transform:translateX(-100%);transition:transform .18s ease;box-shadow:0 0 40px rgba(0,0,0,.5)}
+    body.drawer .rail{transform:none}
+    header .hamburger{display:grid}
+    .scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:25}
+    body.drawer .scrim{display:block}
+    header input[type=password]{width:150px}
+  }
+  .reviewbar{position:fixed;right:14px;bottom:14px;z-index:40;display:flex;gap:8px;align-items:center;
+             background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px 10px;
+             box-shadow:0 6px 24px rgba(0,0,0,.35);font-size:12px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ======================= PROPOSED LEFT RAIL ======================= -->
+  <aside class="rail" id="rail">
+    <div class="rail-head">
+      <span class="brand"><span class="hpe">HPE</span> PCAI Gateway <span class="sub">admin</span></span>
+      <button class="rail-collapse" id="collapse" title="Collapse rail  ( [ )" aria-label="Collapse navigation">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+    </div>
+
+    <div class="rail-search">
+      <div class="searchbox">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" style="color:var(--dim);flex:none"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="navsearch" type="text" placeholder="Search navigation…" aria-label="Search navigation"
+               autocomplete="off" spellcheck="false">
+        <span class="kbd">/</span>
+      </div>
+      <!-- collapsed rail: the field is hidden, so search must still be one click away -->
+      <button id="searchtoggle" title="Search  ( / )" aria-label="Search navigation">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      </button>
+    </div>
+
+    <nav id="nav" aria-label="Admin sections">
+      <div class="navsec" data-sec="access" data-name="Access &amp; safety">
+        <button class="navsec-h" aria-expanded="true"><span class="lbl">Access &amp; safety</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="navitems">
+          <button class="navitem active" data-tab="keys" data-kw="api keys tokens mint revoke rotate create key">
+            <span class="ico" data-icon="key"></span><span class="lbl">API keys</span></button>
+          <button class="navitem" data-tab="profiles" data-kw="profiles budgets cascade routing policy grants presets">
+            <span class="ico" data-icon="sliders"></span><span class="lbl">Profiles</span></button>
+          <button class="navitem" data-tab="enroll" data-kw="enrollment enroll code sso self-mint mint top-up requests">
+            <span class="ico" data-icon="ticket"></span><span class="lbl">Enrollment</span></button>
+          <button class="navitem" data-tab="guardrails" data-kw="guardrails policy pii secrets blocklist regex webhook content">
+            <span class="ico" data-icon="shield"></span><span class="lbl">Guardrails</span></button>
+        </div>
+      </div>
+
+      <div class="navsec" data-sec="models" data-name="Models &amp; routing">
+        <button class="navsec-h" aria-expanded="true"><span class="lbl">Models &amp; routing</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="navitems">
+          <button class="navitem" data-tab="models" data-kw="model endpoints pools register upstream vllm">
+            <span class="ico" data-icon="server"></span><span class="lbl">Model endpoints</span></button>
+          <button class="navitem" data-tab="advertised" data-kw="presented advertised v1 models catalogue catalog">
+            <span class="ico" data-icon="broadcast"></span><span class="lbl">Presented models</span></button>
+          <button class="navitem" data-tab="groups" data-kw="model groups load balanced equivalence">
+            <span class="ico" data-icon="grid"></span><span class="lbl">Model groups</span></button>
+          <button class="navitem" data-tab="routing" data-kw="routing router tiers policy prompt statistics decisions">
+            <span class="ico" data-icon="route"></span><span class="lbl">Routing</span></button>
+        </div>
+      </div>
+
+      <div class="navsec" data-sec="tools" data-name="Agents &amp; tools">
+        <button class="navsec-h" aria-expanded="true"><span class="lbl">Agents &amp; tools</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="navitems">
+          <button class="navitem" data-tab="agents" data-kw="agents tool surface prompt pin model">
+            <span class="ico" data-icon="bot"></span><span class="lbl">Agents</span></button>
+          <button class="navitem" data-tab="mcp" data-kw="mcp servers federation tools acl grants register">
+            <span class="ico" data-icon="plug"></span><span class="lbl">MCP servers</span></button>
+        </div>
+      </div>
+
+      <div class="navsec" data-sec="obs" data-name="Observability">
+        <button class="navsec-h" aria-expanded="true"><span class="lbl">Observability</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="navitems">
+          <button class="navitem" data-tab="usage" data-kw="usage cost pricing ledger chargeback tokens spend">
+            <span class="ico" data-icon="chart"></span><span class="lbl">Usage &amp; cost</span></button>
+          <button class="navitem" data-tab="traces" data-kw="traces agent trace debugging steps">
+            <span class="ico" data-icon="pulse"></span><span class="lbl">Agent traces</span></button>
+          <button class="navitem" data-tab="metrics" data-kw="metrics throughput load latency live endpoints">
+            <span class="ico" data-icon="gauge"></span><span class="lbl">Live metrics</span></button>
+          <button class="navitem" data-tab="audit" data-kw="audit trail admin changes history">
+            <span class="ico" data-icon="list"></span><span class="lbl">Admin audit</span></button>
+        </div>
+      </div>
+
+      <div class="navsec" data-sec="ops" data-name="Operations">
+        <button class="navsec-h" aria-expanded="true"><span class="lbl">Operations</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="navitems">
+          <button class="navitem" data-tab="offpeak" data-kw="off-peak offpeak billing gpu util cache utilization">
+            <span class="ico" data-icon="moon"></span><span class="lbl">Off-peak billing</span></button>
+          <button class="navitem" data-tab="distiller" data-kw="memory distiller distill summarizer canonical memories">
+            <span class="ico" data-icon="brain"></span><span class="lbl">Memory distiller</span></button>
+        </div>
+      </div>
+
+      <div id="noresults" class="muted" style="display:none;padding:10px;font-size:12.5px">
+        No matching section.
+      </div>
+    </nav>
+
+    <div class="rail-foot">
+      <a href="#" title="Back to the chat console"><span class="ico">←</span><span class="lbl">Chat console</span></a>
+      <button id="themebtn" title="Theme"><span class="ico">◐</span><span class="lbl">Theme: Auto</span></button>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ======================= MAIN COLUMN ======================= -->
+  <div class="col">
+    <header>
+      <button class="hamburger" id="hamburger" aria-label="Open navigation">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <input id="adminkey" type="password" placeholder="Admin key (PCAI_LLM_ADMIN_API_KEYS)" aria-label="Admin key">
+      <button class="btn">Connect</button>
+      <span class="conn"><span class="dot"></span>connected</span>
+      <div class="spacer"></div>
+      <div class="theme-seg" role="group" aria-label="Theme">
+        <button class="on">Auto</button><button>Light</button><button>Dark</button>
+      </div>
+    </header>
+
+    <!-- today's top nav, for the compare toggle -->
+    <div id="oldnav">
+      <div class="navgroup"><button class="active">Keys</button><button>Profiles</button><button>Enroll</button></div>
+      <div class="navgroup"><button>Models</button><button>Advertised</button><button>Agents</button><button>MCP</button><button>Metrics</button></div>
+      <div class="navgroup"><button>Usage</button><button>Traces</button><button>Audit</button><button>Guardrails</button></div>
+      <div class="navgroup"><button>Off-peak</button><button>Model groups</button><button>Memory Distiller</button><button>Routing</button></div>
+    </div>
+
+    <main>
+      <div class="crumb"><span id="crumb-sec">Access &amp; safety</span> <span>/</span> <b id="crumb-tab">API keys</b></div>
+
+      <section class="panel active" id="panel-keys">
+        <div class="note"><b>Mockup.</b> Panel bodies are placeholders copied in shape from today's
+          console — the proposal covers the SHELL (navigation, search, hierarchy), not the panels.</div>
+        <div class="card">
+          <h2>Create a key</h2>
+          <div class="row">
+            <label>Tenant <select><option>acme</option><option>research</option></select></label>
+            <label>Profile <select><option>standard</option><option>power</option></select></label>
+            <label>Name <input type="text" value="agent-ci"></label>
+            <button class="btn">Create key</button>
+          </div>
+        </div>
+        <h2>Keys <span class="muted" style="font-size:12px">show revoked</span></h2>
+        <table>
+          <thead><tr><th>Key</th><th>User</th><th>Profile</th><th>Created</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="mono">hllm-9f2c…</td><td>andrew</td><td>power</td><td>2026-11-02</td>
+                <td><span class="pill on">active</span></td><td><span class="pill">rotate</span> <span class="pill">revoke</span></td></tr>
+            <tr><td class="mono">hllm-71ab…</td><td>francesco</td><td>standard</td><td>2026-10-28</td>
+                <td><span class="pill on">active</span></td><td><span class="pill">rotate</span> <span class="pill">revoke</span></td></tr>
+            <tr><td class="mono">hllm-03de…</td><td>bryan</td><td>standard</td><td>2026-09-14</td>
+                <td><span class="pill">revoked</span></td><td></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="panel-usage">
+        <h2>Usage &amp; cost</h2>
+        <div class="grid3">
+          <div class="stat"><div class="k">Tokens today</div><div class="v">12.4M</div></div>
+          <div class="stat"><div class="k">Cost today</div><div class="v">$41.20</div></div>
+          <div class="stat"><div class="k">Cache hits</div><div class="v">18%</div></div>
+          <div class="stat"><div class="k">Active keys</div><div class="v">7</div></div>
+        </div>
+        <h3>By key — chargeback view</h3>
+        <table>
+          <thead><tr><th>Key</th><th>Prompt</th><th>Cached</th><th>Completion</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">hllm-9f2c…</td><td>8.1M</td><td>3.2M</td><td>1.1M</td><td>$22.80</td></tr>
+            <tr><td class="mono">hllm-71ab…</td><td>2.9M</td><td>0.4M</td><td>0.3M</td><td>$18.40</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="panel-mcp">
+        <h2>Registered MCP servers</h2>
+        <table>
+          <thead><tr><th>Server</th><th>URL</th><th>Tools</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="mono">logsearch</td><td class="mono muted">logsearch.svc:8080</td><td>5</td>
+                <td><span class="pill on">ok</span></td><td><span class="pill">test</span> <span class="pill">edit</span></td></tr>
+            <tr><td class="mono">searxng</td><td class="mono muted">searxng.svc:8080</td><td>2</td>
+                <td><span class="pill on">ok</span></td><td><span class="pill">test</span> <span class="pill">edit</span></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="panel-generic">
+        <div class="card"><h2 id="generic-title">Panel</h2>
+          <p class="muted">This panel is unchanged by the proposal. Its content moves verbatim; only the
+            navigation shell around it changes.</p></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="reviewbar">
+  <span>DESIGN PROPOSAL</span>
+  <button class="ghost" id="compare">Compare: today's top bar</button>
+  <button class="ghost" id="collapse2">Collapse rail</button>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  /* ---- icons (stroke, currentColor) ---- */
+  var ICONS = {
+    key:      '<circle cx="8" cy="12" r="4"/><path d="M12 12h9M17 12v4M20 12v3"/>',
+    sliders:  '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+    ticket:   '<path d="M4 8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-4z"/><path d="M12 9v6"/>',
+    shield:   '<path d="M12 3l7 3v5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9.5 12l1.8 1.8 3.4-3.6"/>',
+    server:   '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+    broadcast:'<circle cx="12" cy="12" r="2"/><path d="M7.5 7.5a6.4 6.4 0 0 0 0 9M16.5 16.5a6.4 6.4 0 0 0 0-9M4.5 4.5a10.6 10.6 0 0 0 0 15M19.5 19.5a10.6 10.6 0 0 0 0-15"/>',
+    grid:     '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
+    route:    '<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.5 6h4.5a3 3 0 0 1 3 3v6"/><path d="M6 8.5v4a3 3 0 0 0 3 3h2"/>',
+    bot:      '<rect x="4" y="8" width="16" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9.5 16.5h5"/>',
+    plug:     '<path d="M9 3v5M15 3v5"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/>',
+    chart:    '<path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="12" width="3" height="5"/><rect x="12" y="8" width="3" height="9"/><rect x="17" y="5" width="3" height="12"/>',
+    pulse:    '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/>',
+    gauge:    '<path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-5"/><circle cx="12" cy="18" r="1.4"/>',
+    list:     '<path d="M8 6h12M8 12h12M8 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+    moon:     '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/>',
+    brain:    '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1 5.8V15a3 3 0 0 0 4 2.8V20"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1 5.8V15a3 3 0 0 1-4 2.8V20"/><path d="M9 4v16M15 4v16"/>'
+  };
+  var nodes = document.querySelectorAll("[data-icon]");
+  for (var i = 0; i < nodes.length; i++) {
+    var k = nodes[i].getAttribute("data-icon");
+    nodes[i].innerHTML = '<svg viewBox="0 0 24 24">' + (ICONS[k] || "") + "</svg>";
+  }
+
+  /* ---- tab switching (same flat data-tab contract as today) ---- */
+  var nav = document.getElementById("nav");
+  var crumbSec = document.getElementById("crumb-sec");
+  var crumbTab = document.getElementById("crumb-tab");
+  var TITLES = {
+    keys:"API keys", profiles:"Profiles", enroll:"Enrollment", guardrails:"Guardrails",
+    models:"Model endpoints", advertised:"Presented models", groups:"Model groups", routing:"Routing",
+    agents:"Agents", mcp:"MCP servers", usage:"Usage & cost", traces:"Agent traces",
+    metrics:"Live metrics", audit:"Admin audit", offpeak:"Off-peak billing", distiller:"Memory distiller"
+  };
+  function activateTab(tab) {
+    var items = nav.querySelectorAll(".navitem");
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle("active", items[i].getAttribute("data-tab") === tab);
+    }
+    var sec = nav.querySelector('.navitem[data-tab="' + tab + '"]');
+    var secEl = sec && sec.closest(".navsec");
+    crumbSec.textContent = secEl ? secEl.getAttribute("data-name").replace("&amp;", "&") : "";
+    crumbTab.textContent = TITLES[tab] || tab;
+    var panels = document.querySelectorAll(".panel");
+    for (var j = 0; j < panels.length; j++) panels[j].classList.remove("active");
+    var p = document.getElementById("panel-" + tab);
+    if (!p) {
+      p = document.getElementById("panel-generic");
+      document.getElementById("generic-title").textContent = TITLES[tab] || tab;
+    }
+    p.classList.add("active");
+    history.replaceState(null, "", "#" + tab);
+    document.body.classList.remove("drawer");
+  }
+  nav.addEventListener("click", function (e) {
+    var item = e.target.closest(".navitem");
+    if (item) { activateTab(item.getAttribute("data-tab")); return; }
+    var head = e.target.closest(".navsec-h");
+    if (head) {
+      var sec = head.closest(".navsec");
+      sec.classList.toggle("closed");
+      head.setAttribute("aria-expanded", String(!sec.classList.contains("closed")));
+      saveSections();
+    }
+  });
+
+  /* ---- rail collapse ---- */
+  function toggleCollapse() {
+    document.body.classList.toggle("collapsed");
+    try { localStorage.setItem("pcai-admin-rail", document.body.classList.contains("collapsed") ? "collapsed" : "open"); } catch (e) {}
+  }
+  document.getElementById("collapse").addEventListener("click", toggleCollapse);
+  document.getElementById("collapse2").addEventListener("click", toggleCollapse);
+  try { if (localStorage.getItem("pcai-admin-rail") === "collapsed") document.body.classList.add("collapsed"); } catch (e) {}
+
+  /* ---- section collapse persistence ---- */
+  function saveSections() {
+    var closed = [];
+    var secs = nav.querySelectorAll(".navsec");
+    for (var i = 0; i < secs.length; i++) if (secs[i].classList.contains("closed")) closed.push(secs[i].getAttribute("data-sec"));
+    try { localStorage.setItem("pcai-admin-navsecs", JSON.stringify(closed)); } catch (e) {}
+  }
+  try {
+    var saved = JSON.parse(localStorage.getItem("pcai-admin-navsecs") || "[]");
+    for (var s = 0; s < saved.length; s++) {
+      var el = nav.querySelector('.navsec[data-sec="' + saved[s] + '"]');
+      if (el) el.classList.add("closed");
+    }
+  } catch (e) {}
+
+  /* ---- search: matches label + keyword list + section name ---- */
+  var search = document.getElementById("navsearch");
+  var noRes = document.getElementById("noresults");
+  function filterNav() {
+    var q = search.value.trim().toLowerCase();
+    var secs = nav.querySelectorAll(".navsec");
+    var any = false;
+    for (var i = 0; i < secs.length; i++) {
+      var sec = secs[i];
+      var secName = sec.getAttribute("data-name").toLowerCase();
+      var items = sec.querySelectorAll(".navitem");
+      var hits = 0;
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j];
+        var hay = (it.querySelector(".lbl").textContent + " " + it.getAttribute("data-kw") + " " + secName).toLowerCase();
+        var match = !q || hay.indexOf(q) !== -1;
+        it.style.display = match ? "" : "none";
+        if (match) hits++;
+      }
+      sec.style.display = hits ? "" : "none";
+      if (hits) { any = true; if (q) sec.classList.remove("closed"); }
+    }
+    noRes.style.display = any ? "none" : "block";
+  }
+  search.addEventListener("input", filterNav);
+  search.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { search.value = ""; filterNav(); search.blur(); }
+    if (e.key === "Enter") {
+      var first = nav.querySelector('.navitem:not([style*="none"])');
+      if (first) activateTab(first.getAttribute("data-tab"));
+    }
+  });
+
+  /* ---- collapsed-rail search button: expand, then focus the field ---- */
+  document.getElementById("searchtoggle").addEventListener("click", function () {
+    document.body.classList.remove("collapsed");
+    try { localStorage.setItem("pcai-admin-rail", "open"); } catch (e) {}
+    setTimeout(function () { search.focus(); search.select(); }, 40);
+  });
+
+  /* ---- keyboard: / search, [ collapse ---- */
+  document.addEventListener("keydown", function (e) {
+    var typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+    if (e.key === "/" && !typing) { e.preventDefault(); search.focus(); search.select(); }
+    if (e.key === "[" && !typing) toggleCollapse();
+    if (e.key === "Escape" && document.body.classList.contains("drawer")) document.body.classList.remove("drawer");
+  });
+
+  /* ---- mobile drawer ---- */
+  document.getElementById("hamburger").addEventListener("click", function () {
+    document.body.classList.toggle("drawer");
+  });
+  document.getElementById("scrim").addEventListener("click", function () {
+    document.body.classList.remove("drawer");
+  });
+
+  /* ---- theme + compare (review conveniences) ---- */
+  var themeIdx = 0, themes = ["auto", "light", "dark"];
+  document.getElementById("themebtn").addEventListener("click", function () {
+    themeIdx = (themeIdx + 1) % 3;
+    document.documentElement.setAttribute("data-theme", themes[themeIdx]);
+    this.querySelector(".lbl").textContent = "Theme: " + themes[themeIdx].charAt(0).toUpperCase() + themes[themeIdx].slice(1);
+  });
+  var cmp = document.getElementById("compare");
+  cmp.addEventListener("click", function () {
+    document.body.classList.toggle("compare");
+    var on = document.body.classList.contains("compare");
+    cmp.textContent = on ? "Back to proposed sidebar" : "Compare: today's top bar";
+  });
+
+  /* ---- boot: honour #hash, else first tab ---- */
+  var h = (location.hash || "").replace("#", "");
+  activateTab(TITLES[h] ? h : "keys");
+})();
+</script>
+</body>
+</html>

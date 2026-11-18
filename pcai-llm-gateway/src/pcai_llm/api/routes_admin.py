@@ -487,6 +487,15 @@ class EndpointSpec(BaseModel):
     # Panel-managed key: None = keep existing, "" = clear, "..." = set/replace.
     # Stored Fernet-encrypted (master key); NEVER returned by any endpoint.
     api_key: str | None = None
+    # Credential carry-over across a base_url EDIT (2026-11-18 operator report).
+    # A pool's upsert identity is (model_name, base_url), so re-pointing an
+    # endpoint at a new address INSERTs a new row — "api_key: null = keep" then
+    # has no row to keep, and the REPLACE-prune deletes the old row that held the
+    # only copy of the ciphertext: the credential was silently destroyed while
+    # the console still rendered "(unchanged)". The console therefore names the
+    # row's PREVIOUS base_url here and the stored ciphertext is COPIED onto the
+    # new row. Consulted only when api_key is null; a typed api_key wins.
+    api_key_from: str | None = None
 
 
 MODEL_TYPES = {"chat", "embedding", "reranker", "voice", "decision"}
@@ -2372,8 +2381,19 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
             log.warning("model upsert: model-group shadow check failed (fail-open)", exc_info=True)
     # Panel credentials: resolve each endpoint's api_key to ciphertext (or a
     # clear/set marker) BEFORE the write; plaintext never leaves this block.
+    # A MOVED endpoint (base_url edited): its credential lives on the row it
+    # moved FROM, so "keep" cannot mean "leave this row's column alone" — this
+    # row does not exist yet. The ciphertext is carried over below. ONE predicate,
+    # consumed by the write, the source lookup and the audit row, so the three
+    # can never disagree about which endpoints are moving.
+    moved = [
+        ep.api_key_from
+        if ep.api_key is None and ep.api_key_from and ep.api_key_from != ep.base_url
+        else None
+        for ep in body.endpoints
+    ]
     enc_rows = []
-    for ep in body.endpoints:
+    for ep, moved_from in zip(body.endpoints, moved, strict=True):
         if ep.api_key is None:
             enc = None  # marker: leave existing column untouched
         elif ep.api_key == "":
@@ -2386,9 +2406,44 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
                     "is not set (deploy the Secret, or use api_key_secret by-ref)",
                 )
             enc = secretbox.encrypt(ep.api_key)
-        enc_rows.append((body.model_name, ep.base_url, ep.priority, ep.weight, ep.api_key_secret, enc))
+        enc_rows.append(
+            (body.model_name, ep.base_url, ep.priority, ep.weight, ep.api_key_secret, enc, moved_from)
+        )
     async with db.acquire() as conn, conn.transaction():
-        for model_name, base_url, priority, weight, secret_name, enc in enc_rows:
+        # CREDENTIAL CARRY-OVER (2026-11-18). Resolved INSIDE the write's own
+        # transaction: the source row is about to be pruned by the REPLACE
+        # semantics below, and a read taken outside would let a concurrent prune
+        # turn a promised carry-over into the same silent no-op this fixes.
+        # The CIPHERTEXT is copied verbatim — never decrypted, never re-encrypted
+        # — so the carry-over cannot leak a plaintext and does not depend on the
+        # master key that produced it still being loaded.
+        sources = sorted({m for m in moved if m})
+        carried: dict[str, str] = {}
+        if sources:
+            src_rows = await conn.fetch(
+                "SELECT base_url, auth_token_enc FROM model_endpoints "
+                "WHERE model_name = $1 AND base_url = ANY($2)",
+                body.model_name,
+                sources,
+            )
+            carried = {
+                r["base_url"]: r["auth_token_enc"]
+                for r in src_rows
+                if r["auth_token_enc"]
+            }
+            missing = [s for s in sources if s not in carried]
+            if missing:
+                # FAIL LOUD: silently writing a credential-less row is exactly
+                # the bug this parameter exists to close.
+                raise HTTPException(
+                    400,
+                    f"api_key_from {missing!r} names no stored credential in pool "
+                    f"{body.model_name!r} — paste the key instead of carrying it",
+                )
+        for model_name, base_url, priority, weight, secret_name, enc, moved_from in enc_rows:
+            if enc is None and moved_from:
+                # validated above: a carried ciphertext is always present here
+                enc = carried[moved_from]
             if enc is None:
                 # keep the stored credential as-is
                 await conn.execute(
@@ -2445,8 +2500,13 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
                     "weight": ep.weight,
                     "api_key_secret": ep.api_key_secret,
                     "panel_credential_set": ep.api_key is not None,  # set/clear marker, never the value
+                    # A base_url edit that carried the stored ciphertext over
+                    # names the row it came FROM (never the value). Without
+                    # this the trail read "panel_credential_set: false" and
+                    # looked like the operator had cleared the key.
+                    "panel_credential_carried_from": moved_from,
                 }
-                for ep in body.endpoints
+                for ep, moved_from in zip(body.endpoints, moved, strict=True)
             ],
         },
     )

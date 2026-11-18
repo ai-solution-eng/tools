@@ -66,7 +66,15 @@ EXCEPTIONS = PC / "reconcile_exceptions.json"
 ROOT_FILES = ["hardlinker.py", "prune_charts.py", "ruff.toml", "mypy.ini", "bump_version.sh", "mcp_auth.py"]
 # Control-plane scripts that STAY in pcai_utils — never distributed into
 # consumer utils dirs (same class as hardlinker.py / prune_charts.py).
-CONTROL_PLANE = {"hardlinker.py", "prune_charts.py", "fleet_reconcile.py", "__init__.py"}
+# token_estimator.py is tooling too: a standalone prefill-throughput model used by
+# ModelBenchmarker's scratch analysis, imported by no package at runtime.
+CONTROL_PLANE = {
+    "hardlinker.py",
+    "prune_charts.py",
+    "fleet_reconcile.py",
+    "token_estimator.py",
+    "__init__.py",
+}
 # pcai_utils modules distributed into src/*/utils (derived, like the gate).
 UTIL_MODULES = [f for f in sorted(PC.glob("*.py")) if f.name not in CONTROL_PLANE and "sync-conflict" not in f.name]
 PREPROCESSORS = sorted((PC / "preprocessors").glob("*.py"))
