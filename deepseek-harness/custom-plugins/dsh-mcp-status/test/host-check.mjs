@@ -374,6 +374,23 @@ await record('snapshot: servers added through the MCP servers page are counted',
   const plain = await buildSnapshot(plainCtx, settings, caches(), false)
   assert.equal(plain.summary.total, 2)
   assert.equal(plain.connections.find((item) => item.serverName === 'aruba').toolCount, 2)
+
+  // The host row was renamed once already (dsh-mcp-servers -> the composed
+  // dsh-mcp bundle). Discovery must not depend on the package name, or every
+  // page-managed server disappears from the panel.
+  const renamed = {
+    id: 'mcp',
+    options: { id: 'mcp', name: '@local/dsh-mcp', config: { servers: managed } },
+    fiber: { effectiveConfig: { servers: volatileRef }, state: 2 },
+    disabled: false,
+  }
+  const renamedCtx = {
+    loader: { entries: () => [renamed][Symbol.iterator]() },
+    tools: { schemas: () => [{ name: 'mcp__aruba__health' }, { name: 'mcp__aruba__skills_list' }] },
+  }
+  const afterRename = await buildSnapshot(renamedCtx, settings, caches(), false)
+  assert.equal(afterRename.summary.total, 2, 'a renamed host row is still discovered')
+  assert.equal(afterRename.connections.find((item) => item.serverName === 'aruba').state, 'connected')
 })
 
 await record('snapshot: upstream servers appear for the gateway', async () => {

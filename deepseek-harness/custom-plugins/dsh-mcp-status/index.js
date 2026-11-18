@@ -26,15 +26,6 @@ import { catalogCandidatesFor, commandName, messageOf, probeMcpHttp, redactUrl }
 /** Loader rows this plugin reports on. */
 const MCP_CLIENT_SPECIFIER = 'mcp-client'
 
-/**
- * Loader row that owns the servers added through Settings -> MCP servers.
- *
- * Those servers are mounted as sub-fibers of that row, not as Loader rows of
- * their own, so an entry walk can never see them. The row's own `servers` list
- * is the only place they exist.
- */
-const MCP_SERVERS_SPECIFIER = 'dsh-mcp-servers'
-
 /** Cosmokit's registered symbol for the shared volatile-reference protocol. */
 const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 
@@ -372,10 +363,17 @@ function readServersField(field) {
 function managedRows(ctx) {
   const found = []
   for (const entry of readEntries(ctx)) {
-    const specifier = entry?.options?.name
-    if (typeof specifier !== 'string' || !specifier.includes(MCP_SERVERS_SPECIFIER)) continue
     const config = resolvedConfigOf(entry)
     const servers = readServersField(config?.servers)
+    if (servers.length === 0) continue
+    // Recognise the host row by SHAPE, not by package name. The name changed
+    // once already (dsh-mcp-servers -> dsh-mcp) and every page-managed server
+    // silently vanished from this view, so a row that carries MCP server rows
+    // is the host, whatever it is called.
+    const isHost = servers.some(
+      (row) => row && typeof row === 'object' && typeof row.serverName === 'string' && typeof row.transport === 'string',
+    )
+    if (!isHost) continue
     for (const row of servers) {
       if (!row || typeof row !== 'object') continue
       if (typeof row.serverName !== 'string' || !row.serverName.trim()) continue
