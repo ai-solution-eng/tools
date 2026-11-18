@@ -14,6 +14,7 @@
 # Exit 0 = every guard passes (safe to build). Exit 1 = at least one patch no
 # longer applies (fix the Dockerfile patch before building).
 set -uo pipefail
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
 cd "$(dirname "$0")/.."
 
 VALUES="values.yaml"
@@ -21,13 +22,13 @@ VERSION=""
 WORKDIR=""
 
 usage() {
-  sed -n '2,16p' "$0"
+  sed -n '2,16p' "$SELF"
   exit 1
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --values) VALUES="${2:-}"; shift 2 ;;
+    --values) [ $# -ge 2 ] || { echo "error: --values needs a value" >&2; exit 2; }; VALUES="$2"; shift 2 ;;
     -h|--help) usage ;;
     -*) echo "unknown arg: $1" >&2; usage ;;
     *) VERSION="$1"; shift ;;
@@ -56,11 +57,12 @@ trap cleanup EXIT
 REGISTRY="https://registry.npmjs.org"
 FAILED=0
 CHECKED=0
+SKIPPED=0
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; CHECKED=$((CHECKED + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=$((FAILED + 1)); }
-skip() { printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
+skip() { SKIPPED=$((SKIPPED + 1)); printf '  \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # fetch <pkg> <version> <destdir> — download and extract one npm tarball.
 fetch() {
@@ -172,10 +174,16 @@ PY
     say "    version: ${CC_VER}"
 
     # ---- PATCH 1: isLoopback forced true (multi-user UI origin) -----------
-    # Mirrors the Dockerfile RUN step exactly: any lib/client*.js that still
-    # contains the upstream expression (0.2.1 split client.js into
-    # client.browser.js + client.node.js).
-    EXPR='isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname)'
+    # Mirrors the Dockerfile RUN step exactly: EVERY lib/client*.js carrying an
+    # `isLoopback:` assignment must end up marked.
+    #
+    # 0.2.2-rc.2 MINIFIED the browser bundle (client.browser.js 55,175 -> 40,691
+    # bytes, lib/*.js.map added): the expression is unchanged, the whitespace is
+    # not - `isLoopback:transport?.ownsHost===true||...` in the browser bundle vs
+    # the spaced form in client.node.js. A literal match therefore hit
+    # client.node.js ONLY and this script still reported PASS, while the bundle
+    # that actually decides settings persistence in the UI would ship unpatched.
+    EXPR_RE='isLoopback:[[:space:]]*transport\?\.[[:space:]]*ownsHost[[:space:]]*===[[:space:]]*true[[:space:]]*\|\|[[:space:]]*pageLocation[[:space:]]*===[[:space:]]*void[[:space:]]*0[[:space:]]*\|\|[[:space:]]*isLoopbackHostname\([[:space:]]*pageLocation\.hostname[[:space:]]*\)'
     MARKER='isLoopback: true /* dsh-web-helm: session-gated multi-user UI origin */'
     # Discover candidates with a glob (no find, no redirections) so this works
     # in locked-down shells where /dev/null itself is unwritable.
@@ -185,31 +193,38 @@ PY
     done
     CANDIDATES="${CANDIDATES# }"
     if [ -z "$CANDIDATES" ]; then
-      bad "patch 1 (isLoopback): no lib/client*.js in dsh-client-connection@${CC_VER}"
+      bad "patch 1 (isLoopback): no lib/client*.js in dsh-client-connection${CC_VER}"
     else
-      # The Dockerfile patches EVERY lib/client*.js carrying the expression, so the
-      # guard must assert every one of them. Checking only the first match is what
-      # let 0.2.1-rc.2-dind ship with client.browser.js unpatched while this script
-      # still reported PASS.
       TARGETS=""
       for f in $CANDIDATES; do
-        if grep -Fq "$EXPR" "$f"; then TARGETS="$TARGETS $f"; fi
+        if grep -Eq "$EXPR_RE" "$f"; then TARGETS="$TARGETS $f"; fi
       done
       TARGETS="${TARGETS# }"
       if [ -z "$TARGETS" ]; then
         bad "patch 1 (isLoopback): expression NOT found in: $(printf '%s ' $CANDIDATES)"
-        say "       upstream changed the expression — update the Dockerfile patch"
+        say "       upstream changed the expression - update the Dockerfile patch"
       else
         say "       expression present in $(printf '%s\n' $TARGETS | wc -l | tr -d ' ') file(s); all must be patched"
-        for f in $TARGETS; do
-          COUNT="$(grep -Fo "$EXPR" "$f" | wc -l | tr -d ' ')"
-          if [ "$COUNT" = "1" ]; then
-            ok "patch 1 (isLoopback): $(basename "$f") — exactly 1 occurrence, sed is unambiguous"
-          else
-            bad "patch 1 (isLoopback): $(basename "$f") — ${COUNT} occurrences — sed would only rewrite the first"
-          fi
-        done
       fi
+      # Every candidate that decides isLoopback must be patchable, or already marked.
+      for f in $CANDIDATES; do
+        if grep -Fq 'isLoopback:' "$f"; then
+          if grep -Fq "$MARKER" "$f" && grep -Eq "$EXPR_RE" "$f"; then
+            bad "patch 1 (isLoopback): $(basename "$f") - partially patched: marker AND upstream expression present"
+          elif grep -Eq "$EXPR_RE" "$f"; then
+            COUNT="$(grep -Eo "$EXPR_RE" "$f" | wc -l | tr -d ' ')"
+            if [ "$COUNT" = "1" ]; then
+              ok "patch 1 (isLoopback): $(basename "$f") - exactly 1 occurrence, sed is unambiguous"
+            else
+              bad "patch 1 (isLoopback): $(basename "$f") - ${COUNT} occurrences - sed would only rewrite the first"
+            fi
+          elif grep -Fq "$MARKER" "$f"; then
+            ok "patch 1 (isLoopback): $(basename "$f") - already marked"
+          else
+            bad "patch 1 (isLoopback): $(basename "$f") - carries an isLoopback assignment that is not the expected expression shape"
+          fi
+        fi
+      done
     fi
   fi
 fi
@@ -218,6 +233,7 @@ fi
 say ""
 if [ "$FAILED" -eq 0 ]; then
   say "==> all ${CHECKED} guard(s) passed for dsh ${VERSION} — safe to build the image"
+  [ "$SKIPPED" -eq 0 ] || say "    WARNING: ${SKIPPED} guard(s) SKIPPED (missing python3?) — not a clean pass"
   exit 0
 fi
 say "==> ${FAILED} guard(s) FAILED for dsh ${VERSION} — fix docker/user/Dockerfile before building" >&2

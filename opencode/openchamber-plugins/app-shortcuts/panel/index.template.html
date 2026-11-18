@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>App Shortcuts</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+      }
+      body {
+        background: var(--oc-bg, #ffffff);
+        color: var(--oc-fg, #1a1a1a);
+        font-family: var(--oc-font, system-ui, -apple-system, "Segoe UI", sans-serif);
+        font-size: 13px;
+        line-height: 1.45;
+        padding: 14px;
+        -webkit-font-smoothing: antialiased;
+      }
+      #root {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        max-width: 520px;
+        margin: 0 auto;
+      }
+      .head h1 {
+        margin: 0 0 4px;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .head p {
+        margin: 0;
+        color: var(--oc-muted, #6b6b6b);
+        font-size: 12px;
+      }
+      .group {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        width: 100%;
+        padding: 10px 11px;
+        border: 1px solid var(--oc-border, rgba(0, 0, 0, 0.12));
+        border-radius: calc(var(--oc-radius, 8px) + 2px);
+        background: var(--oc-elevated, transparent);
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+      }
+      .row:hover {
+        background: var(--oc-hover, rgba(0, 0, 0, 0.05));
+        border-color: var(--oc-focus, rgba(0, 0, 0, 0.28));
+      }
+      .row:active {
+        transform: translateY(1px);
+      }
+      .row:focus-visible {
+        outline: 2px solid var(--oc-focus, #4c8dff);
+        outline-offset: 1px;
+      }
+      .row[data-kind="surface"] {
+        padding: 8px 10px;
+        background: transparent;
+        border-style: dashed;
+      }
+      .row-icon {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        border-radius: var(--oc-radius, 8px);
+        background: var(--oc-subtle, rgba(0, 0, 0, 0.06));
+        color: var(--oc-primary, currentColor);
+      }
+      .row[data-kind="surface"] .row-icon {
+        width: 24px;
+        height: 24px;
+        background: transparent;
+        color: var(--oc-muted, currentColor);
+      }
+      .row-icon svg {
+        width: 17px;
+        height: 17px;
+      }
+      .row[data-kind="surface"] .row-icon svg {
+        width: 15px;
+        height: 15px;
+      }
+      .row-text {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        min-width: 0;
+        gap: 1px;
+      }
+      .row-label {
+        font-weight: 550;
+      }
+      .row-hint {
+        overflow: hidden;
+        color: var(--oc-muted, #6b6b6b);
+        font-size: 11.5px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .row-go {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        color: var(--oc-muted, #8a8a8a);
+      }
+      .row:hover .row-go {
+        color: var(--oc-primary, currentColor);
+      }
+      .row-go svg {
+        width: 15px;
+        height: 15px;
+      }
+      .divider {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--oc-muted, #8a8a8a);
+        font-size: 10.5px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .divider::after {
+        content: "";
+        flex: 1 1 auto;
+        height: 1px;
+        background: var(--oc-border, rgba(0, 0, 0, 0.12));
+      }
+      .foot {
+        color: var(--oc-muted, #8a8a8a);
+        font-size: 11px;
+      }
+      .notice {
+        padding: 10px 11px;
+        border: 1px solid var(--oc-border, rgba(0, 0, 0, 0.12));
+        border-radius: calc(var(--oc-radius, 8px) + 2px);
+        background: var(--oc-subtle, rgba(0, 0, 0, 0.04));
+        color: var(--oc-muted, #6b6b6b);
+        font-size: 12px;
+      }
+      #diagnostic {
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--oc-error-text, #b3261e);
+        font-family: var(--oc-mono, ui-monospace, monospace);
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="root">
+      <header class="head">
+        <h1>App Shortcuts</h1>
+        <p>Open the environment&#39;s full pages in a new tab. This session keeps running.</p>
+      </header>
+
+      <section class="group" aria-label="Pages in a new tab">
+        <button type="button" class="row" data-id="terminal" data-kind="page">
+          <span class="row-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg></span>
+          <span class="row-text">
+            <span class="row-label">Terminal</span>
+            <span class="row-hint">tmux-backed terminal, survives a reload</span>
+          </span>
+          <span class="row-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg></span>
+        </button>
+        <button type="button" class="row" data-id="data-manager" data-kind="page">
+          <span class="row-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg></span>
+          <span class="row-text">
+            <span class="row-label">Data Manager</span>
+            <span class="row-hint">Browse, upload, download and unpack files</span>
+          </span>
+          <span class="row-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg></span>
+        </button>
+        <button type="button" class="row" data-id="account" data-kind="page">
+          <span class="row-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg></span>
+          <span class="row-text">
+            <span class="row-label">Login / Account</span>
+            <span class="row-hint">Switch account or sign out</span>
+          </span>
+          <span class="row-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg></span>
+        </button>
+      </section>
+
+      <div class="divider">In this app</div>
+
+      <section class="group" aria-label="In-app panels">
+        <button type="button" class="row" data-id="in-app-terminal" data-kind="surface">
+          <span class="row-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg></span>
+          <span class="row-text">
+            <span class="row-label">In-app terminal</span>
+            <span class="row-hint">Right-rail terminal panel</span>
+          </span>
+          <span class="row-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></span>
+        </button>
+        <button type="button" class="row" data-id="in-app-files" data-kind="surface">
+          <span class="row-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/></svg></span>
+          <span class="row-text">
+            <span class="row-label">In-app files</span>
+            <span class="row-hint">Right-rail file editor</span>
+          </span>
+          <span class="row-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></span>
+        </button>
+      </section>
+
+      <p class="foot">
+        The Terminal and Data Manager pages are the heavyweight versions: tmux sessions that outlive a reload,
+        and uploads, downloads and archive extraction the in-app file tree does not do.
+      </p>
+
+      <p class="notice" id="standalone" hidden>
+        This panel runs inside OpenChamber. Open it from Settings &rarr; Extensions or the context rail.
+      </p>
+      <p class="notice" id="diagnostic" hidden></p>
+    </main>
+
+    <script>
+      // Surface a load or runtime failure instead of leaving the panel blank.
+      window.addEventListener('error', function (event) {
+        var node = document.getElementById('diagnostic');
+        if (!node) return;
+        var target = event.target;
+        var detail = event.message || (target && (target.src || target.href)) || event.type;
+        node.hidden = false;
+        node.textContent = 'Extension error: ' + detail;
+      }, true);
+    </script>
+    <!-- build.mjs replaces this tag with the bundle inlined. The sandboxed frame
+         is an opaque origin, so a relative script source is a cookieless
+         cross-origin request and the platform SSO gate redirects it to the
+         login page. Inlining keeps the panel at zero subresource requests. -->
+    <script src="main.js"></script>
+  </body>
+</html>

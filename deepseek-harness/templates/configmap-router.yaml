@@ -183,6 +183,11 @@ data:
     // 50 (0.4.44): rendered pages carry a "back to <page>" bar (ancestor trail in
     // the 'from' parameter, so it works at any depth and the root has none) and
     // links keep the theme. Server-rendered; the preview CSP still forbids scripts.
+    // 54 (0.4.48): dsh 0.2.2-rc.3 (npm 'next'; 'latest' is still rc.1) on the
+    // same node:24.22.2 base - engines.node is still >=24.9.0. The baked image
+    // now patches the MINIFIED browser bundle (0.2.2-rc.2 minified it), see
+    // docker/user/Dockerfile. dsh.version + image tag join userTemplateVersion,
+    // so every unit re-stamps and rolls (Recreate) on the next reconcile.
     // 53 (0.4.47): seed profiles/web/.npmrc (ignore-workspace-root-check=true)
     // so `dsh plugin add` and the Plugins page stop failing with
     // ERR_PNPM_ADDING_TO_ROOT — the profile dir is a pnpm workspace root.
@@ -196,7 +201,7 @@ data:
     // 51 (0.4.45): the edit dialog adopts the page the preview navigated to, so
     // Source / Rename / Delete / Save follow the document on screen instead of
     // the one the dialog was opened with.
-    // surprise rollout); values.yaml ships 51.
+    // surprise rollout); values.yaml ships 54.
     const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:

@@ -2,8 +2,8 @@ apiVersion: v2
 name: dsh-web-helm
 description: Multi-user DeepSeek Harness (dsh web) deployment with per-user PVC-backed workspaces
 type: application
-appVersion: "0.2.2-rc.1"
-version: "0.4.47"
+appVersion: "0.2.2-rc.3"
+version: "0.4.48"
 keywords:
   - deepseek
   - deepseek-harness
