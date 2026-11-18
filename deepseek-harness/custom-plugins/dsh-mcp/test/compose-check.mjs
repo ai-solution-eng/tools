@@ -67,12 +67,21 @@ check('both methods are wired on the server routes', () => {
   if (!status || !Array.isArray(status.methods) || status.methods[0] !== 'GET') return 'status route is not GET'
 })
 
-check('the client bundle carries both browser halves', () => {
+check('the client bundle registers once, under the bundle name', () => {
   const client = fs.readFileSync(path.join(root, 'client.js'), 'utf8')
   const loads = client.match(/__ModuleLoader__\.load\(/g) ?? []
-  if (loads.length !== 2) return 'expected 2 module registrations, got ' + loads.length
-  if (!client.includes("'@local/dsh-mcp-servers'")) return 'servers module id missing'
-  if (!client.includes("'@local/dsh-mcp-status'")) return 'status module id missing'
+  // The harness builds one bundle per package and matches a single registration
+  // against the package name, so two registrations would activate neither.
+  if (loads.length !== 1) return 'expected 1 module registration, got ' + loads.length
+  if (!client.includes("id: '@local/dsh-mcp'")) return 'the registration id is not the bundle name'
+})
+
+check('the client bundle still carries both halves', () => {
+  const client = fs.readFileSync(path.join(root, 'client.js'), 'utf8')
+  if (!client.includes('serversHalf.factory(require)')) return 'servers half not composed'
+  if (!client.includes('statusHalf.factory(require)')) return 'status half not composed'
+  if (!client.includes("'mcp-servers'")) return 'servers locale namespace missing'
+  if (!client.includes("'mcp-status'")) return 'status locale namespace missing'
 })
 
 check('the bundle patch inserts exactly one row', () => {
