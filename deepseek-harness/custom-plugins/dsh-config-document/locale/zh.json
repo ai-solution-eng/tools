@@ -31,5 +31,20 @@
   "error.route": "主机路由不可用（HTTP {status}）。该插件的主机部分可能尚未加载；安装后需要重启 dsh。",
   "error.network": "无法连接主机：{message}",
   "error.unavailable": "主机未提供配置文件。",
-  "hint.readonly": "只读视图。如需修改，请下载文件，编辑后再在主机上恢复。"
+  "hint.readonly": "只读文本视图。顶层设置请使用“编辑值”，其他内容请在主机上编辑文件。",
+  "action.edit": "编辑值",
+  "action.save": "保存",
+  "action.saving": "保存中…",
+  "action.cancel": "取消",
+  "editor.title": "编辑值",
+  "editor.hint": "仅提供顶层的文本、数字和布尔值。其他内容仍保留在文件中。",
+  "editor.row": "条目",
+  "editor.noRows": "没有条目提供可编辑的值。",
+  "editor.saved": "已保存。配置编辑器已重写文件。",
+  "editor.failed": "未保存：{message}",
+  "editor.unchanged": "没有变化。",
+  "guide.title": "手动编辑",
+  "guide.body": "如需修改其他内容，请打开数据管理器，进入配置卷并编辑 {file}，然后重启主机。",
+  "guide.copyPath": "复制路径",
+  "guide.copied": "路径已复制。"
 }

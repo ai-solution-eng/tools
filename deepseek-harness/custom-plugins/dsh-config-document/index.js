@@ -187,8 +187,108 @@ async function readDocument(ctx, settings) {
   return payload
 }
 
+/** Largest number of scalar fields offered per row. */
+const MAX_FIELDS_PER_ENTRY = 24
+
 /**
- * Register the read-only document route.
+ * Top-level scalar leaves of a row config: the fields this editor offers.
+ * Nested objects and arrays are left to the file, because a partial rewrite of
+ * them would drop the parts the form does not show.
+ * @param {unknown} config - row config.
+ * @returns {Array<{ path: string, value: string | number | boolean, type: string }>} fields.
+ */
+function scalarFields(config) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return []
+  const fields = []
+  for (const [path, value] of Object.entries(config)) {
+    const type = typeof value
+    if (type !== 'string' && type !== 'number' && type !== 'boolean') continue
+    fields.push({ path, value, type })
+    if (fields.length >= MAX_FIELDS_PER_ENTRY) break
+  }
+  return fields
+}
+
+/**
+ * Rows the editor may change: Loader entries with an id and a plain config.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @returns {Array<{ id: string, name: string, fields: Array<object> }>} editable rows.
+ */
+function editableEntries(ctx) {
+  const editor = ctx.get('configEditor')
+  if (!editor || typeof editor.entries !== 'function') return []
+  const rows = []
+  for (const entry of editor.entries()) {
+    const id = entry && entry.options ? entry.options.id : undefined
+    if (typeof id !== 'string' || id === '') continue
+    const name = entry.options && typeof entry.options.name === 'string' ? entry.options.name : ''
+    const fields = scalarFields(entry.options ? entry.options.config : undefined)
+    if (fields.length === 0) continue
+    rows.push({ id, name, fields })
+  }
+  return rows
+}
+
+/**
+ * Coerce a submitted value to the type the current one has.
+ * @param {unknown} current - current value.
+ * @param {unknown} next - submitted value.
+ * @returns {{ value?: unknown, error?: string }} coerced value or a reason.
+ */
+function coerceValue(current, next) {
+  if (typeof current === 'number') {
+    const parsed = Number(next)
+    if (!Number.isFinite(parsed)) return { error: 'enter a number' }
+    return { value: parsed }
+  }
+  if (typeof current === 'boolean') {
+    if (typeof next === 'boolean') return { value: next }
+    if (next === 'true') return { value: true }
+    if (next === 'false') return { value: false }
+    return { error: 'enter true or false' }
+  }
+  if (typeof next !== 'string') return { error: 'enter a text value' }
+  return { value: next }
+}
+
+/**
+ * Apply one scalar edit through the configuration editor, which validates the
+ * row against its own schema, patches the document in place (comments and
+ * !!js expressions preserved), writes atomically and rolls back on failure.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {unknown} body - request body.
+ * @returns {Promise<Record<string, any>>} result.
+ */
+async function applyEdit(ctx, body) {
+  const editor = ctx.get('configEditor')
+  if (!editor || typeof editor.edit !== 'function') {
+    return { ok: false, code: 'unavailable', message: 'the configuration editor is not mounted' }
+  }
+  const id = body && typeof body.id === 'string' ? body.id : ''
+  const path = body && typeof body.path === 'string' ? body.path : ''
+  if (!id || !path) return { ok: false, code: 'invalid', message: 'id and path are required' }
+  let entry
+  for (const candidate of editor.entries()) {
+    if (candidate && candidate.options && candidate.options.id === id) {
+      entry = candidate
+      break
+    }
+  }
+  if (entry === undefined) return { ok: false, code: 'missing', message: 'no row with id ' + id }
+  const current = entry.options && entry.options.config ? entry.options.config[path] : undefined
+  if (current === undefined) return { ok: false, code: 'missing', message: 'row has no field ' + path }
+  const coerced = coerceValue(current, body.value)
+  if (coerced.error !== undefined) return { ok: false, code: 'invalid', message: coerced.error }
+  try {
+    await editor.edit(entry, (config) => ({ ...config, [path]: coerced.value }))
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, code: 'refused', message: messageOf(error) }
+  }
+}
+
+/**
+ * Register the document routes.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  * @param {unknown} config - row config.
  */
@@ -210,8 +310,43 @@ export function apply(ctx, config) {
 
   // A missing or conflicting route must never take the plugin row down: the
   // browser half degrades to a clear "route unavailable" message instead.
+  const entriesRoute = {
+    path: settings.routePath + '/entries',
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        return jsonResponse({ ok: true, entries: editableEntries(ctx) })
+      } catch (error) {
+        return jsonResponse({ ok: false, code: 'internal', message: messageOf(error) }, 500)
+      }
+    },
+  }
+
+  const editRoute = {
+    path: settings.routePath + '/edit',
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return jsonResponse({ ok: false, code: 'invalid', message: 'expected a JSON body' }, 400)
+      }
+      try {
+        const result = await applyEdit(ctx, body)
+        return jsonResponse(result, result.ok === true ? 200 : 400)
+      } catch (error) {
+        return jsonResponse({ ok: false, code: 'internal', message: messageOf(error) }, 500)
+      }
+    },
+  }
+
   try {
     ctx.effect(() => ctx.connection.fetch.register(route), 'config-document: document route')
+    ctx.effect(() => ctx.connection.fetch.register(entriesRoute), 'config-document: entries route')
+    ctx.effect(() => ctx.connection.fetch.register(editRoute), 'config-document: edit route')
     ctx.logger?.debug?.(`config-document: serving ${settings.routePath}`)
   } catch (error) {
     try {
@@ -222,4 +357,4 @@ export function apply(ctx, config) {
   }
 }
 
-export { countLines, readDocument, resolveDocumentPath, resolveSettings }
+export { applyEdit, countLines, editableEntries, readDocument, resolveDocumentPath, resolveSettings, scalarFields }

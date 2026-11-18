@@ -12,7 +12,7 @@ const moduleUrl = pathToFileURL(path.join(bundleRoot, 'index.js')).href
 const host = await import(moduleUrl)
 const checks = createChecks()
 
-const { apply, countLines, readDocument, resolveDocumentPath, resolveSettings } = host
+const { apply, applyEdit, countLines, editableEntries, readDocument, resolveDocumentPath, resolveSettings } = host
 
 // --- exports -----------------------------------------------------------------
 checks.check('index.js exports apply', typeof apply === 'function')
@@ -87,12 +87,15 @@ fs.writeFileSync(documentPath, documentText, 'utf8')
 {
   const stub = createHostContext({ settings: { prepareDocument: async () => documentPath } })
   apply(stub.ctx, {})
-  checks.equal('registration: one route registered', stub.routes.length, 1)
+  checks.equal('registration: document, entries and edit routes', stub.routes.length, 3)
   const route = stub.routes[0]
   checks.equal('registration: default route path', route.path, '/api/config-document')
   checks.equal('registration: GET only', route.methods, ['GET'])
   checks.equal('registration: buffered request body', route.requestBody, 'buffered')
-  checks.equal('registration: one effect owns the route', stub.effects.length, 1)
+  checks.equal('registration: entries route', stub.routes[1].path, '/api/config-document/entries')
+  checks.equal('registration: edit route', stub.routes[2].path, '/api/config-document/edit')
+  checks.equal('registration: edit is POST', stub.routes[2].methods, ['POST'])
+  checks.equal('registration: one effect per route', stub.effects.length, 3)
   checks.check('registration: logs the served path', stub.logs.debug.some((line) => line.includes('/api/config-document')))
 
   const { status, headers, body } = await readJson(route)
@@ -240,6 +243,57 @@ fs.writeFileSync(documentPath, documentText, 'utf8')
   checks.check('resolveDocumentPath: reports reasons instead of throwing', typeof resolved.error === 'string')
   const payload = await readDocument(ctx, resolveSettings(undefined))
   checks.equal('readDocument: unavailable without services', payload.code, 'unavailable')
+}
+
+// --- guided editing ---------------------------------------------------------
+{
+  const entries = [
+    {
+      options: {
+        id: 'mcp-pcai-llm-gateway',
+        name: '@deepseek-ai/dsh-mcp-client',
+        config: {
+          transport: 'streamable-http',
+          serverName: 'pcai-llm-gateway',
+          url: 'http://old:9200/mcp',
+          toolCallTimeoutMs: 600000,
+          headers: { Authorization: 'secret' },
+        },
+      },
+    },
+    { options: { id: 'no-scalars', name: 'x', config: { nested: { a: 1 }, list: [1, 2] } } },
+  ]
+  const calls = []
+  const configEditor = {
+    entries: () => entries,
+    edit: async (entry, change) => {
+      calls.push({ id: entry.options.id, next: change(structuredClone(entry.options.config)) })
+    },
+  }
+  const ctx = { get: (name) => (name === 'configEditor' ? configEditor : undefined) }
+
+  const listed = editableEntries(ctx)
+  checks.equal('editableEntries: skips rows without scalar fields', listed.length, 1)
+  checks.equal('editableEntries: reports the row id', listed[0].id, 'mcp-pcai-llm-gateway')
+  checks.check('editableEntries: nested objects are not offered', !listed[0].fields.some((field) => field.path === 'headers'))
+
+  const ok = await applyEdit(ctx, { id: 'mcp-pcai-llm-gateway', path: 'url', value: 'http://new:9200/mcp' })
+  checks.equal('applyEdit: accepts a string change', ok.ok, true)
+  checks.equal('applyEdit: the change reaches the editor', calls[0].next.url, 'http://new:9200/mcp')
+  checks.equal('applyEdit: sibling scalars survive', calls[0].next.serverName, 'pcai-llm-gateway')
+  checks.equal('applyEdit: an untouched object sibling survives', calls[0].next.headers.Authorization, 'secret')
+
+  const missing = await applyEdit(ctx, { id: 'nope', path: 'url', value: 'x' })
+  checks.equal('applyEdit: unknown row is refused', missing.code, 'missing')
+  const missingField = await applyEdit(ctx, { id: 'mcp-pcai-llm-gateway', path: 'nope', value: 'x' })
+  checks.equal('applyEdit: unknown field is refused', missingField.code, 'missing')
+  const badNumber = await applyEdit(ctx, { id: 'mcp-pcai-llm-gateway', path: 'toolCallTimeoutMs', value: 'soon' })
+  checks.equal('applyEdit: a non-numeric number is refused', badNumber.code, 'invalid')
+  const goodNumber = await applyEdit(ctx, { id: 'mcp-pcai-llm-gateway', path: 'toolCallTimeoutMs', value: '120000' })
+  checks.equal('applyEdit: a numeric string is coerced', goodNumber.ok, true)
+  checks.equal('applyEdit: the coerced value is a number', calls[1].next.toolCallTimeoutMs, 120000)
+  const noEditor = await applyEdit({ get: () => undefined }, { id: 'x', path: 'y', value: 'z' })
+  checks.equal('applyEdit: reports a missing editor', noEditor.code, 'unavailable')
 }
 
 fs.rmSync(tempRoot, { recursive: true, force: true })

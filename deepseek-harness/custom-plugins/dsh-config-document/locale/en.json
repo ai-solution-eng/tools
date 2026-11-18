@@ -31,5 +31,20 @@
   "error.route": "The Host route is not available (HTTP {status}). The Host half of this plugin may not be loaded yet; a dsh restart is required after installing it.",
   "error.network": "Could not reach the Host: {message}",
   "error.unavailable": "The Host exposes no configuration document.",
-  "hint.readonly": "Read-only view. Download the file to edit it, then restore it on the Host."
+  "hint.readonly": "Read-only view. Use Edit values for top-level settings, or edit the file on the Host.",
+  "action.edit": "Edit values",
+  "action.save": "Save",
+  "action.saving": "Saving…",
+  "action.cancel": "Cancel",
+  "editor.title": "Edit a value",
+  "editor.hint": "Only top-level text, number and boolean values are offered. Everything else stays in the file.",
+  "editor.row": "Row",
+  "editor.noRows": "No row exposes an editable value.",
+  "editor.saved": "Saved. The configuration editor rewrote the file.",
+  "editor.failed": "Not saved: {message}",
+  "editor.unchanged": "Nothing changed.",
+  "guide.title": "Editing by hand",
+  "guide.body": "To change anything else, open the data manager, navigate to the profile volume and edit {file}, then restart the Host.",
+  "guide.copyPath": "Copy path",
+  "guide.copied": "Path copied."
 }

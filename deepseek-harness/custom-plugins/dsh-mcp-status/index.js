@@ -21,7 +21,7 @@
  * @module
  */
 
-import { commandName, messageOf, probeMcpHttp, redactUrl } from './probe.js'
+import { catalogCandidatesFor, commandName, messageOf, probeMcpHttp, redactUrl } from './probe.js'
 
 /** Loader rows this plugin reports on. */
 const MCP_CLIENT_SPECIFIER = 'mcp-client'
@@ -51,8 +51,13 @@ const DEFAULT_SETTINGS = {
   connectionTtlMs: 5000,
   /** How long a federating server's upstream catalog is reused. */
   upstreamTtlMs: 60000,
-  /** Tool that lists a federating server's upstream MCP servers. */
+  /** Preferred tool that lists a federating server's upstream MCP servers. */
   catalogTool: 'mcp_catalog',
+  /**
+   * Catalog tool names tried when the preferred one does not exist. Federating
+   * gateways disagree about the name, so one panel can unroll several of them.
+   */
+  catalogTools: ['mcp_catalog', 'list_mcp_servers', 'list_servers', 'list_mcp_tools'],
   /** Tool names included per connection in the snapshot. */
   maxToolsListed: 24,
   /** Upstream server rows included per connection. */
@@ -91,6 +96,12 @@ function resolveSettings(config) {
       if (typeof value !== 'number' || !Number.isFinite(value)) continue
       const [min, max] = BOUNDS[key] ?? [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]
       settings[key] = Math.min(max, Math.max(min, Math.floor(value)))
+    } else if (Array.isArray(fallback)) {
+      if (!Array.isArray(value)) continue
+      const names = value
+        .filter((entry) => typeof entry === 'string' && entry.trim())
+        .map((entry) => entry.trim())
+      if (names.length > 0) settings[key] = names
     } else if (typeof value === 'string' && value.trim()) {
       settings[key] = value.trim()
     }
@@ -262,6 +273,8 @@ async function describeConnection(ctx, entry, settings) {
       url: config.url,
       headers: config.headers,
       timeoutMs: settings.probeTimeoutMs,
+      catalogTool: settings.catalogTool,
+      catalogTools: settings.catalogTools,
     })
     connection.target = { url: config.url, headers: config.headers }
     return applyProbe(connection, probe, settings)
@@ -303,7 +316,7 @@ function applyProbe(connection, probe, settings) {
     toolCount: toolNames.length,
     tools: toolNames.slice(0, settings.maxToolsListed),
     toolsHidden: hidden > 0 ? hidden : undefined,
-    catalogAvailable: toolNames.includes(settings.catalogTool),
+    catalogAvailable: catalogCandidatesFor(toolNames, settings).length > 0,
   }
 }
 
@@ -403,12 +416,19 @@ async function describeManagedConnection(ctx, hostEntry, row, settings) {
   const names = registeredToolNames(ctx, serverName)
   if (names.length > 0) {
     const hidden = Math.max(0, names.length - settings.maxToolsListed)
+    const candidates = catalogCandidatesFor(names, settings)
+    // A page-managed server that federates others unrolls through the same
+    // second probe as a native row, so it needs its endpoint kept here.
+    if (transport === 'streamable-http' && typeof row.url === 'string' && row.url.trim()) {
+      connection.target = { url: row.url, headers: row.headers }
+    }
     return {
       ...connection,
       state: 'connected',
       toolCount: names.length,
       tools: names.slice(0, settings.maxToolsListed),
       toolsHidden: hidden > 0 ? hidden : undefined,
+      catalogAvailable: candidates.length > 0,
       note: 'registered through the MCP servers page',
     }
   }
@@ -418,6 +438,8 @@ async function describeManagedConnection(ctx, hostEntry, row, settings) {
       url: row.url,
       headers: row.headers,
       timeoutMs: settings.probeTimeoutMs,
+      catalogTool: settings.catalogTool,
+      catalogTools: settings.catalogTools,
     })
     return {
       ...connection,
@@ -494,13 +516,14 @@ async function withUpstream(connection, settings, cache) {
     headers: connection.target.headers,
     timeoutMs: settings.probeTimeoutMs,
     catalogTool: settings.catalogTool,
+    catalogTools: settings.catalogTools,
   })
   const servers = Array.isArray(probe.catalog)
     ? probe.catalog.slice(0, settings.maxUpstreamServers)
     : []
   const upstream = {
     generatedAt: new Date().toISOString(),
-    tool: settings.catalogTool,
+    tool: probe.catalogTool ?? settings.catalogTool,
     servers,
     error: probe.catalogError ?? (servers.length ? undefined : 'no upstream servers reported'),
   }

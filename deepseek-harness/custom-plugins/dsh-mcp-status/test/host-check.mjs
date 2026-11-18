@@ -55,15 +55,36 @@ function startMock(mode) {
           jsonrpc: '2.0',
           id: message.id,
           result: {
-            tools: [
-              { name: 'mcp_catalog', description: 'list servers' },
-              { name: 'mcp_call', description: 'call a tool' },
-            ],
+            tools: mode === 'litellm'
+              ? [
+                  { name: 'list_mcp_servers', description: 'list upstream servers' },
+                  { name: 'search', description: 'search' },
+                ]
+              : [
+                  { name: 'mcp_catalog', description: 'list servers' },
+                  { name: 'mcp_call', description: 'call a tool' },
+                ],
           },
         })
         return
       }
       if (message.method === 'tools/call') {
+        if (mode === 'litellm') {
+          // LiteLLM-style: a differently named tool, a data envelope, and
+          // server_url/tool_count/status keys instead of server/tools/error.
+          const payload = {
+            data: [
+              { name: 'github', server_url: 'http://github:8080/mcp', tool_count: 7, status: 'connected' },
+              { name: 'slack', server_url: 'http://slack:8080/mcp', tool_count: 3, status: 'error' },
+            ],
+          }
+          send({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+          })
+          return
+        }
         if (mode === 'catalog-error') {
           send({ jsonrpc: '2.0', id: message.id, result: { isError: true, content: [{ type: 'text', text: 'catalog exploded' }] } })
           return
@@ -134,6 +155,7 @@ const catalogError = await startMock('catalog-error')
 const fastmcp = await startMock('fastmcp')
 const structuredOnly = await startMock('structured-only')
 const structuredObject = await startMock('structured-object')
+const litellm = await startMock('litellm')
 const deadPort = await new Promise((resolve) => {
   const server = createServer(() => {})
   server.listen(0, '127.0.0.1', () => {
@@ -364,6 +386,27 @@ await record('snapshot: upstream servers appear for the gateway', async () => {
   assert.equal(snapshot.summary.hasUpstream, true)
 })
 
+await record('snapshot: a federator with a differently named catalog tool unrolls too', async () => {
+  const entry = fakeEntry('mcp-litellm', {
+    transport: 'streamable-http',
+    serverName: 'litellm',
+    url: 'http://127.0.0.1:' + litellm.port + '/mcp',
+    headers,
+  })
+  const ctx = {
+    loader: { entries: () => [entry][Symbol.iterator]() },
+    tools: { schemas: () => [] },
+  }
+  const snapshot = await buildSnapshot(ctx, settings, caches(), true)
+  const connection = snapshot.connections.find((item) => item.serverName === 'litellm')
+  assert.equal(connection.state, 'connected')
+  assert.equal(connection.upstream.tool, 'list_mcp_servers', 'the tool that answered is reported')
+  assert.deepEqual(connection.upstream.servers.map((server) => server.server), ['github', 'slack'])
+  assert.equal(connection.upstream.servers[0].toolCount, 7, 'tool_count is read')
+  assert.equal(connection.upstream.servers[0].url, 'http://github:8080/mcp', 'server_url is read')
+  assert.equal(connection.upstream.servers[1].reachable, false, 'a failure status marks it unreachable')
+})
+
 await record('snapshot: upstream is omitted unless requested', async () => {
   const snapshot = await buildSnapshot(fakeCtx, settings, caches(), false)
   assert.ok(snapshot.connections.every((item) => item.upstream === undefined))
@@ -468,6 +511,7 @@ for (const line of results) console.log(line)
 const failures = results.filter((line) => line.startsWith('FAIL')).length
 console.log(`\n${results.length - failures}/${results.length} checks passed`)
 json.server.close()
+litellm.server.close()
 sse.server.close()
 unauthorized.server.close()
 catalogError.server.close()

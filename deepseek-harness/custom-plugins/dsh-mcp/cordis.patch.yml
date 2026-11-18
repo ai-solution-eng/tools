@@ -1,0 +1,12 @@
+# MCP bundle: one row, two jobs.
+#
+# The row config is shared. `servers` is the list the Settings page edits; the
+# remaining keys (`routePath`, `catalogTools`, TTLs) configure the status view.
+#
+# This bundle composes the two halves in ../dsh-mcp-servers and
+# ../dsh-mcp-status, so both packages must stay installed next to it.
+- insert:
+    - id: mcp
+      name: '@local/dsh-mcp'
+      config:
+        servers: []

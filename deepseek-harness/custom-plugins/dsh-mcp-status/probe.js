@@ -27,6 +27,35 @@ const FALLBACK_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 /** Upper bound on an error excerpt shown in the panel. */
 const MAX_ERROR_CHARS = 240
+/**
+ * Last-resort catalog tool name, used only when none of the configured names
+ * exists. Deliberately strict: a federator's list tool is a read-only verb on
+ * a server-shaped noun, and calling anything looser risks a side effect.
+ */
+const CATALOG_NAME_PATTERN = /^(?:list|get|show)[_.]?(?:mcp[_.]?)?(?:servers?|catalog)$/i
+
+/**
+ * Catalog tools a server exposes, in preference order.
+ *
+ * An explicit override wins, then the configured names in order, then a strict
+ * name guess. Exported so the status view can decide whether a server is worth
+ * a second probe without duplicating the rule.
+ * @param {string[]} toolNames - tools the server listed.
+ * @param {{ catalogTool?: string, catalogTools?: string[] }} [options] - configured names.
+ * @returns {string[]} present candidates, possibly a single guessed one.
+ */
+export function catalogCandidatesFor(toolNames, options = {}) {
+  const names = []
+  const push = (name) => {
+    if (typeof name === 'string' && name && !names.includes(name)) names.push(name)
+  }
+  push(options.catalogTool)
+  for (const name of Array.isArray(options.catalogTools) ? options.catalogTools : []) push(name)
+  const present = names.filter((name) => toolNames.includes(name))
+  if (present.length > 0) return present
+  const guessed = toolNames.find((name) => CATALOG_NAME_PATTERN.test(name))
+  return guessed === undefined ? [] : [guessed]
+}
 
 /**
  * Coerce anything thrown into one short line of text.
@@ -251,35 +280,89 @@ export function readToolPayload(result) {
   return undefined
 }
 
+/** Payload keys that may hold the server list, in the order they are tried. */
+const CATALOG_CONTAINERS = ['servers', 'mcp_servers', 'mcpServers', 'data', 'items', 'results']
+
+/** Row keys that may name a server. */
+const CATALOG_NAME_KEYS = ['server', 'name', 'server_name', 'serverName', 'id']
+
+/** Row keys that may carry a server endpoint. */
+const CATALOG_URL_KEYS = ['url', 'server_url', 'serverUrl', 'endpoint', 'base_url', 'baseUrl']
+
+/** Row statuses that mean this upstream is not reachable. */
+const UNREACHABLE_STATUS = new Set(['error', 'failed', 'down', 'unreachable', 'offline', 'disconnected'])
+
+/**
+ * Find the server list inside a catalog payload.
+ *
+ * Federating gateways disagree about the envelope: some answer { servers },
+ * some { data } or { items }, some a bare array, and a few wrap it one level
+ * deeper under result.
+ * @param {unknown} payload - catalog payload.
+ * @returns {unknown[] | undefined} the list, or undefined when there is none.
+ */
+function catalogList(payload) {
+  if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== 'object') return undefined
+  for (const key of CATALOG_CONTAINERS) {
+    if (Array.isArray(payload[key])) return payload[key]
+  }
+  const nested = payload.result
+  if (Array.isArray(nested)) return nested
+  if (nested && typeof nested === 'object') {
+    for (const key of CATALOG_CONTAINERS) {
+      if (Array.isArray(nested[key])) return nested[key]
+    }
+  }
+  return undefined
+}
+
 /**
  * Project a server catalog payload into the panel's upstream rows.
- * Accepts `{ servers: [...] }` and a bare array; a row is reachable unless it
- * carries an `error`/`failure`, which is how a federating gateway reports a
- * server it could not reach.
+ *
+ * A row is reachable unless it carries an error/failure or an explicit failure
+ * status, which is how a federating gateway reports an upstream it could not
+ * reach.
  * @param {unknown} payload - catalog payload.
  * @returns {Array<{ server: string, url?: string, toolCount: number, reachable: boolean, error?: string }> | undefined} rows.
  */
 export function normalizeCatalog(payload) {
-  const list = Array.isArray(payload?.servers)
-    ? payload.servers
-    : Array.isArray(payload)
-      ? payload
-      : Array.isArray(payload?.result?.servers)
-        ? payload.result.servers
-        : undefined
+  const list = catalogList(payload)
   if (!list) return undefined
   const rows = []
   for (const item of list) {
     if (!item || typeof item !== 'object') continue
-    const server = typeof item.server === 'string' ? item.server : typeof item.name === 'string' ? item.name : undefined
+    let server
+    for (const key of CATALOG_NAME_KEYS) {
+      const value = item[key]
+      if (typeof value === 'string' && value.trim()) {
+        server = value.trim()
+        break
+      }
+    }
     if (!server) continue
+    let url
+    for (const key of CATALOG_URL_KEYS) {
+      const value = item[key]
+      if (typeof value === 'string' && value.trim()) {
+        url = value.trim()
+        break
+      }
+    }
     const tools = Array.isArray(item.tools) ? item.tools : []
+    const counted = Number.isFinite(item.tool_count)
+      ? item.tool_count
+      : Number.isFinite(item.toolCount)
+        ? item.toolCount
+        : tools.length
     const failure = item.error ?? item.failure
+    const status = typeof item.status === 'string' ? item.status.toLowerCase() : ''
+    const failed = (failure !== undefined && failure !== null) || UNREACHABLE_STATUS.has(status)
     rows.push({
       server,
-      url: typeof item.url === 'string' ? item.url : undefined,
-      toolCount: tools.length,
-      reachable: failure === undefined || failure === null,
+      url,
+      toolCount: counted,
+      reachable: !failed,
       error: failure === undefined || failure === null ? undefined : messageOf(failure),
     })
   }
@@ -310,6 +393,8 @@ function normalizeServerInfo(info) {
  * @property {string[]} [toolNames] - tools the server currently exposes.
  * @property {string[]} [capabilities] - capability names from `initialize`.
  * @property {Array<object>} [catalog] - normalized catalog rows when requested.
+ * @property {string} [catalogTool] - the catalog tool that answered.
+ * @property {string[]} [catalogCandidates] - catalog tools the server exposes.
  * @property {string} [catalogError] - catalog failure reason.
  */
 
@@ -437,25 +522,36 @@ export async function probeMcpHttp(options) {
         : [],
     }
 
-    const catalogTool = typeof options.catalogTool === 'string' ? options.catalogTool : ''
-    if (catalogTool && toolNames.includes(catalogTool)) {
-      try {
-        const called = await send({
-          jsonrpc: '2.0',
-          id: 3,
-          method: 'tools/call',
-          params: { name: catalogTool, arguments: {} },
-        })
-        if (called?.isError === true) {
-          result.catalogError = messageOf(toolText(called) || 'catalog tool failed')
-        } else {
-          const payload = readToolPayload(called)
-          const rows = normalizeCatalog(payload)
-          if (rows) result.catalog = rows
-          else result.catalogError = 'catalog tool returned no server list'
+    // Candidate catalog tools, in preference order: an explicit override, then
+    // the configured names, then a strict name pattern. Federators disagree
+    // about what the list tool is called, so trying several is what lets one
+    // panel unroll more than the gateway it was originally written for.
+    const present = catalogCandidatesFor(toolNames, options)
+    if (present.length > 0) {
+      result.catalogCandidates = present
+      for (const name of present) {
+        try {
+          const called = await send({
+            jsonrpc: '2.0',
+            id: 3,
+            method: 'tools/call',
+            params: { name, arguments: {} },
+          })
+          if (called?.isError === true) {
+            result.catalogError = messageOf(toolText(called) || name + ' failed')
+            continue
+          }
+          const rows = normalizeCatalog(readToolPayload(called))
+          if (Array.isArray(rows)) {
+            result.catalog = rows
+            result.catalogTool = name
+            result.catalogError = undefined
+            break
+          }
+          result.catalogError = name + ' returned no server list'
+        } catch (error) {
+          result.catalogError = messageOf(error)
         }
-      } catch (error) {
-        result.catalogError = messageOf(error)
       }
     }
 
