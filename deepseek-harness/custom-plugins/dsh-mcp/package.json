@@ -17,7 +17,12 @@
     "README.md",
     "locale/*.json",
     "icon.svg",
-    "test/*.mjs"
+    "src/servers/*.js",
+    "src/status/*.js",
+    "scripts/*.mjs",
+    "test/*.mjs",
+    "test/servers/*.mjs",
+    "test/status/*.mjs"
   ],
   "dsh": {
     "bundle": {

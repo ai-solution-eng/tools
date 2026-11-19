@@ -250,7 +250,7 @@ rewrite it — so the action is to edit `~/.dsh/profiles/web/cordis.patch.yml` p
 `scripts/push_dsh_cordis_patch.sh`). AgentTeam moved to unified
 named subagents ("custom plugins and SDK integrations need migration"), custom overlay positioning
 changed, and the skills/dev-doc paths were reorganised. Both custom plugins
-(`dsh-app-shortcuts`, `dsh-mcp-status`) are UI overlays - re-test them after the upgrade.
+(`dsh-app-shortcuts`, `dsh-mcp`) are UI overlays - re-test them after the upgrade.
 
 **Rollback:** ordinary sessions roll back to rc.1. Sessions that used team mode write a `team/mode`
 event (the 63rd session event type, new in rc.3) and will not be readable by rc.1 - freeze team
@@ -401,7 +401,7 @@ standalone Cordis bundle — see the [plugin guide + install steps](custom-plugi
 | Plugin | Adds |
 |---|---|
 | `dsh-app-shortcuts` | Terminal / Data Manager / Login shortcuts at the sidebar foot |
-| `dsh-mcp-status` | Live MCP server status row under the composer (real handshake probe, not a flag) |
+| `dsh-mcp` | MCP servers page + live status row under the composer (real handshake probe, not a flag) |
 
 The directory is **not chart content**: `.helmignore` excludes it, no value references it, and the
 chart never installs a plugin into a user pod. Installation is per profile (`web`) — Plugins page →

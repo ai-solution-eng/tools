@@ -7,8 +7,8 @@
  */
 import { createServer } from 'node:http'
 import assert from 'node:assert/strict'
-import { probeMcpHttp, normalizeCatalog, readToolPayload } from '../probe.js'
-import { buildSnapshot, describeConnection, inject, resolveSettings, summarize, toWire } from '../index.js'
+import { probeMcpHttp, normalizeCatalog, readToolPayload } from '../../src/status/probe.js'
+import { buildSnapshot, describeConnection, inject, resolveSettings, summarize, toWire } from '../../src/status/index.js'
 
 const SESSION = 'session-abc'
 const SECRET = 'Bearer super-secret-token'
@@ -571,7 +571,7 @@ await record('describe: resolved config falls back to raw input for a failed row
 })
 
 await record('route: handler answers JSON and never throws', async () => {
-  const { apply } = await import('../index.js')
+  const { apply } = await import('../../src/status/index.js')
   let registered
   const ctx = {
     ...fakeCtx,

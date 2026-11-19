@@ -12,9 +12,9 @@ shared between users.
 | Plugin | Adds | Host half | Browser half |
 |---|---|---|---|
 | [`dsh-app-shortcuts`](dsh-app-shortcuts/README.md) | Terminal / Data Manager / Login buttons at the sidebar foot (`sidebar.footer.action`) | none — `apply()` has no behaviour | three same-origin links, opened in a new tab |
-| [`dsh-mcp-status`](dsh-mcp-status/README.md) | An `MCP` row below the composer: which MCP servers are connected, probe latency, tool counts, and the upstream servers behind a federating one | discovers the `@deepseek-ai/dsh-mcp-client` rows, probes each endpoint with a real MCP handshake, serves `GET /api/mcp-status` | the composer-dock row and its expandable panel |
+
 | [`dsh-asr-endpoint`](dsh-asr-endpoint/README.md) | Voice input that transcribes through **your own HTTP ASR endpoint** instead of the local SenseVoice model — URL, protocol, credentials and request shape all set in `cordis.patch.yml` | registers one remote `ctx.speechToText` provider (`location: 'cloud'`, no `preparation`); posts the recording as OpenAI-compatible multipart, whisper.cpp multipart, base64 JSON or raw WAV | none — the mic comes from the upstream `client-ui-voice-input` row this bundle inserts |
-| [`dsh-mcp-servers`](dsh-mcp-servers/README.md) | A **Settings → MCP servers** page, the MCP counterpart of Settings → Models: list, add (Streamable HTTP or stdio), edit, disable and remove MCP servers (`settings.section`, order 12) | keeps the list as a volatile field of its own row, mounts one `@deepseek-ai/dsh-mcp-client` child per enabled server and reconciles on change, serves `GET /api/mcp-servers` with fiber state and live tool counts | the page: rows, add/edit forms, live state, and the nav icon |
+| [`dsh-mcp`](dsh-mcp/README.md) | MCP in one bundle: a **Settings → MCP servers** page (list, add, edit, disable, remove, test an endpoint) **and** an `MCP` row below the composer showing what is connected, its tool counts, and the upstream servers behind a federating gateway | mounts one `@deepseek-ai/dsh-mcp-client` child per enabled server, serves `GET /api/mcp-servers` (fiber state, live tool counts), `POST /api/mcp-servers/test` (probe a draft), `POST /api/mcp-servers/save`, and `GET /api/mcp-status` (handshake probe plus upstream discovery) | the page and the composer-dock panel; `client.js` is generated from `src/servers/client.js` + `src/status/client.js` by `scripts/compose-client.mjs` |
 | [`dsh-config-document`](dsh-config-document/README.md) | Makes the Settings header button **Open configuration file** work in a headless deployment: the profile's `cordis.patch.yml` opens *inside* the Web UI instead of in an OS editor on the Host (`settings.action`, replaces the shipped cell) | serves the prepared document's path and text on `GET /api/config-document`; read-only, accepts no path parameter | the modal: monospace content, path, line/size hints, Copy, Download, Reload, and an "Open in Host editor" fallback that reports the Host's failure |
 
 ## Anatomy of a plugin
@@ -51,11 +51,11 @@ A profile keeps an **absolute** `link:` dependency *and* the package name in
 ```json
 {
   "dependencies": {
-    "@local/dsh-mcp-status": "link:/mnt/shared/califra-dsh/tools/deepseek-harness/custom-plugins/dsh-mcp-status"
+    "@local/dsh-mcp": "link:/mnt/shared/califra-dsh/tools/deepseek-harness/custom-plugins/dsh-mcp"
   },
   "dsh": {
     "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@local/dsh-mcp-status"]
+      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@local/dsh-mcp"]
     }
   }
 }
@@ -109,7 +109,7 @@ breaking change for everyone who installed from the old location. When a move ha
    (`ln -s deepseek-harness/custom-plugins/<name> <old-path>`). The shared PVC is mounted at the
    same path in every user pod, so this keeps existing profiles resolving with no action from
    their owners. The 2026-11-12 move into this folder did exactly that for
-   `dsh-app-shortcuts` and `dsh-mcp-status`.
+   `dsh-app-shortcuts` and `dsh-mcp`.
 2. Re-link each profile to the new path when convenient, then delete the symlink.
 
 A profile that still points at a removed path only fails **on the next dsh restart** (the running

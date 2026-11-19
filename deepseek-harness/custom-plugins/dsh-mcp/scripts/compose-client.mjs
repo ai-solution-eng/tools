@@ -17,7 +17,6 @@ import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.dirname(here)
-const plugins = path.dirname(root)
 
 const HEADER = `/**
  * MCP — browser half.
@@ -74,8 +73,8 @@ function capture(file, id, name) {
  * @returns {string} the bundle source.
  */
 export function composeClient() {
-  const servers = capture(path.join(plugins, 'dsh-mcp-servers', 'client.js'), '@local/dsh-mcp-servers', 'serversHalf')
-  const status = capture(path.join(plugins, 'dsh-mcp-status', 'client.js'), '@local/dsh-mcp-status', 'statusHalf')
+  const servers = capture(path.join(root, 'src', 'servers', 'client.js'), '@local/dsh-mcp-servers', 'serversHalf')
+  const status = capture(path.join(root, 'src', 'status', 'client.js'), '@local/dsh-mcp-status', 'statusHalf')
   return HEADER + servers + '\n\n' + status + FOOTER
 }
 

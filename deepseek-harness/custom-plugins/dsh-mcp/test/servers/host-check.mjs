@@ -10,8 +10,8 @@
  */
 import assert from 'node:assert/strict'
 
-import { Config } from '../schema.js'
-import { apply } from '../index.js'
+import { Config } from '../../src/servers/schema.js'
+import { apply } from '../../src/servers/index.js'
 
 const WRITE = Symbol.for('cosmokit.volatile.write')
 

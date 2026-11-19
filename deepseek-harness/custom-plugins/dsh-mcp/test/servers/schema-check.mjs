@@ -40,7 +40,7 @@ import {
   resolveConfigValue,
   schemaToJSON,
   slugOf,
-} from '../schema.js'
+} from '../../src/servers/schema.js'
 
 const results = []
 /**

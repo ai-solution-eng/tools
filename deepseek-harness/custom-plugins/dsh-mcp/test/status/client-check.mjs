@@ -76,7 +76,7 @@ function loadClient() {
   }
   sandbox.globalThis = sandbox
   createContext(sandbox)
-  runInContext(readFileSync(new URL('../client.js', import.meta.url), 'utf8'), sandbox, { filename: 'client.js' })
+  runInContext(readFileSync(new URL('../../src/status/client.js', import.meta.url), 'utf8'), sandbox, { filename: 'client.js' })
   assert.ok(registration, 'client module did not register a factory')
   return registration
 }
@@ -301,7 +301,7 @@ await check('render: missing translator falls back to keys without throwing', as
 })
 
 await check('style: only theme tokens are referenced', async () => {
-  const css = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const css = readFileSync(new URL('../../src/status/client.js', import.meta.url), 'utf8')
   const colors = [...css.matchAll(/:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\))\b/g)].map((match) => match[1])
   assert.deepEqual(colors, [], `literal colors found: ${colors.join(', ')}`)
   const variables = [...css.matchAll(/var\((--[a-z0-9-]+)\)/g)].map((match) => match[1])
@@ -310,7 +310,7 @@ await check('style: only theme tokens are referenced', async () => {
 })
 
 await check('bundle: imports no Harness Client package', async () => {
-  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const source = readFileSync(new URL('../../src/status/client.js', import.meta.url), 'utf8')
   const requires = [...source.matchAll(/require\('([^']+)'\)/g)].map((match) => match[1])
   assert.deepEqual(requires, ['react'])
 })

@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
-const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+const source = readFileSync(new URL('../../src/servers/client.js', import.meta.url), 'utf8')
 
 const results = []
 /**

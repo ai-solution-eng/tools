@@ -21,8 +21,8 @@
  * @module
  */
 
-import { apply as applyServers } from '../dsh-mcp-servers/index.js'
-import { apply as applyStatus } from '../dsh-mcp-status/index.js'
+import { apply as applyServers } from './src/servers/index.js'
+import { apply as applyStatus } from './src/status/index.js'
 
 /**
  * The row's config schema, re-exported from the server half.
@@ -33,7 +33,7 @@ import { apply as applyStatus } from '../dsh-mcp-status/index.js'
  * but the page reports "Configuration is not available" because no schema is
  * registered for the row.
  */
-export { Config } from '../dsh-mcp-servers/index.js'
+export { Config } from './src/servers/index.js'
 
 /**
  * Services required before either half can answer.
