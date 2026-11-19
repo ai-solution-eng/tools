@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apply, Config, inject } from '../index.js'
+import { clientPath, composeClient } from '../scripts/compose-client.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.dirname(here)
@@ -64,9 +65,10 @@ const ctx = {
 check('one apply() registers the server and status routes', () => {
   apply(ctx, { servers: [] })
   const paths = routes.map((route) => route.path)
-  if (paths.length !== 3) return 'expected 3 routes, got ' + JSON.stringify(paths)
+  if (paths.length !== 4) return 'expected 4 routes, got ' + JSON.stringify(paths)
   if (!paths.includes('/api/mcp-servers')) return 'server status route missing'
   if (!paths.includes('/api/mcp-servers/test')) return 'server test route missing'
+  if (!paths.includes('/api/mcp-servers/save')) return 'server save route missing'
   if (!paths.includes('/api/mcp-status')) return 'status route missing'
 })
 
@@ -75,6 +77,14 @@ check('both methods are wired on the server routes', () => {
   if (!test || !Array.isArray(test.methods) || test.methods[0] !== 'POST') return 'test route is not POST'
   const status = routes.find((route) => route.path === '/api/mcp-status')
   if (!status || !Array.isArray(status.methods) || status.methods[0] !== 'GET') return 'status route is not GET'
+})
+
+check('the client bundle is up to date with both halves', () => {
+  // client.js is generated. Editing a half without regenerating leaves the
+  // merged bundle serving the previous version of that surface.
+  const expected = composeClient()
+  const actual = fs.readFileSync(clientPath(), 'utf8')
+  if (actual !== expected) return 'client.js is stale - run node scripts/compose-client.mjs'
 })
 
 check('the client bundle registers once, under the bundle name', () => {

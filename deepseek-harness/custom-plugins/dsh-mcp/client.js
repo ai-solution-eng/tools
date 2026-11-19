@@ -47,6 +47,9 @@ const serversHalf = {
 
 /** Route that probes one unsaved draft. */
 const TEST_ENDPOINT = 'api/mcp-servers/test'
+
+/** Route that persists the list when the settings form refuses the write. */
+const SAVE_ENDPOINT = 'api/mcp-servers/save'
     /** How often live state is re-read while the page is open. */
     const POLL_MS = 5000
     /** The bridge's `serverName` contract. */
@@ -105,6 +108,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'action.addHeader': 'Add header',
       'action.addVariable': 'Add variable',
       'action.clear': 'Clear',
+      'action.reveal': 'Show',
+      'action.hide': 'Hide',
       'transport.streamable-http': 'Streamable HTTP',
       'transport.stdio': 'stdio',
       'field.serverName': 'Server name',
@@ -124,6 +129,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'field.env.hint': 'Optional. Variables merged over the scrubbed environment.',
       'field.timeout': 'Tool call timeout',
       'field.timeout.hint': 'Milliseconds. Default {ms}.',
+      'field.catalogUrl': 'Upstream catalog URL',
+      'field.catalogUrl.hint': 'Optional. An HTTP endpoint that lists this gateway\'s upstream MCP servers, for a gateway that publishes no catalog tool. LiteLLM serves it at /v1/mcp/server.',
+      'placeholder.catalogUrl': 'http://gateway:4000/v1/mcp/server',
       'field.instructions': 'Instruction cap',
       'field.instructions.hint':
         'Bytes of server instructions allowed into the system prompt. Default {bytes}. Raise it when a server reports that its instructions exceed the cap.',
@@ -206,6 +214,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'action.addHeader': '添加请求头',
       'action.addVariable': '添加变量',
       'action.clear': '清除',
+      'action.reveal': '显示',
+      'action.hide': '隐藏',
       'transport.streamable-http': 'Streamable HTTP',
       'transport.stdio': 'stdio',
       'field.serverName': '服务器名称',
@@ -225,6 +235,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'field.env.hint': '可选。合并到已清理的环境之上。',
       'field.timeout': '工具调用超时',
       'field.timeout.hint': '毫秒。默认 {ms}。',
+      'field.catalogUrl': '上游目录 URL',
+      'field.catalogUrl.hint': '可选。列出该网关上游 MCP 服务器的 HTTP 端点，用于不提供目录工具的网关。LiteLLM 的地址为 /v1/mcp/server。',
+      'placeholder.catalogUrl': 'http://gateway:4000/v1/mcp/server',
       'field.instructions': '指令上限',
       'field.instructions.hint': '允许进入系统提示的服务器指令字节数。默认 {bytes}。当服务器报告指令超过上限时调高此值。',
       'field.failOnStartup': '服务器无法启动时报告失败',
@@ -432,6 +445,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         env: [],
         toolCallTimeoutMs: String(DEFAULT_TIMEOUT_MS),
         maxInstructionBytes: String(DEFAULT_MAX_INSTRUCTION_BYTES),
+        catalogUrl: '',
         failOnStartupError: false,
         enabled: true,
       }
@@ -456,6 +470,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         env: pairsOf(row.env),
         toolCallTimeoutMs: String(row.toolCallTimeoutMs ?? DEFAULT_TIMEOUT_MS),
         maxInstructionBytes: String(row.maxInstructionBytes ?? DEFAULT_MAX_INSTRUCTION_BYTES),
+        catalogUrl: typeof row.catalogUrl === 'string' ? row.catalogUrl : '',
         failOnStartupError: row.failOnStartupError === true,
         enabled: row.enabled !== false,
       }
@@ -547,6 +562,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         if (Object.keys(env).length > 0) row.env = env
       } else {
         row.url = String(draft.url ?? '').trim()
+        const catalogUrl = String(draft.catalogUrl ?? '').trim()
+        if (catalogUrl) row.catalogUrl = catalogUrl
         const headers = dictOf(draft.headers)
         if (Object.keys(headers).length > 0) row.headers = headers
       }
@@ -764,8 +781,25 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
      * @param {{ id: string, label: string, hint?: string, error?: string, addLabel: string, pairs: Array<{ key: string, value: string }>, keyPlaceholder: string, valuePlaceholder: string, onChange: (pairs: Array<{ key: string, value: string }>) => void }} props - editor props.
      * @returns {any} element.
      */
+    /**
+     * Header and variable names whose values are credentials. Their value input
+     * renders as a password field, so a bearer token is never shown on screen
+     * while the real value stays in the draft and is saved unchanged.
+     */
+    const SENSITIVE_NAME = /(authorization|cookie|token|secret|api[-_]?key|apikey|password|credential|session)/i
+
+    /**
+     * Whether a header or variable name holds a secret.
+     * @param {unknown} name - header or variable name.
+     * @returns {boolean} true when the value must be hidden.
+     */
+    function isSensitiveName(name) {
+      return SENSITIVE_NAME.test(String(name ?? ''))
+    }
+
     function KeyValueEditor(props) {
       const pairs = Array.isArray(props.pairs) ? props.pairs : []
+      const [revealed, setRevealed] = React.useState({})
       const update = (index, patch) => {
         props.onChange(pairs.map((pair, position) => (position === index ? { ...pair, ...patch } : pair)))
       }
@@ -789,7 +823,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
               }),
               h('input', {
                 className: 'dsh-mcp-servers__input',
-                type: 'text',
+                // A credential value is masked by default: the draft keeps the
+                // real text, the field just does not render it.
+                type: isSensitiveName(pair.key) && revealed[index] !== true ? 'password' : 'text',
                 value: pair.value ?? '',
                 placeholder: props.valuePlaceholder,
                 spellCheck: false,
@@ -797,6 +833,14 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                 'aria-label': props.valuePlaceholder,
                 onChange: (event) => update(index, { value: event.target.value }),
               }),
+              isSensitiveName(pair.key)
+                ? h('button', {
+                    type: 'button',
+                    className: 'dsh-mcp-servers__ghost',
+                    'aria-label': revealed[index] === true ? props.hideLabel : props.revealLabel,
+                    onClick: () => setRevealed({ ...revealed, [index]: revealed[index] !== true }),
+                  }, revealed[index] === true ? props.hideLabel : props.revealLabel)
+                : null,
               h('button', {
                 type: 'button',
                 className: 'dsh-mcp-servers__ghost',
@@ -995,6 +1039,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                   error: errors.keys.env,
                   addLabel: t('action.addVariable'),
                   removeLabel: t('action.clear'),
+                  revealLabel: t('action.reveal'),
+                  hideLabel: t('action.hide'),
                   pairs: draft.env,
                   keyPlaceholder: t('placeholder.key'),
                   valuePlaceholder: t('placeholder.value'),
@@ -1018,6 +1064,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                   error: errors.keys.headers,
                   addLabel: t('action.addHeader'),
                   removeLabel: t('action.clear'),
+                  revealLabel: t('action.reveal'),
+                  hideLabel: t('action.hide'),
                   pairs: draft.headers,
                   keyPlaceholder: t('placeholder.key'),
                   valuePlaceholder: t('placeholder.value'),
@@ -1031,6 +1079,15 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
             hint: t('field.timeout.hint', { ms: DEFAULT_TIMEOUT_MS }),
             error: errors.fields.toolCallTimeoutMs,
             onChange: (value) => patch({ toolCallTimeoutMs: value }),
+          }),
+          h(TextField, {
+            id: 'catalogUrl',
+            label: t('field.catalogUrl'),
+            value: draft.catalogUrl,
+            hint: t('field.catalogUrl.hint'),
+            placeholder: t('placeholder.catalogUrl'),
+            error: errors.fields.catalogUrl,
+            onChange: (value) => patch({ catalogUrl: value }),
           }),
           h(TextField, {
             id: 'maxInstructionBytes',
@@ -1127,20 +1184,55 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
        * @returns {Promise<boolean>} whether the Host accepted the write.
        */
       const write = async (nextRows) => {
-        if (!form) {
-          setWriteError(t('error.unavailableWrite'))
-          return false
-        }
         setBusy(true)
         setWriteError(null)
         try {
-          const accepted = await form.mutate([{ op: 'set', path: ['servers'], value: nextRows }])
-          if (!accepted) {
-            setWriteError(t('error.saveFailed'))
-            return false
+          // Write through the Host route first: it is bounded, it runs the same
+          // sanctioned editor call, and it answers with the reason on failure.
+          // The settings form reports a refusal as a bare false — and, when the
+          // write stalls, as no answer at all — which left the button spinning.
+          // Writing the profile patch makes the supervisor restart the Host to
+          // apply it, which cuts this request before it can answer. A dropped
+          // connection is therefore the SUCCESS path, not a failure — only an
+          // answer that says so is an error.
+          let response = null
+          let result = null
+          try {
+            response = await fetch(SAVE_ENDPOINT, {
+              method: 'POST',
+              credentials: 'same-origin',
+              cache: 'no-store',
+              headers: { 'content-type': 'application/json', accept: 'application/json' },
+              body: JSON.stringify({ servers: nextRows }),
+              signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                ? AbortSignal.timeout(8000)
+                : undefined,
+            })
+            result = await response.json().catch(() => null)
+          } catch {
+            // The Host restarted to apply the write; the change is on disk.
+            return true
           }
-          if (live && typeof live.refresh === 'function') void live.refresh(false)
-          return true
+          if (result && result.ok === true) {
+            if (live && typeof live.refresh === 'function') void live.refresh(false)
+            return true
+          }
+          const reason = result && typeof result.error === 'string' && result.error
+            ? result.error
+            : 'HTTP ' + (response === null ? 'no answer' : response.status)
+          // The route itself missing (an older Host half) is the only case the
+          // settings form can still serve.
+          if (response.status === 404 || response.status === 503) {
+            if (form) {
+              const accepted = await form.mutate([{ op: 'set', path: ['servers'], value: nextRows }])
+              if (accepted) {
+                if (live && typeof live.refresh === 'function') void live.refresh(false)
+                return true
+              }
+            }
+          }
+          setWriteError(t('error.saveFailed') + ' ' + reason)
+          return false
         } catch (error) {
           setWriteError(messageOf(error))
           return false
