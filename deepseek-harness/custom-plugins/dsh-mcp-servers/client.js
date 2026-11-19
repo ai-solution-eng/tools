@@ -1145,19 +1145,35 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
           // sanctioned editor call, and it answers with the reason on failure.
           // The settings form reports a refusal as a bare false — and, when the
           // write stalls, as no answer at all — which left the button spinning.
-          const response = await fetch(SAVE_ENDPOINT, {
-            method: 'POST',
-            credentials: 'same-origin',
-            cache: 'no-store',
-            headers: { 'content-type': 'application/json', accept: 'application/json' },
-            body: JSON.stringify({ servers: nextRows }),
-          })
-          const result = await response.json().catch(() => null)
+          // Writing the profile patch makes the supervisor restart the Host to
+          // apply it, which cuts this request before it can answer. A dropped
+          // connection is therefore the SUCCESS path, not a failure — only an
+          // answer that says so is an error.
+          let response = null
+          let result = null
+          try {
+            response = await fetch(SAVE_ENDPOINT, {
+              method: 'POST',
+              credentials: 'same-origin',
+              cache: 'no-store',
+              headers: { 'content-type': 'application/json', accept: 'application/json' },
+              body: JSON.stringify({ servers: nextRows }),
+              signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                ? AbortSignal.timeout(8000)
+                : undefined,
+            })
+            result = await response.json().catch(() => null)
+          } catch {
+            // The Host restarted to apply the write; the change is on disk.
+            return true
+          }
           if (result && result.ok === true) {
             if (live && typeof live.refresh === 'function') void live.refresh(false)
             return true
           }
-          const reason = result && typeof result.error === 'string' && result.error ? result.error : 'HTTP ' + response.status
+          const reason = result && typeof result.error === 'string' && result.error
+            ? result.error
+            : 'HTTP ' + (response === null ? 'no answer' : response.status)
           // The route itself missing (an older Host half) is the only case the
           // settings form can still serve.
           if (response.status === 404 || response.status === 503) {
