@@ -34,8 +34,10 @@
  * @module
  */
 
-import { accessSync, constants as fsConstants, statSync } from 'node:fs'
+import { accessSync, constants as fsConstants, realpathSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { delimiter, isAbsolute, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { probeMcpHttp } from './probe.js'
 import {
@@ -162,6 +164,26 @@ async function resolveBridge(ctx) {
         ctx.loader && typeof ctx.loader.import === 'function'
           ? ctx.loader.import(BRIDGE_PACKAGE)
           : Promise.reject(new Error('no Loader service')),
+    ],
+    [
+      // Resolve from the running Host installation. A linked profile plugin has
+      // no node_modules of its own, and a Loader that exposes no import() has
+      // no other way to reach the bridge — but the process that is running this
+      // plugin is the installation that owns it.
+      'host resolution',
+      () => {
+        const entry = typeof process.argv[1] === 'string' && process.argv[1] ? process.argv[1] : join(process.cwd(), 'package.json')
+        // The launcher is usually a symlink (/usr/local/bin/dsh): resolution
+        // must start from the real file, or it looks beside the symlink.
+        let anchor = entry
+        try {
+          anchor = realpathSync(entry)
+        } catch {
+          // Keep the entry path; the attempt fails and is reported like any other.
+        }
+        const hostRequire = createRequire(anchor)
+        return import(pathToFileURL(hostRequire.resolve(BRIDGE_PACKAGE)).href)
+      },
     ],
   ]
   for (const [label, load] of attempts) {
