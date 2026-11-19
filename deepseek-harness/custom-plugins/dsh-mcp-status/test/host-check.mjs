@@ -16,6 +16,18 @@ const SECRET = 'Bearer super-secret-token'
 /** One mock MCP server whose behaviour is selected by `mode`. */
 function startMock(mode) {
   const server = createServer((req, res) => {
+    // A gateway that publishes its upstream list over REST instead of as an
+    // MCP tool (LiteLLM's /v1/mcp/server).
+    if (req.method === 'GET' && req.url === '/v1/mcp/server') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        servers: [
+          { server_name: 'github', url: 'http://github:8080/mcp', tool_count: 5 },
+          { server_name: 'slack', url: 'http://slack:8080/mcp', tool_count: 2 },
+        ],
+      }))
+      return
+    }
     let body = ''
     req.on('data', (chunk) => { body += chunk })
     req.on('end', () => {
@@ -55,7 +67,12 @@ function startMock(mode) {
           jsonrpc: '2.0',
           id: message.id,
           result: {
-            tools: mode === 'litellm'
+            tools: mode === 'rest-only'
+              ? [
+                  { name: 'execute_query', description: 'run a query' },
+                  { name: 'search', description: 'search' },
+                ]
+              : mode === 'litellm'
               ? [
                   { name: 'list_mcp_servers', description: 'list upstream servers' },
                   { name: 'search', description: 'search' },
@@ -156,6 +173,7 @@ const fastmcp = await startMock('fastmcp')
 const structuredOnly = await startMock('structured-only')
 const structuredObject = await startMock('structured-object')
 const litellm = await startMock('litellm')
+const restOnly = await startMock('rest-only')
 const deadPort = await new Promise((resolve) => {
   const server = createServer(() => {})
   server.listen(0, '127.0.0.1', () => {
@@ -424,6 +442,25 @@ await record('snapshot: a federator with a differently named catalog tool unroll
   assert.equal(connection.upstream.servers[1].reachable, false, 'a failure status marks it unreachable')
 })
 
+await record('snapshot: a gateway with no catalog tool unrolls through its REST catalog', async () => {
+  const entry = fakeEntry('mcp-rest', {
+    transport: 'streamable-http',
+    serverName: 'rest-gateway',
+    url: 'http://127.0.0.1:' + restOnly.port + '/mcp',
+    headers,
+  })
+  const ctx = {
+    loader: { entries: () => [entry][Symbol.iterator]() },
+    tools: { schemas: () => [] },
+  }
+  const snapshot = await buildSnapshot(ctx, settings, caches(), true)
+  const connection = snapshot.connections.find((item) => item.serverName === 'rest-gateway')
+  assert.equal(connection.state, 'connected')
+  assert.equal(connection.upstream.tool, 'rest', 'the REST catalog answered')
+  assert.deepEqual(connection.upstream.servers.map((server) => server.server), ['github', 'slack'])
+  assert.equal(connection.upstream.servers[0].toolCount, 5, 'tool_count is read')
+})
+
 await record('snapshot: upstream is omitted unless requested', async () => {
   const snapshot = await buildSnapshot(fakeCtx, settings, caches(), false)
   assert.ok(snapshot.connections.every((item) => item.upstream === undefined))
@@ -529,6 +566,7 @@ const failures = results.filter((line) => line.startsWith('FAIL')).length
 console.log(`\n${results.length - failures}/${results.length} checks passed`)
 json.server.close()
 litellm.server.close()
+restOnly.server.close()
 sse.server.close()
 unauthorized.server.close()
 catalogError.server.close()

@@ -70,6 +70,7 @@ const ROW_FIELDS = [
   'toolCallTimeoutMs',
   'failOnStartupError',
   'maxInstructionBytes',
+  'catalogUrl',
   'enabled',
 ]
 
@@ -304,6 +305,9 @@ export function normalizeRow(raw, index, taken) {
   }
   if (transport === 'streamable-http') {
     row.url = typeof source.url === 'string' ? source.url.trim() : ''
+    // Optional REST catalog endpoint, for a gateway that publishes its upstream
+    // server list over HTTP instead of as an MCP tool (LiteLLM does).
+    row.catalogUrl = typeof source.catalogUrl === 'string' ? source.catalogUrl.trim() : ''
     row.headers = normalizeStringDict(source.headers)
     row.command = ''
     row.args = []

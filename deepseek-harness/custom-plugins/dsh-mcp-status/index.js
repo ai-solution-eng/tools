@@ -21,7 +21,7 @@
  * @module
  */
 
-import { catalogCandidatesFor, commandName, messageOf, probeMcpHttp, redactUrl } from './probe.js'
+import { catalogCandidatesFor, commandName, fetchCatalog, messageOf, probeMcpHttp, redactUrl } from './probe.js'
 
 /** Loader rows this plugin reports on. */
 const MCP_CLIENT_SPECIFIER = 'mcp-client'
@@ -268,6 +268,7 @@ async function describeConnection(ctx, entry, settings) {
       catalogTools: settings.catalogTools,
     })
     connection.target = { url: config.url, headers: config.headers }
+    if (typeof config.catalogUrl === 'string' && config.catalogUrl.trim()) connection.catalogUrl = config.catalogUrl.trim()
     return applyProbe(connection, probe, settings)
   }
 
@@ -419,6 +420,7 @@ async function describeManagedConnection(ctx, hostEntry, row, settings) {
     // second probe as a native row, so it needs its endpoint kept here.
     if (transport === 'streamable-http' && typeof row.url === 'string' && row.url.trim()) {
       connection.target = { url: row.url, headers: row.headers }
+      if (typeof row.catalogUrl === 'string' && row.catalogUrl.trim()) connection.catalogUrl = row.catalogUrl.trim()
     }
     return {
       ...connection,
@@ -502,28 +504,64 @@ function readConnections(ctx, settings, caches) {
  * @param {Map<string, { at: number, value: any }>} cache - upstream cache.
  * @returns {Promise<Record<string, any>>} connection view with `upstream`.
  */
+/**
+ * Guess a gateway's REST catalog endpoint from its MCP endpoint.
+ *
+ * LiteLLM proxies the upstream tools and keeps the server list at
+ * `/v1/mcp/server`, so a gateway that publishes no catalog tool still has an
+ * answer — it is just not an MCP one.
+ * @param {string} url - MCP endpoint.
+ * @returns {string | undefined} catalog URL, or undefined when the shape is unknown.
+ */
+function deriveCatalogUrl(url) {
+  try {
+    const parsed = new URL(url)
+    if (!/\/mcp\/?$/.test(parsed.pathname)) return undefined
+    return parsed.origin + '/v1/mcp/server'
+  } catch {
+    return undefined
+  }
+}
+
 async function withUpstream(connection, settings, cache) {
-  if (connection.state !== 'connected' || !connection.catalogAvailable || !connection.target) return connection
+  if (connection.state !== 'connected' || !connection.target) return connection
   const key = `${connection.serverName}|${connection.endpoint ?? ''}`
   const cached = cache.get(key)
   if (cached && Date.now() - cached.at < settings.upstreamTtlMs) {
     return { ...connection, upstream: cached.value }
   }
-  const probe = await probeMcpHttp({
-    url: connection.target.url,
-    headers: connection.target.headers,
-    timeoutMs: settings.probeTimeoutMs,
-    catalogTool: settings.catalogTool,
-    catalogTools: settings.catalogTools,
-  })
-  const servers = Array.isArray(probe.catalog)
-    ? probe.catalog.slice(0, settings.maxUpstreamServers)
-    : []
+
+  const headers = connection.target.headers
+  const derived = connection.catalogUrl ?? deriveCatalogUrl(connection.target.url)
+  let servers = []
+  let tool = settings.catalogTool
+  let error
+
+  if (connection.catalogAvailable) {
+    const probe = await probeMcpHttp({
+      url: connection.target.url,
+      headers,
+      timeoutMs: settings.probeTimeoutMs,
+      catalogTool: settings.catalogTool,
+      catalogTools: settings.catalogTools,
+    })
+    servers = Array.isArray(probe.catalog) ? probe.catalog : []
+    tool = probe.catalogTool ?? settings.catalogTool
+    error = probe.catalogError
+  } else if (derived !== undefined) {
+    const fetched = await fetchCatalog({ url: derived, headers, timeoutMs: settings.probeTimeoutMs })
+    servers = Array.isArray(fetched.rows) ? fetched.rows : []
+    tool = 'rest'
+    error = fetched.error
+  } else {
+    return connection
+  }
+
   const upstream = {
     generatedAt: new Date().toISOString(),
-    tool: probe.catalogTool ?? settings.catalogTool,
-    servers,
-    error: probe.catalogError ?? (servers.length ? undefined : 'no upstream servers reported'),
+    tool,
+    servers: servers.slice(0, settings.maxUpstreamServers),
+    error: error ?? (servers.length ? undefined : 'no upstream servers reported'),
   }
   cache.set(key, { at: Date.now(), value: upstream })
   return { ...connection, upstream }

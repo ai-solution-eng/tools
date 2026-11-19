@@ -361,7 +361,7 @@ if (!existsSync(schemasteryPath) || !existsSync(cosmokitPath)) {
     const live = Config['~standard'].validate({ servers: [{ serverName: 'github', enabled: false }] }).value
     const projected = projectForm(form, plainConfig(live))
     assert.doesNotThrow(() => rehydrated(projected))
-    assert.deepEqual(projected, { servers: [{ serverName: 'github', enabled: false, id: 'github', transport: 'streamable-http', url: '', headers: {}, command: '', args: [], cwd: '', env: {}, toolCallTimeoutMs: 60000, failOnStartupError: false, maxInstructionBytes: 262144 }] })
+    assert.deepEqual(projected, { servers: [{ serverName: 'github', enabled: false, id: 'github', transport: 'streamable-http', url: '', headers: {}, command: '', args: [], cwd: '', env: {}, toolCallTimeoutMs: 60000, failOnStartupError: false, maxInstructionBytes: 262144, catalogUrl: '' }] })
   })
 
   check('interop: isVolatilePath() allows the servers field and nothing else', () => {

@@ -370,6 +370,41 @@ export function normalizeCatalog(payload) {
 }
 
 /**
+ * Read an upstream catalog from a plain HTTP endpoint.
+ *
+ * Not every federating gateway publishes its server list as an MCP tool:
+ * LiteLLM proxies the upstream tools and keeps the list at `/v1/mcp/server`.
+ * The same normalisation applies once the JSON is in hand.
+ * @param {{ url: string, headers?: Record<string, string>, timeoutMs?: number }} options - request inputs.
+ * @returns {Promise<{ rows?: Array<object>, error?: string }>} rows or a reason.
+ */
+export async function fetchCatalog(options) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 5000)
+  try {
+    const response = await fetch(options.url, {
+      method: 'GET',
+      headers: { accept: 'application/json', ...(options.headers ?? {}) },
+      signal: controller.signal,
+    })
+    if (!response.ok) return { error: 'HTTP ' + response.status }
+    const text = await response.text()
+    let payload
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      return { error: 'the catalog endpoint did not answer JSON' }
+    }
+    const rows = normalizeCatalog(payload)
+    return Array.isArray(rows) ? { rows } : { error: 'the catalog endpoint reported no server list' }
+  } catch (error) {
+    return { error: messageOf(error) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
  * Normalize `initialize` server identity.
  * @param {unknown} info - `serverInfo` member.
  * @returns {{ name?: string, version?: string } | undefined} identity.

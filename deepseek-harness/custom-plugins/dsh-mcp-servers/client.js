@@ -113,6 +113,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'field.env.hint': 'Optional. Variables merged over the scrubbed environment.',
       'field.timeout': 'Tool call timeout',
       'field.timeout.hint': 'Milliseconds. Default {ms}.',
+      'field.catalogUrl': 'Upstream catalog URL',
+      'field.catalogUrl.hint': 'Optional. An HTTP endpoint that lists this gateway\'s upstream MCP servers, for a gateway that publishes no catalog tool. LiteLLM serves it at /v1/mcp/server.',
+      'placeholder.catalogUrl': 'http://gateway:4000/v1/mcp/server',
       'field.instructions': 'Instruction cap',
       'field.instructions.hint':
         'Bytes of server instructions allowed into the system prompt. Default {bytes}. Raise it when a server reports that its instructions exceed the cap.',
@@ -214,6 +217,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'field.env.hint': '可选。合并到已清理的环境之上。',
       'field.timeout': '工具调用超时',
       'field.timeout.hint': '毫秒。默认 {ms}。',
+      'field.catalogUrl': '上游目录 URL',
+      'field.catalogUrl.hint': '可选。列出该网关上游 MCP 服务器的 HTTP 端点，用于不提供目录工具的网关。LiteLLM 的地址为 /v1/mcp/server。',
+      'placeholder.catalogUrl': 'http://gateway:4000/v1/mcp/server',
       'field.instructions': '指令上限',
       'field.instructions.hint': '允许进入系统提示的服务器指令字节数。默认 {bytes}。当服务器报告指令超过上限时调高此值。',
       'field.failOnStartup': '服务器无法启动时报告失败',
@@ -421,6 +427,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         env: [],
         toolCallTimeoutMs: String(DEFAULT_TIMEOUT_MS),
         maxInstructionBytes: String(DEFAULT_MAX_INSTRUCTION_BYTES),
+        catalogUrl: '',
         failOnStartupError: false,
         enabled: true,
       }
@@ -445,6 +452,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         env: pairsOf(row.env),
         toolCallTimeoutMs: String(row.toolCallTimeoutMs ?? DEFAULT_TIMEOUT_MS),
         maxInstructionBytes: String(row.maxInstructionBytes ?? DEFAULT_MAX_INSTRUCTION_BYTES),
+        catalogUrl: typeof row.catalogUrl === 'string' ? row.catalogUrl : '',
         failOnStartupError: row.failOnStartupError === true,
         enabled: row.enabled !== false,
       }
@@ -536,6 +544,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
         if (Object.keys(env).length > 0) row.env = env
       } else {
         row.url = String(draft.url ?? '').trim()
+        const catalogUrl = String(draft.catalogUrl ?? '').trim()
+        if (catalogUrl) row.catalogUrl = catalogUrl
         const headers = dictOf(draft.headers)
         if (Object.keys(headers).length > 0) row.headers = headers
       }
@@ -1020,6 +1030,15 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
             hint: t('field.timeout.hint', { ms: DEFAULT_TIMEOUT_MS }),
             error: errors.fields.toolCallTimeoutMs,
             onChange: (value) => patch({ toolCallTimeoutMs: value }),
+          }),
+          h(TextField, {
+            id: 'catalogUrl',
+            label: t('field.catalogUrl'),
+            value: draft.catalogUrl,
+            hint: t('field.catalogUrl.hint'),
+            placeholder: t('placeholder.catalogUrl'),
+            error: errors.fields.catalogUrl,
+            onChange: (value) => patch({ catalogUrl: value }),
           }),
           h(TextField, {
             id: 'maxInstructionBytes',
