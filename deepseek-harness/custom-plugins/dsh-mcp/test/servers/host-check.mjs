@@ -379,6 +379,9 @@ await check('the snapshot reports fiber state and live tool counts', async () =>
   assert.equal(body.servers[1].toolCount, 1)
   assert.equal(body.servers[1].endpoint, 'npx')
   assert.equal(body.servers[1].transport, 'stdio')
+  // The page lists the tool names, not just the count.
+  assert.deepEqual(body.servers[0].tools, ['fetch', 'search'])
+  assert.deepEqual(body.servers[1].tools, ['run'])
 })
 
 await check('the test route probes a draft without mounting it', async () => {

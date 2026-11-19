@@ -235,6 +235,30 @@ function registeredToolCount(ctx, serverName) {
 }
 
 /**
+ * Tool names the bridge currently publishes for one server name, prefix stripped.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {string} serverName - MCP server namespace.
+ * @returns {string[] | undefined} registered tool names, or undefined when the
+ * registry is unavailable.
+ */
+function registeredToolNames(ctx, serverName) {
+  try {
+    const tools = ctx.tools
+    if (!tools || typeof tools.schemas !== 'function') return undefined
+    const schemas = tools.schemas()
+    if (!Array.isArray(schemas)) return undefined
+    const prefix = `mcp__${serverName}__`
+    return schemas
+      .map((schema) => schema?.name)
+      .filter((name) => typeof name === 'string' && name.startsWith(prefix))
+      .map((name) => name.slice(prefix.length))
+      .sort()
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Read the MCP rows other layers of the profile configure. These are not
  * managed by this page: they belong to the profile patch, a bundle, or an
  * agent preset, and their configuration is not this plugin's to rewrite.
@@ -559,6 +583,9 @@ export function apply(ctx, config) {
         state: failed ? 'failed' : state === 'active' ? 'ready' : record?.fiber ? 'starting' : 'pending',
         fiberState: state,
         toolCount: registeredToolCount(ctx, serverName),
+        // The names, so the page can list them; the count alone left the
+        // operator guessing what a server actually offers.
+        tools: registeredToolNames(ctx, serverName),
         error: record?.error,
       }
     })

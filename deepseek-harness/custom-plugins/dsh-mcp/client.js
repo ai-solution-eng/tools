@@ -85,6 +85,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'state.failed': 'Failed',
       'state.disabled': 'Disabled',
       'tools.none': 'no tools',
+      'tools.list': 'Tools ({count})',
       'tools.one': '1 tool',
       'tools.many': '{count} tools',
       'action.edit': 'Edit',
@@ -191,6 +192,7 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'state.failed': '失败',
       'state.disabled': '已禁用',
       'tools.none': '无工具',
+      'tools.list': '工具（{count}）',
       'tools.one': '1 个工具',
       'tools.many': '{count} 个工具',
       'action.edit': '编辑',
@@ -307,6 +309,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       '.dsh-mcp-servers__dot[data-tone="error"]{background:var(--dsw-alias-state-error-primary)}',
       '.dsh-mcp-servers__endpoint{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}',
       '.dsh-mcp-servers__meta{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}',
+      '.dsh-mcp-servers__tools{margin-top:2px}',
+      '.dsh-mcp-servers__toolsSummary{cursor:pointer;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
+      '.dsh-mcp-servers__toolList{margin:4px 0 0;padding-left:18px;max-height:200px;overflow:auto;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}',
       '.dsh-mcp-servers__error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
       '.dsh-mcp-servers__rowActions{display:flex;align-items:center;gap:6px;flex:none;flex-wrap:wrap;justify-content:flex-end}',
       '.dsh-mcp-servers__empty{display:flex;flex-direction:column;gap:4px;padding:20px 12px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}',
@@ -895,6 +900,13 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
           ),
           endpoint ? h('div', { className: 'dsh-mcp-servers__endpoint' }, endpoint) : null,
           h('div', { className: 'dsh-mcp-servers__meta' }, metaText),
+          enabled && Array.isArray(live?.tools) && live.tools.length > 0
+            ? h('details', { className: 'dsh-mcp-servers__tools' },
+                h('summary', { className: 'dsh-mcp-servers__toolsSummary' },
+                  t('tools.list', { count: live.tools.length })),
+                h('ul', { className: 'dsh-mcp-servers__toolList' },
+                  live.tools.map((name) => h('li', { key: name }, name))))
+            : null,
           error
             ? h('div', { className: 'dsh-mcp-servers__error' }, problem ? `${t('problem.title')}: ${error}` : error)
             : null,

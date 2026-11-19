@@ -320,7 +320,7 @@ await check('a configured server shows its name, transport, endpoint and live st
       data: {
         bridge: { available: true },
         servers: [
-          { id: 'github', serverName: 'github', state: 'ready', fiberState: 'active', toolCount: 12 },
+          { id: 'github', serverName: 'github', state: 'ready', fiberState: 'active', toolCount: 12, tools: ['search', 'fetch'] },
           { id: 'local', serverName: 'local', state: 'starting', fiberState: 'loading', toolCount: 0 },
         ],
         problems: [],
@@ -450,6 +450,29 @@ await check('the add form offers the streamable-http fields', () => {
   const labels = byClass(tree, 'dsh-mcp-servers__label').map((entry) => textOf(entry))
   assert.ok(labels.includes('Server name'))
   assert.ok(labels.includes('URL'))
+})
+
+await check('a connected server can list its tools', () => {
+  const tree = renderPage({
+    form: readyForm([
+      { id: 'github', serverName: 'github', transport: 'streamable-http', url: 'https://mcp.example.com/mcp', enabled: true },
+    ]),
+    live: {
+      status: 'ready',
+      error: null,
+      data: {
+        bridge: { available: true },
+        servers: [{ id: 'github', serverName: 'github', state: 'ready', fiberState: 'active', toolCount: 2, tools: ['fetch', 'search'] }],
+        problems: [],
+        external: [],
+      },
+    },
+  })
+  const summary = byType(tree, 'summary').map((props) => textOf({ type: 'summary', props }))
+  assert.ok(summary.some((label) => label.includes('Tools (2)')), 'the list is collapsed behind a summary')
+  const text = textOf(tree)
+  assert.match(text, /fetch/)
+  assert.match(text, /search/)
 })
 
 await check('the editor masks a credential header value', () => {
