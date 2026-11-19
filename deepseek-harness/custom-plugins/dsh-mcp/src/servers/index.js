@@ -501,7 +501,12 @@ export function apply(ctx, config) {
         const next = wanted.get(serverName)
         if (!next || next.facts !== record.facts) unmount(serverName)
       }
-      if (desired.servers.length === 0) return
+      if (desired.servers.length === 0) {
+        // Nothing to mount, but the bridge is still resolved so the page can
+        // report the truth instead of "not resolved yet" on an empty list.
+        void ensureBridge()
+        return
+      }
       // A replaced server may reuse the same namespace, so wait for the
       // outgoing child to release it before mounting the replacement.
       await disposing
@@ -562,10 +567,13 @@ export function apply(ctx, config) {
       writable: true,
       bridge: bridge
         ? { available: true }
-        : {
-            available: false,
-            error: bridgeFailure ? messageOf(bridgeFailure.error) : 'the MCP bridge has not been resolved yet',
-          },
+        : bridgeFailure
+          ? { available: false, error: messageOf(bridgeFailure.error) }
+          : desired.servers.length === 0
+            // No servers means nothing needs the bridge; saying it is
+            // unavailable made a fresh install look broken.
+            ? { available: true }
+            : { available: false, error: 'the MCP bridge has not been resolved yet' },
       servers,
       problems: desired.problems,
       external: externalRows(ctx),
@@ -685,4 +693,7 @@ export function apply(ctx, config) {
   // Mount whatever the profile already configured. Deliberately not awaited:
   // a slow or unreachable MCP server must not delay this row's activation.
   void reconcile()
+  // Resolve the bridge once at startup, so the page can report a real state
+  // before the first server is configured.
+  void ensureBridge()
 }

@@ -216,6 +216,18 @@ await check('apply() does not throw when nothing is configured', async () => {
   assert.equal(state.mounts.length, 0)
 })
 
+await check('an empty list does not report the bridge as unavailable', async () => {
+  // reconcile() used to return before resolving the bridge when there was
+  // nothing to mount, so a fresh install showed "the MCP bridge is unavailable"
+  // until the first server was added.
+  const { start, snapshot } = createContext({ servers: [] })
+  start()
+  await tick()
+  await tick()
+  const snap = await snapshot()
+  assert.equal(snap.bridge.available, true)
+})
+
 await check('a volatile update mounts additions and unmounts removals only', async () => {
   const { ctx, state, start, setServers } = createContext({
     servers: [
