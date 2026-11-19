@@ -5,8 +5,11 @@
 #
 # This bundle composes the two halves in ../dsh-mcp-servers and
 # ../dsh-mcp-status, so both packages must stay installed next to it.
+# The row id must stay "mcp-servers": the browser half addresses its settings
+# namespace by that name, and a different id makes the Settings page write into
+# whatever row it can reach instead.
 - insert:
-    - id: mcp
+    - id: mcp-servers
       name: '@local/dsh-mcp'
       config:
         servers: []

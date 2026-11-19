@@ -4,7 +4,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { apply, inject } from '../index.js'
+import { apply, Config, inject } from '../index.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.dirname(here)
@@ -24,6 +24,16 @@ const check = (name, fn) => {
     results.push('FAIL ' + name + ': ' + error.message)
   }
 }
+
+check('host re-exports the row config schema', () => {
+  // Without Config the Loader cannot validate the row and the Settings service
+  // has no form to expose, so the page reports "Configuration is not available".
+  if (!Config || typeof Config !== 'object') return 'Config is not exported'
+  if (!Config['~standard'] || typeof Config['~standard'].validate !== 'function') return 'Config is not a schema'
+  const validated = Config['~standard'].validate({ servers: [] })
+  if (!validated || validated.issues) return 'Config rejected an empty server list'
+  if (!validated.value || !validated.value.servers) return 'Config did not return a servers field'
+})
 
 check('host declares the services both halves need', () => {
   if (!inject.includes('connection')) return 'connection missing'

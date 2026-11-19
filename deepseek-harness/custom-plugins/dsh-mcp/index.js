@@ -25,6 +25,17 @@ import { apply as applyServers } from '../dsh-mcp-servers/index.js'
 import { apply as applyStatus } from '../dsh-mcp-status/index.js'
 
 /**
+ * The row's config schema, re-exported from the server half.
+ *
+ * The Loader needs it to validate and normalise this row's config, and the
+ * Settings service needs it to expose the row as an editable form. Without this
+ * export the row still mounts (the server half reads a plain `servers` array),
+ * but the page reports "Configuration is not available" because no schema is
+ * registered for the row.
+ */
+export { Config } from '../dsh-mcp-servers/index.js'
+
+/**
  * Services required before either half can answer.
  *
  * `tools` comes from the status half: without it, reading the tool registry
