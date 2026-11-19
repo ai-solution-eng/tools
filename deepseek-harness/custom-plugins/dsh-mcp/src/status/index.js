@@ -551,11 +551,14 @@ async function withUpstream(connection, settings, cache) {
   const key = `${connection.serverName}|${connection.endpoint ?? ''}`
   const cached = cache.get(key)
   if (cached && Date.now() - cached.at < settings.upstreamTtlMs) {
-    return { ...connection, upstream: cached.value }
+    // A null value records "this server federates nothing": cache the negative
+    // answer too, or a plain server is re-probed on every poll.
+    return cached.value === null ? connection : { ...connection, upstream: cached.value }
   }
 
   const headers = connection.target.headers
-  const derived = connection.catalogUrl ?? deriveCatalogUrl(connection.target.url)
+  const explicit = typeof connection.catalogUrl === 'string' && connection.catalogUrl !== ''
+  const derived = explicit ? connection.catalogUrl : deriveCatalogUrl(connection.target.url)
   let servers = []
   let tool = settings.catalogTool
   let error
@@ -586,6 +589,14 @@ async function withUpstream(connection, settings, cache) {
         tool = 'tool-names'
         error = undefined
       }
+    }
+    // Nothing answered and nothing could be inferred: this is a plain MCP
+    // server, not a gateway. Say nothing rather than render "HTTP 404" under
+    // every server that happens to end in /mcp. An explicitly configured
+    // catalog URL is the exception — there the operator asked for it.
+    if (servers.length === 0 && !explicit) {
+      cache.set(key, { at: Date.now(), value: null })
+      return connection
     }
   } else {
     return connection

@@ -19,6 +19,12 @@ function startMock(mode) {
     // A gateway that publishes its upstream list over REST instead of as an
     // MCP tool (LiteLLM's /v1/mcp/server).
     if (req.method === 'GET' && req.url === '/v1/mcp/server') {
+      if (mode === 'plain') {
+        // A plain MCP server has no catalog endpoint at all.
+        res.writeHead(404, { 'content-type': 'text/plain' })
+        res.end('not found')
+        return
+      }
       if (mode === 'rest-denied') {
         res.writeHead(403, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: { message: 'not permitted' } }))
@@ -72,7 +78,12 @@ function startMock(mode) {
           jsonrpc: '2.0',
           id: message.id,
           result: {
-            tools: mode === 'rest-denied'
+            tools: mode === 'plain'
+              ? [
+                  { name: 'search', description: 'search' },
+                  { name: 'execute_query', description: 'query' },
+                ]
+              : mode === 'rest-denied'
               ? [
                   { name: 'alpha_mcp-run', description: 'proxied' },
                   { name: 'alpha_mcp-fetch', description: 'proxied' },
@@ -186,6 +197,7 @@ const structuredObject = await startMock('structured-object')
 const litellm = await startMock('litellm')
 const restOnly = await startMock('rest-only')
 const restDenied = await startMock('rest-denied')
+const plain = await startMock('plain')
 const deadPort = await new Promise((resolve) => {
   const server = createServer(() => {})
   server.listen(0, '127.0.0.1', () => {
@@ -492,6 +504,21 @@ await record('snapshot: a denied catalog falls back to tool-name grouping', asyn
   assert.equal(connection.upstream.error, undefined)
 })
 
+await record('snapshot: a plain server reports no upstreams at all', async () => {
+  const entry = fakeEntry('mcp-plain', {
+    transport: 'streamable-http',
+    serverName: 'plain',
+    url: 'http://127.0.0.1:' + plain.port + '/mcp',
+    headers,
+  })
+  const ctx = { loader: { entries: () => [entry][Symbol.iterator]() }, tools: { schemas: () => [] } }
+  const snapshot = await buildSnapshot(ctx, settings, caches(), true)
+  const connection = snapshot.connections.find((item) => item.serverName === 'plain')
+  assert.equal(connection.state, 'connected')
+  // A 404 on the derived catalog URL means "not a gateway": no block, no error.
+  assert.equal(connection.upstream, undefined, 'no upstream block for a plain server')
+})
+
 await record('snapshot: upstream is omitted unless requested', async () => {
   const snapshot = await buildSnapshot(fakeCtx, settings, caches(), false)
   assert.ok(snapshot.connections.every((item) => item.upstream === undefined))
@@ -599,6 +626,7 @@ json.server.close()
 litellm.server.close()
 restOnly.server.close()
 restDenied.server.close()
+plain.server.close()
 sse.server.close()
 unauthorized.server.close()
 catalogError.server.close()
