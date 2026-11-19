@@ -56,6 +56,10 @@ const ROUTE_PATH = '/api/mcp-servers'
 
 /** Authenticated route that probes one unsaved draft server. */
 const TEST_ROUTE_PATH = '/api/mcp-servers/test'
+/** Route that persists the list directly through the configuration editor. */
+const SAVE_ROUTE_PATH = '/api/mcp-servers/save'
+/** Loader row this plugin owns; the settings namespace and the row id match. */
+const ROW_ID = 'mcp-servers'
 
 /** Budget for one draft probe: a browser request, so it stays short. */
 const PROBE_TIMEOUT_MS = 5000
@@ -609,6 +613,48 @@ export function apply(ctx, config) {
         },
       }
       child.effect(() => child.connection.fetch.register(testRoute), 'mcp-servers: test route')
+
+      // Direct persistence, used when the settings form's write is refused.
+      // The settings service reports a refusal as a bare false, so the page
+      // cannot tell the operator why; this route runs the same sanctioned
+      // editor call and returns the reason instead.
+      const saveRoute = {
+        path: SAVE_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let body
+          try {
+            body = await request.json()
+          } catch {
+            return jsonResponse({ ok: false, error: 'expected a JSON body' }, 400)
+          }
+          const rows = Array.isArray(body && body.servers) ? body.servers : undefined
+          if (rows === undefined) return jsonResponse({ ok: false, error: 'servers must be an array' }, 400)
+          const editor = ctx.get('configEditor')
+          if (!editor || typeof editor.edit !== 'function') {
+            return jsonResponse({ ok: false, error: 'the configuration editor is not mounted' }, 503)
+          }
+          let entry
+          for (const candidate of editor.entries()) {
+            if (candidate && candidate.options && candidate.options.id === ROW_ID) {
+              entry = candidate
+              break
+            }
+          }
+          if (entry === undefined) {
+            return jsonResponse({ ok: false, error: 'no configuration row with id ' + ROW_ID }, 404)
+          }
+          try {
+            await editor.edit(entry, (current) => ({ ...current, servers: rows }))
+            void reconcile()
+            return jsonResponse({ ok: true })
+          } catch (error) {
+            return jsonResponse({ ok: false, error: messageOf(error) }, 400)
+          }
+        },
+      }
+      child.effect(() => child.connection.fetch.register(saveRoute), 'mcp-servers: save route')
     })
   } catch (error) {
     warn('could not register the status route', error)

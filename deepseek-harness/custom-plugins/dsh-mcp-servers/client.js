@@ -36,6 +36,9 @@ window.__ModuleLoader__.load({
 
 /** Route that probes one unsaved draft. */
 const TEST_ENDPOINT = 'api/mcp-servers/test'
+
+/** Route that persists the list when the settings form refuses the write. */
+const SAVE_ENDPOINT = 'api/mcp-servers/save'
     /** How often live state is re-read while the page is open. */
     const POLL_MS = 5000
     /** The bridge's `serverName` contract. */
@@ -1135,20 +1138,39 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
        * @returns {Promise<boolean>} whether the Host accepted the write.
        */
       const write = async (nextRows) => {
-        if (!form) {
-          setWriteError(t('error.unavailableWrite'))
-          return false
-        }
         setBusy(true)
         setWriteError(null)
         try {
-          const accepted = await form.mutate([{ op: 'set', path: ['servers'], value: nextRows }])
-          if (!accepted) {
-            setWriteError(t('error.saveFailed'))
-            return false
+          // Write through the Host route first: it is bounded, it runs the same
+          // sanctioned editor call, and it answers with the reason on failure.
+          // The settings form reports a refusal as a bare false — and, when the
+          // write stalls, as no answer at all — which left the button spinning.
+          const response = await fetch(SAVE_ENDPOINT, {
+            method: 'POST',
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({ servers: nextRows }),
+          })
+          const result = await response.json().catch(() => null)
+          if (result && result.ok === true) {
+            if (live && typeof live.refresh === 'function') void live.refresh(false)
+            return true
           }
-          if (live && typeof live.refresh === 'function') void live.refresh(false)
-          return true
+          const reason = result && typeof result.error === 'string' && result.error ? result.error : 'HTTP ' + response.status
+          // The route itself missing (an older Host half) is the only case the
+          // settings form can still serve.
+          if (response.status === 404 || response.status === 503) {
+            if (form) {
+              const accepted = await form.mutate([{ op: 'set', path: ['servers'], value: nextRows }])
+              if (accepted) {
+                if (live && typeof live.refresh === 'function') void live.refresh(false)
+                return true
+              }
+            }
+          }
+          setWriteError(t('error.saveFailed') + ' ' + reason)
+          return false
         } catch (error) {
           setWriteError(messageOf(error))
           return false

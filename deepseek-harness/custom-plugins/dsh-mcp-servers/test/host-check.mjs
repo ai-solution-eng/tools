@@ -178,11 +178,13 @@ await check('apply() registers the settings opt-out and the status route', async
   start()
   assert.equal(state.settingsCalls.length, 1, 'the generated settings page must be disabled')
   assert.deepEqual(state.settingsCalls[0].options, { auto: false })
-  assert.equal(state.routes.length, 2, 'status + test routes')
+  assert.equal(state.routes.length, 3, 'status, test and save routes')
   assert.equal(state.routes[0].path, '/api/mcp-servers')
   assert.deepEqual(state.routes[0].methods, ['GET'])
   assert.equal(state.routes[1].path, '/api/mcp-servers/test')
   assert.deepEqual(state.routes[1].methods, ['POST'])
+  assert.equal(state.routes[2].path, '/api/mcp-servers/save')
+  assert.deepEqual(state.routes[2].methods, ['POST'])
 })
 
 await check('apply() mounts one bridge child per enabled server', async () => {
