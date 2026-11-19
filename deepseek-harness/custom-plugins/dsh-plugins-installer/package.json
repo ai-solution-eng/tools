@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-plugins-installer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Installs every sibling bundle in the custom-plugins folder, so one install brings the whole collection into the profile and each plugin keeps its own on/off switch.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "test/*.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
