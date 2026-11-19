@@ -1421,6 +1421,13 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                         ? h('div', { className: 'dsh-mcp-servers__meta' },
                             entry.toolCount === 1 ? t('tools.one') : t('tools.many', { count: entry.toolCount }))
                         : null,
+                      !entry.disabled && Array.isArray(entry.tools) && entry.tools.length > 0
+                        ? h('details', { className: 'dsh-mcp-servers__tools' },
+                            h('summary', { className: 'dsh-mcp-servers__toolsSummary' },
+                              t('tools.list', { count: entry.tools.length })),
+                            h('ul', { className: 'dsh-mcp-servers__toolList' },
+                              entry.tools.map((name) => h('li', { key: name }, name))))
+                        : null,
                     ),
                   ),
                 ),

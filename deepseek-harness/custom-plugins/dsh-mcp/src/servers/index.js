@@ -294,6 +294,9 @@ function externalRows(ctx) {
       disabled: entry.disabled === true,
       fiberState: fiberStateName(entry.fiber?.state),
       toolCount: registeredToolCount(ctx, config.serverName),
+      // A server configured in the profile patch lists its tools here too: the
+      // page is where an operator looks, whichever layer declared the server.
+      tools: registeredToolNames(ctx, config.serverName),
     }
     if (transport === 'streamable-http') row.endpoint = displayEndpoint(config.url)
     else if (typeof config.command === 'string') row.command = config.command.split(/\s+/)[0]

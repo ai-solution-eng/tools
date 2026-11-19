@@ -424,6 +424,7 @@ await check('external MCP rows are reported without their request headers', asyn
       },
       { options: { id: 'not-mcp' }, fiber: { state: 2, effectiveConfig: { something: true } } },
     ],
+    tools: [{ name: 'mcp__legacy__ping' }, { name: 'mcp__legacy__status' }, { name: 'bash' }],
   })
   start()
   await tick()
@@ -433,6 +434,8 @@ await check('external MCP rows are reported without their request headers', asyn
   assert.equal(row.serverName, 'legacy')
   assert.equal(row.endpoint, 'https://legacy.example.com/mcp')
   assert.equal(JSON.stringify(body).includes('secret'), false, 'credentials must not reach the browser')
+  // A server declared outside the page still lists its tools on it.
+  assert.deepEqual(row.tools, ['ping', 'status'])
 })
 
 await check('retry leaves a healthy server alone', async () => {
