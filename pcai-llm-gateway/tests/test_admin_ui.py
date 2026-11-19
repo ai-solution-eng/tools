@@ -931,45 +931,59 @@ def test_sso_default_profile_wiring_accepts_usd_preset(tc) -> None:
 # written degrade-first, and these pins hold that line.
 # ---------------------------------------------------------------------------
 
-NAV_GROUP_TABS = [
-    "keys|profiles|enroll",
-    # agents sit with the registry tabs: an agent IS a model entry in the data
-    # plane (GET /v1/models, pcai.type="agent"), so it belongs next to Models.
-    # 2026-10-30: "Advertised" (the registry view split out of Models) and
-    # "Metrics" (live endpoint throughput/load) join the inventory group —
-    # both are about the objects the Models tab registers.
-    "models|advertised|agents|mcp|metrics",
-    "usage|traces|audit|guardrails",
-    # 2026-11-08: "Model groups" (load-balanced sets of equivalent models)
-    # joins the background GPU-economy group next to Off-peak.
-    "offpeak|groups|distiller|routing",
+# The rail's section tree, in file order (2026-11-18). Sections are named by
+# CONCEPT: Guardrails is a policy surface (not telemetry), Routing is a model
+# concern, MCP belongs with the agents/tools that consume it.
+RAIL_SECTIONS = [
+    ("access", ["keys", "profiles", "enroll", "guardrails"]),
+    ("models", ["models", "advertised", "groups", "routing"]),
+    ("tools", ["agents", "mcp"]),
+    ("obs", ["usage", "traces", "metrics", "audit"]),
+    ("ops", ["offpeak", "distiller"]),
 ]
 
 
-def test_console_nav_groups_with_green_separators() -> None:
-    """5a: the tabs are grouped into exactly FOUR .navgroup divs —
-    identity, inventory, observability (Usage folded in with
-    traces/audit/guardrails — the Lead's ruling), background GPU-economy
-    (off-peak, distiller, routing) — separated by a thin green rule. The
-    grouping is COSMETIC ONLY: buttons stay <button data-tab=...> inside
-    <nav>, so activateTab(), the nav-click wiring and the boot restore work
-    unchanged, and nav keeps flex-wrap so a narrow window wraps whole groups
-    WITH their separators intact."""
+def test_console_nav_is_a_sectioned_searchable_rail() -> None:
+    """2026-11-18: the flat tab bar became a collapsible left rail — five
+    LABELLED sections of collapsible items plus a search box — because 16 flat
+    tabs under four unlabelled rules were unsearchable and cost ~40px of every
+    panel.
+
+    What must not move: every item is still <button data-tab=...> inside <nav>,
+    so activateTab(), the click wiring and the boot restore are untouched, and
+    every data-tab still has exactly ONE panel. The structure is asserted (not
+    the copy) so a rename cannot silently orphan a panel."""
     import re
 
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
-    nav = re.search(r"<nav>(.*?)</nav>", s, re.DOTALL)
-    assert nav, "nav block missing"
-    groups = [re.findall(r'data-tab="([^"]+)"', c) for c in nav.group(1).split('class="navgroup"')[1:]]
-    assert len(groups) == 4, f"expected 4 navgroups, got {groups}"
-    assert ["|".join(g) for g in groups] == NAV_GROUP_TABS
-    # separator + wrap rules on the documented CSS contract
-    assert ".navgroup + .navgroup" in s
-    assert "border-left: 1px solid var(--ok)" in s
-    assert re.search(r"nav \{[^}]*flex-wrap:\s*wrap", s), "nav must wrap on narrow screens"
-    # the activation contract is untouched by the regrouping
+    rail = re.search(r'<nav id="nav".*?>(.*?)\n  </nav>', s, re.DOTALL)
+    assert rail, "rail nav (#nav) missing"
+    body = rail.group(1)
+    sections = re.findall(
+        r'<div class="navsec" data-sec="([^"]+)" data-name="[^"]*">(.*?)\n    </div>', body, re.DOTALL
+    )
+    assert [sec for sec, _ in sections] == [sec for sec, _ in RAIL_SECTIONS], sections
+    for (sec, _chunk), (want_sec, want_tabs) in zip(sections, RAIL_SECTIONS):
+        assert re.findall(r'data-tab="([^"]+)"', _chunk) == want_tabs, sec
+    # every item has exactly one panel, and no panel is orphaned
+    tabs = [t for _sec, chunk in sections for t in re.findall(r'data-tab="([^"]+)"', chunk)]
+    assert len(tabs) == len(set(tabs)) == 16, tabs
+    for t in tabs:
+        assert f'id="tab-{t}"' in s, f"no panel for {t}"
+    # the rail contract: collapse, section collapse, search, drawer
+    assert "body.rail-collapsed .shell" in s
+    assert 'id="rail-toggle"' in s and "function setRail(collapsed)" in s
+    assert "pcai-admin-rail" in s and "pcai-admin-navsecs" in s
+    assert 'id="navsearch"' in s and "function filterNav()" in s
+    assert "body.drawer .rail" in s and 'id="hamburger"' in s
+    # breadcrumb + deep link ride activateTab
+    assert 'id="crumb-sec"' in s and 'id="crumb-tab"' in s
+    assert "history.replaceState(null, '', '#' + name)" in s
+    # the activation contract is untouched by the restructuring
     assert "activateTab(b.dataset.tab)" in s
     assert "sessionStore.set('pcai-admin-tab', b.dataset.tab)" in s
+    # and the old flat grouping is GONE (a leftover nav renders twice)
+    assert "navgroup" not in s
 
 
 def test_console_routing_panel() -> None:
@@ -1319,12 +1333,156 @@ def test_console_live_pools_edit_loads_the_whole_registration() -> None:
     assert "nameInput.readOnly = true" in s and "name.readOnly = false" in s
     assert "model_name: editingModel || $('mo-name').value" in s
     # blank key = keep stored credential; the form knows which rows have one
-    assert "e.auth_configured ? '(unchanged)'" in s
+    assert "div.dataset.authConfigured = e.auth_configured ? '1' : ''" in s
     # weight 0 is standby — the edit paint and the save must both preserve it
     assert "e.weight != null ? e.weight : 1" in s
     assert "Number.isFinite(w) ? w : 1" in s
     # removing the pool that is open in the form clears the dead editor
     assert "editingModel === name" in s
+
+
+def test_console_carries_the_api_key_across_a_base_url_edit() -> None:
+    """2026-11-18 operator report: an endpoint's API key vanished when its Base
+    URL was changed (remote -> local), while the field still read "(unchanged)".
+
+    Two halves, both pinned here: the ROW remembers the identity it was loaded
+    with, and the SAVE names that identity as the credential's source
+    (api_key_from) so the server can carry the ciphertext onto the new row —
+    "blank = keep" alone cannot, because the new (model, url) row does not exist
+    yet and the save prunes the one that held the key. The placeholder is
+    re-evaluated as the URL is typed, so the form never claims "(unchanged)"
+    next to a changed address."""
+    import re
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    # the row keeps its loaded identity
+    assert "div.dataset.origUrl = e.base_url || ''" in s
+    assert "div.dataset.authConfigured = e.auth_configured ? '1' : ''" in s
+    # ... and the placeholder is derived from it, not painted once at render
+    assert "function syncKeyHint(row)" in s
+    assert "syncKeyHint(div);" in s
+    # a moved row is told the truth instead of "(unchanged)"
+    assert "key.placeholder = 'carried over — paste to replace'" in s
+    assert "key.placeholder = '(unchanged)'" in s
+    # live re-evaluation: delegated on the row container, so rows added after
+    # boot are covered too (no per-input listener to leak on remove)
+    assert re.search(r"\$\('mo-eps'\)\.addEventListener\('input'", s)
+    assert "classList.contains('mo-url')" in s
+    # the save carries the key over, and a typed key wins
+    assert "api_key_from: (!typedKey && movedFrom) ? movedFrom : null" in s
+    assert "r.dataset.origUrl !== url" in s
+    # no stale "painted once" placeholder left in the row template
+    assert "e.auth_configured ? '(unchanged)'" not in s
+
+
+def _run_console_fn(s: str, name: str, body: str) -> None:
+    """Extract ONE top-level console function and run it under node."""
+    import re
+    import subprocess
+    import tempfile
+
+    fn = re.search(rf"^function {name}\(.*?\n\}}", s, re.DOTALL | re.MULTILINE)
+    assert fn, f"{name}() not found in admin.html"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(fn.group(0) + "\n" + body)
+        path = f.name
+    r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"{name}() behaviour mismatch:\n{r.stdout}\n{r.stderr}"
+
+
+def test_console_endpoint_payload_carries_a_moved_credential() -> None:
+    """The SAVE half of the 2026-11-18 fix, executed (not source-pinned).
+
+    moEndpoints() turns the on-screen rows into the POST /admin/models body.
+    The rule under test: a row that was loaded WITH a stored credential and
+    whose base URL changed names its old URL in api_key_from (so the server can
+    carry the ciphertext); a typed key wins; an unmoved row and a fresh row
+    never carry anything."""
+    import json
+
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+
+    def row(orig: str, configured: bool, url: str, key: str = "") -> dict:
+        vals = {".mo-w": "1", ".mo-url": url, ".mo-pri": "0",
+                ".mo-secret": "", ".mo-key": key}
+        return {
+            "dataset": {"origUrl": orig, "authConfigured": "1" if configured else ""},
+            "_vals": vals,
+        }
+
+    rows = [
+        # moved WITH a stored credential -> carries from the old URL
+        row("http://glm.example.com/v1", True, "http://vllm-svc.ai.svc.cluster.local/v1"),
+        # moved but the operator pasted a new key -> the paste wins, no carry
+        row("http://old/v1", True, "http://new/v1", key="sk-fresh"),
+        # same URL -> plain keep, no carry
+        row("http://same/v1", True, "http://same/v1"),
+        # never had a credential -> nothing to carry
+        row("http://plain/v1", False, "http://plain2/v1"),
+        # a blank row is dropped entirely
+        row("", False, ""),
+    ]
+    body = (
+        "const rows = " + json.dumps(rows) + ";\n"
+        "for (const r of rows) {\n"
+        "  r.querySelector = sel => ({ value: (r._vals[sel] === undefined ? '' : r._vals[sel]) });\n"
+        "}\n"
+        "global.document = { querySelectorAll: () => rows };\n"
+        "const out = moEndpoints();\n"
+        "console.log(JSON.stringify(out));\n"
+        "const want = [\n"
+        "  { base_url: 'http://vllm-svc.ai.svc.cluster.local/v1', priority: 0, weight: 1,\n"
+        "    api_key_secret: null, api_key: null, api_key_from: 'http://glm.example.com/v1' },\n"
+        "  { base_url: 'http://new/v1', priority: 0, weight: 1,\n"
+        "    api_key_secret: null, api_key: 'sk-fresh', api_key_from: null },\n"
+        "  { base_url: 'http://same/v1', priority: 0, weight: 1,\n"
+        "    api_key_secret: null, api_key: null, api_key_from: null },\n"
+        "  { base_url: 'http://plain2/v1', priority: 0, weight: 1,\n"
+        "    api_key_secret: null, api_key: null, api_key_from: null },\n"
+        "];\n"
+        "if (JSON.stringify(out) !== JSON.stringify(want)) {\n"
+        "  console.error('GOT ' + JSON.stringify(out));\n"
+        "  console.error('WANT ' + JSON.stringify(want));\n"
+        "  process.exit(1);\n"
+        "}\n"
+    )
+    _run_console_fn(s, "moEndpoints", body)
+
+
+def test_console_key_placeholder_follows_the_url() -> None:
+    """The PLACEHOLDER half: "(unchanged)" must not survive a URL edit.
+
+    syncKeyHint() is the only thing that paints the key field, so it is
+    executed here against stub rows rather than source-pinned."""
+    s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
+    body = (
+        "const mk = (orig, configured, url) => ({\n"
+        "  dataset: { origUrl: orig, authConfigured: configured ? '1' : '' },\n"
+        "  _key: { placeholder: '', title: '', removeAttribute(k) { delete this[k]; } },\n"
+        "  _url: { value: url },\n"
+        "  querySelector(sel) { return sel === '.mo-key' ? this._key : this._url; },\n"
+        "});\n"
+        "const cases = [\n"
+        "  ['stored, same url',   mk('http://a/v1', true,  'http://a/v1'), '(unchanged)'],\n"
+        "  ['stored, MOVED url',  mk('http://a/v1', true,  'http://b/v1'), 'carried over — paste to replace'],\n"
+        "  ['stored, moved back', mk('http://a/v1', true,  'http://a/v1'), '(unchanged)'],\n"
+        "  ['no credential',      mk('http://a/v1', false, 'http://b/v1'), 'paste — stored encrypted'],\n"
+        "];\n"
+        "for (const [name, row, want] of cases) {\n"
+        "  syncKeyHint(row);\n"
+        "  if (row._key.placeholder !== want) {\n"
+        "    console.error('FAIL ' + name + ': got ' + row._key.placeholder + ' want ' + want);\n"
+        "    process.exit(1);\n"
+        "  }\n"
+        "}\n"
+        "const moved = mk('http://a/v1', true, 'http://b/v1');\n"
+        "syncKeyHint(moved);\n"
+        "if (moved.dataset.moved !== '1') { console.error('moved flag not set'); process.exit(1); }\n"
+        "const same = mk('http://a/v1', true, 'http://a/v1');\n"
+        "syncKeyHint(same);\n"
+        "if (same.dataset.moved) { console.error('moved flag must clear'); process.exit(1); }\n"
+    )
+    _run_console_fn(s, "syncKeyHint", body)
 
 
 def test_console_table_action_cells_share_one_block() -> None:
@@ -1356,20 +1514,25 @@ def test_console_table_action_cells_share_one_block() -> None:
     assert 'onclick="editModel(this)"' in s
 
 
-def test_nav_is_sticky_below_the_header() -> None:
-    """The tab strip scrolled away on a long page, forcing a scroll back to
-    the top to change section. It must stick, and it must stick BELOW the
-    header (not under it) with a z-index under the error strip."""
+def test_rail_is_sticky_full_height_and_scrolls_itself() -> None:
+    """Supersedes the sticky-tab-strip pin (2026-11-18). Navigation no longer
+    rides the page: it owns a full-height column beside it. Two things keep a
+    long section list from breaking the layout — the rail must stick to the
+    viewport at exactly one screen tall, and the ITEM LIST (not the rail) must
+    scroll, or the Chat/Theme footer is pushed off-screen on a laptop."""
     import re
 
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
-    m = re.search(r"nav \{[^}]*\}", s)
-    assert m, "nav rule not found"
+    m = re.search(r"\.rail \{[^}]*\}", s)
+    assert m, ".rail rule not found"
     rule = m.group(0)
-    assert "position: sticky" in rule
-    assert "top: var(--header-h" in rule, "nav must offset by the header height"
-    assert "z-index: 4" in rule, "nav must sit under the header (5) and errstrip (9)"
-    assert "--header-h:" in s, "the header height variable must be defined"
+    assert "position: sticky" in rule and "top: 0" in rule
+    assert "height: 100vh" in rule
+    assert "overflow: hidden" in rule, "the rail clips; the item list is what scrolls"
+    m2 = re.search(r"nav \{[^}]*\}", s)
+    assert m2, "nav rule not found"
+    assert "overflow-y: auto" in m2.group(0), "the item list must scroll inside the rail"
+    assert "--header-h:" in s, "the rail head height variable must be defined"
 
 
 def test_key_actions_are_a_compact_grid_not_a_button_pile() -> None:
@@ -2189,7 +2352,7 @@ def test_model_groups_tab() -> None:
 
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
     # nav + section + lazy load on activation (the click handler is generic)
-    assert '<button data-tab="groups">Model groups</button>' in s
+    assert 'data-tab="groups"' in s and ">Model groups<" in s
     assert '<section id="tab-groups">' in s
     assert "if (name === 'groups') loadGroups().catch(e => banner(e.message, 'error', 5000));" in s
     # form + list + preview ids

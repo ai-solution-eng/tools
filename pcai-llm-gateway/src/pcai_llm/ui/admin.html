@@ -68,26 +68,86 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
          background: var(--bg); color: var(--text); min-height: 100vh; }
+  :root { --rail-w: 252px; --rail-w-collapsed: 62px; --header-h: 48px; }
+  /* ---- shell (2026-11-18): collapsible left rail + content column ---------
+     Navigation used to be a sticky top bar: 16 flat tabs under four unlabelled
+     rules, wrapping on narrow windows, pinning ~40px above every panel and
+     impossible to search. The rail is collapsible (remembered), the header
+     keeps only the connection controls, and a breadcrumb carries the
+     section/item pair once the rail is collapsed. The buttons keep the flat
+     data-tab contract, so activateTab() and the boot restore are unchanged. */
+  .shell { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); min-height: 100vh; }
+  body.rail-collapsed .shell { grid-template-columns: var(--rail-w-collapsed) minmax(0, 1fr); }
+  .col { min-width: 0; display: flex; flex-direction: column; }
+  .rail { background: var(--panel); border-right: 1px solid var(--border);
+          display: flex; flex-direction: column; position: sticky; top: 0;
+          height: 100vh; overflow: hidden; z-index: 7; }
+  .rail-head { display: flex; align-items: center; gap: 8px; padding: 0 10px;
+               height: var(--header-h); border-bottom: 1px solid var(--border); flex: none; }
+  .rail-head h1 { font-size: 13.5px; font-weight: 600; white-space: nowrap;
+                  overflow: hidden; text-overflow: ellipsis; }
+  .rail-head h1 .hpe { color: var(--accent); }
+  .rail-head h1 .sub { color: var(--dim); font-weight: 400; }
+  .rail-toggle { margin-left: auto; color: var(--dim); background: none;
+                 border: 1px solid var(--border); border-radius: 6px;
+                 width: 26px; height: 26px; display: grid; place-items: center;
+                 flex: none; cursor: pointer; }
+  .rail-toggle:hover { color: var(--text); border-color: var(--accent); }
+  body.rail-collapsed .rail-head h1,
+  body.rail-collapsed .rail-search .searchbox,
+  body.rail-collapsed .navsec-h .lbl,
+  body.rail-collapsed .navsec-h .chev,
+  body.rail-collapsed .navitem .lbl,
+  body.rail-collapsed .rail-foot .lbl { display: none; }
+  body.rail-collapsed .rail-toggle { margin: 0 auto; transform: rotate(180deg); }
+
+  .rail-search { padding: 10px 10px 8px; flex: none; }
+  .searchbox { display: flex; align-items: center; gap: 6px; background: var(--bg);
+               border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; }
+  .searchbox:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--focus); }
+  .searchbox svg { color: var(--dim); flex: none; }
+  .searchbox input { background: none; border: 0; outline: 0; color: var(--text);
+                     font: inherit; font-size: 13px; width: 100%; }
+  .searchbox .kbd { border: 1px solid var(--border); border-radius: 4px; color: var(--dim);
+                    font-size: 10.5px; padding: 0 4px; flex: none; }
+  #searchtoggle { display: none; color: var(--dim); background: none;
+                  border: 1px solid var(--border); border-radius: 7px;
+                  width: 30px; height: 30px; place-items: center; margin: 0 auto; cursor: pointer; }
+  #searchtoggle:hover { color: var(--text); border-color: var(--accent); }
+  body.rail-collapsed #searchtoggle { display: grid; }
+  #noresults { padding: 10px; font-size: 12.5px; }
+
+  .rail-foot { flex: none; border-top: 1px solid var(--border); padding: 8px 10px; }
+  .rail-foot a { color: var(--dim); text-decoration: none; font-size: 12px;
+                 display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; }
+  .rail-foot a:hover { color: var(--text); background: rgba(255,255,255,.05); }
+  body.rail-collapsed .rail-foot a { justify-content: center; }
+  @media (prefers-color-scheme: light) { :root[data-theme="auto"] .rail-foot a:hover { background: rgba(0,0,0,.05); } }
+  :root[data-theme="light"] .rail-foot a:hover { background: rgba(0,0,0,.05); }
+
+  /* breadcrumb: what the collapsed rail no longer shows */
+  .crumb { display: flex; align-items: center; gap: 6px; font-size: 11.5px;
+           color: var(--dim); margin: 0 0 10px; letter-spacing: .02em; }
+  .crumb b { color: var(--text); font-weight: 600; }
+
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
            background: var(--panel); border-bottom: 1px solid var(--border);
-           position: sticky; top: 0; z-index: 5;
-           /* --header-h is the offset the sticky nav parks under. Measured,
-              not guessed: 10px padding x2 + the 27px control row + 1px rule. */
-           --header-h: 48px; }
-  header h1 { font-size: 15px; font-weight: 600; }
-  header .hpe { color: var(--accent); }
+           position: sticky; top: 0; z-index: 5; }
   header input[type=password] { background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
     font-size: 13px; width: 300px; }
-  /* ← Chat link (2026-10-30, team tier): sits IMMEDIATELY LEFT of the admin
-     key input — the operator's first move is often "back to the chat
-     console". A ghost-border anchor in the header control family: never a
-     filled button, because the header keeps exactly one primary action
-     (Connect). */
-  header a.backlink { color: var(--accent2); text-decoration: none; font-size: 13px;
-    border: 1px solid var(--border); border-radius: 7px; padding: 5px 10px; }
-  header a.backlink:hover { border-color: var(--accent2); }
   header .spacer { flex: 1; }
+  /* Mobile drawer trigger: the rail is off-canvas under 900px (see the media
+     query below), so the header carries the only way back to it. */
+  .hamburger { display: none; color: var(--dim); background: none;
+               border: 1px solid var(--border); border-radius: 6px;
+               width: 28px; height: 28px; place-items: center; cursor: pointer; }
+  .hamburger:hover { color: var(--text); border-color: var(--accent); }
+  /* Under 900px the rail is off-canvas, taking the brand with it — the header
+     carries it there so the page never loses its name. */
+  header .brand-sm { display: none; font-size: 13.5px; font-weight: 600; white-space: nowrap; }
+  header .brand-sm .hpe { color: var(--accent); }
+  @media (max-width: 900px) { header .brand-sm { display: block; } }
   /* Theme control: three-way Auto / Light / Dark segmented pill (same shape in
      all three PCAI consoles). */
   .theme-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
@@ -99,24 +159,42 @@
   .theme-seg button.on { background: var(--accent); color: var(--accent-contrast);
                          font-weight: 600; }
   .theme-seg button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-  /* Sticky tab bar (2026-10-23): the admin page runs long enough that the
-     tab strip scrolled away and you had to scroll back to the top to change
-     sections. `top` is the header height so it parks directly under the
-     header instead of sliding beneath it; the z-index sits below the header
-     (5) and the error strip (9) so those still win when they overlap. */
-  nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px 0; background: var(--panel);
-        border-bottom: 1px solid var(--border);
-        position: sticky; top: var(--header-h, 49px); z-index: 4; }
-  /* Tab groups (2026-10-23 wave): buttons live in .navgroup divs — four
-     intent groups separated by a thin green rule (--ok). Presentation only:
-     the buttons keep the flat data-tab contract, so activateTab(), the nav
-     wiring and the boot restore are untouched. flex-wrap keeps narrow
-     screens usable WITH the separators intact. */
-  .navgroup { display: flex; gap: 4px; }
-  .navgroup + .navgroup { border-left: 1px solid var(--ok); margin-left: 10px; padding-left: 10px; }
-  nav button { background: none; border: none; color: var(--dim); padding: 8px 14px;
-               cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
-  nav button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  /* Sectioned rail (2026-11-18): five labelled sections of collapsible items,
+     replacing the flat tab bar. Section headers are the hierarchy the old
+     1px rules never communicated; .closed is remembered per section. */
+  nav { overflow-y: auto; overflow-x: hidden; padding: 4px 8px 12px; flex: 1; }
+  .navsec { margin-top: 6px; }
+  .navsec-h { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 8px 4px;
+              color: var(--dim); background: none; border: 0; cursor: pointer;
+              font-size: 10.5px; font-weight: 700; letter-spacing: .09em;
+              text-transform: uppercase; white-space: nowrap; font-family: inherit; }
+  .navsec-h:hover { color: var(--text); }
+  .navsec-h .chev { margin-left: auto; transition: transform .14s ease; flex: none; opacity: .7; }
+  .navsec.closed .chev { transform: rotate(-90deg); }
+  .navsec.closed .navitems { display: none; }
+  .navitems { display: flex; flex-direction: column; gap: 1px; }
+  .navitem { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 10px;
+             border-radius: 7px; background: none; border: 0; cursor: pointer;
+             color: var(--dim); font: inherit; font-size: 13px; text-align: left;
+             white-space: nowrap; position: relative; }
+  .navitem:hover { background: rgba(255,255,255,.05); color: var(--text); }
+  .navitem.active { background: rgba(1,169,130,.14); color: var(--accent); font-weight: 600; }
+  .navitem.active::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px;
+                            width: 2px; border-radius: 2px; background: var(--accent); }
+  .navitem .ico { flex: none; width: 18px; height: 18px; display: grid; place-items: center; opacity: .9; }
+  .navitem svg { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.6;
+                 stroke-linecap: round; stroke-linejoin: round; }
+  .navitem .lbl { overflow: hidden; text-overflow: ellipsis; }
+  body.rail-collapsed .navitem { justify-content: center; padding: 9px 0; }
+  body.rail-collapsed .navsec-h { justify-content: center; padding: 8px 0 2px; }
+  body.rail-collapsed .navsec-h::after { content: ""; display: block; width: 18px; height: 1px;
+                                         background: var(--border); }
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="auto"] .navitem:hover { background: rgba(0,0,0,.05); }
+    :root[data-theme="auto"] .navitem.active { background: rgba(0,128,95,.11); }
+  }
+  :root[data-theme="light"] .navitem:hover { background: rgba(0,0,0,.05); }
+  :root[data-theme="light"] .navitem.active { background: rgba(0,128,95,.11); }
   /* Row action grid (2026-10-23; table rows 2026-11-05): eight stacked ghost
      buttons made every key row ~150px tall and read as a scattered pile. A
      fixed 2-column grid of EQUAL cells gives one compact block whose height
@@ -389,17 +467,130 @@
     header input[type=password], header input { width: 100% !important; }
     table { display: block; overflow-x: auto; white-space: nowrap; }
   }
+  /* Under 900px the rail cannot afford 252px of a phone: it slides in over a
+     scrim instead, opened from the header hamburger and closed by the scrim,
+     Escape, or picking an item. */
+  .scrim { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 6; }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    body.rail-collapsed .shell { grid-template-columns: minmax(0, 1fr); }
+    .rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--rail-w);
+            transform: translateX(-100%); transition: transform .18s ease;
+            box-shadow: 0 0 40px rgba(0,0,0,.5); }
+    body.drawer .rail { transform: none; }
+    body.drawer .scrim { display: block; }
+    .hamburger { display: grid; }
+    header input[type=password] { width: 150px; }
+  }
 
 </style>
 </head>
 <body>
+<div class="shell">
+<!-- ============================ LEFT RAIL ============================
+     Five labelled sections, replacing the flat tab bar. Every item keeps its
+     flat data-tab contract (activateTab + the boot restore read it), so the
+     hierarchy is presentation only. Items are grouped by CONCEPT: Guardrails
+     is a policy surface (not telemetry), Routing is a model concern, and MCP
+     belongs with the agents/tools that consume it. -->
+<aside class="rail" id="rail">
+  <div class="rail-head">
+    <h1><span class="hpe">HPE</span> PCAI LLM <span class="sub">admin</span></h1>
+    <button class="rail-toggle" id="rail-toggle" type="button" title="Collapse navigation  ( [ )"
+            aria-label="Collapse navigation" aria-expanded="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+  </div>
+  <div class="rail-search">
+    <div class="searchbox">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <input id="navsearch" type="text" placeholder="Search navigation…" aria-label="Search navigation"
+             autocomplete="off" spellcheck="false">
+      <span class="kbd">/</span>
+    </div>
+    <!-- collapsed rail: the field is hidden, so search stays one click away -->
+    <button id="searchtoggle" type="button" title="Search  ( / )" aria-label="Search navigation">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    </button>
+  </div>
+  <nav id="nav" aria-label="Admin sections">
+    <div class="navsec" data-sec="access" data-name="Access &amp; safety">
+      <button class="navsec-h" type="button" aria-expanded="true"><span class="lbl">Access &amp; safety</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="navitems">
+        <button class="navitem active" data-tab="keys" data-kw="api keys tokens mint revoke rotate create key"><span class="ico" data-icon="key"></span><span class="lbl">API keys</span></button>
+        <button class="navitem" data-tab="profiles" data-kw="profiles budgets cascade routing policy grants presets"><span class="ico" data-icon="sliders"></span><span class="lbl">Profiles</span></button>
+        <button class="navitem" data-tab="enroll" data-kw="enrollment enroll code sso self-mint mint top-up requests"><span class="ico" data-icon="ticket"></span><span class="lbl">Enrollment</span></button>
+        <button class="navitem" data-tab="guardrails" data-kw="guardrails policy pii secrets blocklist regex webhook content"><span class="ico" data-icon="shield"></span><span class="lbl">Guardrails</span></button>
+      </div>
+    </div>
+    <div class="navsec" data-sec="models" data-name="Models &amp; routing">
+      <button class="navsec-h" type="button" aria-expanded="true"><span class="lbl">Models &amp; routing</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="navitems">
+        <button class="navitem" data-tab="models" data-kw="model endpoints pools register upstream vllm"><span class="ico" data-icon="server"></span><span class="lbl">Model endpoints</span></button>
+        <button class="navitem" data-tab="advertised" data-kw="presented advertised v1 models catalogue catalog"><span class="ico" data-icon="broadcast"></span><span class="lbl">Presented models</span></button>
+        <button class="navitem" data-tab="groups" data-kw="model groups load balanced equivalence"><span class="ico" data-icon="grid"></span><span class="lbl">Model groups</span></button>
+        <button class="navitem" data-tab="routing" data-kw="routing router tiers policy prompt statistics decisions"><span class="ico" data-icon="route"></span><span class="lbl">Routing</span></button>
+      </div>
+    </div>
+    <div class="navsec" data-sec="tools" data-name="Agents &amp; tools">
+      <button class="navsec-h" type="button" aria-expanded="true"><span class="lbl">Agents &amp; tools</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="navitems">
+        <button class="navitem" data-tab="agents" data-kw="agents tool surface prompt pin model"><span class="ico" data-icon="bot"></span><span class="lbl">Agents</span></button>
+        <button class="navitem" data-tab="mcp" data-kw="mcp servers federation tools acl grants register"><span class="ico" data-icon="plug"></span><span class="lbl">MCP servers</span></button>
+      </div>
+    </div>
+    <div class="navsec" data-sec="obs" data-name="Observability">
+      <button class="navsec-h" type="button" aria-expanded="true"><span class="lbl">Observability</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="navitems">
+        <button class="navitem" data-tab="usage" data-kw="usage cost pricing ledger chargeback tokens spend"><span class="ico" data-icon="chart"></span><span class="lbl">Usage &amp; cost</span></button>
+        <button class="navitem" data-tab="traces" data-kw="traces agent trace debugging steps"><span class="ico" data-icon="pulse"></span><span class="lbl">Agent traces</span></button>
+        <button class="navitem" data-tab="metrics" data-kw="metrics throughput load latency live endpoints"><span class="ico" data-icon="gauge"></span><span class="lbl">Live metrics</span></button>
+        <button class="navitem" data-tab="audit" data-kw="audit trail admin changes history"><span class="ico" data-icon="list"></span><span class="lbl">Admin audit</span></button>
+      </div>
+    </div>
+    <div class="navsec" data-sec="ops" data-name="Operations">
+      <button class="navsec-h" type="button" aria-expanded="true"><span class="lbl">Operations</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="navitems">
+        <button class="navitem" data-tab="offpeak" data-kw="off-peak offpeak billing gpu util cache utilization"><span class="ico" data-icon="moon"></span><span class="lbl">Off-peak billing</span></button>
+        <button class="navitem" data-tab="distiller" data-kw="memory distiller distill summarizer canonical memories"><span class="ico" data-icon="brain"></span><span class="lbl">Memory distiller</span></button>
+      </div>
+    </div>
+    <div id="noresults" class="muted hidden">No matching section.</div>
+  </nav>
+  <div class="rail-foot">
+    <a href="/" title="Back to the chat console">← <span class="lbl">Chat console</span></a>
+  </div>
+</aside>
+<div class="scrim" id="scrim"></div>
+<div class="col">
 <header>
-  <h1><span class="hpe">HPE</span> PCAI LLM Gateway — Admin</h1>
-  <div class="spacer"></div>
-  <a class="backlink" href="/" title="Back to the chat console">← Chat</a>
+  <button class="hamburger" id="hamburger" type="button" aria-label="Open navigation">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+  <span class="brand-sm"><span class="hpe">HPE</span> PCAI LLM</span>
   <input id="adminkey" type="password" placeholder="Admin key (PCAI_LLM_ADMIN_API_KEYS)" aria-label="Admin key" autocomplete="off">
   <button id="connect" class="btn">Connect</button>
   <span id="conn" class="muted"></span>
+  <div class="spacer"></div>
   <!-- Auto follows the OS; Light/Dark pin and are remembered. The #theme id is
        the shared anchor the other two consoles use — keep it. -->
   <div class="theme-seg" id="theme" role="group" aria-label="Theme">
@@ -408,38 +599,6 @@
     <button type="button" data-theme-btn="dark">Dark</button>
   </div>
 </header>
-<!-- Grouped tabs (5a, 2026-10-23 wave): four intent groups — identity
-     (keys/profiles/enroll), inventory (models/mcp), observability
-     (usage/traces/audit/guardrails — Usage IS an observability surface, the
-     Lead's ruling on the user's grouping proposal), and the background
-     GPU-economy features (off-peak, memory distiller, routing). The
-     grouping is presentation only; every button keeps its flat data-tab. -->
-<nav>
-  <div class="navgroup">
-    <button data-tab="keys" class="active">Keys</button>
-    <button data-tab="profiles">Profiles</button>
-    <button data-tab="enroll">Enroll</button>
-  </div>
-  <div class="navgroup">
-    <button data-tab="models">Models</button>
-    <button data-tab="advertised">Advertised</button>
-    <button data-tab="agents">Agents</button>
-    <button data-tab="mcp">MCP</button>
-    <button data-tab="metrics">Metrics</button>
-  </div>
-  <div class="navgroup">
-    <button data-tab="usage">Usage</button>
-    <button data-tab="traces">Traces</button>
-    <button data-tab="audit">Audit</button>
-    <button data-tab="guardrails">Guardrails</button>
-  </div>
-  <div class="navgroup">
-    <button data-tab="offpeak">Off-peak</button>
-    <button data-tab="groups">Model groups</button>
-    <button data-tab="distiller">Memory Distiller</button>
-    <button data-tab="routing">Routing</button>
-  </div>
-</nav>
 <div id="errstrip" class="hidden" aria-live="polite" style="position:sticky;top:0;z-index:9;background:var(--err-bg);
      color:var(--err);border-bottom:1px solid var(--err);padding:6px 16px;font-size:12px;
      font-family:ui-monospace,monospace;white-space:pre-wrap;max-height:140px;overflow:auto"></div>
@@ -447,6 +606,8 @@
      color:var(--warn,#e6aa28);border-bottom:1px solid var(--warn,#e6aa28);padding:6px 16px;font-size:12px;
      font-family:ui-monospace,monospace;white-space:pre-wrap"></div>
 <main>
+  <!-- Section / item breadcrumb: what the collapsed rail no longer shows. -->
+  <div class="crumb"><span id="crumb-sec">Access &amp; safety</span> <span>/</span> <b id="crumb-tab">API keys</b></div>
   <div id="banner" aria-live="polite"></div>
 
   <!-- ============ KEYS ============ -->
@@ -697,7 +858,7 @@
       </div>
       <div class="form-hint"><ul>
         <li><b>Saving replaces the whole pool</b> — endpoints not listed are removed.</li>
-        <li><b>Editing</b> — a row's <i>edit</i> button loads the whole pool into this form; the model name is fixed (it is the pool key — remove and re-register to rename), and a blank API key keeps the stored one.</li>
+        <li><b>Editing</b> — a row's <i>edit</i> button loads the whole pool into this form; the model name is fixed (it is the pool key — remove and re-register to rename), and a blank API key keeps the stored one — including when you change the Base URL, where the key is carried over to the new address.</li>
         <li><b>API key</b> — required even in-cluster. Stored encrypted; blank on re-save keeps the stored one. Rotation = paste + Save, no restart.</li>
         <li><b>Secret name</b> — by-reference path for ops-managed tokens (<code>upstreamKeySecrets</code> in chart values).</li>
         <li><b>Priority</b> — lower is preferred. The next tier serves only when every endpoint in it is failing.</li>
@@ -1277,6 +1438,8 @@
     </div>
   </section>
 </main>
+</div><!-- /.col -->
+</div><!-- /.shell -->
 
 <dialog id="dlg"><div id="dlg-body"></div>
   <div style="text-align:right;margin-top:12px"><button class="ghost" onclick="document.getElementById('dlg').close()">Close</button></div>
@@ -3349,6 +3512,34 @@ window.editModel = async btn => {
 };
 $('mo-cancel').onclick = () => modelFormReset('edit cancelled — form cleared');
 
+// The API key field's honest state for ONE endpoint row. Three cases:
+//   stored + same URL    -> "(unchanged)" — a blank field really does keep it
+//   stored + MOVED URL   -> "carried over" — the row is a NEW (model, url) pair
+//                           server-side, so the key is copied from the old one
+//                           (mo-save sends api_key_from); paste to replace
+//   no stored credential -> invite a paste
+// The placeholder is re-evaluated as the operator types the URL: painting it
+// once at edit-load is what let "(unchanged)" sit next to a changed address
+// while the save silently dropped the credential (2026-11-18 report).
+function syncKeyHint(row) {
+  const key = row.querySelector('.mo-key');
+  const url = row.querySelector('.mo-url');
+  if (!key || !url) return;
+  const stored = row.dataset.authConfigured === '1';
+  const moved = stored && (row.dataset.origUrl || '') !== url.value.trim();
+  row.dataset.moved = moved ? '1' : '';
+  if (!stored) {
+    key.placeholder = 'paste — stored encrypted';
+    key.removeAttribute('title');
+  } else if (moved) {
+    key.placeholder = 'carried over — paste to replace';
+    key.title = 'this endpoint moved to a new base URL: the stored credential is carried over to it on Save — paste a key to replace it';
+  } else {
+    key.placeholder = '(unchanged)';
+    key.title = 'a panel credential is stored — leave blank to keep it, paste to replace';
+  }
+}
+
 // ep = one endpoint from GET /admin/models/{name}/pool (edit mode) or omitted
 // (a fresh row). Blank API key means KEEP the stored credential (the server's
 // tri-state: null = keep), so an edited row with a stored key says
@@ -3358,8 +3549,13 @@ window.moAddRow = ep => {
   const e = ep || {};
   const div = document.createElement('div');
   div.className = 'ep-row';
+  // The row's identity AS LOADED. A base_url edit lands on a DIFFERENT
+  // (model_name, base_url) row, where "blank = keep" has nothing to keep, so
+  // the save names this URL as the credential's source (api_key_from).
+  div.dataset.origUrl = e.base_url || '';
+  div.dataset.authConfigured = e.auth_configured ? '1' : '';
   div.innerHTML = `<label>Base URL <input class="mo-url" placeholder="http://vllm-svc.ns.svc.cluster.local/v1" value="${esc(e.base_url || '')}"></label>
-    <label>API key <input class="mo-key" type="password" placeholder="${e.auth_configured ? '(unchanged)' : 'paste — stored encrypted'}"${e.auth_configured ? ' title="a panel credential is stored — leave blank to keep it, paste to replace"' : ''}></label>
+    <label>API key <input class="mo-key" type="password"></label>
     <label>or Secret name <input class="mo-secret" placeholder="(by-ref, advanced)" value="${esc(e.api_key_secret || '')}"></label>
     <label>Priority <input class="mo-pri" type="number" value="${esc(e.priority != null ? e.priority : 0)}"></label>
     <label>Weight <input class="mo-w" type="number" value="${esc(e.weight != null ? e.weight : 1)}"></label>
@@ -3367,21 +3563,46 @@ window.moAddRow = ep => {
   $('mo-eps').appendChild(div);
   armPasswordToggles(div);
   layoutFormRowsNow();
+  syncKeyHint(div);   // paints the key placeholder from the row's loaded state
 };
-$('mo-save').onclick = guarded('mo-save', async () => {
-  const endpoints = [...document.querySelectorAll('#mo-eps .ep-row')].map(r => {
+
+// Delegated: covers rows added after boot and costs nothing when one is removed.
+$('mo-eps').addEventListener('input', ev => {
+  const t = ev.target;
+  if (!t || !t.classList || !t.classList.contains('mo-url')) return;
+  const row = t.closest('.ep-row');
+  if (row) syncKeyHint(row);
+});
+// The save body's endpoints array, built from the rows on screen. Extracted
+// from the click handler so the carry-over rule is testable on its own
+// (tests/test_admin_ui.py runs it under node against stub rows).
+function moEndpoints() {
+  return [...document.querySelectorAll('#mo-eps .ep-row')].map(r => {
     const wRaw = r.querySelector('.mo-w').value;
     const w = wRaw === '' ? 1 : +wRaw;
+    const url = r.querySelector('.mo-url').value.trim();
+    const typedKey = r.querySelector('.mo-key').value;
+    // A row that HAD a stored credential and MOVED to a new base URL: name the
+    // old URL so the server copies the ciphertext onto the new row. "Blank =
+    // keep" alone cannot do it — the new (model, url) row does not exist yet,
+    // and the save then prunes the row that held the only copy (the 2026-11-18
+    // remote->local report). A typed key wins and needs no carry-over.
+    const movedFrom = (r.dataset.authConfigured === '1' && r.dataset.origUrl
+      && r.dataset.origUrl !== url) ? r.dataset.origUrl : null;
     return {
-      base_url: r.querySelector('.mo-url').value.trim(),
+      base_url: url,
       priority: +r.querySelector('.mo-pri').value || 0,
       // 0 is standby — a fallback of 1 here would silently promote it
       weight: Number.isFinite(w) ? w : 1,
       api_key_secret: r.querySelector('.mo-secret').value.trim() || null,
       // "" would CLEAR the stored key — normalize blank to null (keep)
-      api_key: r.querySelector('.mo-key').value || null,
+      api_key: typedKey || null,
+      api_key_from: (!typedKey && movedFrom) ? movedFrom : null,
     };
   }).filter(e => e.base_url);
+}
+$('mo-save').onclick = guarded('mo-save', async () => {
+  const endpoints = moEndpoints();
   try {
     const chosenType = ($('mo-type') && $('mo-type').value) || '';
     // editingModel is the source of truth: the name field is readonly in edit
@@ -6407,11 +6628,21 @@ $('mg-preview-go').onclick = guarded('mg-preview-go', async () => {
 // one activation path so a restored tab runs the exact same lazy loaders a
 // click would (no divergent "restore" behavior to maintain).
 function activateTab(name) {
-  const btn = document.querySelector(`nav button[data-tab="${CSS.escape(name)}"]`);
+  const btn = document.querySelector(`nav button.navitem[data-tab="${CSS.escape(name)}"]`);
   if (!btn) return false;                 // unknown/renamed tab — stay put
-  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('nav button.navitem').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
   btn.classList.add('active'); $(`tab-${name}`).classList.add('active');
+  // Rail chrome: the breadcrumb carries the section/item pair the collapsed
+  // rail stops showing, and the hash makes a panel linkable (Back/Forward
+  // work, and a reload lands on the same panel). storage/history can both be
+  // blocked (iframe, file://) — neither failure may break the switch.
+  const secEl = btn.closest('.navsec');
+  if (secEl) $('crumb-sec').textContent = secEl.dataset.name || '';
+  const lbl = btn.querySelector('.lbl');
+  if (lbl) $('crumb-tab').textContent = lbl.textContent;
+  try { history.replaceState(null, '', '#' + name); } catch (e) {}
+  document.body.classList.remove('drawer');
   if (name === 'usage') loadCostsEditor().then(() => loadUsage()).catch(e => banner(e.message, 'error', 5000));
   if (name === 'traces') loadTraces().catch(e => banner(e.message, 'error', 5000));
   if (name === 'audit') loadAudit().catch(e => banner(e.message, 'error', 5000));
@@ -6448,18 +6679,135 @@ function activateTab(name) {
   layoutFormRowsNow();
   return true;
 }
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+document.querySelectorAll('nav button.navitem').forEach(b => b.onclick = () => {
   // Remember the tab for THIS tab-session so a browser reload (F5) lands
   // back where the operator was — sessionStorage (iframe-safe like the
   // admin key), so a fresh console session still opens on Keys.
   sessionStore.set('pcai-admin-tab', b.dataset.tab);
   activateTab(b.dataset.tab);
 });
+// ---------- rail chrome: icons, collapse, sections, search, drawer ----------
+// Stroke icons injected from one map so the markup stays readable and an icon
+// change reaches every item at once (no label depends on them).
+const NAV_ICONS = {
+  key: '<circle cx="8" cy="12" r="4"/><path d="M12 12h9M17 12v4M20 12v3"/>',
+  sliders: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+  ticket: '<path d="M4 8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-4z"/><path d="M12 9v6"/>',
+  shield: '<path d="M12 3l7 3v5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9.5 12l1.8 1.8 3.4-3.6"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+  broadcast: '<circle cx="12" cy="12" r="2"/><path d="M7.5 7.5a6.4 6.4 0 0 0 0 9M16.5 16.5a6.4 6.4 0 0 0 0-9M4.5 4.5a10.6 10.6 0 0 0 0 15M19.5 19.5a10.6 10.6 0 0 0 0-15"/>',
+  grid: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
+  route: '<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.5 6h4.5a3 3 0 0 1 3 3v6"/><path d="M6 8.5v4a3 3 0 0 0 3 3h2"/>',
+  bot: '<rect x="4" y="8" width="16" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9.5 16.5h5"/>',
+  plug: '<path d="M9 3v5M15 3v5"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/>',
+  chart: '<path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="12" width="3" height="5"/><rect x="12" y="8" width="3" height="9"/><rect x="17" y="5" width="3" height="12"/>',
+  pulse: '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/>',
+  gauge: '<path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-5"/><circle cx="12" cy="18" r="1.4"/>',
+  list: '<path d="M8 6h12M8 12h12M8 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  moon: '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/>',
+  brain: '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1 5.8V15a3 3 0 0 0 4 2.8V20"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1 5.8V15a3 3 0 0 1-4 2.8V20"/><path d="M9 4v16M15 4v16"/>',
+};
+for (const el of document.querySelectorAll('.navitem [data-icon]')) {
+  const d = NAV_ICONS[el.dataset.icon];
+  if (d) el.innerHTML = '<svg viewBox="0 0 24 24">' + d + '</svg>';
+}
+
+// Rail collapse — remembered. Collapsed keeps every item reachable as an icon;
+// the magnifier re-opens the rail so search is never lost in that state.
+const railCollapsed = () => document.body.classList.contains('rail-collapsed');
+function setRail(collapsed) {
+  document.body.classList.toggle('rail-collapsed', collapsed);
+  $('rail-toggle').setAttribute('aria-expanded', String(!collapsed));
+  try { localStorage.setItem('pcai-admin-rail', collapsed ? 'collapsed' : 'open'); } catch (e) {}
+}
+$('rail-toggle').onclick = () => setRail(!railCollapsed());
+$('searchtoggle').onclick = () => {
+  setRail(false);
+  setTimeout(() => { $('navsearch').focus(); $('navsearch').select(); }, 40);
+};
+
+// Section collapse — remembered as the list of CLOSED section ids, so a new
+// section (a future nav item) opens by default.
+function saveNavSecs() {
+  const closed = [...document.querySelectorAll('.navsec.closed')].map(s => s.dataset.sec);
+  try { localStorage.setItem('pcai-admin-navsecs', JSON.stringify(closed)); } catch (e) {}
+}
+for (const h of document.querySelectorAll('.navsec-h')) {
+  h.onclick = () => {
+    const sec = h.closest('.navsec');
+    sec.classList.toggle('closed');
+    h.setAttribute('aria-expanded', String(!sec.classList.contains('closed')));
+    saveNavSecs();
+  };
+}
+
+// Search — matches the label, the item's keyword list and its section name, so
+// "pricing" finds Usage & cost and "federation" finds MCP servers. A collapsed section opens
+// while a query is live; Enter opens the first hit; Escape clears.
+const navSearch = $('navsearch');
+function filterNav() {
+  const q = (navSearch.value || '').trim().toLowerCase();
+  let any = false;
+  for (const sec of document.querySelectorAll('.navsec')) {
+    const secName = (sec.dataset.name || '').toLowerCase();
+    let hits = 0;
+    for (const it of sec.querySelectorAll('.navitem')) {
+      const hay = (it.textContent + ' ' + (it.dataset.kw || '') + ' ' + secName).toLowerCase();
+      const match = !q || hay.includes(q);
+      it.classList.toggle('hidden', !match);
+      if (match) hits++;
+    }
+    sec.classList.toggle('hidden', !hits);
+    if (hits) { any = true; if (q) sec.classList.remove('closed'); }
+  }
+  $('noresults').classList.toggle('hidden', any);
+}
+navSearch.addEventListener('input', filterNav);
+navSearch.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { navSearch.value = ''; filterNav(); navSearch.blur(); }
+  if (e.key === 'Enter') {
+    const first = document.querySelector('.navsec:not(.hidden) .navitem:not(.hidden)');
+    if (first) first.click();
+  }
+});
+
+// Mobile drawer (the rail is off-canvas under 900px).
+$('hamburger').onclick = () => document.body.classList.toggle('drawer');
+$('scrim').onclick = () => document.body.classList.remove('drawer');
+
+// Keyboard: "/" search, "[" rail, Escape closes the drawer. Never while typing.
+document.addEventListener('keydown', e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+  if (e.key === '/' && !typing) {
+    e.preventDefault(); if (railCollapsed()) setRail(false);
+    navSearch.focus(); navSearch.select();
+  }
+  if (e.key === '[' && !typing) setRail(!railCollapsed());
+  if (e.key === 'Escape' && document.body.classList.contains('drawer')) {
+    document.body.classList.remove('drawer');
+  }
+});
+
+// Restore persisted rail state. Storage can be BLOCKED (iframe, privacy mode)
+// and then getItem throws — every read degrades to the default layout.
+try {
+  if (localStorage.getItem('pcai-admin-rail') === 'collapsed') setRail(true);
+  for (const id of JSON.parse(localStorage.getItem('pcai-admin-navsecs') || '[]')) {
+    const sec = document.querySelector(`.navsec[data-sec="${CSS.escape(id)}"]`);
+    if (!sec) continue;
+    sec.classList.add('closed');
+    sec.querySelector('.navsec-h').setAttribute('aria-expanded', 'false');
+  }
+} catch (e) { /* storage blocked — keep the default layout */ }
+
 // Boot restore: honor the remembered tab. Called from the boot block AFTER
 // the admin key input is repopulated (the tab loaders fire real fetches —
 // restoring earlier would run them keyless), and only in the auto-connect
 // path: with no remembered key the console opens on Keys, as before.
 function restoreSavedTab() {
+  // A deep link (#traces) is an explicit ask and outranks the remembered tab.
+  const hash = (location.hash || '').replace('#', '');
+  if (hash && activateTab(hash)) return;
   const saved = sessionStore.get('pcai-admin-tab');
   if (!saved || saved === 'keys') return;   // default view needs no restore
   try { if (activateTab(saved)) return; } catch { /* fall through to Keys */ }
@@ -6543,6 +6891,10 @@ async function connect() {
     await refreshAll();
     setConn(true);
     btn.textContent = 'Connected ✓';
+    // Re-run the ACTIVE panel's lazy loaders: a deep link can open a panel
+    // before any key exists, and that panel rendered its keyless state.
+    const activeNav = document.querySelector('nav button.navitem.active');
+    if (activeNav) activateTab(activeNav.dataset.tab);
   } catch (e) {
     setConn(false); btn.textContent = 'Connect';
     banner(e.message, 'error', 6000);
@@ -6598,6 +6950,13 @@ if (storedKey) {
   // the fetches resolve against the now-set key).
   restoreSavedTab();
   connect();
+} else {
+  // No stored key yet: a DEEP LINK is still an explicit ask, so open the panel
+  // and let it render its keyless state — connect() re-runs its loaders once a
+  // key arrives. The remembered TAB is deliberately NOT restored here (it would
+  // fire the same fetches with nothing to authenticate them).
+  const bootHash = (location.hash || '').replace('#', '');
+  if (bootHash) activateTab(bootHash);
 }
 })();
 </script>

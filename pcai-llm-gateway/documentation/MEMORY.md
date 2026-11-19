@@ -283,7 +283,7 @@ So a correct § 1–3 chain shows up here as
 
 | Gate | Where | Default |
 |---|---|---|
-| `PCAI_LLM_DISTILLER_ENABLED` (`settings.distillerEnabled`) | env / chart | **false** — the routes are *unmounted* (404) |
+| `PCAI_LLM_DISTILLER_ENABLED` (`settings.memory.distiller.enabled`) | env / chart | **false** — the routes are *unmounted* (404) |
 | `enabled` | Admin UI → Memory Distiller (DB-backed) | true |
 
 Env false = the surface does not exist. Env true + admin toggle off = 503
@@ -295,16 +295,18 @@ needed** for those.
 
 ```yaml
 settings:
-  distillerEnabled: true              # PCAI_LLM_DISTILLER_ENABLED — master switch
-  distillerMemoryServer: "mm-rag"     # _DISTILLER_MEMORY_SERVER — registry name
-  distillerMemoryTool: "add_memory"   # _DISTILLER_MEMORY_TOOL
-  distillerMemoryProbeTool: "memory_status"  # _DISTILLER_MEMORY_PROBE_TOOL
-  distillerGateBackoffS: 900          # _GATE_BACKOFF_S — skip backoff (0 = retry every pass)
-  distillerRawFallback: false         # _RAW_FALLBACK — see below
-  distillerMinDocChars: 100           # _MIN_DOC_CHARS — body floor (0 = off)
+  memory:
+    distiller:
+      enabled: true                   # PCAI_LLM_DISTILLER_ENABLED — master switch
+      server: "mm-rag"                # _DISTILLER_MEMORY_SERVER — registry name
+      tool: "add_memory"              # _DISTILLER_MEMORY_TOOL
+      probeTool: "memory_status"      # _DISTILLER_MEMORY_PROBE_TOOL
+      gateBackoffS: 900               # _GATE_BACKOFF_S — skip backoff (0 = retry every pass)
+      rawFallback: false              # _RAW_FALLBACK — see below
+      minDocChars: 100                # _MIN_DOC_CHARS — body floor (0 = off)
 ```
 
-**`distillerRawFallback` deserves a decision, not a default.** On a model
+**`settings.memory.distiller.rawFallback` deserves a decision, not a default.** On a model
 failure *after* the gates passed:
 
 - `true` (app default, the historical DSH contract) — write the raw transcript
@@ -341,11 +343,11 @@ integrates by changing chart values — no code:
 1. **Registry row.** Register the server normally (`POST /admin/mcp-servers`);
    the URL comes from the registry and is SSRF-validated at registration. There
    is deliberately **no free-form memory-URL env** — that surface stays closed.
-2. **A write tool** that accepts `{text, metadata}` — `distillerMemoryTool`.
+2. **A write tool** that accepts `{text, metadata}` — `settings.memory.distiller.tool`.
    The gateway sends `metadata: {kind, session_id, source, prompt_version}`;
    `kind` is `project-summary` or `session_history`. Extra metadata is the
    backend's business.
-3. **A capability probe tool** — `distillerMemoryProbeTool` — taking no
+3. **A capability probe tool** — `settings.memory.distiller.probeTool` — taking no
    arguments and returning JSON with at least
    `{memory_available: bool, writable: bool}` (optionally `dataset`,
    `unlocked`, `detail`). It must answer **about its own caller**, resolved
@@ -356,8 +358,8 @@ integrates by changing chart values — no code:
    Without this, every tenant shares one memory store — the thing the override
    exists to prevent.
 
-Set `distillerMemoryServer` / `distillerMemoryTool` / `distillerMemoryProbeTool`
-to your backend — **and `enrollMemoryServer` too**, for the reason in the first
+Set `settings.memory.distiller.server` / `.tool` / `.probeTool`
+to your backend — **and `settings.memory.enroll.server` too**, for the reason in the first
 gap below.
 
 ### Two known gaps in the current implementation
@@ -369,8 +371,8 @@ code comments claim otherwise:
   `settings.distiller_memory_server`; the write path
   (`routes_distill._mcp_call_for`) uses `settings.enroll_memory_server`.
   Both default to `mm-rag`, so the default deployment is correct — but if you
-  point `distillerMemoryServer` at a non-default backend **you must also set
-  `enrollMemoryServer` to the same name**, or the gate will probe one server
+  point `settings.memory.distiller.server` at a non-default backend **you must also set
+  `settings.memory.enroll.server` to the same name**, or the gate will probe one server
   and the write will target another.
 - **The "tools/list fallback" described in `config.py` does not exist.**
   That comment says a backend without the probe tool "degrades to tools/list
@@ -454,9 +456,9 @@ Work top-down; each row is one link in the chain.
 | Probe says `memory_available: false` | no ★ and no header dataset | star a dataset (§ 2) |
 | Memory goes to the wrong dataset / a deleted one | stale `X-Memory-Dataset` header beats the ★ | update or DELETE the header override (§ 3) |
 | `security.memoryDefault` set but ignored | `RAG_MEMORY_DEFAULT` is never read | use `MEMORY_DATASET` on the mm-rag container, or ★ bindings |
-| Probe `detail` says *"not in the enabled registry"* | server name/row | register + enable `mm-rag`; check `distillerMemoryServer` |
+| Probe `detail` says *"not in the enabled registry"* | server name/row | register + enable `mm-rag`; check `settings.memory.distiller.server` |
 | Probe `detail` says *"memory probe failed: …"* | transport/auth | check the credential, and see the fail-closed note below |
-| Distiller 404s | env flag off | `distillerEnabled: true` (restart) |
+| Distiller 404s | env flag off | `settings.memory.distiller.enabled: true` (restart) |
 | Distiller 503s | admin toggle off | Admin UI → Memory Distiller → enabled |
 | Count flat, `ok=True` lines present | watching the wrong dataset | resolve which dataset the *key* uses — an enrolled key's store is not yours |
 | Count flat, no `ok=True` lines | gate or extraction | see the stage-by-stage recipe in `check_memory_feed.py` |

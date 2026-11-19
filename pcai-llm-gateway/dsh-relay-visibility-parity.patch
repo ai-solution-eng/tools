@@ -1,0 +1,155 @@
+diff --git a/packages/client/ui-chat/src/client/contract/assistant-content.ts b/packages/client/ui-chat/src/client/contract/assistant-content.ts
+--- a/packages/client/ui-chat/src/client/contract/assistant-content.ts
++++ b/packages/client/ui-chat/src/client/contract/assistant-content.ts
+@@ -1,4 +1,27 @@
+ import type { AssistantBlock } from '@deepseek-ai/dsh-client-ui-conversation/client'
++
++/**
++ * Test whether one Assistant block renders anything the user can see.
++ *
++ * SINGLE SOURCE OF TRUTH. The streaming reducer (assistant.ts) and the turn
++ * fold's anchor (turn-process.ts) ask the same question, and after r4 they
++ * answered it differently for display-only relayed calls: the message body
++ * rendered the card while the fold counted the step as content-free, so a
++ * relayed card could settle into a different region from the narration around
++ * it. Both passes now call this.
++ *
++ * A RESULT-LESS tool-call head is not visible here: it renders as a tool row
++ * through the tool nodes, not in the message body. A result-bearing one is the
++ * r4 display-only relayed call and renders inline.
++ * @param block - Assistant content block, or undefined for a sparse slot.
++ * @returns whether the block renders in the message body.
++ */
++export function isVisibleAssistantBlock(block: AssistantBlock | undefined): boolean {
++  if (block === undefined) return false
++  if (block.kind === 'tool-call') return block.result !== undefined
++  if (block.kind === 'text' || block.kind === 'reasoning') return block.text.trim() !== ''
++  return true
++}
+ 
+ /**
+  * Test whether Assistant blocks contain a user-facing reply rather than only
+diff --git a/packages/client/ui-chat/src/client/conversation-nodes/assistant.ts b/packages/client/ui-chat/src/client/conversation-nodes/assistant.ts
+--- a/packages/client/ui-chat/src/client/conversation-nodes/assistant.ts
++++ b/packages/client/ui-chat/src/client/conversation-nodes/assistant.ts
+@@ -6,6 +6,7 @@
+ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+ import type {} from '@deepseek-ai/dsh-llm-retry/types'
+ import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
++import { isVisibleAssistantBlock } from '../contract/assistant-content.ts'
+ import type { AssistantChatData } from '../contract/chat-nodes.ts'
+ import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode } from './common.ts'
+ import {
+@@ -60,12 +61,10 @@
+ }
+ 
+ function blockIsVisible(block: AssistantBlock | undefined): boolean {
+-  if (block === undefined) return false
+-  // Result-less tool-call heads render as tool rows in the grouping pass; a
+-  // display-only relayed call (r4) renders inline in this body and is visible.
+-  if (block.kind === 'tool-call') return block.result !== undefined
+-  if (block.kind === 'text' || block.kind === 'reasoning') return block.text.trim() !== ''
+-  return true
++  // Shared with the turn-fold anchor (contract/assistant-content.ts): both
++  // passes must answer this identically or a relayed card renders in one and
++  // is invisible to the other.
++  return isVisibleAssistantBlock(block)
+ }
+ 
+ function hasVisibleContent(blocks: readonly AssistantBlock[]): boolean {
+diff --git a/packages/client/ui-chat/src/client/conversation-nodes/turn-process.ts b/packages/client/ui-chat/src/client/conversation-nodes/turn-process.ts
+--- a/packages/client/ui-chat/src/client/conversation-nodes/turn-process.ts
++++ b/packages/client/ui-chat/src/client/conversation-nodes/turn-process.ts
+@@ -5,7 +5,7 @@
+ import type {} from '@deepseek-ai/dsh-llm-retry/types'
+ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+ import type {} from '@deepseek-ai/dsh-tool-executor-ptc/client'
+-import { hasAssistantReplyContent } from '../contract/assistant-content.ts'
++import { hasAssistantReplyContent, isVisibleAssistantBlock } from '../contract/assistant-content.ts'
+ import type { AssistantChatData, ChatNode, FinalAssistantChatData } from '../contract/chat-nodes.ts'
+ import {
+   isSubagentDelegationTool, sameTurnProcessSpec, type TurnProcessSpec,
+@@ -54,7 +54,10 @@
+   }
+   if (chunk.type !== 'block-end') return false
+   const block = chunk.block
+-  if (block.type === 'tool-call') return false
++  // Display-only relayed call (r4): the gateway's outcome is stamped on the
++  // block, so the live path must see the card exactly as the settled path
++  // does. A result-less head stays invisible here - it is a tool row.
++  if (block.type === 'tool-call') return block.result !== undefined
+   if (block.type === 'text' || block.type === 'reasoning') return block.text.trim() !== ''
+   return true
+ }
+@@ -64,11 +67,7 @@
+   if (event.type === 'assistant/attempt') return false
+   return event.type === 'assistant/message'
+     && event.surfaceOp === 'append'
+-    && toAssistantBlocks(event.data.message.content).some((block) => {
+-      if (block.kind === 'tool-call') return false
+-      if (block.kind === 'text' || block.kind === 'reasoning') return block.text.trim() !== ''
+-      return true
+-    })
++    && toAssistantBlocks(event.data.message.content).some(isVisibleAssistantBlock)
+ }
+ 
+ type ProcessEvidence =
+diff --git a/packages/client/ui-chat/tests/assistant-visibility.client.spec.ts b/packages/client/ui-chat/tests/assistant-visibility.client.spec.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/client/ui-chat/tests/assistant-visibility.client.spec.ts
+@@ -0,0 +1,54 @@
++/** Block visibility parity: the message body and the turn fold share one predicate. */
++import { describe, expect, it } from 'vitest'
++import type { AssistantBlock } from '@deepseek-ai/dsh-client-ui-conversation/client'
++import {
++  hasAssistantReplyContent, isVisibleAssistantBlock,
++} from '../src/client/contract/assistant-content.ts'
++
++const relayCard: AssistantBlock = {
++  kind: 'tool-call',
++  callId: 'relay-1',
++  name: 'logsearch__search_logs',
++  argsRaw: '{"q":"gpu"}',
++  result: '\n→ ok (175ms)\n{"hits":1}\n',
++  resultOk: true,
++}
++
++const pendingCall: AssistantBlock = {
++  kind: 'tool-call',
++  callId: 'call-1',
++  name: 'bash',
++  argsRaw: '{"cmd":"ls"}',
++}
++
++describe('isVisibleAssistantBlock', () => {
++  it('renders a display-only relayed call inline', () => {
++    expect(isVisibleAssistantBlock(relayCard)).toBe(true)
++  })
++
++  it('hides a result-less tool-call head, which renders as a tool row', () => {
++    expect(isVisibleAssistantBlock(pendingCall)).toBe(false)
++  })
++
++  it('hides empty text and reasoning and keeps non-empty', () => {
++    expect(isVisibleAssistantBlock({ kind: 'text', text: '   ' })).toBe(false)
++    expect(isVisibleAssistantBlock({ kind: 'reasoning', text: '' })).toBe(false)
++    expect(isVisibleAssistantBlock({ kind: 'text', text: 'done' })).toBe(true)
++    expect(isVisibleAssistantBlock({ kind: 'reasoning', text: 'thinking' })).toBe(true)
++  })
++
++  it('hides a sparse slot', () => {
++    expect(isVisibleAssistantBlock(undefined)).toBe(false)
++  })
++})
++
++describe('hasAssistantReplyContent', () => {
++  // Deliberate asymmetry, pinned so it is not "fixed" by accident: a relayed
++  // card is VISIBLE but is not a prose reply. latestAnswer() uses this to
++  // decide where the answer region starts, so a relay-only step must not claim
++  // it - only the visibility predicate is shared.
++  it('still excludes tool-call blocks, including relayed cards', () => {
++    expect(hasAssistantReplyContent([relayCard])).toBe(false)
++    expect(hasAssistantReplyContent([relayCard, { kind: 'text', text: 'done' }])).toBe(true)
++  })
++})

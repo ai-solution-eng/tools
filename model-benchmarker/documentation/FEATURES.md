@@ -216,6 +216,10 @@ ones a reader of this package actually meets:
   `.serving.` → in-cluster Service URL rewrite rule the chat page's
   local/remote toggle uses, the request timeout contract (connect 30s /
   read 600s), and the sync→async bridge pool.
+  `print_curl_command()` renders any base function (chat, responses,
+  embeddings, rerank, systemone, ASR/TTS) as a runnable curl command with
+  the TLS posture the client actually uses: no flags in-cluster, `--cacert`
+  for a pinned `REMOTE_CA_BUNDLE`, `-k` for the self-signed remote ingress.
 - **`pcai_models.py`** — the *developer* model registry (named entries
   like `qwen38_27B`). **Excluded from the shipped image by the
   Dockerfile's build-time credential boundary** — the entries carry

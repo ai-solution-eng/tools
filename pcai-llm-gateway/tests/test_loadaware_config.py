@@ -4,7 +4,7 @@ The cascade implementation itself (cascade.py/stickiness.py) is covered by
 the cascade agent's suite; these tests pin the pieces THIS slice owns:
 
 1. CHART WIRING — `helm template` renders PCAI_LLM_LOAD_AWARE_CASCADE
-   from settings.loadAwareCascade.enabled: "false" by default, "true"
+   from settings.routing.loadAwareCascade.enabled: "false" by default, "true"
    when set, and "false" (never an empty value) when the key is absent
    from site values (chained `| default false` for backward-compatible
    pastes). Rendered via subprocess helm — the same subprocess pattern
@@ -52,7 +52,7 @@ def _render(env_value: str | None = None) -> str:
     (exactly how a site would flip it); with None, render the file defaults."""
     cmd = ["helm", "template", "pcai-llm-gateway", str(HELM_CHART)]
     if env_value is not None:
-        cmd += ["--set", f"settings.loadAwareCascade.enabled={env_value}"]
+        cmd += ["--set", f"settings.routing.loadAwareCascade.enabled={env_value}"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, f"helm template failed: {r.stderr}"
     return r.stdout
@@ -112,7 +112,7 @@ class TestChartWiring:
         the default render exercises the default VALUE, not the absent
         KEY path."""
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write("settings:\n  upstreamTimeoutS: 600\n")
+            f.write("settings:\n  upstream:\n    timeoutS: 600\n")
             override = f.name
         try:
             cmd = ["helm", "template", "pcai-llm-gateway", str(HELM_CHART), "-f", override]
@@ -141,11 +141,11 @@ class TestChartWiring:
 
 class TestValuesParity:
     def test_fleet_default_is_off(self) -> None:
-        block = _load_yaml(VALUES_YAML)["settings"]["loadAwareCascade"]
+        block = _load_yaml(VALUES_YAML)["settings"]["routing"]["loadAwareCascade"]
         assert block["enabled"] is False
 
     def test_g2_example_is_on(self) -> None:
-        block = _load_yaml(G2_YAML)["settings"]["loadAwareCascade"]
+        block = _load_yaml(G2_YAML)["settings"]["routing"]["loadAwareCascade"]
         assert block["enabled"] is True
 
     def test_g2_example_documents_the_site_divergence(self) -> None:
@@ -157,9 +157,12 @@ class TestValuesParity:
         assert "load-aware cascade" in text
 
     def test_values_yaml_documents_off_by_default(self) -> None:
+        # settings is grouped by subsystem since 4.2, so the comment must sit ON the
+        # loadAwareCascade block (a bare "OFF" anywhere in the file proves nothing).
         text = VALUES_YAML.read_text()
-        assert "loadAwareCascade:" in text
-        assert "OFF" in text  # the brief's backwards-compat gate is stated
+        block = text.split("loadAwareCascade:", 1)
+        assert len(block) == 2, "loadAwareCascade block missing from values.yaml"
+        assert "off by default" in block[1].splitlines()[1]
 
 
 # ---------------------------------------------------------------------------

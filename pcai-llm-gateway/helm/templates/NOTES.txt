@@ -5,13 +5,14 @@
 {{- $mkSecret := .Values.secretsMasterKey.existingSecret -}}
 {{- $embedded := .Values.database.embedded.enabled -}}
 {{- $vs := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint -}}
-{{- /* HPA × dbPoolMax connection arithmetic (W6 F5): each replica pools its
-     own dbPoolMax connections, so worst-case aggregate demand is
-     maxReplicas × dbPoolMax. Budget = embedded.maxConnections (image default
-     100 when 0) in embedded mode, else the optional maxConnectionsBudget.
-     Warn (never fail) when demand exceeds a KNOWN budget; one-line
-     informational note when the DB is external and no budget is known. */ -}}
-{{- $hpaDemand := mul (int .Values.autoscaling.maxReplicas) (int .Values.settings.dbPoolMax) -}}
+{{- /* HPA × settings.dbPool.max connection arithmetic (W6 F5): each replica
+     pools its own settings.dbPool.max connections, so worst-case aggregate
+     demand is maxReplicas × settings.dbPool.max. Budget =
+     embedded.maxConnections (image default 100 when 0) in embedded mode, else
+     the optional maxConnectionsBudget. Warn (never fail) when demand exceeds a
+     KNOWN budget; one-line informational note when the DB is external and no
+     budget is known. */ -}}
+{{- $hpaDemand := mul (int .Values.autoscaling.maxReplicas) (int .Values.settings.dbPool.max) -}}
 {{- $hpaBudget := 0 -}}
 {{- if $embedded -}}
 {{- $hpaBudget = or (int .Values.database.embedded.maxConnections) 100 -}}
@@ -24,8 +25,8 @@
 {{- $hpaUnknown := and .Values.autoscaling.enabled (not $embedded) (le $hpaBudget 0) -}}
 
 pcai-llm-gateway {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
-{{- if and .Values.settings.trustProxyIdentity (not .Values.ezua.authorizationPolicy.ingressGatewayPrincipals) }}
-⚠️  IDENTITY SPOOFING RISK — settings.trustProxyIdentity is ON but
+{{- if and .Values.settings.auth.trustProxyIdentity (not .Values.ezua.authorizationPolicy.ingressGatewayPrincipals) }}
+⚠️  IDENTITY SPOOFING RISK — settings.auth.trustProxyIdentity is ON but
     ezua.authorizationPolicy.ingressGatewayPrincipals is EMPTY, so the
     AuthorizationPolicy edge rule admits the ENTIRE ingressNamespace
     ({{ .Values.ezua.authorizationPolicy.ingressNamespace }}) to every path:
@@ -47,20 +48,20 @@ pcai-llm-gateway {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to 
 {{- if $hpaOver }}
 ⚠️  POSTGRES CONNECTION OVERSUBSCRIPTION — autoscaling scales to
     {{ .Values.autoscaling.maxReplicas }} replicas, each holding a pool of up to
-    {{ .Values.settings.dbPoolMax }} connections: worst-case aggregate demand is
-    {{ .Values.autoscaling.maxReplicas }} × {{ .Values.settings.dbPoolMax }} = {{ $hpaDemand }}
+    {{ .Values.settings.dbPool.max }} connections: worst-case aggregate demand is
+    {{ .Values.autoscaling.maxReplicas }} × {{ .Values.settings.dbPool.max }} = {{ $hpaDemand }}
     connections, but the budget is only {{ $hpaBudget }}
     ({{ if $embedded }}database.embedded.maxConnections{{ else }}database.maxConnectionsBudget{{ end }}).
     Under the load spike that triggers the scale-up, pods fail to ACQUIRE
     connections (bounded acquire → fast 503) — autoscaling amplifies the
     pressure instead of relieving it.
     FIX: raise {{ if $embedded }}database.embedded.maxConnections{{ else }}database.maxConnectionsBudget (and the real database limit){{ end }}
-    and/or lower settings.dbPoolMax or autoscaling.maxReplicas so that
-    maxReplicas × dbPoolMax fits the budget.
+    and/or lower settings.dbPool.max or autoscaling.maxReplicas so that
+    maxReplicas × settings.dbPool.max fits the budget.
 {{ end }}
 {{- if $hpaUnknown }}
 NOTE (POSTGRES CONNECTIONS): autoscaling scales to
-    {{ .Values.autoscaling.maxReplicas }} replicas × dbPoolMax {{ .Values.settings.dbPoolMax }}
+    {{ .Values.autoscaling.maxReplicas }} replicas × settings.dbPool.max {{ .Values.settings.dbPool.max }}
     = {{ $hpaDemand }} connections of worst-case aggregate demand. The external
     database's max_connections is unknown to this chart — verify it can cover
     {{ $hpaDemand }} under spike, or set database.maxConnectionsBudget to the real

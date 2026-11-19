@@ -164,7 +164,7 @@ can never collide with handback deltas, which start at 0; the index cursor is
 monotone for the whole response, so multiple iterations cannot fuse two calls
 into one card ([toolrelay.py](../src/pcai_llm/core/toolrelay.py#L2955-L2975)).
 
-**Not the same as `toolRelayStreamWireTools`** — that knob emits unstamped,
+**Not the same as `settings.relay.streamWireTools`** — that knob emits unstamped,
 executable-looking deltas and must stay **false** for clients that execute what
 they see ([DEPLOYMENT.md](DEPLOYMENT.md#L355)).
 
@@ -239,7 +239,7 @@ constraint is **dependency**, not conflict:
 | Compress / Relay-Deltas / Stream-Events **without** the relay on | **inert** (not an error): read only inside the relay branch |
 | `Compress-Tools: 1` + `Stream-Events: 0` | compression still happens and the response header still reports the mode, but the `pcai.compress` reporting events are suppressed |
 | `Relay-Deltas: 1` + `Stream-Events: 0` | **good combo** — rendered deltas are native OpenAI chunks, so a strict client gets tool-call rendering without the non-spec `pcai` lines |
-| `Relay-Deltas: 1` alone | inert unless the deployment flag `toolRelayRenderDeltas` is on |
+| `Relay-Deltas: 1` alone | inert unless the deployment flag `settings.relay.renderDeltas` is on |
 | `Execute-Tools: 0` + `Compress-Tools: 1` | compress is inert; no error |
 | `Execute-Tools: 0` + `{type: mcp}` in the body | 400 (loud, with the `require_approval: "always"` pointer) |
 | `Conversation: raw` + anything | orthogonal — it only removes conversation bookkeeping; but it disables `X-PCAI-Continue` and memory capture |

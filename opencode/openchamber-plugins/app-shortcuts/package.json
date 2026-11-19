@@ -1,0 +1,30 @@
+{
+  "name": "@local/openchamber-app-shortcuts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal, Data Manager and login shortcuts in the OpenChamber context rail.",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=1.24.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "app-shortcuts",
+        "name": "App Shortcuts",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      }
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node test/client-check.mjs"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "1.24.2",
+    "esbuild": "0.25.0",
+    "jsdom": "26.1.0"
+  }
+}

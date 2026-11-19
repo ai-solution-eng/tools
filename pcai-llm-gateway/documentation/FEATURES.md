@@ -52,7 +52,7 @@ is no "remaining" column — no read-modify-write, no check-then-act race.
   are about to run out" without guessing. Fail-open: a budget-table fault
   degrades to `ok: true` / `warn: 0` (the previous listing), never to an
   empty one.
-- **Cached-token budget discount** (`settings.budgetCachedExemptFraction`,
+- **Cached-token budget discount** (`settings.cache.metering.budgetExemptFraction`,
   default **0.9**): prompt-cache hits are discounted against day/week/month
   TOKEN budgets (0.9 = one-tenth weight, 1.0 = fully exempt, 0.0 = legacy
   full count). USD cost budgets are unaffected — the cache is already priced
@@ -74,7 +74,7 @@ a request was billed IN.
   `X-PCAI-Duration` header, then the upstream's reported duration, clamped
   into a documented compression envelope (a client could under-report
   otherwise); TTS uses the upstream's duration when present. The fallback
-  heuristics (`audioTtsCharsPerToken` 4, `audioAsrTokensPerSecond` 3.0) price
+  heuristics (`settings.audio.ttsCharsPerToken` 4, `settings.audio.asrTokensPerSecond` 3.0) price
   models still on `token`.
 - **Routing settles its own rows**: the routing/decision model's pick
   (`status='routing'`, gated by `routing_charge_enabled`) is priced and
@@ -94,11 +94,11 @@ carry `X-RateLimit-Remaining-Requests` / `-Tokens` so OpenAI-compatible SDK
 clients back off natively. MCP tool calls (0 tokens) consume the RPM axis
 only — TPM is blind to them.
 
-- **Cached tokens leave the window** (`rateLimitExcludeCachedTokens`, default
+- **Cached tokens leave the window** (`settings.cache.metering.excludeCachedTokens`, default
   true): the settle refunds what the upstream served from its prefix cache,
   so a warm conversation is not double-charged against TPM for tokens the
   model never recomputed.
-- **Admission-time cache prediction** (`rateLimitPredictCached`, default
+- **Admission-time cache prediction** (`settings.cache.metering.predictCached`, default
   **off** — it changes admission behaviour, so it is per-site): the refund
   above is post-hoc and cannot influence a decision already made, and a long
   call settles in the window AFTER the one it charged — a single 800k-token
@@ -108,7 +108,7 @@ only — TPM is blind to them.
   (key, model), because chat pools run 94-99.7% prefix-cache hits while
   embedding/reranker pools sit near zero and a blended ratio mis-prices both.
   A key with no history pays the full estimate — no bypass for new keys.
-- **Settle-time reconciliation** (`rateLimitPredictReconcile`, default on):
+- **Settle-time reconciliation** (`settings.cache.metering.predictReconcile`, default on):
   `charged + (true_billable − charged) == true_billable` — prediction only
   decides WHEN tokens are charged, never HOW MANY. A caller that busts its
   own cache (a nonce defeats the prefix cache) pays the real cost at settle,
@@ -199,17 +199,17 @@ only — TPM is blind to them.
   three-state shape as `X-PCAI-Execute-Tools`; there is deliberately NO
   global kill switch — the key default + header are the whole surface).
 - **Token shadow-keys** (identity Phase B; `PCAI_LLM_TOKEN_SHADOW_KEYS`,
-  chart key `settings.tokenShadowKeys`, default OFF): a first-seen VALID
+  chart key `settings.auth.tokenShadow.enabled`, default OFF): a first-seen VALID
   IdP token subject lazily provisions user + ledger key
   (`bound_via='token-shadow'`, scopes proxy+mcp) so usage attribution
   keeps its `key_id` anchor when callers authenticate with short-lived
   tokens instead of virtual keys. Limits come from
-  `settings.tokenShadowRateLimitRpm` / `tokenShadowRateLimitTpm`
+  `settings.auth.tokenShadow.rateLimitRpm` / `.rateLimitTpm`
   (defaults 60 / 100 000 — config-sourced; the console can tighten them
   per key afterwards, exactly like enrollment-created keys); shadow keys
-  are created under `settings.tokenShadowTenantId` (REQUIRED with the
+  are created under `settings.auth.tokenShadow.tenantId` (REQUIRED with the
   flag — without a tenant the flag is inert) named
-  `settings.tokenShadowKeyName` (`token-shadow`). Lookup is
+  `settings.auth.tokenShadow.keyName` (`token-shadow`). Lookup is
   UNIQUE (idp, subject) → newest non-revoked shadow key. Off = tokens
   validate but never provision (the anonymous-fp posture).
 
@@ -238,7 +238,7 @@ only — TPM is blind to them.
   page + synthesize; the cap bounds ONE user turn's relay loop — a
   handback-continuation request resumes the turn's counter, a fresh user
   message resets it), wall-clock
-  cap (`settings.toolRelayWallClockS` — chart default 900 s, clamped in
+  cap (`settings.relay.wallClockS` — chart default 900 s, clamped in
   code to the upstream timeout minus the 30 s
   ingress headroom so a burned budget still closes the stream before the
   VS deadline), identical-call loop detection (abort + one clean wrap-up
@@ -247,7 +247,7 @@ only — TPM is blind to them.
   tool rows as 0-token `mcp:<server>:<tool>` rows). A mid-relay budget
   re-gate stops the loop cleanly on exhaustion — iterations 2..N are new
   model calls the pre-loop gate never saw.
-- **Bounded retry-once** (`toolRelayCallRetries`, default 1): a bounded
+- **Bounded retry-once** (`settings.relay.callRetries`, default 1): a bounded
   model call that expires on timeout retries once PER TURN when the
   remaining wall clock affords another attempt (≥ 10 s) — the retry budget
   comes OUT OF the remaining wall clock (the guard deadline never moves,
@@ -281,7 +281,7 @@ only — TPM is blind to them.
   which is what makes it cache-safe and cheap enough for the request path.
   `shadow` reports the saving via `pcai.compress` events without rewriting.
   A store failure fails the COMPRESSION, not the turn (the original passes
-  through). Retention is `toolCompressStoreTtlS` (0 disables reclamation).
+  through). Retention is `settings.relay.compress.storeTtlS` (0 disables reclamation).
 - **Request semantics**: the relay pre-flight (grants check) runs BEFORE
   the gates — a grantless relay request cannot leak its concurrency slot —
   and a catalog fetch per granted server happens before the first token
@@ -296,20 +296,20 @@ only — TPM is blind to them.
   mcp-type entries are stripped from the payload forwarded upstream; an
   explicit `X-PCAI-Execute-Tools: 0` still wins over a body execution
   request (loud 400, not a silent ignore).
-- **Tool surface modes** (`settings.toolRelaySurface`, default `hybrid`):
+- **Tool surface modes** (`settings.relay.surface`, default `hybrid`):
   the offered tool list is a compact discover-then-call catalog (~4.6-6k
   tokens for the whole 10-server/111-tool fleet, ~2-3k for one server)
   instead of every full definition — exposing all of them cost 34,459 prompt
   tokens per relayed request and made tool SELECTION a 111-way choice.
   `full` re-offers every definition, per site, for a client that cannot
   discover-then-call.
-- **Rendered call deltas** (`settings.toolRelayRenderDeltas`, default off;
+- **Rendered call deltas** (`settings.relay.renderDeltas`, default off;
   needs request header `X-PCAI-Relay-Deltas: 1`): each in-cluster tool call
   is re-emitted as a NATIVE OpenAI `tool_call` delta stamped
   `pcai.relay: true` — the stamp is what blocks an executing stream client
   from double-running the call (the hazard that keeps
-  `toolRelayStreamWireTools` default-off; see DEPLOYMENT.md § values →
-  environment variables for the incident). `toolRelayRenderIndexBase`
+  `settings.relay.streamWireTools` default-off; see DEPLOYMENT.md § values →
+  environment variables for the incident). `settings.relay.renderIndexBase`
   (1000) keeps delta indexes clear of the model's own tool indexes.
 
 ## Tool-definition pinning (rug-pull defence)
@@ -521,7 +521,7 @@ chat cascade exactly as `auto` does.
 - **Per-key availability**: agents are offered through the profile's agent
   menu (`profile_agents`); a key with NO profile offers every ENABLED agent
   (the repo's empty-allowlist convention). Off by default as a routing
-  candidate (`routingAgentsEnabled`) — a profile may still pin one directly.
+  candidate (`settings.routing.agentsEnabled`) — a profile may still pin one directly.
 - **Read faults fail open, loudly**: a registry fault raises
   `AgentRegistryUnavailable` and the request path degrades to
   "no narrowing" — exactly what any unregistered model name does — bounded
@@ -558,7 +558,7 @@ chat cascade exactly as `auto` does.
   recommendation, never a P1 — the plateau IS the healthy steady state, and
   chronic criticals train operators to ignore alerts.
 - **Honest about budget**: the relay's per-turn tool budget
-  (`toolRelayMaxIterations` — chart default 32, the reference g2 site 16) is
+  (`settings.relay.maxIterations` — chart default 32, the reference g2 site 16) is
   smaller than a full sweep. The agent investigates top-down, P1 first, and
   marks what it did not reach `unverified` with cause "not investigated: tool
   budget"; every firing alert still appears in exactly one defect or in
@@ -678,7 +678,7 @@ someone who is not an admin.
   key — the identity ladder's browser-header rung (`X-Auth-Request-*`
   headers an enforcing proxy overwrites on every request; the ezaf-gateway
   edge classifies these paths, not the app). Two flags gate the surfaces
-  (`settings.trustProxyIdentity`, `settings.ssoKeyCreateEnabled` — both
+  (`settings.auth.trustProxyIdentity`, `settings.auth.ssoKeyCreate.enabled` — both
   default OFF) and are INERT until the coupled rollout in
   [`DEPLOYMENT.md`](DEPLOYMENT.md) § SSO self-mint rollout lands: flipping
   them before the edge chain + AuthorizationPolicy enforce trusts
@@ -776,7 +776,7 @@ someone who is not an admin.
   fetches stay key-independent.
 - **Separation of concerns**: credentials are not grants — a key can carry
   memory headers for a server whose tools it has not been granted.
-- **The self-service surface** (`settings.mcpSelfService`, default true —
+- **The self-service surface** (`settings.mcp.selfService`, default true —
   `/v1/mcp/creds`, `/v1/mcp/selfservice`, `PUT /v1/mcp/selfservice/grants`):
   the KEY HOLDER (not an admin) manages its own key's per-server overrides
   and toggles grants WITHIN its entitlement catalog — the same least-privilege
@@ -797,7 +797,7 @@ someone who is not an admin.
   header pair into the creds dialog. The REDEEM itself can do it: the
   redeem request gains `memory_opt_in` (`bool | null`) — `null`/omitted
   falls back to the deployment default (`PCAI_LLM_ENROLL_MEMORY_DEFAULT`,
-  chart `settings.enrollMemoryDefault`, **false**), and a profile bound to
+  chart `settings.memory.enroll.provisionDataset`, **false**), and a profile bound to
   the code can preset the cohort with `"memory": {"provision": true}` in
   its `defaults_json` (request > profile > deployment default).
 - **Provisioning**: the gateway resolves the RAG server by REGISTRY NAME
@@ -812,7 +812,7 @@ someone who is not an admin.
   id) — human-readable, grammar-sanitized to RAG's `[A-Za-z0-9._-]`, and
   globally unique even across two "Alice"s (the key fragment
   disambiguates). A 409 (name taken — a re-redeem or a squatter) gets a
-  bounded suffix retry (`-2`, `-3`, … `enrollMemoryNameRetries` extra
+  bounded suffix retry (`-2`, `-3`, … `settings.memory.enroll.nameRetries` extra
   attempts) — never a blind adopt of a name the gateway can't prove it
   owns.
 - **Bind, don't display**: on success the pair is stamped into
@@ -871,16 +871,15 @@ budget full price wastes headroom.
   at a discount (normal billing adds no header); `GET /admin/offpeak` is a
   read-only snapshot (state, thresholds, last sample/error); console
   Off-peak tab auto-refreshes while visible.
-- **Evaluator knobs** (chart keys under `settings.`, env
+- **Evaluator knobs** (chart keys under `settings.offpeak.*`, env
   `PCAI_LLM_OFFPEAK_*` — full defaults in DEPLOYMENT.md § values →
-  environment variables): `offpeakCheckS` cadence (30), `offpeakEnterPct` /
-  `offpeakExitPct` hysteresis (20 / 35), `offpeakPromql` global demand
-  query (DCGM GPU util, 5 m window), `offpeakFraction` gateway default
-  fraction (0.5), and `offpeakMcpServer` / `offpeakTool` naming the
-  registered Prometheus MCP server + tool that serves the query
-  (`prometheus` / `prom_query`).
-- **Per-model evaluators** (`settings.offpeakModelPromql`, chart key
-  `settings.offpeakModelPromql`): model name → PromQL returning a 0-100
+  environment variables): `checkS` cadence (30), `enterPct` / `exitPct`
+  hysteresis (20 / 35), `promql` global demand query (DCGM GPU util, 5 m
+  window), `fraction` gateway default fraction (0.5), and `mcpServer` /
+  `tool` naming the registered Prometheus MCP server + tool that serves
+  the query (`prometheus` / `prom_query`).
+- **Per-model evaluators** (`settings.offpeak.modelPromql`, chart key
+  `settings.offpeak.modelPromql`): model name → PromQL returning a 0-100
   load percentage for THE RESOURCES THAT MODEL SERVES ON. A model with an
   entry bills by its OWN hysteresis state; models without one fall back to
   the global query. WHY: the global GPU average dilutes a busy model with
@@ -1069,7 +1068,7 @@ cannot drift.
   rebinding-after-registration residual), never refuse on a resolver error.
 - **TLS verification is unconditional upstream**: there is no
   `verify=False` knob anywhere — a private-CA site sets
-  `settings.upstreamCaBundle` instead (DEPLOYMENT.md § Upstream CA bundle).
+  `settings.upstream.caBundle` instead (DEPLOYMENT.md § Upstream CA bundle).
 
 ## Upstream credential resolution (upstream_auth)
 
@@ -1109,7 +1108,7 @@ get wrong, and the failure mode is silent (an unauthenticated probe just
   per-candidate breakdown (`cascade_attempts`). The response's `model`
   field always reports what actually served, and the ledger records it.
 
-- **Load-aware cascade head** (opt-in: `loadAwareCascade.enabled` = env
+- **Load-aware cascade head** (opt-in: `settings.routing.loadAwareCascade.enabled` = env
   `PCAI_LLM_LOAD_AWARE_CASCADE`, default **false**): the `auto` cascade
   entry picks its HEAD once per conversation — at START, keyed by
   `thread_key` — from the per-model **off-peak state** the billing
@@ -1366,27 +1365,34 @@ get wrong, and the failure mode is silent (an unauthenticated probe just
 - **Credentials**: three modes, first hit wins — panel token
   (`auth_token_enc`, Fernet), by-ref Secret name (`api_key_secret` → env
   `PCAI_LLM_UPSTREAM_KEY__<NAME>`), or open. Never inline, never returned.
+  **A pool's credential follows its endpoint across a base URL edit**
+  (2026-11-18): the upsert identity is `(model_name, base_url)`, so re-pointing
+  an endpoint at a new address is a NEW row — the console sends the row's
+  previous URL as `api_key_from` and the stored ciphertext is copied onto the
+  new row inside the same transaction, before the replace-prune removes the old
+  one. A typed key wins; a source that names no stored credential is a 400, not
+  a silently credential-less row.
 - **Transport**: all upstream calls ride the in-cluster fabric
   (`svc.cluster.local`) over one shared httpx client with
   `upstream_timeout_s` (app default 600 s; the chart ships 900 via
-  `settings.upstreamTimeoutS`) and `follow_redirects=False`.
-- **Conversation floor stickiness** (`settings.stickyRouting`, default
+  `settings.upstream.timeoutS`) and `follow_redirects=False`.
+- **Conversation floor stickiness** (`settings.routing.sticky.enabled`, default
   off — it changes which model serves, so it is opt-in; the DB routing
   config `sticky_routing` overrides): a routed conversation holds a
   capability FLOOR and may escalate above it but never fall below it, so
   mid-thread turns do not silently downgrade to the cheapest model. The
-  floor resets after `stickyRoutingIdleResetS` (1800) idle — without that,
+  floor resets after `settings.routing.sticky.idleResetS` (1800) idle — without that,
   a long thread climbs monotonically to the ceiling.
-- **`auto` routing opt-in** (`settings.routeDefaultModel`, default off):
+- **`auto` routing opt-in** (`settings.routing.routeDefaultModel`, default off):
   arming routing must never silently change what an existing client request
   does, so the legacy `auto` alias keeps its plain ladder until a site
   flips this; the explicit `routing` / `routing__<model>` names always
   route.
-- **Head exclusion** (`settings.demandAwareExcludedModels`, default empty):
+- **Head exclusion** (`settings.routing.demandAwareExcludedModels`, default empty):
   models the conversation-START head must never pick (they stay on the
   plain `auto` ladder and the failover tail) — e.g. keep the tiny
   summarizer model out of the head decision while leaving it reachable.
-- **Per-model `max_tokens` ceiling** (`settings.maxTokensCeiling`, JSON
+- **Per-model `max_tokens` ceiling** (`settings.models.maxTokensCeiling`, JSON
   object, default empty): silently LOWERS a client's larger `max_tokens`
   for that virtual model (never raises) — the static complement of live
   context-window discovery (§ below).
@@ -1442,24 +1448,24 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   where the work happened, never free.
 * **Failure semantics**: a memory-write failure is reported as `ok: false`,
   never a 5xx; a skipped row (gate down, collapsed transcript) backs off for
-  `distillerGateBackoffS` (default 900 — a broken dependency cannot starve
+  `settings.memory.distiller.gateBackoffS` (default 900 — a broken dependency cannot starve
   newer rows) and returns to the due set when the window lapses. On a MODEL
-  failure after the gates passed, `distillerRawFallback` decides: `true`
+  failure after the gates passed, `settings.memory.distiller.rawFallback` decides: `true`
   (app default, the historical DSH contract) writes the raw transcript as
   `session_history` so a session is never lost — but mm-rag chunks a raw
   transcript (measured: 126 fragments from one session), diluting recall;
   `false` (the shipped G2 example) leaves the row due and retries — nothing
   is lost (the conversation stays in `canonical_conversations`) and the
   memory store only ever receives distilled summaries.
-* **Output cap and thinking**: `settings.distillerMaxTokens` (4096) caps
+* **Output cap and thinking**: `settings.memory.distiller.maxTokens` (4096) caps
   the distill OUTPUT — an overrun is rejected whole by
   `document_is_complete()`, so the memory write is LOST rather than
   shortened (keep the prompt target short; leave this as headroom).
-  `settings.distillerDisableThinking` (true) sends
+  `settings.memory.distiller.disableThinking` (true) sends
   `chat_template_kwargs {"enable_thinking": false}` (the Qwen3/SGLang
   switch); engines without the kwarg ignore it, so leaving it on is safe
   for non-reasoning summarizers too.
-* **Title requests are never canonical** (`settings.canonicalSkipTitleRequests`,
+* **Title requests are never canonical** (`settings.memory.capture.skipTitleRequests`,
   default true): a title-generation request would otherwise be captured as
   a canonical row and distilled into a bogus "session summary" whose whole
   body is a title string. Detection is structural (the chat-template shape,
@@ -1550,7 +1556,7 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   `kv_host_total_tokens` the per-model strips read, summed across pods
   (weighted percent, never a mean of ratios). The engine exports NO storage
   occupancy gauge, so a real disk number is read from the L3 VOLUMES:
-  `settings.endpointMetricsDiskSelector` (env
+  `settings.offpeak.diskSelector` (env
   `PCAI_LLM_ENDPOINT_METRICS_DISK_SELECTOR`) is a PromQL label selector
   over `kubelet_volume_stats_*` naming them — on G2 the Mooncake store's SSD
   offload PVCs — and `GET /admin/endpoint-metrics` gains
@@ -1567,7 +1573,7 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   endpoint dies before the first user rather than on them. Structural
   guard: `Pool.healthy()` ignores a probe verdict that would empty a pool —
   the blast radius of a probe mistake is degraded routing, never an outage.
-- **TTFT failover** (`settings.failoverTtftS`, default 45 s, 0 disables):
+- **TTFT failover** (`settings.upstream.failoverTtftS`, default 45 s, 0 disables):
   after a 2xx the stream waits this long for the upstream's FIRST SSE data
   line (keepalives do not count) — a wedged-but-200 upstream no longer
   holds a turn for the full request timeout before the pool fails over.
@@ -1588,7 +1594,7 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   model; `X-PCAI-Fallback` names the model failed over FROM. Plain
   streaming fails over only BEFORE the first byte; mid-stream death is
   unchanged. Bounded by `PCAI_LLM_MODEL_FALLBACK_MAX` (chart key
-  `settings.modelFallbackMax`, default 2; 0 = chains never walk).
+  `settings.routing.fallbackMax`, default 2; 0 = chains never walk).
   **Alias runtime continuation**: for an ALIAS request (`auto`) the profile
   ordering's TAIL — the models AFTER the serving one — is appended as the
   FINAL segment of the same walk, so an `auto` whose admitted model cannot
@@ -1608,7 +1614,7 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   non-streaming responses — the module is a declared transparent proxy;
   body mutation is opt-in.
 - **Zero-completion insurance** (`PCAI_LLM_ZERO_COMPLETION_RETRY`, chart
-  key `settings.zeroCompletionRetry`, default OFF): 2xx + empty assistant
+  key `settings.upstream.zeroCompletionRetry`, default OFF): 2xx + empty assistant
   text (string or content-parts shape) + `completion_tokens==0` +
   `finish_reason=='stop'` triggers ONE identical retry — non-streaming
   JSON path and the relay's final answer only, never plain streaming. BOTH
@@ -1616,7 +1622,7 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   real GPU spend; budgets see both).
 - **Native wire visibility for in-cluster tool calls**
   (`PCAI_LLM_RELAY_STREAM_WIRE_TOOLS`, chart key
-  `settings.toolRelayStreamWireTools`, default OFF): when on, the relay
+  `settings.relay.streamWireTools`, default OFF): when on, the relay
   re-emits the model's `tool_call` deltas as native OpenAI chunks DURING
   the loop — informational only (no `finish_reason`; the relay still owns
   execution). OFF by default because executing stream clients (DSH)
@@ -1624,8 +1630,8 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   DEPLOYMENT.md § values → environment variables for the full incident
   rationale. Handback deltas for CLIENT-offered tools are emitted
   unconditionally and are not affected by this flag.
-- **Client tool-server dispatch** (chart keys `settings.clientToolDispatch`
-  / `settings.clientToolDispatchTimeoutS`, env
+- **Client tool-server dispatch** (chart keys `settings.relay.clientDispatch.enabled`
+  / `settings.relay.clientDispatch.timeoutS`, env
   `PCAI_LLM_CLIENT_TOOL_DISPATCH` / `..._TIMEOUT_S`, default off / 120 s):
   when enabled, a key may register its local tools
   (`POST /v1/dispatch/register`, answered over the
@@ -1684,15 +1690,15 @@ of these, take the idle one".
   group name unroutable while the admin API still stores the rows and
   routing is byte-identical), `PCAI_LLM_MODEL_GROUP_LOAD_REFRESH_S` (5),
   `PCAI_LLM_MODEL_GROUP_LOAD_STALE_S` (30); chart keys
-  `settings.modelGroupsEnabled` / `modelGroupLoadRefreshS` /
-  `modelGroupLoadStaleS`.
+  `settings.routing.modelGroups.enabled` / `.loadRefreshS` /
+  `.loadStaleS`.
 
 ## Context-window discovery and request fit
 
 An OpenAI-compatible server admits a request only when
 `prompt_tokens + max_tokens <= max_model_len`; violate it and it answers
 400 BEFORE sampling. The gateway historically knew only the second term —
-and only as a hand-maintained constant (`settings.maxTokensCeiling`) — so
+and only as a hand-maintained constant (`settings.models.maxTokensCeiling`) — so
 the first term was frozen at whatever prompt size the operator imagined.
 
 - **The gateway learns the term the upstream already publishes**: every
@@ -1720,7 +1726,7 @@ embeddings cache generalised to chat, with three deliberate limits:
 **deterministic only** (`temperature: 0`; an absent temperature is a
 sample, not a fact), **non-streaming only** (SSE replay is a different
 feature; relay turns are never cached), and **opt-in by mode**
-(`settings.responseCacheMode` = `off | shadow | active`, default `off`).
+(`settings.cache.response.mode` = `off | shadow | active`, default `off`).
 
 - **Shadow first**: `shadow` computes the key and records WOULD-BE hits
   (`gateway_response_cache_total{mode="shadow"}`) without serving, so the
@@ -1735,7 +1741,7 @@ feature; relay turns are never cached), and **opt-in by mode**
   estimated prompt tokens and zero cost — the budget SUM excludes that
   status, exactly like the embeddings cache — and returns `X-Cache: HIT`
   with the stored bytes replayed verbatim (`response_cache` stores BYTEA,
-  so replay is byte-identical). TTL `settings.responseCacheTtlS` (3600) is
+  so replay is byte-identical). TTL `settings.cache.response.ttlS` (3600) is
   the policy; expiry is a housekeeping purge.
 - **Fail-open**: every cache call is error-swallowed — a cache fault is a
   miss, never a failed request.
@@ -1743,7 +1749,7 @@ feature; relay turns are never cached), and **opt-in by mode**
 ## OTLP / Langfuse spans (metadata-only tracing)
 
 Request traces for an external observability stack, with no SDK dependency:
-`core/tracing.py` emits OTLP/HTTP JSON to `{otelEndpoint}/v1/traces`
+`core/tracing.py` emits OTLP/HTTP JSON to `{settings.tracing.endpoint}/v1/traces`
 directly — no `opentelemetry` import, so an air-gapped image gains the
 capability without a wheel change.
 
@@ -1754,7 +1760,7 @@ capability without a wheel change.
   `intValue`/`doubleValue` so Langfuse reads token counts as usage.
 - **Conversation grouping without client change**: spans carry
   `langfuse.session.id` = the gateway's own thread fingerprint.
-- **Auth**: `settings.otelHeaders` (comma-separated `Key=Value` pairs)
+- **Auth**: `settings.tracing.headers` (comma-separated `Key=Value` pairs)
   supplies exporter auth, e.g. Langfuse's
   `Authorization=Basic <base64 pk:sk>`.
 - **Metadata only, off by default**: prompts, completions, tool arguments
@@ -1773,8 +1779,8 @@ existing contracts so every hop is governed the same way.
   out) and `POST /v1/audio/transcriptions` (multipart in, JSON out) relay
   the body BYTES unchanged behind the same key/gates/breaker/ledger as
   every other route. Audio endpoints report no usage, so one ledger row
-  settles an ESTIMATE — TTS by characters (`audioTtsCharsPerToken`), ASR
-  by duration (`audioAsrTokensPerSecond`) — because a zero-token row would
+  settles an ESTIMATE — TTS by characters (`settings.audio.ttsCharsPerToken`), ASR
+  by duration (`settings.audio.asrTokensPerSecond`) — because a zero-token row would
   be a budget bypass; with unit-aware pricing (`model_costs.unit`), the
   measured duration supersedes the estimate.
 - **Rerank**: `POST /v1/rerank` mirrors the embeddings contract —
@@ -1878,7 +1884,7 @@ The full method/path/auth/body/response reference now lives in
 | Distill | `POST /v1/distill` (+ `/conversations/{id}`) | virtual key (`X-API-Key` envelope) |
 | Audio | `POST /v1/audio/speech`, `POST /v1/audio/transcriptions` | virtual key, `proxy` |
 | Rerank | `POST /v1/rerank` (pool must be `reranker`-typed) | virtual key, `proxy` |
-| MCP self-service | `GET/PUT /v1/mcp/creds[/{server}]`, `GET /v1/mcp/selfservice`, `PUT /v1/mcp/selfservice/grants` | virtual key (`settings.mcpSelfService` on) |
+| MCP self-service | `GET/PUT /v1/mcp/creds[/{server}]`, `GET /v1/mcp/selfservice`, `PUT /v1/mcp/selfservice/grants` | virtual key (`settings.mcp.selfService` on) |
 
 Data-plane extras: `/mcp` (virtual key + `mcp` scope; the MCP 2.0 surface
 with `mcp_catalog` + `mcp_call` tools), `GET /health` (liveness, inert),

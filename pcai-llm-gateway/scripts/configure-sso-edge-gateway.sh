@@ -53,21 +53,33 @@
 # ── MODES ──────────────────────────────────────────────────────────────
 #   --verify (default)  read-only pre-flight + the behavioral chain
 #                       oracle (the curl triple); safe anywhere, any time
+#   --manifest          print the edge-chain AuthorizationPolicy for THIS host
+#                       (ready for `kubectl apply -f -`) and exit; requires an
+#                       extensionProviders entry named $PROVIDER to already
+#                       exist — see the diagnosis printed by --verify
 #   --attach            locate + print the existing chained-host
 #                       EnvoyFilter (RBAC permitting) and exit; the
 #                       pcai-llm clone is generated from it once seen
 #
 # Run from a terminal with the cluster KUBECONFIG (the chaining objects
 # live in istio-system; a read-only SA sees only the verify half).
+# The release NAMESPACE and VirtualService name are DISCOVERED from the host —
+# the namespace is a site choice (G2: pcai-llm, dc15: pcai-llm-gateway), so do
+# not hardcode it; GATEWAY_NS / VS_NAME override the discovery.
 # Requirements: kubectl, curl. NOT required: jq (no Keycloak API calls).
 
 set -euo pipefail
 
-GATEWAY_NS="${GATEWAY_NS:-pcai-llm}"
+# The release NAMESPACE is a SITE choice (G2: pcai-llm, dc15: pcai-llm-gateway)
+# and the chart names the VS <deployment.name>-vs, so both are DISCOVERED from
+# the VirtualService that serves HOST unless GATEWAY_NS / VS_NAME are set.
+GATEWAY_NS="${GATEWAY_NS:-}"
 POLICY_NAME="${POLICY_NAME:-pcai-llm-gateway-authz}"
-VS_NAME="${VS_NAME:-pcai-llm-gateway-vs}"
+VS_NAME="${VS_NAME:-}"
+APP_LABEL="${APP_LABEL:-pcai-llm-gateway}"
 KUBECTL="${KUBECTL:-kubectl}"
 CURL_HOST="${CURL_HOST:-}"   # override the probed host if needed
+PROVIDER="${PROVIDER:-oauth2-proxy}"   # extensionProviders name (istio ConfigMap)
 
 mode="${1:---verify}"
 
@@ -101,6 +113,54 @@ HOST="pcai-llm-gateway.${DOMAIN_NAME}"
 [ -n "$CURL_HOST" ] && HOST="$CURL_HOST"
 echo "host: ${HOST}"
 
+# ── release discovery: namespace + VirtualService name ─────────────────
+# Look the host up among the cluster's VirtualServices instead of assuming G2's
+# namespace: a site that deploys into pcai-llm-gateway (or renames the release)
+# then needs no env overrides. Explicit GATEWAY_NS / VS_NAME still win.
+if [ "$SKIPPED_KUBECONFIG" = "0" ] && { [ -z "$GATEWAY_NS" ] || [ -z "$VS_NAME" ]; }; then
+  VS_ROWS=$(kc get virtualservice -A \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.hosts[0]}{"\n"}{end}' 2>/dev/null || true)
+  D_NS=$(printf '%s\n' "$VS_ROWS" | awk -v h="$HOST" '$3 == h {print $1; exit}')
+  D_VS=$(printf '%s\n' "$VS_ROWS" | awk -v h="$HOST" '$3 == h {print $2; exit}')
+  if [ -z "$GATEWAY_NS" ]; then GATEWAY_NS="${D_NS:-pcai-llm}"; fi
+  if [ -z "$VS_NAME" ]; then VS_NAME="${D_VS:-pcai-llm-gateway-vs}"; fi
+fi
+GATEWAY_NS="${GATEWAY_NS:-pcai-llm}"
+VS_NAME="${VS_NAME:-pcai-llm-gateway-vs}"
+
+# ── --manifest: the edge-chain policy for this host ────────────────────
+# The chained paths are the load-bearing part: EVERYTHING ELSE falls through
+# unchained (that IS the skip-auth half — a blanket 302 breaks API-key clients).
+if [ "$mode" = "--manifest" ]; then
+  cat <<EOF
+# Edge-chain AuthorizationPolicy for ${HOST} — step 3 of the SSO rollout.
+# PREREQUISITE: an extensionProviders entry named ${PROVIDER} in the istio
+# ConfigMap (envoyExtAuthzHttp -> the platform oauth2-proxy). Verify with:
+#   kubectl -n istio-system get configmap istio -o jsonpath='{.data.mesh}' | grep -A8 extensionProviders
+# Unmatched requests fall through UNCHAINED — deliberately: /v1/*, /mcp/*,
+# /admin stay reachable with the app's own key (NO blanket 302).
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: pcai-llm-gateway-edge-chain
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: ingressgateway
+  action: CUSTOM
+  provider:
+    name: ${PROVIDER}
+  rules:
+    - to:
+        - operation:
+            hosts: ["${HOST}"]
+            paths: ["/", "/ui", "/ui/*", "/v1/identity", "/v1/keys/for-me"]
+EOF
+  exit 0
+fi
+echo "namespace: ${GATEWAY_NS}   virtualservice: ${VS_NAME}"
+
 echo
 echo "── 1. release state (steps 1+2 must already be live) ──────────────"
 if [ "$SKIPPED_KUBECONFIG" = "1" ]; then
@@ -108,13 +168,29 @@ if [ "$SKIPPED_KUBECONFIG" = "1" ]; then
 else
 VS_HOST=$(kc get virtualservice "$VS_NAME" -n "$GATEWAY_NS" \
   -o jsonpath='{.spec.hosts[0]}' 2>/dev/null || true)
-[ "$VS_HOST" = "$HOST" ] && echo "  ok: VS $VS_NAME serves $HOST" \
-  || { echo "  FAIL: VS mismatch (got '${VS_HOST:-none}') — deploy first"; exit 1; }
+[ "$VS_HOST" = "$HOST" ] && echo "  ok: VS $VS_NAME in ns $GATEWAY_NS serves $HOST" \
+  || { echo "  FAIL: VS $VS_NAME in ns $GATEWAY_NS does not serve $HOST (got '${VS_HOST:-none}') — deploy first, or set GATEWAY_NS/VS_NAME"; exit 1; }
 
 POLICY=$(kc get authorizationpolicy "$POLICY_NAME" -n "$GATEWAY_NS" -o yaml 2>/dev/null || true)
 echo "$POLICY" | grep -q 'paths:' && \
   echo "  ok: AuthorizationPolicy carries the metrics + in-cluster relief rules" \
   || echo "  ⚠️ policy lacks the path-scoped relief rules — the 2026-10-07 chart fixes are NOT applied (metrics + in-cluster consumers would be denied)"
+
+# step 2 (injection) state — the policy is mesh L7: without a sidecar it
+# enforces NOTHING, and principals cannot match without mTLS.
+INJ=$(kc get ns "$GATEWAY_NS" -o jsonpath='{.metadata.labels.istio-injection}' 2>/dev/null || true)
+[ "$INJ" = "enabled" ] && echo "  ok: ns $GATEWAY_NS is istio-injection=enabled" \
+  || echo "  FAIL: ns $GATEWAY_NS is NOT labelled istio-injection=enabled — the AuthorizationPolicy is a NO-OP (kubectl label namespace $GATEWAY_NS istio-injection=enabled; then rollout restart)"
+PROXY=$(kc get pods -n "$GATEWAY_NS" -l "app=$APP_LABEL" \
+  -o jsonpath='{range .items[*]}{.status.containerStatuses[*].name}{"\n"}{end}' 2>/dev/null | grep -c 'istio-proxy' || true)
+[ "${PROXY:-0}" -ge 1 ] && echo "  ok: gateway pod(s) carry istio-proxy" \
+  || echo "  FAIL: no istio-proxy on the gateway pods — inject + restart, or the policy enforces nothing"
+
+echo
+echo "── 1b. edge chain objects (istio-system: CUSTOM = chained hosts) ──"
+kc get authorizationpolicy -n istio-system \
+  -o custom-columns='NAME:.metadata.name,ACTION:.spec.action,HOSTS:.spec.rules[*].to[*].operation.hosts[*]' 2>/dev/null \
+  | sed 's/^/  /' || echo "  (RBAC denied — run under a full kubeconfig)"
 fi
 
 echo
@@ -131,10 +207,17 @@ echo
 echo "── 3. interpretation ───────────────────────────────────────────────"
 if [ "$CODE_ROOT" = "200" ] && [ "$CODE_IDENTITY" = "200" ]; then
   echo "  NOT CHAINED (steps 1+2 state): browser paths hit the app directly."
-  echo "  → step 3 (the edge-chain AuthorizationPolicy) is the remaining work —"
-  echo "    .scratch/pcai-llm-edge-authz.yaml is the applied shape (clone of"
-  echo "    dsh-web-helm-auth-policy). GOTCHA: policies propagate over xDS —"
-  echo "    wait ~1 min and re-verify before concluding NOT CHAINED (2026-10-08:""the first post-apply verify raced propagation and still read 200/401/200)."
+  echo "  → step 3 (the edge-chain AuthorizationPolicy) is the remaining work."
+  echo "    Diagnose the platform plumbing first (read-only):"
+  echo "      kubectl -n oauth2-proxy get deploy"
+  echo "      kubectl -n istio-system get configmap istio -o jsonpath='{.data.mesh}' | grep -A8 extensionProviders"
+  echo "      kubectl -n istio-system get authorizationpolicy -o custom-columns='NAME:.metadata.name,ACTION:.spec.action,HOSTS:.spec.rules[*].to[*].operation.hosts[*]'"
+  echo "    A CUSTOM policy for another host is a clone source (e.g. dsh-web-helm-auth-policy)."
+  echo "    No oauth2-proxy provider at all = the unit has no platform SSO: that is"
+  echo "    platform work, and the app flags stay off until it exists."
+  echo "    Generate this host's policy with: $0 --manifest | kubectl apply -f -"
+  echo "    GOTCHA: policies propagate over xDS — wait ~1 min and re-verify"
+  echo "    (2026-10-08: the first post-apply verify raced propagation)."
 elif [ "$CODE_ROOT" = "302" ] && [ "$CODE_IDENTITY" = "302" ] && [ "$CODE_MODELS" = "401" ]; then
   echo "  ✅ CHAINED CORRECTLY: browser+identity paths redirect to Keycloak,"
   echo "     /v1/models answers 401 FROM THE APP (bearer control intact)."

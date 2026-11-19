@@ -559,17 +559,17 @@ class TestZeroValueNumericKnobs:
     lesson) — these pins keep the documented 0s reaching the pod as "0"."""
 
     ZERO_KNOBS: ClassVar[list[tuple[str, str]]] = [
-        ("failoverTtftS", "PCAI_LLM_FAILOVER_TTFT_S"),
-        ("stickyRoutingIdleResetS", "PCAI_LLM_STICKY_ROUTING_IDLE_RESET_S"),
-        ("registryWatchS", "PCAI_LLM_REGISTRY_WATCH_S"),
-        ("registryAdminFreshS", "PCAI_LLM_REGISTRY_ADMIN_FRESH_S"),
+        ("settings.upstream.failoverTtftS", "PCAI_LLM_FAILOVER_TTFT_S"),
+        ("settings.routing.sticky.idleResetS", "PCAI_LLM_STICKY_ROUTING_IDLE_RESET_S"),
+        ("settings.mcp.registryWatchS", "PCAI_LLM_REGISTRY_WATCH_S"),
+        ("settings.mcp.registryAdminFreshS", "PCAI_LLM_REGISTRY_ADMIN_FRESH_S"),
     ]
 
     @pytest.mark.parametrize("knob,env_name", ZERO_KNOBS)
     def test_zero_renders_as_zero(self, knob: str, env_name: str) -> None:
-        envs = _deployment_envs(_render_docs(f"--set settings.{knob}=0"))
+        envs = _deployment_envs(_render_docs(f"--set {knob}=0"))
         assert envs.get(env_name) == "0", (
-            f"settings.{knob}=0 must reach the pod as 0 (documented kill-switch); "
+            f"{knob}=0 must reach the pod as 0 (documented kill-switch); "
             f"got {envs.get(env_name)!r} — `| default` rewrites 0 to the non-zero default"
         )
 
@@ -626,14 +626,14 @@ class TestTrustPrincipalWarning:
     WARN = "IDENTITY SPOOFING RISK"
 
     def test_warning_emitted_when_trust_on_and_principals_empty(self) -> None:
-        notes = _render_notes("--set settings.trustProxyIdentity=true")
+        notes = _render_notes("--set settings.auth.trustProxyIdentity=true")
         assert self.WARN in notes, (
             "trustProxyIdentity=true with empty ingressGatewayPrincipals must emit the NOTES.txt spoofing-risk warning"
         )
 
     def test_warning_suppressed_when_principals_set(self) -> None:
         notes = _render_notes(
-            "--set settings.trustProxyIdentity=true",
+            "--set settings.auth.trustProxyIdentity=true",
             "--set ezua.authorizationPolicy.ingressGatewayPrincipals[0]=cluster.local/ns/istio-system/sa/ezaf-gateway",
         )
         assert self.WARN not in notes, "warning must be gone once principals are set"
