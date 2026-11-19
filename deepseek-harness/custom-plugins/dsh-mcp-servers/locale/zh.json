@@ -44,6 +44,8 @@
   "action.addHeader": "添加请求头",
   "action.addVariable": "添加变量",
   "action.clear": "清除",
+  "action.reveal": "显示",
+  "action.hide": "隐藏",
   "transport.streamable-http": "Streamable HTTP",
   "transport.stdio": "stdio",
   "field.serverName": "服务器名称",

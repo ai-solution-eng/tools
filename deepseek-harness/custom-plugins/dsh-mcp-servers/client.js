@@ -97,6 +97,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'action.addHeader': 'Add header',
       'action.addVariable': 'Add variable',
       'action.clear': 'Clear',
+      'action.reveal': 'Show',
+      'action.hide': 'Hide',
       'transport.streamable-http': 'Streamable HTTP',
       'transport.stdio': 'stdio',
       'field.serverName': 'Server name',
@@ -201,6 +203,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'action.addHeader': '添加请求头',
       'action.addVariable': '添加变量',
       'action.clear': '清除',
+      'action.reveal': '显示',
+      'action.hide': '隐藏',
       'transport.streamable-http': 'Streamable HTTP',
       'transport.stdio': 'stdio',
       'field.serverName': '服务器名称',
@@ -766,8 +770,25 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
      * @param {{ id: string, label: string, hint?: string, error?: string, addLabel: string, pairs: Array<{ key: string, value: string }>, keyPlaceholder: string, valuePlaceholder: string, onChange: (pairs: Array<{ key: string, value: string }>) => void }} props - editor props.
      * @returns {any} element.
      */
+    /**
+     * Header and variable names whose values are credentials. Their value input
+     * renders as a password field, so a bearer token is never shown on screen
+     * while the real value stays in the draft and is saved unchanged.
+     */
+    const SENSITIVE_NAME = /(authorization|cookie|token|secret|api[-_]?key|apikey|password|credential|session)/i
+
+    /**
+     * Whether a header or variable name holds a secret.
+     * @param {unknown} name - header or variable name.
+     * @returns {boolean} true when the value must be hidden.
+     */
+    function isSensitiveName(name) {
+      return SENSITIVE_NAME.test(String(name ?? ''))
+    }
+
     function KeyValueEditor(props) {
       const pairs = Array.isArray(props.pairs) ? props.pairs : []
+      const [revealed, setRevealed] = React.useState({})
       const update = (index, patch) => {
         props.onChange(pairs.map((pair, position) => (position === index ? { ...pair, ...patch } : pair)))
       }
@@ -791,7 +812,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
               }),
               h('input', {
                 className: 'dsh-mcp-servers__input',
-                type: 'text',
+                // A credential value is masked by default: the draft keeps the
+                // real text, the field just does not render it.
+                type: isSensitiveName(pair.key) && revealed[index] !== true ? 'password' : 'text',
                 value: pair.value ?? '',
                 placeholder: props.valuePlaceholder,
                 spellCheck: false,
@@ -799,6 +822,14 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                 'aria-label': props.valuePlaceholder,
                 onChange: (event) => update(index, { value: event.target.value }),
               }),
+              isSensitiveName(pair.key)
+                ? h('button', {
+                    type: 'button',
+                    className: 'dsh-mcp-servers__ghost',
+                    'aria-label': revealed[index] === true ? props.hideLabel : props.revealLabel,
+                    onClick: () => setRevealed({ ...revealed, [index]: revealed[index] !== true }),
+                  }, revealed[index] === true ? props.hideLabel : props.revealLabel)
+                : null,
               h('button', {
                 type: 'button',
                 className: 'dsh-mcp-servers__ghost',
@@ -997,6 +1028,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                   error: errors.keys.env,
                   addLabel: t('action.addVariable'),
                   removeLabel: t('action.clear'),
+                  revealLabel: t('action.reveal'),
+                  hideLabel: t('action.hide'),
                   pairs: draft.env,
                   keyPlaceholder: t('placeholder.key'),
                   valuePlaceholder: t('placeholder.value'),
@@ -1020,6 +1053,8 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                   error: errors.keys.headers,
                   addLabel: t('action.addHeader'),
                   removeLabel: t('action.clear'),
+                  revealLabel: t('action.reveal'),
+                  hideLabel: t('action.hide'),
                   pairs: draft.headers,
                   keyPlaceholder: t('placeholder.key'),
                   valuePlaceholder: t('placeholder.value'),

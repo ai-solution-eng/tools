@@ -44,6 +44,8 @@
   "action.addHeader": "Add header",
   "action.addVariable": "Add variable",
   "action.clear": "Clear",
+  "action.reveal": "Show",
+  "action.hide": "Hide",
   "transport.streamable-http": "Streamable HTTP",
   "transport.stdio": "stdio",
   "field.serverName": "Server name",

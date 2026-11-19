@@ -452,6 +452,25 @@ await check('the add form offers the streamable-http fields', () => {
   assert.ok(labels.includes('URL'))
 })
 
+await check('the editor masks a credential header value', () => {
+  const base = {
+    id: '', serverName: 'x', transport: 'streamable-http', url: 'http://x/mcp',
+    command: '', argsText: '', cwd: '', env: [],
+    toolCallTimeoutMs: '60000', maxInstructionBytes: '262144', catalogUrl: '',
+    failOnStartupError: false, enabled: true,
+  }
+  const secretDraft = { ...base, headers: [{ key: 'Authorization', value: 'Bearer sk-secret' }] }
+  const secretTree = renderPage({ form: readyForm([]), overrides: { 2: secretDraft } })
+  const secretInput = byType(secretTree, 'input').find((props) => props.value === 'Bearer sk-secret')
+  assert.ok(secretInput, 'the header value input is rendered')
+  assert.equal(secretInput.type, 'password', 'a bearer token is masked')
+
+  const plainDraft = { ...base, headers: [{ key: 'X-Auth-Request-User', value: 'francesco-caliva' }] }
+  const plainTree = renderPage({ form: readyForm([]), overrides: { 2: plainDraft } })
+  const plainInput = byType(plainTree, 'input').find((props) => props.value === 'francesco-caliva')
+  assert.equal(plainInput.type, 'text', 'a non-credential header stays readable')
+})
+
 await check('the add form offers the stdio fields', () => {
   const draft = {
     id: '', serverName: 'local', transport: 'stdio', url: '', headers: [], command: '', argsText: '', cwd: '', env: [],
