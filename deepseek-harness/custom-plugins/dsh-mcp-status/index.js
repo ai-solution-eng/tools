@@ -308,6 +308,7 @@ function applyProbe(connection, probe, settings) {
     toolCount: toolNames.length,
     tools: toolNames.slice(0, settings.maxToolsListed),
     toolsHidden: hidden > 0 ? hidden : undefined,
+    toolNames,
     catalogAvailable: catalogCandidatesFor(toolNames, settings).length > 0,
   }
 }
@@ -428,6 +429,7 @@ async function describeManagedConnection(ctx, hostEntry, row, settings) {
       toolCount: names.length,
       tools: names.slice(0, settings.maxToolsListed),
       toolsHidden: hidden > 0 ? hidden : undefined,
+      toolNames: names,
       catalogAvailable: candidates.length > 0,
       note: 'registered through the MCP servers page',
     }
@@ -505,6 +507,27 @@ function readConnections(ctx, settings, caches) {
  * @returns {Promise<Record<string, any>>} connection view with `upstream`.
  */
 /**
+ * Group a gateway's tool names into upstream servers.
+ *
+ * A gateway that refuses its catalog still namespaces every proxied tool as
+ * `<server>-<tool>` (LiteLLM does), so the server names and their tool counts
+ * are already in the tool list. This is the last resort, used only when the
+ * catalog endpoint exists but denies access — a 404 means "not a gateway".
+ * @param {string[]} toolNames - tools the server listed.
+ * @returns {Array<{ server: string, toolCount: number, reachable: boolean }>} derived rows.
+ */
+function deriveServersFromTools(toolNames) {
+  const counts = new Map()
+  for (const name of Array.isArray(toolNames) ? toolNames : []) {
+    const at = name.indexOf('-')
+    if (at <= 0 || at === name.length - 1) continue
+    const server = name.slice(0, at)
+    counts.set(server, (counts.get(server) ?? 0) + 1)
+  }
+  return [...counts.entries()].map(([server, toolCount]) => ({ server, toolCount, reachable: true }))
+}
+
+/**
  * Guess a gateway's REST catalog endpoint from its MCP endpoint.
  *
  * LiteLLM proxies the upstream tools and keeps the server list at
@@ -553,6 +576,17 @@ async function withUpstream(connection, settings, cache) {
     servers = Array.isArray(fetched.rows) ? fetched.rows : []
     tool = 'rest'
     error = fetched.error
+    // A denied catalog (401/403) still proves this is a gateway, and its tool
+    // names carry the upstream server names. A 404 means there is no catalog
+    // here at all, so nothing is derived from a plain server's tool names.
+    if (servers.length === 0 && (fetched.status === 401 || fetched.status === 403)) {
+      const derivedRows = deriveServersFromTools(connection.toolNames)
+      if (derivedRows.length > 0) {
+        servers = derivedRows
+        tool = 'tool-names'
+        error = undefined
+      }
+    }
   } else {
     return connection
   }

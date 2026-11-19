@@ -19,6 +19,11 @@ function startMock(mode) {
     // A gateway that publishes its upstream list over REST instead of as an
     // MCP tool (LiteLLM's /v1/mcp/server).
     if (req.method === 'GET' && req.url === '/v1/mcp/server') {
+      if (mode === 'rest-denied') {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'not permitted' } }))
+        return
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         servers: [
@@ -67,7 +72,13 @@ function startMock(mode) {
           jsonrpc: '2.0',
           id: message.id,
           result: {
-            tools: mode === 'rest-only'
+            tools: mode === 'rest-denied'
+              ? [
+                  { name: 'alpha_mcp-run', description: 'proxied' },
+                  { name: 'alpha_mcp-fetch', description: 'proxied' },
+                  { name: 'beta_mcp-search', description: 'proxied' },
+                ]
+              : mode === 'rest-only'
               ? [
                   { name: 'execute_query', description: 'run a query' },
                   { name: 'search', description: 'search' },
@@ -174,6 +185,7 @@ const structuredOnly = await startMock('structured-only')
 const structuredObject = await startMock('structured-object')
 const litellm = await startMock('litellm')
 const restOnly = await startMock('rest-only')
+const restDenied = await startMock('rest-denied')
 const deadPort = await new Promise((resolve) => {
   const server = createServer(() => {})
   server.listen(0, '127.0.0.1', () => {
@@ -461,6 +473,25 @@ await record('snapshot: a gateway with no catalog tool unrolls through its REST 
   assert.equal(connection.upstream.servers[0].toolCount, 5, 'tool_count is read')
 })
 
+await record('snapshot: a denied catalog falls back to tool-name grouping', async () => {
+  const entry = fakeEntry('mcp-denied', {
+    transport: 'streamable-http',
+    serverName: 'denied-gateway',
+    url: 'http://127.0.0.1:' + restDenied.port + '/mcp',
+    headers,
+  })
+  const ctx = { loader: { entries: () => [entry][Symbol.iterator]() }, tools: { schemas: () => [] } }
+  const snapshot = await buildSnapshot(ctx, settings, caches(), true)
+  const connection = snapshot.connections.find((item) => item.serverName === 'denied-gateway')
+  assert.equal(connection.upstream.tool, 'tool-names', 'the fallback answered')
+  assert.deepEqual(
+    connection.upstream.servers.map((server) => [server.server, server.toolCount]),
+    [['alpha_mcp', 2], ['beta_mcp', 1]],
+    'upstreams are grouped from the namespaced tool names',
+  )
+  assert.equal(connection.upstream.error, undefined)
+})
+
 await record('snapshot: upstream is omitted unless requested', async () => {
   const snapshot = await buildSnapshot(fakeCtx, settings, caches(), false)
   assert.ok(snapshot.connections.every((item) => item.upstream === undefined))
@@ -567,6 +598,7 @@ console.log(`\n${results.length - failures}/${results.length} checks passed`)
 json.server.close()
 litellm.server.close()
 restOnly.server.close()
+restDenied.server.close()
 sse.server.close()
 unauthorized.server.close()
 catalogError.server.close()

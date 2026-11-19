@@ -387,7 +387,7 @@ export async function fetchCatalog(options) {
       headers: { accept: 'application/json', ...(options.headers ?? {}) },
       signal: controller.signal,
     })
-    if (!response.ok) return { error: 'HTTP ' + response.status }
+    if (!response.ok) return { error: 'HTTP ' + response.status, status: response.status }
     const text = await response.text()
     let payload
     try {
