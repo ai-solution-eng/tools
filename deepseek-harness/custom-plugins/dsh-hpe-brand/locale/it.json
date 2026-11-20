@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Marchio e accento HPE",
+    "description": "Ridisegna la Web UI in stile HPE: verde HPE per il pulsante principale, gli interruttori, le caselle di controllo, gli anelli di focus, i link, l'indicatore degli slot e la velatura di selezione, l'elemento grafico HPE accanto al nome nella barra laterale e prima del titolo della sessione vuota, e il nome del prodotto a due toni. L'accento arriva come livello di token rimovibile, quindi le palette chiara e scura sottostanti restano intatte; disattiva il plugin per tornare all'aspetto DeepSeek originale."
+  }
+}

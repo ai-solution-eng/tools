@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "HPE brand and accent",
+    "description": "Restyles the Web UI in HPE terms: HPE green for the primary button, switches, checkboxes, focus rings, links, the slot caret and the selection wash, the HPE brand element beside the sidebar wordmark and before the blank-session headline, and a two-tone HPE wordmark. The accent arrives as a removable token layer, so the light and dark palettes underneath stay intact; disable the plugin to return to the shipped DeepSeek look."
+  }
+}
