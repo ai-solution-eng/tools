@@ -1271,7 +1271,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_resource ON admin_audit(resource_type
 --     volume is tool-call-rate, not chat-rate, so per-row chaining is
 --     affordable there in a way it is NOT on usage_ledger (whose INSERT arg
 --     tuple is positional and whose write is on the hot path - deliberately
---     out of scope for this wave; see documentation/HARDENING-2026-10-26.md).
+--     out of scope for this wave).
 --
 -- Chain shape: row_hash = sha256(prev_hash || '|' || canonical row text).
 -- The first row's prev_hash is ''. Verification walks id ASC and reports the
@@ -1543,4 +1543,57 @@ EXCEPTION WHEN duplicate_object THEN
     NULL;
 END;
 $pcai$;
+
+-- ============================================================================
+-- Async tool-call jobs (2026-11-20: documentation/design/async-tool-execution.md)
+--
+-- WHY a table and not the in-memory hub next door: a detached tool call is
+-- addressed by a job id from a LATER request, on an arbitrary replica. The
+-- client-dispatch hub (core.clientside) is deliberately per-process and that
+-- is fine for its use (the offering client long-polls its own gateway), but a
+-- job id that 404s because the poll landed on the wrong replica is the exact
+-- bug SQLhandler hit in production (2026-09: 3 of 4 status calls 404'd on a
+-- 4-replica release) and the exact property ROADMAP refuses to give up for
+-- /mcp. Working state lives here; the durable RECORD is the audit chain.
+--
+-- The state vocabulary is MCP's (tasks TaskStatus) so these rows can answer
+-- tasks/get later without a translation layer. Cancellation is a FLAG, not a
+-- state: "requested, worker may still be unwinding" is a moment every cancel
+-- passes through, and a phantom state would force every reader to handle it.
+-- The result is claimed ONCE (result_claimed_at), because a replayed request
+-- must not inject the same tool result into the conversation twice.
+--
+-- Additive and idempotent like every migration in this file. The canonical
+-- copy for reviewers also lives in core/tooljobs.py (DDL) so the module is
+-- testable in isolation; both are IF NOT EXISTS, so applying both is a no-op.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS tool_jobs (
+    job_id            UUID PRIMARY KEY,
+    key_id            UUID NOT NULL,
+    server            TEXT NOT NULL,
+    tool              TEXT NOT NULL,
+    args_sha256       TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'working',
+    status_message    TEXT,
+    cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
+    result_body       TEXT,
+    result_bytes      INTEGER,
+    result_claimed_at TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at        TIMESTAMPTZ NOT NULL,
+    CONSTRAINT tool_jobs_state_vocab CHECK (
+        state IN ('working','input_required','completed','failed','cancelled')
+    )
+);
+
+-- The active-list read ("what am I still waiting on?") and the per-key
+-- admission count both scan exactly this slice; a partial index keeps the
+-- finished-job majority out of it.
+CREATE INDEX IF NOT EXISTS idx_tool_jobs_active ON tool_jobs(key_id, created_at DESC)
+    WHERE state IN ('working','input_required');
+
+-- The reaper's scan. Separate index because expiry is a GLOBAL sweep, not a
+-- per-key read: one busy key must not be able to starve the sweep.
+CREATE INDEX IF NOT EXISTS idx_tool_jobs_expiry ON tool_jobs(expires_at);
 """

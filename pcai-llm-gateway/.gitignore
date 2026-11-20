@@ -24,10 +24,10 @@ dsh/*.clean
 *.tar.gz
 *.jpg
 scratch_workspace/
-relay-visibility-r2/pod-check/
-relay-visibility-r2/shadow/
-relay-visibility-r2/shadow2/
--o
+# archived relay kit's verification scratch (moved with the kit in the 2026-11-20 docs wave)
+documentation/history/relay-visibility-r2/pod-check/
+documentation/history/relay-visibility-r2/shadow/
+documentation/history/relay-visibility-r2/shadow2/
 
 # Local-only scratch (session artifacts, one-off scripts, empty probe files)
 .memory-rca/

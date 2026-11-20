@@ -27,7 +27,5 @@ formatter.sh
 .scratch/
 dsh/
 PCAI_LLM.jpg
-# Patch kits (relay-visibility: gateway tombstone/render work — source of truth
-# lives in src/; kits are working copies + DSH-side artifacts, never image content)
-relay-visibility/
-relay-visibility-r2/
+# Historical patch kits (relay-visibility r1/r2/r4) now live under
+# documentation/history/ and are already excluded by the documentation/ rule.

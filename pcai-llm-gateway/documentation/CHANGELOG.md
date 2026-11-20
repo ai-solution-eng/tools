@@ -72,6 +72,26 @@ feature is listed under the LATER version.
 
 ## Documentation waves
 
+- **2026-11-20 architecture-and-cleanup wave.** The diagrams are now three,
+  sourced and rendered under `documentation/images/` (the old
+  `documentation/architecture.*` moved there; every reference updated):
+  `architecture` (request path, routing plane, the Prometheus monitoring
+  plane feeding both off-peak billing and model-group selection, MCP fleet,
+  control plane), `memory-progression` (the AUTOMATIC capture → sweep →
+  capability gate → map-reduce distill → write → recall pipeline) and
+  `tenancy` (admin → team leader/sub-admin → teammate, with the one budget
+  gate and the scoping discipline). Superseded material moved to
+  `documentation/history/` (the v1.5.1-era audit pair, the relay work kits,
+  the relay ship note) and the stale one-line product description was
+  dropped; `Audits/README.md` indexes the dated waves. Reference fixes:
+  stale release claims (README, DEPLOYMENT, headers, LITELLM-COMPARISON),
+  chart-key paths after the values regroup (`settings.relay.compress.mode`,
+  `settings.relay.renderDeltas`, `settings.server.maxBodyBytes`,
+  `settings.dbPool.max`), moved-file pointers in `NOTES.txt` and two
+  module docstrings, the duplicated `API.md §2.7`, and LITELLM-COMPARISON's
+  line citations replaced with section anchors. Every relative markdown link
+  and heading anchor in the tree resolves.
+
 - **2026-11-11 doc wave.** README.md restructured to the fleet's ten-section
   spine (what it is → problem → fit → capabilities → deploy → prerequisites →
   day-2 → doc map). FEATURES.md gains the policy-plane sections

@@ -1,0 +1,160 @@
+// pcai-llm-gateway — session memory progression: capture -> sweep -> gate -> MAP-REDUCE -> write -> recall
+//
+// Render (from the repo root):
+//   dot -Tpng -Gdpi=150 documentation/images/memory-progression.dot -o documentation/images/memory-progression.png
+//   dot -Tsvg documentation/images/memory-progression.dot -o documentation/images/memory-progression.svg
+//
+// The point of this diagram: memory is NOT an MCP tool a client has to call.
+// It is an AUTOMATIC pipeline the gateway runs for every harness, and the part
+// that makes a multi-megabyte session fit a single memory document is the
+// MAP-REDUCE (adaptive windows -> per-window notes -> one reduced summary).
+//
+// Operator path (mint the RAG key, star the dataset, attach it, prove the feed
+// moves): documentation/MEMORY.md. Pipeline internals: FEATURES.md
+// "Session memory distiller". This file is the shape of the pipeline.
+//
+digraph memory_progression {
+  rankdir=TB;
+  splines=spline;
+  compound=true;
+  nodesep=0.30;
+  ranksep=0.48;
+  fontname="Helvetica";
+  labelloc=t;
+  fontsize=13;
+  label="session memory — the automatic progression of a conversation into durable memory\nteal: the pipeline · orange: off-peak scheduling · grey: Postgres · red: failure paths";
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, margin="0.13,0.07"];
+  edge [fontname="Helvetica", fontsize=8, penwidth=1.4, arrowsize=0.7];
+
+  // ---------- 1 · capture ----------
+  subgraph cluster_capture {
+    label="1 · CAPTURE — universal: every harness that uses the gateway feeds it, with ZERO client changes";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#0f766e";
+
+    relayed [label="relayed agent (tool relay)\ncapture after the loop ends", fillcolor="#ccfbf1", color="#0f766e"];
+    plain   [label="plain chat agent (raw SDK, opencode, OWUI)\nfire-and-forget on input — converges\nas the client resends history", fillcolor="#ccfbf1", color="#0f766e"];
+    optout  [label="X-PCAI-Conversation: raw\nopts a request out entirely", fillcolor="#f1f5f9", color="#64748b"];
+    titles  [label="title-generation requests\nskipped (structural shape, not prose)", fillcolor="#f1f5f9", color="#64748b"];
+  }
+
+  canonical [label="canonical_conversations — Postgres\nthe sweep's substrate: every turn of every key\n(a memory row is never the only copy)",
+             fillcolor="#f1f5f9", color="#475569", penwidth=1.6];
+
+  // ---------- 2 · sweep ----------
+  subgraph cluster_sweep {
+    label="2 · SWEEP — the housekeeping loop decides WHAT and WHEN";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#0f766e";
+
+    quiet [label="QUIET conversations of\nMEMORY-ATTACHED keys\ndebounce window (default 5 min)",
+           fillcolor="#ccfbf1", color="#0f766e"];
+    offpeak [label="off-peak-only scheduling (optional)\na distill runs only while the SUMMARIZER\nMODEL's own evaluator reports low demand\n(global evaluator = fallback)",
+             fillcolor="#ffedd5", color="#ea580c"];
+    knobs [label="admin knobs: summarizer model (default = the caller's routing)\nquiet window · output cap · runtime enable\nDB overrides over env, audited",
+           fillcolor="#f8fafc", color="#64748b", fontsize=9];
+  }
+
+  // ---------- 3 · gate ----------
+  gate [label="3 · ATTACHMENT GATE — a CAPABILITY probe, not a config check\nthe gateway calls the memory server's memory_status tool WITH THE KEY'S OWN CREDENTIALS\n→ available / writable / unlocked (TTL-cached 60 s)\nNOT attached → 200 {ok:false, inert:true} · nothing runs · nothing is spent",
+        fillcolor="#fff7ed", color="#c2410c", penwidth=1.8];
+
+  // ---------- 4 · distill (map-reduce) ----------
+  subgraph cluster_distill {
+    label="4 · DISTILL — automatic MAP-REDUCE: how a multi-megabyte session fits one memory document";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#0f766e";
+
+    split  [label="split at BLOCK boundaries\ninto adaptive windows\n(an oversized block is hard-split,\nnever dropped)", fillcolor="#ccfbf1", color="#0f766e"];
+    m1     [label="MAP call 1\nwindow → notes", fillcolor="#ccfbf1", color="#0f766e"];
+    m2     [label="MAP call 2\nwindow → notes", fillcolor="#ccfbf1", color="#0f766e"];
+    m3     [label="MAP call N\nwindow → notes", fillcolor="#ccfbf1", color="#0f766e"];
+    reduce [label="REDUCE\ncombined notes → ONE structured summary", fillcolor="#99f6e4", color="#0f766e", penwidth=1.7];
+    single [label="short transcript\n(one window): single pass,\nno map step", fillcolor="#f0fdfa", color="#0f766e"];
+
+    contract [label=<<b>the output contract (recall compatibility, prompt_version stamped)</b><br align="left"/>
+      [MEMORY INDEX | project: &lt;slug&gt; | type: session-summary | topics: …]<br align="left"/>
+      ## What we did<br align="left"/>## Key decisions &amp; rationale<br align="left"/>## Gotchas<br align="left"/>## How to proceed<br align="left"/>
+      <i>+ optional</i> ## Playbook — fenced JSON, only when the trace carries ≥ MIN_TOOL_CALLS<br align="left"/>clean tool calls; the outcome label is INFERRED (or stamped unverified)<br align="left"/>>,
+      shape=box, fillcolor="#f0fdfa", color="#0f766e", fontsize=9];
+  }
+
+  // ---------- 5 · write ----------
+  write [label="5 · WRITE — add_memory over MCP\nwith the KEY'S OWN dataset credentials (per-key override, last-wins)\nmetadata: kind = project-summary | session_history · session_id · prompt_version",
+         fillcolor="#ccfbf1", color="#0f766e", penwidth=1.6];
+  store [label="mm-rag memory dataset — the key's long-term memory\nproject summaries · session histories", fillcolor="#dcfce7", color="#16a34a", penwidth=1.6];
+  recall [label="6 · RECALL — the next session's agent retrieves it\n(that is the whole payoff: the memory is the project's own history)",
+          fillcolor="#dcfce7", color="#16a34a", penwidth=1.6];
+
+  // ---------- side boxes ----------
+  subgraph cluster_fail {
+    label="Failure semantics — fail SOFT, never lose the session";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#b91c1c";
+
+    rawfb [label="MODEL failure after the gates passed\nrawFallback = true (app default): write the raw\ntranscript as session_history — never lost, but\nchunked (measured: 126 fragments → diluted recall)\nfalse (shipped G2 example): leave the row due and\nretry — the canonical store still holds it",
+            fillcolor="#fee2e2", color="#b91c1c", fontsize=9];
+    backoff [label="gate down / collapsed transcript\n→ back off 900 s (a broken dependency\ncannot starve newer rows)", fillcolor="#fee2e2", color="#b91c1c", fontsize=9];
+    softfail [label="memory-write failure\n→ ok:false, never a 5xx", fillcolor="#fee2e2", color="#b91c1c", fontsize=9];
+  }
+
+  cost [label="cost is attributed, never free\nevery distill LLM call settles ONE ledger row\nagainst the owning key + a phase=distill agent trace",
+        fillcolor="#f1f5f9", color="#475569", fontsize=9];
+
+  // ================= edges =================
+  edge [color="#0f766e", fontcolor="#0f766e"];
+  relayed -> canonical;
+  plain   -> canonical;
+  canonical -> quiet [label="due set"];
+  quiet -> gate [label="gates passed"];
+  gate -> split [label="attached"];
+  split -> m1;
+  split -> m2;
+  split -> m3;
+  m1 -> reduce;
+  m2 -> reduce;
+  m3 -> reduce;
+  single -> reduce [style=dashed];
+  reduce -> contract;
+  contract -> write [label="one document"];
+  write -> store;
+  store -> recall;
+
+  // off-peak scheduling (orange)
+  edge [color="#ea580c", fontcolor="#c2410c", style=dashed];
+  offpeak -> quiet [label="only while low demand", style=solid];
+
+  // opt-out / skipped (grey)
+  edge [color="#64748b", fontcolor="#475569", style=dashed];
+  optout -> canonical [label="never captured"];
+  titles -> canonical [label="never distilled"];
+
+  // failure paths (red)
+  edge [color="#b91c1c", fontcolor="#b91c1c", style=dashed];
+  gate -> backoff [label="not attached / gate error"];
+  reduce -> rawfb [label="model failure"];
+  rawfb -> store [label="session_history", constraint=false];
+  write -> softfail [label="write refused"];
+
+  // continue -> re-distill loop
+  edge [color="#0f766e", fontcolor="#0f766e", style=dashed];
+  store -> quiet [label="session CONTINUES →\lmarker dropped on next write →\lre-distilled when quiet (the memory evolves)\l", constraint=false];
+
+  // cost
+  edge [color="#475569", fontcolor="#475569", style=dotted];
+  reduce -> cost [constraint=false];
+
+  // ============ band ordering ============
+  canonical -> gate [style=invis, weight=5];
+  reduce -> write [style=invis, weight=5];
+  write -> cost [style=invis];
+
+  // ============ legend ============
+  subgraph cluster_legend {
+    label="Legend"; labeljust=l; fontsize=10; style="rounded"; color="#9ca3af";
+    legend [shape=plaintext, style="", fontsize=9,
+            label=<<table border="0" cellborder="0" cellspacing="2">
+              <tr><td align="left"><font color="#0f766e">━ pipeline</font></td><td align="left">automatic — no client call, no harness plugin</td></tr>
+              <tr><td align="left"><font color="#ea580c">━ off-peak</font></td><td align="left">scheduling only — the summarizer's own demand state</td></tr>
+              <tr><td align="left"><font color="#b91c1c">┈ failure</font></td><td align="left">soft, attributed, and never a lost session</td></tr>
+              <tr><td align="left"><font color="#475569">┈ grey</font></td><td align="left">Postgres truth · opt-out paths</td></tr>
+            </table>>];
+  }
+}

@@ -4,8 +4,8 @@
 > master table, the SSO end-to-end walkthrough and the claim-to-source map —
 > lives in `general_documentation/LiteLLM_Comparison/PCAI_LLM_Gateway_vs_LiteLLM_Bifrost_v4.md`
 > (external documentation repo, read-only). This page is the five-minute version
-> to read next to [`architecture.png`](architecture.png) (source:
-> [`architecture.dot`](architecture.dot)). Gateway claims are grounded in this
+> to read next to [`architecture.png`](images/architecture.png) (source:
+> [`architecture.dot`](images/architecture.dot)). Gateway claims are grounded in this
 > repo with `file:line` citations; the competitor columns summarize the long
 > doc's research against LiteLLM's and Bifrost's public documentation
 > (September 2026) — re-verify there before quoting externally.
@@ -22,15 +22,17 @@ attributed to a key or subject, and every call is an immutable ledger row
 ([README.md:3-15](../README.md), long doc §1). Concretely, on top of being an
 LLM proxy it is: a **budget engine** (day/week/month token + USD budgets derived
 as SUMs over an append-only `usage_ledger` — no "remaining" column, no
-read-modify-write race; [README.md:26-34](../README.md), [FEATURES.md:9-13](FEATURES.md)),
+read-modify-write race; [README.md:26-34](../README.md), [FEATURES.md § Budget semantics](FEATURES.md#budget-semantics)),
 a **federated MCP plane** with per-(key, server, tool) default-DENY ACLs
-([README.md:37-39](../README.md), [FEATURES.md:545-565](FEATURES.md)), a
+([README.md:37-39](../README.md), [FEATURES.md § MCP federation](FEATURES.md#mcp-federation)), a
 **server-side tool relay** that runs the model↔MCP agentic loop in-cluster
-([README.md:122-137](../README.md), [FEATURES.md:147-214](FEATURES.md)), an
+([README.md:122-137](../README.md), [FEATURES.md § Tool-use relay](FEATURES.md#tool-use-relay-server-side-agentic-loop)), an
 **SSO self-service front door** where a signed-in human mints their own governed
-key ([README.md:144-151](../README.md), [FEATURES.md:360-407](FEATURES.md)), and
+key ([README.md:144-151](../README.md), [FEATURES.md § SSO self-mint](FEATURES.md#sso-self-mint-browser-identity--key)), and
 a **session-memory distiller** that turns conversations into structured project
-memories in the calling key's RAG dataset ([FEATURES.md:874-931](FEATURES.md)).
+memories in the calling key's RAG dataset
+([FEATURES.md § Session memory distiller](FEATURES.md#session-memory-distiller),
+[pipeline diagram](images/memory-progression.svg)).
 The architecture diagram draws exactly this: one entry point, routing and
 fallback deciding *which* model serves, the relay corridor reaching the MCP
 fleet, and the demand evaluator feeding both the head pick and the price.
@@ -53,39 +55,39 @@ long doc (§2 master table, §6, §8). ✔ ships · ◐ partial/config-dependent
 | 8 | **SSO self-service** | `GET /v1/identity` whoami probe + `POST /v1/keys/for-me`: one key per browser identity, fixed scopes/limits, transactional rotate, spend lineage survives rotation (`spend_ancestors`); grants stay admin-controlled — [FEATURES.md:360-407](FEATURES.md), [schema.py:146](../src/pcai_llm/db/schema.py) | SSO-driven key generation is 💰 enterprise; invitation flows are admin-run (long doc §2 row 8, §3.2) | IdP integration 💰 enterprise; no self-service mint (long doc §2 row 8) |
 | 9 | **Deployment surface** | One stateless container + external Postgres (embedded single-node PG 16 for units without a site DB); values-only Helm; credentials by-reference; exposure via the PCAI Istio gateway; the gateway itself holds no Kubernetes API access — [README.md:168-187](../README.md), [README.md:99-103](../README.md), [values.yaml:72-87](../helm/values.yaml) | Postgres + Redis recommended for production; some governance/UI behind enterprise (long doc §2 row 19) | Redis for clustering/HA; clustering/RBAC/IdP/audit 💰 enterprise (long doc §2 row 19) |
 | 10 | **Provider breadth** | Registered local endpoint pools (vLLM/SGLang, priority/weight, circuit breaker) — deliberately no cloud API translation — [FEATURES.md:841-868](FEATURES.md) | **✔ wins: 100+ providers** — the category leader (long doc §2 row 20, §6) | 20+ native providers (long doc §2 row 20) |
-| 11 | **Ecosystem & community** | Single-team internal product; HPE-internal support; the self-audit loop (`Audits/AUDIT.md` → `Audits/REMEDIATION.md` with per-fix regression tests) is the differentiator | **✔ wins: large community, hosted UI, plugins, mature gateway knobs** (long doc §2 row 21, §6) | Go performance (~11 µs added at 5k rps), WASM plugins, community (long doc §2 rows 21, 24) |
+| 11 | **Ecosystem & community** | Single-team internal product; HPE-internal support; the self-audit loop (`Audits/` → per-fix regression tests; the original v1.5.1 pair is archived under `history/audits-2026-09/`) is the differentiator | **✔ wins: large community, hosted UI, plugins, mature gateway knobs** (long doc §2 row 21, §6) | Go performance (~11 µs added at 5k rps), WASM plugins, community (long doc §2 rows 21, 24) |
 | 12 | **Design center** | In-cluster MCP + agentic relay; fleet identity + metering plane (long doc §8) | Provider breadth, cloud spend (long doc §8) | Raw throughput, router knobs (long doc §8) |
 
 ## Reading the diagram with this table
 
-The current [`architecture.dot`](architecture.dot) (rendered as
-[`architecture.png`](architecture.png)) shows one request path from the harness
+The current [`architecture.dot`](images/architecture.dot) (rendered as
+[`architecture.png`](images/architecture.png)) shows one request path from the harness
 through the gateway, with the two ways a model gets picked — each maps to the
 rows above:
 
 - **Blue — routing (row 4).** The gateway asks **d3-turbo** (vLLM-SR System One,
   `decision_mode: shadow | active`), which picks exactly ONE model: DeepSeek for
-  hard code, GLM for review / lowest hallucination, Qwen3.8-27B for lighter
+  hard code, GLM for review / lowest hallucination, a Qwen for lighter
   work. It sees a SUMMARY of the request — estimated tokens, message/tool
   counts, per-candidate cost and live GPU load — never the message content, and
   a confidence under 0.60 leaves the heuristics standing rather than downgrading
-  on a guess ([FEATURES.md:742-787](FEATURES.md)).
+  on a guess ([FEATURES.md § Routing](FEATURES.md#routing)).
 - **Green — fallback (row 5).** With no routing decision the gateway walks the
   cascade **DeepSeek → GLM → Qwen**, promoting on budget exhaustion or a dead /
   5xx primary. Every hop is re-gated at walk time — registered, inside the key's
   `allowed_models`, a healthy chat pool, fresh budget headroom — so failover can
   never become a budget bypass, and each attempt settles under the model that
-  actually served ([FEATURES.md:975-1000](FEATURES.md)).
+  actually served ([FEATURES.md § Routing](FEATURES.md#routing)).
 - **Orange — the demand-aware path (row 6, opt-in).** The load-aware head picks
   the cascade's ENTRY point once per conversation from the per-model off-peak
   state and stays sticky for the thread; the *same* evaluator that picks the
   head sets the billing fraction, so the prompt and the price cannot disagree
-  ([FEATURES.md:631-644](FEATURES.md), [FEATURES.md:480-496](FEATURES.md)).
+  ([FEATURES.md § Routing](FEATURES.md#routing), [FEATURES.md § Off-peak billing](FEATURES.md#off-peak-billing)).
 - **The MCP fleet panel (bottom) — rows 2-3.** Broken out by task group — data
   handling, visualization, research (searxng web search + page fetch), cluster
   admin, and **workbench** (scratch write + execution env) — every server is reached only through the gateway's in-cluster
   relay (③ tool call, ④ result back to the model), gated per tool by the key's
-  default-DENY ACLs ([FEATURES.md:551-565](FEATURES.md)).
+  default-DENY ACLs ([FEATURES.md § MCP federation](FEATURES.md#mcp-federation)).
 
 ## Where LiteLLM / Bifrost are genuinely better
 
@@ -95,7 +97,7 @@ Stated honestly, unchanged in substance from the long doc (§6):
   20+ native providers dwarf the gateway's endpoint-pool model. For a team whose
   center of gravity is cloud model access with frequent provider churn, they
   are the right tools (long doc §6; the gateway's posture:
-  [FEATURES.md:841-843](FEATURES.md)).
+  [FEATURES.md § Endpoint health](FEATURES.md#endpoint-health)).
 - **Raw latency.** Bifrost documents ~11 µs added overhead at 5 000 rps. The
   gateway publishes its own number: ~100 µs of framework stack per request
   (p99 ≈ 127 µs) and ≈ 1.3 ms p50 through a real loopback gateway hop — roughly
@@ -150,12 +152,12 @@ private model+tool fleet safely *shareable* (long doc §7).
 - This repo: [README.md](../README.md) · [FEATURES.md](FEATURES.md) (budget
   semantics, relay, off-peak billing, MCP federation, routing, session memory
   distiller, router extras, ledger schema) · [API.md](API.md) ·
-  [MEMORY.md](MEMORY.md) · [DEPLOYMENT.md](DEPLOYMENT.md) · `Audits/AUDIT.md` +
-  `Audits/REMEDIATION.md` (the self-audit trail row 11 above references).
-- Diagram: [architecture.png](architecture.png) — source
-  [architecture.dot](architecture.dot); re-render with
-  `dot -Tpng -Gdpi=150 documentation/architecture.dot -o documentation/architecture.png`.
-- Version note: the long doc documents gateway v2.3.1; this repo is at 3.0.3
+  [MEMORY.md](MEMORY.md) · [DEPLOYMENT.md](DEPLOYMENT.md) · [Audits/](Audits/) (the
+  self-audit trail row 11 above references; the v1.5.1 pair is archived under
+  [history/audits-2026-09/](history/audits-2026-09/)).
+- Diagrams: [architecture](images/architecture.svg) · [memory progression](images/memory-progression.svg) · [tenancy](images/tenancy.svg) — each with its `.dot` source beside it; re-render with
+  `dot -Tpng -Gdpi=150 documentation/images/<name>.dot -o documentation/images/<name>.png`.
+- Version note: the long doc documents gateway v2.3.1; this repo is at 4.2.1
   (`helm/Chart.yaml`). The structural rows above (ledger budgets, per-tool
   ACLs, relay, SSO self-mint, distiller) are design properties, not release
   snapshots; competitor claims were verified against September 2026 public

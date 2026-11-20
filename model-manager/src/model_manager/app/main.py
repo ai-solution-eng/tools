@@ -30,6 +30,7 @@ from .catalog import (
     TIER_LABELS,
     TIERS,
     Catalog,
+    entry_pinned,
     entry_quant,
     entry_unvalidated,
 )
@@ -1680,6 +1681,17 @@ async def push_models(req: Request, project: str = ""):
                 "recorded; MLIS will treat it as equivalent to the bf16 model",
                 cfg.get("name") or "<unnamed>",
                 entry_quant(cfg),
+            )
+    # ENGINE: warn (never block) when pushing a config whose image tag floats.
+    # Two operators deploying the same catalog row on different days then get
+    # different inference engines, and nothing in MLIS records which one ran.
+    for cfg in configs:
+        if isinstance(cfg, dict) and cfg.get("image") and not entry_pinned(cfg):
+            log.warning(
+                "pushing UNPINNED image %r for %r to MLIS -- a floating tag can resolve to a "
+                "different engine release on the next deploy; pin a version tag (or a digest)",
+                cfg.get("image"),
+                cfg.get("name") or "<unnamed>",
             )
     results = await aioli_db.push_batch(configs, project=project)
     pushed = sum(1 for r in results if r["status"] == "pushed")

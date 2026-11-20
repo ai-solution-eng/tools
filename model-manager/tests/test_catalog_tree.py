@@ -90,6 +90,10 @@ def test_seed_labs_are_the_expected_families():
     # Labs come from the model family, not the URI org: the Qwen re-uploads live
     # under Inferact / RamManavalan / RedHatAI but belong to their real labs.
     assert "Qwen" in labs
+    # NVIDIA's own Nemotron family: the org fallback would title-case the lab
+    # header to "Nvidia", so the curated prefix is what keeps it branded.
+    assert "NVIDIA" in labs
+    assert "Nvidia" not in labs
     assert "Inferact" not in labs
     assert "RamManavalan" not in labs
     assert "RedHatAI" not in labs

@@ -80,7 +80,7 @@ survive, redundancy is dropped — and the original is stored under a content
 digest so the model can expand it with the synthetic `pcai__retrieve` tool
 (offered only while the mode is `on`; `{"digest", "offset", "limit"}` pages
 the text). The header outranks the deployment default
-(`settings.tool_compress_default`); an unknown value is OFF, never an error.
+(`settings.relay.compress.mode`, chart key; the code setting is `tool_compress_default`); an unknown value is OFF, never an error.
 `shadow` computes and reports the saving — in-stream `pcai.compress` events
 carry kind/digest/before/after — and rewrites nothing. Compression is
 deterministic and model-free: the same bytes in produce the same bytes out,
@@ -445,7 +445,7 @@ missing/unset `PCAI_LLM_SECRETS_MASTER_KEY` prevents even the create —
 nothing is provisioned that cannot be bound). The gateway never deletes
 datasets.
 
-### 2.7 Identity probe + SSO self-service key (Phase B)
+### 2.8 Identity probe + SSO self-service key (Phase B)
 
 **`GET /v1/identity`** — the whoami probe the SPA calls BEFORE it has a key.
 PUBLIC by design (no auth dependency — there is nothing here to authorize;
@@ -526,7 +526,7 @@ for attribution but authorizes nothing (401) unless token shadow-keys are
 enabled, in which case the subject's newest non-revoked `token-shadow` key
 (first sighting lazily provisions user + key) is the authorization anchor.
 
-### 2.8 `POST /v1/audio/speech` and `POST /v1/audio/transcriptions`
+### 2.9 `POST /v1/audio/speech` and `POST /v1/audio/transcriptions`
 
 Transparent audio passthrough over `voice`-typed pools. The request body
 **bytes** are forwarded unchanged (JSON for speech, multipart for
@@ -562,7 +562,7 @@ arithmetic and is merely tagged, so upgrading the gateway never changes an
 existing site's bill. The row carries `endpoint = audio.speech` /
 `audio.transcriptions`.
 
-### 2.9 `POST /v1/rerank` — rerankers behind the key
+### 2.10 `POST /v1/rerank` — rerankers behind the key
 
 Body: `{"model", "query", "documents"}` (`query`/`documents` may be strings or
 multimodal content dicts; vendor knobs such as `mm_processor_kwargs` pass
