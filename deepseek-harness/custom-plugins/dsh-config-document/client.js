@@ -31,6 +31,10 @@ window.__ModuleLoader__.load({
     const ENDPOINT = 'api/config-document'
     /** Fallback name when the Host reports a path without a basename. */
     const FALLBACK_NAME = 'cordis.patch.yml'
+    /** Row and field listing for the guided editor. */
+    const ENTRIES_ENDPOINT = ENDPOINT + '/entries'
+    /** Write route for one scalar field. */
+    const EDIT_ENDPOINT = ENDPOINT + '/edit'
 
     const EN = {
       'action.open': 'Open configuration file',
@@ -61,7 +65,22 @@ window.__ModuleLoader__.load({
       'error.route': 'The Host route is not available (HTTP {status}). The Host half of this plugin may not be loaded yet; a dsh restart is required after installing it.',
       'error.network': 'Could not reach the Host: {message}',
       'error.unavailable': 'The Host exposes no configuration document.',
-      'hint.readonly': 'Read-only view. Download the file to edit it, then restore it on the Host.',
+      'hint.readonly': 'Read-only view. Use Edit values for top-level settings, or edit the file on the Host.',
+      'action.edit': 'Edit values',
+      'action.save': 'Save',
+      'action.saving': 'Saving…',
+      'action.cancel': 'Cancel',
+      'editor.title': 'Edit a value',
+      'editor.hint': 'Only top-level text, number and boolean values are offered. Everything else stays in the file.',
+      'editor.row': 'Row',
+      'editor.noRows': 'No row exposes an editable value.',
+      'editor.saved': 'Saved. The configuration editor rewrote the file.',
+      'editor.failed': 'Not saved: {message}',
+      'editor.unchanged': 'Nothing changed.',
+      'guide.title': 'Editing by hand',
+      'guide.body': 'To change anything else, open the data manager, navigate to the profile volume and edit {file}, then restart the Host.',
+      'guide.copyPath': 'Copy path',
+      'guide.copied': 'Path copied.',
     }
 
     const ZH = {
@@ -93,7 +112,22 @@ window.__ModuleLoader__.load({
       'error.route': '主机路由不可用（HTTP {status}）。该插件的主机部分可能尚未加载；安装后需要重启 dsh。',
       'error.network': '无法连接主机：{message}',
       'error.unavailable': '主机未提供配置文件。',
-      'hint.readonly': '只读视图。如需修改，请下载文件，编辑后再在主机上恢复。',
+      'hint.readonly': '只读文本视图。顶层设置请使用“编辑值”，其他内容请在主机上编辑文件。',
+      'action.edit': '编辑值',
+      'action.save': '保存',
+      'action.saving': '保存中…',
+      'action.cancel': '取消',
+      'editor.title': '编辑值',
+      'editor.hint': '仅提供顶层的文本、数字和布尔值。其他内容仍保留在文件中。',
+      'editor.row': '条目',
+      'editor.noRows': '没有条目提供可编辑的值。',
+      'editor.saved': '已保存。配置编辑器已重写文件。',
+      'editor.failed': '未保存：{message}',
+      'editor.unchanged': '没有变化。',
+      'guide.title': '手动编辑',
+      'guide.body': '如需修改其他内容，请打开数据管理器，进入配置卷并编辑 {file}，然后重启主机。',
+      'guide.copyPath': '复制路径',
+      'guide.copied': '路径已复制。',
     }
 
     const CSS = [
@@ -127,6 +161,18 @@ window.__ModuleLoader__.load({
       '.cfgdoc-notice { display: flex; flex-direction: column; gap: 6px; padding: 18px 16px; color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }',
       '.cfgdoc-notice__title { color: var(--dsw-alias-label-primary); font-weight: 500; }',
       '.cfgdoc-notice__detail { color: var(--dsw-alias-label-secondary); font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-size: 11.5px; line-height: 17px; }',
+      '.cfgdoc-editor { display: flex; flex-direction: column; gap: 10px; padding: 14px; }',
+      '.cfgdoc-editor__title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }',
+      '.cfgdoc-editor__hint { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }',
+      '.cfgdoc-editor__form { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow: auto; }',
+      '.cfgdoc-editor__field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--dsw-alias-label-secondary); }',
+      '.cfgdoc-editor__input { box-sizing: border-box; width: 100%; padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; }',
+      '.cfgdoc-editor__actions { display: flex; gap: 8px; justify-content: flex-end; }',
+      '.cfgdoc-guide { display: flex; flex-direction: column; gap: 6px; padding: 10px 20px; border-top: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); }',
+      '.cfgdoc-guide__title { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); }',
+      '.cfgdoc-guide__body { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }',
+      '.cfgdoc-guide__actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }',
+      '.cfgdoc-guide__path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; padding: 3px 6px; border-radius: 4px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }',
       '.cfgdoc-foot { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; padding: 12px 20px 16px; color: var(--dsw-alias-label-tertiary); font-size: 11.5px; line-height: 16px; }',
       '.cfgdoc-foot__hint { flex: 1; min-width: 0; overflow-wrap: anywhere; }',
       '.cfgdoc-sr { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }',
@@ -303,6 +349,11 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState({ phase: 'loading', data: null, error: null })
       const [tick, setTick] = React.useState(0)
       const [status, setStatus] = React.useState(null)
+      const [editOpen, setEditOpen] = React.useState(false)
+      const [editRows, setEditRows] = React.useState([])
+      const [editRowId, setEditRowId] = React.useState('')
+      const [editValues, setEditValues] = React.useState({})
+      const [editBusy, setEditBusy] = React.useState(false)
       const dialogRef = React.useRef(null)
       const copyRef = React.useRef(null)
       const linkRef = React.useRef(null)
@@ -442,6 +493,85 @@ window.__ModuleLoader__.load({
 
       const data = state.data
       const path = data && typeof data.path === 'string' ? data.path : ''
+
+      // Guided editor: top-level scalar values only, written through the
+      // configuration editor so the row is validated by its own schema and the
+      // document keeps its comments and !!js expressions.
+      const valuesOf = (row) => {
+        const values = {}
+        for (const field of row && Array.isArray(row.fields) ? row.fields : []) {
+          values[field.path] = field.value === undefined || field.value === null ? '' : String(field.value)
+        }
+        return values
+      }
+
+      const selectRow = (id) => {
+        setEditRowId(id)
+        setEditValues(valuesOf(editRows.find((entry) => entry.id === id)))
+      }
+
+      const openEditor = async () => {
+        setEditOpen(true)
+        setStatus(null)
+        try {
+          const response = await fetch(ENTRIES_ENDPOINT, {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { accept: 'application/json' },
+          })
+          const body = await response.json().catch(() => null)
+          const rows = body && Array.isArray(body.entries) ? body.entries : []
+          setEditRows(rows)
+          const first = rows.length > 0 ? rows[0] : null
+          setEditRowId(first ? first.id : '')
+          setEditValues(first ? valuesOf(first) : {})
+        } catch (error) {
+          setEditRows([])
+          setStatus({ tone: 'error', text: t('error.network', { message: messageOf(error) }) })
+        }
+      }
+
+      const saveEditor = async () => {
+        const row = editRows.find((entry) => entry.id === editRowId)
+        if (!row || !Array.isArray(row.fields)) return
+        const changes = row.fields.filter((field) => String(field.value) !== String(editValues[field.path]))
+        if (changes.length === 0) {
+          setStatus({ tone: 'ok', text: t('editor.unchanged') })
+          return
+        }
+        setEditBusy(true)
+        for (const field of changes) {
+          try {
+            const response = await fetch(EDIT_ENDPOINT, {
+              method: 'POST',
+              credentials: 'same-origin',
+              cache: 'no-store',
+              headers: { 'content-type': 'application/json', accept: 'application/json' },
+              body: JSON.stringify({ id: row.id, path: field.path, value: editValues[field.path] }),
+            })
+            const body = await response.json().catch(() => null)
+            if (!body || body.ok !== true) {
+              const reason = body && typeof body.message === 'string' && body.message ? body.message : 'HTTP ' + response.status
+              setStatus({ tone: 'error', text: t('editor.failed', { message: reason }) })
+              setEditBusy(false)
+              return
+            }
+          } catch (error) {
+            setStatus({ tone: 'error', text: t('editor.failed', { message: messageOf(error) }) })
+            setEditBusy(false)
+            return
+          }
+        }
+        setEditBusy(false)
+        setEditOpen(false)
+        setStatus({ tone: 'ok', text: t('editor.saved') })
+        onReload()
+      }
+
+      const copyPath = async () => {
+        const copied = await writeClipboard(path || FALLBACK_NAME, copyRef.current)
+        setStatus({ tone: copied ? 'ok' : 'error', text: copied ? t('guide.copied') : t('action.copyFailed') })
+      }
       const ready = state.phase === 'ready' && data !== null
       const meta = []
       if (ready) {
@@ -455,6 +585,35 @@ window.__ModuleLoader__.load({
         const modified = formatTime(data.mtime)
         if (modified) meta.push(t('meta.modified', { time: modified }))
       }
+
+      const activeRow = editRows.find((entry) => entry.id === editRowId)
+      const editorPane = h('div', { className: 'cfgdoc-editor' },
+        h('div', { className: 'cfgdoc-editor__title' }, t('editor.title')),
+        h('div', { className: 'cfgdoc-editor__hint' }, t('editor.hint')),
+        editRows.length === 0
+          ? h('div', { className: 'cfgdoc-notice' }, h('div', null, t('editor.noRows')))
+          : h('div', { className: 'cfgdoc-editor__form' },
+              h('label', { className: 'cfgdoc-editor__field' },
+                h('span', null, t('editor.row')),
+                h('select', {
+                  className: 'cfgdoc-editor__input',
+                  value: editRowId,
+                  onChange: (event) => selectRow(event.target.value),
+                }, editRows.map((row) => h('option', { key: row.id, value: row.id },
+                  row.name ? row.id + ' — ' + row.name : row.id)))),
+              (activeRow && Array.isArray(activeRow.fields) ? activeRow.fields : []).map((field) =>
+                h('label', { key: field.path, className: 'cfgdoc-editor__field' },
+                  h('span', null, field.path),
+                  h('input', {
+                    className: 'cfgdoc-editor__input',
+                    type: 'text',
+                    value: editValues[field.path] === undefined ? '' : editValues[field.path],
+                    onChange: (event) => setEditValues({ ...editValues, [field.path]: event.target.value }),
+                  })))),
+        h('div', { className: 'cfgdoc-editor__actions' },
+          h('button', { type: 'button', className: 'cfgdoc-btn', onClick: () => setEditOpen(false), disabled: editBusy }, t('action.cancel')),
+          h('button', { type: 'button', className: 'cfgdoc-btn', onClick: saveEditor, disabled: editBusy || editRows.length === 0 },
+            editBusy ? t('action.saving') : t('action.save'))))
 
       return h('div', { className: 'cfgdoc-overlay', onClick: onMaskClick, key: 'overlay' },
         h('div', {
@@ -488,6 +647,7 @@ window.__ModuleLoader__.load({
               }))),
           ),
           h('div', { className: 'cfgdoc-toolbar' },
+            h('button', { type: 'button', className: 'cfgdoc-btn', onClick: openEditor, disabled: !ready }, t('action.edit')),
             h('button', { type: 'button', className: 'cfgdoc-btn', onClick: onCopy, disabled: !ready }, t('action.copy')),
             h('button', { type: 'button', className: 'cfgdoc-btn', onClick: onDownload, disabled: !ready }, t('action.download')),
             h('button', { type: 'button', className: 'cfgdoc-btn', onClick: onReload }, t('action.reload')),
@@ -499,7 +659,9 @@ window.__ModuleLoader__.load({
             role: status.tone === 'error' ? 'alert' : 'status',
           }, status.text) : null,
           h('div', { className: 'cfgdoc-body' },
-            ready
+            editOpen
+              ? editorPane
+              : ready
               ? (data.content.length === 0
                   ? h('div', { className: 'cfgdoc-notice' }, h('div', null, t('state.empty')))
                   : h('pre', { className: 'cfgdoc-code' }, data.content))
@@ -509,6 +671,12 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'cfgdoc-notice__detail' }, state.error))
                   : h('div', { className: 'cfgdoc-notice' }, h('div', null, t('state.loading')))),
           ),
+          h('div', { className: 'cfgdoc-guide' },
+            h('div', { className: 'cfgdoc-guide__title' }, t('guide.title')),
+            h('div', { className: 'cfgdoc-guide__body' }, t('guide.body', { file: path || FALLBACK_NAME })),
+            h('div', { className: 'cfgdoc-guide__actions' },
+              h('code', { className: 'cfgdoc-guide__path' }, path || FALLBACK_NAME),
+              h('button', { type: 'button', className: 'cfgdoc-btn', onClick: copyPath }, t('guide.copyPath')))),
           h('div', { className: 'cfgdoc-foot' },
             h('div', { className: 'cfgdoc-foot__hint' }, t('hint.readonly')),
             h('div', null, t('system.hint')),

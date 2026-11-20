@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" width="36" height="36" role="img" aria-label="HPE brand">
+  <!-- The HPE element: top edge shifted right by a quarter of its width, the
+       same geometry the plugin draws in the sidebar and on the blank session.
+       Plugin Manager supplies the surrounding tile, so the artwork is the
+       shape alone. -->
+  <path d="M13 8 H28 L23 28 H8 Z" fill="#01a982"/>
+</svg>

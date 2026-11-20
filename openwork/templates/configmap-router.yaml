@@ -162,7 +162,13 @@ data:
     // ancestor trail in the 'from' parameter, and links keep the theme.
     // r31 (RUNTIME_REV): the edit dialog adopts the page the preview navigated to,
     // so Source / Rename / Delete / Save follow the document on screen.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 33 }}'
+    // r32 (RUNTIME_REV): editor keyboard — Esc closes the open file, Cmd/Ctrl-S
+    // saves and Cmd/Ctrl-W closes, with a Save / Don't Save / Cancel prompt
+    // whenever the buffer is modified (the same prompt guards opening another
+    // file, leaving the Source view and Rename). Client-only: data_manager.mjs
+    // is untouched. A re-stamp, because data_manager.html is a subPath mount
+    // that never refreshes on its own.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 35 }}'
     const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- Unit-pod container resources -------------------------------------

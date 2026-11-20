@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugins installer",
+    "description": "Installs every plugin in the folder it sits in, so the whole collection arrives in one step — each plugin still lands as its own entry, switched on or off individually."
+  }
+}

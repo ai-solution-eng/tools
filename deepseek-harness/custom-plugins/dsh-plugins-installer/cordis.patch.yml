@@ -1,0 +1,10 @@
+# Installs every sibling bundle next to this one, once the Host has settled.
+#
+# Each sibling becomes its own bundle in dsh.profile.bundles, so the Plugins
+# page lists them individually and each one keeps its own on/off switch.
+- insert:
+    - id: plugins-installer
+      name: '@local/dsh-plugins-installer'
+      config:
+        installOnStart: true
+        delayMs: 2000

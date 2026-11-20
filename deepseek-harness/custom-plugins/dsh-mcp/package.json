@@ -1,0 +1,41 @@
+{
+  "name": "@local/dsh-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "One bundle for MCP: add, edit and connect MCP servers, and see which ones are connected with the upstream servers behind a federating gateway.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "src/servers/*.js",
+    "src/status/*.js",
+    "scripts/*.mjs",
+    "test/*.mjs",
+    "test/servers/*.mjs",
+    "test/status/*.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

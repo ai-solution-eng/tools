@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP",
+    "description": "Adds a Settings page that lists, adds, edits, disables and removes MCP servers, and a status chip that shows which ones are connected plus the upstream servers behind a federating gateway."
+  }
+}

@@ -9,13 +9,29 @@ references it, and nothing installs a plugin into a user pod automatically. Inst
 **profile** (`web`) and lands on the user's state PVC, so it survives pod restarts but is not
 shared between users.
 
+## What each plugin is for
+
+Pick by the job you want done; the next table covers how each one is built.
+
+| Plugin | What it is for |
+|---|---|
+| [`dsh-plugins-installer`](dsh-plugins-installer/README.md) | **Install the whole folder at once.** Scans the `custom-plugins` folder it sits in and installs every sibling bundle, so one install brings the collection in — each plugin still lands as its own entry, switched on or off individually. |
+| [`dsh-mcp`](dsh-mcp/README.md) | **Connect and watch MCP servers.** A *Settings → MCP servers* page to add, edit, disable, remove and test a server before saving it, plus an **MCP** chip above the composer listing every connection, its tool count, and the upstream servers behind a federating gateway. |
+| [`dsh-config-document`](dsh-config-document/README.md) | **See and change the profile config.** Opens the profile's `cordis.patch.yml` inside the Web UI instead of an OS editor on the Host, edits top-level values through the validated config editor, and shows the path plus the by-hand steps for anything the form does not cover. |
+| [`dsh-app-shortcuts`](dsh-app-shortcuts/README.md) | **Reach the other pages.** Terminal, Data Manager and Login buttons at the sidebar foot, each opening in a new tab. |
+| [`dsh-hpe-brand`](dsh-hpe-brand/README.md) | **Look like an HPE product.** HPE green accent (primary button, switches, caret), the HPE brand element in the sidebar and on the blank session, and an HPE two-tone wordmark. |
+| [`dsh-asr-endpoint`](dsh-asr-endpoint/README.md) | **Use your own speech-to-text.** Voice input transcribed by an HTTP ASR endpoint you configure (OpenAI-compatible, whisper.cpp, base64 JSON or raw WAV) instead of the local model. |
+
+## How each one is built
+
 | Plugin | Adds | Host half | Browser half |
 |---|---|---|---|
+| [`dsh-plugins-installer`](dsh-plugins-installer/README.md) | Installs every sibling bundle in the folder it sits in, so one install brings the whole collection into the profile | scans its own parent directory for packages declaring `dsh.bundle`, skips the ones the profile already declares, and installs the rest sequentially with `pluginManager.installBundle('link:' + dir)`; waits for that service before running | none — it has no UI; its output is ordinary Plugins-page entries with their own switches |
 | [`dsh-app-shortcuts`](dsh-app-shortcuts/README.md) | Terminal / Data Manager / Login buttons at the sidebar foot (`sidebar.footer.action`) | none — `apply()` has no behaviour | three same-origin links, opened in a new tab |
-| [`dsh-mcp-status`](dsh-mcp-status/README.md) | An `MCP` row below the composer: which MCP servers are connected, probe latency, tool counts, and the upstream servers behind a federating one | discovers the `@deepseek-ai/dsh-mcp-client` rows, probes each endpoint with a real MCP handshake, serves `GET /api/mcp-status` | the composer-dock row and its expandable panel |
+| [`dsh-hpe-brand`](dsh-hpe-brand/README.md) | HPE branding: green accent tokens (primary button, switches, caret), the HPE element as the brand mark, and an HPE two-tone wordmark | none — `apply()` has no behaviour | one `ctx.theme.overrideTokens` accent layer plus three single-slot occupants: `sidebar.brand.mark`, `sidebar.brand.name`, `conversation.hero.brand.mark` |
 | [`dsh-asr-endpoint`](dsh-asr-endpoint/README.md) | Voice input that transcribes through **your own HTTP ASR endpoint** instead of the local SenseVoice model — URL, protocol, credentials and request shape all set in `cordis.patch.yml` | registers one remote `ctx.speechToText` provider (`location: 'cloud'`, no `preparation`); posts the recording as OpenAI-compatible multipart, whisper.cpp multipart, base64 JSON or raw WAV | none — the mic comes from the upstream `client-ui-voice-input` row this bundle inserts |
-| [`dsh-mcp-servers`](dsh-mcp-servers/README.md) | A **Settings → MCP servers** page, the MCP counterpart of Settings → Models: list, add (Streamable HTTP or stdio), edit, disable and remove MCP servers (`settings.section`, order 12) | keeps the list as a volatile field of its own row, mounts one `@deepseek-ai/dsh-mcp-client` child per enabled server and reconciles on change, serves `GET /api/mcp-servers` with fiber state and live tool counts | the page: rows, add/edit forms, live state, and the nav icon |
-| [`dsh-config-document`](dsh-config-document/README.md) | Makes the Settings header button **Open configuration file** work in a headless deployment: the profile's `cordis.patch.yml` opens *inside* the Web UI instead of in an OS editor on the Host (`settings.action`, replaces the shipped cell) | serves the prepared document's path and text on `GET /api/config-document`; read-only, accepts no path parameter | the modal: monospace content, path, line/size hints, Copy, Download, Reload, and an "Open in Host editor" fallback that reports the Host's failure |
+| [`dsh-mcp`](dsh-mcp/README.md) | MCP in one bundle: a **Settings → MCP servers** page (list, add, edit, disable, remove, test an endpoint) **and** an `MCP` row below the composer showing what is connected, its tool counts, and the upstream servers behind a federating gateway | mounts one `@deepseek-ai/dsh-mcp-client` child per enabled server, serves `GET /api/mcp-servers` (fiber state, live tool counts), `POST /api/mcp-servers/test` (probe a draft), `POST /api/mcp-servers/save`, and `GET /api/mcp-status` (handshake probe plus upstream discovery) | the page and the composer-dock panel; `client.js` is generated from `src/servers/client.js` + `src/status/client.js` by `scripts/compose-client.mjs` |
+| [`dsh-config-document`](dsh-config-document/README.md) | Makes the Settings header button **Open configuration file** work in a headless deployment: the profile's `cordis.patch.yml` opens *inside* the Web UI instead of in an OS editor on the Host (`settings.action`, replaces the shipped cell) | serves the prepared document's path and text on `GET /api/config-document`, the editable rows on `GET /api/config-document/entries`, and one scalar write on `POST /api/config-document/edit` (validated by the row's own schema, comments preserved, atomic) | the modal: monospace content, path, line/size hints, Copy, Download, Reload, **Edit values** for top-level settings, an "editing by hand" block with the absolute path and the data-manager steps, and an "Open in Host editor" fallback that reports the Host's failure |
 
 ## Anatomy of a plugin
 
@@ -51,11 +67,11 @@ A profile keeps an **absolute** `link:` dependency *and* the package name in
 ```json
 {
   "dependencies": {
-    "@local/dsh-mcp-status": "link:/mnt/shared/califra-dsh/tools/deepseek-harness/custom-plugins/dsh-mcp-status"
+    "@local/dsh-mcp": "link:/mnt/shared/califra-dsh/tools/deepseek-harness/custom-plugins/dsh-mcp"
   },
   "dsh": {
     "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@local/dsh-mcp-status"]
+      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@local/dsh-mcp"]
     }
   }
 }
@@ -109,7 +125,7 @@ breaking change for everyone who installed from the old location. When a move ha
    (`ln -s deepseek-harness/custom-plugins/<name> <old-path>`). The shared PVC is mounted at the
    same path in every user pod, so this keeps existing profiles resolving with no action from
    their owners. The 2026-11-12 move into this folder did exactly that for
-   `dsh-app-shortcuts` and `dsh-mcp-status`.
+   `dsh-app-shortcuts` and `dsh-mcp`.
 2. Re-link each profile to the new path when convenient, then delete the symlink.
 
 A profile that still points at a removed path only fails **on the next dsh restart** (the running

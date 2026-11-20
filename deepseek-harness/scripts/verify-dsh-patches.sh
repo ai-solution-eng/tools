@@ -229,6 +229,49 @@ PY
   fi
 fi
 
+# ------------------------------------------------- patch 2 target (write mode) --
+# The write-mode patch targets @deepseek-ai/dsh-fs-local, a DIRECT dependency of
+# @deepseek-ai/dsh (so it lives at dsh/node_modules/@deepseek-ai/dsh-fs-local).
+# New files created by the agent's write tool inherit the 0o600 the atomic writer
+# uses for its private staging file, because writeText passes `existing?.mode`
+# and that is undefined for a new file. Anything an agent writes into a shared
+# PVC is then unreadable to every other platform user. The patch makes a new file
+# follow the process umask; an overwrite keeps the target's mode.
+say ""
+say "==> resolving @deepseek-ai/dsh-fs-local (write mode)"
+FS_SPEC="$(python3 -c "
+import json
+d=json.load(open('$ROOT/package.json'))
+print(d.get('dependencies',{}).get('@deepseek-ai/dsh-fs-local',''))
+")"
+say "    spec: ${FS_SPEC:-<not a dependency>}"
+FS_VER="$(printf '%s' "$FS_SPEC" | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*[-0-9A-Za-z.]*\).*/\1/p')"
+if [ -z "$FS_VER" ]; then
+  bad "patch 2 (write mode): cannot resolve a concrete version from '${FS_SPEC}'"
+elif ! fetch "@deepseek-ai/dsh-fs-local" "$FS_VER" "$WORKDIR/fs"; then
+  bad "patch 2 (write mode): could not download @deepseek-ai/dsh-fs-local@${FS_VER}"
+else
+  say "    version: ${FS_VER}"
+  FSF="$WORKDIR/fs/package/lib/index.js"
+  EXPR2='writeFileAtomic\(target\.targetKey, content, existing\?\.mode, signal, this\.internals, \{'
+  MARKER2='dsh-web-helm: new files follow the umask'
+  if [ ! -f "$FSF" ]; then
+    bad "patch 2 (write mode): lib/index.js missing in dsh-fs-local${FS_VER}"
+  elif grep -Fq "$MARKER2" "$FSF"; then
+    ok "patch 2 (write mode): already marked"
+  elif ! grep -Eq "$EXPR2" "$FSF"; then
+    bad "patch 2 (write mode): writeText expression NOT found - upstream changed it"
+    say "       update the Dockerfile patch-2 expression"
+  else
+    COUNT2="$(grep -Eo "$EXPR2" "$FSF" | wc -l | tr -d ' ')"
+    if [ "$COUNT2" = "1" ]; then
+      ok "patch 2 (write mode): exactly 1 occurrence, sed is unambiguous"
+    else
+      bad "patch 2 (write mode): ${COUNT2} occurrences - sed would only rewrite the first"
+    fi
+  fi
+fi
+
 # --------------------------------------------------------------- summary ----
 say ""
 if [ "$FAILED" -eq 0 ]; then

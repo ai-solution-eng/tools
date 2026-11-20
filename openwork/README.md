@@ -139,6 +139,25 @@ markdown is escaped before parsing, HTML is isolated twice over. In-flight copy 
 (`.dm-stage-*`) are filtered out of the listing, so a copy in progress never appears as a file you
 can rename or delete.
 
+**Type-to-navigate (0.1.38).** A **Path** bar under the toolbar takes a path you already know
+instead of six clicks down the tree: absolute (`/mnt/shared/califra-dsh`), relative to the folder
+you are in (`califra-dsh`, `../personal/x`), or `~` / `~/sub` for the current root. Enter or **Go**
+navigates, **Cmd/Ctrl+L** jumps into the bar from anywhere, **Esc** puts the old path back. `//`,
+`./` and `../` are normalised the way a shell would, and typing a path in a different root switches
+the root selector too. A refused path (outside the workspace, a file, a typo) leaves you where you
+were, marks the field red and explains itself in a toast.
+
+**Editor keyboard (0.1.37).** **Esc** closes the open file, **Cmd/Ctrl+S** saves it and
+**Cmd/Ctrl+W** closes it (⌘ on macOS, Ctrl on Linux/Windows). A modified buffer is never dropped
+silently: closing asks **Save / Don't Save / Cancel**, an `unsaved` pill in the dialog header marks
+the buffer, and the same prompt guards the other paths that would throw it away — opening another
+file, flipping a `.md`/`.html` back to *Rendered*, and *Rename*. Two browser limits are handled
+rather than hidden: **Cmd/Ctrl+W** is reserved by Chrome and Firefox (they close the tab before the
+page sees the key), so a `beforeunload` guard raises the browser's own "leave site?" prompt while
+the buffer is modified; and **Esc** pressed inside a rendered `.md`/`.html` preview is consumed by
+that sandboxed frame, so it does not close the dialog (Esc anywhere else in the dialog does). Esc
+also still dismisses Monaco's completion popup first.
+
 The server (`data_manager.mjs`, port 7682, zero dependencies) clamps every operation to the
 navigable roots, writes through a temp file + `rename()`, and refuses to follow symlinks out of a
 root.

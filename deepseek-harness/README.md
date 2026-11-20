@@ -4,7 +4,7 @@ Deploy and manage multiple isolated [DeepSeek Harness (`dsh`)](https://github.co
 
 Port of the `opencode` chart (`opencode-web-helm`): same router, admin console, terminal, data manager and preview machinery — with the [`dsh web`](https://github.com/deepseek-ai/deepseek-harness) UI in place of opencode/OpenChamber. **OpenChamber is not used.**
 
-Chart: `dsh-web-helm` · current version **0.4.48** (dsh `0.2.2-rc.3`, Node 24.22.2 image).
+Chart: `dsh-web-helm` · current version **0.4.49** (dsh `0.2.2-rc.3`, Node 24.22.2 image).
 0.4.4 fixes the VAST quota-collision hang for long usernames: quota names are `csi:<ns>:<pvc>`
 **truncated to 64 chars** — with a long namespace (e.g. `project-user-XXX-XXX-XXX`)
 only the first ~20 chars of the PVC name survive, so a version *suffix* was invisible to VAST and
@@ -187,6 +187,20 @@ Ports map: **443→8080 router→8082 nginx→3080 dsh** (loopback), 7681 ttyd, 
 
 Data Manager roots: **Personal**, **Shared**, **DSH Home** (`$DSH_HOME` — settings.yaml, skills, sessions), State (non-navigable); SSO units with `platformIntegration.enabled` also get **Platform Shared** (`/mnt/shared`) and **Platform Workspace** (`/mnt/user`). Monaco editor, upload/download/zip, storage panel — path-traversal clamped to the navigable roots.
 
+**Type-to-navigate (0.4.50).** A **Path** bar under the toolbar takes a path you already know
+instead of six clicks down the tree: absolute (`/mnt/shared/califra-dsh`), relative to the folder
+you are in (`califra-dsh`, `../personal/x`), or `~` / `~/sub` for the current root. Enter or **Go**
+navigates, **Cmd/Ctrl+L** jumps into the bar from anywhere, **Esc** puts the old path back. `//`,
+`./` and `../` are normalised the way a shell would, and typing a path in a different root switches
+the root selector too. A refused path (outside the workspace, a file, a typo) leaves you where you
+were, marks the field red and explains itself in a toast. Client-only, like the editor shortcuts.
+
+**Shared-folder permissions (0.4.49 note).** `/mnt/shared` and `/workspace/shared` are mounted into every user pod, so a file one colleague writes has to be readable by the others. Directories are (umask 022 → 0755), but **files the agent writes are 0600**: `dsh-fs-local`'s atomic writer opens its private staging file `0o600` and only chmods when a mode is supplied, and `writeText` passes `existing?.mode` — undefined for a *new* file. Anything the agent creates in a shared folder is therefore invisible to every other platform user (a colleague could not install a plugin that lived under `/mnt/shared/califra-dsh`; the directories were fine, only the files were `0600`).
+
+**Fixed in image `0.2.2-rc.3-r2-dind` (0.4.50).** Image **patch 2** makes a *new* file follow the process umask — the same rule as `fs.writeFile`, a shell redirect, or the Data Manager's own uploads — while an overwrite keeps the target's mode: `0644` at umask 022 (readable, not writable, by others), `0600` again at umask 077. It is one expression in `@deepseek-ai/dsh-fs-local` (`existing?.mode ?? (0o666 & ~process.umask())`), guarded by a build step that fails if upstream moves it, and by `scripts/verify-dsh-patches.sh` which checks the same guard against the published tarball before a build. Verified in the pushed image: marker present, `editText`'s `existing.mode` untouched, `node --check` clean.
+
+The tag is **new** (`-r2`) because an existing tag is never rebuilt: units pull `IfNotPresent`, so re-pushing `0.2.2-rc.3-dind` would leave already-pulled units on the old layers and destroy the rollback baseline. `images.user` and `images.init` both move, and the tag joins `userTemplateVersion`, so the fleet re-stamps on the next reconcile. It is a posture change worth stating plainly: files the agent writes into a **shared** folder become readable by other platform users, which is the point, but a secret the agent writes there becomes readable too.
+
 **Previews (0.4.37).** Double-clicking a file previews it in the dialog: images, PDF (native viewer, Range seeks), audio and video render inline, and **markdown and HTML now render too** — everything else still opens as text in Monaco. `.md` is rendered server-side by `/api/preview`: escape-first, zero dependencies, and **no raw-HTML passthrough** (a `<script>` in a .md file is displayed as text, never executed), with GFM tables, task lists, nested lists, fenced code and relative links/images resolved against the file's own folder. As of 0.4.42 those relative links resolve to working endpoints instead of staying relative to `/data-manager/api/`: a `#fragment` stays a real fragment (it used to be folded into the path, so `ONE-PAGER.md#top` 404'd), a `.md`/`.html` target opens the preview, any other file (PDF, zip, dataset) opens through the byte endpoint inline-or-download, and a folder link opens the Data Manager at that folder via the new `?path=<dir>` deep link; a path the workspace clamp refuses now answers with the reason — the resolved path, and that a symlink or bind mount leaves the workspace — instead of a bare *Forbidden path*. `.html` is served **verbatim** so an exported report keeps its own markup, but under `Content-Security-Policy: sandbox` — opaque origin, scripts cannot run, nothing remote may load — inside an iframe that also carries `sandbox=""`. Both are read-only previews; a **Source / Rendered** toggle in the dialog switches to the editor when the file needs changing. Nothing about this path can execute file content in the data-manager origin: markdown is escaped before parsing, and HTML is isolated twice over. Remote (https) images always render; a README's *local* sibling images are rewritten to the inline byte endpoint and may still be blocked by the sandbox in some browsers — use Download for those. One residual by design: because remote images are allowed, a hostile .md can still point an image at an external https URL and signal "someone opened this" to that host — no script runs and no file data is reachable; HTML previews block remote loads entirely. In-flight copy stages (`.dm-stage-*`) are filtered out of the listing, so a copy in progress never appears as a file you can rename or delete.
 
 **Uploads (0.4.30).** *Upload* takes plain files **and** compressed archives (.zip, .tar, .tar.gz/`.tgz`, .tar.xz, .tar.zst) — an archive is unpacked server-side unless you untick *Extract archives*, which is also the fastest way to land a big tree and the only path that preserves empty folders on every browser; *Upload folder* (`webkitdirectory`) keeps a directory tree as-is. Drag & drop accepts files **and** folders (entries API; empty folders preserved). Each file is one streamed request (temp file + `rename`, 3 in flight) with a progress dialog, per-file errors, cancel and retry. The pre-flight dialog sets the conflict policy (keep both / skip / overwrite), the permission policy (644/664/755/775) and hidden/temporary-entry skipping (`.git`, `.venv`, `~$…` Office lock files, `Thumbs.db` — on by default). Per-file ceiling: `dataManager.clientMaxBodySize` (default `2g`, per-location nginx override); `dataManager.maxUploadMb` is the server-side guard and must stay at or above it. The legacy whole-batch multipart endpoint is kept for browsers holding a cached SPA copy and is capped at 64 MiB.
@@ -194,6 +208,8 @@ Data Manager roots: **Personal**, **Shared**, **DSH Home** (`$DSH_HOME` — sett
 **Copy / move / duplicate (0.4.42).** Tick rows to raise the selection bar (*Copy*, *Move*, *Duplicate*, beside *Download* and *Delete*); *Copy* and *Move* fill an in-page clipboard and the toolbar's **Paste (N)** button (disabled while the clipboard is empty or the current root is read-only) opens a confirm dialog naming the destination directory, the item count and the conflict policy (*Overwrite* / *Keep both* / *Skip*), then POSTs `/api/copy` or `/api/move` — a paste consumes the clipboard — for a *copy* as well as a *move* — so the toolbar's **Paste (N)** button greys out once the items are pasted and the same selection can only be pasted again after a fresh *Copy* / *Move* (a deliberate re-selection, so a stale clipboard can never paste something the user has forgotten about). A paste whose request never reached the server keeps the clipboard so it can be retried. *Duplicate* acts on the selection immediately, with no dialog. Right-clicking a row opens a context menu (*Open/Edit*, *Download*, *Rename*, *Duplicate*, *Copy*, *Move*, *Delete*), replacing the old right-click-equals-rename behaviour, and **Ctrl/Cmd+C** / **X** / **V** work whenever the selection is collapsed and focus is not in an input, textarea, contenteditable or Monaco.
 
 The server side is three JSON endpoints beside the rest of the API: `POST /api/copy` and `POST /api/move` (`{paths: [...], dest, onConflict}` — `onConflict` is `rename` | `overwrite` | `skip`, default `rename`) and `POST /api/duplicate` (`{paths: [...]}`). A processed request answers `200` even when individual items fail — `{ok: true, results: [{path, target?, renamed?, skipped?, noop?, error?}]}` — so one bad path never aborts the batch; a request that cannot be honoured at all (empty or non-string `paths`, a `dest` that does not exist or is not a directory, a forbidden destination) is refused up front with `4xx` and `{error}`, before anything is written. `POST /api/delete` now refuses a navigable root outright (`Cannot delete a workspace root`) — a pre-existing hole this release closes. Both ends resolve through the same `resolveSafe()` clamp, so source and destination must each land inside a navigable root (Personal, Shared, DSH Home, plus the platform roots when mounted; State stays non-navigable) — a source that *is* a navigable root is refused per item. Refused per item, not per request: a missing source; a destination inside the source directory (or equal to it — *cannot copy a folder into itself*); a destination on a read-only platform volume (`platformIntegration.readOnly`); a move whose source sits on such a volume; a socket/fifo/device source. The default conflict policy is **keep both** — the first free `name (N).ext` — so nothing is overwritten unless *Overwrite* was chosen; `skip` leaves an existing target untouched (`skipped: true`), and an overwrite moves the old entry aside and renames the staged copy into its place — the old is renamed back if that swap fails — so a failed overwrite never destroys what was there. Outside an overwrite a file is published with `link()` + `unlink()`, not `rename()`: `link()` is atomic and fails `EEXIST`, so **keep both** can never silently replace a file that appeared while the copy was running — that item fails with *An item with that name appeared while copying — nothing was overwritten* instead. Symlinks are never dereferenced: a link inside a copied tree is recreated as a link, while a link named directly as the source is resolved first (`resolveSafe()` realpaths its input), so the copy is the target's content under the target's name — and a link that leaves the workspace is refused outright (`Forbidden`). Copies preserve file mode and mtime and work for a single file or a whole tree; a transfer stops at 20,000 entries (the archive extractor's ceiling) or when the browser goes away mid-copy, both reported per item.
+
+**Editor keyboard (0.4.49).** **Esc** closes the open file, **Cmd/Ctrl+S** saves it and **Cmd/Ctrl+W** closes it (⌘ on macOS, Ctrl on Linux/Windows). A modified buffer is never dropped silently: closing asks **Save / Don't Save / Cancel**, an `unsaved` pill in the dialog header marks the buffer, and the same prompt guards the other paths that would throw it away — opening another file, flipping a `.md`/`.html` back to *Rendered*, and *Rename*. Two browser limits are handled rather than hidden: **Cmd/Ctrl+W** is reserved by Chrome and Firefox (they close the tab before the page sees the key), so a `beforeunload` guard raises the browser's own "leave site?" prompt while the buffer is modified; and **Esc** pressed inside a rendered `.md`/`.html` preview is consumed by that sandboxed frame, so it does not close the dialog (Esc anywhere else in the dialog does). Esc also still dismisses Monaco's completion popup first, so closing a completion popup never costs the file. The change is client-only — `data_manager.mjs` is untouched.
 
 A move is `rename()` first and falls back to copy + delete on `EXDEV`, so cross-volume moves (Personal ↔ Shared, or onto a platform root) work; moving an item into its own parent directory is a no-op success (`noop: true`) rather than an error, and an open editor follows the file — the client rewrites its current path after the move. *Duplicate* creates a sibling — `report.txt` → `report (copy).txt` → `report (copy 2).txt`, a folder `proj` → `proj (copy)` — and never overwrites. After any of the three the listing and the storage panel reload and a toast summarises the batch (N copied/moved/duplicated, M skipped, K renamed, plus the first error). This release also bumps `RUNTIME_REV` to 48, so existing units re-stamp onto the new `data_manager.mjs` / `data_manager.html` on the next reconcile — no user action needed.
 
@@ -221,6 +237,40 @@ docker buildx build --platform linux/amd64 \
 Then `helm upgrade` (the values files already point at the matching tag).
 
 ---
+
+## Data Manager editor shortcuts (0.4.49)
+
+Client-only change to `data_manager.html`; `data_manager.mjs` is byte-identical to 0.4.48, so no
+image rebuild and no dsh version bump — units re-stamp on the new chart version and pick it up.
+
+**Esc closes the open file, Cmd/Ctrl+S saves, Cmd/Ctrl+W closes.** A modified buffer is never
+dropped silently: closing asks **Save / Don't Save / Cancel**, an `unsaved` pill in the dialog
+header marks the buffer, and the same prompt guards the other paths that would throw it away —
+opening another file, flipping a `.md`/`.html` back to *Rendered*, and *Rename*. The shortcuts are
+registered in the **capture** phase so Monaco cannot swallow them, and only while the editor dialog
+is the front-most one — every other dialog keeps its own Esc.
+
+**Two browser limits are handled, not hidden.**
+
+- **Cmd/Ctrl+W is reserved.** Chrome and Firefox close the tab before the page sees the keydown, so
+  the handler cannot fire there. A `beforeunload` guard covers that path (and the tab's close
+  button, and a reload): while the buffer is modified the browser raises its own "leave site?"
+  prompt. Where the key *does* arrive (webviews, non-reserved hosts) it closes the file, not the tab.
+- **Esc inside a rendered preview is unreachable.** A `.md`/`.html` preview is a sandboxed,
+  opaque-origin iframe; keydowns inside it never reach the page. Esc closes the dialog from anywhere
+  else in it (footer buttons, Monaco, the textarea, the dialog background).
+
+Esc also still dismisses Monaco's completion popup first — the popup's dismissal raises a native
+`cancel` on the dialog, which is now ignored instead of being read as a close request.
+
+Verified by `.dsh/dm-close-save/test-client.mjs` (48 assertions over a DOM stub: dirty tracking,
+Save / Don't Save / Cancel, a failed save keeping the file open, Esc / Cmd-S / Cmd-W dispatch, the
+completion-popup case, front-dialog ownership and the `beforeunload` guard), run against the page
+extracted from each chart's configmap.
+
+The shared-folder permission finding from the same investigation is documented under *Shared-folder
+permissions* above and its candidate image patch is parked in `.dsh/shared-perms/image-patch.diff`;
+nothing about it is in the image, so this release does not change any file mode.
 
 ## dsh 0.2.2-rc.3 (0.4.48)
 
@@ -250,7 +300,7 @@ rewrite it — so the action is to edit `~/.dsh/profiles/web/cordis.patch.yml` p
 `scripts/push_dsh_cordis_patch.sh`). AgentTeam moved to unified
 named subagents ("custom plugins and SDK integrations need migration"), custom overlay positioning
 changed, and the skills/dev-doc paths were reorganised. Both custom plugins
-(`dsh-app-shortcuts`, `dsh-mcp-status`) are UI overlays - re-test them after the upgrade.
+(`dsh-app-shortcuts`, `dsh-mcp`) are UI overlays - re-test them after the upgrade.
 
 **Rollback:** ordinary sessions roll back to rc.1. Sessions that used team mode write a `team/mode`
 event (the 63rd session event type, new in rc.3) and will not be readable by rc.1 - freeze team
@@ -401,7 +451,7 @@ standalone Cordis bundle — see the [plugin guide + install steps](custom-plugi
 | Plugin | Adds |
 |---|---|
 | `dsh-app-shortcuts` | Terminal / Data Manager / Login shortcuts at the sidebar foot |
-| `dsh-mcp-status` | Live MCP server status row under the composer (real handshake probe, not a flag) |
+| `dsh-mcp` | MCP servers page + live status row under the composer (real handshake probe, not a flag) |
 
 The directory is **not chart content**: `.helmignore` excludes it, no value references it, and the
 chart never installs a plugin into a user pod. Installation is per profile (`web`) — Plugins page →

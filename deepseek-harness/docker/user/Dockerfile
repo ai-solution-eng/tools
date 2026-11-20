@@ -157,6 +157,37 @@ RUN FILES="$(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-client-
  && grep -Fq "$MARKER" $FILES \
  && echo "dsh-web-helm: isLoopback patched in:${PATCHED:- (already marked)}"
 
+# --- dsh-web-helm patch 2: new files follow the umask ------------------------
+# The Data Manager's shared workspace (/mnt/shared, /workspace/shared) is mounted
+# into EVERY user pod, so a file one colleague writes must be readable by the
+# others. Directories already are (mkdir -> 0755 at umask 022), but FILES the
+# agent writes are 0600: dsh-fs-local's atomic writer opens its private staging
+# file with 0o600 and only chmods when a mode is supplied, and writeText passes
+# `existing?.mode` — which is undefined for a NEW file. Result: anything the
+# agent creates in a shared folder is invisible to every other platform user
+# (observed: a colleague could not install a dsh plugin that lived under
+# /mnt/shared/califra-dsh).
+# The patch makes a new file follow the process umask — the same rule as
+# fs.writeFile, a shell redirect, or the Data Manager's own uploads — while an
+# overwrite keeps the target's existing mode. With the fleet's umask 022 that is
+# 0644 (readable, not writable, by others); an operator who wants private files
+# sets umask 077 and gets 0600 back. GUARDED: a missing expression, a second
+# occurrence, or a file that still lacks the marker fails the build.
+RUN FS="$(find /opt/dsh/npm/lib/node_modules -path '*@deepseek-ai/dsh-fs-local/lib/index.js' -print)" \
+ && { test -n "$FS" || { echo "dsh-web-helm: no dsh-fs-local/lib/index.js under /opt/dsh/npm" >&2; exit 1; }; } \
+ && EXPR='writeFileAtomic\(target\.targetKey, content, existing\?\.mode, signal, this\.internals, \{' \
+ && MARKER='writeFileAtomic(target.targetKey, content, existing?.mode ?? (0o666 \& ~process.umask()) /* dsh-web-helm: new files follow the umask */, signal, this.internals, {' \
+ && for f in $FS; do \
+      if grep -Eq "$EXPR" "$f"; then \
+        N="$(grep -Eo "$EXPR" "$f" | wc -l | tr -d ' ')"; \
+        [ "$N" = "1" ] || { echo "dsh-web-helm: $N writeText expressions in $f (expected 1)" >&2; exit 1; }; \
+        sed -E -i "s#$EXPR#$MARKER#" "$f"; \
+      fi; \
+      grep -Fq 'dsh-web-helm: new files follow the umask' "$f" \
+        || { echo "dsh-web-helm: write-mode patch missing in $f - upstream changed the expression" >&2; exit 1; }; \
+    done \
+ && echo "dsh-web-helm: new files follow the umask"
+
 # --- uv + ttyd under /opt/dsh/bin ---
 # Same ttyd asset selection as the router's init container (x86_64/aarch64;
 # the g2 fleet is amd64). ttyd version mirrors templates/configmap-router.yaml.

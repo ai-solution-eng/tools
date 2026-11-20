@@ -1,0 +1,32 @@
+# HPE brand bundle.
+#
+# One Host row with no configuration and no Host-side behaviour: the browser
+# half (declared by `dsh.client` in package.json) restyles the Web UI in HPE
+# terms.
+#
+# What it changes, and why nothing else moves:
+#
+#   theme layer   A stacked `--dsw-alias-*` override layer (ctx.theme
+#                 .overrideTokens) recolours the accent tokens only. The base
+#                 light/dark palettes stay untouched, the layer is removable
+#                 and later layers still win.
+#   brand mark    `sidebar.brand.mark`, `sidebar.brand.name` and
+#                 `conversation.hero.brand.mark` are SINGLE slots declared for
+#                 exactly this purpose, so replacing their occupant leaves the
+#                 surrounding controls, the collapsed rail and the new-session
+#                 button alone.
+#   wordmark      `sidebar.brand.name` is the text seat beside the mark.
+#
+# `ui-brand-official` is DISABLED on purpose. A single slot keeps only its
+# first registration (`entriesOfSlot(slot)[0]`), and that shipped row — the
+# whale, the DeepSeek wordmark and the home whale layer — activates before any
+# user bundle, so it would keep both sidebar seats and this plugin's marks
+# would never render. Disabling it hands the seats over and removes the
+# DeepSeek home animation, which an HPE skin does not want. Re-enable it (or
+# remove the override below) to get the shipped brand back.
+- insert:
+    - id: hpe-brand
+      name: '@local/dsh-hpe-brand'
+
+- id: ui-brand-official
+  disabled: true
