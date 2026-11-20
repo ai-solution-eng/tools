@@ -201,7 +201,14 @@ data:
     // 51 (0.4.45): the edit dialog adopts the page the preview navigated to, so
     // Source / Rename / Delete / Save follow the document on screen instead of
     // the one the dialog was opened with.
-    // surprise rollout); values.yaml ships 54.
+    // 55 (0.4.49): editor keyboard — Esc closes the open file, Cmd/Ctrl-S saves
+    // and Cmd/Ctrl-W closes, with a Save / Don't Save / Cancel prompt whenever
+    // the buffer is modified (the same prompt guards opening another file,
+    // leaving the Source view and Rename). Client-only: data_manager.mjs is
+    // untouched, so no image rebuild and no dsh version bump — but a re-stamp,
+    // because data_manager.html is a subPath mount that never refreshes on its
+    // own.
+    // surprise rollout); values.yaml ships 55.
     const RUNTIME_REV = '{{ .Values.RUNTIME_REV | default 44 }}'
     // userTemplateVersion is the pod-template convergence contract. Three
     // independent things must roll existing units when they change:

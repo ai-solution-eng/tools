@@ -3898,6 +3898,20 @@ data:
     
     /* Editor dialog */
     #edit-dialog { width: 96vw; height: 94vh; max-width: none; max-height: none; }
+    /* Unsaved-changes state: a pill next to the file name in the editor header,
+       and the hint line inside the save prompt. */
+    .dirty-badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: var(--accent);
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      padding: 1px 7px;
+      white-space: nowrap;
+    }
+    .dlg-note { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin: 10px 0 0; }
     /* Upload dialog: progress bar + per-file list */
     .up-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
     .up-bar-fill { height: 100%; width: 0%; background: var(--accent); transition: width .15s linear; }
@@ -3937,6 +3951,37 @@ data:
     }
     #edit-dialog form { display: flex; flex-direction: column; height: 100%; }
     .hidden { display: none !important; }
+    
+    /* Type-to-navigate bar under the toolbar. */
+    #pathbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .pathbar-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: var(--text-muted);
+      user-select: none;
+    }
+    #path-input {
+      flex: 1;
+      min-width: 0;
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-family: 'SF Mono', Monaco, Menlo, 'Courier New', monospace;
+      font-size: 12px;
+    }
+    #path-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    #path-input.invalid { border-color: var(--danger); }
+    #btn-path-go { padding: 4px 12px; }
     
     /* Footer */
     .hpe-footer { margin-top: 0; padding-top: 0; border-top: none; font-size: .78rem; color: var(--text-muted); text-align: center; }
@@ -3985,6 +4030,17 @@ data:
       <button class="btn" id="btn-refresh">Refresh</button>
     </div>
     
+    <!-- Type-to-navigate: the breadcrumb is fine for walking a tree, but a path
+         you already know (copied from a terminal, a link, a colleague's folder)
+         should be one paste away instead of six clicks. -->
+    <div id="pathbar">
+      <span class="pathbar-label" title="Type a path and press Enter (Cmd/Ctrl+L)">Path</span>
+      <input type="text" id="path-input" spellcheck="false" autocomplete="off" autocapitalize="off"
+             placeholder="/workspace/shared — absolute, or relative to the folder you are in"
+             aria-label="Path">
+      <button class="btn" id="btn-path-go">Go</button>
+    </div>
+    
     <div id="main">
       <div id="drop-overlay">Drop files or folders here to upload</div>
       <table>
@@ -4018,7 +4074,10 @@ data:
     <dialog id="edit-dialog">
       <form method="dialog">
         <div class="dlg-header">
-          <span id="edit-title">Edit File</span>
+          <span style="display:flex;align-items:center;gap:8px;min-width:0;">
+            <span id="edit-title">Edit File</span>
+            <span id="edit-dirty" class="dirty-badge" style="display:none;" title="This file has unsaved changes">unsaved</span>
+          </span>
           <span id="edit-meta" style="font-size:11px;color:var(--text-muted);"></span>
         </div>
         <div class="dlg-body">
@@ -4033,6 +4092,21 @@ data:
           <button class="btn" id="btn-editor-close" type="button">Close</button>
         </div>
       </form>
+    </dialog>
+    
+    <!-- Unsaved changes: raised when the editor is closed (Esc, Cmd/Ctrl-W, Close)
+         with a modified buffer, so a stray key can never throw edits away. -->
+    <dialog id="unsaved-dialog">
+      <div class="dlg-header">Unsaved changes</div>
+      <div class="dlg-body">
+        <p id="unsaved-message" style="font-size:13px;line-height:1.5;margin:0;"></p>
+        <p class="dlg-note">Esc or Cancel keeps the file open.</p>
+      </div>
+      <div class="dlg-footer">
+        <button class="btn" id="unsaved-cancel" type="button">Cancel</button>
+        <button class="btn btn-danger" id="unsaved-discard" type="button">Don't Save</button>
+        <button class="btn btn-primary" id="unsaved-save" type="button">Save</button>
+      </div>
     </dialog>
     
     <!-- Download Dialog -->
@@ -4193,6 +4267,11 @@ data:
     let monacoEditor = null;
     let monacoReady = false;
     let editorCurrentPath = null;
+    // Content the editor last loaded from (or wrote to) disk. The buffer is
+    // "dirty" when its value differs — that is what raises the unsaved-changes
+    // prompt on Esc / Cmd-Ctrl-W / Close. Preview modes (image, PDF, rendered
+    // .md/.html) have no buffer and are never dirty.
+    let editorBaseline = null;
     
     function fmt(bytes) {
       if (bytes === 0) return '0 B';
@@ -4301,6 +4380,7 @@ data:
     
     // ─── Breadcrumb ─────────────────────────────────────
     function renderBreadcrumb() {
+      syncPathInput();
       syncUploadButtons();
       syncClipboardUi();
       const bc = document.getElementById('breadcrumb');
@@ -4444,6 +4524,104 @@ data:
       selectedPaths.clear();
       await loadDir(path);
     }
+    
+    // ─── Type-to-navigate ───────────────────────────────
+    // Accepts an absolute path, a path relative to the open folder, and ~ / ~/…
+    // for the current root. The server clamps the result to the navigable roots,
+    // so a path that escapes the workspace is refused there, not here.
+    function rootForPath(p) {
+      if (!Array.isArray(roots)) return null;
+      let best = null;
+      for (const r of roots) {
+        if (p === r.path || p.indexOf(r.path + '/') === 0) {
+          if (!best || r.path.length > best.path.length) best = r;
+        }
+      }
+      return best;
+    }
+    
+    function normalizePathInput(raw) {
+      let value = String(raw == null ? '' : raw).trim();
+      if (!value) return '';
+      if (value === '~') value = (currentRoot && currentRoot.path) || '';
+      else if (value.indexOf('~/') === 0) value = ((currentRoot && currentRoot.path) || '') + value.slice(1);
+      if (!value) return '';
+      if (value.charAt(0) !== '/') value = (currentPath || '/') + '/' + value;
+      const out = [];
+      for (const part of value.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') { out.pop(); continue; }
+        out.push(part);
+      }
+      return '/' + out.join('/');
+    }
+    
+    function syncPathInput() {
+      const input = document.getElementById('path-input');
+      if (!input) return;
+      input.value = currentPath || '';
+      input.classList.remove('invalid');
+    }
+    
+    async function goToPath(raw) {
+      const input = document.getElementById('path-input');
+      const target = normalizePathInput(raw);
+      if (!target) { syncPathInput(); return; }
+      const previous = currentPath;
+      const previousRoot = currentRoot;
+      const nextRoot = rootForPath(target);
+      if (nextRoot) {
+        currentRoot = nextRoot;
+        const sel = document.getElementById('root-selector');
+        if (sel) sel.value = nextRoot.path;
+      }
+      try {
+        selectedPaths.clear();
+        await loadDir(target);
+        if (input) input.classList.remove('invalid');
+      } catch (e) {
+        // A refused path (outside the workspace, a file, a typo) must leave the
+        // user where they were instead of on an empty table.
+        currentRoot = previousRoot;
+        const sel = document.getElementById('root-selector');
+        if (sel && previousRoot) sel.value = previousRoot.path;
+        try { await loadDir(previous); } catch (e2) { /* the toast below still explains it */ }
+        if (input) { input.classList.add('invalid'); input.value = target; }
+        toast(target + ' — ' + e.message, 'error');
+      }
+    }
+    
+    document.getElementById('btn-path-go').onclick = function () {
+      goToPath(document.getElementById('path-input').value);
+    };
+    
+    document.getElementById('path-input').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        goToPath(e.target.value);
+        return;
+      }
+      if (e.key === 'Escape') {
+        // Esc in the path bar means "never mind", not "close the open file".
+        e.preventDefault();
+        e.stopPropagation();
+        e.target.value = currentPath || '';
+        e.target.classList.remove('invalid');
+        e.target.blur();
+      }
+    });
+    
+    // Cmd/Ctrl-L is "go to location" in every other file manager; make it so here.
+    document.addEventListener('keydown', function (e) {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      if (String(e.key || '').toLowerCase() !== 'l') return;
+      const input = document.getElementById('path-input');
+      if (!input) return;
+      e.preventDefault();
+      e.stopPropagation();
+      input.focus();
+      input.select();
+    }, true);
     
     // ─── Select All ─────────────────────────────────────
     document.getElementById('select-all').onchange = function() {
@@ -5711,6 +5889,7 @@ data:
       }
       if (!target || target === editorCurrentPath) return;
       editorCurrentPath = target;
+      editorBaseline = null;
       const nm = target.split('/').pop() || target;
       const ext = (nm.split('.').pop() || '').toLowerCase();
       editorCurrentEntry = { name: nm, ext: ext, type: 'file' };
@@ -5720,6 +5899,13 @@ data:
     }
     
     async function openEditor(filePath, entry) {
+      // Switching to another file replaces the buffer: ask first, so opening a
+      // second file cannot silently drop edits to the first.
+      if (editorCurrentPath !== filePath && editorDirty()) {
+        const answer = await askUnsaved('Save changes to "' + (editorCurrentPath.split('/').pop() || editorCurrentPath) + '" before opening another file?');
+        if (answer === 'cancel') return;
+        if (answer === 'save' && !(await saveEditor())) return;
+      }
       if (editorCurrentPath !== filePath) editorViewMode = 'preview';
       editorCurrentPath = filePath;
       editorCurrentEntry = entry;
@@ -5739,6 +5925,10 @@ data:
       const container = document.getElementById('editor-container');
       container.innerHTML = '';
       if (monacoEditor) { monacoEditor.dispose(); monacoEditor = null; }
+      // A freshly rendered body starts from disk, so nothing is dirty until the
+      // user types (the change listeners below flip the badge).
+      editorBaseline = null;
+      refreshDirtyBadge();
     
       const kind = previewKind(entry.ext);
       const isDoc = kind === 'markdown' || kind === 'html';
@@ -5774,6 +5964,9 @@ data:
         }
     
         document.getElementById('btn-editor-save').disabled = false;
+        // The buffer starts equal to disk; typing is what makes it dirty.
+        editorBaseline = data.content;
+        refreshDirtyBadge();
         document.getElementById('edit-meta').textContent = fmt(data.size) + ' \u00b7 ' + (entry.ext || 'plaintext');
     
         const lang = langForExt(entry.ext);
@@ -5791,10 +5984,12 @@ data:
             wordWrap: 'on',
             tabSize: 2,
           });
+          monacoEditor.onDidChangeModelContent(function () { refreshDirtyBadge(); });
         } else {
           const ta = document.createElement('textarea');
           ta.id = 'editor-textarea';
           ta.value = data.content;
+          ta.addEventListener('input', refreshDirtyBadge);
           container.appendChild(ta);
         }
       } catch (e) {
@@ -5802,29 +5997,32 @@ data:
       }
     }
     
-    document.getElementById('btn-editor-save').onclick = async function() {
-      if (!editorCurrentPath) return;
-      let content;
-      if (monacoEditor) {
-        content = monacoEditor.getValue();
-      } else {
-        const ta = document.getElementById('editor-textarea');
-        if (ta) content = ta.value;
-      }
-      if (content === undefined) return;
+    // Write the buffer to disk. true on success, false when there is nothing to
+    // save (preview mode) or the write failed. Shared by the Save button,
+    // Cmd/Ctrl-S and the unsaved-changes prompt.
+    async function saveEditor() {
+      if (!editorCurrentPath || !editorEditable()) return false;
+      const content = editorBufferValue();
+      if (content === undefined) return false;
       try {
         await api('/write?path=' + encodeURIComponent(editorCurrentPath), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content }),
         });
+        editorBaseline = content;
+        refreshDirtyBadge();
         toast('Saved', 'success');
         await loadDir(currentPath);
         loadStorage();
+        return true;
       } catch (e) {
         toast('Save failed: ' + e.message, 'error');
+        return false;
       }
-    };
+    }
+    
+    document.getElementById('btn-editor-save').onclick = function () { saveEditor(); };
     
     document.getElementById('btn-editor-download').onclick = function() {
       if (!editorCurrentPath) return;
@@ -5832,33 +6030,192 @@ data:
       window.location.href = API + '/download?path=' + encodeURIComponent(editorCurrentPath) + '&name=' + encodeURIComponent(name);
     };
     
-    document.getElementById('btn-editor-rename').onclick = function() {
+    document.getElementById('btn-editor-rename').onclick = async function() {
       if (!editorCurrentPath) return;
-      document.getElementById('edit-dialog').close();
-      showRenameDialog(editorCurrentPath);
+      if (editorDirty()) {
+        const answer = await askUnsaved('Save changes to this file before renaming it?');
+        if (answer === 'cancel') return;
+        if (answer === 'save' && !(await saveEditor())) return;
+      }
+      const target = editorCurrentPath;
+      closeEditorNow();
+      showRenameDialog(target);
     };
     
     document.getElementById('btn-editor-delete').onclick = async function() {
       if (!editorCurrentPath) return;
-      const name = editorCurrentPath.split('/').pop();
+      const target = editorCurrentPath;
+      const name = target.split('/').pop();
       document.getElementById('confirm-message').textContent = 'Delete "' + name + '"? This cannot be undone.';
-      document.getElementById('confirm-dialog').dataset.paths = JSON.stringify([editorCurrentPath]);
-      document.getElementById('edit-dialog').close();
+      document.getElementById('confirm-dialog').dataset.paths = JSON.stringify([target]);
+      // Deleting the file makes the buffer moot; the confirm dialog below is the
+      // guard, so no second prompt here.
+      closeEditorNow();
       document.getElementById('confirm-dialog').showModal();
     };
     
     document.getElementById('btn-editor-source').onclick = async function() {
       if (!editorCurrentPath) return;
+      // Going back to the rendered view drops the buffer, so ask first.
+      if (editorDirty()) {
+        const answer = await askUnsaved('Save changes to this file before switching to the rendered view?');
+        if (answer === 'cancel') return;
+        if (answer === 'save' && !(await saveEditor())) return;
+      }
       editorViewMode = editorViewMode === 'source' ? 'preview' : 'source';
       await renderEditorBody();
     };
     
-    document.getElementById('btn-editor-close').onclick = function() {
+    // ─── Dirty state, closing, keyboard shortcuts ───────────────────────
+    // Closing an open file must never throw edits away silently: Esc, Cmd/Ctrl-W
+    // and the Close button all go through closeEditor(), which asks Save / Don't
+    // Save / Cancel when the buffer differs from disk. Cmd/Ctrl-S saves.
+    function editorBufferValue() {
+      if (monacoEditor) return monacoEditor.getValue();
+      const ta = document.getElementById('editor-textarea');
+      return ta ? ta.value : undefined;
+    }
+    
+    // The Save button is the authority on whether the body is editable: preview
+    // modes (image, PDF, rendered .md/.html) disable it and have no buffer to lose.
+    function editorEditable() {
+      return !document.getElementById('btn-editor-save').disabled;
+    }
+    
+    function editorDirty() {
+      if (!editorCurrentPath || !editorEditable()) return false;
+      const value = editorBufferValue();
+      if (value === undefined || editorBaseline === null) return false;
+      return value !== editorBaseline;
+    }
+    
+    function refreshDirtyBadge() {
+      const badge = document.getElementById('edit-dirty');
+      if (badge) badge.style.display = editorDirty() ? '' : 'none';
+    }
+    
+    // Promise-based Save / Don't Save / Cancel prompt. Resolves 'save', 'discard'
+    // or 'cancel'; any close that is not one of the buttons (Esc) is 'cancel'.
+    function askUnsaved(message) {
+      return new Promise(function (resolve) {
+        const dlg = document.getElementById('unsaved-dialog');
+        // A second close request while the prompt is up must not stack a modal.
+        if (dlg.open) { resolve('cancel'); return; }
+        const save = document.getElementById('unsaved-save');
+        const discard = document.getElementById('unsaved-discard');
+        const cancel = document.getElementById('unsaved-cancel');
+        document.getElementById('unsaved-message').textContent = message;
+        function finish(answer) {
+          save.onclick = discard.onclick = cancel.onclick = null;
+          dlg.removeEventListener('cancel', onCancel);
+          dlg.removeEventListener('close', onClose);
+          if (dlg.open) dlg.close();
+          resolve(answer);
+        }
+        function onCancel(ev) { ev.preventDefault(); finish('cancel'); }
+        function onClose() { finish('cancel'); }
+        save.onclick = function () { finish('save'); };
+        discard.onclick = function () { finish('discard'); };
+        cancel.onclick = function () { finish('cancel'); };
+        dlg.addEventListener('cancel', onCancel);
+        dlg.addEventListener('close', onClose);
+        dlg.showModal();
+      });
+    }
+    
+    function closeEditorNow() {
       if (monacoEditor) { monacoEditor.dispose(); monacoEditor = null; }
       previewFrame = null;
       editorCurrentPath = null;
-      document.getElementById('edit-dialog').close();
-    };
+      editorBaseline = null;
+      refreshDirtyBadge();
+      const dlg = document.getElementById('edit-dialog');
+      if (dlg.open) dlg.close();
+    }
+    
+    // The one way out of the editor. Nothing is discarded without an answer.
+    async function closeEditor() {
+      if (!editorCurrentPath || !editorDirty()) { closeEditorNow(); return; }
+      const name = editorCurrentPath.split('/').pop() || editorCurrentPath;
+      const answer = await askUnsaved('Save changes to "' + name + '" before closing?');
+      if (answer === 'cancel') return;
+      if (answer === 'save') {
+        const saved = await saveEditor();
+        if (!saved) return; // save failed: keep the file open so nothing is lost
+      }
+      closeEditorNow();
+    }
+    
+    // Only the front-most dialog owns Esc; any other dialog on top (the unsaved
+    // prompt itself, rename, delete, upload) keeps its own Esc handling.
+    function editorIsFrontDialog() {
+      const open = document.querySelectorAll('dialog[open]');
+      return open.length > 0 && open[open.length - 1].id === 'edit-dialog';
+    }
+    
+    // Set when an Esc was handed to Monaco's completion popup: the native cancel
+    // event that follows belongs to that popup, not to the file.
+    let escForSuggest = false;
+    
+    // Capture phase, so Monaco (which stops propagation on several keys) cannot
+    // swallow the shortcut before we see it.
+    document.addEventListener('keydown', function (e) {
+      const key = String(e.key || '').toLowerCase();
+      const mod = e.ctrlKey || e.metaKey;
+      if (key !== 'escape') escForSuggest = false;
+    
+      if (key === 'escape' && !mod && !e.altKey) {
+        if (!editorIsFrontDialog()) { escForSuggest = false; return; }
+        if (document.querySelector('.monaco-editor .suggest-widget.visible')) {
+          // Esc belongs to Monaco's completion popup: let it through, and remember
+          // that the cancel event it triggers is not a request to close the file.
+          escForSuggest = true;
+          return;
+        }
+        escForSuggest = false;
+        e.preventDefault();
+        e.stopPropagation();
+        closeEditor();
+        return;
+      }
+    
+      if (!mod || e.altKey || e.shiftKey) return;
+      if (!editorIsFrontDialog()) return;
+      if (key === 's') {
+        e.preventDefault();
+        e.stopPropagation();
+        saveEditor();
+        return;
+      }
+      // Cmd/Ctrl-W is browser-reserved: Chrome and Firefox close the tab before
+      // the page sees the keydown, so the beforeunload guard below is the real
+      // safety net for it. When the key does arrive (webview / non-reserved
+      // hosts) it closes the file instead of the tab.
+      if (key === 'w') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeEditor();
+      }
+    }, true);
+    
+    // Esc that reaches the dialog itself (focus in the dialog rather than in
+    // Monaco or the textarea) arrives as a cancel event: take it over for the
+    // same prompt.
+    document.getElementById('edit-dialog').addEventListener('cancel', function (e) {
+      e.preventDefault();
+      if (escForSuggest) { escForSuggest = false; return; }
+      closeEditor();
+    });
+    
+    // Last line of defence for the paths a page cannot intercept (Cmd/Ctrl-W, the
+    // tab's close button, a reload): the browser asks before dropping the buffer.
+    window.addEventListener('beforeunload', function (e) {
+      if (!editorDirty()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
+    
+    document.getElementById('btn-editor-close').onclick = function () { closeEditor(); };
     
     // ─── Init ───────────────────────────────────────────
     (async function init() {
