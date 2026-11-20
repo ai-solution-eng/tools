@@ -137,7 +137,7 @@ NOTE (POSTGRES CONNECTIONS): autoscaling scales to
     -H "Authorization: Bearer <ADMIN_KEY>" -H 'Content-Type: application/json' \
     -d '{"name":"trial"}'
   # Full bootstrap sequence (tenant → user → key → model pool):
-  documentation/VERIFICATION.md §3, or scripts/seed_registry.py.
+  documentation/changelogs/VERIFICATION.md §3, or scripts/seed_registry.py.
   # If NO model endpoints are registered yet, that is expected — register
   # them via /admin (README → Deployment) before proxying traffic.
 

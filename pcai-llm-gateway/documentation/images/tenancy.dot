@@ -1,0 +1,120 @@
+// pcai-llm-gateway — tenancy: admin -> team leader (sub-admin) -> teammate
+//
+// Render (from the repo root):
+//   dot -Tpng -Gdpi=150 documentation/images/tenancy.dot -o documentation/images/tenancy.png
+//   dot -Tsvg documentation/images/tenancy.dot -o documentation/images/tenancy.svg
+//
+// An enrollment code is not just an invite — it is a TEAM. The keys redeemed
+// from it share a HARD budget envelope, and someone who is not an admin gets a
+// scoped console over exactly that team. The two properties that make this safe:
+//   * ONE enforcement point (core.budgets.check_budgets) — the per-key gate and
+//     the team cap SUM the same ledger rows with the same weighting, so they can
+//     never disagree about what "spent" means;
+//   * SCOPING DISCIPLINE — every id a leader names is resolved with
+//     WHERE id = $1 AND enrollment_id = $2, never fetch-then-compare, so a
+//     foreign id is a 404 exactly like a missing one (no existence oracle).
+//
+// Feature rationale: FEATURES.md "Team leader tier". Route surface: API.md.
+//
+digraph tenancy {
+  rankdir=TB;
+  splines=spline;
+  compound=true;
+  nodesep=0.34;
+  ranksep=0.50;
+  fontname="Helvetica";
+  labelloc=t;
+  fontsize=13;
+  label="tenancy — admin → team leader (sub-admin) → teammate\namber: control plane · blue: credentials · grey: Postgres truth · green: data plane · red: fail-closed";
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, margin="0.13,0.07"];
+  edge [fontname="Helvetica", fontsize=8, penwidth=1.4, arrowsize=0.7];
+
+  // ---------- control plane ----------
+  subgraph cluster_admin {
+    label="ADMIN PLANE — the admin key owns everything";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#b45309";
+
+    admin  [label="admin browser\n/admin — admin key (hash-only)", fillcolor="#fef3c7", color="#b45309", penwidth=1.6];
+    mint   [label="mint an enrollment code\nPOST /admin/enrollments\ncode shown ONCE, hash stored", fillcolor="#fef3c7", color="#b45309"];
+    topup  [label="top-up review\nGET /admin/topup-requests\napprove (optional amount) / deny", fillcolor="#fef3c7", color="#b45309"];
+  }
+
+  subgraph cluster_leader {
+    label="TEAM PLANE — a leader key sees ONE enrollment and nothing else";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#b45309";
+
+    leader  [label="team leader browser\n/team_leader — leader key (hash-only)", fillcolor="#fef3c7", color="#b45309", penwidth=1.6];
+    console [label="/team_leader console\nits own keys · its own usage · its own traces\nfull advertised-models view", fillcolor="#fffbeb", color="#b45309"];
+    alloc   [label="write a teammate's ALLOCATION\n(PATCH /team_leader/... )\nsame-period allocations must fit\nthe envelope → 409 with the numbers", fillcolor="#fffbeb", color="#b45309"];
+    ask     [label="ask for a top-up\nPOST /team_leader/topup-requests\none OPEN ask at a time\n(uniqueness-guarded insert)", fillcolor="#fffbeb", color="#b45309"];
+  }
+
+  // ---------- the tenancy objects ----------
+  code [label="enrollment code — the TEAM INVITE\n32-byte urlsafe · SHA-256 hash only · max_uses · expiry\nONE generic rejection: no expired/exhausted oracle",
+        fillcolor="#dbeafe", color="#1d4ed8"];
+  enrollment [label="enrollment = THE TEAM\nhard envelope: budget_tokens / budget_usd per period\noverflow_enabled (DEFAULT TRUE) · team_leader_key (hash only)\nteam_leader_key_last_used_at → a dead leader is visible",
+              fillcolor="#eff6ff", color="#1d4ed8", penwidth=1.6];
+  keys [label="api_keys — one per teammate\nenrollment_id GROUPS the team\nbudgets / cost_budgets = that teammate's allocation\nkey_group survives rotation",
+        fillcolor="#eff6ff", color="#1d4ed8"];
+  gate [label="core.budgets.check_budgets — the ONE enforcement point\nper-key allocation + team envelope SUM + shared overflow pool\nboth gates SUM the same ledger rows with the same fraction weighting\n→ the per-key gate and the team cap can never disagree",
+        fillcolor="#fff7ed", color="#c2410c", penwidth=1.8];
+  ledger [label="usage_ledger — append-only\nbudgets are SUMs, never a counter", fillcolor="#f1f5f9", color="#475569"];
+
+  // ---------- data plane ----------
+  teammate [label="teammate (data plane only)\nPOST /v1/enroll {code, name} → a personal hllm- key\nbudgets + MCP grants stamped in the SAME transaction",
+            fillcolor="#dbeafe", color="#1d4ed8"];
+  call [label="every call: /v1 · /mcp\nsettles one ledger row", fillcolor="#dcfce7", color="#16a34a"];
+
+  // ---------- fail-closed + audit ----------
+  failclosed [label="FAIL CLOSED\nrevoked leader key · revoked enrollment (a closed team closes its console)\nexpired enrollment → 401 for everything\nforeign id → 404, exactly like a missing one",
+              fillcolor="#fee2e2", color="#b91c1c"];
+  audit [label="admin_audit\nteam.* actions · actor_source = team-leader\nactor = the enrollment LABEL — never key material",
+         fillcolor="#f1f5f9", color="#475569"];
+
+  // ================= edges =================
+  edge [color="#b45309", fontcolor="#92400e"];
+  admin -> mint [label="mint (envelope + profile + tenant)"];
+  mint  -> code [label="show once"];
+  code  -> teammate [label="hand it out"];
+  admin -> topup;
+  topup -> enrollment [label="raises the CAP — the admin's alone", style=dashed];
+  admin -> leader [label="mint / rotate the leader key", style=dashed];
+
+  edge [color="#1d4ed8", fontcolor="#1d4ed8"];
+  teammate -> keys [label="redeem: ONE transaction\n(code is the credential —\nno auth on /v1/enroll by design)"];
+  keys -> enrollment [label="enrollment_id", style=dashed];
+  leader -> console [label="auth envelope:\nBearer or X-API-Key"];
+  console -> keys [label="allocation writes"];
+  console -> ledger [label="scoped reads", style=dashed];
+  leader -> ask;
+  ask -> topup [label="one open ask", style=dashed];
+
+  edge [color="#16a34a", fontcolor="#15803d", penwidth=1.8];
+  keys -> gate [label="the key that calls"];
+  gate -> ledger [label="pre-estimate / post-settle", style=dashed];
+  call -> gate [label="admission", dir=back];
+  teammate -> call [label="uses its key"];
+
+  edge [color="#b91c1c", fontcolor="#b91c1c", style=dashed];
+  leader -> failclosed [label="dead key / closed team"];
+  console -> audit [label="every mutation", style=dotted];
+
+  // ============ band ordering ============
+  mint -> code [style=invis, weight=4];
+  console -> gate [style=invis, weight=4];
+  keys -> gate [style=invis];
+  gate -> call [style=invis];
+
+  // ============ legend ============
+  subgraph cluster_legend {
+    label="Legend"; labeljust=l; fontsize=10; style="rounded"; color="#9ca3af";
+    legend [shape=plaintext, style="", fontsize=9,
+            label=<<table border="0" cellborder="0" cellspacing="2">
+              <tr><td align="left"><font color="#b45309">━ control plane</font></td><td align="left">admin (the cap) · team leader (its own team, inside the cap)</td></tr>
+              <tr><td align="left"><font color="#1d4ed8">━ credentials</font></td><td align="left">hash-only, shown once: enrollment code, leader key, teammate key</td></tr>
+              <tr><td align="left"><font color="#16a34a">━ data plane</font></td><td align="left">a teammate's key is a data-plane credential and nothing more</td></tr>
+              <tr><td align="left"><font color="#b91c1c">┈ fail closed</font></td><td align="left">no credential, no console; no id oracle either</td></tr>
+            </table>>];
+  }
+}

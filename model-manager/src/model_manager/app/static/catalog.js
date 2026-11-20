@@ -307,12 +307,22 @@ function buildConfigRow(cfg) {
       '</span>'
     : '';
 
+  // ENGINE: an unpinned image tag can resolve to a different engine release on
+  // the next deploy -- the badge makes that drift risk visible per config.
+  const unpinnedBadge = cfg.pinned === false
+    ? '<span class="cfg-badge-unpinned"' +
+        ' title="Image tag floats (e.g. :latest) -- a redeploy can silently pick up a different inference engine release">' +
+        'unpinned' +
+      '</span>'
+    : '';
+
   row.innerHTML =
     '<label class="tree-config-select"><input type="checkbox" data-catalog-id="' + esc(e.catalog_id) +
       '" data-tier="' + esc(e.tier || '') + '"></label>' +
     '<span class="tree-config-label">' + configLabelHtml(cfg) + '</span>' +
     caveatChip +
     unvalidatedBadge +
+    unpinnedBadge +
     '<span class="tree-config-id">' + esc(cfg.model_id || '') + '</span>' +
     '<span class="tree-config-actions">' +
       '<button type="button" class="action-btn details-btn" data-details="' + esc(e.catalog_id) + '">Config</button>' +

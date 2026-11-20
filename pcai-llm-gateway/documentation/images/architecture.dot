@@ -1,0 +1,246 @@
+// pcai-llm-gateway — architecture: request path, routing, monitoring & control planes (4.2, 2026-11-20)
+//
+// Render (from the repo root):
+//   dot -Tpng -Gdpi=150 documentation/images/architecture.dot -o documentation/images/architecture.png
+//   dot -Tsvg documentation/images/architecture.dot -o documentation/images/architecture.svg
+//
+// "USER" = a local agent harness / SDK / MCP client (automated), not a human.
+// Admin and team-leader browsers are the CONTROL plane; everything else is the
+// DATA plane.
+//
+// The load-bearing property: the DATA plane never waits on the MONITORING plane.
+// Off-peak, model-group load and the routing prompt all read a cached evaluator
+// snapshot; a Prometheus outage degrades to full price / uniform random, never a
+// stalled request.
+//
+// Companion diagrams: memory-progression.dot (the automatic map-reduce distill
+// pipeline) and tenancy.dot (admin -> team leader -> teammate credential ladder).
+//
+// LAYOUT NOTES (graphviz 16):
+//  * rank=same naming a node that lives inside a cluster silently DELETES it from
+//    the cluster ("was already in a rankset"). Only top-level nodes may be in a
+//    rankset; unconnected cluster members already share a rank.
+//  * The diagram is drawn as horizontal BANDS (consumers -> gateway -> routing ->
+//    gate -> models -> monitoring -> MCP). Edges that would fight the band order
+//    (monitoring feeding back UP into routing/billing, control plane reaching
+//    down) are constraint=false so they cannot re-rank the bands.
+//
+digraph pcai_llm_gw {
+  rankdir=TB;
+  splines=spline;
+  compound=true;
+  nodesep=0.26;
+  ranksep=0.55;
+  fontname="Helvetica";
+  labelloc=t;
+  fontsize=13;
+  label="pcai-llm-gateway 4.2 — request path, routing, monitoring & control planes\nblue: routing · green: fallback · orange: off-peak demand · purple: monitoring (fail-open) · teal: memory · amber: control plane";
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, margin="0.12,0.07"];
+  edge [fontname="Helvetica", fontsize=8, penwidth=1.3, arrowsize=0.7];
+
+  // ============ band 1: data-plane consumers + control plane ============
+  subgraph cluster_consumers {
+    label="Consumers — a virtual key (hllm-…) on every data-plane call";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#1d4ed8";
+
+    harness [label="agent harnesses\nDSH · opencode · OpenWebUI", fillcolor="#dbeafe", color="#1d4ed8"];
+    sdk     [label="SDKs / chat UIs\nOpenAI-compatible",          fillcolor="#dbeafe", color="#1d4ed8"];
+    mcpcli  [label="MCP clients\n/mcp",                            fillcolor="#dbeafe", color="#1d4ed8"];
+  }
+
+  subgraph cluster_control {
+    label="Control plane — hash-only keys, every mutation audited";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#b45309";
+
+    admin  [label="admin browser\n/admin — admin key",             fillcolor="#fef3c7", color="#b45309"];
+    leader [label="team leader browser\n/team_leader — leader key", fillcolor="#fef3c7", color="#b45309"];
+    team   [label="team leader tier (sub-admin)\nhard envelope over the team SUM\noverflow pool · top-up → admin\n▸ tenancy.dot", fillcolor="#fef3c7", color="#b45309"];
+  }
+
+  // ============ band 2: the gateway ============
+  gateway [label="pcai-llm-gateway :9200\n/v1 OpenAI proxy · /mcp federation\n/admin + /team_leader consoles\n/health /ready /metrics",
+           fillcolor="#fbcfe8", color="#9d174d", penwidth=2.2];
+
+  // ============ band 3: routing plane ============
+  subgraph cluster_routing {
+    label="Routing plane — how ONE model is chosen (pre-generation; a stream cannot switch mid-flight)";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#4338ca";
+
+    d3     [label="d3-turbo decision model\nvLLM-SR System One\nsees a COMPACT summary, never the prompt\nconfidence < 0.60 → heuristics stand",
+            fillcolor="#e0e7ff", color="#4338ca", penwidth=1.6];
+    heur   [label="complexity router\nrouting / routing__X\npure, deterministic, pre-generation",
+            fillcolor="#e0e7ff", color="#4338ca"];
+    groups [label="model groups\nequivalent models, pick by LIVE load\nsticky per conversation (grp:)",
+            fillcolor="#e0e7ff", color="#4338ca"];
+    head   [label="load-aware cascade head\nopt-in · picked once per thread\nfrom per-model off-peak state",
+            fillcolor="#ffedd5", color="#ea580c"];
+  }
+
+  // ============ band 4: admission, policy, accounting ============
+  gate   [label="admission gate — ONE choke point\nkey scope · model ACL · budget (key allocation + team envelope) · rate window",
+          fillcolor="#fff7ed", color="#c2410c", penwidth=1.8];
+  policy [label="policy stage\ncontent guardrails · arg_policy destination\nURL guard (one SSRF deny-list)", fillcolor="#fff7ed", color="#c2410c"];
+  db     [label="PostgreSQL — the ledger IS the budget engine\nusage_ledger (append-only) · admin_audit · agent_traces\nkeys · pools · canonical_conversations\nbudgets are SUMs — no \"remaining\" counter, no check-then-act race",
+          fillcolor="#f1f5f9", color="#475569"];
+
+  // ============ band 5: model endpoints ============
+  subgraph cluster_models {
+    label="Model endpoints — pool by priority/weight, circuit breaker, admin-curated fallback chains";
+    labeljust=l; labelloc=b;
+    fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#dc2626";
+
+    deepseek [label="DeepSeek 4.x\ncascade 1st — hard code", fillcolor="#fee2e2", color="#dc2626"];
+    glm      [label="GLM 5.x\ncascade 2nd — review · lowest hallucination", fillcolor="#fee2e2", color="#dc2626"];
+    qwen     [label="Qwen3.x\ncascade 3rd — cheaper / faster", fillcolor="#fee2e2", color="#dc2626"];
+    mnote    [label="fallback walks this order,\nRE-GATED at every hop\n(budget / 5xx only — never a policy bypass)", shape=plaintext, style="", fillcolor="", fontsize=9];
+  }
+
+  // ============ band 6: monitoring plane ============
+  subgraph cluster_mon {
+    label="Monitoring plane — Prometheus, in-cluster behind the MCP registry. Every read is CACHED and FAILS OPEN.";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#7e22ce";
+
+    prom    [label="Prometheus\n(scrapes vLLM / SGLang / DCGM)", fillcolor="#f3e8ff", color="#7e22ce"];
+    offpeak [label="off-peak evaluator\n30 s loop · hysteresis 20 / 35 %\nglobal + PER-MODEL PromQL",
+             fillcolor="#ffedd5", color="#ea580c"];
+    loadsnap[label="load snapshot\nqueue depth · running · KV %\n5 s refresh · stale = no data",
+             fillcolor="#f3e8ff", color="#7e22ce"];
+    epm     [label="endpoint metrics\nprefill / decode rates\nconsole panel", fillcolor="#f3e8ff", color="#7e22ce"];
+    sweep   [label="prometheus-sweep agent\nreport-only: alerts → one JSON report\nread tools only, no applygate",
+             fillcolor="#f3e8ff", color="#7e22ce"];
+  }
+
+  // ============ band 7: memory pipeline + MCP fleet ============
+  mem [label="session memory — automatic, no client changes\ncanonical capture → sweep → MAP-REDUCE distill → mm-rag write\n▸ memory-progression.dot",
+       fillcolor="#ccfbf1", color="#0f766e", penwidth=1.6];
+
+  subgraph cluster_mcp {
+    label="MCP fleet — reached ONLY through the in-cluster relay ③ call · ④ result back · per-tool default-DENY ACL";
+    labeljust=l; fontname="Helvetica-Bold"; fontsize=11; style="rounded"; color="#6b7280";
+
+    subgraph cluster_data {
+      label="Data — memory, knowledge, SQL"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#16a34a";
+      rag_mem  [label="mm-rag — memory\nlong-term · short-term", fillcolor="#dcfce7", color="#16a34a"];
+      rag_know [label="mm-rag — knowledge\n(unstructured)",       fillcolor="#dcfce7", color="#16a34a"];
+      sql      [label="sqlhandler\nread-only SQL",                 fillcolor="#dcfce7", color="#16a34a"];
+    }
+    subgraph cluster_viz {
+      label="Viz — charting"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#db2777";
+      seaborn [label="seaborn\nhistogram · scatter · heatmap", fillcolor="#fce7f3", color="#db2777"];
+    }
+    subgraph cluster_search {
+      label="Research — web search + page fetch"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#0891b2";
+      sx [label="searxng\nsearch · fetch_content", fillcolor="#cffafe", color="#0891b2"];
+    }
+    subgraph cluster_ops {
+      label="Cluster ops — read-only + gated deploy"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#6b7280";
+      k8s  [label="k8s-ops\nread-only",         fillcolor="#f3f4f6", color="#6b7280"];
+      logs [label="logsearch\nnamespace-wide",  fillcolor="#f3f4f6", color="#6b7280"];
+      ag   [label="applygate\ndry-run → apply", fillcolor="#f3f4f6", color="#6b7280"];
+      ez   [label="ezapp deploy",                fillcolor="#f3f4f6", color="#6b7280"];
+    }
+    subgraph cluster_wb {
+      label="Workbench — scratch write + execution"; labeljust=l;
+      fontname="Helvetica-Bold"; fontsize=10; style="rounded"; color="#7c3aed";
+      wb [label="workspace · run_command · sandbox_run\nno net · no GPU · no creds", fillcolor="#ede9fe", color="#7c3aed"];
+    }
+  }
+
+  // =============================================
+  // GREEN — the data path and the fallback cascade
+  // =============================================
+  edge [color="#16a34a", fontcolor="#15803d", penwidth=1.9];
+
+  harness -> gateway [label="① call"];
+  sdk     -> gateway;
+  mcpcli  -> gateway;
+  gate    -> deepseek [label="admitted request\l(one model, then its pool)\l", lhead=cluster_models];
+  gateway -> rag_mem [label="③ relay tool call\l④ result → model\l", dir=both, lhead=cluster_mcp, constraint=false];
+  gateway -> policy [label="pre / post call", style=dashed, penwidth=1.1];
+  policy  -> gate   [style=dashed, penwidth=1.1];
+  gate    -> db     [label="pre-estimate\lpost-settle\l", style=dashed, penwidth=1.1];
+
+  // =============================================
+  // BLUE — routing: exactly one model is chosen
+  // =============================================
+  edge [color="#1d4ed8", fontcolor="#1d4ed8", penwidth=1.7];
+
+  gateway -> d3     [label="decide (shadow | active)", lhead=cluster_routing];
+  gateway -> heur   [label="cheap-first ladder"];
+  gateway -> groups [label="group → member"];
+  d3     -> gate [label="one model\l", ltail=cluster_routing];
+  heur   -> gate [label="one model\l", ltail=cluster_routing];
+  groups -> gate [label="one model\l", ltail=cluster_routing];
+
+  // =============================================
+  // PURPLE — monitoring feeds routing/billing; never on the request path
+  // =============================================
+  edge [color="#7e22ce", fontcolor="#6b21a8", penwidth=1.3, style=dashed];
+
+  prom -> offpeak  [label="PromQL"];
+  prom -> loadsnap [label="3 queries"];
+  prom -> epm      [label="rates"];
+  prom -> sweep    [label="alerts + rules"];
+  loadsnap -> groups [label="min queue / member\lstale → uniform random\l", constraint=false, ltail=cluster_mon];
+
+  // =============================================
+  // ORANGE — off-peak demand: the price AND the cascade entry
+  // =============================================
+  edge [color="#ea580c", fontcolor="#c2410c", penwidth=1.5, style=dashed];
+
+  offpeak -> gate [label="billing fraction — budget consumes tokens × fraction\l(ledger keeps TRUE usage)\l", constraint=false, ltail=cluster_mon];
+  offpeak -> head [label="per-model low-demand", constraint=false, ltail=cluster_mon];
+
+  // =============================================
+  // TEAL — memory pipeline (expanded in memory-progression.dot)
+  // =============================================
+  edge [color="#0f766e", fontcolor="#0f766e", penwidth=1.5];
+  gateway -> mem [label="capture every turn", constraint=false];
+  mem -> rag_mem [label="add_memory (MCP)"];
+
+  // =============================================
+  // AMBER — control plane
+  // =============================================
+  edge [color="#b45309", fontcolor="#92400e", penwidth=1.4, style=dashed];
+  admin  -> gateway [label="admin key"];
+  leader -> gateway [label="leader key (scoped)"];
+  team   -> leader  [style=invis];
+  gate   -> team    [label="team envelope cap", constraint=false];
+
+  // ============ band ordering (invisible, weight 9) ============
+  gateway -> gate [style=invis, weight=9];
+  gate -> prom [style=invis, weight=9];
+  qwen -> prom [style=invis, weight=9];
+  prom -> mem [style=invis, weight=9];
+  mem -> rag_mem [style=invis];
+  rag_know -> k8s [style=invis, weight=5];   // wrap the fleet into two rows
+  sx -> wb [style=invis, weight=5];
+
+  // ---------- layout constraints (top-level nodes only) ----------
+  { rank=same; gate; policy; db; }
+
+  // ---------- legend ----------
+  subgraph cluster_legend {
+    label="Legend"; labeljust=l; fontsize=10; style="rounded"; color="#9ca3af";
+    legend [shape=plaintext, style="", fontsize=9,
+            label=<<table border="0" cellborder="0" cellspacing="2">
+              <tr><td align="left"><font color="#16a34a">━ data path / fallback</font></td>
+                  <td align="left">no routing decision → walk DeepSeek → GLM → Qwen; every hop re-gated</td></tr>
+              <tr><td align="left"><font color="#1d4ed8">━ routing</font></td>
+                  <td align="left">decision model, heuristics, or a model group picks ONE target</td></tr>
+              <tr><td align="left"><font color="#ea580c">┈ off-peak</font></td>
+                  <td align="left">Prometheus demand → billing fraction AND the cascade entry; opt-in, sticky</td></tr>
+              <tr><td align="left"><font color="#7e22ce">┈ monitoring</font></td>
+                  <td align="left">cached reads, fail open: no discount, uniform random pick — never a stalled request</td></tr>
+              <tr><td align="left"><font color="#0f766e">━ memory</font></td>
+                  <td align="left">capture is universal (relayed + plain chat); distillation is automatic</td></tr>
+              <tr><td align="left"><font color="#b45309">┈ control plane</font></td>
+                  <td align="left">admin (all) · team leader (its own enrollment only) — hash-only keys, audited</td></tr>
+            </table>>];
+  }
+}

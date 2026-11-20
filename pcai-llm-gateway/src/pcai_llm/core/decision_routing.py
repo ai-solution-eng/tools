@@ -98,7 +98,7 @@ MAX_DECISION_IMAGES = 2
 
 DECISION_MODES = ("off", "shadow", "active")
 
-# The shipped router prompt: the SAME text as documentation/changelogs/routing_text.md
+# The shipped router prompt: the SAME text as documentation/example_routing_prompts/routing_text.md
 # (asserted by tests/test_routing_prompt_default.py). An EMPTY operator prompt
 # falls back to this constant, and the previous three-sentence default silently
 # replaced the whole operator template on every deployment that had not saved

@@ -101,6 +101,7 @@ Creation commands, verification, and the failure-mode detail for each: [DEPLOYME
 | [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | How do I deploy, upgrade and troubleshoot this on PCAI, and what must exist first? |
 | [documentation/nim-mirror-design.md](documentation/nim-mirror-design.md) | How does the NIM profile mirror work, and what can go wrong? |
 | [documentation/manual-delete-design.md](documentation/manual-delete-design.md) | Why is admin deletion designed this way (threat model, gates, fail-closed matrix)? |
+| [documentation/gpu-node-hugepages.md](documentation/gpu-node-hugepages.md) | What node-level huge-page tuning do the DeepSeek-V4.1-Flash catalog entries assume, and how do I replicate, verify and roll it back? |
 | [helm/values.yaml](helm/values.yaml) | What is the canonical, fully commented default for every value? |
 | [helm/values-examples/README.md](helm/values-examples/README.md) | Paste-ready sanitized values for a proxied site or a hosted trial? |
 | [helm/local/README.md](helm/local/README.md) | Where do real per-site credentials live, and why never in git? |

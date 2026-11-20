@@ -52,6 +52,11 @@ LAB_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("whisper",), "OpenAI"),
     (("fishaudio", "s2-"), "Fish Audio"),
     (("d3-turbo", "vllm-sr"), "vLLM Project"),
+    # NVIDIA publishes its own Nemotron family as nvidia/NVIDIA-Nemotron-*, and
+    # the org fallback would render that lab as "Nvidia".  "nemotron" alone
+    # never matches today (the family key starts with "nvidia-"), but it is
+    # listed so a future nemotron-* repo files under the same lab.
+    (("nemotron", "nvidia-nemotron"), "NVIDIA"),
 )
 
 # Trailing tokens stripped when reducing a model path to its base-model key,
@@ -181,6 +186,48 @@ def entry_framework(entry: dict) -> str:
         if needle in image:
             return label
     return "Other"
+
+
+# Image tags that are ALIASES rather than versions: they keep their name while
+# the artifact under them moves, so a catalog row "pinned" to one of these
+# still deploys whatever the registry happened to serve that day.  A reference
+# with no tag at all implies latest and is treated the same way.
+_FLOATING_TAGS = frozenset(
+    {"latest", "stable", "main", "master", "dev", "devel", "edge", "nightly", "rolling", "current"}
+)
+
+
+def image_is_pinned(image: str) -> bool:
+    """True when the image reference names an immutable artifact.
+
+    A digest (repo@sha256:...) is pinned by definition.  A tag is pinned when
+    it is anything other than a floating alias -- v0.5.23-cu130 yes, latest no
+    -- and an untagged reference is latest by convention.
+
+    Only the LAST path component is inspected, so a registry port
+    (host:5000/repo:tag) is never mistaken for a tag separator.
+    """
+    ref = (image or "").strip()
+    if not ref:
+        return False
+    if "@" in ref:
+        return True
+    last = ref.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return False
+    tag = last.rsplit(":", 1)[1]
+    return bool(tag) and tag.lower() not in _FLOATING_TAGS
+
+
+def entry_pinned(entry: dict) -> bool:
+    """True when the entry's image is pinned to a version tag or a digest.
+
+    Drives the catalog UI's "unpinned" badge and the MLIS push warning.  A
+    floating tag means two operators deploying the same catalog row on
+    different days get different inference engines, and nothing in MLIS
+    records which one ran.
+    """
+    return image_is_pinned(str(entry.get("image") or ""))
 
 
 def entry_hicache(entry: dict) -> bool:
@@ -454,6 +501,79 @@ def entry_unvalidated(entry: dict) -> bool:
     return entry_eval(entry) is None
 
 
+# ---------------------------------------------------------------------------
+# Optional engine provenance block (ENGINE)
+# ---------------------------------------------------------------------------
+#
+# An image tag says which artifact to pull; it does not say which inference
+# engine release that artifact IS, nor whether anyone ever booted the pair.
+# lmsysorg/sglang:latest moving from v0.5.22 to v0.5.23 under a fixed catalog
+# row is exactly the drift this block records:
+#
+#     "engine": {
+#         "version": "v0.5.23-cu130",       # release tag, "" when unknown
+#         "digest": "sha256:f832b5c3...",   # resolved digest, "" when unknown
+#         "validated": "2026-11-02",        # ISO date last boot-verified, "" if never
+#         "source": "live-pod"              # free-text provenance
+#     }
+#
+# The block is stored verbatim and is CATALOG-ONLY: it never rides into the
+# Push-to-MLIS payload (db.COLUMNS has no "engine" column) and is not part of
+# the configuration fingerprint (versioning.FINGERPRINT_COLUMNS), so recording
+# provenance never mints an MLIS version on its own -- changing the image tag
+# is what does that.  Same contract as the eval block.
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_engine(engine_block, name: str = "") -> None:
+    """Validate an entry's optional engine block, raising ValueError (naming
+    the entry and the offending field) when malformed.  Absent/None is always
+    valid -- the field is optional.
+
+    Same idiom as validate_eval: a plain ValueError the API layer turns into a
+    4xx/502 with a clear message (catalog add/batch and the GitHub refresh both
+    surface it).  Unknown extra keys are allowed for forward compatibility;
+    the known keys are enforced.
+    """
+    if engine_block is None:
+        return
+    if not isinstance(engine_block, dict):
+        raise ValueError(f"{name!r}: engine must be an object, got {engine_block!r}")  # noqa: TRY004
+    for key in ("version", "digest", "validated", "source"):
+        value = engine_block.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(  # noqa: TRY004 - the catalog's validation idiom is ValueError (see validate_eval)
+                f"{name!r}: engine.{key} must be a string, got {value!r}"
+            )
+    digest = engine_block.get("digest") or ""
+    if digest and not digest.startswith("sha256:"):
+        raise ValueError(f"{name!r}: engine.digest must be a sha256: digest, got {digest!r}")
+    validated = engine_block.get("validated") or ""
+    if validated and not _ISO_DATE_RE.match(validated):
+        raise ValueError(f"{name!r}: engine.validated must be an ISO date (YYYY-MM-DD), got {validated!r}")
+
+
+def entry_engine(entry: dict) -> dict | None:
+    """The entry's engine block, or None when absent or malformed.
+
+    Defensive by design, like every other entry_* derivation: a bad block is
+    treated as absent here so a rogue entry can never crash the tree render or
+    the push path -- REJECTION happens at the entry boundary (validate_engine
+    in Catalog.add / merge_entries), not at render time.
+    """
+    engine = entry.get("engine")
+    if not isinstance(engine, dict):
+        return None
+    for key in ("version", "digest", "validated", "source"):
+        value = engine.get(key)
+        if value is not None and not isinstance(value, str):
+            return None
+    return engine
+
+
 def entry_shared_gpu(entry: dict) -> bool:
     """True when the config is meant to share a GPU with other models."""
     tags = str((entry.get("metadata") or {}).get("tags") or "").lower()
@@ -656,6 +776,7 @@ class Catalog:
                 # failure (seed) or a 502 "invalid catalog JSON from GitHub" —
                 # never a silently skipped entry.
                 validate_eval(entry.get("eval"), str(entry.get("name") or ""))
+                validate_engine(entry.get("engine"), str(entry.get("name") or ""))
                 # Same normalisation as the on-load pass: a seed file or a
                 # GitHub refresh may carry an inherited MLIS version.
                 entry = dict(entry)
@@ -749,6 +870,10 @@ class Catalog:
                     # derived "unvalidated" flag the UI badges on.
                     "eval": entry_eval(entry),
                     "unvalidated": entry_unvalidated(entry),
+                    # ENGINE: provenance of the pinned image plus the derived
+                    # "pinned" flag the UI badges on.
+                    "engine": entry_engine(entry),
+                    "pinned": entry_pinned(entry),
                     "shared_gpu": entry_shared_gpu(entry),
                     "gpus": entry_gpus(entry),
                     # Numeric form of "gpus" for the min/max window: the UI
@@ -767,6 +892,9 @@ class Catalog:
         # naming the entry and field) instead of storing it and discovering
         # the problem at render/push time.
         validate_eval(entry.get("eval"), str(entry.get("name") or ""))
+        # ENGINE: same boundary rule -- reject a malformed engine block here
+        # rather than storing it and discovering it at render/push time.
+        validate_engine(entry.get("engine"), str(entry.get("name") or ""))
         entry["catalog_id"] = uuid.uuid4().hex[:12]
         if entry.get("tier") not in TIERS:
             entry["tier"] = TIERS[0]

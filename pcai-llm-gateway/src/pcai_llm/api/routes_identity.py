@@ -1,6 +1,7 @@
 """GET /v1/identity — the whoami probe the SPA calls BEFORE it has a key.
 
-Brief §Z2 (sso-selfmint-BRIEF.md, ratified 2026-10-06). PUBLIC route BY
+Brief §Z2 (ratified 2026-10-06; operator path in documentation/DEPLOYMENT.md
+§ SSO self-mint rollout). PUBLIC route BY
 DESIGN: the SPA boots without a key and must learn (a) whether the
 deployment would let it mint one via POST /v1/keys/for-me (flags.self_mint)
 and (b) who the request resolves to once it HAS a key. There is no auth

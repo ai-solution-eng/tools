@@ -10,14 +10,14 @@ It is a consolidated deep-dive: the same facts appear in
 rationale). If this document and the code disagree, **the code wins** — every
 section links to it.
 
-Verified against the 4.1.3 working tree (2026-11-13).
+Verified against the 4.2.1 working tree (2026-11-20).
 
 ## At a glance
 
 | Header | Layer | Accepted values | Fallback when absent | Scope |
 |---|---|---|---|---|
 | `X-PCAI-Execute-Tools` | relay on/off | `1` / `0` only | key's `relay_default` (false) | `POST /v1/chat/completions` |
-| `X-PCAI-Compress-Tools` | relay result rewriting | `1`/`on`/`true`/`yes`, `0`/`off`/`false`/`no`, `shadow` | deployment `tool_compress_default` (code default `off`) | relayed turns only |
+| `X-PCAI-Compress-Tools` | relay result rewriting | `1`/`on`/`true`/`yes`, `0`/`off`/`false`/`no`, `shadow` | deployment `settings.relay.compress.mode` (code default `off`) | relayed turns only |
 | `X-PCAI-Relay-Deltas` | relay stream rendering | exactly `1` | off (also needs a deployment flag) | relayed turns only |
 | `X-PCAI-Stream-Events` | relay stream telemetry | `1` / `0` only | key's `stream_pcai_events` | relayed turns only |
 | `X-PCAI-Conversation` | conversation bookkeeping | `raw` (case-insensitive) | canonical handling on (fleet switch `canonical_conversations`) | all chat requests |
@@ -114,7 +114,7 @@ Opts a **relayed** turn into compression of oversized tool results
 - **Modes:** `1`/`on`/`true`/`yes` → `on`; `0`/`off`/`false`/`no` →
   `off`; `shadow` → compute and report, rewrite nothing. **Unknown values are
   off, never a 400** — a typo must not fail a turn.
-- **Fallback:** the deployment default `settings.tool_compress_default` (code
+- **Fallback:** the deployment default `settings.relay.compress.mode` (code
   default `off`; a site can ship `shadow` to measure the saving on real
   traffic before enabling).
 - **What `on` does:** recognised result kinds (JSON arrays, NDJSON, logs,
@@ -152,7 +152,7 @@ render-capable client can show a real tool card for a call it did not make
 
 **Two gates, both required:**
 
-1. deployment flag `settings.tool_relay_render_deltas` (chart default false), and
+1. deployment flag `settings.relay.renderDeltas` (chart default false), and
 2. the request header exactly `"1"`
    ([routes_proxy.py](../src/pcai_llm/api/routes_proxy.py#L5672)).
 

@@ -1,8 +1,8 @@
 """Caller identity resolution — Phase A+B of the fleet identity architecture.
 
-Decision contract: ``scratch_workspace/feature-ideas-2026-09/DECISIONS.md``
-("OAuth REVISION (final)", binding). Implementation review:
-``reviews/01-gateway-impl.md`` §1.1–1.3 — this module is the fleet's identity
+Decision contract: the SSO self-mint rollout in ``documentation/DEPLOYMENT.md``
+§ SSO self-mint rollout (binding; the 2026-09 decision notes are not in this
+repo). This module is the fleet's identity
 keystone for the gateway: ONE pure resolver produces ONE ``Caller`` per
 request, and BOTH entry surfaces (the FastAPI dependency, ``api/auth.py
 require_key``, and the pure-ASGI ``/mcp`` wrapper, ``routes_mcp

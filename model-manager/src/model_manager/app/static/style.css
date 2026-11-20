@@ -991,6 +991,19 @@ details[open] > .tree-model-summary::before { transform: rotate(90deg); }
   background: var(--hpe-skip-tint);
   color: var(--hpe-text);
 }
+/* ENGINE: "unpinned" badge for configs whose image tag floats (e.g. :latest).
+   Same status-chip geometry as the unvalidated badge; a redeploy can pick up a
+   different engine release, so the drift risk is worth flagging per config. */
+.cfg-badge-unpinned {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border: 1px solid var(--hpe-warning);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--hpe-text);
+}
 .tree-config-id {
   flex: 0 1 auto;
   margin-left: auto;

@@ -2,7 +2,7 @@
 
 The multi-tenant LLM + MCP gateway for HPE Private Cloud AI (PCAI): one
 service — packaged as the `pcai-llm-gateway` Helm chart, current release
-**4.1.0** — that sits between PCAI-served models, in-cluster MCP servers and
+**4.2.1** — that sits between PCAI-served models, in-cluster MCP servers and
 the people and agents that use them, and accounts for every call. It deploys
 into a PCAI AI Essentials / Ezmeral unit as an EzAppConfig import and
 targets PCAI clusters running vLLM/SGLang model endpoints and fleet MCP
@@ -101,7 +101,7 @@ Fernet-encrypted under an operator-provisioned master key.
 | PCAI Istio gateway (`ezaf-gateway`) + optional oauth2-proxy SSO chain for exposure | Agents and harnesses (DSH, OpenWebUI, opencode, raw SDKs) via `/v1` |
 | Postgres — external (PCAI-provided, the default) or the chart's embedded single-node mode | MCP clients via `/mcp` |
 | Model endpoints (vLLM/SGLang / MLIS) registered in `/admin` | Team leaders via `/team_leader`; admins via `/admin` |
-| Fleet MCP servers registered in `/admin`; Prometheus only for off-peak/model groups/metrics | |
+| Fleet MCP servers registered in `/admin`; Prometheus (as a registered MCP server) for off-peak billing, model-group load, the routing prompt's GPU-load signal, endpoint metrics and the alert sweep | |
 
 ## Capabilities, by theme
 
@@ -228,7 +228,7 @@ Each line states the design decision and why; the link is the deep dive.
    the Postgres URL Secret in the default external-Postgres mode; the Fernet
    master key recommended) — table below and
    [DEPLOYMENT.md § Prerequisites](documentation/DEPLOYMENT.md#prerequisites).
-2. **Import the chart once** — `pcai-llm-gateway-4.1.0.tar.gz` into PCAI
+2. **Import the chart once** — `pcai-llm-gateway-4.2.1.tar.gz` into PCAI
    (AI Essentials / EzAppConfig import; PCAI uploads it to ChartMuseum and
    installs it).
 3. **Set values** — paste a values document into the Helm Values editor:
@@ -293,10 +293,13 @@ Postgres, model endpoints and MCP servers — proven from the cluster.
 | [documentation/changelogs/VERIFICATION.md](documentation/changelogs/VERIFICATION.md) | How do I smoke-test a deployment or an upgrade? |
 | [documentation/changelogs/SSO-ROLLOUT-G2.md](documentation/changelogs/SSO-ROLLOUT-G2.md) | The exact G2 runbook for the SSO + AuthorizationPolicy rollout. |
 | [documentation/changelogs/DIAGNOSTIC-JOBS.md](documentation/changelogs/DIAGNOSTIC-JOBS.md) | Why do my diagnostic Jobs hang in this namespace, and how do I run them correctly? |
+| [documentation/headers.md](documentation/headers.md) | Which `X-PCAI-*` request header does what, and what the default is when it is absent. |
 | [documentation/Audits/](documentation/Audits/) | Audit + remediation reports (what the waves found and fixed). |
-| [documentation/architecture.svg](documentation/architecture.svg) (+ `.dot` source) | The routing/fallback/MCP-fleet diagram. |
+| [documentation/images/](documentation/images/) | The three diagrams, each as `.dot` source + rendered `.svg`/`.png`: [architecture](documentation/images/architecture.svg) (request path, routing, Prometheus monitoring plane, MCP fleet), [memory progression](documentation/images/memory-progression.svg) (automatic capture → map-reduce distill → write → recall), [tenancy](documentation/images/tenancy.svg) (admin → team leader → teammate). |
+| [documentation/design/](documentation/design/) | Design records for UI work (the admin rail redesign, with the approved mockup). |
+| [documentation/history/](documentation/history/) | Archived material kept for the record (superseded audits, the relay work kits) — never authoritative. |
 | [helm/values-examples/README.md](helm/values-examples/README.md) | Paste-ready values documents (G2, hosted trial) and the `# SITE:` convention. |
-| [helm/local/README.md](helm/local/README.md) | Where per-site credentials-bearing values live (gitignored, never packaged). |
+| `helm/local/README.md` (site-local, gitignored) | Where per-site credentials-bearing values live (never packaged; not in a clone by design). |
 
 ## Developing locally
 

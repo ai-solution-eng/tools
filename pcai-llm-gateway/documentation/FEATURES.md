@@ -624,6 +624,9 @@ chat cascade exactly as `auto` does.
 
 ## Team leader tier (enrollment-scoped console)
 
+> Diagram: [images/tenancy.svg](images/tenancy.svg) — the admin → team leader →
+> teammate credential ladder, the one budget gate, and the scoping discipline.
+
 An enrollment code (§ Self-service enrollment) is also a TEAM INVITE: every
 key redeemed from it carries `api_keys.enrollment_id`, which groups those
 keys into a team and gives the enrollment two things a plain key budget
@@ -834,6 +837,10 @@ someone who is not an admin.
   re-encryption and no re-prompt.
 
 ## Off-peak billing
+
+> Diagram: [images/architecture.svg](images/architecture.svg) — the monitoring
+> plane: the same Prometheus-fed evaluator sets the billing fraction AND the
+> load-aware cascade entry.
 
 Demand-shaped budget consumption: GPU demand is spiky — a tenant burning
 budget at 3 AM costs the fleet no foreground capacity, so charging their
@@ -1402,7 +1409,9 @@ get wrong, and the failure mode is silent (an unauthenticated probe just
 > **Configuring memory?** Start with [MEMORY.md](MEMORY.md) — the end-to-end
 > walkthrough (mint a RAG key → create and ★ a dataset → attach the header
 > override → prove the feed moves). This section describes the pipeline
-> internals; MEMORY.md is the operator/user path into it.
+> internals; MEMORY.md is the operator/user path into it. The pipeline shape
+> (capture → sweep → gate → **automatic map-reduce** → write → recall) is
+> drawn in [images/memory-progression.svg](images/memory-progression.svg).
 
 One canonical pipeline turns a conversation transcript into a structured
 project-summary memory (`[MEMORY INDEX | project: … | type: session-summary |

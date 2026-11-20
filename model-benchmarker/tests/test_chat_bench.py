@@ -587,12 +587,64 @@ class TestCacheHitRate:
         assert row.cache_hit_rate == pytest.approx(0.5)
 
     def test_level_row_divide_by_zero_guarded(self):
-        # No prompt tokens reported at all: rate is unmeasurable (None), not a
-        # ZeroDivisionError, and cached_tokens stays 0.
+        # No usage block at all: rate is unmeasurable (None), not a
+        # ZeroDivisionError, and no cached count was measured either.
         row = bc.build_level_rows(ctx=0, users=1, task_name="t", group=[_mk_result()], group_fail=0, multiturn=False)[0]
-        assert row.cached_tokens == 0
+        assert row.cached_tokens is None
         assert row.prompt_tokens_total == 0
         assert row.cache_hit_rate is None
+
+    def test_unreported_cache_is_unmeasurable_not_zero(self):
+        """The SGLang shape: usage carries prompt_tokens but the engine never
+        populates prompt_tokens_details.cached_tokens.  Reporting that as 0.0%
+        reads as "prefix caching is off" and sends the operator after a flag
+        that is already correct — it is an absent measurement, not a miss."""
+        r1 = _mk_result(prompt_tokens=4000)
+        r2 = _mk_result(prompt_tokens=6000)
+        row = bc.build_level_rows(ctx=0, users=2, task_name="t", group=[r1, r2], group_fail=0, multiturn=True)[0]
+        assert row.cached_tokens is None
+        assert row.prompt_tokens_total == 10000  # the prompt side WAS reported
+        assert row.cache_hit_rate is None
+
+    def test_measured_zero_stays_distinct_from_unreported(self):
+        """A reported 0 is a finding; an absent field is not.  They must not
+        collapse into the same number."""
+        row = bc.build_level_rows(
+            ctx=0,
+            users=1,
+            task_name="t",
+            group=[_mk_result(prompt_tokens=4000, cached_tokens=0)],
+            group_fail=0,
+            multiturn=True,
+        )[0]
+        assert row.cached_tokens == 0
+        assert row.cache_hit_rate == pytest.approx(0.0)
+
+    def test_partial_reporting_uses_the_reporting_subset(self):
+        """The denominator must not be diluted by requests that reported
+        nothing, or a mostly-blind run understates a healthy cache."""
+        reported = _mk_result(prompt_tokens=1000, cached_tokens=500)
+        silent = _mk_result(prompt_tokens=9000)
+        row = bc.build_level_rows(
+            ctx=0, users=2, task_name="t", group=[reported, silent], group_fail=0, multiturn=False
+        )[0]
+        assert row.cached_tokens == 500
+        assert row.prompt_tokens_total == 10000  # all-requests total is kept
+        assert row.cache_hit_rate == pytest.approx(0.5)  # 500/1000, not 500/10000
+
+    def test_markdown_renders_dash_for_unreported_cache(self):
+        row = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1.0, "P95": 1.0, "P99": 1.0, "P100": 1.0},
+            tps={"P50": 9.0, "P95": 9.0, "P99": 9.0, "P100": 9.0},
+            prompt_tokens_total=1000,
+        )
+        md = format_table_markdown([row])
+        cells = [c.strip() for c in md.splitlines()[2].strip("|").split("|")]
+        assert cells[-1] == "-"
 
     def test_markdown_carries_the_cache_column(self):
         row = LevelRow(
@@ -636,6 +688,7 @@ class TestCacheHitRate:
             task="t",
             failed=0,
             ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            cached_tokens=0,  # MEASURED zero: the field was reported, nothing hit
             prompt_tokens_total=8000,
         )
         note = bc._cache_note([zero])
@@ -667,6 +720,7 @@ class TestCacheHitRate:
             task="t",
             failed=0,
             ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            cached_tokens=0,
             prompt_tokens_total=8000,
         )
         note = bc._cache_note([zero], cache_possible=False)
@@ -674,6 +728,36 @@ class TestCacheHitRate:
         assert "--no-nonce" in note
         # The misconfiguration wording must NOT appear in this mode.
         assert "--enable-cache-report" not in note
+
+    def test_cache_note_unreported_is_not_a_zero(self):
+        """Prompt tokens with no cached-token count earns the unmeasurable
+        note and must NOT claim a measured zero."""
+        row = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            prompt_tokens_total=8000,
+        )
+        assert row.cached_tokens is None
+        note = bc._cache_note([row])
+        assert "unmeasurable" in note
+        assert "exactly 0" not in note
+        assert "--enable-cache-report" not in note
+
+    def test_cache_note_unreported_is_silent_when_reuse_is_impossible(self):
+        """A nonced run cannot reuse a prefix, so an absent measurement there
+        is not worth a note either."""
+        row = LevelRow(
+            ctx=0,
+            users=1,
+            task="t",
+            failed=0,
+            ttft={"P50": 1, "P95": 1, "P99": 1, "P100": 1},
+            prompt_tokens_total=8000,
+        )
+        assert bc._cache_note([row], cache_possible=False) == ""
 
     def test_cache_reuse_possible_reads_the_sweep_flags(self):
         assert bc._cache_reuse_possible(SimpleNamespace(no_nonce=True, multiturn=False)) is True

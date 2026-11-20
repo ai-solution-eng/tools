@@ -1,7 +1,8 @@
 # helm/values-examples — paste-ready values for PCAI
 
-Example **full values documents** for the pcai-llm-gateway Helm chart. Each
-file is complete (every chart key listed) and **intentionally secret-free** —
+Example **site values documents** for the pcai-llm-gateway Helm chart. Each
+file carries every key that site turns, omits the rest (chart defaults apply),
+and is **intentionally secret-free** —
 every credential is a `REPLACE_WITH_*` placeholder or an out-of-band Secret
 reference (see *Placeholder convention* below).
 
