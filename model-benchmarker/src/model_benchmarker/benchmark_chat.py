@@ -771,8 +771,8 @@ def _resume_seed_rows(text: str) -> list[LevelRow]:
     aggregates the atoms do not carry (itl_mean, n_requests, goodput) default
     — the table cells the artifacts render are all preserved (MB-CACHE: the
     cache hit rate comes back as the atoms' cache_hit_pct; the raw token
-    counts are not in the table, so they default to 0 and a fully-seeded run
-    cannot fire the zero-cache note)."""
+    counts are not in the table, so they default to unmeasured (None/0) and a
+    fully-seeded run cannot fire the zero-cache note)."""
     atoms = _resume_atoms(text)
     rows: list[LevelRow] = []
     for a in atoms:
@@ -1669,13 +1669,28 @@ def build_level_rows(
     itl_pcts = merged.percentiles() if merged.n else None
     burst_frac = sum(1 for r in group if r.burst_guarded) / len(group)
 
-    # MB-CACHE: the server-reported cached prompt tokens of the group, plus
-    # the cached/prompt rate.  The rate is None (unmeasurable, rendered as a
-    # dash) when no prompt tokens were reported, which stays distinct from a
-    # measured 0.0 — the CONFIG signal that cache reporting may be off.
-    cached_tokens = sum(r.cached_tokens for r in group if r.cached_tokens)
+    # MB-CACHE: only requests whose usage block actually carried
+    # ``cached_tokens`` can contribute to the rate.  A request that reported
+    # prompt_tokens but NOT cached_tokens is UNMEASURABLE, not a miss: folding
+    # the None away as 0 reported a hard 0.0% for engines that simply never
+    # populate the field (SGLang, and vLLM without --enable-cache-report),
+    # which reads as "prefix caching is off" while the server may be hitting
+    # heavily.  The group keeps cached_tokens None when nothing reported, so
+    # the rate renders as a dash — distinct from a measured 0.0.
+    reporting = [r for r in group if r.cached_tokens is not None]
     prompt_tokens_total = sum(r.prompt_tokens for r in group if r.prompt_tokens)
-    cache_hit_rate = cached_tokens / prompt_tokens_total if prompt_tokens_total > 0 else None
+    cached_tokens: int | None = None
+    cache_hit_rate: float | None = None
+    if reporting:
+        # "or 0" keeps the sum a plain int for the type checker; reporting
+        # holds no None, so it cannot mask a real count.
+        cached_total = sum(r.cached_tokens or 0 for r in reporting)
+        # Denominator is the reporting subset only: mixing in prompt tokens
+        # from requests that reported nothing would understate the rate.
+        prompt_tokens_reporting = sum(r.prompt_tokens for r in reporting if r.prompt_tokens)
+        cached_tokens = cached_total
+        if prompt_tokens_reporting > 0:
+            cache_hit_rate = cached_total / prompt_tokens_reporting
 
     goodput: float | None = None
     goodput_each: dict[str, float] | None = None
@@ -1795,10 +1810,15 @@ class LevelRow:
     # False when the level's max TTFT is straggler-dominated (P100/P50 above
     # the stability threshold), so prefill_tps understates the real rate.
     prefill_stable: bool = True
-    # MB-CACHE: server-reported cache usage for the group — total cached
-    # prompt tokens (0 when unreported), the group's total prompt tokens, and
-    # the cached/prompt rate (None when unmeasurable, distinct from 0.0).
-    cached_tokens: int = 0
+    # MB-CACHE: server-reported cache usage for the group.  ``cached_tokens``
+    # is None when NO request in the group reported
+    # ``usage.prompt_tokens_details.cached_tokens`` — the engine never filled
+    # the field, so nothing was measured and the rate is None (a dash).  A
+    # group whose field WAS reported but never hit carries 0 here, which is
+    # the distinct CONFIG signal (prefix cache off, or the workload misses).
+    # ``prompt_tokens_total`` stays the all-requests total; the rate's
+    # denominator is only the requests that reported a cached count.
+    cached_tokens: int | None = None
     prompt_tokens_total: int = 0
     cache_hit_rate: float | None = None
 
@@ -1982,8 +2002,11 @@ def _cache_note(rows: list[LevelRow], *, cache_possible: bool = True) -> str:
     A measured zero (prompt tokens reported, none of them cached) is a CONFIG
     signal: the engine most likely does not have cache reporting enabled
     (vLLM needs ``--enable-cache-report``; the fleet enables it only on some
-    catalog entries, and its absence is silent).  An UNMEASURABLE rate (no
-    prompt tokens at all) says nothing and earns no note.
+    catalog entries, and its absence is silent).  An UNMEASURABLE rate says
+    nothing about the engine and must never borrow that wording: it has two
+    shapes — no prompt tokens at all (silent, no note), and prompt tokens
+    with NO cached-token count (a note, because a 0% column there would be a
+    reporting artifact rather than a finding).
 
     ``cache_possible=False`` means the run was CONSTRUCTED so that no request
     can reuse a prefix — the default mode prepends a unique random nonce to
@@ -1994,7 +2017,25 @@ def _cache_note(rows: list[LevelRow], *, cache_possible: bool = True) -> str:
     note).  Those runs get the accurate note instead.
     """
     prompt_total = sum(r.prompt_tokens_total for r in rows)
-    cached_total = sum(r.cached_tokens for r in rows)
+    # Only rows whose engine actually reported a cached-token count can say
+    # anything about caching.  A row that reported prompt tokens but no
+    # cached_tokens is UNMEASURABLE: it must not borrow the "none were cached"
+    # wording below, which asserts a measurement that never happened.
+    reporting = [r for r in rows if r.cached_tokens is not None]
+    if not reporting:
+        # Nothing was measured.  Say so only when this run COULD have reused a
+        # prefix — under the default per-request nonce the zero is the design,
+        # and a missing measurement costs the operator nothing there.
+        if prompt_total > 0 and cache_possible:
+            return (
+                "\nNOTE: cache hit rate is unmeasurable, not 0 — the engine reported "
+                "prompt tokens but no cached-token count "
+                "(usage.prompt_tokens_details.cached_tokens), so a 0% rate here would be "
+                "a reporting artifact. Check the server's own cache metrics before "
+                "concluding prefix caching is off."
+            )
+        return ""
+    cached_total = sum(r.cached_tokens or 0 for r in reporting)
     if prompt_total > 0 and cached_total == 0:
         if not cache_possible:
             return (
