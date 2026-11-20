@@ -539,12 +539,19 @@ data:
     // the headless container from trying to launch a browser.
     const primaryConfigPath = process.env.DSH_CONFIG || process.env.DSH_CONFIG_PATH || '/var/dsh/home/.dsh/profiles/web/cordis.patch.yml'
     const configDir = path.dirname(primaryConfigPath)
+    // DSH_HOME is the parent of profiles/; dsh reads `$DSH_HOME/.env` there,
+    // NOT in the profile directory. Watching the profile-relative path left
+    // the signature permanently 'missing', so editing .env never restarted
+    // dsh and new keys were never picked up.
+    const dshHome = process.env.DSH_HOME || path.dirname(path.dirname(configDir))
+    // The one watched file dsh never writes itself.
+    const envPath = `${dshHome}/.env`
     // `.env` is a launch-environment layer: dsh reads it only when the
     // process starts, so edits require a dsh restart to take effect —
     // watching it here gives that automatically (same UX as settings.yaml).
     //
-    // Watch model: config FILES only — .env, the web profile's
-    // cordis.patch.yml and the dsh.profile manifest. dsh >= 0.2.1 dropped
+    // Watch model: config FILES only — $DSH_HOME/.env (absolute), the web
+    // profile's cordis.patch.yml and the dsh.profile manifest. dsh >= 0.2.1 dropped
     // settings.yaml entirely: the profile patch layer IS the config, so
     // there is nothing else to watch. Do NOT watch the profile tree: dsh
     // writes session/runtime state into it continuously, and restarting on
@@ -555,10 +562,16 @@ data:
     const watchedConfigFiles = [
       ...new Set(
         (process.env.DSH_WATCH_CONFIG_FILES ||
-          '.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile')
+          `${dshHome}/.env,profiles/web/cordis.patch.yml,profiles/web/dsh.profile`)
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean)
+          // A bare '.env' has always meant "the launch env file", which lives in
+          // DSH_HOME — not in the profile dir. The deployment passes that exact
+          // list through DSH_WATCH_CONFIG_FILES (router template), so normalize
+          // it HERE: trusting every caller to spell the absolute path is what
+          // left .env watched at a path that never existed.
+          .map((value) => (value === '.env' ? `${dshHome}/.env` : value))
           .concat(path.basename(primaryConfigPath)),
       ),
     ]
@@ -598,7 +611,9 @@ data:
     function readConfigSignature() {
       const signature = {}
       for (const file of watchedConfigFiles) {
-        const filePath = path.join(configDir, file)
+        // An absolute entry (the DSH_HOME .env) must not be joined to
+        // configDir: path.join('/a/b', '/c/.env') collapses to '/a/b/c/.env'.
+        const filePath = path.isAbsolute(file) ? file : path.join(configDir, file)
         try {
           const stat = fs.statSync(filePath)
           signature[`file:${file}`] = `${stat.mtimeMs}:${stat.size}`
@@ -999,11 +1014,21 @@ data:
       const changedFiles = changedConfigFiles(nextSignature)
       lastConfigSignature = nextSignature
       const inGrace = Date.now() - lastStartAt < BOOT_SETTLE_MS
+      // `.env` is a USER file: dsh reads it at start and never writes it. The
+      // settle window exists to absorb dsh's OWN boot writes into profiles/web,
+      // so it must not delay a .env edit — apply it at once, boot or not.
+      if (changedFiles.includes(`file:${envPath}`)) {
+        pendingRestart = null
+        if (isPrimaryConfigValid()) scheduleRestart('.env changed')
+        return
+      }
       const userFileEdits = changedFiles.filter((key) => key.startsWith('file:'))
       if (inGrace) {
         if (userFileEdits.length) pendingRestart = userFileEdits.join(', ')
-        if (changedFiles.length || pendingRestart) {
-          console.log(`[dsh] ignoring changes during boot settle window: ${[...new Set([...changedFiles, ...(pendingRestart ? [pendingRestart] : [])])].join(', ')}`)
+        // Log only an actual change: pendingRestart alone used to re-print this
+        // every poll for the rest of the window, which read like a failure.
+        if (changedFiles.length) {
+          console.log(`[dsh] queued until the boot settle window ends: ${changedFiles.join(', ')}`)
         }
         return
       }
@@ -1040,6 +1065,19 @@ data:
       })
     } catch (error) {
       console.error('[dsh] config watch setup failed', error)
+    }
+
+    try {
+      // `.env` lives in DSH_HOME, outside configDir, so it needs its own
+      // trigger — otherwise the 3s poll is the floor. Watch the DIRECTORY, not
+      // the file: editors save by writing a temp file and renaming it over
+      // .env, which a file watch does not survive. Non-recursive, so the
+      // sessions/storages churn underneath stays invisible.
+      fs.watch(dshHome, () => {
+        setTimeout(() => maybeRestart(), 100)
+      })
+    } catch (error) {
+      console.error('[dsh] .env watch setup failed; the 3s poll still applies', error)
     }
 
     setInterval(() => maybeRestart(), 3000)

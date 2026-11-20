@@ -40,6 +40,40 @@ storage:
   keepPvcOnDelete: true
   stateSize: 2Gi
 
+# Cross-namespace shared workspace: make /workspace/shared the SAME filesystem in
+# every namespace, for SSO and non-SSO users alike.
+#
+# A PVC is namespaced and a pod can only mount a claim from its own namespace, so
+# "one shared PVC" cannot exist. The platform shares kubeflow-shared-pvc the other
+# way round — ONE VAST volume, a statically provisioned PV per namespace, every PV
+# carrying the same csi.volumeHandle — and this block does the same:
+#
+#   anchor   the release-namespace <release>-shared-pvc keeps owning the volume.
+#            Its PV is patched to reclaimPolicy Retain FIRST, so deleting that one
+#            claim can never delete the volume every namespace now depends on.
+#   clone    each unit namespace gets PV <ns>-<release>-shared-xns-pvc with
+#            spec.csi, capacity, accessModes, storageClassName and volumeMode
+#            copied verbatim from the anchor PV, claimRef pinned to that
+#            namespace, and Retain.
+#   claim    the namespace's claim is created with volumeName set, so it
+#            pre-binds to that PV and never triggers dynamic provisioning.
+#
+# Units mount the -xns claim at /workspace/shared; the claim name is identical in
+# every namespace, so the pod template stays uniform.
+#
+# Needs the router to manage cluster-scoped PVs — rbac.yaml adds that ClusterRole
+# only when this is on. It FAILS OPEN: any error logs and falls back to today's
+# per-namespace dynamically provisioned claim, so a bug here can never stop a unit
+# from starting.
+#
+# Rollout order: empty the per-namespace shared folders first
+# (scripts/migrate-shared-to-personal.sh), then flip this on. Rolling back is
+# turning it off again — the -xns claims and their PVs are left in place, and the
+# legacy claims are untouched either way.
+sharedWorkspace:
+  crossNamespace: false
+  stateSize: 2Gi
+
 # Max request body accepted by the in-pod nginx (the single entry point in
 # front of dsh at :8082). nginx's own default is 1 MB, which is far too small
 # once the browser base64-encodes a pasted/dropped image into a
@@ -69,7 +103,7 @@ dataManager:
 # changes, the router patches each Deployment and the unit rolls.
 # Historical values live as comments on the template constant (RUNTIME_REV in
 # templates/configmap-router.yaml); keep this in sync with the shipped default.
-RUNTIME_REV: 56
+RUNTIME_REV: 59
 
 images:
   # Baked user image: carries the apt toolchain, @deepseek-ai/dsh, uv, ttyd
