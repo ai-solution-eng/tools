@@ -197,7 +197,13 @@ data:
     // its own (in-document links, the back chip); the dialog now adopts the page
     // it is actually showing, so Source / Rename / Delete / Save act on THAT file
     // instead of the one the dialog was opened with.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 32 }}'
+    // r31 (RUNTIME_REV): editor keyboard — Esc closes the open file, Cmd/Ctrl-S
+    // saves and Cmd/Ctrl-W closes, with a Save / Don't Save / Cancel prompt
+    // whenever the buffer is modified (the same prompt guards opening another
+    // file, leaving the Source view and Rename). Client-only: data_manager.mjs
+    // is untouched. A re-stamp, because data_manager.html is a subPath mount
+    // that never refreshes on its own.
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 34 }}'
     const userTemplateVersion = `terminal-tab-v25-opencode-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenChamberVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- Unit-pod container resources -------------------------------------
