@@ -162,7 +162,7 @@ openwork:
 # v10: webBootstrapToken=true (browser gets the injected client token; welcome-screen strand fix)
 # r25: workspace convergence — the supervisor converges server.json to the chart's workspaces
 #      (personal + shared, plus platform-shared/platform-user on mounted SSO units).
-RUNTIME_REV: 35
+RUNTIME_REV: 37
 
 # Browser-facing UI: openwork-server web — single origin (UI + API) on
 # serverPort, bound to 127.0.0.1 inside the pod; the nginx sidecar (:8082)
@@ -460,6 +460,38 @@ platformIntegration:
   # read-only in the Data Manager (unix permissions stay the real
   # enforcement regardless).
   readOnly: false
+
+# Cross-namespace shared workspace: make /workspace/shared the SAME filesystem in
+# every namespace, for SSO and non-SSO users alike.
+#
+# A PVC is namespaced and a pod can only mount a claim from its own namespace, so
+# "one shared PVC" cannot exist. The platform shares kubeflow-shared-pvc the other
+# way round - ONE VAST volume, a statically provisioned PV per namespace, every PV
+# carrying the same csi.volumeHandle - and this block does the same:
+#
+#   anchor   the release-namespace <release>-shared-pvc keeps owning the volume.
+#            Its PV is patched to reclaimPolicy Retain FIRST, so deleting that one
+#            claim can never delete the volume every namespace now depends on.
+#   clone    each unit namespace gets PV <ns>-<release>-shared-xns-pvc with
+#            spec.csi, capacity, accessModes, storageClassName and volumeMode
+#            copied verbatim from the anchor PV, claimRef pinned to that
+#            namespace, and Retain.
+#   claim    the namespace claim is created with volumeName set, so it pre-binds
+#            to that PV and never triggers dynamic provisioning.
+#
+# Units mount the -xns claim at /workspace/shared; the claim name is identical in
+# every namespace, so the pod template stays uniform.
+#
+# Needs the router to manage cluster-scoped PVs - rbac.yaml adds that ClusterRole
+# only when this is on. It FAILS OPEN: any error logs and falls back to today's
+# per-namespace dynamically provisioned claim, so a bug here can never stop a unit
+# from starting.
+#
+# Rollout order: empty the per-namespace shared folders first, then flip this on.
+# Rolling back is turning it off again - the -xns claims and their PVs are left in
+# place, and the legacy claims are untouched either way.
+sharedWorkspace:
+  crossNamespace: false
 
 # ============================================================
 # Shared workspace content (populates the shared PVC)

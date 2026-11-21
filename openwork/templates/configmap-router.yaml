@@ -16,6 +16,16 @@ data:
 
     const namespace = process.env.POD_NAMESPACE || '{{ .Release.Namespace }}'
     const sharedWorkspaceClaim = process.env.SHARED_WORKSPACE_CLAIM || '{{ .Release.Name }}-shared-pvc'
+    // Cross-namespace shared workspace (values sharedWorkspace.crossNamespace).
+    // The anchor claim above keeps OWNING the volume; units mount a per-namespace
+    // claim pre-bound to a PV cloned from the anchor, so every namespace ends up
+    // on the SAME VAST volume - the trick kubeflow-shared-pvc already uses.
+    // The -xns suffix is deliberate: it never collides with the legacy
+    // per-namespace claim, so a migration cannot destroy it and rolling back is
+    // just pointing the mount at the old name again.
+    const xnsSharedEnabled = '{{ .Values.sharedWorkspace.crossNamespace }}' === 'true'
+    const xnsSharedClaim = '{{ .Release.Name }}-shared-xns-pvc'
+    const unitSharedClaim = xnsSharedEnabled ? xnsSharedClaim : sharedWorkspaceClaim
     const storageClassName = process.env.STORAGE_CLASS_NAME || '{{ .Values.storageClass }}'
     const previewDomainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX || '{{ .Values.previewDomain }}'
     const userInstanceImage = process.env.USER_INSTANCE_IMAGE || '{{ .Values.images.user }}'
@@ -168,7 +178,7 @@ data:
     // file, leaving the Source view and Rename). Client-only: data_manager.mjs
     // is untouched. A re-stamp, because data_manager.html is a subPath mount
     // that never refreshes on its own.
-    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 35 }}'
+    const userRuntimeRev = '{{ .Values.RUNTIME_REV | default 37 }}'
     const userTemplateVersion = `terminal-tab-v22-openwork-${dockerSidecar}-${[...new Set([userOpencodeVersion, userOpenWorkServerVersion, userImageRev])].join('-')}-r${userRuntimeRev}`
 
     // --- Unit-pod container resources -------------------------------------
@@ -1181,7 +1191,7 @@ data:
           ns: tns,
           workspaceClaim: names.workspaceClaim,
           stateClaim: names.stateClaim,
-          sharedClaim: sharedWorkspaceClaim,
+          sharedClaim: unitSharedClaim,
         }
       }
       for (const candidate of candidates) {
@@ -1206,6 +1216,12 @@ data:
         } else {
           for (const claim of [target.workspaceClaim, target.stateClaim, target.sharedClaim].filter(Boolean)) {
             if (await isPlatformOwnedClaim(tns, claim)) continue
+            // Under crossNamespace the shared claim is mounted by EVERY unit in
+            // the namespace. Purging one user must never take it from the rest.
+            if (xnsSharedEnabled && claim === xnsSharedClaim) {
+              console.log('[xns-shared] keeping shared claim ' + tns + '/' + claim + ' (shared by every unit)')
+              continue
+            }
             await deleteK8s(`/api/v1/namespaces/${tns}/persistentvolumeclaims`, claim)
           }
         }
@@ -1485,11 +1501,148 @@ data:
       }
     }
 
+    // --- Cross-namespace shared workspace --------------------------------
+    // One VAST volume, one PV per namespace: the pattern kubeflow-shared-pvc
+    // already uses on this platform. The release-namespace claim is the ANCHOR
+    // and keeps owning the volume; every other namespace gets a PV cloned from
+    // the anchor's PV (same driver / volumeHandle / volumeAttributes) with its
+    // claimRef pinned to that namespace's claim.
+    //
+    // Cached once resolved. A MISS is not cached: the anchor may still be
+    // binding when the first unit is provisioned, and a cached null would keep
+    // the feature off until the router restarted.
+    let anchorSharedPV = null
+    async function resolveAnchorSharedVolume() {
+      if (anchorSharedPV) return anchorSharedPV
+      // HARD RAIL 1: the platform volumes are mounted BY REFERENCE and are never
+      // ours to touch. kubeflow-shared-pvc carries other teams' data; if
+      // SHARED_WORKSPACE_CLAIM is ever pointed at a platform claim, refuse.
+      if (sharedWorkspaceClaim === platformSharedClaim || sharedWorkspaceClaim === platformUserClaim) {
+        console.log('[xns-shared] REFUSING: SHARED_WORKSPACE_CLAIM is the platform claim ' + sharedWorkspaceClaim)
+        return null
+      }
+      const pvc = await k8sRequest('GET', '/api/v1/namespaces/' + namespace + '/persistentvolumeclaims/' + sharedWorkspaceClaim)
+      const pvName = pvc && pvc.spec && pvc.spec.volumeName
+      if (!pvName) return null
+      const pv = await k8sRequest('GET', '/api/v1/persistentvolumes/' + pvName)
+      if (!pv || !pv.spec || !pv.spec.csi) return null
+      // HARD RAIL 2: only ever act on the PV pinned to OUR anchor claim. A PV
+      // bound to a platform claim (<ns>-kf-pv) must never be patched — flipping
+      // its reclaim policy or claimRef would put another team's volume at risk.
+      const anchorRef = pv.spec.claimRef
+      if (anchorRef && (anchorRef.namespace !== namespace || anchorRef.name !== sharedWorkspaceClaim)) {
+        console.log('[xns-shared] REFUSING: PV ' + pvName + ' is bound to ' + anchorRef.namespace + '/' + anchorRef.name + ', not the anchor')
+        return null
+      }
+      // HARD RAIL 3: no handle, nothing to clone.
+      if (!pv.spec.csi.volumeHandle) return null
+      // Retain BEFORE the first clone exists. With the default Delete policy,
+      // deleting the anchor claim would delete the volume that every namespace
+      // now points at - one helm uninstall away from destroying the lot.
+      if (pv.spec.persistentVolumeReclaimPolicy !== 'Retain') {
+        await k8sRequest('PATCH', '/api/v1/persistentvolumes/' + pvName, {
+          spec: { persistentVolumeReclaimPolicy: 'Retain' },
+        })
+        pv.spec.persistentVolumeReclaimPolicy = 'Retain'
+        console.log('[xns-shared] anchor PV ' + pvName + ' reclaimPolicy -> Retain')
+      }
+      anchorSharedPV = pv
+      return pv
+    }
+
+    // Create (or find) this namespace's clone of the anchor PV and return its
+    // name, so the claim can pre-bind to it. Returns null to fall back.
+    async function ensureCrossNamespaceSharedPV(claimName, ns) {
+      const anchor = await resolveAnchorSharedVolume()
+      if (!anchor) {
+        console.log('[xns-shared] no anchor volume yet for ' + ns + ', using a per-namespace claim')
+        return null
+      }
+      const pvName = ns + '-' + claimName
+      const existing = await k8sRequest('GET', '/api/v1/persistentvolumes/' + pvName)
+      if (existing) {
+        // After a claim is deleted (uninstall, namespace cleanup) the PV keeps
+        // the OLD claim UID in its claimRef and sits Released, which never
+        // rebinds on its own. Re-point it at the current claim by clearing the
+        // stale UID; only in a Released/Failed phase, so a healthy binding is
+        // never disturbed.
+        const phase = existing.status && existing.status.phase
+        const ref = existing.spec && existing.spec.claimRef
+        if (ref && ref.uid && (phase === 'Released' || phase === 'Failed')) {
+          await k8sRequest('PATCH', '/api/v1/persistentvolumes/' + pvName, {
+            spec: { claimRef: { apiVersion: 'v1', kind: 'PersistentVolumeClaim', name: claimName, namespace: ns } },
+          })
+          console.log('[xns-shared] re-adopted released PV ' + pvName)
+        }
+        return pvName
+      }
+      const spec = anchor.spec
+      const manifest = {
+        apiVersion: 'v1',
+        kind: 'PersistentVolume',
+        metadata: {
+          name: pvName,
+          labels: {
+            app: '{{ .Chart.Name }}',
+            'dsh-cross-namespace-shared': 'true',
+          },
+        },
+        spec: {
+          accessModes: spec.accessModes,
+          capacity: spec.capacity,
+          // Pinned to THIS namespace's claim: that is what stops two namespaces
+          // from binding the same PV.
+          claimRef: { apiVersion: 'v1', kind: 'PersistentVolumeClaim', name: claimName, namespace: ns },
+          csi: spec.csi,
+          persistentVolumeReclaimPolicy: 'Retain',
+          ...(spec.storageClassName ? { storageClassName: spec.storageClassName } : {}),
+          volumeMode: spec.volumeMode || 'Filesystem',
+        },
+      }
+      try {
+        await k8sRequest('POST', '/api/v1/persistentvolumes', manifest)
+        console.log('[xns-shared] created PV ' + pvName + ' -> ' + spec.csi.volumeHandle)
+      } catch (error) {
+        // 409 = another reconcile created it between our GET and our POST.
+        if (error.statusCode !== 409) throw error
+      }
+      return pvName
+    }
     async function ensurePersistentVolumeClaim(name, size, ns = namespace, ownerRefs = null, accessModes = ['ReadWriteOnce']) {
+      // A programming error must never reach the API server: an empty name comes
+      // back as a 422 that aborts the whole login instead of failing open.
+      if (!name) {
+        console.log('[claims] refusing a claim with an empty name (ns=' + ns + ')')
+        return
+      }
       const path = `/api/v1/namespaces/${ns}/persistentvolumeclaims/${name}`
       const existing = await k8sRequest('GET', path)
       if (existing) {
+        // F4: a claim that exists but is NOT pre-bound to the shared PV cannot be
+        // healed in place (volumeName is immutable once bound), so it is a silent
+        // per-namespace fork. Say so loudly instead of pretending it is fine.
+        if (xnsSharedEnabled && name === xnsSharedClaim && !(existing.spec && existing.spec.volumeName)) {
+          console.log('[xns-shared] WARNING: ' + ns + '/' + name + ' is bound to a per-namespace volume, not the shared one - operator attention needed')
+        }
         return
+      }
+      // Cross-namespace shared claim: pre-bind it to a PV cloned from the
+      // anchor so every namespace lands on the SAME volume. FAIL OPEN - a null
+      // here means today's per-namespace dynamically provisioned claim, which is
+      // always a working unit, just not a shared one.
+      let volumeName = null
+      let requestSize = size
+      if (xnsSharedEnabled && name === xnsSharedClaim) {
+        try {
+          volumeName = await ensureCrossNamespaceSharedPV(name, ns)
+          // Request exactly what the cloned PV offers. A request LARGER than the
+          // PV can never bind, and the claim would then sit Pending forever: the
+          // fail-open above only covers errors raised while creating it.
+          const cap = anchorSharedPV && anchorSharedPV.spec && anchorSharedPV.spec.capacity
+          if (volumeName && cap && cap.storage) requestSize = cap.storage
+        } catch (error) {
+          console.log('[xns-shared] binding ' + ns + '/' + name + ' failed, falling back to a per-namespace claim:', error.message)
+        }
       }
       const manifest = {
         apiVersion: 'v1',
@@ -1499,16 +1652,26 @@ data:
           namespace: ns,
           labels: {
             app: '{{ .Chart.Name }}',
-            'openwork-user-managed': 'true',
+            // The cross-namespace shared claim is INFRASTRUCTURE, not user data:
+            // every unit in the namespace mounts it, so it must not be swept by
+            // the pre-delete cleanup or by one user's purge (both key off openwork-user-managed).
+            // It survives uninstall and re-binds on reinstall.
+            ...(name === xnsSharedClaim
+              ? { 'dsh-cross-namespace-shared': 'true' }
+              : { 'openwork-user-managed': 'true' }),
           },
           ...(ownerRefs ? { ownerReferences: ownerRefs } : {}),
         },
         spec: {
           accessModes,
           storageClassName,
+          // A pre-bound claim: volumeName makes the binder use exactly this PV
+          // and suppresses dynamic provisioning, which is what keeps every
+          // namespace on the anchor's volume.
+          ...(volumeName ? { volumeName } : {}),
           resources: {
             requests: {
-              storage: size,
+              storage: requestSize,
             },
           },
         },
@@ -1680,7 +1843,7 @@ data:
         // every boot, and NEVER the platform volumes (/mnt/shared, /mnt/user):
         // those keep their platform ownership; access is enforced by unix
         // permissions against the identity, exactly like a notebook.
-        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/openwork/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/openwork /workspace/personal /workspace/shared; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; fi',
+        'RUN_AS_USER=""; if [ -n "$USER_INFO_UID" ] && [ "$USER_INFO_UID" != "0" ]; then export HOME=/var/openwork/home; RUN_AS_USER="setpriv --clear-groups --reuid=$USER_INFO_UID --regid=$USER_INFO_GID"; for d in /var/openwork /workspace/personal{{ if not .Values.sharedWorkspace.crossNamespace }} /workspace/shared{{ end }}; do if [ "$(stat -c %u "$d" 2>/dev/null)" != "$USER_INFO_UID" ]; then chown -R "$USER_INFO_UID:$USER_INFO_GID" "$d" || true; fi; done; {{ if .Values.sharedWorkspace.crossNamespace }}if [ -n "$PREVIEW_USER_SLUG" ]; then mkdir -p "/workspace/shared/$PREVIEW_USER_SLUG" 2>/dev/null || true; chown "$USER_INFO_UID:$USER_INFO_GID" "/workspace/shared/$PREVIEW_USER_SLUG" 2>/dev/null || true; fi; {{ end }}fi',
         '$RUN_AS_USER ln -sfn /workspace /var/openwork/home/workspace',
         // Per-user folder in the shared workspace: every real unit creates
         // /workspace/shared/<slug> — named after the login username (SSO or
@@ -2104,7 +2267,7 @@ data:
               ],
               volumes: [
                 { name: 'personal-workspace', persistentVolumeClaim: { claimName: workspaceClaim } },
-                { name: 'shared-workspace', persistentVolumeClaim: { claimName: sharedWorkspaceClaim } },
+                { name: 'shared-workspace', persistentVolumeClaim: { claimName: unitSharedClaim } },
                 { name: 'state', persistentVolumeClaim: { claimName: stateClaim } },
                 { name: 'project-config', configMap: { name: '{{ .Release.Name }}-project-config' } },
                 { name: 'personal-content', configMap: { name: '{{ .Release.Name }}-personal-content' } },
@@ -2533,7 +2696,7 @@ data:
     // mounted BY REFERENCE and the identity stamped into the pod.
     async function resolvePlatformEnvironment(userId, slug, platform) {
       const unitNs = platform.unitNamespace
-      const names = { ...namesForSlug(slug, unitNs), unitSharedClaim: sharedWorkspaceClaim }
+      const names = { ...namesForSlug(slug, unitNs), unitSharedClaim }
       const existing = await k8sRequest('GET', `/apis/apps/v1/namespaces/${unitNs}/deployments/${names.deployment}`)
       const anchor = await ensureUnitAnchor(unitNs, slug)
       const ownerRefs = ownerRefToAnchor(anchor)
@@ -2610,6 +2773,7 @@ data:
         await ensureLease(`openwork-user-${slug}`)
         await ensurePersistentVolumeClaim(workspaceClaim, workspaceSize)
         await ensurePersistentVolumeClaim(stateClaim, stateSize)
+        await ensurePersistentVolumeClaim(unitSharedClaim, sharedWorkspaceSize, namespace, null, ['ReadWriteMany'])
         await ensureService(names.service, slug)
         await ensureDeployment(names.deployment, workspaceClaim, stateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names: { ...names, workspaceClaim, stateClaim } }
@@ -2657,6 +2821,7 @@ data:
       await ensureLease(`openwork-user-${slug}`)
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
       await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
+      await ensurePersistentVolumeClaim(unitSharedClaim, sharedWorkspaceSize, namespace, null, ['ReadWriteMany'])
       await ensureService(names.service, slug)
       await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { ssoUnit: isSsoUser })
       return { slug, names }
