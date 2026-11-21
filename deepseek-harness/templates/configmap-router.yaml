@@ -1607,11 +1607,28 @@ data:
     let anchorSharedPV = null
     async function resolveAnchorSharedVolume() {
       if (anchorSharedPV) return anchorSharedPV
+      // HARD RAIL 1: the platform volumes are mounted BY REFERENCE and are never
+      // ours to touch. kubeflow-shared-pvc carries other teams' data; if
+      // SHARED_WORKSPACE_CLAIM is ever pointed at a platform claim, refuse.
+      if (sharedWorkspaceClaim === platformSharedClaim || sharedWorkspaceClaim === platformUserClaim) {
+        console.log('[xns-shared] REFUSING: SHARED_WORKSPACE_CLAIM is the platform claim ' + sharedWorkspaceClaim)
+        return null
+      }
       const pvc = await k8sRequest('GET', '/api/v1/namespaces/' + namespace + '/persistentvolumeclaims/' + sharedWorkspaceClaim)
       const pvName = pvc && pvc.spec && pvc.spec.volumeName
       if (!pvName) return null
       const pv = await k8sRequest('GET', '/api/v1/persistentvolumes/' + pvName)
       if (!pv || !pv.spec || !pv.spec.csi) return null
+      // HARD RAIL 2: only ever act on the PV pinned to OUR anchor claim. A PV
+      // bound to a platform claim (<ns>-kf-pv) must never be patched — flipping
+      // its reclaim policy or claimRef would put another team's volume at risk.
+      const anchorRef = pv.spec.claimRef
+      if (anchorRef && (anchorRef.namespace !== namespace || anchorRef.name !== sharedWorkspaceClaim)) {
+        console.log('[xns-shared] REFUSING: PV ' + pvName + ' is bound to ' + anchorRef.namespace + '/' + anchorRef.name + ', not the anchor')
+        return null
+      }
+      // HARD RAIL 3: no handle, nothing to clone.
+      if (!pv.spec.csi.volumeHandle) return null
       // Retain BEFORE the first clone exists. With the default Delete policy,
       // deleting the anchor claim would delete the volume that every namespace
       // now points at — one helm uninstall away from destroying the lot.
@@ -1687,9 +1704,21 @@ data:
     }
 
     async function ensurePersistentVolumeClaim(name, size, ns = namespace, ownerRefs = null) {
+      // A programming error must never reach the API server: an empty name comes
+      // back as a 422 that aborts the whole login instead of failing open.
+      if (!name) {
+        console.log('[claims] refusing a claim with an empty name (ns=' + ns + ')')
+        return
+      }
       const path = `/api/v1/namespaces/${ns}/persistentvolumeclaims/${name}`
       const existing = await k8sRequest('GET', path)
       if (existing) {
+        // F4: a claim that exists but is NOT pre-bound to the shared PV cannot be
+        // healed in place (volumeName is immutable once bound), so it is a silent
+        // per-namespace fork. Say so loudly instead of pretending it is fine.
+        if (xnsSharedEnabled && name === xnsSharedClaim && !(existing.spec && existing.spec.volumeName)) {
+          console.log('[xns-shared] WARNING: ' + ns + '/' + name + ' is bound to a per-namespace volume, not the shared one - operator attention needed')
+        }
         return
       }
       // Cross-namespace shared claim: pre-bind it to a PV cloned from the
@@ -2731,6 +2760,7 @@ data:
         await ensureLease(`dsh-user-${slug}`)
         await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
         await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
+        await ensurePersistentVolumeClaim(unitSharedClaim, sharedWorkspaceSize)
         await ensureService(names.service, slug)
         await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { ssoUnit: isSsoUser })
         return { slug, names }
@@ -2769,6 +2799,7 @@ data:
       await ensureLease(`dsh-user-${slug}`)
       await ensurePersistentVolumeClaim(names.workspaceClaim, workspaceSize)
       await ensurePersistentVolumeClaim(names.stateClaim, stateSize)
+      await ensurePersistentVolumeClaim(unitSharedClaim, sharedWorkspaceSize)
       await ensureService(names.service, slug)
       await ensureDeployment(names.deployment, names.workspaceClaim, names.stateClaim, slug, { ssoUnit: isSsoUser })
       return { slug, names }

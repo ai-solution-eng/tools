@@ -66,13 +66,22 @@ storage:
 # per-namespace dynamically provisioned claim, so a bug here can never stop a unit
 # from starting.
 #
-# Rollout order: empty the per-namespace shared folders first
-# (scripts/migrate-shared-to-personal.sh), then flip this on. Rolling back is
-# turning it off again — the -xns claims and their PVs are left in place, and the
-# legacy claims are untouched either way.
+# DEFAULT ON since 0.4.55: every unit — SSO (project-user-*) and classic (release
+# namespace) alike — mounts ONE platform-wide /workspace/shared. The release's
+# <release>-shared-pvc is the anchor; each unit namespace gets a <release>-shared-xns-pvc
+# pre-bound to a PV cloned from it (same csi.volumeHandle), so everyone lands on the
+# same VAST volume. The router refuses to touch the platform claims (kubeflow) or any
+# PV whose claimRef is not this release's anchor.
+#
+# Prerequisite when upgrading an EXISTING install: copy each user's legacy
+# per-namespace shared folder into personal/shared-legacy first
+# (scripts/recover-legacy-shared-all.sh), because once a unit rolls onto the shared
+# volume its old claim is no longer mounted. Fresh installs need nothing.
+#
+# Rolling back is turning it off again — the -xns claims and their PVs are left in
+# place and the legacy claims are untouched either way.
 sharedWorkspace:
-  crossNamespace: false
-  stateSize: 2Gi
+  crossNamespace: true
 
 # Max request body accepted by the in-pod nginx (the single entry point in
 # front of dsh at :8082). nginx's own default is 1 MB, which is far too small
