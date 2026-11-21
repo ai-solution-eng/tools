@@ -23,6 +23,14 @@ payload() {
 P=$(payload)
 [ -n "$P" ] && ok "payload extracted from the rendered manifest" || no "payload extracted" "empty" "non-empty"
 run() { docker run --rm -i alpine:3.20 sh -s 2>&1; }
+# Kubernetes caps the pod template's job-name label at 63 chars; a long namespace
+# made apply fail with "must be no more than 63 characters".
+NAME=$(bash "$SCRIPT" --namespace project-user-alejandro-morales-martinez --chart opencode \
+        --legacy-claim opencode-web-helm-shared-pvc \
+        --personal-claim opencode-v2-ws-alejandro-morales-martinez 2>/dev/null \
+      | sed -n 's/^==> job: *//p' | head -1)
+if [ -n "$NAME" ] && [ ${#NAME} -le 63 ]; then ok "Job name fits the 63-char label limit (${#NAME})"; else no "Job name length" "${NAME:-none}" "<=63"; fi
+
 
 out=$(printf 'set -e\nmkdir -p /tmp/legacy/sub /tmp/personal\nprintf AAAA > /tmp/legacy/a.txt\nprintf BBBB > /tmp/legacy/sub/b.txt\nchown -R 1000:1000 /tmp/personal\n%s\n' "$P" | run)
 case "$out" in *verdict=moved*) ok "fresh copy -> verdict=moved" ;; *) no "fresh copy -> moved" "$out" "verdict=moved" ;; esac

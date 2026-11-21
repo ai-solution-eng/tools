@@ -120,7 +120,11 @@ done
 
 # F5: the chart belongs in the name - Job templates are immutable, so two charts
 # sharing a namespace would otherwise collide and the second could never run.
-JOB="shared-legacy-recover-$CHART-$(echo "$NS" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-36 | sed 's/-*$//')"
+# Kubernetes copies the Job name into the pod template's job-name LABEL, which is
+# capped at 63 chars, so a long namespace is rejected at admission. Cap the name.
+JOB="shared-legacy-recover-$CHART-$(echo "$NS" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-')"
+JOB=$(printf '%s' "$JOB" | cut -c1-63 | sed 's/-*$//')
+[ "$(printf '%s' "$JOB" | wc -c)" -le 63 ] || { echo "ERROR: computed Job name too long: $JOB" >&2; exit 1; }
 NODE_LINE=""
 [ -n "$NODE" ] && NODE_LINE="      nodeName: $NODE"
 
