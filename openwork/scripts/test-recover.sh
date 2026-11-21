@@ -6,9 +6,11 @@
 # that never executed the payload. This extracts the payload from the manifest the
 # script actually generates and runs it under alpine.
 set -uo pipefail
-SCRIPT=${1:-/mnt/shared/califra-dsh/tools/openwork/scripts/recover-legacy-shared.sh}
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+SCRIPT=${1:-$SELF_DIR/recover-legacy-shared.sh}
 export PATH=/tmp/stub:$PATH
-export DOCKER_CONFIG=${DOCKER_CONFIG:-/mnt/shared/califra-dsh/tools/.dsh/docker-config}
+# docker needs a writable config dir; honour an override rather than hardcoding a host path.
+if [ -n "${DOCKER_CONFIG:-}" ]; then export DOCKER_CONFIG; fi
 pass=0; fail=0
 ok() { pass=$((pass+1)); printf 'PASS  %s\n' "$1"; }
 no() { fail=$((fail+1)); printf 'FAIL  %s\n      got [%s] want [%s]\n' "$1" "$2" "$3"; }
