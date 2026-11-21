@@ -24,7 +24,7 @@ set -uo pipefail
 
 APPLY=0
 NS=""
-CHART="openwork"
+CHART="opencode"
 LEGACY=""
 PERSONAL=""
 NODE=""
@@ -129,6 +129,7 @@ NODE_LINE=""
 [ -n "$NODE" ] && NODE_LINE="      nodeName: $NODE"
 
 echo "==> mode:      $([ "$APPLY" = 1 ] && echo APPLY || echo 'DRY RUN (pass --apply to create the Job)')"
+echo "==> chart:     $CHART"
 echo "==> namespace: $NS"
 echo "==> legacy:    $LEGACY (read-only, never modified)"
 echo "==> personal:  $PERSONAL"

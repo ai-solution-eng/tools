@@ -7,7 +7,7 @@
 #   scripts/recover-legacy-shared-all.sh --apply         # run them one by one
 #
 # options:
-#   --chart openwork|opencode|deepseek-harness   (default openwork)
+#   --chart openwork|opencode|deepseek-harness   (default deepseek-harness)
 #   --namespace-prefix P    default project-user-
 #
 # Deliberately a driver, not a second copy of the Job: recover-legacy-shared.sh
