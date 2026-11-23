@@ -25,7 +25,7 @@ sessionSecret: "4nK8wQ2vR7pT3kL1mX9yB5dF3hJ6cZ0aG"
 
 storageClass: gl4f-filesystem
 storage:
-  sharedSize: 20Gi
+  sharedSize: 100Gi
   workspaceSize: 5Gi
   # Version prefix for per-user PVC names (`dsh-<nameVersion>-ws/st-<slug>`).
   # CANONICAL SCHEME: dsh-v2 — do NOT bump this casually and never revert to
@@ -234,7 +234,7 @@ provisioning:
   unitResources:
     web:
       requests: {cpu: 250m, memory: 512Mi}
-      limits:   {cpu: "2",  memory: 2Gi}
+      limits:   {cpu: "2",  memory: 8Gi}
     init:
       requests: {cpu: 250m, memory: 512Mi}
       limits:   {cpu: "2",  memory: 2Gi}
