@@ -94,6 +94,10 @@ def test_seed_labs_are_the_expected_families():
     # header to "Nvidia", so the curated prefix is what keeps it branded.
     assert "NVIDIA" in labs
     assert "Nvidia" not in labs
+    # Thinking Machines: the org segment is "thinkingmachines", so the curated
+    # prefix is what brands the Inkling lab correctly.
+    assert "Thinking Machines" in labs
+    assert "Thinkingmachines" not in labs
     assert "Inferact" not in labs
     assert "RamManavalan" not in labs
     assert "RedHatAI" not in labs

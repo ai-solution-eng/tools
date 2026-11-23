@@ -55,12 +55,17 @@ VALID_ENGINE = {
 # tracking a moving tag is better than freezing a version, and the reason is
 # recorded on the entry's own notes.  The "unpinned" badge stays visible on
 # them by design -- it is telling the truth, not flagging a defect.
-KNOWN_UNPINNED = {
-    # Upstream semantic-router is very new and moving fast; a pin would go
-    # stale faster than it could be validated (decision 2026-11-19).
-    "seed-h200-d3-turbo-vllm-srun",
-    "seed-h200-d3-turbo-fp8-vllm-srun",
-}
+# Empty as of 2026-11-20. The two d3-turbo entries were the only deliberate
+# floaters: upstream semantic-router was very new and moving fast, so a version
+# pin would have gone stale faster than it could be validated (decision
+# 2026-11-19).
+#
+# That trade-off no longer applies. Both entries now point at
+# ghcr.io/ai-solution-eng/d3-turbo-router:v0.2.0, a wrapper we own that freezes
+# the upstream base by commit tag AND platform digest. Pinning is now cheaper
+# than floating, so the allowlist is empty by design -- not because nothing
+# floats, but because nothing needs to.
+KNOWN_UNPINNED: set[str] = set()
 
 
 def _entry(**overrides):
