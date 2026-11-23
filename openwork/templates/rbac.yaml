@@ -123,3 +123,38 @@ subjects:
   name: {{ .Release.Name }}-router
   namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if .Values.sharedWorkspace.crossNamespace }}
+---
+# Cross-namespace shared workspace (values sharedWorkspace.crossNamespace): the
+# router clones the anchor PV into every unit namespace, which is cluster-scoped.
+# No "delete" on purpose - a cloned PV is Retain by design, and deleting one
+# would orphan that namespace's claim; removing them is a deliberate operator
+# action, not something a reconcile can do by accident.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-router-pv
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumes"]
+  verbs: ["get", "list", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-router-pv
+  labels:
+    hpe-ezua/type: vendor-service
+    hpe-ezua/app: {{ .Chart.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-router-pv
+subjects:
+- kind: ServiceAccount
+  name: {{ .Release.Name }}-router
+  namespace: {{ .Release.Namespace }}
+{{- end }}
