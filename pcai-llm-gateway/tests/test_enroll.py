@@ -1143,3 +1143,128 @@ async def test_bind_user_profile_writes_only_when_null() -> None:
     calls.clear()
     await routes_enroll._bind_user_profile(_Conn(), uid, None)
     assert calls == []
+
+# ---------------------------------------------------------------------------
+# model ACL mode (2026-11-23)
+#
+# The ACL stamped onto a redeemed key is CONFIGURABLE per enrollment:
+#   'profile'  (default) - the profile's model_order ∩ registered, frozen at
+#               redeem time. The pre-2026-11-23 behaviour.
+#   'all'      - stamp nothing: an empty ACL resolves against the registry per
+#               request, so a model deployed later needs no re-stamp.
+#   'explicit' - stamp the enrollment's own list.
+# WHY: the stamped list is a SNAPSHOT, so every roster change stranded keys that
+# had already been issued (adding a model meant hand-patching each key), and the
+# freeze was neither visible nor optional from the console.
+# ---------------------------------------------------------------------------
+
+ACL_MODELS = ["Deepseek-V4.1-Flash-1017", "Inkling-2-Small", "Qwen3.8-27B"]
+
+
+def _registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(routes_enroll.model_router, "models", lambda: list(ACL_MODELS))
+
+
+def _acl_redeemed(profile_id: uuid.UUID | None, mode: str, allowed: list[str] | None = None) -> dict[str, Any]:
+    row = _redeemed(profile_id)
+    row["model_acl_mode"] = mode
+    row["allowed_models"] = allowed
+    return row
+
+
+def _minted_acl(fake: EnrollFakeDB) -> list[str]:
+    """The allowed_models the redeem stamped onto the ONE key it minted."""
+    assert len(fake.api_keys) == 1, "the redeem must mint exactly one key"
+    return list(next(iter(fake.api_keys.values()))["allowed_models"])
+
+
+PROFILE_WITH_ORDER = {
+    "name": "starter",
+    "defaults_json": "{}",
+    "model_order": ["Qwen3.8-27B", "Inkling-2-Small", "Decommissioned-9B"],
+}
+
+
+def test_enroll_acl_default_mode_is_the_profile_snapshot(env, monkeypatch) -> None:
+    """A row with no ACL columns = 'profile' = the historical snapshot: the
+    profile's model_order ∩ registered, frozen onto the key at redeem time."""
+    tc, fake = env
+    _registered(monkeypatch)
+    pid = uuid.uuid4()
+    fake.enroll_row = _redeemed(pid)  # legacy row: neither column present
+    fake.profile_row = {**PROFILE_WITH_ORDER, "id": pid}
+
+    r = tc.post("/v1/enroll", json={"code": _code(), "name": "A"})
+    assert r.status_code == 201, r.text
+    # the decommissioned order entry is dropped; the rest is stamped verbatim
+    assert _minted_acl(fake) == ["Qwen3.8-27B", "Inkling-2-Small"]
+
+
+def test_enroll_acl_all_mode_stamps_nothing(env, monkeypatch) -> None:
+    """'all' stamps NOTHING, even with a profile order in play: an empty ACL is
+    resolved against the registry at request time, so a model deployed after the
+    key was minted is reachable with no re-stamp."""
+    tc, fake = env
+    _registered(monkeypatch)
+    pid = uuid.uuid4()
+    fake.enroll_row = _acl_redeemed(pid, "all")
+    fake.profile_row = {**PROFILE_WITH_ORDER, "id": pid}
+
+    r = tc.post("/v1/enroll", json={"code": _code(), "name": "A"})
+    assert r.status_code == 201, r.text
+    assert _minted_acl(fake) == []
+
+
+def test_enroll_acl_explicit_mode_stamps_the_enrollment_list(env, monkeypatch) -> None:
+    """'explicit' stamps the enrollment's own list — the profile order must NOT
+    leak in alongside it."""
+    tc, fake = env
+    _registered(monkeypatch)
+    pid = uuid.uuid4()
+    fake.enroll_row = _acl_redeemed(pid, "explicit", ["Inkling-2-Small"])
+    fake.profile_row = {**PROFILE_WITH_ORDER, "id": pid}
+
+    r = tc.post("/v1/enroll", json={"code": _code(), "name": "A"})
+    assert r.status_code == 201, r.text
+    assert _minted_acl(fake) == ["Inkling-2-Small"]
+
+
+def test_enroll_acl_explicit_with_every_model_gone_falls_back_to_profile(env, monkeypatch) -> None:
+    """An explicit list whose models were ALL decommissioned must never degrade
+    to allow-all by accident (empty = every model): it falls back to the
+    profile's signed-off order instead."""
+    tc, fake = env
+    _registered(monkeypatch)
+    pid = uuid.uuid4()
+    fake.enroll_row = _acl_redeemed(pid, "explicit", ["Decommissioned-9B"])
+    fake.profile_row = {**PROFILE_WITH_ORDER, "id": pid}
+
+    r = tc.post("/v1/enroll", json={"code": _code(), "name": "A"})
+    assert r.status_code == 201, r.text
+    assert _minted_acl(fake) == ["Qwen3.8-27B", "Inkling-2-Small"]
+
+
+def test_create_enrollment_rejects_explicit_acl_without_models(env, monkeypatch) -> None:
+    """The mode is validated at MINT time: a code whose explicit ACL is empty is
+    dead config, and discovering it at redeem would burn a use."""
+    tc, _fake = env
+    _registered(monkeypatch)
+    r = tc.post(
+        "/admin/enrollments",
+        headers=ADMIN_H,
+        json={"label": "team", "tenant_id": str(uuid.uuid4()), "max_uses": 2, "model_acl_mode": "explicit"},
+    )
+    assert r.status_code == 400, r.text
+    assert "allowed_models" in r.json()["detail"]
+
+
+def test_create_enrollment_rejects_unknown_acl_mode(env, monkeypatch) -> None:
+    tc, _fake = env
+    _registered(monkeypatch)
+    r = tc.post(
+        "/admin/enrollments",
+        headers=ADMIN_H,
+        json={"label": "team", "tenant_id": str(uuid.uuid4()), "max_uses": 2, "model_acl_mode": "everything"},
+    )
+    assert r.status_code == 400, r.text
+    assert "model_acl_mode" in r.json()["detail"]

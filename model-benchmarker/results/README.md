@@ -43,6 +43,7 @@ Filenames follow the convention `<GPU>[xN][_sglang|_vllm][_MTP][_weights][_hicac
 | `deepseek_v4_flash_0731/H200Sx4_hicachex2.md` | DeepSeek-V4-Flash-0731, 4× H200, HiCache ×2 |
 | `deepseek_v4_flash_0731/RTXPRO6000x2_hicachex16.md` | 2× RTX PRO 6000 (memory-tight), HiCache ×16 |
 | `deepseek_v41_flash/H200x4_engram_offload.md` | DeepSeek-V4.1-Flash, 4× H200, weight/ expert-offload serving (webapp run 20261004T193334Z, fused with its two resume-source attempts) |
+| `inkling-2-small/H200x4_hicache.md` | Inkling-2-Small, 4× H200, SGLang TP4/EP4 with hierarchical cache (running-request cap 32) |
 | `qwen_38_27b/H200.md` | Qwen3.8-27B, 1× H200 |
 | `qwen_38_27b/H200_sglang_dflash2_hicachex1.md` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×1 |
 | `qwen_38_27b/H200_sglang_dflash2_hicachex3.md` | Qwen3.8-27B, 1× H200, SGLang + DFlash2, HiCache ×3 |
@@ -107,6 +108,7 @@ task-matched with the rest:
 |:---|---:|---:|
 | GLM-5.3-Flash 8× H200 SMX, HiCache 1.5 TB | 24,573 | 32,668 |
 | GLM-5.3-Flash 4× H200, HiCache ×4 | 15,419 | 26,879 |
+| Inkling-2-Small 4× H200, SGLang TP4/EP4 | 15,509 | 20,351 |
 | Qwen3.8-27B 1× H200 (plain) | 13,633 | 17,055 |
 | GLM-5.3-Flash 4× H200 dual-NVLink, HiCache ×6 | 11,903 | 12,698 |
 | DeepSeek-V4.1-Flash 4× H200, offload | 11,516 | 11,918 |

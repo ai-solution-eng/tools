@@ -28,6 +28,31 @@ ezua:
     # it automatically when the chart is imported as an EzAppConfig.
     endpoint: "mooncake.${DOMAIN_NAME}"
 
+master:
+  # Live symptom this fixes: the pool sits at ~74% of DRAM, yet the master logs
+  #   "BatchPutStart failed for 1 keys due to insufficient space"
+  # and revokes ~40% of Put items, while clients log TRANSFER_FAIL for every key
+  # in the refused batch. 0.95 is the top of the recommended range: below the
+  # watermark the eviction thread never fires, so nothing frees space
+  # proactively while per-segment fragmentation still fails allocations.
+  # Lowering this ratio is upstream's documented remedy for excessive allocation
+  # failures ("consider lowering eviction_high_watermark_ratio").
+  # Trade-off: eviction starts earlier, so the effective DRAM tier is smaller.
+  # At a ~40% refusal rate that capacity was not usable anyway.
+  evictionHighWatermarkRatio: 0.85
+
+  # DELIBERATELY LEFT AT THE CHART DEFAULT (local_first), not overridden here.
+  # local_first keeps a client's objects on the store pod in its own node - which
+  # is what MOONCAKE_HOST_ID (= spec.nodeName) is for. On this TCP pool that
+  # avoids a cross-node hop per KV page, and it bounds the loss from a store pod
+  # to that node's share of the cache rather than scattering it.
+  # free_ratio_first fills segments more evenly and may cut allocation failures,
+  # but gives up both properties: some of a client's writes would land on the
+  # other node's segment. Only switch once per-segment usage shows real imbalance:
+  #   kubectl -n mooncake port-forward svc/mooncake-master 9003:9003 &
+  #   curl -s localhost:9003/metrics/summary
+  # allocationStrategy: free_ratio_first
+
 store:
   replicaCount: 3
   # TCP. The transport is ONE decision for the whole pool and every client must
@@ -41,6 +66,14 @@ store:
   # serves pages out of this at memory speed. Keep it modest — the PVC is the
   # capacity tier.
   segmentSize: "16gb"
+  # WORKAROUND for a chart bug, not a site tuning choice. helm/values.yaml ships
+  # "localBufferSize: 4194304" as a YAML number; Helm parses it to float64 and the
+  # template renders it with Go's %g, so the live store pods carry
+  # MOONCAKE_LOCAL_BUFFER_SIZE="4.194304e+06" instead of 4194304. Quoting it here
+  # keeps it a string, so the template emits "4194304" verbatim.
+  # The real fix is `| int64` on helm/templates/statefulset-store.yaml:92; this
+  # line is harmless once that lands.
+  localBufferSize: "4194304"
   # 16 GB segment + local buffer + python overhead must fit the request.
   resources:
     requests:
@@ -67,3 +100,4 @@ ui:
     # MOONCAKE_MASTER env var).
     namespaces:
       - project-user-andrew-bydlon
+      - project-user-jeff-oxenberg

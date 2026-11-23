@@ -176,9 +176,37 @@ def normalize_chat_rows(report_md: str) -> list[dict]:
     file a repeated (ctx, users, task) is a later level of the same test;
     the LAST occurrence wins (atomize.latest_occurrences semantics).
     """
+    return normalize_chat_rows_multi([("report.md", report_md)])
+
+
+def normalize_chat_rows_multi(sources: list[tuple[str, str | None]]) -> list[dict]:
+    """Several report.md texts -> ONE normalized row set, additively.
+
+    The results listing FUSES runs of the same experiment even when their
+    number_users / context_length ROSTERS differ (runner._fuse_key treats a
+    roster as sweep progress, not identity), so one fused entry can hold a
+    cold ctx=0 half and a padded ctx=32768 half in different runs. Reading
+    only the representative's report.md silently dropped the other half:
+    the listing promised additive levels and the compare view showed one
+    run's slice.
+
+    sources is [(source_label, report_md_text)] ordered OLDEST RUN FIRST.
+    Every atom is re-stamped with one shared source so latest_occurrences
+    collapses per TEST CONDITION across runs rather than per run, making a
+    condition measured by two runs resolve to the NEWER measurement while a
+    condition only one run measured survives either way.
+    """
     from model_benchmarker import atomize
 
-    atoms = atomize.atomize_chat_report(report_md, source="report.md", meta={})
+    atoms: list[dict] = []
+    for source, text in sources:
+        if not text:
+            continue
+        for a in atomize.atomize_chat_report(text, source=source, meta={}):
+            # one shared source: dedupe must span the fused group, not the
+            # individual file it came from.
+            a["source"] = "fused/report.md"
+            atoms.append(a)
     return [
         {"label": a["label"], "metrics": atomize.atom_to_compare_metrics(a)} for a in atomize.latest_occurrences(atoms)
     ]

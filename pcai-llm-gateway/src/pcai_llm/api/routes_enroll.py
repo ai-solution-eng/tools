@@ -98,11 +98,23 @@ _REDEEM_SQL = (
     # envelope too. A legacy 0 row is now EXHAUSTED (0 uses < 0 is false): fail
     # closed, and the admin fixes it with PATCH .../enrollments/{id}.
     "AND (uses < max_uses) "
-    "RETURNING id, tenant_id, profile_id"
+    "RETURNING id, tenant_id, profile_id, model_acl_mode, allowed_models"
 )
 _GENERIC_CODE_REJECTION = "invalid, expired, or exhausted code"
 
 ENROLL_SCOPES = ["proxy", "mcp"]
+
+# Model ACL stamped onto keys minted from an enrollment (2026-11-23).
+#   'profile'  - the profile's model_order ∩ registered models, frozen at redeem
+#                time. The historical behaviour and the default.
+#   'all'      - stamp nothing. An empty ACL is resolved against the REGISTRY at
+#                request time, so a model deployed later is reachable with no
+#                re-stamp (the repo's "empty = every registered model" rule).
+#   'explicit' - stamp the enrollment's own allowed_models list.
+# WHY configurable: the stamped ACL is a SNAPSHOT, so adding a model to the
+# fleet stranded every already-issued key until someone hand-patched it, and the
+# freeze was neither visible nor optional from the console.
+MODEL_ACL_MODES = ("profile", "all", "explicit")
 
 # Per-key MCP credential override limits (header-injection hygiene: these
 # become upstream request headers, so both names and values are bounded —
@@ -517,11 +529,40 @@ async def enroll(body: EnrollRequest, request: Request) -> dict[str, Any]:
         # any other write: an invalid preset raises 400 → the whole
         # transaction (including the uses-increment) rolls back.
         profile_seed = await _read_profile_seed_tx(profile_id, conn) if profile_id is not None else None
+        profile_defaults: dict[str, Any] = {}
+        profile_order: list[str] = []
         if profile_seed is not None:
             _, profile_defaults, profile_order = profile_seed
-            allowed_models = [m for m in profile_order if m in registered] if profile_order else []
+        # Model ACL, per the enrollment's configured mode (2026-11-23). The
+        # stamped list is a SNAPSHOT of the admin's signed-off set (finding 8b);
+        # mode='all' is the deliberate escape from that freeze, mode='explicit'
+        # makes the set the admin's own rather than the profile's.
+        # .get on every new column: production rows are asyncpg Records, test
+        # fakes are dicts, and a pre-migration snapshot must still redeem.
+        acl_mode = str(redeemed.get("model_acl_mode") or "profile")
+        if acl_mode == "all":
+            # Stamp NOTHING: an empty ACL is resolved against the registry at
+            # request time, so a model deployed later needs no re-stamp.
+            allowed_models = []
+        elif acl_mode == "explicit":
+            explicit = [str(m) for m in (redeemed.get("allowed_models") or [])]
+            allowed_models = [m for m in explicit if m in registered]
+            if not allowed_models and explicit:
+                # Every explicitly-listed model was decommissioned between mint
+                # and redeem. Falling through to allow-all would be a SILENT
+                # widening of an explicit ACL, so fall back to the profile's
+                # signed-off order instead, and say so.
+                allowed_models = [m for m in profile_order if m in registered] if profile_order else []
+                log.warning(
+                    "enroll redeem: explicit model ACL %s has no registered member left "
+                    "(enrollment %s) — fell back to the profile order (%d model(s))",
+                    explicit,
+                    redeemed["id"],
+                    len(allowed_models),
+                )
         else:
-            profile_defaults, allowed_models = {}, []
+            # 'profile' and any unknown value: the historical behaviour.
+            allowed_models = [m for m in profile_order if m in registered] if profile_order else []
 
         user = await _create_enroll_user(tenant_id, body.name, profile_id=profile_id, conn=conn)
         # stream_pcai_events=True: the DSH harness (this enrollment's primary
@@ -1393,6 +1434,18 @@ class EnrollmentCreate(BaseModel):
     # so the admin hands it to the team lead in the same action that mints
     # the invite.
     with_team_leader: bool = False
+    # --- model ACL stamped onto the keys this code mints (2026-11-23) ---
+    # 'profile' (default) = the profile's model_order ∩ registered, FROZEN at
+    # redeem time (the historical behaviour); 'all' = stamp nothing, so the
+    # key's ACL is resolved at request time and later roster changes need no
+    # re-stamp; 'explicit' = stamp allowed_models. Validated app-side against
+    # MODEL_ACL_MODES (a 400 — code-owned vocabulary, like budget_period).
+    model_acl_mode: str = "profile"
+    # Only read when model_acl_mode = 'explicit'. Must then be non-empty and
+    # name registered models (a 400 otherwise: an unregistered name would be a
+    # dead ACL entry, and an empty list is the allow-all the mode exists to
+    # avoid making accidental).
+    allowed_models: list[str] = Field(default_factory=list)
 
 
 @admin_router.post("/enrollments", status_code=201)
@@ -1414,6 +1467,21 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
     """
     if body.budget_period not in teams.TEAM_PERIODS:
         raise HTTPException(400, f"budget_period must be one of {sorted(teams.TEAM_PERIODS)}")
+    # Model ACL mode (2026-11-23): code-owned vocabulary -> 400, the same
+    # convention as budget_period. 'explicit' is validated against the REGISTRY
+    # HERE rather than at redeem: a code whose ACL no registered model can
+    # satisfy is dead config, and discovering that at redeem time burns a use.
+    if body.model_acl_mode not in MODEL_ACL_MODES:
+        raise HTTPException(400, f"model_acl_mode must be one of {list(MODEL_ACL_MODES)}")
+    explicit_acl: list[str] = []
+    if body.model_acl_mode == "explicit":
+        explicit_acl = [m.strip() for m in body.allowed_models if m and m.strip()]
+        if not explicit_acl:
+            raise HTTPException(400, "model_acl_mode=explicit needs a non-empty allowed_models list")
+        registered_now = set(model_router.models())
+        unknown = [m for m in explicit_acl if m not in registered_now]
+        if unknown:
+            raise HTTPException(400, f"allowed_models not registered: {unknown}")
     if not await _exists("tenants", body.tenant_id):
         raise HTTPException(404, f"tenant {body.tenant_id} not found")
     if body.profile_id is not None and not await _exists("profiles", body.profile_id):
@@ -1422,9 +1490,10 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
     expires_at = datetime.now(UTC) + timedelta(days=body.expires_days) if body.expires_days else None
     row = await db.fetchrow(
         "INSERT INTO enrollments (code_hash, label, tenant_id, profile_id, max_uses, expires_at, "
-        "budget_tokens, budget_usd, budget_period, overflow_enabled) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
-        "RETURNING id, label, tenant_id, profile_id, max_uses, uses, expires_at, revoked_at, created_at",
+        "budget_tokens, budget_usd, budget_period, overflow_enabled, model_acl_mode, allowed_models) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
+        "RETURNING id, label, tenant_id, profile_id, max_uses, uses, expires_at, revoked_at, created_at, "
+        "model_acl_mode, allowed_models",
         hash_key(code),
         body.label,
         body.tenant_id,
@@ -1435,6 +1504,10 @@ async def create_enrollment(body: EnrollmentCreate, request: Request, _: AdminDe
         body.budget_usd,
         body.budget_period,
         body.overflow_enabled,
+        body.model_acl_mode,
+        # Only 'explicit' stores a list; the other modes must not carry one that
+        # a later mode flip could silently re-activate.
+        explicit_acl or None,
     )
     assert row is not None
     out = dict(row)
@@ -1504,6 +1577,7 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
         "SELECT e.id, e.label, t.name AS tenant_name, p.name AS profile_name, "
         "e.max_uses, e.uses, e.expires_at, e.revoked_at, e.created_at, "
         "e.budget_tokens, e.budget_usd, e.budget_period, e.overflow_enabled, p.defaults_json, "
+        "e.model_acl_mode, e.allowed_models, "
         "e.team_leader_key_prefix, e.team_leader_key_created_at, e.team_leader_key_revoked_at, "
         "e.team_leader_key_last_used_at, "
         "(SELECT count(*) FROM api_keys ak WHERE ak.enrollment_id = e.id) AS key_count "
@@ -1526,6 +1600,8 @@ async def list_enrollments(_: AdminDep) -> list[dict[str, Any]]:
         row.setdefault("budget_usd", None)
         row.setdefault("budget_period", "month")
         row.setdefault("overflow_enabled", True)
+        row.setdefault("model_acl_mode", "profile")
+        row.setdefault("allowed_models", None)
         # DERIVED ENVELOPE (2026-10-30): same rule the gate and the team console
         # use — an enrollment with a profile and a mint allowance but no explicit
         # cap reports max_uses x the profile's per-key presets for its period.
@@ -1678,6 +1754,10 @@ class EnrollmentPatch(BaseModel):
     budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False, le=MAX_LIMIT_USD)
     budget_period: str | None = None
     overflow_enabled: bool | None = None
+    # Model ACL mode (2026-11-23): an EXISTING enrollment can stop freezing its
+    # keys' ACL ('all'), or stamp its own list ('explicit'). Omitted = untouched.
+    model_acl_mode: str | None = None
+    allowed_models: list[str] | None = None
 
 
 @admin_router.patch("/enrollments/{enrollment_id}")
@@ -1697,7 +1777,7 @@ async def patch_enrollment(
         raise HTTPException(400, f"budget_period must be one of {sorted(teams.TEAM_PERIODS)}")
     sets: list[str] = []
     args: list[Any] = []
-    for col in ("max_uses", "budget_period", "overflow_enabled"):
+    for col in ("max_uses", "budget_period", "overflow_enabled", "model_acl_mode"):
         val = getattr(body, col)
         if val is not None:
             args.append(val)
@@ -1712,12 +1792,41 @@ async def patch_enrollment(
         if col in body.model_fields_set:
             args.append(getattr(body, col))
             sets.append(f"{col} = ${len(args)}")
+    # --- model ACL (2026-11-23) ---
+    # allowed_models has a reader ONLY while the mode is 'explicit', so it is
+    # written together with that mode and CLEARED when the mode moves away —
+    # otherwise a stale list would come back to life on a later flip back to
+    # 'explicit'. Flipping to 'explicit' without a list is a 400: the mode would
+    # otherwise be a no-op that looks configured.
+    if body.model_acl_mode is not None and body.model_acl_mode not in MODEL_ACL_MODES:
+        raise HTTPException(400, f"model_acl_mode must be one of {list(MODEL_ACL_MODES)}")
+    mode_after = body.model_acl_mode
+    if mode_after is None and body.allowed_models is not None:
+        mode_after = await db.fetchval("SELECT model_acl_mode FROM enrollments WHERE id = $1", enrollment_id)
+    if mode_after == "explicit":
+        cleaned: list[str] | None = None
+        if body.allowed_models is not None:
+            cleaned = [m.strip() for m in body.allowed_models if m and m.strip()]
+            if not cleaned:
+                raise HTTPException(400, "allowed_models must be a non-empty list when provided")
+            registered_now = set(model_router.models())
+            unknown = [m for m in cleaned if m not in registered_now]
+            if unknown:
+                raise HTTPException(400, f"allowed_models not registered: {unknown}")
+        elif body.model_acl_mode == "explicit":
+            raise HTTPException(400, "model_acl_mode=explicit needs a non-empty allowed_models list")
+        if cleaned is not None:
+            args.append(cleaned)
+            sets.append(f"allowed_models = ${len(args)}")
+    elif body.model_acl_mode is not None or body.allowed_models is not None:
+        sets.append("allowed_models = NULL")
     if not sets:
         raise HTTPException(400, "no editable fields provided")
     # column names above are a fixed tuple, never user input
     row = await db.fetchrow(
         f"UPDATE enrollments SET {', '.join(sets)} WHERE id = ${len(args) + 1} "
-        "RETURNING id, label, max_uses, expires_at, budget_tokens, budget_usd, budget_period, overflow_enabled",
+        "RETURNING id, label, max_uses, expires_at, budget_tokens, budget_usd, budget_period, "
+        "overflow_enabled, model_acl_mode, allowed_models",
         *args,
         enrollment_id,
     )

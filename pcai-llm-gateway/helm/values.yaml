@@ -39,7 +39,7 @@ image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits appVersion. The tag is MUTABLE: pin with tag@sha256:<digest>
   # (or pullPolicy: Always) for a reproducible supply chain.
-  tag: v4.2.2
+  tag: v4.3.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -217,6 +217,26 @@ settings:
       storeTtlS: 86400
       maxStoreChars: 1000000   # above this a result passes through instead of pinning MBs
 
+    # Tool-definition pinning (rug-pull defence, 2026-11-10): a server that rewrites a
+    # tool's description/inputSchema AFTER the grant was approved offers a definition
+    # nobody reviewed — and a rewritten description is an instruction channel into the
+    # model's context. off | warn | block.
+    # TRACKED DEFAULT "warn" — a tracked default must not change what a deployment DOES:
+    # warn logs the old -> new digest and keeps offering the tool. "block" drops the
+    # changed tool from the offered surface AND refuses the call at dispatch (both halves
+    # are needed: the offer alone is bypassable by history replay); the GRANT is untouched
+    # either way — a definition change is not an ACL change. Pins are IN-MEMORY, so a
+    # restart re-records (re-approves) every definition.
+    toolPinMode: "warn"
+    # Tool-RESULT injection screening (2026-11-10): tool output was the one channel the
+    # guardrails did not cover. off | warn | annotate | block.
+    # TRACKED DEFAULT "annotate" — a FLAGGED result gets a one-line provenance header
+    # (server, tool, finding count) prepended and KEEPS its content; a clean result is
+    # never touched, so the default changes nothing on unflagged traffic. "block"
+    # substitutes a short refusal instead. RELAY ONLY: the /mcp surface is not screened
+    # yet, so this is not a whole-gateway guarantee.
+    toolInjectionScreen: "annotate"
+
     # A key registers its local tools and answers relay dispatches over long-poll, so
     # the model calls client__<tool> in the live loop. Routes 404 while off. timeoutS
     # bounds ONE dispatch: an offline client yields a tool error, never a hang.
@@ -377,6 +397,21 @@ settings:
       # canonical rows and bogus "session summary" memories. Detection is structural.
       skipTitleRequests: true
 
+    # Procedural memory, READ half (2026-11-23): the distiller already WRITES
+    # outcome-labelled playbooks and mm-rag exposes recall_playbooks, but nothing put
+    # one in front of a model before it started work. Enabled = recall the top-k
+    # procedures for the task signature and prepend them to the system preamble.
+    # TRACKED DEFAULT OFF — a tracked default must not change what a deployment DOES:
+    # injection spends prompt tokens on EVERY request and a stale procedure is worse
+    # than none. Turn it on per site once the store holds playbooks for the traffic
+    # being served. FAIL OPEN: past timeoutMs the turn proceeds without procedures.
+    playbookInject:
+      enabled: false
+      k: 3                  # top-k procedures injected (3 = recall_playbooks' own default)
+      maxChars: 2000        # hard cap on the injected block (truncation keeps a marker)
+      timeoutMs: 800        # recall is a network hop; 0 disables the timeout (not recommended)
+      minSuccessRate: 0.0   # smoothed-success floor for a candidate; 0.0 = no filter
+
   # --- Off-peak billing ----------------------------------------------------
   # Needs a registered Prometheus MCP server: GPU util under enterPct scales budget
   # drain by fraction. Enable only where that server is deployed.
@@ -406,7 +441,7 @@ settings:
     ttsCharsPerToken: 4
     asrTokensPerSecond: 3.0
 
-  # --- Tracing (OpenTelemetry) --------------------------------------------
+  # --- Tracing: OTel spans + agent-trace quality (DB-backed) --------------
   # One server span per HTTP request, exported as OTLP/HTTP JSON to {endpoint}/v1/traces.
   # WARNING: these are CHART DEFAULTS, NOT SITE CONFIG. A site that wants tracing must
   # set it in its OWN values document (helm/values-examples/values.<site>.yaml, pasted
@@ -421,6 +456,27 @@ settings:
     sampleRatio: 1.0        # deterministic per-trace hash: 0 = none, 1 = all
     headers: ""             # comma-separated Key=Value (empty = content-type only), e.g. Langfuse:
                             #   Authorization=Basic <base64 pk:sk>,x-langfuse-ingestion-version=4
+
+    # Agent trace PAYLOADS (2026-11-23): DB-backed rows in agent_traces, NOT OTel spans
+    # and not exported anywhere. They record WHAT the agent saw (tool arguments and
+    # results) — the most sensitive rows the gateway would store — so a site opts in
+    # deliberately. Sampling is PER REQUEST (a hash of request_id), never per row: a
+    # captured trace must be readable as a whole, not a random subset of rows.
+    # TRACKED DEFAULT OFF — a tracked default must not change what a deployment DOES.
+    tracePayload:
+      sampling: 0.0         # 0.0 = off, 1.0 = every request, 0.1 = one in ten (deterministic per request)
+      retentionDays: 7      # pruned by the housekeeping sweep; 0 = keep until manually pruned (NOT recommended)
+      maxChars: 2000        # per-payload cap; the ORIGINAL length is recorded so a judge can spot a cut
+      redact: true          # best-effort bearer/api-key/password/DSN-userinfo redaction — leave ON
+    # Deterministic, model-free scoring of what the trace already proves: did the tool
+    # call succeed, was it granted, did the turn loop on an identical call, did it blow
+    # the step budget. No payloads needed and no model call. Writes one verdict row per
+    # relay step ON THE HOT PATH, hence TRACKED DEFAULT OFF (a tracked default must not
+    # change what a deployment DOES); read the verdicts before gating a build on them.
+    agentEval:
+      enabled: false
+      maxSteps: 40          # a relay turn over this many model rounds is flagged step_budget; 0 disables the rule
+      loopThreshold: 3      # this many calls to one (server, tool) pair in a turn = loop; 0 disables the rule
 
 # ============================================================================
 # Kyverno / Metrics

@@ -26,7 +26,7 @@ import time
 from ..config import settings
 from ..db import db
 from ..routing.router import router as model_router
-from . import context_window, embedcache, response_cache, toolcompress_store, upstream_auth
+from . import context_window, embedcache, response_cache, toolcompress_store, trace_payloads, upstream_auth
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +84,23 @@ async def _sweep_once() -> None:
                 log.info("housekeeping: pruned %d compressed tool results", reclaimed)
     except Exception:
         log.debug("housekeeping: tool_compress_store prune skipped", exc_info=True)
+
+    # 1e) agent trace payloads (2026-11-23): tool arguments and results, the
+    #     highest-sensitivity rows the gateway stores — everything the fleet
+    #     actually touched. Retention is operator-opted like the rest
+    #     (trace_payload_retention_days; 0 = keep until manually pruned), which
+    #     is why the shipped default is a 7-day window instead of forever.
+    #     trace_payloads.prune is itself a no-op returning 0 at days <= 0
+    #     (defence in depth: this guard is the first of two), and
+    #     error-swallowed like every other sweep — a prune fault only delays
+    #     reclamation.
+    try:
+        if settings.trace_payload_retention_days > 0:
+            reclaimed = await trace_payloads.prune(settings.trace_payload_retention_days)
+            if reclaimed:
+                log.info("housekeeping: pruned %d trace payload rows", reclaimed)
+    except Exception:
+        log.debug("housekeeping: trace_payloads prune skipped", exc_info=True)
 
     # 2) operator-opted retention (0 = disabled — nothing is deleted until
     #    the policy exists, the roadmap contract).

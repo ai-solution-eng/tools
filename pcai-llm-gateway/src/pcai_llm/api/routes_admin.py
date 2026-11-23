@@ -911,7 +911,71 @@ async def admin_index(_: AdminDep) -> dict[str, Any]:
             "PUT    /admin/model-groups/{name}",
             "DELETE /admin/model-groups/{name}",
             "POST   /admin/model-groups/{name}/preview",
+            "GET    /admin/readiness",
         ],
+    }
+
+
+@router.get("/readiness")
+async def admin_readiness(_: AdminDep) -> dict[str, Any]:
+    """Deployment posture for the console's help panels: the BOOT-TIME flags
+    no other admin GET exposes.
+
+    WHY this exists: the three features the console can configure (off-peak
+    billing, the session distiller, SSO self-mint) are each gated by an env
+    flag a running pod cannot change, and their own endpoints report only the
+    RUNTIME half (DB overrides, evaluator state). An operator who saves a
+    profile, a fraction or a threshold therefore sees "saved" and then nothing
+    happens — because PCAI_LLM_OFFPEAK_ENABLED (or ..._DISTILLER_ENABLED, or
+    ..._SSO_KEY_CREATE_ENABLED) is false, a state nothing in the console
+    showed. The help panels render these as required-config rows; this
+    endpoint is their only honest source.
+
+    CONTRACT: read the SAME settings attributes the enforcement paths read —
+    routes_enroll's mint gate, core.identity's ladder, core.offpeak's
+    evaluator, routes_distill's mount — so the panel cannot drift from what
+    actually gates the feature. Booleans and tool names only: never a
+    credential, never a URL.
+
+    NOT a health check: enabled=false is a POSTURE, not a fault. Nothing here
+    reads the DB, so it answers even while Postgres is down — which is exactly
+    when an operator is reading these panels.
+    """
+    from ..core.identity import settings_trust_proxy_identity
+
+    tenant_id = (settings.token_shadow_tenant_id or "").strip()
+    try:
+        uuid.UUID(tenant_id)
+        tenant_id_valid = True
+    except (AttributeError, TypeError, ValueError):
+        # Unset and malformed are DIFFERENT fixes that block the mint with the
+        # SAME 503 (routes_enroll's mint gate) — reported separately so the
+        # help row can name which one it is.
+        tenant_id_valid = False
+    return {
+        "sso": {
+            "trust_proxy_identity": settings_trust_proxy_identity(),
+            "trust_forwarded_groups": bool(settings.trust_forwarded_groups),
+            "sso_key_create_enabled": bool(settings.sso_key_create_enabled),
+            "token_shadow_tenant_id_set": bool(tenant_id),
+            "token_shadow_tenant_id_valid": tenant_id_valid,
+        },
+        "memory": {
+            "distiller_enabled": bool(settings.distiller_enabled),
+            "memory_server": settings.distiller_memory_server,
+            "probe_tool": settings.distiller_memory_probe_tool,
+            "write_tool": settings.distiller_memory_tool,
+            "enroll_memory_default": bool(settings.enroll_memory_default),
+        },
+        "offpeak": {
+            "enabled": bool(settings.offpeak_enabled),
+            "mcp_server": settings.offpeak_mcp_server,
+            "tool": settings.offpeak_tool,
+            "per_model_queries": len(settings.offpeak_model_promql or {}),
+            "enter_pct": settings.offpeak_enter_pct,
+            "exit_pct": settings.offpeak_exit_pct,
+            "fraction": settings.offpeak_fraction,
+        },
     }
 
 

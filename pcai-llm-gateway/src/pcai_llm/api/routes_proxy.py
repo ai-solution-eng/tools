@@ -42,8 +42,8 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config import clamp_max_tokens, settings
-from ..core import agents as agents_mod
 from ..core import (
+    agent_eval,
     canonical,
     clientside,
     context_window,
@@ -62,6 +62,7 @@ from ..core import (
     upstream_auth,
     wire_compat,
 )
+from ..core import agents as agents_mod
 
 # TTFT / budget-warning / concurrency metrics (settle-side counters live in
 # core.budgets so metric and ledger agree by construction). No-op shims when
@@ -6099,6 +6100,24 @@ async def chat_completions(
                         # model text. iteration_depth is refreshed after the
                         # loop from the out-param.
                         yield chunk
+                    # Agent-behaviour scoring (2026-11-23). The turn is over and its
+                    # trace rows are written, so this is the ONE point where the whole
+                    # turn can be scored — evaluate_turn reads those rows itself so it
+                    # cannot score a different row set than the one stored.
+                    # NORMAL EXHAUSTION ONLY: a client that closes the generator
+                    # mid-turn leaves an incomplete row set, and awaiting here during a
+                    # generator close would be unsafe, so that path is skipped by design.
+                    # Best-effort: a scorer fault is a gap in the quality view, never a
+                    # failed request (the same posture as the trace write itself).
+                    if settings.agent_eval_enabled:
+                        try:
+                            await agent_eval.evaluate_turn(request_id)
+                        except Exception:
+                            log.warning(
+                                "agent eval failed (request_id=%s) — continuing",
+                                request_id,
+                                exc_info=True,
+                            )
                 finally:
                     # Every exit path (done, guard, disconnect) observes the
                     # depth reached; histogram in [0..max_iterations]. The

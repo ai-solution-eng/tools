@@ -271,6 +271,24 @@ spec:
               value: {{ .Values.settings.relay.compress.storeTtlS | default 86400 | int | quote }}
             - name: PCAI_LLM_TOOL_COMPRESS_MAX_STORE_CHARS
               value: {{ .Values.settings.relay.compress.maxStoreChars | default 1000000 | int | quote }}
+            # --- tool-definition pinning (rug-pull defence, 2026-11-10) -----
+            # Every definition the relay offers is fingerprinted; a later
+            # mismatch is a server that rewrote a tool AFTER its grant was
+            # approved. off = inert, warn = log the old -> new digest and keep
+            # offering, block = drop the changed tool from the OFFERED surface
+            # AND refuse the call at dispatch. Pins are IN-MEMORY, so a restart
+            # re-records (re-approves) every definition. The grant is untouched
+            # in every mode: a definition change is not an ACL change.
+            - name: PCAI_LLM_TOOL_PIN_MODE
+              value: {{ .Values.settings.relay.toolPinMode | default "warn" | quote }}
+            # --- tool-RESULT injection screening (2026-11-10) ---------------
+            # Screens attacker-controlled tool output before it re-enters the
+            # model. off = inert, warn = log only, annotate = prepend a
+            # provenance header to FLAGGED results (content kept; a clean result
+            # is never touched), block = substitute a short refusal. RELAY ONLY
+            # — the /mcp surface is not screened yet.
+            - name: PCAI_LLM_TOOL_INJECTION_SCREEN
+              value: {{ .Values.settings.relay.toolInjectionScreen | default "annotate" | quote }}
             # --- client tool-server dispatch (wave B2; routes 404 while off,
             # inert for keys without a registered offer) ---
             - name: PCAI_LLM_CLIENT_TOOL_DISPATCH
@@ -476,6 +494,24 @@ spec:
             # the 8192 chunking lives in mm-rag).
             - name: PCAI_LLM_DISTILLER_MAX_TOKENS
               value: {{ dig "memory" "distiller" "maxTokens" 4096 .Values.settings | int | quote }}
+            # --- procedural memory, READ half: pre-task playbook injection
+            # (2026-11-23) --- The distiller already WRITES outcome-labelled
+            # playbooks; this is the missing read: recall the top-k procedures
+            # for the task signature and prepend them to the system preamble.
+            # DEFAULT OFF — injection spends prompt tokens on EVERY request and
+            # a stale procedure is worse than none. FAIL OPEN: past timeoutMs
+            # the turn proceeds WITHOUT procedures (a slow memory store must
+            # never delay an answer); maxChars caps the rendered block.
+            - name: PCAI_LLM_PLAYBOOK_INJECT_ENABLED
+              value: {{ dig "memory" "playbookInject" "enabled" false .Values.settings | quote }}
+            - name: PCAI_LLM_PLAYBOOK_INJECT_K
+              value: {{ dig "memory" "playbookInject" "k" 3 .Values.settings | int | quote }}
+            - name: PCAI_LLM_PLAYBOOK_INJECT_MAX_CHARS
+              value: {{ dig "memory" "playbookInject" "maxChars" 2000 .Values.settings | int | quote }}
+            - name: PCAI_LLM_PLAYBOOK_INJECT_TIMEOUT_MS
+              value: {{ dig "memory" "playbookInject" "timeoutMs" 800 .Values.settings | int | quote }}
+            - name: PCAI_LLM_PLAYBOOK_INJECT_MIN_SUCCESS_RATE
+              value: {{ dig "memory" "playbookInject" "minSuccessRate" 0.0 .Values.settings | quote }}
             # --- off-peak billing (optional; safe defaults, off by default) ---
             - name: PCAI_LLM_OFFPEAK_ENABLED
               value: {{ .Values.settings.offpeak.enabled | quote }}
@@ -555,6 +591,30 @@ spec:
               value: {{ .Values.settings.tracing.sampleRatio | quote }}
             - name: PCAI_LLM_OTEL_HEADERS
               value: {{ .Values.settings.tracing.headers | quote }}
+            # --- agent trace PAYLOADS + deterministic eval (2026-11-23) ------
+            # Payloads record WHAT the agent SAW (tool arguments/results) — the
+            # most sensitive rows the gateway would store, so sampling is
+            # PER REQUEST (a hash of request_id), never per row: a captured
+            # trace must be readable as a whole. 0.0 = off. Retention is
+            # enforced by the housekeeping sweep (0 = keep until pruned). Eval
+            # writes one verdict row per relay step on the hot path, hence OFF
+            # by default; maxSteps is deliberately separate from the relay's own
+            # iteration cap so the gate's threshold cannot change what the relay
+            # allows.
+            - name: PCAI_LLM_TRACE_PAYLOAD_SAMPLING
+              value: {{ dig "tracing" "tracePayload" "sampling" 0.0 .Values.settings | quote }}
+            - name: PCAI_LLM_TRACE_PAYLOAD_RETENTION_DAYS
+              value: {{ dig "tracing" "tracePayload" "retentionDays" 7 .Values.settings | int | quote }}
+            - name: PCAI_LLM_TRACE_PAYLOAD_MAX_CHARS
+              value: {{ dig "tracing" "tracePayload" "maxChars" 2000 .Values.settings | int | quote }}
+            - name: PCAI_LLM_TRACE_PAYLOAD_REDACT
+              value: {{ dig "tracing" "tracePayload" "redact" true .Values.settings | quote }}
+            - name: PCAI_LLM_AGENT_EVAL_ENABLED
+              value: {{ dig "tracing" "agentEval" "enabled" false .Values.settings | quote }}
+            - name: PCAI_LLM_AGENT_EVAL_MAX_STEPS
+              value: {{ dig "tracing" "agentEval" "maxSteps" 40 .Values.settings | int | quote }}
+            - name: PCAI_LLM_AGENT_EVAL_LOOP_THRESHOLD
+              value: {{ dig "tracing" "agentEval" "loopThreshold" 3 .Values.settings | int | quote }}
             # Session affinity (endpoint pin) and audio billing heuristics.
             - name: PCAI_LLM_SESSION_AFFINITY_ENABLED
               value: {{ .Values.settings.routing.sessionAffinity.enabled | quote }}

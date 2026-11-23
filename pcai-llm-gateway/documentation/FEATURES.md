@@ -388,6 +388,136 @@ assistant text post-call; tool output is the third channel and was unguarded.
   `provenance_spoof` finding — otherwise the model would see two
   indistinguishable headers and could be talked into trusting the forged one.
 
+## Scorecard enablement (2026-11-23)
+
+Five knob families reach the chart in this wave. Two already existed in code
+but had NO chart surface (`tool_pin_mode`, `tool_injection_screen`): a
+deployed pod ran whatever the code default said, and the operator could not
+change it without editing the image. Three are new — pre-task playbook
+injection, agent-trace payloads and deterministic agent evaluation. Each is a
+`settings.*` value that renders one `PCAI_LLM_*` env var, and each is
+reversible from the values document with no rebuild.
+
+Two postures, deliberately different. The **tracked chart defaults**
+(`helm/values.yaml`) never change what a deployment DOES: the behaviour knobs
+are off, and the two defence knobs sit at a mode that keeps every result and
+every tool. The **G2 site values** (`helm/local/values.g2.yaml`) push the
+boundaries — pinning `block`, playbook injection on, payload sampling 0.1,
+agent eval on — and each flip carries its rollback value and the failure it
+can cause in a comment beside it.
+
+- **Tool-definition pinning** (`settings.relay.toolPinMode` →
+  `PCAI_LLM_TOOL_PIN_MODE`): `off` | `warn` | `block`, chart default `warn`.
+  Mechanism, the vanished-tool case and the dispatch half:
+  [Tool-definition pinning](#tool-definition-pinning-rug-pull-defence).
+  `warn` logs the old → new digest and keeps offering the tool — evidence,
+  not prevention. `block` (G2) drops the changed tool from the OFFERED
+  surface AND refuses the call at dispatch. **Pins are in-memory**: a pod
+  restart re-records every definition, so `block` protects a running pod from
+  a change made after first sighting and nothing more — it is not a durable
+  approval. The GRANT is untouched in every mode: a definition change is not
+  an ACL change. Failure mode of `block`: a server that legitimately ships a
+  new description loses that one tool from every relay turn until a restart
+  re-records the pin (a self-inflicted one-tool outage) — which is why the
+  tracked default is `warn`.
+- **Tool-result injection screening** (`settings.relay.toolInjectionScreen` →
+  `PCAI_LLM_TOOL_INJECTION_SCREEN`): `off` | `warn` | `annotate` | `block`,
+  chart default `annotate` (code default `warn`; G2 `annotate`). Detectors and
+  the spoof-resistant header:
+  [Tool-result injection screening](#tool-result-injection-screening).
+  `annotate` prepends a one-line provenance header (server, tool, finding
+  count, fresh token) to a FLAGGED result and keeps the body; a result with no
+  findings is never annotated or blocked, so the default is invisible on clean
+  traffic. `block` substitutes a short refusal and is the mode that can lose
+  information — a false positive withholds a legitimate document from the
+  model. **Coverage, honestly**: screening runs in the relay's tool-result path
+  (`_prepare_tool_content`) and on the compressed-original retrieval path; the
+  federated **`/mcp` surface is not screened yet**, so this knob is not
+  whole-gateway coverage. An unknown value falls back to `warn` (and logs
+  once) — a typo degrades to detection without mitigation, never to `block`
+  (which would refuse legitimate results) or `off`.
+- **Pre-task playbook injection** (`settings.memory.playbookInject.*` →
+  `PCAI_LLM_PLAYBOOK_INJECT_*`) is the READ half of procedural memory. The
+  distiller already writes outcome-labelled playbooks and mm-rag exposes
+  `recall_playbooks`, but nothing put one in front of a model before it
+  started work. On: derive the task signature from the incoming request,
+  recall the top-k procedures, drop any below `minSuccessRate`, and render a
+  compact block — `## Recalled playbooks`, opened by a line that tells the
+  model this is UNTRUSTED reference data, not instructions, then per
+  procedure its signature with its evidence counters, its ordered steps and
+  the failure modes to avoid. The block is prepended to the system preamble
+  once per turn (a conversation that already carries it gets no second
+  copy). `enabled` (default **false**; off is byte-identical to the pre-wave
+  behaviour) — on costs prompt tokens on EVERY request, which is why the
+  tracked default is off and a site opts in once its store holds playbooks
+  for its traffic. `k` (default **3**) is top-k injected; more turns the
+  preamble into a procedures manual the model skims.
+  `maxChars` (default **2000**) is the hard cap on the rendered block,
+  truncated with a marker — a pathological entry must never grow the preamble
+  without limit. `timeoutMs` (default **800**) bounds the recall hop and
+  **FAILS OPEN**: past the budget the turn proceeds without procedures, because
+  a slow memory store must never delay or fail an answer (`0` disables the
+  timeout — not recommended). `minSuccessRate` (default **0.0** = no filter)
+  is the operator's floor; set above the store's recorded outcomes it silently
+  yields an empty block. Failure mode of getting it wrong: a stale or
+  off-signature procedure steers a turn down the wrong path while looking
+  authoritative — the cap and the floor are guards, not substitutes for a
+  store that matches the traffic served.
+- **Agent trace payloads** (`settings.tracing.tracePayload.*` →
+  `PCAI_LLM_TRACE_PAYLOAD_*`) add what the agent SAW — tool arguments and
+  results — to what `agent_traces` already records (what it did and what it
+  cost): a companion `agent_trace_payloads` table keyed by `request_id` and
+  iteration. These are the **most sensitive rows the gateway stores**, so
+  every default is conservative. `sampling` (default **0.0** = off; G2
+  **0.1**) is sampled PER REQUEST from a hash of `request_id`, never per row:
+  a captured trace must be readable as a whole, not a random subset no judge
+  can follow, and the same request always samples the same way.
+  `retentionDays` (default **7**; 0 = keep until manually pruned, NOT
+  recommended) is enforced by the existing housekeeping sweep. `maxChars`
+  (default **2000**) caps each payload and records the ORIGINAL length, so a
+  judge can tell a short result from a truncated one. `redact` (default
+  **true**) turns bearer/basic tokens, api keys, aws secret keys, session
+  cookies, passwords and DSN userinfo into typed markers — best-effort pattern
+  matching that reduces blast radius and is NOT a guarantee; leave it on. Two
+  limits worth knowing before relying on it: a credential HARD-WRAPPED across a
+  line break is stored raw (the rules match within one line), and **coverage is
+  the server-executed MCP path only** — ACL denials, pin refusals, unknown-tool
+  and client-dispatch steps write a trace row with NO payload, so a red-team set
+  built from this table under-samples exactly the refusals. The table is also
+  write-only today: no judge or console reads it yet. Failure mode: sampling on with
+  `redact: false` writes whatever the fleet touched, credentials included,
+  into Postgres, and `retentionDays: 0` makes it unbounded. Payloads are DB
+  rows, not OTel spans — they are not exported and do not appear in a trace
+  backend.
+- **Agent-behaviour evaluation** (`settings.tracing.agentEval.*` →
+  `PCAI_LLM_AGENT_EVAL_*`) is deterministic, model-free scoring of what the
+  trace already proves — no payloads, no LLM call. The verdict vocabulary, in
+  report order: `not_granted` (a call DENIED by the grant/pin gate),
+  `tool_error` (a call that did not succeed — client handbacks are not
+  failures), `loop` (the same `(server, tool)` pair called at least
+  `loopThreshold` times in one turn; handbacks excluded, but a DENIED call still
+  counts — a model repeating a tool the grant gate refused is both `not_granted`
+  and looping, and that second signal is what says it kept trying after being
+  told no), `step_budget` (more
+  model rounds than `maxSteps`) and `clean`, which is exclusive and returned
+  only when nothing else fired. It is the first half of the quality layer; a
+  calibrated judge is the second. `enabled` (default **false**; G2 **true**)
+  writes one verdict row per relay step ON THE HOT PATH — hence off by
+  default. `maxSteps` (default **40**) is deliberately separate from
+  `settings.relay.maxIterations`: tuning the gate's threshold must not change
+  what the relay allows. `loopThreshold` (default **3**) counts one
+  `(server, tool)` pair, not its arguments; below 3 it flags legitimate
+  retries. A `0` (or negative) threshold DISABLES that rule rather than
+  flagging every turn — a zeroed knob must not fail everything. Failure
+  mode: this is a SCORER, not a gate — wiring a build gate to verdicts
+  before reading real ones turns scorer noise into failed builds.
+- **Wiring**: `settings.<section>.<key>` in the values document → one
+  `PCAI_LLM_*` env var on the gateway container
+  (`helm/templates/deployment.yaml`). Validate with `helm template
+  pcai-llm-gateway ./helm [-f <site values>]`: a missing `.Values` path
+  renders an EMPTY env value silently, which is the phantom-knob class
+  `tests/test_values_layout.py` exists to catch.
+
 ## Content guardrails
 
 Per-model content policy, ported from the hpe-llm-gateway design and
@@ -1122,7 +1252,7 @@ get wrong, and the failure mode is silent (an unauthenticated probe just
   evaluator already maintains (ACTIVE outranks loaded/never-sampled; ties
   keep profile order; off-peak off = all equal). The pick is **sticky for
   the conversation** (Postgres-backed `model_stickiness`, replica-safe):
-  "if it went to GLM, stay with GLM" — only a START re-picks, plus a
+  "if it went to Inkling, stay with Inkling" — only a START re-picks, plus a
   mid-conversation drop+re-pick if the sticky head leaves the servable set
   (deregistered, or out of the key's ACL/ordering). Pinned
   requests, budget/rate gates and 429 failover walk unchanged, off-peak
@@ -1510,6 +1640,47 @@ one prompt, one taxonomy, one credential path, one place to maintain.
   vs RPM/TPM, and the 20 most recent outcomes — the "why am I 429ing"
   surface, no admin involved. The chat UI's usage panel calls it and
   auto-opens on a 429.
+
+## Console help panels (`[?]` readiness checklists)
+
+A `[?]` beside the title of the three pages whose feature is gated by a
+BOOT-TIME env flag — **Off-peak billing**, **Session memory distiller** and
+**SSO self-mint default profile** — opens a checklist of what has to be true
+for that page to do anything, with LIVE state per item. Those pages configure
+only the RUNTIME half (DB overrides, evaluator state, tenant settings); the
+flag half had no surface anywhere in the console, so an operator could save a
+profile or a fraction, read "saved", and then watch nothing happen with
+nothing explaining why.
+
+* **`GET /admin/readiness`** (admin-gated, §4.8 of [API.md](API.md)) is the
+  flag half: the SAME `settings` attributes the enforcement paths read —
+  trust flag, forwarded groups, the self-mint kill switch, the mint tenant
+  (reported `set` AND `valid` separately, because unset and malformed are
+  different fixes for the same 503), the distiller mount + memory
+  server/probe/write tool names, and off-peak enabled/server/tool/thresholds/
+  per-model query count. Booleans and tool names only, and NO DB read — so it
+  answers while Postgres is down, which is exactly when someone is reading
+  these panels. It is a POSTURE read, not a health check: `enabled: false` is
+  a legitimate state, never a fault.
+* **Three states, never two**: ✓ in place · ✗ not in place · ⚠ cannot be
+  checked from here. The ⚠ rows are the honest ones — the oauth2-proxy /
+  AuthorizationPolicy front door, the RAG-side ★ memory-dataset binding and
+  the per-key MCP credential are all invisible to gateway code, so the panel
+  NAMES them and says so rather than claiming "all good". A two-state
+  checklist would be a help panel that lies.
+* **Rendering**: the `[?]` opens the shared `<dialog>` (native focus trap +
+  Esc), long panels scroll (`dialog.dlg-scroll`), and an in-dialog ✕ closes
+  without scrolling to the footer. Each panel ends with **Then verify** — the
+  observable proof (the pill flips, `X-PCAI-Billing: offpeak-0.5`,
+  `ok:true` from `/v1/distill`, the SSO card appearing) — plus a docs
+  pointer. Every fetch degrades to ⚠, so a failed read never turns a help
+  panel into a broken page.
+* **Extending it**: one `HELP` entry keyed by the TAB id + one
+  `button[data-help="<tab id>"]` beside the title. That the key is a real tab
+  id is pinned by a test, as is the knob DRIFT GUARD: every `PCAI_LLM_*` the
+  copy names must resolve to a `settings` attribute, so a renamed field fails
+  the suite instead of the panel quietly telling operators to set a knob that
+  no longer exists.
 
 ## Endpoint health
 

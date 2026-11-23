@@ -1358,6 +1358,21 @@ class RunManager:
             model = rec.target_url.rstrip("/")
         return (rec.kind, model, sweep)
 
+    def _fused_group(self, rec: RunRecord) -> list[RunRecord]:
+        """Every run the results listing fuses into ONE entry with rec,
+        OLDEST FIRST (latest-occurrence-wins needs chronological order).
+
+        Mirrors public_index's grouping exactly — live running runs stand
+        alone, endpoint runs never fuse — so the compare view reads the
+        same set the listing collapsed into that one row.
+        """
+        key = self._fuse_key(rec)
+        if key is None or rec.status == "running":
+            return []
+        group = [other for other in self._runs.values() if other.status != "running" and self._fuse_key(other) == key]
+        group.sort(key=lambda r: r.started_utc or "")
+        return group
+
     def public_index(self, limit: int = 200, fuse: bool = True) -> list[dict]:
         """Public-safe run index for the results page: no params (they can
         carry redacted-but-still-sensitive header names), no log content.
@@ -1370,7 +1385,13 @@ class RunManager:
         ``fused_from`` (the run ids absorbed) + ``fused_count`` so the UI can
         show "3 runs fused". Completed measurements are additive across the
         group; showing five rows for one experiment was noise. Runs still
-        ``running`` and full-success runs always stand alone."""
+        ``running`` and full-success runs always stand alone.
+
+        Additivity is implemented by ``compare_data`` (which reads every
+        member of the fused group) — this index carries ids only. Keep the two
+        in step: a listing that hides a run the compare view never reads
+        silently drops that run's levels.
+        """
         # newest first, then group
         recs = sorted(self._runs.values(), key=lambda x: x.started_utc, reverse=True)[:limit]
         groups: dict[tuple, list[RunRecord]] = {}
@@ -1563,7 +1584,25 @@ class RunManager:
                 return out
             from . import compare as _cmp
 
-            out["rows"] = _cmp.normalize_chat_rows(text)
+            # A fused listing entry must be ADDITIVE. The roster-split
+            # halves of one experiment live in DIFFERENT runs (the listing
+            # fuses them on purpose, because a roster is sweep progress
+            # rather than identity), so reading only this run's report.md
+            # drops the levels only a sibling measured — which is exactly
+            # how a cold ctx=0 half silently vanishes from the compare
+            # view while the padded ctx=32768 half plots fine.
+            group = self._fused_group(rec) or [rec]
+            sources = [
+                (
+                    f"runs/{r.run_id}/report.md",
+                    text if r.run_id == run_id else self._read_text_artifact(r.run_id, "report.md"),
+                )
+                for r in group
+            ]
+            out["rows"] = _cmp.normalize_chat_rows_multi(sources)
+            absorbed = [r.run_id for r in group if r.run_id != run_id]
+            if absorbed:
+                out["fused_from"] = absorbed
             return out
 
         out["error"] = f"unknown kind {rec.kind!r}"

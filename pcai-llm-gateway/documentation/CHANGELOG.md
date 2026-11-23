@@ -5,6 +5,88 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## 2026-11-23 — the scorecard, enabled: procedures before the task, payloads after it
+
+- **The gap this closes.** The 2026-11-10 assessment ended with four unbuilt items and one
+  pattern: every new control shipped in `warn`/shadow and nothing measured whether an agent
+  was *right*. This wave builds the three that were buildable and flips the switches.
+- **Pre-task playbook injection (the read half of procedural memory).** The distiller already
+  WROTE outcome-labelled playbooks and mm-rag already exposed `recall_playbooks`; nothing ever
+  put one in front of a model before it started work. `_with_playbook_block`
+  (`core/toolrelay.py`) derives the task signature from the opening ask, recalls top-k, filters
+  below `minSuccessRate` and appends a compact block to `system_prefix` — so it reaches every
+  model call of the turn while `relay_msgs` and the handback slice boundary stay untouched
+  (X-PCAI-Continue keeps working). FAIL OPEN: any error, timeout or empty recall returns the
+  prefix object unchanged; disabled is byte-identical. The block opens with a line telling the
+  model the procedures are UNTRUSTED reference data, not instructions.
+- **`agent_trace_payloads` — what the agent SAW.** `agent_traces` could answer "what did it do"
+  and "what did it cost" and never "was it right". Sampled PER REQUEST (deterministic sha256 of
+  request_id, so a judge reads a whole turn and not a random subset), redacted best-effort
+  (bearer/api-key/password/DSN-userinfo — NOT a guarantee), truncated with the original length
+  recorded, retention-bounded by the existing housekeeping sweep (step 1e). Written only AFTER
+  its trace row lands, so a payload can never orphan a trace that does not exist. At the shipped
+  default (`sampling: 0`) the whole path is a no-op before any hashing, serialisation or DB write.
+- **`agent_eval` — deterministic behaviour scoring, and a release gate for it.** Scores what the
+  trace already proves: `not_granted`, `tool_error`, `loop`, `step_budget`, else `clean`.
+  Client handbacks are not failures; a DENIED call still counts toward `loop` (a model that
+  keeps trying after being told no is the signal worth having). `scripts/check_agent_eval.py`
+  pins the score against a 12-case golden set and `automation.sh` now runs it as **Gate 4/4** —
+  the first gate in this repo that fails a release on AGENT behaviour rather than code quality.
+- **Knobs are now reachable.** `toolPinMode` and `toolInjectionScreen` existed in code and were
+  not chart-exposed at all; all 14 new settings now render through `helm/templates/deployment.yaml`.
+  Tracked defaults are conservative on purpose (a chart default must not change what a deployment
+  DOES): pin `warn`, screen `annotate`, injection off, sampling 0, eval off. The G2 site values
+  opt in: pin `block`, screen `annotate`, injection on, sampling 0.1, eval on — each flip
+  carries its rollback value and failure mode inline.
+- **Suite:** 3905 → 4054 tests, 0 failed; ruff + mypy clean; SQL↔schema gate clean; helm renders
+  on four values sets with every env present once and parsing into `Settings`.
+- **Cross-review changed the code, and this is the part worth reading.** Two reviewers on a
+  different model family (Inkling) reviewed the wave. The factual pass returned 9 SUPPORTED /
+  1 OVERCLAIMED and the execution pass found a **P1: `agent_eval` had no call site at all** — the
+  knob, the DDL, the scorer and 27 tests were all green and flipping `agentEval.enabled` on G2
+  wrote zero rows, forever. It is now wired at relay turn completion (normal exhaustion only; a
+  mid-turn client close leaves an incomplete row set and is skipped), and `tests/test_trace_payload_wiring.py`
+  gained the same structural guard the payload half already had — an AST check that the call site
+  exists and is flag-guarded. Also fixed from the same review: the injected playbook block welded
+  onto an operator prompt that lacked a trailing newline (`...arguments.## Recalled playbooks`),
+  redaction now covers HTTP Basic, AWS secret access keys and session cookies, and the payload
+  module states its real coverage (server-executed MCP path only) instead of implying completeness.
+- **Known residuals, stated rather than hidden:** pinning and result screening cover the RELAY,
+  not `/mcp`; pins are in-memory, so a restart re-approves; there is still no approval gate for
+  destructive tools; the non-relay proxy path gets no playbooks; and `agent_eval` writes one
+  verdict row per relay step on the hot path (hence off by default).
+
+## 2026-11-23 — the console answers "what does this page need to work?"
+
+- **The gap.** Off-peak billing, the memory distiller and SSO self-mint are
+  each gated by a boot-time env flag (`PCAI_LLM_OFFPEAK_ENABLED`,
+  `PCAI_LLM_DISTILLER_ENABLED`, `PCAI_LLM_SSO_KEY_CREATE_ENABLED`) plus
+  deployment wiring the page cannot change. The panels showed only the runtime
+  half, so an operator could save a profile, a fraction or a threshold, read
+  "saved", and watch nothing happen — with no surface anywhere saying why.
+- **`[?]` readiness checklists.** A `[?]` beside the title of each of those
+  three cards opens a required-config checklist with LIVE state: ✓ in place,
+  ✗ not in place, ⚠ cannot be checked from here (the oauth2-proxy chain, the
+  RAG ★ binding, the per-key credential — NAMED, not glossed). Each panel ends
+  with the observable proof ("Then verify") and a docs pointer. The `[?]` is a
+  BUTTON opening the shared `<dialog>` — native focus trap and Esc, scrolling
+  for long panels, in-dialog ✕ — not a `.tip` hover bubble: the checklist is
+  read while toggling things elsewhere in the panel.
+- **`GET /admin/readiness`** (admin-gated, new) is the flag half: the same
+  `settings` attributes the enforcement paths read — trust flag, forwarded
+  groups, the self-mint kill switch, the mint tenant reported `set` and
+  `valid` separately (unset and malformed are different fixes for the same
+  503), the distiller mount + memory server/probe/write tools, and off-peak
+  enabled/server/tool/thresholds/per-model query count. No DB read, no
+  credential, no URL — it answers while Postgres is down.
+- Tests: `tests/test_admin_help.py` — the endpoint's admin gate and exact
+  payload, the tenant-id tri-state, a knob DRIFT GUARD (every `PCAI_LLM_*` the
+  copy names must resolve to a `settings` attribute), the `[?]`→tab-id wiring,
+  and a node-run behavioural check of the renderer's three states plus an
+  escaping probe on a hostile server name. `test_admin_ui.py` and
+  `test_audit_20261110_ui.py` re-pin the `dlg()` render site now that it takes
+  a scroll flag.
+
 ## 2026-11-18 — a model endpoint's API key now follows it across a base URL edit
 
 - **Data-loss fix, operator report (remote → local address switch).** A pool's

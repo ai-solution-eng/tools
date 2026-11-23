@@ -417,6 +417,86 @@ class Settings(BaseSettings):
     # Unknown values fall back to "warn".
     tool_injection_screen: str = "warn"
 
+    # --- procedural memory: pre-task playbook injection (2026-11-23) -------
+    # The distiller already writes outcome-labelled playbooks (core.playbook,
+    # PROMPT_VERSION "dsh-2026-11-10") and mm-rag exposes recall_playbooks, but
+    # nothing PUT one in front of a model before it started work: an agent had
+    # to choose to call the tool. This is the missing read half of the loop —
+    # retrieve top-k procedures for the task signature and prepend them to the
+    # system preamble.
+    #
+    # Default OFF, because injection spends prompt tokens on EVERY request and a
+    # stale procedure is worse than no procedure. Enable per site once the
+    # playbook store actually holds entries for the traffic being served.
+    playbook_inject_enabled: bool = False
+    # Top-k procedures injected. 3 matches recall_playbooks' own default; more
+    # than that turns the preamble into a procedures manual the model skims.
+    playbook_inject_k: int = 3
+    # Hard cap on the injected block. The playbook payload is bounded by
+    # construction (steps/failure_modes are lists), but a pathological memory
+    # must never be able to grow the preamble without limit.
+    playbook_inject_max_chars: int = 2_000
+    # Recall is a network hop (mm-rag). FAIL OPEN: past this budget the turn
+    # proceeds without procedures — a slow memory store must never delay an
+    # answer. 0 disables the timeout (not recommended).
+    playbook_inject_timeout_ms: int = 800
+    # Only inject procedures whose smoothed success rate clears this bar. 0.0 =
+    # no filter (inject whatever ranks); the store's ranking already prefers
+    # winners, this is the operator's floor.
+    playbook_inject_min_success_rate: float = 0.0
+    # The mm-rag MCP tool that serves recall. Kept a setting (not a constant) for
+    # parity with the distiller's own memory tool names: a fleet that renames the
+    # store-side tool must not need a code change to keep injection working.
+    playbook_inject_recall_tool: str = "recall_playbooks"
+
+    # --- agent trace payloads (2026-11-23) --------------------------------
+    # agent_traces records WHAT the agent did and WHAT IT COST, never WHAT IT
+    # SAW: no arguments, no results, no outcome. Without payloads there is no
+    # replay, no judge, no red-team set and no training data — the quality layer
+    # and the traces-to-training loop are both blocked on this table.
+    #
+    # Default 0.0 = OFF. These are the most sensitive rows the gateway would
+    # store (tool arguments and results, i.e. whatever the fleet touched), so a
+    # site opts in deliberately. Sampled per request: 1.0 captures everything,
+    # 0.1 captures one request in ten.
+    trace_payload_sampling: float = 0.0
+    # Retention in days, enforced by the housekeeping sweep. 0 = keep until
+    # manually pruned (NOT recommended — highest-sensitivity table in the
+    # schema). 7 days matches effective_prompts' window.
+    trace_payload_retention_days: int = 7
+    # Per-payload character cap before storage. Truncation is recorded on the
+    # row (original length) so a judge can tell a short result from a cut one.
+    trace_payload_max_chars: int = 2_000
+    # Redact before storage: bearer tokens, api keys, passwords and DSN userinfo
+    # become a typed marker. Best-effort pattern matching — it reduces blast
+    # radius, it is not a guarantee. Leave ON.
+    trace_payload_redact: bool = True
+
+    # --- agent-behaviour evaluation (2026-11-23) --------------------------
+    # Deterministic, model-free scoring of what the trace already proves: did the
+    # tool call succeed, was it a granted tool, did the turn loop on an identical
+    # call, did it blow the step budget. This is the first half of the quality
+    # layer (a calibrated judge is the second) and it needs no payloads.
+    #
+    # Default OFF: the scorer writes a verdict row per relay step, a new write on
+    # the hot path. Enable, then read agent_eval_* before wiring a gate that can
+    # fail a build.
+    agent_eval_enabled: bool = False
+    # A relay turn exceeding this many model rounds is flagged step_budget.
+    # Kept separate from tool_relay_max_iterations so the gate's threshold can be
+    # tuned without changing what the relay allows.
+    agent_eval_max_steps: int = 40
+    # N identical (server, tool) calls in one turn = loop. Grouped on the pair, not
+    # on the arguments (the scorer does not read payloads), and client handbacks are
+    # excluded — a DSH handback is normal client work, not a loop. 0 or negative
+    # DISABLES the rule, the fleet convention for thresholds, rather than flagging
+    # every turn.
+    # DELIBERATE: a DENIED call still counts toward the loop. A model that repeats a
+    # tool the grant gate refused is both not_granted AND looping, and that second
+    # signal is the one that says "it kept trying after being told no" — the whole
+    # point of watching an autonomous agent. It is not folded into tool_error.
+    agent_eval_loop_threshold: int = 3
+
     # --- reasoning continuity (2026-10-26) -------------------------------
     # Whether the model is shown its OWN prior reasoning: in-loop (the
     # assistant rows a relay turn builds between tool calls) and inbound (the

@@ -387,6 +387,39 @@
   dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border);
            border-radius: 12px; padding: 18px; max-width: 720px; width: 92vw; }
   dialog::backdrop { background: rgba(0,0,0,.55); }
+  /* Scrolling dialog (the [?] help checklists): a panel can be taller than the
+     viewport and the UA's own <dialog> constraint is not something to rely on,
+     so the long ones say so explicitly and scroll instead of clipping. */
+  dialog.dlg-scroll { max-height: 82vh; overflow-y: auto; }
+  /* Card-title help: the [?] beside a page title opens its required-config
+     checklist. A BUTTON, not the .tip hover bubble — the checklist is read
+     WHILE toggling things elsewhere in the panel, so it must survive the
+     pointer leaving the title, and a hover-only affordance is unreachable by
+     keyboard and touch. */
+  .help-btn { display: inline-grid; place-items: center; width: 17px; height: 17px;
+    margin-left: 7px; padding: 0; vertical-align: 2px; border-radius: 50%;
+    border: 1px solid var(--border); background: none; color: var(--dim);
+    font: 700 11px/1 ui-sans-serif, system-ui, sans-serif; cursor: help; }
+  .help-btn:hover, .help-btn:focus-visible { color: var(--accent); border-color: var(--accent); }
+  /* The checklist: state glyph | what must be true / the knob / the fix. */
+  .help-t { width: 100%; margin: 4px 0 2px; border: none; border-radius: 0; background: none; }
+  .help-t th, .help-t td { border: none; padding: 6px 8px 6px 0; vertical-align: top;
+    font-size: 12.5px; text-align: left; text-transform: none; letter-spacing: 0; }
+  .help-t th { width: 26px; font-size: 14px; line-height: 1.2; }
+  .help-t .knob { margin-top: 2px; font-family: ui-monospace, monospace; font-size: 12px;
+    word-break: break-word; }
+  .help-fix { margin-top: 3px; color: var(--dim); font-size: 12px; line-height: 1.45; }
+  .help-ok { color: var(--ok); }
+  .help-no { color: var(--err); }
+  .help-un { color: var(--warn); }
+  .help-lead { margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
+  .help-sect { margin: 14px 0 4px; color: var(--dim); font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .05em; }
+  /* The title + close row sticks to the top of the scrolling dialog: a long
+     checklist must never leave the operator scrolling back up to close it
+     (Esc works, but a mouse-only reader should not have to know that). */
+  .help-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: flex-start;
+    gap: 10px; padding-bottom: 6px; background: var(--panel); }
   .chkrow { display: flex; flex-wrap: wrap; gap: 10px; }
   .chkrow label { flex-direction: row; align-items: center; gap: 5px; color: var(--text); }
   /* A standalone inline checkbox: the page's default label is a stacked
@@ -1090,7 +1123,7 @@
   <!-- ============ ENROLL (invite codes) ============ -->
   <section id="tab-enroll">
     <div class="card">
-      <h2>SSO self-mint default profile</h2>
+      <h2>SSO self-mint default profile <button class="help-btn" type="button" data-help="enroll" aria-haspopup="dialog" aria-label="Help: what SSO self-mint requires" title="What has to be true for this to work">?</button></h2>
       <p class="hint" style="margin:0 0 8px">Every key a user mints via <b>Sign in with SSO</b> gets this tenant's profile. On mint and on every rotate, two things happen: the profile's budgets, MCP grants and rate-limit presets are <b>stamped</b> onto the key row, and the <b>user row is bound</b> to the profile when it has none. Scopes stay the fixed least-privilege grant; profiles never widen them.</p>
       <div class="row">
         <label>Tenant
@@ -1140,6 +1173,15 @@
         <label class="chk"><input type="checkbox" id="e-with-leader"> also mint a team leader key
           <div class="hint">Control-plane key for the /team_leader console — shown once, alongside the code.</div>
         </label>
+        <label>Model ACL
+          <select id="e-acl-mode" title="Which models the keys this code mints may use. profile snapshot = the profile's model list FROZEN at redeem time (the historical behaviour) — a model added later will NOT reach those keys. allow all registered = stamp nothing, so later roster changes apply automatically. explicit list = exactly the models named beside it.">
+            <option value="profile">profile snapshot</option>
+            <option value="all">allow all registered</option>
+            <option value="explicit">explicit list</option>
+          </select>
+        </label>
+        <label>ACL models <input id="e-acl-models" placeholder="explicit only — comma-separated" style="width:260px"
+          title="Only used with 'explicit'. Must name registered models — the server refuses an unknown name."></label>
         <button class="btn" id="e-create">Mint code</button>
       </div>
       <p class="muted" style="margin-top:6px">The plaintext code is returned <b>once</b> at mint time (only its SHA-256 hash is
@@ -1160,14 +1202,14 @@
       <tr><th>Enrollment</th><th class="col-ttenant">Tenant</th><th title="What the leader asked for">Requested</th><th>Note</th><th title="How long the ask has been open">Waiting</th><th></th></tr>
     </thead><tbody></tbody></table>
     <table id="enroll-table"><thead>
-      <tr><th>Label</th><th class="col-tenant">Tenant</th><th>Profile</th><th>Uses</th><th>Expires</th><th title="Team envelope — the HARD cap on the whole team. A derived cap was NOT set by hand: every profile preset × the mint allowance becomes its own per-model pool (one line per limit), and each pool is the only overflow pool for its kind. Edit sets an explicit pooled cap that replaces them.">Budget</th><th title="Sum of the per-key allocations of the keys minted so far (the budgets rows)">Allocated</th><th title="Spend inside the current envelope window">Spend</th><th title="Team leader key — mint (shown once), rotate, or revoke. Its holder gets the /team_leader console scoped to this enrollment.">Leader key</th><th title="Keys minted from this enrollment">Keys</th><th>Status</th><th>Created</th><th></th></tr>
+      <tr><th>Label</th><th class="col-tenant">Tenant</th><th>Profile</th><th title="Which models the keys minted from this code may use. profile = a SNAPSHOT of the profile's model list, frozen at redeem time, so a model added later will NOT reach those keys; all = nothing stamped, so later roster changes apply; explicit = exactly the listed models.">Model ACL</th><th>Uses</th><th>Expires</th><th title="Team envelope — the HARD cap on the whole team. A derived cap was NOT set by hand: every profile preset × the mint allowance becomes its own per-model pool (one line per limit), and each pool is the only overflow pool for its kind. Edit sets an explicit pooled cap that replaces them.">Budget</th><th title="Sum of the per-key allocations of the keys minted so far (the budgets rows)">Allocated</th><th title="Spend inside the current envelope window">Spend</th><th title="Team leader key — mint (shown once), rotate, or revoke. Its holder gets the /team_leader console scoped to this enrollment.">Leader key</th><th title="Keys minted from this enrollment">Keys</th><th>Status</th><th>Created</th><th></th></tr>
     </thead><tbody></tbody></table>
   </section>
 
   <!-- ============ OFF-PEAK (low-demand billing status) ============ -->
   <section id="tab-offpeak">
     <div class="card">
-      <h2>Off-peak billing</h2>
+      <h2>Off-peak billing <button class="help-btn" type="button" data-help="offpeak" aria-haspopup="dialog" aria-label="Help: what off-peak billing requires" title="What has to be true for this to work">?</button></h2>
       <p class="hint" style="margin:0 0 8px">Requests bill at a reduced multiplier while GPU demand is low.</p>
       <div class="row" style="align-items:center;margin-bottom:8px">
         <span id="op-pill" class="pill">—</span>
@@ -1247,7 +1289,7 @@
 
   <section id="tab-distiller">
     <div class="card">
-      <h2>Session memory distiller</h2>
+      <h2>Session memory distiller <button class="help-btn" type="button" data-help="distiller" aria-haspopup="dialog" aria-label="Help: what the memory distiller requires" title="What has to be true for this to work">?</button></h2>
       <p class="hint" style="margin:0 0 8px">Quiet conversations are distilled into each key's RAG memory dataset.</p>
       <div class="row" style="align-items:center;margin-bottom:8px">
         <span id="di-pill" class="pill">—</span>
@@ -2321,7 +2363,273 @@ window.toggleSelfMint = (btn, userId, allowed) => withBtn(btn, async () => {
   await loadKeys();
 });
 
-function dlg(html) { $('dlg-body').innerHTML = html; $('dlg').showModal(); armPasswordToggles($('dlg-body')); layoutFormRowsNow(); }
+function dlg(html, scroll) {
+  const d = $('dlg');
+  // A long panel (the help checklists) opts into its own scroll; every other
+  // dialog keeps the sizing it has always had.
+  d.classList.toggle('dlg-scroll', scroll === true);
+  $('dlg-body').innerHTML = html;
+  d.showModal();
+  armPasswordToggles($('dlg-body'));
+  layoutFormRowsNow();
+}
+
+// ---------- [?] page help: what a page needs to WORK ---------------------
+// WHY a checklist and not prose: every one of these pages configures a
+// feature that is ALSO gated by boot-time env flags and by deployment wiring
+// the page cannot change, so the operator's real question is "I saved it, why
+// is nothing happening?". A paragraph cannot answer that; required items with
+// LIVE state can. THREE states, never two — in place / not in place / cannot
+// be checked from here (the proxy chain, the RAG star, a per-key credential).
+// A two-state checklist would claim "all good" about things no code can see,
+// which is how a help panel starts lying.
+//
+// Data: GET /admin/readiness (the boot-time flags — the only source for them)
+// plus the page's own endpoints where they carry a checkable fact (the MCP
+// registry row, the distiller runtime toggle, the tenant SSO profiles). Every
+// fetch degrades to null and a null state renders ⚠ — a help panel must never
+// be the reason a page looks broken.
+//
+// Adding a page: one HELP entry + one button carrying data-help=<tab id>
+// beside its title. The key IS the tab id, so an entry can never point at a
+// dead panel.
+const HELP_GLYPH = { ok: '✓', no: '✗', un: '⚠' };
+const HELP_STATE_TITLE = { ok: 'in place', no: 'not in place', un: 'cannot be checked from here' };
+
+function helpVal(v, d) { return typeof v === 'function' ? v(d) : (v || ''); }
+
+function helpState(d, item) {
+  try {
+    const v = item.state ? item.state(d) : null;
+    return v === true ? 'ok' : (v === false ? 'no' : 'un');
+  } catch (e) { return 'un'; }   // a state probe must never break the panel
+}
+
+// The MCP registry row a feature calls through: true = present and enabled,
+// false = missing or disabled, null = the registry read itself failed.
+function helpMcpRow(d, name) {
+  if (!Array.isArray(d.servers)) return null;
+  const row = d.servers.find(function (s) { return s && s.name === name; });
+  return row ? row.enabled !== false : false;
+}
+
+function helpFlags(d) { return d.readiness || {}; }
+
+function helpHtml(spec, d) {
+  const rows = (spec.items || []).map(function (it) {
+    const st = helpState(d, it);
+    return '<tr><th class="help-' + st + '" title="' + HELP_STATE_TITLE[st] + '">' + HELP_GLYPH[st] + '</th>' +
+      '<td><div>' + helpVal(it.label, d) + '</div>' +
+      (it.knob ? '<div class="knob">' + helpVal(it.knob, d) + '</div>' : '') +
+      (it.fix ? '<div class="help-fix">' + helpVal(it.fix, d) + '</div>' : '') +
+      '</td></tr>';
+  }).join('');
+  const caveats = (spec.caveats || []).map(function (c) { return '<li>' + helpVal(c, d) + '</li>'; }).join('');
+  return '<div class="help-head">' +
+      '<h2 style="margin:0;flex:1">' + spec.title + '</h2>' +
+      '<button class="ghost mini" type="button" data-help-close aria-label="Close help">✕</button>' +
+    '</div>' +
+    '<p class="help-lead">' + spec.lead + '</p>' +
+    '<div class="help-sect">Required to work</div>' +
+    '<table class="help-t"><tbody>' + rows + '</tbody></table>' +
+    (spec.verify ? '<div class="help-sect">Then verify</div><p class="help-lead" style="margin:0">' + helpVal(spec.verify, d) + '</p>' : '') +
+    (spec.note ? '<p class="help-fix" style="margin-top:10px">' + helpVal(spec.note, d) + '</p>' : '') +
+    (caveats ? '<div class="help-sect">Cannot be checked from here</div>' +
+      '<ul class="help-fix" style="margin:4px 0 0;padding-left:18px">' + caveats + '</ul>' : '') +
+    (spec.docs ? '<p class="hint" style="margin-top:14px">Docs: <code>' + spec.docs + '</code></p>' : '');
+}
+
+const HELP = {
+  // Operations → Off-peak billing
+  offpeak: {
+    title: 'Off-peak billing — what has to be true',
+    lead: 'Requests bill at a reduced multiplier while GPU demand is low. Two gates decide whether the discount can ever apply — the boot-time flag and an evaluator that can read GPU utilization; the rows below also flag the two settings that make it behave. Everything is checked live.',
+    items: [
+      {
+        label: 'The feature is switched on.',
+        knob: '<code>PCAI_LLM_OFFPEAK_ENABLED=true</code>',
+        state: function (d) { const o = helpFlags(d).offpeak; return o ? o.enabled === true : null; },
+        fix: 'A boot-time env flag: set it in the chart values and restart the pod. Until then the pill above reads DISABLED and every settle bills at full price.',
+      },
+      {
+        label: 'The evaluator can read GPU utilization.',
+        knob: function (d) {
+          const o = helpFlags(d).offpeak || {};
+          return '<code>PCAI_LLM_OFFPEAK_MCP_SERVER</code> = <code>' + esc(o.mcp_server || 'prometheus') +
+            '</code> · tool <code>' + esc(o.tool || 'prom_query') + '</code>';
+        },
+        state: function (d) { const o = helpFlags(d).offpeak; return o ? helpMcpRow(d, o.mcp_server) : null; },
+        fix: 'Register that MCP server under <b>MCP servers</b> and leave it enabled — the evaluator calls its query tool in-cluster, with no tenant key. A missing or disabled row leaves <b>Last error</b> set above and the discount OFF.',
+      },
+      {
+        label: 'Each model you bill on has its own query (recommended).',
+        knob: '<code>PCAI_LLM_OFFPEAK_MODEL_PROMQL</code>',
+        state: function (d) { const o = helpFlags(d).offpeak; return o ? (o.per_model_queries > 0) : null; },
+        fix: 'The global query is a FLEET AVERAGE: a pegged model can read low-demand while the fleet idles, and its requests get the discount. Per-model queries make each model’s OWN hysteresis decide — they are the cards below.',
+      },
+      {
+        label: 'The hysteresis band is ordered.',
+        knob: function (d) {
+          const o = helpFlags(d).offpeak || {};
+          const en = o.enter_pct == null ? '?' : String(o.enter_pct);
+          const ex = o.exit_pct == null ? '?' : String(o.exit_pct);
+          return '<code>PCAI_LLM_OFFPEAK_ENTER_PCT</code> = ' + esc(en) + '% &lt; <code>PCAI_LLM_OFFPEAK_EXIT_PCT</code> = ' + esc(ex) + '%';
+        },
+        state: function (d) {
+          const o = helpFlags(d).offpeak;
+          if (!o) return null;
+          return Number(o.enter_pct) < Number(o.exit_pct);
+        },
+        fix: 'enter must be BELOW exit: the gap is the hysteresis that stops the state flapping at the threshold. Between the two values the state simply stays where it was.',
+      },
+    ],
+    verify: 'Idle the fleet, or wait for a quiet window: the pill above flips to <b>ACTIVE</b> and the next settle stamps <code>X-PCAI-Billing: offpeak-&lt;fraction&gt;</code>. The ledger keeps TRUE usage — only the budget gates read the fraction.',
+    note: 'Fail-safe by construction: a disabled or missing server, a timeout, or an unparseable value all leave the state inactive and record <b>Last error</b> above. Precedence while active: the model’s own ratio → the key profile’s fraction → the gateway default (0.5 makes budgets last twice as long).',
+    docs: 'documentation/FEATURES.md § Off-peak billing',
+  },
+
+  // Operations → Memory distiller
+  distiller: {
+    title: 'Session memory distiller — what has to be true',
+    lead: 'Quiet conversations are distilled into the calling key’s RAG memory dataset. The gates below must pass before a single token is spent; the per-key credential is the one most often missing.',
+    items: [
+      {
+        label: 'The distiller is mounted.',
+        knob: '<code>PCAI_LLM_DISTILLER_ENABLED=true</code>',
+        state: function (d) { const m = helpFlags(d).memory; return m ? m.distiller_enabled === true : null; },
+        fix: 'A boot-time env flag. Unmounted means every <code>/v1/distill</code> call 404s and the housekeeping sweep never runs — the rest of this page would be configuring a surface that does not exist.',
+      },
+      {
+        label: 'The memory server is registered and enabled.',
+        knob: function (d) {
+          const m = helpFlags(d).memory || {};
+          return '<code>PCAI_LLM_DISTILLER_MEMORY_SERVER</code> = <code>' + esc(m.memory_server || 'mm-rag') + '</code>';
+        },
+        state: function (d) { const m = helpFlags(d).memory; return m ? helpMcpRow(d, m.memory_server) : null; },
+        fix: 'Register it under <b>MCP servers</b>. The distiller calls its probe (<code>memory_status</code> by default) and write (<code>add_memory</code> by default) tools through the relay path with the KEY’s own credentials — the server-level token alone is not enough for multi-tenant memory.',
+      },
+      {
+        label: 'The key is memory-attached.',
+        knob: 'a per-key MCP credential for that server (or the enrollment-stamped dataset pair)',
+        state: function () { return null; },
+        fix: 'Per key, so it cannot be read from here: <b>API keys → edit → MCP credentials</b> → paste the RAG key for the memory server. Without it the probe answers writable=false and the surface returns <code>200 {ok:false, inert:true}</code> — nothing runs, and nothing errors.',
+      },
+      {
+        label: 'The runtime toggle is on.',
+        knob: 'Runtime enabled (this page)',
+        state: function (d) { const c = d.distiller && d.distiller.config; return c ? c.enabled !== false : null; },
+        fix: 'BOTH this and the env flag must be true: the env flag owns the MOUNT, this owns whether distills RUN. Pausing here is the safe way to stop the feed without a redeploy.',
+      },
+      {
+        label: 'A pinned summarizer model is registered.',
+        knob: function (d) {
+          const c = (d.distiller && d.distiller.config) || {};
+          return c.model ? '<code>PCAI_LLM_DISTILLER_MODEL</code> = <code>' + esc(c.model) + '</code>'
+            : '<code>PCAI_LLM_DISTILLER_MODEL</code> — empty (the caller’s own routing)';
+        },
+        state: function (d) {
+          const c = d.distiller && d.distiller.config;
+          if (!c) return null;
+          if (!c.model) return true;                     // empty = caller routing, valid
+          if (!Array.isArray(d.models)) return null;      // the registry read failed
+          return d.models.indexOf(c.model) !== -1;
+        },
+        fix: 'Empty is the fleet default: the distill call rides the calling key’s routing. A PINNED model must be a registered chat pool — an unknown name makes every distill raise “not registered” and the sweep retry it forever.',
+      },
+    ],
+    verify: 'Call <code>POST /v1/distill</code> with the key: an attached key returns <code>ok:true</code> with a document id; an unattached one returns <code>200 {ok:false, inert:true}</code>, which is a configuration answer, not an error. The pill above reads ENABLED while the runtime toggle is on.',
+    caveats: [
+      'The RAG side of the chain: the presented key must own a ★ memory dataset on the memory server (mm-rag’s /access star). No gateway code can see that binding — the probe is the only witness, and it reports per key.',
+      'Capture is universal but not unconditional: title-generation requests are never captured, one-shot rows are never distilled, and <code>X-PCAI-Conversation: raw</code> opts a request out entirely.',
+    ],
+    docs: 'documentation/MEMORY.md (the end-to-end walkthrough)',
+  },
+
+  // Access & safety → Enrollment (the SSO self-mint card)
+  enroll: {
+    title: 'SSO self-mint — what has to be true',
+    lead: 'A user signed in through the fleet’s SSO front door mints their own key from the chat console’s <b>Sign in with SSO</b> card. Three boot-time flags and one tenant setting must be true; the proxy chain that makes it safe is the part no code can verify.',
+    items: [
+      {
+        label: 'The browser identity headers are trusted.',
+        knob: '<code>PCAI_LLM_TRUST_PROXY_IDENTITY=true</code>',
+        state: function (d) { const s = helpFlags(d).sso; return s ? s.trust_proxy_identity === true : null; },
+        fix: 'Off: <code>X-Auth-Request-User</code> / <code>X-Email</code> are ignored and every request falls through to a key — the mint card never appears. Turning it on is safe ONLY behind the enforcing front door (see below).',
+      },
+      {
+        label: 'The self-mint kill switch is on.',
+        knob: '<code>PCAI_LLM_SSO_KEY_CREATE_ENABLED=true</code>',
+        state: function (d) { const s = helpFlags(d).sso; return s ? s.sso_key_create_enabled === true : null; },
+        fix: 'A separate posture switch from the trust flag: it removes the surface entirely (403) even where the proxy is trusted. Both must be on.',
+      },
+      {
+        label: 'The mint has a tenant to land in.',
+        knob: '<code>PCAI_LLM_TOKEN_SHADOW_TENANT_ID</code>',
+        state: function (d) {
+          const s = helpFlags(d).sso;
+          return s ? (s.token_shadow_tenant_id_set === true && s.token_shadow_tenant_id_valid === true) : null;
+        },
+        fix: function (d) {
+          const s = helpFlags(d).sso || {};
+          const why = !s.token_shadow_tenant_id_set ? 'it is unset'
+            : (!s.token_shadow_tenant_id_valid ? 'it is not a valid UUID' : '');
+          return 'Unset or malformed → the mint refuses with <b>503</b>: a key needs a tenancy holder and the mint will not invent one' +
+            (why ? ' (currently ' + why + ')' : '') + '. Copy a tenant id from the tenant select on this console.';
+        },
+      },
+      {
+        label: 'That tenant has an SSO default profile.',
+        knob: 'SSO self-mint default profile (the card above)',
+        state: function (d) {
+          if (!Array.isArray(d.tenants)) return null;
+          return d.tenants.some(function (t) { return t && t.sso_default_profile_id; });
+        },
+        fix: 'Without it the mint still works, but hands out the BARE grant (60 rpm · 100k tpm, no budgets, no MCP grants) — and the key then ignores cascade ordering, routing, off-peak and agents. Pick the tenant and its profile above, then Save; <b>bind existing users</b> backfills the ones who signed in before it existed.',
+      },
+    ],
+    verify: 'Open the chat console THROUGH the SSO front door: the <b>Sign in with SSO</b> card appears and mints one key per identity. A second mint is a 409; a rotate replaces the old key in one transaction, so the old plaintext stops working the moment it commits.',
+    caveats: [
+      'The enforcing front door: oauth2-proxy must OVERWRITE the identity headers on every request, and an Istio AuthorizationPolicy must make the pod unreachable except through it. The trust flag only says the gateway will BELIEVE those headers — nothing in code can check that the proxy is actually in front.',
+      'The console card is the client half: it renders only when <code>GET /v1/identity</code> reports <code>flags.self_mint: true</code> for that browser. A console reached by port-forward carries no proxy headers and will report false — the probe being honest, not a fault.',
+      'If the proxy sends groups as <code>X-Forwarded-Groups</code> rather than <code>X-Auth-Request-Groups</code>, set <code>PCAI_LLM_TRUST_FORWARDED_GROUPS=true</code> or the admin-tier split sees no groups.',
+    ],
+    docs: 'documentation/DEPLOYMENT.md § SSO self-mint rollout',
+  },
+};
+
+// One gather per open: the flags (always) plus whatever the page can check.
+// Each failure lands as null so its rows render ⚠ instead of a dead panel.
+async function helpData(key) {
+  const jobs = [['readiness', api('/readiness')], ['servers', api('/mcp-servers')]];
+  if (key === 'offpeak') jobs.push(['offpeak', api('/offpeak')]);
+  if (key === 'distiller') jobs.push(['distiller', api('/distiller/config')], ['models', api('/models')]);
+  if (key === 'enroll') jobs.push(['tenants', api('/tenants')]);
+  const d = { readiness: null, servers: null, offpeak: null, distiller: null, models: null, tenants: null };
+  await Promise.all(jobs.map(function (job) {
+    return job[1].then(function (v) { d[job[0]] = v; }).catch(function () { d[job[0]] = null; });
+  }));
+  return d;
+}
+
+async function openHelp(key) {
+  const spec = HELP[key];
+  if (!spec) return;
+  // Dialog FIRST, content second: a slow /readiness must not read as a dead [?].
+  dlg('<div class="muted">reading deployment posture…</div>', true);
+  const d = await helpData(key);
+  $('dlg-body').innerHTML = helpHtml(spec, d);
+  layoutFormRowsNow();
+}
+
+document.addEventListener('click', function (e) {
+  const t = e.target && e.target.closest ? e.target : null;
+  if (!t) return;
+  if (t.closest('[data-help-close]')) { $('dlg').close(); return; }
+  const b = t.closest('button[data-help]');
+  if (!b) return;
+  e.preventDefault();
+  openHelp(b.dataset.help).catch(function (err) { banner(err.message, 'error', 6000); });
+});
 
 // Scroll a form title into view BELOW the sticky header + nav (2026-11-05).
 // Plain scrollIntoView({block:'start'}) parks the title UNDER both sticky
@@ -4274,6 +4582,16 @@ window.editEnrollment = id => {
           <option value="day"${r.budget_period === 'day' ? ' selected' : ''}>day</option>
         </select></label>
     </div>
+    <div class="row">
+      <label>Model ACL
+        <select id="ee-acl-mode" title="Applies to keys minted AFTER this change — an already-issued key keeps the ACL it was stamped with.">
+          <option value="profile"${(r.model_acl_mode || 'profile') === 'profile' ? ' selected' : ''}>profile snapshot</option>
+          <option value="all"${r.model_acl_mode === 'all' ? ' selected' : ''}>allow all registered</option>
+          <option value="explicit"${r.model_acl_mode === 'explicit' ? ' selected' : ''}>explicit list</option>
+        </select>
+        <div class="hint">Applies to keys minted AFTER this change — an already-issued key keeps the ACL it was stamped with.</div></label>
+      <label>ACL models <input id="ee-acl-models" value="${esc((r.allowed_models || []).join(', '))}" placeholder="explicit only — comma-separated" style="width:300px"></label>
+    </div>
     <label class="chk" style="margin-top:8px"><input type="checkbox" id="ee-overflow"${r.overflow_enabled === false ? '' : ' checked'}> overflow — keys may draw on the unallocated shared pool</label>
     <label style="margin-top:8px">Expires at (local time) <input id="ee-exp" type="datetime-local" value="${esc(expLocal)}" style="width:100%"></label>
     <label class="chk"><input type="checkbox" id="ee-clear"${r.expires_at ? '' : ' checked'}> never expires</label>
@@ -4295,6 +4613,14 @@ window.editEnrollment = id => {
     // A checkbox IS a decision (the create-form convention): the ticked state
     // is the state to send, so an unchanged tick is a harmless same-value write.
     body.overflow_enabled = $('ee-overflow').checked;
+    // Model ACL (2026-11-23): mode is always sent (a decision, like overflow);
+    // the list only with 'explicit'. Changing it here does NOT retro-fix keys
+    // that were already minted — they keep the snapshot they were stamped with.
+    body.model_acl_mode = $('ee-acl-mode').value;
+    if (body.model_acl_mode === 'explicit') {
+      body.allowed_models = $('ee-acl-models').value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!body.allowed_models.length) return banner('an explicit model ACL needs at least one model name', 'error', 6000);
+    }
     if ($('ee-clear').checked) body.expires_at = null;
     else {
       const ex = $('ee-exp').value;
@@ -4369,6 +4695,22 @@ async function loadEnrollTab() {
   // not the default tenant, so it reappears the moment it matters.
   const showTenant = (rows || []).some(r => (r.tenant_name || '') !== 'fleet');
   const colspan = showTenant ? 13 : 12;
+    // Model ACL (2026-11-23): 'profile' is a FROZEN snapshot of the profile's
+    // model list taken when each key was minted, 'all' stamps nothing (so a
+    // model deployed later reaches those keys with no re-stamp), 'explicit'
+    // stamps this enrollment's own list. String concatenation, not a template
+    // literal: the model list is operator data and esc() must see it whole.
+    const aclCell = (r) => {
+      const mode = r.model_acl_mode || 'profile';
+      if (mode === 'all') {
+        return '<span class="pill on" title="No ACL stamped — keys resolve models against the registry, so a model added later is reachable with no re-stamp">allow all</span>';
+      }
+      if (mode === 'explicit') {
+        const list = Array.isArray(r.allowed_models) ? r.allowed_models : [];
+        return '<span class="mono" title="' + esc(list.join(', ')) + '">' + esc(list.length ? list.join(', ') : '—') + '</span>';
+      }
+      return '<span class="muted" title="Snapshot of the profile model list, frozen when each key was minted — a model added later does NOT reach those keys">profile snapshot</span>';
+    };
   $('enroll-table').querySelector('tbody').innerHTML = (rows || []).map(r => {
     const status = r.revoked_at ? '<span class="pill off">revoked</span>'
       : (r.expires_at && new Date(r.expires_at) < new Date() ? '<span class="pill off">expired</span>'
@@ -4416,6 +4758,7 @@ async function loadEnrollTab() {
       <td>${esc(r.label)}</td>
       <td class="muted col-tenant">${esc(r.tenant_name || '—')}</td>
       <td>${esc(r.profile_name || '—')}</td>
+      <td>${aclCell(r)}</td>
       <td class="nw">${r.uses ?? 0} / ${r.max_uses ?? 0}${r.max_uses ? '' : ' <span class="pill off" title="legacy unlimited code: 0 now means EXHAUSTED (the redeem predicate fails closed). Use edit to set a positive allowance.">legacy 0</span>'}</td>
       <td class="muted">${r.expires_at ? new Date(r.expires_at).toLocaleString() : 'never'}</td>
       <td class="muted">${budgetCell}${derivedMark}</td>
@@ -4488,6 +4831,14 @@ $('e-create').onclick = guarded('e-create', async () => {
   body.budget_period = $('e-budget-period').value;
   body.overflow_enabled = $('e-overflow').checked;
   body.with_team_leader = $('e-with-leader').checked;
+  // Model ACL mode (2026-11-23): the select IS the decision, so it is always
+  // sent. The list rides only with 'explicit' — and an explicit ACL with no
+  // names is a server-side 400, caught here where the operator can see why.
+  body.model_acl_mode = $('e-acl-mode').value;
+  if (body.model_acl_mode === 'explicit') {
+    body.allowed_models = $('e-acl-models').value.split(',').map(s => s.trim()).filter(Boolean);
+    if (!body.allowed_models.length) return banner('an explicit model ACL needs at least one model name', 'error', 6000);
+  }
   try {
     const j = await api('/enrollments', { method: 'POST', body });
     // the plaintext code exists ONLY in this response — show-once + copy

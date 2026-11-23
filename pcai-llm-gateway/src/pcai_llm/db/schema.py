@@ -872,6 +872,22 @@ ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS budget_period TEXT NOT NULL DEF
 -- without minting a per-key allocation for every teammate.
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS overflow_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
+-- Model ACL stamped onto keys minted from this enrollment (2026-11-23).
+-- 'profile' (the default, and the only behaviour before this) = the profile's
+-- model_order ∩ registered models, FROZEN at redeem time; 'all' = stamp
+-- NOTHING, so the key's empty ACL is resolved against the registry at request
+-- time and a later roster change needs no re-stamp; 'explicit' = stamp the
+-- enrollment's own allowed_models list.
+-- WHY this is configurable: the stamped ACL is a SNAPSHOT, so every roster
+-- change stranded already-issued keys (adding a model meant hand-patching each
+-- key's ACL) — and the freeze was neither visible nor optional from the
+-- console. TEXT + app-side validation (like budget_period): a CHECK would fail
+-- the whole multi-statement schema apply on a live database that already holds
+-- an out-of-vocabulary value written by an older build.
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS model_acl_mode TEXT NOT NULL DEFAULT 'profile';
+-- Only read when model_acl_mode = 'explicit'. NULL/empty = nothing stamped.
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS allowed_models TEXT[];
+
 -- The team leader key: a control-plane credential scoped to ONE enrollment
 -- (the analog of the admin key, not of an api_key). HASH-ONLY, exactly like
 -- api_keys.key_hash and enrollments.code_hash — the plaintext is returned once
@@ -1596,4 +1612,78 @@ CREATE INDEX IF NOT EXISTS idx_tool_jobs_active ON tool_jobs(key_id, created_at 
 -- The reaper's scan. Separate index because expiry is a GLOBAL sweep, not a
 -- per-key read: one busy key must not be able to starve the sweep.
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_expiry ON tool_jobs(expires_at);
+-- ============================================================================
+-- Agent quality layer (2026-11-23): trace PAYLOADS + deterministic VERDICTS.
+--
+-- agent_traces records what an agent DID and what it COST; it never recorded
+-- what it SAW. Without the tool arguments and the results that came back there
+-- is no replay, no judge, no red-team set and no training data — the quality
+-- layer and the traces-to-training loop are both blocked on that gap. Two
+-- additive tables, both written BEST-EFFORT off the relay path and both
+-- operator-gated in config (trace_payload_sampling / agent_eval_enabled, both
+-- default OFF): the most sensitive rows the gateway stores are opt-in.
+-- ============================================================================
+
+-- One row per captured payload: kind 'args' is what the model SENT to a tool,
+-- kind 'result' is what came back. Grouped by (request_id, iteration) with the
+-- agent_traces row it belongs to. Sampling is per REQUEST (core/trace_payloads),
+-- so a captured turn is captured completely — never a random subset of one.
+--
+-- payload_chars is the length BEFORE truncation (and before redaction), so a
+-- reader can tell a short result from a cut one; truncated/redacted are the
+-- honest flags for the same reason. payload is a pure prefix of the scrubbed
+-- text, never a spliced marker.
+--
+-- NO foreign key to agent_traces: that table has no unique request_id (one row
+-- per step), so a FK would need a composite key that buys nothing — the same
+-- key/request-only convention as the usage ledger. A payload row is inert if
+-- its trace rows were pruned first.
+CREATE TABLE IF NOT EXISTS agent_trace_payloads (
+    id            BIGSERIAL PRIMARY KEY,
+    request_id    TEXT NOT NULL,
+    iteration     INT  NOT NULL DEFAULT 0,
+    phase         TEXT NOT NULL DEFAULT 'tool',
+    server        TEXT NOT NULL DEFAULT '',
+    tool          TEXT NOT NULL DEFAULT '',
+    kind          TEXT NOT NULL,                -- args | result
+    payload       TEXT NOT NULL DEFAULT '',
+    payload_chars INT  NOT NULL DEFAULT 0,      -- length BEFORE truncation
+    truncated     BOOLEAN NOT NULL DEFAULT FALSE,
+    redacted      BOOLEAN NOT NULL DEFAULT FALSE,
+    ts            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Vocabulary enforced NOT VALID (the ck_traces_status idiom above): a VALID add
+-- would scan on every boot and abort the whole implicit schema transaction on a
+-- stale row written by an older build or hand SQL.
+ALTER TABLE agent_trace_payloads DROP CONSTRAINT IF EXISTS ck_trace_payload_kind;
+ALTER TABLE agent_trace_payloads ADD CONSTRAINT ck_trace_payload_kind
+    CHECK (kind IN ('args','result')) NOT VALID;
+-- The judge/replay read: every payload of one step, in step order.
+CREATE INDEX IF NOT EXISTS idx_trace_payloads_request ON agent_trace_payloads(request_id, iteration);
+-- The retention sweep (housekeeping, trace_payload_retention_days): ts-leading
+-- for the same reason idx_traces_ts exists — a prune must never seq-scan the
+-- highest-sensitivity table in the schema.
+CREATE INDEX IF NOT EXISTS idx_trace_payloads_ts ON agent_trace_payloads(ts DESC);
+
+-- Deterministic verdicts (core/agent_eval.py): one row per (turn, verdict).
+-- A turn can produce several (it looped AND blew its step budget) and a clean
+-- turn produces exactly one 'clean' row, so "was this turn scored?" and "what
+-- was wrong with it?" are both a single indexed read. detail is canonical JSON
+-- evidence (TEXT, like profiles.defaults_json — no JSONB operator surface is
+-- needed by any reader yet).
+CREATE TABLE IF NOT EXISTS agent_eval_verdicts (
+    id         BIGSERIAL PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    verdict    TEXT NOT NULL,              -- tool_error|not_granted|loop|step_budget|clean
+    reason     TEXT NOT NULL DEFAULT '',
+    detail     TEXT NOT NULL DEFAULT '',   -- canonical JSON evidence
+    ts         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE agent_eval_verdicts DROP CONSTRAINT IF EXISTS ck_eval_verdicts_vocab;
+ALTER TABLE agent_eval_verdicts ADD CONSTRAINT ck_eval_verdicts_vocab
+    CHECK (verdict IN ('tool_error','not_granted','loop','step_budget','clean')) NOT VALID;
+-- One turn's verdicts (the gate/console read).
+CREATE INDEX IF NOT EXISTS idx_eval_verdicts_request ON agent_eval_verdicts(request_id);
+-- The quality dashboard: "what is failing lately", per verdict class.
+CREATE INDEX IF NOT EXISTS idx_eval_verdicts_verdict_ts ON agent_eval_verdicts(verdict, ts DESC);
 """
