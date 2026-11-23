@@ -52,6 +52,9 @@ LAB_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("whisper",), "OpenAI"),
     (("fishaudio", "s2-"), "Fish Audio"),
     (("d3-turbo", "vllm-sr"), "vLLM Project"),
+    # Thinking Machines publishes Inkling from the org "thinkingmachines", so
+    # the org fallback would title-case the lab header to "Thinkingmachines".
+    (("inkling",), "Thinking Machines"),
     # NVIDIA publishes its own Nemotron family as nvidia/NVIDIA-Nemotron-*, and
     # the org fallback would render that lab as "Nvidia".  "nemotron" alone
     # never matches today (the family key starts with "nvidia-"), but it is
