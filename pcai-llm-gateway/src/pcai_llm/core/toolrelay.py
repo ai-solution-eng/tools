@@ -42,6 +42,7 @@ from . import (
     offpeak,
     tool_injection,
     tool_pin,
+    tool_span,
     tool_surface,
     toolcompress,
     traces,
@@ -1571,6 +1572,7 @@ async def relay_stream(
     model: str,
     key_id: uuid.UUID | None = None,
     user_id: uuid.UUID | None = None,
+    key_name: str | None = None,  # exported as pcai.key on tool spans
     # the KEY's configured off-peak base (profile fraction ?? env default);
     # effective() applies the CURRENT demand state at each settle moment
     key_fraction: float = 1.0,
@@ -1998,7 +2000,16 @@ async def relay_stream(
             tool_result=tool_result,
         )
 
-    def _emit_tool_span(server: str, tool: str, ms: int | None, status: str) -> None:
+    def _emit_tool_span(
+        server: str,
+        tool: str,
+        ms: int | None,
+        status: str,
+        *,
+        iteration: int | None = None,
+        args: Any = None,
+        reason: str | None = None,
+    ) -> None:
         """OTLP span for ONE executed tool call. Metadata only, never raises.
 
         Named '<server>__<tool>' so a backend reads the tool the model actually
@@ -2011,20 +2022,21 @@ async def relay_stream(
         trace. No-op when tracing is off — start_span returns the shared Noop.
         """
         elapsed = ms or 0
-        attrs: dict[str, Any] = {
-            "langfuse.observation.type": "span",
-            "langfuse.trace.name": "tool",
-            "mcp.server": server,
-            "mcp.tool": tool,
-            "duration_ms": elapsed,
-            "tool.status": status,
-        }
-        # Conversation grouping, same value the chat span carries. Langfuse
-        # aggregates on the trace, but its docs ask for the attribute on every
-        # span, and a tool span that starts its OWN trace (no sampled parent)
-        # would otherwise land in no session at all.
-        if thread_id:
-            attrs["langfuse.session.id"] = str(thread_id)
+        # Key contract lives in core/tool_span.py so the /mcp surface cannot
+        # drift from the relay surface (see that module's docstring).
+        attrs = tool_span.tool_span_attrs(
+            server=server,
+            tool=tool,
+            status=status,
+            ms=elapsed,
+            user_id=user_id,
+            key_name=key_name,
+            session_id=thread_id,
+            request_id=request_id,
+            iteration=iteration,
+            args=args,
+            reason=reason,
+        )
         linked = _last_span_ids[0] if _last_span_ids else None
         tracing.start_span(
             f"{server}{TOOLSEP}{tool}",
@@ -3174,13 +3186,25 @@ async def relay_stream(
                 # client was asked to run. NO tool_result: the client executes it
                 # AFTER this turn, so no result exists at trace time — inventing
                 # one (or a placeholder) would be the lie this table must not tell.
+                _handed = str(tc.get("function", {}).get("name", ""))
                 await _trace_step(
                     iteration,
                     "tool",
                     server="client",
-                    tool=str(tc.get("function", {}).get("name", "")),
+                    tool=_handed,
                     status="handed_back",
                     tool_args=tc.get("function", {}).get("arguments"),
+                )
+                # Span too: a handback was DB-only, so Langfuse showed the
+                # turn as "no tools". Duration 0 — the client owns the clock.
+                _emit_tool_span(
+                    "client",
+                    _handed,
+                    None,
+                    "handed_back",
+                    iteration=iteration,
+                    args=tc.get("function", {}).get("arguments"),
+                    reason="client_tool",
                 )
             handback_event: dict[str, Any] = {
                 "pcai": {
@@ -3774,7 +3798,7 @@ async def relay_stream(
                     tool_args=args,
                     tool_result=_denied_text,
                 )
-                _emit_tool_span(server, tool, _denied_ms, "denied")
+                _emit_tool_span(server, tool, _denied_ms, "denied", iteration=iteration, args=args)
                 mcp_summaries.append(f"[tool result] {server}__{tool} → denied by ACL\n")
                 continue
             # --- dispatch-time tool-pin gate (GAP 2, 2026-11-10) ----------
@@ -3823,7 +3847,7 @@ async def relay_stream(
                     tool_args=args,
                     tool_result=_pin_refusal,
                 )
-                _emit_tool_span(server, tool, _pin_ms, "error")
+                _emit_tool_span(server, tool, _pin_ms, "error", iteration=iteration, args=args)
                 mcp_summaries.append(f"[tool result] {server}__{tool} → refused: {_pin_detail}\n")
                 continue
             try:
@@ -3887,7 +3911,7 @@ async def relay_stream(
                 tool_args=args,
                 tool_result=content,
             )
-            _emit_tool_span(server, tool, ms, _tool_status)
+            _emit_tool_span(server, tool, ms, _tool_status, iteration=iteration, args=args)
             mcp_summaries.append(
                 f"[tool result] {server}__{tool} → {'ok' if ok else 'error'} ({ms}ms)\n{_preview(content)}\n"
             )
@@ -3918,6 +3942,17 @@ async def relay_stream(
                     tool=str(final_name),
                     status="handed_back",
                     tool_args=_tc.get("function", {}).get("arguments"),
+                )
+                # Same as the pure-client terminal: the whole batch is handed
+                # back, so all of it needs a span.
+                _emit_tool_span(
+                    "client",
+                    str(final_name),
+                    None,
+                    "handed_back",
+                    iteration=iteration,
+                    args=_tc.get("function", {}).get("arguments"),
+                    reason="client_tool",
                 )
             # NO content-delta echo of the executed MCP results on the
             # handback path: OpenAI-spec clients (DSH) render delta.content

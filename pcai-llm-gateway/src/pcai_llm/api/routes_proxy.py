@@ -6035,6 +6035,7 @@ async def chat_completions(
                         model,
                         key_id=key.id,
                         user_id=key.user_id,
+                        key_name=key.name,
                         key_fraction=off_base,
                         # GOVERNED PER PROFILE (2026-11-03): the relay cap is a
                         # BUDGET IN UNITS, not a round count. The profile's
