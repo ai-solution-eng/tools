@@ -4,7 +4,7 @@ Installs **one** thing: the server list and the live status view.
 
 | Job | Where it shows up | Code |
 | --- | --- | --- |
-| Add / edit / disable / remove MCP servers, and test an endpoint before saving | Settings → **MCP servers** | `src/servers/` |
+| Add / edit / disable / remove MCP servers, test an endpoint before saving, and see the servers a federating one stands for | Settings → **MCP servers** | `src/servers/` |
 | Which MCP servers are connected, their tool counts, and the upstream servers behind a federating gateway | The **MCP** chip above the composer | `src/status/` |
 
 Both halves are vendored in `src/`; nothing outside this package is required.
@@ -16,6 +16,7 @@ index.js                  composes both halves: one apply, one row, one bundle
 client.js                 GENERATED — see scripts/compose-client.mjs
 src/servers/              the management half (page, routes, bridge mounting)
 src/status/               the status half (probe, upstream discovery)
+src/status/upstream.js    SHARED — upstream discovery, used by both halves
 scripts/compose-client.mjs   regenerates client.js from both halves
 test/                     compose-check plus each half's own suites
 ```
@@ -50,6 +51,10 @@ not collide.
 
 ## Upstream discovery
 
+One connection can stand for many MCP servers. Both surfaces answer that
+question with the same code (`src/status/upstream.js`), so the chip and the
+Settings page cannot disagree about one gateway.
+
 Three paths, in order:
 
 1. **MCP catalog tool** — `mcp_catalog`, `list_mcp_servers`, `list_servers`,
@@ -59,6 +64,18 @@ Three paths, in order:
 3. **Tool-name grouping** — when the catalog exists but denies access (401/403),
    the upstreams are read from namespaced tool names (`server-tool`). A 404
    means "not a gateway", so a plain server's tools are never misread.
+
+The answer is cached per server for `upstreamTtlMs` (60 s), including the
+negative one, and an in-flight probe is shared — a page polling every few
+seconds does not open a connection per poll.
+
+**Where it shows up.** The **MCP** chip lists the upstreams under a connected
+server when the panel is expanded. Settings → **MCP servers** lists them under
+the row that configures the server — for rows the page manages *and* for rows
+another layer of the profile declares — because a gateway's own tool list
+(`mcp_catalog`, `mcp_call`) says nothing about what it actually offers. A
+server with no upstreams renders no block at all, so a plain MCP server is
+unchanged.
 
 ## Requirements
 
