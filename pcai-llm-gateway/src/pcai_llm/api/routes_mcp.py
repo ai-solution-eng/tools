@@ -145,7 +145,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import settings
-from ..core import approval, registry, secretbox, tool_injection, tool_pin, toolrelay, tracing
+from ..core import approval, registry, secretbox, tool_injection, tool_pin, tool_span, toolrelay, tracing
 from ..core import metrics as _metrics
 from ..core.budgets import check_rate_limit, settle
 from ..core.identity import (
@@ -208,6 +208,17 @@ router = APIRouter(tags=["mcp"])
 # ---------------------------------------------------------------------------
 
 _caller: contextvars.ContextVar[KeyRecord | None] = contextvars.ContextVar("mcp_caller", default=None)
+
+# Per-call facts the tools/call span needs but that are resolved DEEPER than the
+# span's finally block (inside _gated_mcp_call): which upstream server/tool the
+# requested name actually resolved to, and the request_id the ledger row carries.
+# Without them a span said only "mcp_call" — no server, no tool, no join key.
+_resolved_target: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "mcp_resolved_target", default=None
+)
+_call_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_call_request_id", default=None
+)
 
 
 def _current_key() -> KeyRecord:
@@ -1565,6 +1576,10 @@ async def _gated_mcp_call(
     key = _current_key()
     started = time.monotonic()
     request_id = f"mcp-{uuid.uuid4()}"
+    # Publish for the tools/call span (read + cleared in call_tool's finally).
+    # Set BEFORE any gate, so a refused call is still attributed to its target.
+    _resolved_target.set((server, tool))
+    _call_request_id.set(request_id)
 
     # --- validation (defensive; the JSON schema already narrows most) ---
     arguments = _unwrap_stringy_arguments(arguments)
@@ -2063,16 +2078,34 @@ class _GatewayMCPServer(MCPServer):
             raise
         finally:
             _span_ms = int((time.monotonic() - _span_started) * 1000)
+            # Identity: /mcp spans carried none, so a tool call could not be
+            # attributed to a user or key and vanished under a user filter.
+            try:
+                _k = _current_key()
+            except Exception:
+                _k = None
+            # Resolved target + ledger join key, published by _gated_mcp_call.
+            # Read-and-clear so a later call on the same context cannot inherit
+            # this one's target.
+            _tgt = _resolved_target.get()
+            _resolved_target.set(None)
+            _rid = _call_request_id.get()
+            _call_request_id.set(None)
+            # Same key contract as the relay executor (core/tool_span.py).
+            _attrs = tool_span.tool_span_attrs(
+                server=_tgt[0] if _tgt else None,
+                tool=_tgt[1] if _tgt else name,
+                requested=name,
+                surface="mcp",
+                status="ok" if _span_ok else "error",
+                ms=_span_ms,
+                user_id=_k.user_id if _k is not None else None,
+                key_name=_k.name if _k is not None else None,
+                request_id=_rid,
+            )
             tracing.start_span(
                 name,
-                {
-                    "langfuse.observation.type": "span",
-                    "langfuse.trace.name": "tool",
-                    "mcp.tool": name,
-                    "mcp.surface": "mcp",
-                    "duration_ms": _span_ms,
-                    "tool.status": "ok" if _span_ok else "error",
-                },
+                _attrs,
                 start_ns=time.time_ns() - _span_ms * 1_000_000,
             ).end()
 
