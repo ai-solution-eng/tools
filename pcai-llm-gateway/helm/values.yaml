@@ -39,7 +39,7 @@ image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits appVersion. The tag is MUTABLE: pin with tag@sha256:<digest>
   # (or pullPolicy: Always) for a reproducible supply chain.
-  tag: v4.4.2
+  tag: v4.4.3
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
