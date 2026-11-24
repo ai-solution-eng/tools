@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..config import clamp_max_tokens, settings
 from ..core import (
     agent_eval,
+    approval,
     canonical,
     clientside,
     context_window,
@@ -2843,6 +2844,25 @@ async def _relay_executor(
         if decision.refused:
             await record(server, tool, arguments, "policy_blocked")
             return False, decision.message
+
+        # DESTRUCTIVE-TOOL APPROVAL GATE (2026-11-23, B8 phase 1). The SAME
+        # position as /mcp: after every policy stage, BEFORE credentials are built
+        # or a session opens. This exists because phase 1 originally gated only
+        # _gated_mcp_call — and the RELAY is the path an AGENT actually uses, so
+        # gating /mcp alone would have left the model-driven path ungated and the
+        # observe data incomplete. Scoping error in the design, fixed here.
+        #   off     -> gate_call returns before any store access (byte-identical)
+        #   warn    -> records the request, call proceeds untouched
+        #   enforce -> refuses without a live token; FAILS CLOSED on a store fault
+        approval_decision = await approval.gate_call(key.id, server, tool, arguments)
+        if approval_decision.refused:
+            await record(server, tool, arguments, "denied")
+            # .reason, NOT .message — GateDecision carries (refused, reason, token_id,
+            # request_id). This line originally copied arg_policy's .message and would
+            # have raised AttributeError on an enforce-mode refusal on the RELAY path:
+            # dormant in off/warn (refused is never True there), live the moment the
+            # gate is enforced. Caught by cross-zone mypy, not by any test.
+            return False, approval_decision.reason
 
         # Header build WITH the calling key: resolve_mcp_headers merges the
         # key's per-key MCP credential overrides after the server-level auth

@@ -1403,8 +1403,7 @@ def test_console_endpoint_payload_carries_a_moved_credential() -> None:
     s = open("src/pcai_llm/ui/admin.html", encoding="utf-8").read()
 
     def row(orig: str, configured: bool, url: str, key: str = "") -> dict:
-        vals = {".mo-w": "1", ".mo-url": url, ".mo-pri": "0",
-                ".mo-secret": "", ".mo-key": key}
+        vals = {".mo-w": "1", ".mo-url": url, ".mo-pri": "0", ".mo-secret": "", ".mo-key": key}
         return {
             "dataset": {"origUrl": orig, "authConfigured": "1" if configured else ""},
             "_vals": vals,

@@ -365,6 +365,40 @@ spec:
             - name: PCAI_LLM_MCP_SEPARATE_READ_EGRESS
               value: {{ .Values.settings.mcp.argPolicy.separateReadEgress | quote }}
             {{- end }}
+            # --- destructive-tool approval gate (B8, 2026-11-23) --------------
+            # The gateway has never constructed an InputRequiredResult: a
+            # destructive call (applygate plan_apply, workbench run, k8s
+            # exec_in_pod) executes on a static grant, and the ACL answers "may
+            # this key call this tool", never "should THIS call happen". This
+            # gate answers the second question from an OUT-OF-BAND
+            # pre-authorization token scoped to one (server, tool) and an
+            # arguments fingerprint, with a MANDATORY use count and expiry.
+            # It sits after the ACL/argument-policy stages and BEFORE
+            # credentials are built or an upstream session opens, on BOTH the
+            # relay and /mcp paths.
+            #   off     -> inert, byte-identical, zero store round trip (chart default)
+            #   warn    -> record the request in tool_approval_requests and let
+            #              the call through UNTOUCHED (the observe phase)
+            #   enforce -> refuse without a live token (detail=approval_required)
+            #              and FAIL CLOSED on a store fault: deliberately the
+            #              OPPOSITE trade to pinning, which fails open. A broken
+            #              pinning gate must not break a turn; a broken approval
+            #              gate must not let a destructive call through.
+            # An unknown mode coerces to off — a typo must never start refusing
+            # destructive calls fleet-wide.
+            - name: PCAI_LLM_TOOL_APPROVAL_MODE
+              value: {{ .Values.settings.mcp.toolApproval.mode | quote }}
+            # Comma-separated server.tool globs that require a token in enforce
+            # mode. Defaults to the destructive set; everything else is
+            # unaffected, so turning the gate on cannot break the read paths.
+            - name: PCAI_LLM_TOOL_APPROVAL_REQUIRED
+              value: {{ .Values.settings.mcp.toolApproval.required | quote }}
+            # Ceilings a token may not exceed: an approval that never expires is
+            # a grant wearing a disguise, so both are mandatory per token.
+            - name: PCAI_LLM_TOOL_APPROVAL_TOKEN_TTL_S
+              value: {{ .Values.settings.mcp.toolApproval.tokenTtlS | int | quote }}
+            - name: PCAI_LLM_TOOL_APPROVAL_TOKEN_MAX_USES
+              value: {{ .Values.settings.mcp.toolApproval.tokenMaxUses | int | quote }}
             # --- router extras (review §4a/4b/4c; ledger authoritative) ---
             # Per-model fallback chains: max fallback MODELS tried after the
             # primary cannot serve (no healthy endpoint / upstream 5xx). 0 =
@@ -619,6 +653,45 @@ spec:
               value: {{ dig "tracing" "agentEval" "maxSteps" 40 .Values.settings | int | quote }}
             - name: PCAI_LLM_AGENT_EVAL_LOOP_THRESHOLD
               value: {{ dig "tracing" "agentEval" "loopThreshold" 3 .Values.settings | int | quote }}
+            # --- calibrated behaviour judge (B1, 2026-11-23) ------------------
+            # The deterministic scorer above answers "did the tool calls work".
+            # This is the second half of the quality layer: a model reading what
+            # the agent SAW and DID, answering "was the answer RIGHT, and was the
+            # path defensible". Design: documentation/design/agent-judge.md.
+            #
+            # INERT UNTIL CALIBRATED, and the tracked chart renders it inert.
+            # dailyUsd is the REAL switch: 0.0 = no spend permitted, so the sweep
+            # stays inert even if enabled is true. A judge that is wrong produces
+            # a number that LOOKS like evidence, and a release gate reading it
+            # would launder a bad change into a green build — hence the order
+            # shadow -> calibrated (>=40 hand-labelled turns, >=0.80 agreement
+            # per dimension) -> gating. Nothing gates before calibration.
+            # TWO RULES ARE STRUCTURAL: a claim with no evidence citation is
+            # DROPPED before storage (evidence_refs is never empty), and every
+            # row is stamped with prompt_version so the rubric behind a number is
+            # always recoverable.
+            - name: PCAI_LLM_JUDGE_ENABLED
+              value: {{ .Values.settings.tracing.judge.enabled | quote }}
+            # Empty = the gateway's default route. Use the CHEAPEST self-hosted
+            # model that clears the agreement floor, not the biggest:
+            # verification against evidence rewards instruction-following.
+            - name: PCAI_LLM_JUDGE_MODEL
+              value: {{ .Values.settings.tracing.judge.model | quote }}
+            # Hard spend ceiling per day, USD. 0.0 = no spend permitted.
+            - name: PCAI_LLM_JUDGE_DAILY_USD
+              value: {{ .Values.settings.tracing.judge.dailyUsd | quote }}
+            # Turns scored per sweep run: a 10% sample over a week beats 100% for
+            # two days followed by silence when the budget runs out.
+            - name: PCAI_LLM_JUDGE_MAX_TURNS_PER_RUN
+              value: {{ .Values.settings.tracing.judge.maxTurnsPerRun | int | quote }}
+            # Fraction of eligible turns judged, sampled per REQUEST so a judged
+            # turn is judged whole.
+            - name: PCAI_LLM_JUDGE_SAMPLE_RATE
+              value: {{ .Values.settings.tracing.judge.sampleRate | quote }}
+            # Verdicts below this confidence are stored but never counted toward
+            # a gate (0.0 = no floor, and a missing confidence is 0.0 by design).
+            - name: PCAI_LLM_JUDGE_MIN_CONFIDENCE
+              value: {{ .Values.settings.tracing.judge.minConfidence | quote }}
             # Session affinity (endpoint pin) and audio billing heuristics.
             - name: PCAI_LLM_SESSION_AFFINITY_ENABLED
               value: {{ .Values.settings.routing.sessionAffinity.enabled | quote }}

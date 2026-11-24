@@ -611,8 +611,10 @@ def test_schema_quality_layer_is_additive_only() -> None:
     block = SCHEMA_SQL[SCHEMA_SQL.index("-- Agent quality layer (2026-11-23)") :]
     alters = [line.strip() for line in block.split("\n") if line.strip().upper().startswith("ALTER TABLE")]
     assert alters, "expected the vocabulary constraints"
+    # judge_verdicts joined the quality layer in B1 commit 1 (2026-11-23): it is an
+    # agent-quality table, so it belongs AFTER the marker like the other two.
     for line in alters:
-        assert "agent_trace_payloads" in line or "agent_eval_verdicts" in line, line
+        assert "agent_trace_payloads" in line or "agent_eval_verdicts" in line or "judge_verdicts" in line, line
 
 
 # --- redaction coverage added 2026-11-23 (cross-review P2) ------------------

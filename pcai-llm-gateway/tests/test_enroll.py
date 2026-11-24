@@ -1144,6 +1144,7 @@ async def test_bind_user_profile_writes_only_when_null() -> None:
     await routes_enroll._bind_user_profile(_Conn(), uid, None)
     assert calls == []
 
+
 # ---------------------------------------------------------------------------
 # model ACL mode (2026-11-23)
 #

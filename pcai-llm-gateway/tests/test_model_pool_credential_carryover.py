@@ -89,9 +89,13 @@ class EndpointsDB:
             if "auth_token_enc" in head:
                 model, url, pri, weight, secret, enc, mtype = a
                 row = self.rows.setdefault((model, url), {"auth_token_enc": None})
-                row.update(priority=pri, weight=weight, api_key_secret=secret,
-                           auth_token_enc=(None if enc in ("", None) else enc),
-                           model_type=mtype)
+                row.update(
+                    priority=pri,
+                    weight=weight,
+                    api_key_secret=secret,
+                    auth_token_enc=(None if enc in ("", None) else enc),
+                    model_type=mtype,
+                )
                 self.log.append(f"upsert(WRITE key)          {url}")
             else:
                 # "keep": auth_token_enc is absent from the SET list entirely,
@@ -100,10 +104,8 @@ class EndpointsDB:
                 key = (model, url)
                 existed = key in self.rows
                 row = self.rows.setdefault(key, {"auth_token_enc": None})
-                row.update(priority=pri, weight=weight, api_key_secret=secret,
-                           model_type=mtype)
-                self.log.append(
-                    f"upsert(keep key, {'UPDATE' if existed else 'INSERT'}) {url}")
+                row.update(priority=pri, weight=weight, api_key_secret=secret, model_type=mtype)
+                self.log.append(f"upsert(keep key, {'UPDATE' if existed else 'INSERT'}) {url}")
             return "INSERT 0 1"
         if "DELETE FROM model_endpoints" in sql:
             model, urls = a
@@ -163,10 +165,15 @@ def env(monkeypatch: pytest.MonkeyPatch):
     app.include_router(routes_admin.router)
     tc = TestClient(app, raise_server_exceptions=False)
     # register the pool against the REMOTE address WITH the panel key
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": REMOTE, "api_key": KEY}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": REMOTE, "api_key": KEY}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert fake.rows[("glm", REMOTE)]["auth_token_enc"], "precondition: key stored"
     # the console's edit read renders "(unchanged)" (auth_configured true)
@@ -182,10 +189,15 @@ def test_control_same_url_edit_keeps_the_stored_key(env) -> None:
     must not regress while the moved case is fixed.
     """
     tc, fake, _ = env
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": REMOTE, "priority": 2, "api_key": None}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": REMOTE, "priority": 2, "api_key": None}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert fake.rows[("glm", REMOTE)]["auth_token_enc"] is not None
     assert fake.rows[("glm", REMOTE)]["priority"] == 2
@@ -200,10 +212,15 @@ def test_url_change_carries_the_stored_key(env) -> None:
     """
     tc, fake, audited = env
     before = fake.rows[("glm", REMOTE)]["auth_token_enc"]
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": LOCAL, "api_key": None, "api_key_from": REMOTE}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": LOCAL, "api_key": None, "api_key_from": REMOTE}],
+        },
+    )
     assert r.status_code == 200, r.text
     print("\nSQL trace:")
     for line in fake.log:
@@ -225,10 +242,15 @@ def test_url_change_carries_the_stored_key(env) -> None:
 def test_typed_key_wins_over_carry_over(env) -> None:
     """Rotation in the same save as a move: the pasted key is the one stored."""
     tc, fake, _ = env
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": LOCAL, "api_key": "sk-local", "api_key_from": REMOTE}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": LOCAL, "api_key": "sk-local", "api_key_from": REMOTE}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert secretbox.decrypt(fake.rows[("glm", LOCAL)]["auth_token_enc"]) == "sk-local"
 
@@ -237,11 +259,15 @@ def test_unknown_carry_over_source_is_a_loud_400(env) -> None:
     """A source that names no stored credential must NOT write a credential-less
     row — that silent outcome is the bug being fixed."""
     tc, fake, _ = env
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": LOCAL, "api_key": None,
-                       "api_key_from": "http://typo.example.com/v1"}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": LOCAL, "api_key": None, "api_key_from": "http://typo.example.com/v1"}],
+        },
+    )
     assert r.status_code == 400, r.text
     assert "names no stored credential" in r.text
     # nothing was written and nothing was pruned
@@ -256,19 +282,29 @@ def test_carry_over_from_a_credential_less_row_is_a_loud_400(env) -> None:
     credential-less row the parameter exists to prevent."""
     tc, fake, _ = env
     keyless = "http://plain.example.com/v1"
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [
-            {"base_url": REMOTE, "api_key": None},
-            {"base_url": keyless, "api_key": None},
-        ],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [
+                {"base_url": REMOTE, "api_key": None},
+                {"base_url": keyless, "api_key": None},
+            ],
+        },
+    )
     assert r.status_code == 200, r.text
     assert fake.rows[("glm", keyless)]["auth_token_enc"] is None
-    r2 = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": LOCAL, "api_key": None, "api_key_from": keyless}],
-    })
+    r2 = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": LOCAL, "api_key": None, "api_key_from": keyless}],
+        },
+    )
     assert r2.status_code == 400, r2.text
     assert ("glm", LOCAL) not in fake.rows
 
@@ -276,10 +312,15 @@ def test_carry_over_from_a_credential_less_row_is_a_loud_400(env) -> None:
 def test_api_key_from_equal_to_base_url_is_a_plain_keep(env) -> None:
     """A source equal to the target is not a move — it must not 400."""
     tc, fake, _ = env
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": REMOTE, "api_key": None, "api_key_from": REMOTE}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": REMOTE, "api_key": None, "api_key_from": REMOTE}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert secretbox.decrypt(fake.rows[("glm", REMOTE)]["auth_token_enc"]) == KEY
 
@@ -287,9 +328,14 @@ def test_api_key_from_equal_to_base_url_is_a_plain_keep(env) -> None:
 def test_explicit_clear_still_clears(env) -> None:
     """api_key: "" stays the explicit clear — the carry-over must not revive it."""
     tc, fake, _ = env
-    r = tc.post("/admin/models", headers=H, json={
-        "model_name": "glm", "model_type": "chat",
-        "endpoints": [{"base_url": REMOTE, "api_key": "", "api_key_from": REMOTE}],
-    })
+    r = tc.post(
+        "/admin/models",
+        headers=H,
+        json={
+            "model_name": "glm",
+            "model_type": "chat",
+            "endpoints": [{"base_url": REMOTE, "api_key": "", "api_key_from": REMOTE}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert fake.rows[("glm", REMOTE)]["auth_token_enc"] is None

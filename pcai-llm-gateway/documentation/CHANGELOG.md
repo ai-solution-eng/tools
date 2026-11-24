@@ -5,6 +5,36 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## 2026-11-23 (console) — the usage rollups agree on what "top" means, and the headers sort
+
+- **Reported:** "By model seems to sort by billed cost while by key seems to sort cost. Default for both should
+  be billed. Additionally, can we allow user to click these to choose a sort by increasing/decreasing mode?"
+- **Both rollups default to BILLED cost, descending.** The server folded both by gross `cost_usd` (and
+  `/team_leader/usage`'s two `ORDER BY` clauses said so explicitly) while each console rendered whatever order
+  arrived, so the two chargeback tables ranked the same spend differently and the "top spender" row could differ
+  between them. Billed cost is what budgets actually consumed; gross cost is one click away. `cost_usd` is the
+  tie-break, so an undiscounted deployment keeps its previous, stable order.
+- **Every header sorts; a second click flips the direction.** The order is decided in ONE shared block
+  (`sortUsageRows` / `paintUsageSort` / `wireUsageSort`), byte-identical in `admin.html` and
+  `team_leader.html` and pinned by the two-console drift test. A header stays a real `columnheader` —
+  `aria-sort` IS the visual arrow (drawn in CSS), the header is focusable, and Enter/Space sort without
+  scrolling the page. Sorting re-renders from the CACHED payload (no round trip, no refetch, the window and
+  the ledger below are untouched); the by-key drill-down sorts its per-model children too, falling back to
+  billed cost for columns they do not carry, and the expand/collapse indices are built from the SORTED order
+  so a caret always opens its own key.
+- **NULLs sort LAST in both directions** — a model with no cached input has no cache rate, and a dash floating
+  to the top of an ascending sort reads as the best row.
+- **Tests:** `tests/test_usage_sort.py` extracts the block from the real page and runs it under node (default
+  order, direction flip, text columns, NULL placement, payload never mutated, saved choice restored, junk in
+  the store falls back to billed), pins the header/CSS/keyboard wiring in BOTH consoles, and pins the server
+  order (`_fold_unit_rows` plus every rollup `ORDER BY`). The comparator joined the cross-console drift test.
+- **Verified in a real DOM**, not just by source shape: jsdom drove the page's own markup + renderers (default
+  billed-descending order on both tables, click → gross order with the arrow moving, click again → ascending,
+  keyboard Enter, NULLs last both ways, and the by-key caret still opening its OWN key with its children sorted
+  by the parent column), and a headless-browser render of the same tables confirmed the arrows and the new
+  default ranking.
+- **Suite:** 4442 passed, 0 failed; ruff + ruff-format + mypy clean on the touched modules.
+
 ## 2026-11-23 (later) — the controls bind: durable pins, /mcp coverage, and refusals on the record
 
 Waves 2–4, shipped on top of the morning's scorecard cut. The morning wave built the mechanisms; this one makes

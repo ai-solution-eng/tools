@@ -505,6 +505,69 @@ class Settings(BaseSettings):
     # point of watching an autonomous agent. It is not folded into tool_error.
     agent_eval_loop_threshold: int = 3
 
+    # --- calibrated behaviour judge (2026-11-23) --------------------------
+    # The deterministic scorer (core/agent_eval) answers "did the tool calls work".
+    # It cannot answer "was the answer RIGHT, and was the path defensible". This is
+    # the judge for that. Design: documentation/design/agent-judge.md.
+    #
+    # Default OFF, and it stays off until it has been CALIBRATED: a judge that is
+    # wrong produces a number that looks like evidence, and if a release gate reads
+    # it, it launders a bad change into a green build. Phase order in the design.
+    judge_enabled: bool = False
+    # The model the judge calls. Empty = the gateway's default route. Use the
+    # CHEAPEST self-hosted model that clears the agreement floor, not the biggest:
+    # verification against evidence rewards instruction-following over raw capability.
+    judge_model: str = ""
+    # Hard spend ceiling per day, in USD. 0.0 = no spend permitted, which makes the
+    # sweep inert even if judge_enabled is true — the budget is the real switch.
+    judge_daily_usd: float = 0.0
+    # Turns scored per sweep run. A 10% sample over a week beats 100% for two days
+    # followed by silence when the budget runs out.
+    judge_max_turns_per_run: int = 25
+    # Fraction of eligible turns judged. Sampling is per REQUEST (same rule as trace
+    # payloads) so a judged turn is judged whole.
+    judge_sample_rate: float = 0.1
+    # Verdicts below this confidence are stored but not counted toward a gate.
+    judge_min_confidence: float = 0.0
+    # Retention for judge_verdicts. Longer than the payload window on purpose: the
+    # verdicts are the QUALITY RECORD (the trend an operator reads), while the
+    # payloads under them are the raw evidence and are the expensive part. 0 = keep.
+    # A verdict whose evidence has expired is still a datapoint; it just cannot be
+    # re-adjudicated, which is why prompt_version is stamped on every row.
+    judge_verdict_retention_days: int = 90
+
+    # --- destructive-tool approval gate (2026-11-23) ----------------------
+    # The gateway has NEVER constructed an InputRequiredResult: applygate plan_apply,
+    # workbench run and k8s exec_in_pod execute on a static grant, and the ACL answers
+    # "may this key call this tool", never "should this SPECIFIC call happen". This is
+    # the gate for that. Design: documentation/design/tool-approval-gate.md.
+    #
+    #   "off"     -> inert (today's behaviour, byte-identical).
+    #   "warn"    -> record that a call WOULD have needed approval; change nothing.
+    #                Phase 1 of the rollout: two weeks of this tells you which tools
+    #                actually need a token and how often.
+    #   "enforce" -> a matching pre-authorization token is REQUIRED; without one the
+    #                call is refused with detail=approval_required.
+    # Unknown values fall back to "off" — this gate fails CLOSED only when enforcing,
+    # and a typo must not silently start refusing destructive calls fleet-wide.
+    tool_approval_mode: str = "off"
+    # Comma-separated server.tool globs that REQUIRE a token in enforce mode. Defaults
+    # to the destructive set; everything else is unaffected, so enabling this cannot
+    # break the fleet's read paths.
+    tool_approval_required: str = "applygate.*apply*,workbench.run,k8s.exec_in_pod"
+    # A token's lifetime and use count are MANDATORY (an approval that never expires
+    # is a grant wearing a disguise). Operators set these per token; these are the
+    # ceilings a token may not exceed.
+    tool_approval_token_ttl_s: int = 900
+    tool_approval_token_max_uses: int = 1
+    # Retention for tool_approval_requests (the observe-mode record of calls that
+    # WOULD have needed a token). In warn mode this accumulates one row per distinct
+    # (key, server, tool, args-fingerprint) for every destructive call, forever. 30
+    # days is long enough to see a weekly pattern and short enough not to become a
+    # second trace table. 0 = keep. NOTE: the TOKEN table (tool_approvals) is never
+    # pruned by this — a grant must not evaporate because its request aged out.
+    tool_approval_retention_days: int = 30
+
     # --- query-granular tool search (2026-11-23) --------------------------
     # pcai_tools grew a `search` action: BM25 over the in-memory catalogue, so
     # "the tool that deletes a dataset" costs a handful of candidates instead of

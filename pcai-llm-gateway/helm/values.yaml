@@ -39,7 +39,7 @@ image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits appVersion. The tag is MUTABLE: pin with tag@sha256:<digest>
   # (or pullPolicy: Always) for a reproducible supply chain.
-  tag: v4.3.2
+  tag: v4.4.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -276,6 +276,29 @@ settings:
       resolve: true
       telemetry: true
       separateReadEgress: warn
+    # Destructive-tool approval gate (B8, 2026-11-23): a pre-authorization token
+    # gates the tools that MUTATE the cluster — applygate plan_apply, workbench run,
+    # k8s exec_in_pod — on BOTH the relay and /mcp paths. The ACL answers "may this
+    # key call this tool"; this answers "should THIS call happen".
+    #   mode: off | warn | enforce. An unknown value coerces to off (a typo must not
+    #   start refusing destructive calls fleet-wide).
+    #     off     = inert (the default; byte-identical to pre-B8, no store hit)
+    #     warn    = record what WOULD have needed approval, change nothing
+    #     enforce = require a live token; refuse with detail=approval_required, and
+    #               FAIL CLOSED on a store fault (the deliberate opposite trade to
+    #               pinning, which fails open — different blast radius).
+    # TRACKED DEFAULT "off" — a tracked default must not change what a deployment
+    # DOES: enforce refuses the destructive calls until an operator grants tokens,
+    # which is an outage on the path the fleet's agents use.
+    # required is the comma-separated server.tool glob set that needs a token;
+    # everything else is unaffected, so turning the gate on cannot break the read
+    # paths. tokenTtlS/tokenMaxUses are the CEILINGS a token may not exceed — an
+    # approval that never expires is a grant wearing a disguise.
+    toolApproval:
+      mode: "off"
+      required: "applygate.*apply*,workbench.run,k8s.exec_in_pod"
+      tokenTtlS: 900
+      tokenMaxUses: 1
 
   # --- Routing: pseudo-models, fallback, stickiness, load -------------------
   routing:
@@ -482,6 +505,33 @@ settings:
       enabled: false
       maxSteps: 40          # a relay turn over this many model rounds is flagged step_budget; 0 disables the rule
       loopThreshold: 3      # this many calls to one (server, tool) pair in a turn = loop; 0 disables the rule
+    # Calibrated behaviour judge (B1, 2026-11-23): the SECOND half of the quality
+    # layer — a model reading what the agent saw and did, because the deterministic
+    # scorer above cannot answer "was the answer RIGHT, and was the path
+    # defensible". Design: documentation/design/agent-judge.md.
+    # TRACKED DEFAULT OFF, and it stays off until CALIBRATED: a judge that is wrong
+    # produces a number that looks like evidence, and a release gate reading it
+    # would launder a bad change into a green build.
+    #   enabled       master switch; off = no model call and no spend
+    #   model         "" = the gateway's default route. Use the CHEAPEST self-hosted
+    #                 model that clears the agreement floor, not the biggest
+    #   dailyUsd      hard spend ceiling per day, USD. 0.0 = no spend permitted, and
+    #                 that is the REAL switch: it keeps the sweep inert even when
+    #                 enabled is true
+    #   maxTurnsPerRun turns scored per sweep run (a 10% sample over a week beats
+    #                 100% for two days followed by silence when the budget runs out)
+    #   sampleRate    fraction of eligible turns judged, sampled per REQUEST so a
+    #                 judged turn is judged whole
+    #   minConfidence verdicts below this are stored but never counted toward a gate
+    #                 (0.0 = no floor; a confidence the judge failed to state is 0.0,
+    #                 so an unstamped claim can never clear a gate)
+    judge:
+      enabled: false
+      model: ""
+      dailyUsd: 0.0
+      maxTurnsPerRun: 25
+      sampleRate: 0.1
+      minConfidence: 0.0
 
 # ============================================================================
 # Kyverno / Metrics

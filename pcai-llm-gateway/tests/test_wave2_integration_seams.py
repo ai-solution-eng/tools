@@ -38,9 +38,7 @@ def test_lifespan_awaits_the_pin_warm_load() -> None:
     calls = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "awarm"
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "awarm"
     ]
     assert calls, (
         "app.py no longer awaits _PIN_STORE.awarm(): the pin store would load on the "
@@ -69,9 +67,7 @@ def test_relay_passes_the_staleness_limit_to_recall() -> None:
     """toolrelay must pass stale_after_days, or the 90-day floor silently means 'never'."""
     tree = ast.parse(RELAY.read_text(encoding="utf-8"))
     calls = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "recall_playbook_block"
+        n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "recall_playbook_block"
     ]
     assert calls, "recall_playbook_block is not called from toolrelay.py"
     assert any(kw.arg == "stale_after_days" for c in calls for kw in c.keywords), (
@@ -95,3 +91,71 @@ def test_counts_are_not_redacted_as_credentials() -> None:
     # ...and a numeric PASSWORD stays redacted: a numeric password is real.
     assert "[REDACTED:password]" in redact("password: 512")
 
+
+# ---------------------------------------------------------------------------
+# B8: the approval gate must cover the RELAY, not just /mcp.
+# ---------------------------------------------------------------------------
+# Phase 1 originally gated only _gated_mcp_call. The relay is the path an AGENT
+# uses, so gating /mcp alone left the model-driven path ungated and the observe
+# data incomplete — a scoping error the phase-1 report surfaced. These guards make
+# a future refactor that drops the relay gate fail here rather than silently.
+
+PROXY = SRC / "pcai_llm" / "api" / "routes_proxy.py"
+
+
+def test_relay_executor_calls_the_approval_gate() -> None:
+    """The relay's execute() must consult approval.gate_call, or agents bypass it."""
+    tree = ast.parse(PROXY.read_text(encoding="utf-8"))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "gate_call"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "approval"
+    ]
+    assert calls, (
+        "routes_proxy does not call approval.gate_call: the RELAY path would be "
+        "ungated, so a destructive tool invoked by an agent would bypass the gate"
+    )
+
+
+def test_approval_gate_precedes_credential_build_in_the_relay() -> None:
+    """A refusal must happen before credentials are built or a session opens."""
+    src = PROXY.read_text(encoding="utf-8")
+    gate = src.index("approval.gate_call(")
+    headers = src.index("resolve_mcp_headers(target")
+    assert gate < headers, (
+        "approval.gate_call appears AFTER resolve_mcp_headers in routes_proxy: a refused "
+        "call would build credentials for the server it refuses to reach"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The relay approval-refusal path must use attributes that EXIST on GateDecision.
+# ---------------------------------------------------------------------------
+# 2026-11-23: the relay wiring returned `approval_decision.message` where the
+# dataclass has `.reason`. Dormant in off/warn (refused is never True there) and an
+# AttributeError the moment enforce is switched on — on the path an agent uses.
+# ruff cannot see it and no test covered that branch; mypy caught it, which is why
+# automation.sh now runs mypy. This guard pins the specific attribute contract so a
+# future copy-paste from arg_policy's `.message` fails here instead of in enforce.
+
+
+def test_relay_approval_refusal_uses_real_gate_decision_attributes() -> None:
+    from pcai_llm.core.approval import GateDecision
+
+    tree = ast.parse(PROXY.read_text(encoding="utf-8"))
+    attrs = {
+        n.attr
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "approval_decision"
+    }
+    assert attrs, "routes_proxy never inspects an approval_decision — is the relay gated?"
+    real = set(vars(GateDecision()).keys())
+    unknown = attrs - real
+    assert not unknown, (
+        f"routes_proxy reads approval_decision.{sorted(unknown)} but GateDecision has "
+        f"only {sorted(real)} — an AttributeError waiting for enforce mode"
+    )

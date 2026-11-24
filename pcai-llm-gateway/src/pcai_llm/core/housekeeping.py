@@ -32,6 +32,23 @@ log = logging.getLogger(__name__)
 
 CADENCE_S = 60.0
 
+# Retention defaults for the two tables added in waves 5-6 (2026-11-23):
+# tool_approval_requests (the approval gate's observations) and judge_verdicts
+# (the agent judge's quality record). Neither knob exists in config.py YET —
+# that file belongs to the Lead — so both steps read their knob with
+# getattr(settings, <name>, <default>): today the default below is what runs,
+# and the day the setting lands the operator's value overrides it with no
+# second edit here (the same "knob not deployed yet" shape core/approval.py
+# uses for tool_approval_mode). Unlike the retention_*_days knobs, which ship 0
+# = off, these two default ON: both tables are unbounded-growth tables and the
+# point of this wave is that they stop growing. An explicit 0 still disables
+# either prune (0 = keep forever, the operator contract shared with every
+# other retention knob).
+DEFAULT_TOOL_APPROVAL_RETENTION_DAYS = 30
+# Verdicts are the QUALITY RECORD — the only evidence of what the judge said
+# about a turn — so they are kept far longer than the trace payloads (7d).
+DEFAULT_JUDGE_VERDICT_RETENTION_DAYS = 90
+
 # The canonical-store prune is throttled: the loop ticks every CADENCE_S, but a
 # delete over the biggest table does not need to run every minute (and the
 # existing prunes are cheap by comparison). Mirrors the "prunes piggyback a
@@ -101,6 +118,46 @@ async def _sweep_once() -> None:
                 log.info("housekeeping: pruned %d trace payload rows", reclaimed)
     except Exception:
         log.debug("housekeeping: trace_payloads prune skipped", exc_info=True)
+
+    # 1f) tool approval observations (wave 7, 2026-11-23): warn mode's decision
+    #     input — ONE row per distinct (key, server, tool, args_fingerprint)
+    #     that WOULD have needed approval, upserted so a repeat increments
+    #     times_seen instead of adding a row. In warn mode every destructive
+    #     call shape the fleet ever makes leaves a row behind forever, so it
+    #     needs a window like the rest. Keyed on last_seen (the upsert
+    #     refreshes it), NOT first_seen: a shape still being observed never
+    #     ages out, only one the fleet has STOPPED calling — and that row is
+    #     re-created by the next call, so the operator loses a stale decision
+    #     prompt, never the live one. The token table (tool_approvals) is never
+    #     pruned here: a grant's lifetime is the operator's expiry, and
+    #     expiring a live token by age would silently discard a human decision.
+    #     The knob is not in config.py yet, hence the getattr default; 0 still
+    #     means keep forever (the prune re-checks that itself).
+    try:
+        days = int(getattr(settings, "tool_approval_retention_days", DEFAULT_TOOL_APPROVAL_RETENTION_DAYS))
+        if days > 0:
+            reclaimed = await prune_tool_approval_requests(days)
+            if reclaimed:
+                log.info("housekeeping: pruned %d tool approval request rows", reclaimed)
+    except Exception:
+        log.debug("housekeeping: tool_approval_requests prune skipped", exc_info=True)
+
+    # 1g) judge verdicts (wave 7, 2026-11-23): one row per verdict per judged
+    #     turn (core/judge.py, B1), and the quality trend the release gate
+    #     reads. The window lands BEFORE the volume does — the judge sweep is
+    #     what starts filling the table, and a retention knob added after the
+    #     growth has already happened is the defect this wave exists to avoid.
+    #     90 days by default: a verdict is the evidence behind a number the
+    #     gate reads, so a trend window shorter than a release cycle could not
+    #     show a regression. Same getattr contract as 1f.
+    try:
+        days = int(getattr(settings, "judge_verdict_retention_days", DEFAULT_JUDGE_VERDICT_RETENTION_DAYS))
+        if days > 0:
+            reclaimed = await prune_judge_verdicts(days)
+            if reclaimed:
+                log.info("housekeeping: pruned %d judge verdict rows", reclaimed)
+    except Exception:
+        log.debug("housekeeping: judge_verdicts prune skipped", exc_info=True)
 
     # 2) operator-opted retention (0 = disabled — nothing is deleted until
     #    the policy exists, the roadmap contract).
@@ -208,6 +265,87 @@ async def _prune_canonical_store() -> None:
             )
     except Exception:
         log.warning("housekeeping: canonical-store prune skipped", exc_info=True)
+
+
+def _reclaimed_rows(tag: str) -> int:
+    """Rows removed, read from an asyncpg command tag ("DELETE 5").
+
+    execute() hands back the TAG and nothing else, so a driver (or a test
+    fake) that returns something unexpected must read as "nothing reclaimed"
+    rather than crash the sweep — a wrong count only costs a log line.
+    """
+    try:
+        return int(str(tag).split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+async def prune_tool_approval_requests(days: int) -> int:
+    """Delete approval observations not SEEN for N days; returns rows reclaimed.
+
+    tool_approval_requests is the operator's decision input (core/approval.py
+    owns the write), one row per distinct (key, server, tool,
+    args_fingerprint) shape that would have needed approval. Warn mode is
+    observe-only, so on a fleet that never switches to enforce this table is
+    the only record of the destructive calls the gate saw — and it grows for
+    every new shape, forever. This window is what bounds it.
+
+    Age is measured from last_seen, not first_seen: the upsert refreshes
+    last_seen on every repeat, so a shape still being observed is NEVER
+    eligible no matter how old it is, and only a shape the fleet has stopped
+    calling ages out. That is the same "age from the last touch" rule
+    model_stickiness uses (step 2), and it is why enabling this cannot delete
+    the decision input for a live call pattern.
+
+    NOT the token table: tool_approvals rows live and die by the operator's
+    own expires_at/revoked_at, never by a retention window.
+
+    days <= 0 is a no-op returning 0 — the operator contract shared with every
+    other retention knob, re-checked HERE as well as at the call site (defence
+    in depth, the trace_payloads.prune shape).
+
+    Raises on a DB fault; the housekeeping step is error-swallowed like every
+    other one there. The predicate is a sequential scan (the DDL deliberately
+    ships no second index: the table is the number of DISTINCT call shapes,
+    tens of rows), which is why it needs no throttle of its own.
+    """
+    if days <= 0:
+        return 0
+    tag = await db.execute(
+        "DELETE FROM tool_approval_requests WHERE last_seen < now() - make_interval(days => $1)",
+        int(days),
+    )
+    return _reclaimed_rows(tag)
+
+
+async def prune_judge_verdicts(days: int) -> int:
+    """Delete judge verdicts older than N days; returns rows reclaimed.
+
+    judge_verdicts is the QUALITY RECORD (core/judge.py, B1 commit 1): one row
+    per verdict per judged turn, stamped with the prompt_version that produced
+    it, and the source of the calibration trend the release gate reads. It
+    starts growing the moment the judge sweep runs, so the window ships BEFORE
+    the volume — a retention knob added after the growth has already happened
+    is exactly the defect this wave exists to avoid.
+
+    Age is judged_at, the row's own event time (the column the trend sorts by),
+    so the window means "verdicts about turns older than N days" regardless of
+    when the insert landed.
+
+    days <= 0 is a no-op returning 0, re-checked here as at the call site
+    (defence in depth). Raises on a DB fault; the housekeeping step is
+    error-swallowed like every other one there. The predicate is a sequential
+    scan — neither shipped index leads with judged_at alone — which is
+    acceptable for a table that starts empty and a sweep that runs once a
+    minute.
+    """
+    if days <= 0:
+        return 0
+    tag = await db.execute(
+        "DELETE FROM judge_verdicts WHERE judged_at < now() - make_interval(days => $1)",
+        int(days),
+    )
+    return _reclaimed_rows(tag)
 
 
 async def _distill_sweep() -> None:

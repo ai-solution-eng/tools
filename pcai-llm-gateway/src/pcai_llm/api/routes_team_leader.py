@@ -1191,7 +1191,12 @@ async def team_usage_summary(ctx: TeamDep, since: str | None = None) -> dict[str
                COALESCE({_billable_tokens_sql("l")}, 0)::float             AS billable_tokens,
                COALESCE(SUM(l.cost_usd * l.billing_fraction), 0)::float     AS billed_cost_usd
         FROM usage_ledger l{where_l}
-        GROUP BY l.model ORDER BY cost_usd DESC
+        -- BILLED cost first (2026-11-23): the leader console renders the same
+        -- chargeback table as /admin/usage and both DEFAULT to the billed
+        -- column; ordering by gross cost here made the two consoles disagree
+        -- about the top spender on discounted traffic. cost_usd is the
+        -- tie-break, so an undiscounted deployment keeps its old order.
+        GROUP BY l.model ORDER BY billed_cost_usd DESC, cost_usd DESC
         """,
         *args,
     )
@@ -1214,7 +1219,7 @@ async def team_usage_summary(ctx: TeamDep, since: str | None = None) -> dict[str
         LEFT JOIN api_keys k ON k.id = l.key_id
         LEFT JOIN users u ON u.id = k.user_id
         {where_l}
-        GROUP BY k.name, u.name ORDER BY cost_usd DESC
+        GROUP BY k.name, u.name ORDER BY billed_cost_usd DESC, cost_usd DESC
         """,
         *args,
     )

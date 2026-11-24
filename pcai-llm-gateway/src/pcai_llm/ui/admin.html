@@ -227,6 +227,20 @@
           border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
   th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  /* SORTABLE ROLLUP HEADERS (2026-11-23). A usage-rollup header stays a real
+     columnheader (aria-sort is ITS semantic), so it is focusable rather than a
+     fake button: click, or Enter/Space, sorts by that column and a second press
+     flips the direction. The arrow is drawn FROM aria-sort in CSS, so the
+     visible arrow and the sort state can never disagree (a JS-painted arrow is
+     a second copy of the truth, and second copies drift). The empty ::after
+     reserves the arrow's width on every sortable header, so the header row does
+     not reflow when the arrow moves from one column to another. */
+  th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sortable:hover, th.sortable:focus-visible { color: var(--text); }
+  th.sortable:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+  th.sortable::after { content: ""; display: inline-block; min-width: 1em; color: var(--accent); font-size: 10px; }
+  th.sortable[aria-sort="ascending"]::after { content: "▲"; }
+  th.sortable[aria-sort="descending"]::after { content: "▼"; }
   tr:last-child td { border-bottom: none; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
           padding: 14px 16px; margin-bottom: 14px; }
@@ -1007,7 +1021,7 @@
     </thead><tbody></tbody></table>
     <h3>By model</h3>
     <table id="usage-by-model"><thead>
-      <tr><th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted)">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
+      <tr><th data-sort="model">Model</th><th data-sort="requests">Requests</th><th data-sort="input_tokens">Input</th><th data-sort="output_tokens">Output</th><th data-sort="cached_tokens">Cached</th><th data-sort="cache_hit_rate_pct" title="cached input ÷ input tokens (token-weighted)">Cache rate</th><th data-sort="cost_usd">Cost (USD)</th><th data-sort="billable_tokens" title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th data-sort="billed_cost_usd">Billed cost</th></tr>
     </thead><tbody></tbody></table>
     <h3>By key <span class="muted">— chargeback view; who consumed what</span></h3>
     <div class="row" style="margin-bottom:6px">
@@ -1029,7 +1043,7 @@
       <span class="muted" id="usage-window-note"></span>
     </div>
     <table id="usage-by-key"><thead>
-      <tr><th style="width:1.4em"></th><th>Key</th><th>User</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached input ÷ input tokens (token-weighted) — per KEY, so a key that leans on a cacheable model shows its own rate">Cache rate</th><th>Cost (USD)</th><th title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th>Billed cost</th></tr>
+      <tr><th style="width:1.4em"></th><th data-sort="key_name">Key</th><th data-sort="user_name">User</th><th data-sort="requests">Requests</th><th data-sort="input_tokens">Input</th><th data-sort="output_tokens">Output</th><th data-sort="cached_tokens">Cached</th><th data-sort="cache_hit_rate_pct" title="cached input ÷ input tokens (token-weighted) — per KEY, so a key that leans on a cacheable model shows its own rate">Cache rate</th><th data-sort="cost_usd">Cost (USD)</th><th data-sort="billable_tokens" title="tokens charged against period budgets: (total − cached × exemption) × off-peak fraction — the SAME number the team envelope&#39;s Spent counts">Billable</th><th data-sort="billed_cost_usd">Billed cost</th></tr>
     </thead><tbody></tbody></table>
     <h2 style="margin-top:18px">Pricing (USD per 1M units) <span class="muted">— unpriced models ledger no cost; costs are stored per request at request time. Unit (P10): what a “1M” of the rates is — voice models bill per second, others per token; a unit that cannot match the model's route is refused (ledger NULL) and reported, never billed at the wrong rate</span></h2>
     <div class="card">
@@ -4014,6 +4028,189 @@ function renderCostsTable(costs, empty) {
      <td><button class="ghost mini danger" data-model="${esc(c.model_name)}" onclick="deletePrice(this)">remove</button></td></tr>`).join('')
     || empty;
 }
+// ---- usage rollups: default order + click-to-sort headers ----------------
+// REPORTED 2026-11-23: the two rollups ordered themselves INCONSISTENTLY —
+// by-model read as billed cost while by-key read as gross cost — so comparing
+// the tables meant comparing two different rankings, and the "top spender" row
+// could differ between them. Both now DEFAULT to billed cost, descending: what
+// budgets actually consumed is the chargeback question, and gross cost is one
+// click away. A header click sorts by that column, a second click flips the
+// direction, and a NULL sorts LAST either way (a model with no cached input has
+// no cache rate; a dash floating to the top of an ascending sort reads as the
+// best row).
+const USAGE_SORT_STORE = 'pcai-usage-sort';
+const USAGE_SORT_DEFAULT = { col: 'billed_cost_usd', dir: -1 };
+const USAGE_SORT_COLUMNS = {
+  model: 'text', key_name: 'text', user_name: 'text',
+  requests: 'num', input_tokens: 'num', output_tokens: 'num', cached_tokens: 'num',
+  cache_hit_rate_pct: 'num', cost_usd: 'num', billable_tokens: 'num', billed_cost_usd: 'num',
+};
+const usageSort = { model: { ...USAGE_SORT_DEFAULT }, key: { ...USAGE_SORT_DEFAULT } };
+// The payload both rollups render from, cached so a sort click re-renders
+// WITHOUT a round trip (and without disturbing the window, the pricing editor
+// or the ledger below them).
+let usageSummary = null;
+// Restore the operator's last choice; junk in the store keeps the billed-cost
+// default rather than leaving a half-applied sort.
+try {
+  const savedSort = JSON.parse(sessionStore.get(USAGE_SORT_STORE) || '{}');
+  for (const which of ['model', 'key']) {
+    const s = savedSort[which];
+    if (s && USAGE_SORT_COLUMNS[s.col] && (s.dir === 1 || s.dir === -1)) usageSort[which] = { col: s.col, dir: s.dir };
+  }
+} catch (_e) { /* unreadable store: keep the billed-cost default */ }
+
+function sortUsageRows(rows, spec) {
+  const kind = USAGE_SORT_COLUMNS[spec.col] || 'num';
+  const dir = spec.dir === 1 ? 1 : -1;
+  // Copy: the cached payload stays the source of truth, so a second click
+  // re-sorts from scratch instead of compounding the first.
+  return (rows || []).slice().sort((a, b) => {
+    const av = a ? a[spec.col] : null, bv = b ? b[spec.col] : null;
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;    // NULLs LAST in BOTH directions
+    if (bv == null) return -1;
+    if (kind === 'text') {
+      // numeric-aware compare: a "gpt-4" / "gpt-10" pair must not sort as text
+      return String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' }) * dir;
+    }
+    return ((+av || 0) - (+bv || 0)) * dir;
+  });
+}
+
+function paintUsageSort(tableId, spec) {
+  const tbl = $(tableId);
+  if (!tbl) return;
+  for (const th of tbl.querySelectorAll('th[data-sort]')) {
+    const col = th.getAttribute('data-sort');
+    th.classList.add('sortable');
+    if (!th.hasAttribute('tabindex')) th.setAttribute('tabindex', '0');
+    // aria-sort IS the visual state (the CSS arrow reads it), so a header can
+    // never point at a column the rows are not actually sorted by.
+    th.setAttribute('aria-sort', col === spec.col ? (spec.dir === 1 ? 'ascending' : 'descending') : 'none');
+  }
+}
+
+function wireUsageSort(tableId, which) {
+  const tbl = $(tableId);
+  if (!tbl || tbl.dataset.sortBound) return;   // bound once: the thead is static
+  tbl.dataset.sortBound = '1';
+  const flip = th => {
+    if (!th) return;
+    const col = th.getAttribute('data-sort');
+    const spec = usageSort[which];
+    if (!spec || !USAGE_SORT_COLUMNS[col]) return;
+    if (spec.col === col) {
+      spec.dir = -spec.dir;                                   // same column: flip
+    } else {
+      spec.col = col;                                         // new column: text
+      spec.dir = USAGE_SORT_COLUMNS[col] === 'text' ? 1 : -1;  // reads A→Z, numbers big→small
+    }
+    sessionStore.set(USAGE_SORT_STORE, JSON.stringify(usageSort));
+    if (which === 'model') renderUsageByModel(); else renderUsageByKey();
+  };
+  tbl.addEventListener('click', ev => flip(ev.target.closest('th[data-sort]')));
+  tbl.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+    const th = ev.target.closest('th[data-sort]');
+    if (!th) return;
+    ev.preventDefault();     // Space must not scroll the page under the header
+    flip(th);
+  });
+}
+// ---- end usage rollup sorting --------------------------------------------
+
+// The two rollups render from the CACHED payload, so a sort click re-renders
+// without a round trip (and without disturbing the window, the pricing editor
+// or the ledger below them).
+function renderUsageByModel() {
+  const rows = sortUsageRows((usageSummary && usageSummary.by_model) || [], usageSort.model);
+  $('usage-by-model').querySelector('tbody').innerHTML = rows.map(r =>
+    `<tr><td class="mono">${esc(r.model)}</td><td>${fmtInt(r.requests)}</td>
+     <td>${fmtInt(r.input_tokens)}</td><td>${fmtInt(r.output_tokens)}</td>
+     <td>${fmtInt(r.cached_tokens)}</td><td>${r.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : r.cache_hit_rate_pct + '%'}</td>
+     <td>${fmtUSD(r.cost_usd)}</td><td>${fmtInt(r.billable_tokens)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`).join('')
+    || '<tr><td colspan="9" class="muted">no requests recorded yet</td></tr>';
+  paintUsageSort('usage-by-model', usageSort.model);
+  wireUsageSort('usage-by-model', 'model');
+}
+
+function renderUsageByKey() {
+  const sum = usageSummary || {};
+  // Rows are rolled up by (key name, user) so a ROTATED key reports ONE line:
+  // rotation mints a new key row with the same name, and grouping by key id
+  // used to split one credential's spend across every generation. `generations`
+  // keeps that visible — a rotated key shows a xN badge instead of silently
+  // looking like a single long-lived key.
+  // Expandable per-key rows: the parent line is the chargeback rollup, and
+  // clicking the caret reveals the PER-MODEL split for that key (from
+  // sum.by_key_model). Grouped by (key name, user) exactly like the parent so
+  // a rotated credential keeps one identity. Rendered as sibling <tr>s with a
+  // data-parent attribute so the toggle is a single class flip.
+  const perKeyModel = {};
+  (sum.by_key_model || []).forEach(m => {
+    const k = (m.key_name || '') + '\u0000' + (m.user_name || '');
+    (perKeyModel[k] = perKeyModel[k] || []).push(m);
+  });
+  // SORT FIRST, then render: the caret toggle keys on the row's POSITION, so
+  // sorting the payload (rather than the DOM afterwards) keeps every drill-down
+  // attached to its own key.
+  const parents = sortUsageRows((usageSummary && usageSummary.by_key) || [], usageSort.key);
+  const keyRows = [];
+  parents.forEach((r, i) => {
+    const k = (r.key_name || '') + '\u0000' + (r.user_name || '');
+    const kids = perKeyModel[k] || [];
+    const canExpand = kids.length > 0;
+    // the children carry a SUBSET of the parent's columns; when the parent
+    // sorts by one they do not have (billable_tokens, key_name, user_name) the
+    // drill-down falls back to billed cost, so it is never in raw server order
+    const kidSpec = (kids.length && Object.prototype.hasOwnProperty.call(kids[0], usageSort.key.col))
+      ? usageSort.key : USAGE_SORT_DEFAULT;
+    keyRows.push(
+      `<tr class="ukey-parent" data-kidx="${i}"${canExpand ? ' style="cursor:pointer"' : ''}>
+       <td class="mono">${canExpand ? `<span class="ukey-caret" data-kidx="${i}">▸</span>` : ''}</td>
+       <td class="mono">${esc(r.key_name || '—')}${(r.generations || 1) > 1
+        ? ` <span class="muted" title="${r.generations} key generations (rotations) rolled up">×${r.generations}</span>`
+        : ''}</td><td>${esc(r.user_name || '—')}</td>
+       <td>${fmtInt(r.requests)}</td><td>${fmtInt(r.input_tokens)}</td>
+       <td>${fmtInt(r.output_tokens)}</td>
+       <td>${fmtInt(r.cached_tokens)}</td>
+       <td>${r.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : r.cache_hit_rate_pct + '%'}</td>
+       <td>${fmtUSD(r.cost_usd)}</td><td>${fmtInt(r.billable_tokens)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`);
+    if (canExpand) {
+      keyRows.push(`<tr class="ukey-child" data-kidx="${i}" style="display:none">
+        <td></td><td colspan="9" style="padding:0 0 0 1.6em">
+        <table style="width:100%;margin:2px 0 6px"><thead><tr>
+          <th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th>Cache rate</th><th>Cost (USD)</th><th>Billed cost</th>
+        </tr></thead><tbody>` + sortUsageRows(kids, kidSpec).map(m => `<tr>
+          <td class="mono">${esc(m.model || '—')}</td><td>${fmtInt(m.requests)}</td>
+          <td>${fmtInt(m.input_tokens)}</td><td>${fmtInt(m.output_tokens)}</td>
+          <td>${fmtInt(m.cached_tokens)}</td>
+          <td>${m.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : m.cache_hit_rate_pct + '%'}</td>
+          <td>${fmtUSD(m.cost_usd)}</td><td>${fmtUSD(m.billed_cost_usd)}</td></tr>`).join('') + `</tbody></table>
+        </td></tr>`);
+    }
+  });
+  const byKeyBody = $('usage-by-key').querySelector('tbody');
+  byKeyBody.innerHTML = keyRows.join('') || '<tr><td colspan="11" class="muted">no requests recorded yet</td></tr>';
+  // Delegate the toggle: a caret or the parent row flips every child of that
+  // index and rotates the caret. Bound once per render via onclick on the tbody
+  // (re-assigning is idempotent).
+  byKeyBody.onclick = (ev) => {
+    const el = ev.target.closest('[data-kidx]');
+    if (!el) return;
+    const idx = el.getAttribute('data-kidx');
+    const kids = byKeyBody.querySelectorAll('.ukey-child[data-kidx="' + idx + '"]');
+    if (!kids.length) return;
+    const open = kids[0].style.display !== 'none';
+    kids.forEach(k2 => { k2.style.display = open ? 'none' : ''; });
+    const caret = byKeyBody.querySelector('.ukey-caret[data-kidx="' + idx + '"]');
+    if (caret) caret.textContent = open ? '▸' : '▾';
+  };
+  paintUsageSort('usage-by-key', usageSort.key);
+  wireUsageSort('usage-by-key', 'key');
+}
+
 async function loadUsage() {
   // WINDOW (2026-10-26): the endpoint is bounded to the last 30 days by
   // default, which made a growing lifetime total look like it was DROPPING --
@@ -4122,73 +4319,11 @@ async function loadUsage() {
      <td>${fmtInt(t.output_tokens)}</td><td>${fmtInt(t.cached_tokens)}</td>
      <td>${t.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : t.cache_hit_rate_pct + '%'}</td><td>${fmtUSD(t.cost_usd)}</td>
      <td>${fmtInt(t.billed_tokens)}</td><td>${fmtUSD(t.billed_cost_usd)}</td></tr>`;
-  $('usage-by-model').querySelector('tbody').innerHTML = (sum.by_model || []).map(r =>
-    `<tr><td class="mono">${esc(r.model)}</td><td>${fmtInt(r.requests)}</td>
-     <td>${fmtInt(r.input_tokens)}</td><td>${fmtInt(r.output_tokens)}</td>
-     <td>${fmtInt(r.cached_tokens)}</td><td>${r.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : r.cache_hit_rate_pct + '%'}</td>
-     <td>${fmtUSD(r.cost_usd)}</td><td>${fmtInt(r.billable_tokens)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`).join('')
-    || '<tr><td colspan="9" class="muted">no requests recorded yet</td></tr>';
-  // Rows are rolled up by (key name, user) so a ROTATED key reports ONE line:
-  // rotation mints a new key row with the same name, and grouping by key id
-  // used to split one credential's spend across every generation. `generations`
-  // keeps that visible — a rotated key shows a xN badge instead of silently
-  // looking like a single long-lived key.
-  // Expandable per-key rows: the parent line is the chargeback rollup, and
-  // clicking the caret reveals the PER-MODEL split for that key (from
-  // sum.by_key_model). Grouped by (key name, user) exactly like the parent so
-  // a rotated credential keeps one identity. Rendered as sibling <tr>s with a
-  // data-parent attribute so the toggle is a single class flip.
-  const perKeyModel = {};
-  (sum.by_key_model || []).forEach(m => {
-    const k = (m.key_name || '') + '\u0000' + (m.user_name || '');
-    (perKeyModel[k] = perKeyModel[k] || []).push(m);
-  });
-  const keyRows = [];
-  (sum.by_key || []).forEach((r, i) => {
-    const k = (r.key_name || '') + '\u0000' + (r.user_name || '');
-    const kids = perKeyModel[k] || [];
-    const canExpand = kids.length > 0;
-    keyRows.push(
-      `<tr class="ukey-parent" data-kidx="${i}"${canExpand ? ' style="cursor:pointer"' : ''}>
-       <td class="mono">${canExpand ? `<span class="ukey-caret" data-kidx="${i}">▸</span>` : ''}</td>
-       <td class="mono">${esc(r.key_name || '—')}${(r.generations || 1) > 1
-        ? ` <span class="muted" title="${r.generations} key generations (rotations) rolled up">×${r.generations}</span>`
-        : ''}</td><td>${esc(r.user_name || '—')}</td>
-       <td>${fmtInt(r.requests)}</td><td>${fmtInt(r.input_tokens)}</td>
-       <td>${fmtInt(r.output_tokens)}</td>
-       <td>${fmtInt(r.cached_tokens)}</td>
-       <td>${r.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : r.cache_hit_rate_pct + '%'}</td>
-       <td>${fmtUSD(r.cost_usd)}</td><td>${fmtInt(r.billable_tokens)}</td><td>${fmtUSD(r.billed_cost_usd)}</td></tr>`);
-    if (canExpand) {
-      keyRows.push(`<tr class="ukey-child" data-kidx="${i}" style="display:none">
-        <td></td><td colspan="9" style="padding:0 0 0 1.6em">
-        <table style="width:100%;margin:2px 0 6px"><thead><tr>
-          <th>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Cached</th><th>Cache rate</th><th>Cost (USD)</th><th>Billed cost</th>
-        </tr></thead><tbody>` + kids.map(m => `<tr>
-          <td class="mono">${esc(m.model || '—')}</td><td>${fmtInt(m.requests)}</td>
-          <td>${fmtInt(m.input_tokens)}</td><td>${fmtInt(m.output_tokens)}</td>
-          <td>${fmtInt(m.cached_tokens)}</td>
-          <td>${m.cache_hit_rate_pct == null ? '<span class="muted">—</span>' : m.cache_hit_rate_pct + '%'}</td>
-          <td>${fmtUSD(m.cost_usd)}</td><td>${fmtUSD(m.billed_cost_usd)}</td></tr>`).join('') + `</tbody></table>
-        </td></tr>`);
-    }
-  });
-  const byKeyBody = $('usage-by-key').querySelector('tbody');
-  byKeyBody.innerHTML = keyRows.join('') || '<tr><td colspan="11" class="muted">no requests recorded yet</td></tr>';
-  // Delegate the toggle: a caret or the parent row flips every child of that
-  // index and rotates the caret. Bound once per render via onclick on the tbody
-  // (re-assigning is idempotent).
-  byKeyBody.onclick = (ev) => {
-    const el = ev.target.closest('[data-kidx]');
-    if (!el) return;
-    const idx = el.getAttribute('data-kidx');
-    const kids = byKeyBody.querySelectorAll('.ukey-child[data-kidx="' + idx + '"]');
-    if (!kids.length) return;
-    const open = kids[0].style.display !== 'none';
-    kids.forEach(k2 => { k2.style.display = open ? 'none' : ''; });
-    const caret = byKeyBody.querySelector('.ukey-caret[data-kidx="' + idx + '"]');
-    if (caret) caret.textContent = open ? '▸' : '▾';
-  };
+  // The rollups render from the CACHED payload (see renderUsageByModel /
+  // renderUsageByKey above) so a header click can re-sort without a refetch.
+  usageSummary = sum;
+  renderUsageByModel();
+  renderUsageByKey();
   // {costs, unpriced, unit_mismatch} — 2026-11-10 shape; rows ride in costs
   const costs = await api('/costs');
   // SHAPE FALLBACK (rolling upgrade): GET /admin/costs became an OBJECT

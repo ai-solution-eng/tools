@@ -28,9 +28,7 @@ import test_toolrelay_r1 as r1
 MODEL_ONE = [
     {
         "content": None,
-        "tool_calls": [
-            {"id": "c1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"gpu"}'}}
-        ],
+        "tool_calls": [{"id": "c1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"gpu"}'}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     },
     {"content": "done"},
@@ -39,16 +37,12 @@ MODEL_ONE = [
 MODEL_TWO_ITERATIONS = [
     {
         "content": None,
-        "tool_calls": [
-            {"id": "c1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"a"}'}}
-        ],
+        "tool_calls": [{"id": "c1", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"a"}'}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     },
     {
         "content": None,
-        "tool_calls": [
-            {"id": "c2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"b"}'}}
-        ],
+        "tool_calls": [{"id": "c2", "function": {"name": "logsearch__search_logs", "arguments": '{"q":"b"}'}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     },
     {"content": "done"},
@@ -64,7 +58,7 @@ def _chunks(text: str) -> list[dict]:
         if not line.startswith("data: ") or line == "data: [DONE]":
             continue
         try:
-            out.append(json.loads(line[len("data: "):]))
+            out.append(json.loads(line[len("data: ") :]))
         except json.JSONDecodeError:
             continue
     return out
@@ -120,9 +114,7 @@ def test_render_index_is_monotone_across_iterations() -> None:
         render_index_base=1000,
     )
     assert calls["exec"] == 2
-    indexes = [
-        c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in _render_deltas(text)
-    ]
+    indexes = [c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in _render_deltas(text)]
     assert indexes == [1000, 1001], f"index space reset between iterations: {indexes}"
 
 
@@ -144,9 +136,7 @@ def test_error_outcome_keeps_tool_call_event_with_ok_false() -> None:
     ok=false -- that is the arm the patch maps to an error card. If it moved to
     a different event name with a `detail` field, the patch's error arm expects
     `detail`, and a mismatch would blank the card body."""
-    text, _ = r1._drive(
-        MODEL_ONE, [(False, {"error": "boom"})], grants=GRANTS, render_deltas=True
-    )
+    text, _ = r1._drive(MODEL_ONE, [(False, {"error": "boom"})], grants=GRANTS, render_deltas=True)
     events = _telemetry(text)
     assert len(events) == 1
     assert events[0]["ok"] is False

@@ -1659,6 +1659,102 @@ ALTER TABLE tool_pins ADD CONSTRAINT ck_tool_pins_shape
 -- which the primary key already serves as a single-row lookup. An index here
 -- would be write cost with no reader.
 -- ============================================================================
+
+-- Destructive-tool approval gate, phase 1 (2026-11-23):
+-- documentation/design/tool-approval-gate.md, core/approval.py.
+--
+-- THE HOLE: every tool call -- including applygate plan_apply, workbench run and
+-- k8s exec_in_pod -- executes on a static grant. The ACL answers "may this key
+-- call this tool"; nothing answers "should THIS call happen". An approval token
+-- pre-authorizes a SHAPE of call (one server, one tool, one arguments
+-- fingerprint, a mandatory use count and a mandatory expiry), and the gate in
+-- api/routes_mcp.py::_gated_mcp_call refuses a named destructive tool that has
+-- no matching live token, before the upstream session opens.
+--
+-- PHASE 1 IS OBSERVE-ONLY: tool_approval_mode defaults to "off" (inert -- the
+-- gate does no I/O at all), "warn" records what WOULD have needed approval and
+-- changes nothing, and only an operator setting "enforce" makes a token
+-- mandatory. So both tables are written only in warn/enforce mode; the off path
+-- never touches them.
+--
+-- tool_approval_requests is the operator's DECISION INPUT: one row per
+-- (key_id, server, tool, args_fingerprint) that needed approval, UPSERTED so a
+-- repeated call increments times_seen instead of filling the table with
+-- duplicates. request_id is stable across repeats -- it is the id
+-- 'tool_approval_admin.py grant --request <id>' takes.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS tool_approval_requests (
+    request_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_id           UUID NOT NULL,                    -- the CALLING key (never NULL here)
+    server           TEXT NOT NULL,
+    tool             TEXT NOT NULL,
+    args_fingerprint TEXT NOT NULL,                    -- 16 hex (core.approval.DIGEST_CHARS)
+    first_seen       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    times_seen       BIGINT NOT NULL DEFAULT 1,        -- how often this EXACT call was seen
+    mode             TEXT NOT NULL,                    -- 'warn' | 'enforce' at record time
+    -- The upsert target: one row per shape of call per key, so an operator sees
+    -- "this exact call, N times" rather than N rows. Serves the gate's one write.
+    UNIQUE (key_id, server, tool, args_fingerprint)
+);
+ALTER TABLE tool_approval_requests DROP CONSTRAINT IF EXISTS ck_approval_requests_mode;
+ALTER TABLE tool_approval_requests ADD CONSTRAINT ck_approval_requests_mode
+    CHECK (mode IN ('warn','enforce')) NOT VALID;
+ALTER TABLE tool_approval_requests DROP CONSTRAINT IF EXISTS ck_approval_requests_shape;
+ALTER TABLE tool_approval_requests ADD CONSTRAINT ck_approval_requests_shape
+    CHECK (server <> '' AND tool <> '' AND args_fingerprint ~ '^[0-9a-f]{16}$') NOT VALID;
+-- NO second index on purpose. Every read is the operator's list (a
+-- once-per-decision scan of a table whose size is the number of DISTINCT
+-- destructive call shapes observed -- tens of rows, not call-rate) or the
+-- upsert, which the unique constraint already serves. An index here would be
+-- write cost with no reader.
+
+-- tool_approvals is the TOKEN table. Two nullable columns are the two WEAKER
+-- shapes the design permits, and both are labelled in the admin listing so an
+-- operator can always see what they granted:
+--   * key_id NULL           -> the token authorizes the shape for ANY key
+--                              (the default grant path scopes it to the key that
+--                              made the request; NULL is the fleet-wide shape).
+--   * args_fingerprint NULL -> the token authorizes ANY ARGUMENTS of this tool.
+--                              This is strictly weaker: it does not pin the
+--                              ns/table/id the call names, so a token for
+--                              "delete" authorizes "delete prod" as readily as
+--                              "delete test". It exists for an operator who
+--                              accepts that risk; it is never the default.
+-- max_uses and expires_at are NOT NULL: an approval that never expires (or can
+-- be used forever) is a grant wearing a disguise (design section 3.1).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS tool_approvals (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_id           UUID,                             -- NULL = ANY KEY (weaker shape; see above)
+    server           TEXT NOT NULL,
+    tool             TEXT NOT NULL,
+    args_fingerprint TEXT,                             -- NULL = ANY ARGUMENTS (weaker shape; see above)
+    max_uses         INTEGER NOT NULL,
+    uses_so_far      INTEGER NOT NULL DEFAULT 0,
+    expires_at       TIMESTAMPTZ NOT NULL,             -- MANDATORY: an approval is a perishable thing
+    issued_by        TEXT NOT NULL DEFAULT '',         -- operator identity that issued it
+    reason           TEXT NOT NULL DEFAULT '',         -- why the operator approved this shape
+    revoked_at       TIMESTAMPTZ,                      -- set = dead, regardless of expiry/uses
+    issued_at        TIMESTAMPTZ NOT NULL DEFAULT now() -- when it was granted (operator + audit read)
+);
+ALTER TABLE tool_approvals DROP CONSTRAINT IF EXISTS ck_tool_approvals_shape;
+ALTER TABLE tool_approvals ADD CONSTRAINT ck_tool_approvals_shape
+    CHECK (server <> '' AND tool <> ''
+           AND (args_fingerprint IS NULL OR args_fingerprint ~ '^[0-9a-f]{16}$')) NOT VALID;
+-- The use bound is enforced by the gate's conditional UPDATE; this CHECK makes a
+-- hand-written row that already over-spends visible instead of silently trusted.
+-- NOT VALID for the ck_traces_status reason above: a VALID add scans on every
+-- boot and could abort the whole implicit schema transaction on a bad legacy row.
+ALTER TABLE tool_approvals DROP CONSTRAINT IF EXISTS ck_tool_approvals_uses;
+ALTER TABLE tool_approvals ADD CONSTRAINT ck_tool_approvals_uses
+    CHECK (max_uses >= 1 AND uses_so_far >= 0 AND uses_so_far <= max_uses) NOT VALID;
+-- The gate's read: live tokens for one (server, tool). Partial on revoked_at so
+-- the revoked minority (and the admin listing, which filters the same way) stays
+-- out of it; expiry is a time predicate and is filtered per row.
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_live ON tool_approvals(server, tool)
+    WHERE revoked_at IS NULL;
+
 -- Agent quality layer (2026-11-23): trace PAYLOADS + deterministic VERDICTS.
 --
 -- agent_traces records what an agent DID and what it COST; it never recorded
@@ -1732,4 +1828,59 @@ ALTER TABLE agent_eval_verdicts ADD CONSTRAINT ck_eval_verdicts_vocab
 CREATE INDEX IF NOT EXISTS idx_eval_verdicts_request ON agent_eval_verdicts(request_id);
 -- The quality dashboard: "what is failing lately", per verdict class.
 CREATE INDEX IF NOT EXISTS idx_eval_verdicts_verdict_ts ON agent_eval_verdicts(verdict, ts DESC);
+
+-- --- Calibrated behaviour judge (2026-11-23, B1 commit 1) ----------------------
+-- The deterministic scorer above answers "did the tool calls work". This table holds
+-- the JUDGE's answers to "was the result right, and was the path defensible" — the
+-- second half of the quality layer (design: documentation/design/agent-judge.md).
+--
+-- TWO RULES ARE STRUCTURAL, not convention:
+--   * evidence_refs is NOT NULL and every stored claim cites at least one
+--     (request_id, iteration). core/judge.validate_verdicts DROPS an uncited claim
+--     before it reaches here — a judge that cannot cite is not a judge, and an
+--     uncited number is indistinguishable from a guess.
+--   * prompt_version is stamped on EVERY row, so the rubric that produced a number is
+--     always recoverable. A verdict whose rubric is unknown cannot be compared to a
+--     later one, which is the whole point of tracking the number over time.
+-- 'abstain' is a first-class dimension: "not enough evidence" is a better answer than
+-- a guess, and its rate is a calibration metric.
+CREATE TABLE IF NOT EXISTS judge_verdicts (
+    id            BIGSERIAL PRIMARY KEY,
+    request_id    TEXT NOT NULL,
+    dimension     TEXT NOT NULL,             -- task_completion|trajectory|tool_use|multi_turn|abstain
+    severity      TEXT NOT NULL DEFAULT 'info',
+    claim         TEXT NOT NULL,
+    evidence_refs JSONB NOT NULL,            -- [[request_id, iteration], ...] — never empty
+    confidence    DOUBLE PRECISION,
+    model         TEXT NOT NULL DEFAULT '',
+    prompt_version TEXT NOT NULL DEFAULT '',
+    contaminated  BOOLEAN NOT NULL DEFAULT FALSE,
+    judged_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE judge_verdicts DROP CONSTRAINT IF EXISTS ck_judge_verdicts_dimension;
+ALTER TABLE judge_verdicts ADD CONSTRAINT ck_judge_verdicts_dimension
+    CHECK (dimension IN ('task_completion','trajectory','tool_use','multi_turn','abstain')) NOT VALID;
+ALTER TABLE judge_verdicts DROP CONSTRAINT IF EXISTS ck_judge_verdicts_severity;
+ALTER TABLE judge_verdicts ADD CONSTRAINT ck_judge_verdicts_severity
+    CHECK (severity IN ('info','warn','critical')) NOT VALID;
+-- A claim without evidence must not be storable even by hand-written SQL: the
+-- application rule is enforced here too, because this table feeds a release gate.
+--
+-- DELIBERATE, resolved 2026-11-23: an ABSTENTION ("not enough evidence") also has to
+-- cite — it cites the turn's own steps, via store_verdicts' fallback_refs. The
+-- tempting alternative is `OR dimension = 'abstain'` here, and it is wrong: the moment
+-- the schema carries a citation exemption, "no claim without a citation" becomes a
+-- rule with a door in it, and the next thing through that door is a finding. An
+-- abstention that names what it looked at is also strictly more useful than a bare
+-- "insufficient evidence" — it says WHICH steps were not enough.
+ALTER TABLE judge_verdicts DROP CONSTRAINT IF EXISTS ck_judge_verdicts_cited;
+ALTER TABLE judge_verdicts ADD CONSTRAINT ck_judge_verdicts_cited
+    CHECK (jsonb_typeof(evidence_refs) = 'array' AND jsonb_array_length(evidence_refs) > 0) NOT VALID;
+-- One turn's verdicts (the report and, later, the gate).
+CREATE INDEX IF NOT EXISTS idx_judge_verdicts_request ON judge_verdicts(request_id);
+-- "What is failing lately", per dimension — the quality trend.
+CREATE INDEX IF NOT EXISTS idx_judge_verdicts_dim_ts ON judge_verdicts(dimension, judged_at DESC);
+-- Retention (housekeeping step 1g) deletes WHERE judged_at < cutoff. The composite
+-- above leads with dimension, so it cannot serve that predicate: this one can.
+CREATE INDEX IF NOT EXISTS idx_judge_verdicts_judged_at ON judge_verdicts(judged_at);
 """

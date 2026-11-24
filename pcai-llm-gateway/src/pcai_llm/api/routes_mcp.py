@@ -46,7 +46,10 @@ payload telemetry → read+egress separation, hardening P0-1) → server
 tool-policy → TOOL-PIN DISPATCH GATE (recommendation B3: in ``block`` mode a
 tool whose definition changed or vanished since it was pinned is refused here
 — after the ACL and before the upstream session opens, the same position the
-relay's own gate uses) → proxied call → ledger settle; the result is then
+relay's own gate uses) → DESTRUCTIVE-TOOL APPROVAL GATE (B8, 2026-11-23: in
+``enforce`` mode a listed destructive tool with no matching live approval token
+is refused here; ``warn`` records the request and passes; ``off`` is inert) →
+proxied call → ledger settle; the result is then
 SCREENED for injected instructions (B3: core.tool_injection, gated by
 ``settings.tool_injection_screen``) before it is handed back. The SAME stage
 runs on the relay path (routes_proxy._relay_executor), which is where a
@@ -142,8 +145,8 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import settings
+from ..core import approval, registry, secretbox, tool_injection, tool_pin, toolrelay, tracing
 from ..core import metrics as _metrics
-from ..core import registry, secretbox, tool_injection, tool_pin, toolrelay, tracing
 from ..core.budgets import check_rate_limit, settle
 from ..core.identity import (
     KIND_KEY_BOUND,
@@ -1536,8 +1539,10 @@ async def _gated_mcp_call(
 
     Chain, in order: explicit validation → RPM rate gate (once per request)
     → registry lookup → per-key ACL (default-deny) → argument/grant policy →
-    server tool-policy → dispatch-time tool-pin gate → proxied call → ledger
-    settle per attempt under its actual ``mcp:<server>:<tool>`` endpoint. ALL
+    server tool-policy → dispatch-time tool-pin gate → destructive-tool
+    approval gate (B8: enforce only -- warn records and passes, off is inert)
+    → proxied call → ledger settle per attempt under its actual
+    ``mcp:<server>:<tool>`` endpoint. ALL
     refusals raise ToolError so the SDK turns them into is_error
     CallToolResults (not HTTP errors — streamable-http clients expect a
     JSON-RPC result for tools/call).
@@ -1640,6 +1645,10 @@ async def _gated_mcp_call(
     # kept so that, when NO candidate can serve, the call is refused with the
     # PIN reason instead of a generic transport error.
     pin_refusals: list[str] = []
+    # B8: approval refusals accumulate the same way -- a failover candidate is
+    # a different server with its own token scope, so one candidate's refusal
+    # says nothing about the next.
+    approval_refusals: list[str] = []
     for candidate in candidates:
         candidate_name = str(candidate["name"])
         # Each attempt settles under its ACTUAL endpoint — a failover hit is
@@ -1700,6 +1709,44 @@ async def _gated_mcp_call(
             )
             pin_refusals.append(pin_refusal)
             continue
+        # --- destructive-tool approval gate (B8 phase 1, 2026-11-23) ------
+        # Position: AFTER the ACL/argument/tool-policy gates and the dispatch
+        # pin, BEFORE the upstream session opens -- the same place as the pin
+        # gate, for the same reason: refuse before side effects, never after.
+        # The ACL answers "may this key call this tool"; this answers "should
+        # THIS call happen", from a pre-authorization token scoped to the
+        # arguments fingerprint, with a mandatory use count and expiry.
+        #
+        # PER-CANDIDATE, like the pin gate (R1): a failover target is a
+        # DIFFERENT server, and a token for one server must never authorize
+        # another, so each candidate is checked on its own; the refusal becomes
+        # the call's answer only when no candidate can serve.
+        #
+        # OFF (the default this wave ships) is INERT: gate_call() returns before
+        # any store access, so the call path is byte-identical to pre-B8. WARN
+        # records the request and lets the call through untouched. ENFORCE
+        # refuses without a live token and FAILS CLOSED on a store fault -- the
+        # deliberate asymmetry with pinning (design section 4): a broken pinning
+        # gate must not break a turn, a broken approval gate must not let a
+        # destructive call through.
+        approval_decision = await approval.gate_call(key.id, candidate_name, tool, arguments)
+        if approval_decision.refused:
+            await _settle_quiet(
+                key.id,
+                candidate_endpoint,
+                "denied",
+                started,
+                request_id,
+                arguments=arguments,
+                detail=approval.REFUSAL_DETAIL,
+                metric_server=candidate_name,
+            )
+            approval_refusals.append(approval_decision.reason)
+            continue
+        # The consumed token joins the hash-chained mcp_call_audit row for this
+        # attempt (design section 3.3): an approval that is not in the chain did
+        # not happen. Empty in off/warn mode, so those rows are unchanged.
+        approval_detail = f"approval:{approval_decision.token_id}" if approval_decision.token_id else ""
         call_headers = await resolve_mcp_headers(candidate, key_id=key.id)
 
         async def do(session: ClientSession) -> Any:
@@ -1719,6 +1766,7 @@ async def _gated_mcp_call(
                 started,
                 request_id,
                 arguments=arguments,
+                detail=approval_detail,
                 metric_server=candidate_name,
             )
             transport_errors.append(f"{candidate_name}: {type(exc).__name__}")
@@ -1734,6 +1782,7 @@ async def _gated_mcp_call(
                 started,
                 request_id,
                 arguments=arguments,
+                detail=approval_detail,
                 metric_server=candidate_name,
             )
             # The result is SCREENED before it re-enters the model (B3):
@@ -1753,7 +1802,14 @@ async def _gated_mcp_call(
                 indent=2,
             )
         await _settle_quiet(
-            key.id, candidate_endpoint, "ok", started, request_id, arguments=arguments, metric_server=candidate_name
+            key.id,
+            candidate_endpoint,
+            "ok",
+            started,
+            request_id,
+            arguments=arguments,
+            detail=approval_detail,
+            metric_server=candidate_name,
         )
         # The result is SCREENED before it re-enters the model (B3): the
         # tool text is attacker-controlled content (a document, a web page, a
@@ -1778,6 +1834,12 @@ async def _gated_mcp_call(
     # call's answer (R1: "the final error must name the pin reason, not a
     # generic transport error"). The single-candidate shape is unchanged — an
     # explicit mcp_call() whose only target is refused still raises that refusal.
+    # B8: an approval refusal takes precedence over a pin reason when both fired
+    # on different candidates -- it names the exact operator command that
+    # unblocks the call, which is the more actionable answer. The pin R1
+    # contract is otherwise unchanged.
+    if approval_refusals:
+        raise ToolError(approval_refusals[0])
     if pin_refusals:
         raise ToolError(pin_refusals[0])
 

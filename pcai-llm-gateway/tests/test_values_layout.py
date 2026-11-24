@@ -228,8 +228,7 @@ class TestGroupedValuesLayout:
         settings = _values()["settings"]
         survivors = sorted(set(settings) & set(LEGACY_FLAT_KEYS))
         assert survivors == [], (
-            "these keys belong to the OLD flat layout and must live under a subsystem "
-            f"section now: {survivors}"
+            f"these keys belong to the OLD flat layout and must live under a subsystem section now: {survivors}"
         )
 
     def test_every_legacy_key_is_actually_gone(self) -> None:

@@ -895,7 +895,18 @@ def test_the_two_consoles_share_the_same_plane_implementation() -> None:
 
     admin = _read(ADMIN)
     team = _read(TEAM)
-    for name in ("structureFormRows", "armPasswordToggles", "layoutFormRowsNow", "layoutFormRows"):
+    # the usage rollups' sort implementation (2026-11-23) is the fifth shared
+    # piece: both consoles render the SAME chargeback tables, and their default
+    # order is only one answer if the comparator is one implementation.
+    for name in (
+        "structureFormRows",
+        "armPasswordToggles",
+        "layoutFormRowsNow",
+        "layoutFormRows",
+        "sortUsageRows",
+        "paintUsageSort",
+        "wireUsageSort",
+    ):
         assert norm(js_function(admin, name)) == norm(js_function(team, name)), (
             f"{name} drifted between admin.html and team_leader.html"
         )

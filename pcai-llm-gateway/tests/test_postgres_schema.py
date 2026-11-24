@@ -453,4 +453,3 @@ def test_tool_pin_sql_round_trip(pg: str) -> None:
             await conn.close()
 
     _run(go())
-

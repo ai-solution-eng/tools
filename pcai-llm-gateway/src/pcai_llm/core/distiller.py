@@ -197,9 +197,7 @@ DISTILL_SYSTEM_PROMPT = (
     "- Target 250-600 words TOTAL, roughly 60-150 words per section. A short,"
     " complete document beats a long one that runs out of room before '## How to proceed'.\n"
     "- Preserve exact commands, paths, digests, error messages, and config values"
-    " verbatim - but pick the few that carry recall value, not every one seen."
-
-    + PLAYBOOK_PROMPT
+    " verbatim - but pick the few that carry recall value, not every one seen." + PLAYBOOK_PROMPT
 )
 
 MAP_SYSTEM_PROMPT = (

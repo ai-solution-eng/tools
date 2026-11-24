@@ -2451,9 +2451,7 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
     # consumed by the write, the source lookup and the audit row, so the three
     # can never disagree about which endpoints are moving.
     moved = [
-        ep.api_key_from
-        if ep.api_key is None and ep.api_key_from and ep.api_key_from != ep.base_url
-        else None
+        ep.api_key_from if ep.api_key is None and ep.api_key_from and ep.api_key_from != ep.base_url else None
         for ep in body.endpoints
     ]
     enc_rows = []
@@ -2470,9 +2468,7 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
                     "is not set (deploy the Secret, or use api_key_secret by-ref)",
                 )
             enc = secretbox.encrypt(ep.api_key)
-        enc_rows.append(
-            (body.model_name, ep.base_url, ep.priority, ep.weight, ep.api_key_secret, enc, moved_from)
-        )
+        enc_rows.append((body.model_name, ep.base_url, ep.priority, ep.weight, ep.api_key_secret, enc, moved_from))
     async with db.acquire() as conn, conn.transaction():
         # CREDENTIAL CARRY-OVER (2026-11-18). Resolved INSIDE the write's own
         # transaction: the source row is about to be pruned by the REPLACE
@@ -2485,16 +2481,11 @@ async def upsert_model(body: ModelUpsert, request: Request, _: AdminDep) -> list
         carried: dict[str, str] = {}
         if sources:
             src_rows = await conn.fetch(
-                "SELECT base_url, auth_token_enc FROM model_endpoints "
-                "WHERE model_name = $1 AND base_url = ANY($2)",
+                "SELECT base_url, auth_token_enc FROM model_endpoints WHERE model_name = $1 AND base_url = ANY($2)",
                 body.model_name,
                 sources,
             )
-            carried = {
-                r["base_url"]: r["auth_token_enc"]
-                for r in src_rows
-                if r["auth_token_enc"]
-            }
+            carried = {r["base_url"]: r["auth_token_enc"] for r in src_rows if r["auth_token_enc"]}
             missing = [s for s in sources if s not in carried]
             if missing:
                 # FAIL LOUD: silently writing a credential-less row is exactly
@@ -5004,8 +4995,16 @@ def _fold_unit_rows(rows: list[Any], group_cols: tuple[str, ...]) -> list[dict[s
     pre-GROUPING-SETS query computed it; each per-unit subrow contributes one
     key to the total row's `billable_units_by_unit` object ({unit: units}).
     The fold runs AFTER the whole pass (subrows and totals interleave in the
-    SQL ordering) and the folded list is re-sorted by cost, the display
-    order the query used to deliver.
+    SQL ordering) and the folded list is re-sorted, so the API's own order is
+    the one both consoles default to.
+
+    ORDER BY BILLED COST (2026-11-23): the rollups are chargeback views and the
+    consoles now DEFAULT to the billed-cost column, so the server's order must
+    agree with them — sorting by gross cost_usd made by-model and by-key
+    disagree about who the top spender is on any discounted (off-peak) traffic,
+    and a client that trusts the server order inherited the wrong ranking.
+    cost_usd is the tie-break: on an undiscounted deployment the two columns
+    are equal and the previous, stable order is preserved.
     """
     folded: list[dict[str, Any]] = []
     by_unit: dict[tuple[Any, ...], dict[str, float]] = {}
@@ -5034,7 +5033,10 @@ def _fold_unit_rows(rows: list[Any], group_cols: tuple[str, ...]) -> list[dict[s
             by_unit.setdefault(key, {})[str(unit_kind)] = float(unit_units or 0.0)
     for d in folded:
         d["billable_units_by_unit"] = by_unit.get(tuple(d.get(c) for c in group_cols), {})
-    folded.sort(key=lambda d: d.get("cost_usd") or 0.0, reverse=True)
+    folded.sort(
+        key=lambda d: (d.get("billed_cost_usd") or 0.0, d.get("cost_usd") or 0.0),
+        reverse=True,
+    )
     return folded
 
 
@@ -5223,7 +5225,10 @@ async def usage_summary(_: AdminDep, since: str | None = None, until: str | None
         LEFT JOIN users u ON u.id = k.user_id
         {_cond_l}
         GROUP BY k.name, u.name, l.model
-        ORDER BY cost_usd DESC
+        -- Billed cost first: the drill-down opens inside a parent row that is
+        -- ordered by it (2026-11-23), so a child list in gross-cost order read
+        -- as a different ranking than its own header.
+        ORDER BY billed_cost_usd DESC, cost_usd DESC
         """,
         *_win,
     )

@@ -596,6 +596,118 @@ can cause in a comment beside it.
   renders an EMPTY env value silently, which is the phantom-knob class
   `tests/test_values_layout.py` exists to catch.
 
+## Approval gate and calibrated judge (2026-11-23)
+
+Two setting families that existed only in code reach the chart in this wave: the
+destructive-tool **approval gate** (B8) and the **calibrated behaviour judge**
+(B1). Each is a `settings.*` value rendering one `PCAI_LLM_*` env var, each is
+reversible from the values document with no rebuild, and each sits INERT in the
+tracked chart — a tracked default must not change what a deployment DOES. The G2
+site moves exactly one of them off that posture: the approval gate starts its
+observe clock in `warn`, and the judge stays off.
+
+- **Destructive-tool approval gate** (`settings.mcp.toolApproval.*` →
+  `PCAI_LLM_TOOL_APPROVAL_*`): `mode` (chart default **off**, G2 **warn**),
+  `required` (default the destructive set
+  `applygate.*apply*,workbench.run,k8s.exec_in_pod`), `tokenTtlS` (default
+  **900**) and `tokenMaxUses` (default **1**) as the ceilings a token may not
+  exceed. The hole it closes: `InputRequiredResult` still has zero construction
+  sites, so `applygate plan_apply`, `workbench run` and `k8s exec_in_pod` execute
+  on a static grant — the ACL answers "may this key call this tool", never
+  "should THIS call happen". Approval is **out-of-band, not an interruption**:
+  the gateway never parks a turn on a human (a relay turn has a wall clock and a
+  client that may be a headless agent, so blocking loses the work). An operator
+  issues a pre-authorization token for one `(server, tool)` and one arguments
+  fingerprint (canonical-JSON sha256), with a MANDATORY use count and expiry; a
+  NULL fingerprint (`--any-args`) is the weaker any-arguments shape and is
+  labelled as such wherever the token is shown. What each mode does to a call on
+  a `required` tool:
+  - `off` — inert and byte-identical to pre-B8: the gate returns before any
+    store access, so there is no round trip on the hot path.
+  - `warn` — the call is RECORDED (one indexed upsert into
+    `tool_approval_requests` on key/server/tool/fingerprint, `times_seen`
+    incremented) and then proceeds UNTOUCHED. `applygate`, `workbench run` and
+    `k8s exec_in_pod` run exactly as before; nothing is refused and no token is
+    needed. This is the observe phase, and its table is what says which tools
+    actually need a token and how often.
+  - `enforce` — the same three tools are REFUSED without a live matching token,
+    settled as a `denied` call with `detail=approval_required` and a chained
+    audit row. The refusal text names the recorded request id and the exact
+    command that grants it, because a refusal a model can only retry is a
+    refusal that burns the turn. A live token is CONSUMED (`uses_so_far` + 1)
+    and its id rides the call's audit detail as `approval:<token-id>`, so an
+    approval that is not in the hash chain did not happen. A fingerprint
+    mismatch NEVER matches: a token for `delete ns=test` does not authorize
+    `ns=prod`.
+  The gate sits after the ACL, argument-policy and tool-policy stages and BEFORE
+  credentials are built or an upstream session opens, on BOTH surfaces — the
+  relay (the path an agent actually uses) and `/mcp`. On a failover it is checked
+  per CANDIDATE: a token for one server must never authorize another, and a
+  refusal becomes the call's answer only when no candidate can serve.
+  **The fail-closed asymmetry with pinning is deliberate**: pinning fails OPEN on
+  a store fault (a pinning bug must not break a turn), approval fails CLOSED (a
+  broken approval gate must not let a destructive call through) — different
+  blast radius, different default. An unrecognised `mode` coerces to `off` (and
+  logs once), so a typo degrades to inert and never starts refusing destructive
+  calls fleet-wide.
+  **The grant command** is `scripts/tool_approval_admin.py`: `list` prints the
+  pending requests grouped by server/tool/arguments fingerprint plus the live
+  tokens; `grant --request <id> [--uses N] [--ttl 15m] [--reason TEXT]
+  [--any-args]` issues a token against a RECORDED request (a grant authorizes
+  what actually happened, not a guessed shape); `revoke <token-id>` kills one.
+  **`scripts/` is NOT in the gateway image**, so every one of these runs from a
+  checkout that can reach the database (set the DSN) — never by exec'ing into
+  the pod. Rollout is observe-then-enforce: read the request table, then flip
+  `mode` to `enforce` as a deliberate one-line change. Enforcing before that data
+  exists refuses the fleet's destructive calls until someone grants tokens,
+  which is an outage on the path the agents use.
+- **Calibrated behaviour judge** (`settings.tracing.judge.*` →
+  `PCAI_LLM_JUDGE_*`): `enabled` (default **false**), `model` (default **""** =
+  the gateway's default route), `dailyUsd` (default **0.0**),
+  `maxTurnsPerRun` (default **25**), `sampleRate` (default **0.1**) and
+  `minConfidence` (default **0.0**). This is the second half of the quality
+  layer: the deterministic scorer answers "did the tool calls work"; a judge
+  answers "was the answer RIGHT, and was the path defensible". **It is inert
+  until calibrated**, and `dailyUsd: 0.0` is the REAL switch — no spend is
+  permitted, and the sweep refuses to run at a zero daily budget, so the judge
+  stays inert even if `enabled` is true. Verdicts land in `judge_verdicts` and
+  GATE NOTHING — `shadow` is the rollout PHASE, not a stored column (the table
+  carries `prompt_version` and `contaminated`, not a kind): the sweep scores a
+  sample of turns and writes findings no release gate reads yet. Gating is
+  phase 3 and needs the calibration harness (design commit 3, not part of this
+  cut): at least 40 hand-labelled turns clearing 0.80 agreement per dimension.
+  A judge that is wrong produces a number that LOOKS like evidence, and a
+  release gate reading it would launder a bad change into a green build — which
+  is the whole reason the order is shadow → calibrated → gating.
+  **Its two rules are structural**: (1) a claim that cannot cite evidence is
+  DROPPED before storage — `evidence_refs` is never empty, and a citation must
+  resolve to a step or payload the judge was actually shown, so a fabricated
+  iteration is dropped too; (2) every stored row is stamped with
+  `prompt_version`, so the rubric behind a number is always recoverable — a
+  verdict whose rubric is unknown cannot be compared to a later one. `abstain`
+  is a first-class dimension (a guess is worse), and its RATE is a calibration
+  metric rather than a finding. `sampleRate` is sampled per REQUEST (the same
+  rule as trace payloads) so a judged turn is judged whole; `maxTurnsPerRun`
+  bounds one sweep run, because a 10% sample over a week beats 100% for two days
+  followed by silence when the budget runs out. `minConfidence` only decides what
+  counts toward a gate: a claim whose confidence the judge failed to state is
+  stored as 0.0 and can therefore never clear a positive floor. Two honest
+  limits: the judge reads `agent_trace_payloads`, so it has little to judge
+  unless `settings.tracing.tracePayload.sampling` is on (G2 0.1, chart default
+  off) — it can still abstain, which is the correct answer for an empty
+  evidence set; and it reads untrusted tool output, so payloads are screened for
+  injection first and a turn whose payload tripped HIGH severity is flagged
+  `contaminated` and excluded from calibration.
+- **Wiring and postures**: `settings.<section>.<key>` in the values document →
+  one `PCAI_LLM_*` env var on the gateway container
+  (`helm/templates/deployment.yaml`). Validate with `helm template
+  pcai-llm-gateway ./helm [-f <site values>]`: a missing `.Values` path renders
+  an EMPTY env value silently, which is the phantom-knob class
+  `tests/test_values_layout.py` exists to catch. The tracked chart renders the
+  gate at `off` and the judge disabled; `helm/local/values.g2.yaml` renders the
+  gate at `warn` and the judge disabled, and each posture carries its ROLLBACK
+  value and the failure it can cause in a comment beside the setting.
+
 ## Content guardrails
 
 Per-model content policy, ported from the hpe-llm-gateway design and
