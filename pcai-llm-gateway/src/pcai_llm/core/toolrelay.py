@@ -1571,6 +1571,7 @@ async def relay_stream(
     model: str,
     key_id: uuid.UUID | None = None,
     user_id: uuid.UUID | None = None,
+    key_name: str | None = None,  # exported as pcai.key on tool spans
     # the KEY's configured off-peak base (profile fraction ?? env default);
     # effective() applies the CURRENT demand state at each settle moment
     key_fraction: float = 1.0,
@@ -2019,6 +2020,11 @@ async def relay_stream(
             "duration_ms": elapsed,
             "tool.status": status,
         }
+        # Attribution: the chat span had it, tool spans did not.
+        if user_id:
+            attrs["user.id"] = str(user_id)
+        if key_name:
+            attrs["pcai.key"] = str(key_name)
         # Conversation grouping, same value the chat span carries. Langfuse
         # aggregates on the trace, but its docs ask for the attribute on every
         # span, and a tool span that starts its OWN trace (no sampled parent)
@@ -3174,14 +3180,18 @@ async def relay_stream(
                 # client was asked to run. NO tool_result: the client executes it
                 # AFTER this turn, so no result exists at trace time — inventing
                 # one (or a placeholder) would be the lie this table must not tell.
+                _handed = str(tc.get("function", {}).get("name", ""))
                 await _trace_step(
                     iteration,
                     "tool",
                     server="client",
-                    tool=str(tc.get("function", {}).get("name", "")),
+                    tool=_handed,
                     status="handed_back",
                     tool_args=tc.get("function", {}).get("arguments"),
                 )
+                # Span too: a handback was DB-only, so Langfuse showed the
+                # turn as "no tools". Duration 0 — the client owns the clock.
+                _emit_tool_span("client", _handed, None, "handed_back")
             handback_event: dict[str, Any] = {
                 "pcai": {
                     "event": "handback",
@@ -3919,6 +3929,9 @@ async def relay_stream(
                     status="handed_back",
                     tool_args=_tc.get("function", {}).get("arguments"),
                 )
+                # Same as the pure-client terminal: the whole batch is handed
+                # back, so all of it needs a span.
+                _emit_tool_span("client", str(final_name), None, "handed_back")
             # NO content-delta echo of the executed MCP results on the
             # handback path: OpenAI-spec clients (DSH) render delta.content
             # VERBATIM into the visible answer, so "[tool result]
