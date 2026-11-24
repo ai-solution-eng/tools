@@ -23,10 +23,18 @@ be stored but carries outcome_source "unverified".
 
 READ HALF (2026-11-23): the same module also carries the PRE-TASK injection
 helpers - task-signature derivation, recall-response parsing, success-rate
-filtering and the compact preamble block. They keep the invariants above:
-STDLIB-ONLY and I/O-FREE, with the MCP recall call passed in as an injected
-callable, so the block builder is testable without a gateway, a DB or a
-network, and every failure path answers no-block (FAIL OPEN).
+filtering, staleness gating and the compact preamble block. They keep the
+invariants above: STDLIB-ONLY and I/O-FREE, with the MCP recall call passed in
+as an injected callable and the clock passed in as an epoch, so the block
+builder is testable without a gateway, a DB or a network, and every failure
+path answers no-block (FAIL OPEN).
+
+EVIDENCE + STALENESS (B6, 2026-11-23): the write half stamps an evidence
+reference (the request id / thread the procedure came from) into the memory
+metadata; the read half surfaces it on the parsed record and WITHHOLDS a
+procedure whose timestamp is older than the operator's staleness limit - the
+steps are not injected, but the block says [stale] and why, so an operator can
+see what was withheld instead of wondering why a known playbook never appears.
 """
 
 from __future__ import annotations
@@ -36,7 +44,9 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 # The prompt version the patched distiller stamps. The overlay bumps the
@@ -606,6 +616,39 @@ TRUNCATION_MARKER = "\n[playbooks truncated]"
 # The store clamps k to 25 and rejects 0; recall must never ask for more.
 RECALL_MAX_K = 25
 
+# --- evidence reference (B6, 2026-11-23) -----------------------------------
+# A written playbook carries an inferred outcome, counters and a thread, but
+# until now NO link back to the turn that produced it: a reader (and the future
+# judge) could not go from a stored procedure to the trace it was inferred
+# from. The write half (core.memory_write) stamps this reference into the
+# memory metadata; parse_recall_records surfaces it, so the ref round-trips
+# store -> recall -> parsed record.
+#
+# It is a TYPED single token because the two halves live in different places:
+#   request:<request_id>  -> agent_traces.request_id / agent_trace_payloads
+#   thread:<session_id>   -> the conversation (agent_traces.thread_id family)
+# "request:" is preferred because it names the exact turn; the thread is the
+# fallback for a writer that was never handed a request id. Empty when neither
+# exists (a store written by another path), never a guess.
+EVIDENCE_REF_REQUEST = "request:"
+EVIDENCE_REF_THREAD = "thread:"
+# Bound on either half: a caller-supplied session label is not ours to trust
+# with unbounded length, and the metadata value must stay a single line.
+EVIDENCE_REF_MAX_CHARS = 200
+
+# --- staleness (B6, 2026-11-23) --------------------------------------------
+# The timestamp fields consulted for staleness, in PREFERENCE order. These are
+# the fields the store actually echoes back (record_from_payload) and stamps
+# (metadata.memory_ts). created_at is deliberately NOT consulted: a creation
+# time is not evidence of validity. No usable timestamp -> FRESH (fail open),
+# because withholding a good procedure on a guess is the worse failure.
+STALE_TIMESTAMP_FIELDS: tuple[str, ...] = ("last_validated", "memory_ts")
+# A record older than the operator limit is WITHHELD (its steps are not
+# injected) but still REPORTED in the block as [stale], so an operator can see
+# what was withheld and why. At most this many withheld markers are rendered:
+# a store full of stale procedures must never fill the preamble with them.
+STALE_MARKER_MAX = 3
+
 # One injected recall call: (task_signature, k) -> the MCP tool result TEXT.
 RecallPlaybooks = Callable[[str, int], Awaitable[str]]
 
@@ -626,6 +669,37 @@ def derive_task_signature(task_text: str) -> str:
     if len(text) < SIGNATURE_MIN_CHARS:
         return ""
     return text[:SIGNATURE_MAX_CHARS].strip()
+
+
+def _one_line(value: Any, limit: int = 0) -> str:
+    """Any value as ONE whitespace-collapsed line ("" for None/bools/junk).
+
+    Metadata values arrive from a network store and from callers, so a stored
+    reference can carry a newline or a leading pad; both would corrupt the
+    rendered one-line-per-field shape. The limit truncates (0 = no bound).
+    """
+    if value is None or isinstance(value, bool):
+        return ""
+    text = " ".join(str(value).split())
+    return text[:limit] if limit > 0 else text
+
+
+def playbook_evidence_ref(session_id: str, request_id: str = "") -> str:
+    """The trace anchor for a playbook memory: "request:<id>" or "thread:<id>".
+
+    PURE, stdlib-only, never raises - core.memory_write calls it on the write
+    path and a memory write must never fail because a reference could not be
+    built. The request id wins because it names the exact turn that produced
+    the procedure; the session/thread is the documented fallback for a caller
+    that has no request id (the ref still points at the conversation). Both
+    halves are whitespace-collapsed and bounded, so the metadata value is a
+    single token of bounded length; neither yields "" (nothing to point at).
+    """
+    request = _one_line(request_id, EVIDENCE_REF_MAX_CHARS)
+    if request:
+        return EVIDENCE_REF_REQUEST + request
+    thread = _one_line(session_id, EVIDENCE_REF_MAX_CHARS)
+    return EVIDENCE_REF_THREAD + thread if thread else ""
 
 
 def playbook_success_rate(record: dict) -> float:
@@ -671,11 +745,65 @@ def _text_list(value: Any) -> list[str]:
     return out
 
 
+def _parse_timestamp(value: Any) -> float | None:
+    """Epoch seconds from an ISO-8601 string or a numeric epoch; None if unusable.
+
+    Mirrors the store's own parser (mm-rag playbook._parse_ts) so both sides
+    the same timestamp the same way: a naive value is UTC, and a value that
+    does not parse is UNUSABLE rather than "now" - junk must fall through to
+    the next field, then to the fail-open FRESH answer.
+    """
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _staleness(row: dict, stale_after_days: int, now: float) -> dict[str, Any]:
+    """The staleness fields for one record: {} when fresh or undated.
+
+    A record is STALE when the first USABLE timestamp among
+    STALE_TIMESTAMP_FIELDS is strictly older than stale_after_days (a limit
+    <= 0 disables the rule outright). No usable timestamp reads FRESH: an
+    undated record is not evidence of staleness, and withholding a good
+    procedure on a guess is the worse failure. A timestamp in the future is
+    fresh too - clock skew must not hide a procedure.
+    """
+    if stale_after_days <= 0:
+        return {}
+    for field_name in STALE_TIMESTAMP_FIELDS:
+        epoch = _parse_timestamp(row.get(field_name))
+        if epoch is None:
+            continue
+        age_seconds = now - epoch
+        if age_seconds <= stale_after_days * 86400:
+            return {}
+        return {
+            "stale": True,
+            "stale_field": field_name,
+            "stale_days": int(age_seconds // 86400),
+            "stale_after_days": stale_after_days,
+        }
+    return {}
+
+
 def parse_recall_records(
     raw: str,
     *,
     min_success_rate: float = 0.0,
     k: int = 3,
+    stale_after_days: int | None = None,
+    now: float | None = None,
 ) -> list[dict]:
     """Renderable playbook records from one recall_playbooks result text.
 
@@ -684,8 +812,19 @@ def parse_recall_records(
     task_signature AND at least one step - and its smoothed success rate
     clears min_success_rate. Duplicates are dropped by playbook_key (else by
     signature + steps), so one stored playbook can never be injected twice in
-    a turn. The store order is kept (it already ranks by evidence) and at
-    most k records survive. NEVER raises: malformed input reads as [].
+    a turn. The store order is kept (it already ranks by evidence).
+
+    STALENESS (B6, 2026-11-23): a record whose first usable timestamp
+    (STALE_TIMESTAMP_FIELDS) is older than stale_after_days carries
+    stale=True plus the reason, and render_playbook_block then WITHHOLDS its
+    steps and prints a bounded [stale] marker instead. stale_after_days None
+    or <= 0 disables the rule; an undated record is FRESH (fail open). The
+    clock is injectable as `now` (epoch seconds) so the rule is testable.
+
+    At most k INJECTABLE records survive, in store order; the withheld ones
+    follow them and are capped at STALE_MARKER_MAX, so a store full of stale
+    procedures can neither crowd out fresh ones nor fill the preamble.
+    NEVER raises: malformed input reads as [].
     """
     if not isinstance(raw, str) or not raw.strip() or k <= 0:
         return []
@@ -700,8 +839,16 @@ def parse_recall_records(
         rows = payload["records"]
     limit = max(1, min(int(k), RECALL_MAX_K))
     floor = float(min_success_rate or 0.0)
-    out: list[dict] = []
-    seen: set[str] = set()
+    try:
+        limit_days = 0 if stale_after_days is None else int(stale_after_days)
+    except (TypeError, ValueError):
+        limit_days = 0
+    current = time.time() if now is None else float(now)
+    stale_budget = min(limit, STALE_MARKER_MAX)
+    fresh: list[dict] = []
+    withheld: list[dict] = []
+    seen_fresh: set[str] = set()
+    seen_withheld: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -713,22 +860,32 @@ def parse_recall_records(
         if rate < floor:
             continue
         dedupe = str(row.get("playbook_key") or "") or signature.casefold() + " || " + " | ".join(steps)
-        if dedupe in seen:
-            continue
-        seen.add(dedupe)
-        out.append(
-            {
-                "task_signature": signature[:SIGNATURE_MAX_CHARS],
-                "steps": steps,
-                "failure_modes": _text_list(row.get("failure_modes")),
-                "success_count": _evidence_count(row.get("success_count")),
-                "fail_count": _evidence_count(row.get("fail_count")),
-                "score": rate,
-            }
-        )
-        if len(out) >= limit:
+        record = {
+            "task_signature": signature[:SIGNATURE_MAX_CHARS],
+            "steps": steps,
+            "failure_modes": _text_list(row.get("failure_modes")),
+            "success_count": _evidence_count(row.get("success_count")),
+            "fail_count": _evidence_count(row.get("fail_count")),
+            "score": rate,
+            "evidence_ref": _one_line(row.get("evidence_ref"), EVIDENCE_REF_MAX_CHARS),
+            "evidence_thread": _one_line(row.get("evidence_thread"), EVIDENCE_REF_MAX_CHARS),
+        }
+        staleness = _staleness(row, limit_days, current)
+        record["stale"] = bool(staleness)
+        record.update(staleness)
+        if staleness:
+            if dedupe in seen_withheld or len(withheld) >= stale_budget:
+                continue
+            seen_withheld.add(dedupe)
+            withheld.append(record)
+        else:
+            if dedupe in seen_fresh or len(fresh) >= limit:
+                continue
+            seen_fresh.add(dedupe)
+            fresh.append(record)
+        if len(fresh) >= limit and len(withheld) >= stale_budget:
             break
-    return out
+    return fresh + withheld
 
 
 def render_playbook_block(records: list[dict], *, max_chars: int = 2000) -> str:
@@ -759,6 +916,14 @@ def render_playbook_block(records: list[dict], *, max_chars: int = 2000) -> str:
         signature = " ".join(str(record.get("task_signature") or "").split())
         steps = _text_list(record.get("steps"))
         if not signature or not steps:
+            continue
+        if record.get("stale"):
+            # WITHHELD, not silently dropped (B6): the steps of a stale
+            # procedure are exactly what must not reach the preamble, but the
+            # block has to say that something was withheld and why, or an
+            # operator sees a known playbook simply never appear.
+            lines.append("- TASK: " + signature + _evidence_label(record) + _stale_label(record))
+            rendered += 1
             continue
         lines.append("- TASK: " + signature + _evidence_label(record))
         for index, step in enumerate(steps, 1):
@@ -791,6 +956,26 @@ def _evidence_label(record: dict) -> str:
     return " [" + str(success) + " ok / " + str(fail) + " failed]"
 
 
+def _stale_label(record: dict) -> str:
+    """The withheld marker on a stale record rendered line (B6).
+
+    The literal [stale] is what an operator greps for; the parenthetical
+    carries the reason (which timestamp, how old, the operator limit), the
+    fact that the steps were NOT injected, and - when the store echoed one -
+    the evidence reference, so the turn behind the withheld procedure can be
+    found instead of merely suspected.
+    """
+    field_name = _one_line(record.get("stale_field")) or STALE_TIMESTAMP_FIELDS[0]
+    days = _evidence_count(record.get("stale_days"))
+    limit = _evidence_count(record.get("stale_after_days"))
+    reason = field_name + " " + str(days) + "d old, limit " + str(limit) + "d"
+    tail = "steps withheld"
+    ref = _one_line(record.get("evidence_ref"))
+    if ref:
+        tail += "; evidence " + ref
+    return " [stale] (" + reason + "; " + tail + ")"
+
+
 def contains_playbook_block(messages: Any) -> bool:
     """True when a conversation message already carries a recalled block.
 
@@ -819,21 +1004,29 @@ async def recall_playbook_block(
     min_success_rate: float = 0.0,
     timeout_ms: int = 800,
     request_id: str = "",
+    stale_after_days: int | None = None,
 ) -> str:
     """The rendered pre-task block for one turn; "" on ANY failure (FAIL OPEN).
 
     Derives the task signature, asks the injected recall callable for the
-    top-k playbooks under the operator timeout, filters by success rate and
-    renders the compact block. Every failure mode - no recall client, a
-    signature too short, a timeout, a transport error, malformed JSON, an
-    empty store - answers "" after AT MOST ONE log line, so the turn proceeds
-    exactly as it would without the feature.
+    top-k playbooks under the operator timeout, filters by success rate,
+    withholds stale ones (see parse_recall_records) and renders the compact
+    block. Every failure mode - no recall client, a signature too short, a
+    timeout, a transport error, malformed JSON, an empty store - answers ""
+    after AT MOST ONE log line, so the turn proceeds exactly as it would
+    without the feature.
+
+    stale_after_days is the operator staleness limit (None or <= 0 = never
+    expire); it is a PARAMETER, not a settings read, because this module is
+    stdlib-only and importable without pcai_llm. The relay binds it from
+    settings.playbook_stale_after_days.
     """
     try:
         wanted = int(k)
         cap = int(max_chars)
         budget_ms = int(timeout_ms or 0)
         floor = float(min_success_rate or 0.0)
+        stale_days = 0 if stale_after_days is None else int(stale_after_days)
     except (TypeError, ValueError):
         return ""
     if recall is None or wanted <= 0 or cap <= 0:
@@ -862,5 +1055,5 @@ async def recall_playbook_block(
             request_id or "-",
         )
         return ""
-    records = parse_recall_records(raw, min_success_rate=floor, k=wanted)
+    records = parse_recall_records(raw, min_success_rate=floor, k=wanted, stale_after_days=stale_days)
     return render_playbook_block(records, max_chars=cap)

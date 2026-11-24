@@ -60,7 +60,8 @@ KNOBS: tuple[tuple[str, str, str, str, str], ...] = (
     ("PCAI_LLM_PLAYBOOK_INJECT_ENABLED", "settings.memory.playbookInject.enabled", "false", "true", "true"),
     ("PCAI_LLM_PLAYBOOK_INJECT_K", "settings.memory.playbookInject.k", "3", "3", "5"),
     ("PCAI_LLM_PLAYBOOK_INJECT_MAX_CHARS", "settings.memory.playbookInject.maxChars", "2000", "2000", "1500"),
-    ("PCAI_LLM_PLAYBOOK_INJECT_TIMEOUT_MS", "settings.memory.playbookInject.timeoutMs", "800", "800", "250"),
+    # chart default stays 800 (conservative); G2 raised to 3000 on 2026-11-23 after 800 timed out live.
+    ("PCAI_LLM_PLAYBOOK_INJECT_TIMEOUT_MS", "settings.memory.playbookInject.timeoutMs", "800", "3000", "250"),
     (
         "PCAI_LLM_PLAYBOOK_INJECT_MIN_SUCCESS_RATE",
         "settings.memory.playbookInject.minSuccessRate",
@@ -130,7 +131,7 @@ class TestChartWiring:
         """The G2 file is the site the wave pushes: its flips must reach the pod."""
         env = _env(_render("-f", str(G2_YAML)))
         for name, path, _default, g2, _probe in KNOBS:
-            assert env[name] == g2, f"{name} ({path}) rendered {env[name]!r}, expected {g2!r}"
+            assert env[name] == g2, f"{name} ({path}) rendered {env[name]!r}, expected {g2!r}"  # g2 posture
 
     @pytest.mark.parametrize(("name", "path", "_default", "_g2", "probe"), KNOBS)
     def test_every_values_path_is_wired(self, name: str, path: str, _default: str, _g2: str, probe: str) -> None:
@@ -217,7 +218,7 @@ class TestG2ValuesAreAggressive:
             "enabled": True,
             "k": 3,
             "maxChars": 2000,
-            "timeoutMs": 800,
+            "timeoutMs": 3000,  # raised 800 -> 3000 on 2026-11-23: 800 timed out in production
             "minSuccessRate": 0.0,
         }
         assert settings["tracing"]["tracePayload"]["sampling"] == pytest.approx(0.1)
@@ -261,8 +262,12 @@ class TestDocs:
 
     def test_states_the_two_limits_without_overclaiming(self) -> None:
         section = self._section()
-        assert "in-memory" in section, "the docs must say pins are in-memory (a restart re-approves)"
-        assert "/mcp` surface is not screened yet" in section, "the docs must not claim /mcp screening coverage"
+        # 2026-11-23 wave 2: pins are PERSISTENT and /mcp IS screened. This assertion used to
+        # pin the OPPOSITE (in-memory, relay-only) — it locked in a claim the same release made
+        # false. Keep it pointed at the current truth so the next change must update it.
+        assert "PERSISTENT" in section, "the docs must say pins survive a restart (B2)"
+        assert "not screened yet" not in section, "the docs must not claim /mcp is unscreened (B3 screened it)"
+        assert "in-memory" in section, "the docs must still describe the degraded-mode fallback"
         assert "best-effort" in section, "redaction must be described as best-effort"
         assert "not a guarantee" in section.lower(), "redaction must not be claimed as a guarantee"
 

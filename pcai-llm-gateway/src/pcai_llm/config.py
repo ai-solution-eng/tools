@@ -448,6 +448,14 @@ class Settings(BaseSettings):
     # parity with the distiller's own memory tool names: a fleet that renames the
     # store-side tool must not need a code change to keep injection working.
     playbook_inject_recall_tool: str = "recall_playbooks"
+    # A procedure older than this many days is NOT injected (0 = never expire).
+    # Playbooks are the one memory kind the store PROTECTS from decay, so they are
+    # also the record most likely to be stale: a procedure that worked in August may
+    # describe a world that no longer exists, and injection makes it authoritative by
+    # placing it in the system preamble. 90 days is a floor on trust, not a rotation
+    # schedule. The block says [stale] rather than hiding the record, so an operator
+    # can see what is being withheld and why.
+    playbook_stale_after_days: int = 90
 
     # --- agent trace payloads (2026-11-23) --------------------------------
     # agent_traces records WHAT the agent did and WHAT IT COST, never WHAT IT
@@ -496,6 +504,14 @@ class Settings(BaseSettings):
     # signal is the one that says "it kept trying after being told no" — the whole
     # point of watching an autonomous agent. It is not folded into tool_error.
     agent_eval_loop_threshold: int = 3
+
+    # --- query-granular tool search (2026-11-23) --------------------------
+    # pcai_tools grew a `search` action: BM25 over the in-memory catalogue, so
+    # "the tool that deletes a dataset" costs a handful of candidates instead of
+    # a whole server's catalogue. Purely local ranking — no new dependency, no
+    # network, no change to list/describe. 0 disables the action (it answers with
+    # an explicit error rather than silently returning nothing).
+    tool_search_max_results: int = 10
 
     # --- reasoning continuity (2026-10-26) -------------------------------
     # Whether the model is shown its OWN prior reasoning: in-loop (the

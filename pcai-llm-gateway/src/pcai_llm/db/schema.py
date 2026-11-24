@@ -1612,6 +1612,52 @@ CREATE INDEX IF NOT EXISTS idx_tool_jobs_active ON tool_jobs(key_id, created_at 
 -- The reaper's scan. Separate index because expiry is a GLOBAL sweep, not a
 -- per-key read: one busy key must not be able to starve the sweep.
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_expiry ON tool_jobs(expires_at);
+
+-- ============================================================================
+-- Tool-definition pins (2026-11-23, recommendation B2): a tripwire with a
+-- one-restart memory is not a control.
+--
+-- core/tool_pin.py fingerprints every tool definition the gateway OFFERS and
+-- compares later listings against the digest it approved (FIRST_SEEN / MATCH /
+-- CHANGED / VANISHED; "block" mode withholds a CHANGED tool and refuses to
+-- dispatch it). That store was PROCESS MEMORY, so a restart re-approved
+-- whatever the MCP server happened to be serving at that moment: an attacker
+-- who rewrites a definition only has to wait for (or provoke) a deploy. This
+-- table is the approval made durable — the store loads it BEFORE it computes
+-- its first verdict, so a rewritten definition observed after a restart is
+-- CHANGED, not a fresh FIRST_SEEN.
+--
+-- One row per (server, tool), GLOBAL by design: the pin is a property of the
+-- DEFINITION the fleet serves, not of one key's grant (the ACL is the per-key
+-- half). first_seen is the TTL's origin — an approval is an approval — and
+-- last_seen is observation history, so an operator can tell a definition still
+-- being served from one that vanished.
+--
+-- Writes are BEST-EFFORT off the relay path (a DB fault degrades to in-memory
+-- pinning and never fails a turn) and BOUNDED: one upsert per first
+-- observation, and at most one last_seen refresh per key per
+-- core.tool_pin.TOUCH_INTERVAL_S, so the per-tool hot path pays no round trip.
+CREATE TABLE IF NOT EXISTS tool_pins (
+    server      TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,                          -- 16 hex chars (core.tool_pin.DIGEST_CHARS)
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),     -- the TTL is measured from HERE
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (server, tool)
+);
+-- Shape guard, NOT VALID for the ck_traces_status reason above: a VALID add
+-- would scan (and could abort the whole implicit schema transaction on) a row
+-- written by an older build or by hand SQL. An empty name or a non-digest
+-- fingerprint would make the verdict comparison meaningless, so it is worth
+-- stating — but a bad legacy row must stay visible, not take the boot down.
+ALTER TABLE tool_pins DROP CONSTRAINT IF EXISTS ck_tool_pins_shape;
+ALTER TABLE tool_pins ADD CONSTRAINT ck_tool_pins_shape
+    CHECK (server <> '' AND tool <> '' AND fingerprint ~ '^[0-9a-f]{16}$') NOT VALID;
+-- NO second index on purpose. The only reads are the once-per-process load
+-- (SELECT over the whole table, whose size is the fleet's TOOL COUNT — tens of
+-- rows, so the cheapest plan is a scan of one page) and the per-key UPDATE,
+-- which the primary key already serves as a single-row lookup. An index here
+-- would be write cost with no reader.
 -- ============================================================================
 -- Agent quality layer (2026-11-23): trace PAYLOADS + deterministic VERDICTS.
 --

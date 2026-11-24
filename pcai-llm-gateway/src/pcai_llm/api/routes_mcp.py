@@ -43,21 +43,48 @@ the same gate chain in ``_gated_mcp_call`` — validation → RPM rate limit →
 registry lookup → per-key ACL (default-deny) → ARGUMENT/GRANT POLICY STAGE
 (mcpf.arg_policy.gate_call: admin-tool refusal → argument destination policy →
 payload telemetry → read+egress separation, hardening P0-1) → server
-tool-policy → proxied call → ledger settle. The SAME stage runs on the relay
-path (routes_proxy._relay_executor), which is where a model's own tool calls
-execute. The flat surface re-exposes upstream tools by NAME
+tool-policy → TOOL-PIN DISPATCH GATE (recommendation B3: in ``block`` mode a
+tool whose definition changed or vanished since it was pinned is refused here
+— after the ACL and before the upstream session opens, the same position the
+relay's own gate uses) → proxied call → ledger settle; the result is then
+SCREENED for injected instructions (B3: core.tool_injection, gated by
+``settings.tool_injection_screen``) before it is handed back. The SAME stage
+runs on the relay path (routes_proxy._relay_executor), which is where a
+model's own tool calls execute. The flat surface re-exposes upstream tools by NAME
 only; it does not create a second enforcement path. ``_mcp_call`` is now a
 thin wrapper over that chain (failover disabled — an explicit target never
 silently moves), while flattened calls additionally FAILOVER on
 transport-level failure to the next priority-ordered enabled server that (a)
 exposes the same tool per the cached listing, (b) the key holds an explicit
 grant on, (c) passes tool policy — bounded by ``PCAI_LLM_MCP_FAILOVER_
-ATTEMPTS`` retries after the primary. THIS ASYMMETRY IS DELIBERATE:
+ATTEMPTS`` retries after the primary. A DISPATCH-PIN REFUSAL on one
+candidate is a per-candidate skip like a transport fault (wave 3, R1): a
+granted, approved later candidate still serves the call, and the pin reason
+becomes the call's answer only when no candidate can serve. THIS ASYMMETRY IS
+DELIBERATE:
 ``mcp_call(server, tool)`` names its target, so moving it would silently
 change what the caller addressed; a flattened call names only a tool, and
 the fleet priority order is the documented tiebreak. Kill switch: setting
 ``PCAI_LLM_MCP_FLAT_TOOLS=0`` reverts tools/list to exactly the two gateway
 tools and unknown-tools flattened calls — the pre-flat surface, bit-for-bit.
+
+Tool-trust controls (recommendation B3, 2026-11-23): the relay has carried
+tool-DEFINITION pinning (core.tool_pin) and tool-RESULT screening
+(core.tool_injection) since 2026-11-10, but this surface — one OTLP window put it at
+relay's tool-call traffic — was neither pinned nor screened, so the controls
+covered the minority path. Both now run here, reusing those modules and the
+relay's process-wide pin store (one approval per server definition, whichever
+surface observed it; no second implementation exists to drift): tools/list and
+mcp_catalog observe every offered definition's fingerprint (the OFFER half —
+``block`` drops a rewritten tool from the surface), ``_gated_mcp_call``
+re-checks the definition at dispatch (the DISPATCH half — ``block`` refuses a
+rewritten or vanished tool, AND a pinned tool whose current definition cannot
+be verified because no listing is cached: the cold window fails CLOSED for a
+pinned tool, wave 3 R2) and screens every result payload before it returns.
+Defaults are unchanged and byte-identical: ``warn`` logs and passes through,
+``off`` is inert. See the "Tool-trust controls on /mcp" section below for the
+latency argument (no I/O, no DB, no extra upstream call) and for the cold-cache
+rule that qualifies it.
 
 Listing cache: raw per-server upstream listings are cached per server for
 ``PCAI_LLM_MCP_CATALOG_CACHE_S`` seconds (key-independent payload; ACL
@@ -116,7 +143,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import settings
 from ..core import metrics as _metrics
-from ..core import registry, secretbox, tracing
+from ..core import registry, secretbox, tool_injection, tool_pin, toolrelay, tracing
 from ..core.budgets import check_rate_limit, settle
 from ..core.identity import (
     KIND_KEY_BOUND,
@@ -128,7 +155,7 @@ from ..core.identity import (
     subject_for_key,
 )
 from ..core.keys import KeyRecord, authenticate
-from ..core.toolrelay import UNKNOWN_SERVER_LABEL
+from ..core.toolrelay import UNKNOWN_SERVER_LABEL, pin_catalog_with_verdicts, pin_dispatch_refusal
 from ..db import db
 from ..mcpf import arg_policy
 from ..mcpf.federation import is_allowed, load_grants, server_allows
@@ -770,6 +797,313 @@ async def _cached_upstream_tools(server: dict[str, Any]) -> list[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# Tool-trust controls on /mcp: definition pinning + result screening (B3)
+# ---------------------------------------------------------------------------
+# WHY HERE (recommendation B3, 2026-11-23): core.tool_pin and
+# core.tool_injection were wired into the RELAY only. This module is the
+# federated /mcp front door and — by this file's own measurement (see
+# _GatewayMCPServer.call_tool) — 488 tools/call requests against 56 relay-side
+# MODEL calls in the same window (~8.7x); the relay's own tool-CALL count in that
+# window was never measured separately, so this is an observation, not a ratio:
+# the controls that existed covered the MINORITY path. Both halves are now
+# observed here as well, and both REUSE the relay's implementation: the pin
+# store is toolrelay._PIN_STORE (one approval per server definition, no matter
+# which surface recorded it) and the policy lives in tool_pin / tool_injection.
+# There is deliberately no second pinning or screening implementation to
+# drift from the relay's.
+#
+# THE SPLIT is the relay's, exactly:
+#   * DEFINITIONS (tools/list, mcp_catalog) -> PINNING. A grant approves a
+#     NAME; pinning remembers the DEFINITION that name resolved to. Offer
+#     half: a rewritten tool is dropped from the offered surface in "block"
+#     mode. Dispatch half: the definition is re-checked when the call
+#     ARRIVES, because a model can name a tool it saw in an earlier turn
+#     without ever consulting the offer.
+#   * RESULTS (tools/call) -> INJECTION SCREENING. A tool result is
+#     attacker-controlled text that re-enters the model's context; the
+#     gateway is the last place that sees it first.
+#
+# LATENCY (the /mcp path is the main path) — what this actually costs:
+#   * NO extra upstream call, and NO blocking I/O in the request path. The offer
+#     half hashes definitions ALREADY in hand from the TTL-cached listing; the
+#     dispatch half hashes ONE definition read with _peek_cached_tools — a dict
+#     lookup that never triggers a fetch.
+#   * BUT that peek can come back EMPTY (pod start, HPA scale-up, or a registry
+#     edit that cleared the cache), and an empty peek is NOT a licence to
+#     dispatch blind: a PINNED tool is REFUSED in "block" mode while its current
+#     definition is unverifiable (see _pin_gate_refusal). The cold window fails
+#     CLOSED for a pinned tool and open only for a tool that was NEVER pinned —
+#     which is what keeps a first run working. So the dispatch half verifies
+#     every block-mode dispatch it CAN and refuses the ones it cannot; it never
+#     silently blesses a pinned definition it could not read. (Corrected
+#     2026-11-23, wave 3: this comment used to imply every dispatch was
+#     verified, while the cold-cache path actually dispatched unverified.)
+#   * BUT it DOES touch Postgres, in any non-off mode: the pin store is
+#     persistent (2026-11-23, B2), so every FIRST_SEEN enqueues one upsert and
+#     every MATCH older than TOUCH_INTERVAL_S (300s) enqueues one last_seen
+#     UPDATE, fire-and-forget on the caller's loop (tool_pin._DbPinBackend).
+#     Corrected 2026-11-23 after cross-review: an earlier version of this
+#     comment claimed the path "never issues a query", which was false in the
+#     DEFAULT warn configuration and misinformed the reader about exactly the
+#     cost this paragraph exists to bound.
+#   * Off mode is genuinely inert (no observe() call at all).
+# The store still needs no memoisation tier of its own: the listing cache IS the
+# per-generation memo (cleared on every registry edit via listing_cache_clear),
+# so the write is once per key per generation, not once per request.
+
+
+def _pin_entry(server: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """One raw listing entry in the shape core.tool_pin.fingerprint pins.
+
+    tool_pin.fingerprint() hashes (name, description, inputSchema,
+    annotations) — the four fields a reviewer approves, and the four a
+    rug-pull can rewrite while keeping the NAME the ACL admitted. The raw
+    listing entry (_fetch_tools) carries exactly those under "tool",
+    "description", "inputSchema" and "annotations", so this is a rename, not
+    a transformation: the digest computed on /mcp is the digest the relay
+    computes for the SAME upstream definition. An absent schema/annotations
+    normalises to {} inside the fingerprint, so a server that omits an empty
+    object and one that sends it explicitly pin the same definition.
+    """
+    return {
+        "server": server,
+        "tool": entry.get("tool"),
+        "description": entry.get("description"),
+        "inputSchema": entry.get("inputSchema"),
+        "annotations": entry.get("annotations"),
+    }
+
+
+def _pin_offered(catalog: list[dict[str, Any]], grants: set[tuple[str, str]] | None = None) -> set[tuple[str, str]]:
+    """OFFER half of the definition pin: which (server, tool) may be offered.
+
+    Thin adapter over the relay's pin_catalog_with_verdicts — the SAME
+    function, mode resolution, store and log contract the relay uses, so the
+    two surfaces cannot disagree about what a pin means. It observes the
+    fingerprint of every definition in `catalog` and returns the keys that
+    survive:
+
+      * "off"  -> every key (the call returns before touching the store).
+      * "warn" -> every key; a CHANGED definition is logged, never dropped.
+      * "block" -> a CHANGED definition is ABSENT from the result, i.e. the
+        tool is not offered at all (the relay's treatment of its catalog).
+        The APPROVED fingerprint stays on record, so a rewrite cannot
+        re-approve itself on the next listing.
+
+    grants (the caller's grant set) enables the relay's vanished pass: a
+    tool this key is granted, that was pinned, and that the listing no longer
+    carries is reported exactly as the relay reports it.
+
+    FAILS OPEN, deliberately: the relay function already returns the catalog
+    unchanged on any internal fault, and the extra guard here means even an
+    unforeseen raise cannot empty a tenant's tool surface — a defence that
+    can break discovery is a liability, not a control.
+    """
+    keys = {(str(e.get("server") or ""), str(e.get("tool") or "")) for e in catalog}
+    if not catalog:
+        return keys
+    try:
+        kept, _verdicts = pin_catalog_with_verdicts(catalog, grants)
+    except Exception:
+        log.exception("mcp: tool pin (offer) failed — offering the catalog unchanged")
+        return keys
+    return {(str(e.get("server") or ""), str(e.get("tool") or "")) for e in kept}
+
+
+def _live_pin_fingerprint(server: str, tool: str) -> str:
+    """The LIVE approved fingerprint for one tool, or "" (never pinned/expired).
+
+    Reads the relay's process-wide store directly: there is no public "is this
+    pinned?" query, and the relay's own pin_dispatch_refusal does the same store
+    lookup for its vanished-tool fallback (toolrelay.py). ``ttl_s`` is refreshed
+    the way pin_catalog_with_verdicts refreshes it, so an EXPIRED pin reads as
+    never pinned here too — dispatch, exactly like a first run — instead of a
+    refusal.
+    """
+    store = toolrelay._PIN_STORE
+    store.ttl_s = float(getattr(settings, "tool_pin_ttl_s", 0.0) or 0.0)
+    return store.pinned(server, tool)
+
+
+def _unverified_pin_reason(tool: str, approved: str) -> str:
+    """WHY a pinned tool cannot be verified right now, in one clause.
+
+    ONE text, shared by the block-mode refusal and the warn-mode warning, so the
+    two modes can never describe the same cold window differently.
+    """
+    return (
+        f"the tool is pinned (approved fingerprint {approved or 'unknown'}) but this gateway has"
+        " no cached listing for its server to verify the current definition against — block mode"
+        " cannot prove the approved definition is still the one on offer"
+    )
+
+
+def _unverified_pin_refusal(server: str, tool: str, approved: str) -> str:
+    """The refusal text for a PINNED tool whose definition cannot be verified.
+
+    Cold-cache fail-closed (wave 3, R2): an ordinary tool error in the same
+    shape as tool_pin.dispatch_refusal — it names the tool and the approved
+    fingerprint, says the call was NOT executed, and names the way out (cache
+    one listing, or re-approve), so a model does not simply retry the call.
+    """
+    return (
+        f"error: the gateway refused to run {server}__{tool}:"
+        f" {_unverified_pin_reason(tool, approved)}. The call was NOT executed. It dispatches"
+        " again once a tools/list has cached that server's current definitions, or after an"
+        " operator re-approves the tool."
+    )
+
+
+def _pin_gate_refusal(server: dict[str, Any], tool: str) -> str | None:
+    """DISPATCH half: the refusal text for ONE call about to be proxied, or None.
+
+    WHERE: _gated_mcp_call, AFTER the per-call ACL admits the call (an
+    ungranted tool is an ACL denial, never a pin report) and BEFORE the
+    upstream session opens — the last point at which the gateway can still
+    say no, which is exactly where the relay puts its own gate.
+
+    WHY: dropping a changed tool from the OFFERED surface is not a gate. A
+    model that names the tool from conversation history (a replayed
+    tool_calls turn, a definition it read before the rewrite) never consults
+    the offer, so block mode alone was a speed bump. The definition to compare
+    against is the one the LAST listing carried, which is the cached listing
+    _peek_cached_tools returns (stale-on-purpose: no fetch on the call path).
+
+    The comparison itself is the relay's: the current definition is observed
+    through pin_catalog_with_verdicts (one hash), then pin_dispatch_refusal
+    applies the mode and the store fallback — so a tool that VANISHED from the
+    listing is refused on the same path as one that changed, and "warn"/"off"
+    never refuse a definition they CAN verify (the offer half already logged
+    the change).
+
+    NO CACHED LISTING (wave 3, R2 — the cold window: the first call after every
+    pod start / scale-up, and after a registry edit) — TWO cases, deliberately
+    NOT conflated, because "unknown" is not one thing:
+      * the tool was NEVER pinned: DISPATCH. A first run must work — the relay
+        applies exactly this rule ("a tool that was NEVER pinned still
+        dispatches: the defence must not break a first run").
+      * the tool IS pinned but there is no cached listing to verify it
+        against: "block" mode REFUSES, naming that reason. We KNOW the operator
+        approved a definition; we cannot PROVE the current one still matches
+        it, and block means block — the cold window is exactly the window
+        durable pinning exists to close. "warn" mode dispatches and logs the
+        same reason at WARNING. The tool becomes callable again as soon as one
+        listing caches its server's definitions (the normal comparison then
+        decides), or after an operator re-approves it.
+    An earlier version of this gate failed OPEN in BOTH cases, which made every
+    pod start an unverified-dispatch window for a tool the store already held an
+    approval for. That claim is retired: the cold-cache path is fail-closed for
+    a pinned tool in block mode, and only the never-pinned case stays open.
+
+    NEVER raises: any fault returns None (dispatch normally).
+    """
+    try:
+        mode = tool_pin.resolve_mode(getattr(settings, "tool_pin_mode", tool_pin.DEFAULT_MODE))
+        if mode == tool_pin.MODE_OFF:
+            return None
+        name = str(server.get("name") or "")
+        listing = _peek_cached_tools(server)
+        if listing is None:
+            approved = _live_pin_fingerprint(name, tool)
+            if not approved:
+                # NEVER pinned: a first run must work (the relay's own rule).
+                return None
+            reason = _unverified_pin_reason(tool, approved)
+            if mode == tool_pin.MODE_BLOCK:
+                log.error("mcp: REFUSED dispatch of %r/%r — %s", name, tool, reason)
+                return _unverified_pin_refusal(name, tool, approved)
+            log.warning("mcp: dispatching %r/%r UNVERIFIED (warn mode) — %s", name, tool, reason)
+            return None
+        if mode != tool_pin.MODE_BLOCK:
+            return None
+        current = [_pin_entry(name, entry) for entry in listing if str(entry.get("tool") or "") == tool]
+        _kept, verdicts = pin_catalog_with_verdicts(current)
+        return pin_dispatch_refusal(name, tool, verdicts)
+    except Exception:
+        log.exception("mcp: tool-pin dispatch check failed (%s/%s) — dispatching", server.get("name"), tool)
+        return None
+
+
+def _screen_mcp_text(text: str, *, server: str, tool: str, mode: str) -> str:
+    """Screen ONE model-visible text under an already-resolved mode.
+
+    The POLICY is core.tool_injection's (scan/render): this call site owns only
+    the logging, exactly as the relay's _screen_tool_text does — a hit is
+    worth an operator-visible line in every mode except "off", and the level
+    says what happened to the content.
+
+    NEVER raises and never drops the call: a screening fault returns the text
+    untouched, because a defence that can break a turn is a liability.
+    """
+    if not text:
+        return text
+    try:
+        result = tool_injection.scan(text)
+        if result.severity == tool_injection.SEVERITY_NONE:
+            return text
+        reasons = "; ".join(result.reasons)
+        if mode == tool_injection.MODE_BLOCK:
+            log.error("mcp: tool-result injection screen WITHHELD %s/%s (%s)", server, tool, reasons)
+        elif mode == tool_injection.MODE_ANNOTATE:
+            log.info("mcp: tool-result injection screen annotated %s/%s (%s)", server, tool, reasons)
+        else:
+            log.warning(
+                "mcp: tool-result injection screen hit on %s/%s (%s) — passing through (warn)",
+                server,
+                tool,
+                reasons,
+            )
+        return tool_injection.render(text, result, server=server, tool=tool, mode=mode)
+    except Exception:
+        log.exception("mcp: tool-result injection screen failed (%s/%s) — passing the result through", server, tool)
+        return text
+
+
+def _screen_mcp_result(payload: dict[str, Any], *, server: str, tool: str) -> dict[str, Any]:
+    """Screen every model-visible TEXT field of ONE /mcp result payload.
+
+    WHERE: _gated_mcp_call builds the payload the caller receives — the single
+    point at which a proxied tool result leaves the gateway on this surface,
+    for flattened names AND the mcp_call compat tool alike.
+
+    WHY PER FIELD, NOT THE WHOLE BODY: the relay's results are plain text, so
+    its screen can render the entire result. Here the model-facing text is a
+    JSON envelope that clients parse, so the screen is applied to the FIELDS
+    that carry upstream content — each text block's text (and, for an
+    embedded resource block, its resource text), plus the "error" string of an
+    upstream tool-error result. The envelope therefore stays valid JSON in
+    every mode, and the block text is the UNESCAPED form, which is the
+    strongest form to match against (a real newline stays a real newline).
+
+    MODES (settings.tool_injection_screen, core.tool_injection): "off" inert;
+    "warn" logs the findings and passes the text through; "annotate" prepends
+    the gateway provenance header and keeps the content; "block" substitutes
+    the refusal text for the content (the call itself still succeeds, so the
+    envelope keeps ok=true and a valid, non-empty body).
+
+    MUTATES payload in place and returns it: in warn/off every assignment is a
+    no-op, so the serialized result is byte-for-byte the pre-B3 one.
+    """
+    mode = tool_injection.resolve_mode(getattr(settings, "tool_injection_screen", tool_injection.DEFAULT_MODE))
+    if mode == tool_injection.MODE_OFF:
+        return payload
+    error = payload.get("error")
+    if isinstance(error, str) and error:
+        payload["error"] = _screen_mcp_text(error, server=server, tool=tool, mode=mode)
+    for block in payload.get("content") or ():
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if block.get("type") == "text" and isinstance(text, str):
+            block["text"] = _screen_mcp_text(text, server=server, tool=tool, mode=mode)
+            continue
+        resource = block.get("resource")
+        if isinstance(resource, dict) and isinstance(resource.get("text"), str):
+            resource["text"] = _screen_mcp_text(resource["text"], server=server, tool=tool, mode=mode)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Flat per-tool naming: sanitize + resolve (design doc §2/§4)
 # ---------------------------------------------------------------------------
 
@@ -1001,6 +1335,24 @@ async def _mcp_catalog(server: str | None = None) -> str:
         # duplicated half of the payload.
         granted_tools_here = [tool for tool in tools if tool["tool"] in granted_tools]
         out_servers.append({"server": srv["name"], "url": srv["url"], "tools": granted_tools_here})
+    # OFFER half of the definition pin (B3): the catalog is the /mcp discovery
+    # surface for callers that list by explicit server name, so it observes the
+    # same definitions the flat tools/list does — and from the RAW listing
+    # entries (full description/inputSchema/annotations), NOT from the
+    # 120-char summary this payload ships, because the pin must fingerprint
+    # what the upstream declared, not what this response abbreviates. In
+    # "block" mode a tool whose definition changed since it was pinned is
+    # dropped here exactly as it is dropped from the flat listing; "warn" and
+    # "off" keep every tool, so the payload below is byte-for-byte the pre-B3
+    # one.
+    pin_catalog = [
+        _pin_entry(sv["server"], t) for sv in out_servers if not sv.get("error") for t in sv.get("tools") or []
+    ]
+    allowed = _pin_offered(pin_catalog, grants)
+    for sv in out_servers:
+        if sv.get("error"):
+            continue
+        sv["tools"] = [t for t in sv.get("tools") or [] if (sv["server"], t["tool"]) in allowed]
     # Tenant-visible inventory is ACL-FILTERED: servers/URLs the key has no
     # grant on are dropped entirely (previously the full fleet inventory +
     # internal URLs leaked to any mcp-scoped key). A server with ZERO
@@ -1179,15 +1531,22 @@ async def _gated_mcp_call(
     Both surfaces funnel through here: the ``mcp_call`` gateway tool
     (failover=False — the caller NAMED the server, so it never silently
     moves) and flattened ``{server}__{tool}`` calls (failover=True — a
-    transport-dead primary hands off to the next priority-ordered eligible
-    server, see ``_failover_candidates``).
+    transport-dead or dispatch-pin-refused primary hands off to the next
+    priority-ordered eligible server, see ``_failover_candidates``).
 
     Chain, in order: explicit validation → RPM rate gate (once per request)
-    → registry lookup → per-key ACL (default-deny) → server tool-policy →
-    proxied call → ledger settle per attempt under its actual
-    ``mcp:<server>:<tool>`` endpoint. ALL refusals raise ToolError so the
-    SDK turns them into is_error CallToolResults (not HTTP errors —
-    streamable-http clients expect a JSON-RPC result for tools/call).
+    → registry lookup → per-key ACL (default-deny) → argument/grant policy →
+    server tool-policy → dispatch-time tool-pin gate → proxied call → ledger
+    settle per attempt under its actual ``mcp:<server>:<tool>`` endpoint. ALL
+    refusals raise ToolError so the SDK turns them into is_error
+    CallToolResults (not HTTP errors — streamable-http clients expect a
+    JSON-RPC result for tools/call).
+
+    PER-CANDIDATE failures do NOT raise: a transport fault, the candidate's
+    own arg-policy refusal and (wave 3, R1) a dispatch-pin refusal are each
+    recorded and the chain continues. When no candidate serves, a pin refusal
+    becomes the raised refusal (its reason must not be flattened into a
+    transport error); otherwise the pre-failover ok=false JSON is returned.
 
     Returns:
         JSON string {"ok": bool, "server", "tool", ...} — on upstream tool
@@ -1195,7 +1554,8 @@ async def _gated_mcp_call(
         (plus "attempts" when failover had more than one candidate).
 
     Raises:
-        ToolError on validation/gate refusal.
+        ToolError on validation/gate refusal (including a dispatch-pin
+        refusal when no candidate could serve an approved definition).
     """
     key = _current_key()
     started = time.monotonic()
@@ -1272,6 +1632,14 @@ async def _gated_mcp_call(
         candidates.extend(await _failover_candidates(servers, server, tool, grants))
 
     transport_errors: list[str] = []
+    # R1 (wave 3, 2026-11-23): a dispatch-pin refusal on ONE candidate is a
+    # PER-CANDIDATE skip, exactly like a transport fault or the candidate's own
+    # arg-policy refusal — it must not abort the chain, because a failover
+    # target is a different server with a different (possibly approved)
+    # definition and G2 runs block mode WITH failover enabled. The refusals are
+    # kept so that, when NO candidate can serve, the call is refused with the
+    # PIN reason instead of a generic transport error.
+    pin_refusals: list[str] = []
     for candidate in candidates:
         candidate_name = str(candidate["name"])
         # Each attempt settles under its ACTUAL endpoint — a failover hit is
@@ -1301,6 +1669,37 @@ async def _gated_mcp_call(
                 )
                 transport_errors.append(f"{candidate_name}: {candidate_decision.reason}")
                 continue
+        # --- dispatch-time tool-pin gate (B3, 2026-11-23) ------------------
+        # The ACL above admitted the NAME; the pin decides whether the
+        # DEFINITION is still the one the grant approved. Same position as
+        # the relay's gate (toolrelay.pin_dispatch_refusal: after the grant
+        # check, before the executor): block mode removed a rewritten tool
+        # from the OFFERED surface, but a call replayed from conversation
+        # history never consults the offer, so this is the last point at
+        # which the gateway can still refuse it. Run per CANDIDATE — a
+        # failover target is a different server with a different definition,
+        # so the primary's verdict does not transfer.
+        # A REFUSAL IS PER-CANDIDATE, NOT FATAL (wave 3, R1): a rug-pulled
+        # primary says nothing about a granted, approved secondary, and the
+        # chain exists to survive a bad candidate — so record the refusal,
+        # settle the denial against the candidate that was refused, and let the
+        # next candidate try. It becomes the call's answer only if NO candidate
+        # serves (after the loop). "warn"/"off" never refuse a definition they
+        # can verify, so the default path is unchanged.
+        pin_refusal = _pin_gate_refusal(candidate, tool)
+        if pin_refusal is not None:
+            await _settle_quiet(
+                key.id,
+                candidate_endpoint,
+                "denied",
+                started,
+                request_id,
+                arguments=arguments,
+                detail="tool_pin",
+                metric_server=candidate_name,
+            )
+            pin_refusals.append(pin_refusal)
+            continue
         call_headers = await resolve_mcp_headers(candidate, key_id=key.id)
 
         async def do(session: ClientSession) -> Any:
@@ -1337,27 +1736,50 @@ async def _gated_mcp_call(
                 arguments=arguments,
                 metric_server=candidate_name,
             )
+            # The result is SCREENED before it re-enters the model (B3):
+            # an upstream tool-error's text is as attacker-controlled as a
+            # success body, so the same screen applies to it.
             return json.dumps(
-                {
-                    "ok": False,
-                    "server": candidate_name,
-                    "tool": tool,
-                    "error": "; ".join(getattr(block, "text", str(block)) for block in result.content),
-                },
+                _screen_mcp_result(
+                    {
+                        "ok": False,
+                        "server": candidate_name,
+                        "tool": tool,
+                        "error": "; ".join(getattr(block, "text", str(block)) for block in result.content),
+                    },
+                    server=candidate_name,
+                    tool=tool,
+                ),
                 indent=2,
             )
         await _settle_quiet(
             key.id, candidate_endpoint, "ok", started, request_id, arguments=arguments, metric_server=candidate_name
         )
+        # The result is SCREENED before it re-enters the model (B3): the
+        # tool text is attacker-controlled content (a document, a web page, a
+        # log line) and this is the last place the gateway owns it.
         return json.dumps(
-            {
-                "ok": True,
-                "server": candidate_name,
-                "tool": tool,
-                "content": [block.model_dump(mode="json", exclude_none=True) for block in result.content],
-            },
+            _screen_mcp_result(
+                {
+                    "ok": True,
+                    "server": candidate_name,
+                    "tool": tool,
+                    "content": [block.model_dump(mode="json", exclude_none=True) for block in result.content],
+                },
+                server=candidate_name,
+                tool=tool,
+            ),
             indent=2,
         )
+
+    # No candidate served. A PIN refusal is a SECURITY decision, so it must not
+    # be flattened into the generic transport-error payload below: when the gate
+    # refused at least one candidate and nothing served, the pin reason is the
+    # call's answer (R1: "the final error must name the pin reason, not a
+    # generic transport error"). The single-candidate shape is unchanged — an
+    # explicit mcp_call() whose only target is refused still raises that refusal.
+    if pin_refusals:
+        raise ToolError(pin_refusals[0])
 
     # Every attempt transport-failed. Single-candidate shape is unchanged
     # from the pre-failover contract; multi-candidate adds "attempts".
@@ -1371,7 +1793,10 @@ async def _gated_mcp_call(
     }
     if len(candidates) > 1:
         payload["attempts"] = transport_errors
-    return json.dumps(payload, indent=2)
+    # Gateway-generated text only (exception TYPE names, arg-policy reasons),
+    # but it leaves by the same door as every other result, so it is screened
+    # on the same path: "off"/"warn" leave it byte-identical.
+    return json.dumps(_screen_mcp_result(payload, server=server, tool=tool), indent=2)
 
 
 async def _failover_candidates(
@@ -1381,7 +1806,8 @@ async def _failover_candidates(
     grants: set[tuple[str, str]],
 ) -> list[dict[str, Any]]:
     """Priority-ordered failover candidates for a FLATTENED call whose
-    primary transport failed. Eligibility — ALL three, so default-deny
+    primary failed (transport fault, or a dispatch-pin refusal — R1) or was
+    never tried. Eligibility — ALL three, so default-deny
     survives failover (no grant, no candidate):
     (a) the candidate's CACHED listing exposes the same tool name — cache
         peek only, never a fresh fetch: one dead server must not become a
@@ -1670,6 +2096,13 @@ class _GatewayMCPServer(MCPServer):
                 return await _cached_upstream_tools(srv)
 
         listings = await asyncio.gather(*(_bounded_fetch(sv) for sv in servers), return_exceptions=True)
+        # Collect the granted definitions first: the OFFER half of the
+        # definition pin (B3) needs the whole catalog of one listing before it
+        # can decide what may be offered, and the tools it keeps must be the
+        # ones _remember_sanitized maps (a dropped tool must not be resolvable
+        # by a flattened name).
+        catalog: list[dict[str, Any]] = []
+        offered: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for server, listing in zip(servers, listings):
             if isinstance(listing, BaseException):
                 # skip-with-error, same discipline as _mcp_catalog: a dead
@@ -1679,19 +2112,29 @@ class _GatewayMCPServer(MCPServer):
                 log.warning("flat tools/list: server %r unavailable: %s", server["name"], listing)
                 continue
             for entry in listing:
-                tool_name = entry["tool"]
-                if (server["name"], tool_name) not in grants:
+                if (server["name"], entry["tool"]) not in grants:
                     continue  # per-tool ACL filter, after the cached fetch
-                flat = flat_tool_name(server["name"], tool_name)
-                mapping[flat] = (server["name"], tool_name)
-                out.append(
-                    MCPTool(
-                        name=flat,
-                        description=entry.get("description") or None,
-                        input_schema=entry.get("inputSchema") or {"type": "object"},
-                        annotations=_tool_annotations(entry.get("annotations")),
-                    )
+                catalog.append(_pin_entry(server["name"], entry))
+                offered.append((server, entry))
+        # OFFER half of the definition pin (B3, 2026-11-23): in "block" mode a
+        # tool whose definition changed since it was pinned is NOT offered at
+        # all — the relay's treatment of its catalog, and the reason a rug-pull
+        # cannot be handed to the model here. warn/off keep every tool, so this
+        # listing is exactly the pre-B3 listing on the default path.
+        allowed = _pin_offered(catalog, grants)
+        for server, entry in offered:
+            if (server["name"], entry["tool"]) not in allowed:
+                continue
+            flat = flat_tool_name(server["name"], entry["tool"])
+            mapping[flat] = (server["name"], entry["tool"])
+            out.append(
+                MCPTool(
+                    name=flat,
+                    description=entry.get("description") or None,
+                    input_schema=entry.get("inputSchema") or {"type": "object"},
+                    annotations=_tool_annotations(entry.get("annotations")),
                 )
+            )
         _remember_sanitized(mapping)
         return out
 

@@ -5,6 +5,54 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## 2026-11-23 (later) — the controls bind: durable pins, /mcp coverage, and refusals on the record
+
+Waves 2–4, shipped on top of the morning's scorecard cut. The morning wave built the mechanisms; this one makes
+them bind, covers the path that carries the traffic, and puts refusals in the evidence.
+
+- **Tool-definition pins are PERSISTENT** (was in-memory). A `tool_pins` table now backs the store, and a fresh store
+  **loads before its first verdict** — a deferred load would make the first post-restart observation FIRST_SEEN and let
+  a rewritten definition approve itself, which is the entire attack. Writes are coalesced (300 s), faults degrade to
+  in-memory, and a store that could not READ the table **disables writes** so it can never overwrite an approval it
+  never saw. `block` is now a durable control rather than a per-process tripwire.
+- **Pinning and result screening now cover `/mcp`**, not just the relay. The gate reuses the relay's own
+  `pin_catalog_with_verdicts`/`pin_dispatch_refusal` and one process-wide pin store, so a pin recorded on either surface
+  protects both and there is no second implementation to drift. Screening is applied per model-visible field so the JSON
+  envelope stays parseable. `warn`/`off` are byte-identical to before, proven against the pre-change bytes.
+- **Cold listing cache fails CLOSED for a pinned tool** (it used to fail open). A never-pinned tool still dispatches —
+  a first run must work. A pinned tool with no listing to verify against is refused in `block` and warns in `warn`.
+  A pinning *fault* still fails open: that is a different rule and both are documented.
+- **A pin refusal no longer aborts the failover chain.** It is a per-candidate failure like a transport error; the call
+  is refused only when no candidate could serve, and the final error names the pin, not a generic transport fault.
+- **`scripts/tool_pin_admin.py`** — `list` / `clear --server --tool` / `clear --all --yes`. Durable pinning created a
+  support burden (a legitimate definition change locks the tool out), so there is now a supported lever instead of hand
+  SQL. It says plainly that the running gateway keeps the retired digest in memory until restart.
+- **The release gate is keyed on `PROMPT_VERSION`.** Gate 4/4 compares both prompt versions against a committed
+  baseline and fails closed on drift; `--rebaseline` makes a prompt bump a deliberate act. A prompt change can no longer
+  ship silently behind a green suite.
+- **Query-granular tool search.** `pcai_tools` gained a `search` action (BM25 over server/tool/description). Finding
+  "the tool that deletes a dataset" no longer pulls a whole server's catalogue into context. `list`/`describe` are
+  byte-identical; a `<= 0` cap returns an explicit error rather than an empty result the model would read as "no such
+  tool".
+- **Procedural memory got its evidence link and its expiry.** A playbook now carries `evidence_ref` naming the turn that
+  produced it, and a record older than `playbook_stale_after_days` (90) is **withheld and labelled `[stale]`** rather
+  than injected — playbooks are the one memory kind the store protects from decay, so they are the one most likely to
+  drift. `k` bounds only injectable records, so a stale entry cannot displace a fresh one.
+- **Redaction covers the wrapped-credential shape**, and `token: 512` in a config dump is no longer mistaken for a
+  credential (the all-digits guard used to live only in the wrapped pass).
+- **Payload capture now covers the REFUSAL sites** — all 10 tool-phase steps, not 1. ACL denial, pin refusal, unknown
+  tool, malformed arguments, client dispatch, the loop guard, `pcai__retrieve` misses and handbacks all record what the
+  model ASKED FOR. A red-team set built from this table is no longer a log of successes.
+- **`scripts/agent_eval_report.py`** — the reader the quality tables were missing: verdict counts, worst recent turns,
+  payload-table health.
+- **Design docs**: `design/agent-judge.md` (the calibrated judge, including that it is itself a prompt-injection target
+  because it reads untrusted tool results) and `design/tool-approval-gate.md` (approval is out-of-band and fails
+  CLOSED, deliberately the opposite of pinning).
+- **Suite:** 4054 → 4235 tests, 0 failed; ruff + mypy clean; SQL↔schema gate clean; the pin SQL now has a real-Postgres
+  round trip (it had none, and the whole restart-survival guarantee rested on it).
+- **Residuals, stated:** the approval gate is designed but not built (`InputRequiredResult` still has zero construction
+  sites); per-agent identity and egress isolation are unchanged; the judge is designed, not built.
+
 ## 2026-11-23 — the scorecard, enabled: procedures before the task, payloads after it
 
 - **The gap this closes.** The 2026-11-10 assessment ended with four unbuilt items and one

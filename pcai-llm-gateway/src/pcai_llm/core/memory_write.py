@@ -78,6 +78,7 @@ async def _overlay_emit_playbook(
     source: str,
     key_id: uuid.UUID | None,
     trace_messages: list[dict[str, Any]] | None = None,
+    request_id: str = "",
 ) -> str:
     """Split the optional Playbook section off a distilled summary.
 
@@ -97,6 +98,12 @@ async def _overlay_emit_playbook(
     gives the structural gate nothing to judge: the model's claimed
     outcome may be stored but is stamped outcome_source="unverified" -
     "inferred" is reserved for labels derived from trace signals.
+
+    EVIDENCE REF (B6, 2026-11-23): the stored metadata carries
+    evidence_ref - "request:<request_id>" when the caller passed the
+    originating turn, else "thread:<session_id>" - so a reader can trace a
+    procedure back to the trace it came from. evidence_thread keeps the
+    bare session id (the store record vocabulary already echoes it).
     """
     from datetime import UTC, datetime
 
@@ -108,6 +115,7 @@ async def _overlay_emit_playbook(
             format_playbook_section,
             infer_outcome,
             parse_playbook,
+            playbook_evidence_ref,
             playbook_key,
             strip_playbook_section,
         )
@@ -165,6 +173,13 @@ async def _overlay_emit_playbook(
                 "success_count": 0,
                 "fail_count": 0,
                 "evidence_thread": session_id,
+                # B6 (2026-11-23): the trace anchor for the turn that
+                # produced this procedure. "request:<id>" when the caller
+                # passed one (the agent_traces join key), else
+                # "thread:<session>" - see playbook.playbook_evidence_ref.
+                # A reader (and the future judge) can go from a stored
+                # playbook back to the turn it was inferred from.
+                "evidence_ref": playbook_evidence_ref(session_id, request_id),
             }
         )
         try:
@@ -186,6 +201,8 @@ async def _overlay_emit_playbook(
     except Exception:  # pragma: no cover - the overlay must never break a write
         log.warning("playbook emission fault (key=%s)", key_id, exc_info=True)
     return body
+
+
 # --- pcai-llm-playbook overlay END ---
 
 
@@ -222,6 +239,7 @@ async def write_memory(
     mcp_search: McpCall | None = None,
     verdict_out: list[str] | None = None,
     trace_messages: list[dict[str, Any]] | None = None,
+    request_id: str = "",
 ) -> tuple[bool, str]:
     """Write ONE memory document to the calling key memory dataset.
 
@@ -241,6 +259,10 @@ async def write_memory(
     caller can tell a PERMANENT refusal (a near-duplicate that will be
     produced again by every retry) from a TRANSIENT failure (which must leave
     the row due). The (ok, detail) tuple is unchanged.
+
+    request_id (optional): the originating turn (the distiller's own id,
+    the agent_traces join key). It only feeds the playbook evidence
+    reference; omitting it is safe - the reference then names the thread.
     """
 
     def _verdict(v: str) -> None:
@@ -327,7 +349,6 @@ async def write_memory(
                     + f" (containment {score:.2f}); write suppressed"
                 )
 
-
     # --- pcai-llm-playbook overlay: split the optional Playbook section off ---
     doc = await _overlay_emit_playbook(
         mcp_call,
@@ -336,6 +357,7 @@ async def write_memory(
         source=source,
         key_id=key_id,
         trace_messages=trace_messages,
+        request_id=request_id,
     )
 
     try:

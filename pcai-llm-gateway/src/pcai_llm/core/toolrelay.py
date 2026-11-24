@@ -544,6 +544,11 @@ async def _with_playbook_block(
             min_success_rate=settings.playbook_inject_min_success_rate,
             timeout_ms=settings.playbook_inject_timeout_ms,
             request_id=request_id,
+            # Playbooks are the one memory kind the store PROTECTS from decay, so they
+            # are also the record most likely to be stale — and injection makes a stale
+            # procedure authoritative by putting it in the system preamble. The module
+            # is stdlib-only/I/O-free, so the policy is threaded in from here.
+            stale_after_days=settings.playbook_stale_after_days,
         )
         if not block:
             return system_prefix
@@ -3138,12 +3143,19 @@ async def relay_stream(
                 yield _pcai({"pcai": {"event": "guard", "detail": reason}})
                 yield _reasoning_delta(f"\n[relay] {reason}\n")
                 mcp_summaries.append(f"[tool result] {fn.get('name', '')} → {reason}\n")
+                # Payload half (A4, 2026-11-23): the refused ARGUMENTS are what a
+                # red-team set is missing — this row says the call was denied,
+                # the payload says what the model tried to do. call_args is the
+                # already-parsed dict (with the {"_raw": ...} fallback for a
+                # malformed body), reason is the refusal text fed back to it.
                 await _trace_step(
                     iteration,
                     "tool",
                     server="client",
                     tool=str(fn.get("name", "")),
                     status="denied",
+                    tool_args=call_args,
+                    tool_result=reason,
                 )
             client_calls = still_client
 
@@ -3157,12 +3169,18 @@ async def relay_stream(
         # wall-clock belongs to the client.
         if client_calls and not mcp_calls:
             for tc in client_calls:
+                # Payload half (A4, 2026-11-23): the model's raw argument JSON is
+                # in scope on the call dict, so a handback row can say what the
+                # client was asked to run. NO tool_result: the client executes it
+                # AFTER this turn, so no result exists at trace time — inventing
+                # one (or a placeholder) would be the lie this table must not tell.
                 await _trace_step(
                     iteration,
                     "tool",
                     server="client",
                     tool=str(tc.get("function", {}).get("name", "")),
                     status="handed_back",
+                    tool_args=tc.get("function", {}).get("arguments"),
                 )
             handback_event: dict[str, Any] = {
                 "pcai": {
@@ -3476,11 +3494,15 @@ async def relay_stream(
                     # the call is gateway-SHAPED but refused: point the model
                     # at what it may call instead of a bare "unknown tool"
                     granted_hint = " — granted tools: " + ", ".join(sorted(f"{s}{TOOLSEP}{t}" for s, t in grants))
+                # Named once so the payload half below stores the SAME text the
+                # model was fed — a refusal payload that differs from the refusal
+                # is worse than none (A4, 2026-11-23).
+                _unknown_text = f"error: unknown tool {fn_name!r}{granted_hint}"
                 relay_msgs.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "content": f"error: unknown tool {fn_name!r}{granted_hint}",
+                        "content": _unknown_text,
                     }
                 )
                 yield _pcai(
@@ -3500,6 +3522,11 @@ async def relay_stream(
                     tool=fn_name,
                     ms=int((time.monotonic() - started) * 1000),
                     status="error",
+                    # A4 payload half: the hallucinated call's raw argument JSON
+                    # (whatever the model emitted, parseable or not) plus the
+                    # refusal text it was handed back.
+                    tool_args=fn.get("arguments"),
+                    tool_result=_unknown_text,
                 )
                 mcp_summaries.append(f"[tool result] {fn_name} → unknown tool (not an MCP name)\n")
                 continue
@@ -3538,6 +3565,11 @@ async def relay_stream(
                     tool=tool,
                     ms=int((time.monotonic() - started) * 1000),
                     status="error",
+                    # A4 payload half: the MALFORMED argument text verbatim (it is
+                    # the only record of what the model emitted — a parsed {} would
+                    # hide the defect) plus the error fed back for self-correction.
+                    tool_args=fn.get("arguments"),
+                    tool_result=err_text,
                 )
                 mcp_summaries.append(f"[tool result] {server}__{tool} → invalid arguments JSON\n")
                 continue
@@ -3598,6 +3630,10 @@ async def relay_stream(
                     tool=tool,
                     ms=0,
                     status="ok" if _stored is not None else "error",
+                    # A4 payload half: the digest/offset/limit the model asked for
+                    # and the slice (or the unknown-digest refusal) it got back.
+                    tool_args=args,
+                    tool_result=_retrieve_text,
                 )
                 mcp_summaries.append(
                     f"[tool result] {server}__{tool} → " + ("ok" if _stored is not None else "no stored result") + "\n"
@@ -3652,19 +3688,26 @@ async def relay_stream(
                     tool=tool,
                     ms=ms,
                     status=_tool_trace_status(exec_ok, content),
+                    # A4 payload half: the dispatched call's parsed arguments and
+                    # whatever the client executor returned (ok or refusal text).
+                    tool_args=args,
+                    tool_result=content,
                 )
                 continue
             if (server, tool) not in grants:
+                # Named once: the ACL refusal the model reads and the refusal the
+                # payload table stores must be the same text (A4, 2026-11-23).
+                _denied_text = (
+                    f"denied: {server}/{tool} is not granted — granted tools: "
+                    + ", ".join(sorted(f"{s}{TOOLSEP}{t}" for s, t in grants))
+                    if grants
+                    else f"denied: {server}/{tool} is not granted"
+                )
                 relay_msgs.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "content": (
-                            f"denied: {server}/{tool} is not granted — granted tools: "
-                            + ", ".join(sorted(f"{s}{TOOLSEP}{t}" for s, t in grants))
-                            if grants
-                            else f"denied: {server}/{tool} is not granted"
-                        ),
+                        "content": _denied_text,
                     }
                 )
                 yield _pcai(
@@ -3725,6 +3768,11 @@ async def relay_stream(
                     tool=tool,
                     ms=_denied_ms,
                     status="denied",
+                    # A4 payload half — the headline case: what the model asked a
+                    # tool to do when the ACL refused it. args is the parsed call
+                    # body; the refusal text is what the model was told instead.
+                    tool_args=args,
+                    tool_result=_denied_text,
                 )
                 _emit_tool_span(server, tool, _denied_ms, "denied")
                 mcp_summaries.append(f"[tool result] {server}__{tool} → denied by ACL\n")
@@ -3770,6 +3818,10 @@ async def relay_stream(
                     tool=tool,
                     ms=_pin_ms,
                     status="error",
+                    # A4 payload half: the call that tripped the pin gate and the
+                    # exact refusal (vanished / definition changed) it received.
+                    tool_args=args,
+                    tool_result=_pin_refusal,
                 )
                 _emit_tool_span(server, tool, _pin_ms, "error")
                 mcp_summaries.append(f"[tool result] {server}__{tool} → refused: {_pin_detail}\n")
@@ -3854,12 +3906,18 @@ async def relay_stream(
             # CLIENT-facing name is what the client executes (a twin-rewritten
             # cloud call hands back under the client's own name).
             for _tc, final_name in handback_calls:
+                # Payload half (A4, 2026-11-23): raw argument JSON of the call as
+                # the model emitted it (the twin rewrite changes the NAME the
+                # client executes, never the arguments). NO tool_result: the
+                # client executes after this turn — same rule as the pure-client
+                # handback above.
                 await _trace_step(
                     iteration,
                     "tool",
                     server="client",
                     tool=str(final_name),
                     status="handed_back",
+                    tool_args=_tc.get("function", {}).get("arguments"),
                 )
             # NO content-delta echo of the executed MCP results on the
             # handback path: OpenAI-spec clients (DSH) render delta.content

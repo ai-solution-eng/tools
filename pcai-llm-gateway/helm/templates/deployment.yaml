@@ -502,6 +502,10 @@ spec:
             # a stale procedure is worse than none. FAIL OPEN: past timeoutMs
             # the turn proceeds WITHOUT procedures (a slow memory store must
             # never delay an answer); maxChars caps the rendered block.
+            # Query-granular tool search (2026-11-23): cap on the `search` action of the
+            # pcai_tools discovery tool. 0/negative disables the action outright.
+            - name: PCAI_LLM_TOOL_SEARCH_MAX_RESULTS
+              value: {{ .Values.settings.relay.toolSearchMaxResults | default 10 | quote }}
             - name: PCAI_LLM_PLAYBOOK_INJECT_ENABLED
               value: {{ dig "memory" "playbookInject" "enabled" false .Values.settings | quote }}
             - name: PCAI_LLM_PLAYBOOK_INJECT_K

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "_comment": "Prompt versions this agent-behaviour gate is keyed on. Written by scripts/check_agent_eval.py --rebaseline; changing it is a decision to accept a prompt bump, not a formality.",
+  "prompt_versions": {
+    "agent_presets": "sweep-2026-11-06",
+    "distiller": "dsh-2026-11-10"
+  }
+}

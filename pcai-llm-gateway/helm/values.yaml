@@ -39,7 +39,7 @@ image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits appVersion. The tag is MUTABLE: pin with tag@sha256:<digest>
   # (or pullPolicy: Always) for a reproducible supply chain.
-  tag: v4.3.0
+  tag: v4.3.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -193,6 +193,11 @@ settings:
     wallClockS: 900
     callRetries: 1          # per turn; spends only the remaining wall clock, needs >=10s left; 0 = fail fast
     grantMode: explicit
+    # Cap on the `search` action of the pcai_tools discovery tool (BM25 over the
+    # in-memory catalogue). Discovery, not enforcement: the default is a sane
+    # ranking window, and 0/negative disables the action rather than returning an
+    # empty result the model would read as "no such tool".
+    toolSearchMaxResults: 10
     # Native wire visibility: leave FALSE for DSH — its stream client EXECUTES any
     # tool_call delta it sees. renderDeltas re-emits calls stamped pcai.relay: true
     # (requires header X-PCAI-Relay-Deltas: 1).

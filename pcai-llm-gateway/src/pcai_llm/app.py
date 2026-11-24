@@ -184,6 +184,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     warn_short_admin_keys()
     await db.connect()
+    # Tool-definition pins are PERSISTED (2026-11-23): a restart must not re-approve
+    # a rewritten definition. The store's synchronous bridge would pay that one round
+    # trip on the FIRST relay request of the process; awaiting it here pays it at boot
+    # instead. Best-effort by design — a pin-load fault degrades to in-memory pinning
+    # (the store then disables writes so it can never overwrite an approval it could
+    # not read) and must never block startup.
+    try:
+        from .core import toolrelay
+
+        # Module-private on purpose: the pin store is a process-wide singleton and a
+        # second accessor would be a second source of truth for the same approvals.
+        await toolrelay._PIN_STORE.awarm()
+    except Exception:
+        log.warning("tool pin warm-load failed — pins stay in-memory for this process", exc_info=True)
     # router.start() may not exist in every router build — call it only if
     # present so app wiring survives sibling-module evolution.
     if hasattr(model_router, "start"):

@@ -667,3 +667,728 @@ def test_new_rules_are_idempotent() -> None:
     ):
         once = trace_payloads.redact(sample)
         assert trace_payloads.redact(once) == once
+
+
+# --- hard-wrap redaction (B9, 2026-11-23) -----------------------------------
+# The cross-review defeat: a credential HARD-WRAPPED across a line break was
+# stored RAW on BOTH lines (the head is under the 8-char floor, the tail has no
+# keyword anchor). These pin the closed shape AND the payloads that must not be
+# touched: the second pass never re-joins lines, so structure survives.
+
+
+def test_redacts_a_split_bearer_continuation() -> None:
+    """The exact shape the reviewer used to defeat the redactor."""
+    tail = _fake("defghijklmnop")
+    out = trace_payloads.redact("Authorization: Bearer " + _fake("abc") + "\n" + tail)
+    assert out == "Authorization: Bearer [REDACTED:bearer]\n[REDACTED:bearer]"
+    assert tail not in out
+
+
+def test_redacts_a_split_password_continuation() -> None:
+    out = trace_payloads.redact("password=" + _fake("hun") + "\n" + _fake("ter2") + " and more")
+    assert out == "password=[REDACTED:password]\n[REDACTED:password] and more"
+
+
+def test_redacts_a_split_value_in_every_key_value_class() -> None:
+    """The continuation is redacted for every class the single-line rules know."""
+    # AWS keys are 40 chars, so their joined floor is higher (20) and the
+    # fragment a real wrap leaves behind is long.
+    cases = (
+        ("access_token=", "secret", "defgh1234"),
+        ("refresh_token=", "secret", "defgh1234"),
+        ("client_secret=", "secret", "defgh1234"),
+        ("api_key=", "api_key", "defgh1234"),
+        ("aws_secret_access_key=", "aws_secret", "defghijklmnopqrstuvwx"),
+        ("set-cookie: session=", "cookie", "defgh1234"),
+    )
+    for prefix, kind, fragment in cases:
+        tail = _fake(fragment)
+        out = trace_payloads.redact(prefix + _fake("abc") + "\n" + tail)
+        head, _, rest = out.partition("\n")
+        assert head == prefix + "[REDACTED:" + kind + "]", out
+        assert rest.startswith("[REDACTED:" + kind + "]"), out
+
+
+def test_redacts_split_basic_and_bare_sk_credentials() -> None:
+    out = trace_payloads.redact("Authorization: Basic " + _fake("dXNlc") + "\n" + _fake("jpwYXNz"))
+    assert out == "Authorization: Basic [REDACTED:basic]\n[REDACTED:basic]"
+    out = trace_payloads.redact("key sk-" + _fake("abc") + "\n" + _fake("defghijklmno"))
+    assert out == "key sk-[REDACTED:api_key]\n[REDACTED:api_key]"
+
+
+def test_wrapped_credential_redaction_is_idempotent() -> None:
+    """The marker cannot be re-matched, so a payload scrubbed twice is stable."""
+    for sample in (
+        "Authorization: Bearer " + _fake("abc") + "\n" + _fake("defghijklmnop"),
+        "password=" + _fake("hun") + "\n" + _fake("ter2"),
+        "api_key=" + _fake("ab") + "\n" + _fake("cd1234efgh"),
+    ):
+        once = trace_payloads.redact(sample)
+        assert once != sample
+        assert trace_payloads.redact(once) == once
+
+
+def test_wrapped_prose_is_not_mangled() -> None:
+    """A line ending in an anchor WORD is prose, not a wrapped credential."""
+    for text in (
+        "the bearer of\ngood news arrived",
+        "the bearer of\ngoodness arrived",
+        "a basic\nrule of thumb",
+        "line one ends here\nand the next line is prose",
+    ):
+        assert trace_payloads.redact(text) == text
+
+
+def test_wrapped_jsonl_records_are_not_mangled() -> None:
+    """No line is joined to its neighbour: every record still parses alone."""
+    import json
+
+    records = [
+        {"step": 1, "password": "hunter2"},
+        {"step": 2, "note": "ordinary line"},
+    ]
+    text = "\n".join(json.dumps(r) for r in records)
+    out = trace_payloads.redact(text)
+    lines = out.split("\n")
+    assert len(lines) == len(records)
+    assert [json.loads(line)["step"] for line in lines] == [1, 2]
+    assert "hunter2" not in out
+    assert "[REDACTED:password]" in out
+
+
+def test_wrapped_csv_rows_are_not_mangled() -> None:
+    text = "id,user,password\n1,bob,hunter2\n2,amy,s3cret"
+    assert trace_payloads.redact(text) == text
+
+
+def test_stacked_log_lines_are_not_mangled() -> None:
+    """The next RECORD start is never eaten as a continuation fragment."""
+    text = (
+        "2026-11-23 12:00:01 INFO password=hunter2\n"
+        "2026-11-23 12:00:02 INFO ready\n"
+        "2026-11-23 12:00:03 ERROR token=abc\n"
+        "2026-11-23 12:00:04 INFO done"
+    )
+    out = trace_payloads.redact(text)
+    assert out.count("\n") == text.count("\n")
+    assert "hunter2" not in out
+    assert "[REDACTED:password]" in out
+    for line in out.split("\n"):
+        assert re.match(r"^\d{4}-\d{2}-\d{2} ", line), line
+
+
+def test_wrapped_secret_is_redacted_by_prepare() -> None:
+    """The storage projection runs the wrap pass too (prepare -> redact)."""
+    text = "Authorization: Bearer " + _fake("abc") + "\n" + _fake("defghijklmnop")
+    p = trace_payloads.prepare(text, max_chars=1000, redact_enabled=True)
+    assert p.redacted is True
+    assert "defghijklmnop" not in p.payload
+    assert p.payload == "Authorization: Bearer [REDACTED:bearer]\n[REDACTED:bearer]"
+
+
+def test_wrapped_redaction_handles_crlf() -> None:
+    out = trace_payloads.redact("Authorization: Bearer " + _fake("abc") + "\r\n" + _fake("defghijklmnop") + "\r\n")
+    assert out == "Authorization: Bearer [REDACTED:bearer]\r\n[REDACTED:bearer]\r\n"
+
+
+def test_a_short_dangling_value_needs_a_real_joined_length() -> None:
+    """A 2-char continuation is not a credential fragment: the head is redacted
+    by the single-line rule and the tiny tail is left alone."""
+    out = trace_payloads.redact("password=" + _fake("ab") + "\n" + _fake("12"))
+    assert out == "password=[REDACTED:password]\n" + _fake("12")
+
+
+def test_a_full_length_head_wrap_keeps_its_tail_raw() -> None:
+    """DOCUMENTED BOUND (pinned, not celebrated): when the head value already
+    looks like a complete credential the single-line rule redacts the head and
+    the continuation stays raw - a long dangling value at EOL is
+    indistinguishable from an ordinary word. Pinned so a future change to this
+    bound is a deliberate act, not silent drift."""
+    tail = _fake("tailfragment")
+    out = trace_payloads.redact("Authorization: Bearer " + _fake("abcdefgh12345678") + "\n" + tail)
+    assert out == "Authorization: Bearer [REDACTED:bearer]\n" + tail
+
+
+def test_a_dangling_anchor_at_eof_has_no_continuation() -> None:
+    """No next line, no continuation: the under-floor value stays (unchanged
+    single-line behaviour - the wrap pass needs a fragment to act on)."""
+    text = "Authorization: Bearer " + _fake("abc")
+    assert trace_payloads.redact(text) == text
+
+
+# ===========================================================================
+# 9. R4 (2026-11-23): the wrapped-continuation RECORD GUARD is NARROWED
+# ===========================================================================
+# The cross-review defeat: _redact_wrapped treated ANY next line beginning with a
+# log level (a \b boundary) or a bare date as a NEW RECORD, so "Bearer abc" +
+# newline + "ERROR-xyz..." left BOTH credential fragments raw. The guard now
+# requires the log-level convention to be followed by a SPACE or a COLON, and a
+# date-prefixed record to look like a real record (YYYY-MM-DD then T/space).
+# These pin the new truth AND the shapes that must still be left alone.
+
+
+def test_r4_record_start_guard_requires_a_real_level_separator() -> None:
+    """A level counts as a record start only when a SPACE or a COLON follows
+    (or it is the whole line) - `ERROR-xyz` is a fragment, not a record."""
+    for level in ("TRACE", "DEBUG", "INFO", "NOTICE", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"):
+        assert trace_payloads._RECORD_START_RE.match(f"{level} something happened"), level
+        assert trace_payloads._RECORD_START_RE.match(f"{level}: something happened"), level
+        assert trace_payloads._RECORD_START_RE.match(level), level
+        assert trace_payloads._RECORD_START_RE.match(f"{level}-xyzfragment") is None, level
+        assert trace_payloads._RECORD_START_RE.match(f"{level}|xyzfragment") is None, level
+
+
+def test_r4_record_start_guard_requires_a_real_date_record() -> None:
+    """`YYYY-MM-DD` is a record only when T or a space follows; a bare date
+    prefix (the reviewer's shape) is a credential fragment."""
+    for record_start in (
+        "2026-11-23T12:00:01Z INFO ready",
+        "2026-11-23 12:00:01 INFO ready",
+        "2026-11-23t12:00:01",
+    ):
+        assert trace_payloads._RECORD_START_RE.match(record_start), record_start
+    for fragment in ("2026-11-23xyzfrag", "2026-frag", "2026-11-23x", "2026"):
+        assert trace_payloads._RECORD_START_RE.match(fragment) is None, fragment
+
+
+def test_r4_wrapped_bearer_then_log_level_hyphen_is_now_redacted() -> None:
+    """THE reviewer's shape: `Bearer abc` + newline + `ERROR-xyz...` used to
+    leave BOTH halves raw because the next line read as a stacked log record."""
+    tail = _fake("xyzdefghijkl")
+    out = trace_payloads.redact("Authorization: Bearer " + _fake("abc") + "\nERROR-" + tail)
+    assert out == "Authorization: Bearer [REDACTED:bearer]\n[REDACTED:bearer]"
+    assert tail not in out
+    # ... and the same for any other level, not just ERROR
+    out = trace_payloads.redact("password=" + _fake("hun") + "\nINFO-" + _fake("ter2xyz"))
+    assert out == "password=[REDACTED:password]\n[REDACTED:password]"
+
+
+def test_r4_wrapped_continuation_after_a_real_log_level_is_still_exempt() -> None:
+    """The guard still exists: a genuine stacked log line is NOT a fragment, so
+    a short dangling value stays (the pre-R4 protection is intact)."""
+    for continuation in (
+        "ERROR something happened",
+        "INFO: ready",
+        "WARN: 3 retries left",
+        "DEBUG boot",
+        "CRITICAL",
+    ):
+        text = "Authorization: Bearer " + _fake("abc") + "\n" + continuation
+        assert trace_payloads.redact(text) == text, continuation
+
+
+def test_r4_wrapped_continuation_after_a_real_iso_timestamp_is_still_exempt() -> None:
+    """A real record start (date + T/space) is never eaten as a fragment; the
+    single-line rule still redacts the head it can see."""
+    for stamp in ("2026-11-23T12:00:01Z", "2026-11-23 12:00:01"):
+        text = "password=" + _fake("abc") + "\n" + stamp + " INFO ready"
+        assert trace_payloads.redact(text) == "password=[REDACTED:password]\n" + stamp + " INFO ready"
+
+
+def test_r4_wrapped_continuation_with_a_bare_date_prefix_is_redacted() -> None:
+    """`2026-` alone is not a record: it is a fragment (the narrowing)."""
+    tail = _fake("2026-11-23xyzfrag")
+    out = trace_payloads.redact("password=" + _fake("ab") + "\n" + tail)
+    assert out == "password=[REDACTED:password]\n[REDACTED:password]"
+    assert tail not in out
+
+
+def test_r4_narrowed_guard_keeps_stacked_logs_and_prose_intact() -> None:
+    """The narrowing must not start eating ordinary structured payloads: real
+    stacked logs keep their shape and prose is untouched."""
+    text = (
+        "2026-11-23 12:00:01 INFO password=hunter2\n"
+        "2026-11-23 12:00:02 ERROR something happened\n"
+        "2026-11-23 12:00:03 INFO done"
+    )
+    out = trace_payloads.redact(text)
+    assert out.count("\n") == text.count("\n")
+    assert "hunter2" not in out
+    for line in out.split("\n"):
+        assert re.match(r"^\d{4}-\d{2}-\d{2} ", line), line
+    for prose in (
+        "the bearer of\ngoodness arrived",
+        "line one ends here\nand the next line is prose",
+        "no secrets here\njust two lines",
+    ):
+        assert trace_payloads.redact(prose) == prose
+
+
+def test_r4_narrowed_guard_is_idempotent() -> None:
+    """Redaction stays stable on the new shapes (a stored payload scrubbed
+    twice must be byte-identical)."""
+    for sample in (
+        "Authorization: Bearer " + _fake("abc") + "\nERROR-" + _fake("xyzdefghijkl"),
+        "password=" + _fake("ab") + "\n" + _fake("2026-11-23xyzfrag"),
+        "password=" + _fake("abc") + "\n2026-11-23T12:00:01Z INFO ready",
+    ):
+        once = trace_payloads.redact(sample)
+        assert trace_payloads.redact(once) == once
+
+
+# ===========================================================================
+# 10. scripts/tool_pin_admin.py - the operator re-approval lever (R3)
+# 11. scripts/agent_eval_report.py - the quality-layer reader (R5)
+# ===========================================================================
+# WHY THESE LIVE HERE: this wave's write zone grants exactly ONE test file (this
+# one), so the two new operator scripts are tested from it. They are loaded by
+# path - the repo's established pattern for scripts/ (test_eval_gate_keying.py,
+# test_deploy_contract.py) - and the imports stay LOCAL to the helpers so this
+# suite remains append-only: no existing import block is touched.
+
+
+def _load_script(name: str) -> Any:
+    """Load scripts/<name>.py as a module by path (no sys.path edit, no package)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"{name}_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _blank_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the gateway's own DB config unresolvable (the unit-suite environment)."""
+    for field in ("database_url", "db_host", "db_port", "db_user", "db_password", "db_name"):
+        monkeypatch.setattr(settings, field, "")
+
+
+class _FakeAdminConn:
+    """The two statements tool_pin_admin issues, and nothing else."""
+
+    def __init__(self, rows: Any = (), tag: str = "DELETE 1", fault: Exception | None = None) -> None:
+        self.rows = list(rows)
+        self.tag = tag
+        self.fault = fault
+        self.fetched: list[tuple[str, tuple[Any, ...]]] = []
+        self.executed: list[tuple[str, tuple[Any, ...]]] = []
+        self.closed = False
+
+    async def fetch(self, sql: str, *params: Any) -> list[Any]:
+        if self.fault is not None:
+            raise self.fault
+        self.fetched.append((sql, params))
+        return self.rows
+
+    async def execute(self, sql: str, *params: Any) -> str:
+        if self.fault is not None:
+            raise self.fault
+        self.executed.append((sql, params))
+        return self.tag
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _install_conn(monkeypatch: pytest.MonkeyPatch, module: Any, conn: Any) -> None:
+    """Point the script's _open() at a fake connection (no database is touched)."""
+
+    async def _open() -> Any:
+        return conn
+
+    monkeypatch.setattr(module, "_open", _open)
+
+
+def test_tool_pin_admin_lists_every_column() -> None:
+    """`list` must show what an operator needs to decide: server, tool,
+    fingerprint, first_seen, last_seen."""
+    module = _load_script("tool_pin_admin")
+    from datetime import UTC, datetime
+
+    rows = [
+        {
+            "server": "logsearch",
+            "tool": "search_logs",
+            "fingerprint": "0123456789abcdef",
+            "first_seen": datetime(2026, 11, 20, 10, 0, 0, tzinfo=UTC),
+            "last_seen": datetime(2026, 11, 23, 18, 0, 0, tzinfo=UTC),
+        }
+    ]
+    out = module._format_rows(rows)
+    for expected in (
+        "1 pin(s) in tool_pins",
+        "SERVER",
+        "TOOL",
+        "FINGERPRINT",
+        "FIRST_SEEN",
+        "LAST_SEEN",
+        "logsearch",
+        "search_logs",
+        "0123456789abcdef",
+        "2026-11-20 10:00:00",
+        "2026-11-23 18:00:00",
+    ):
+        assert expected in out, expected
+
+
+def test_tool_pin_admin_empty_listing_says_what_it_means() -> None:
+    """An empty list is an ANSWER, not silence: it must say the next observation
+    is FIRST_SEEN rather than print nothing an operator can misread."""
+    module = _load_script("tool_pin_admin")
+    out = module._format_rows([])
+    assert "no tool-definition pins recorded" in out
+    assert "FIRST_SEEN" in out
+
+
+def test_tool_pin_admin_clear_all_reuses_the_stores_clear_sql() -> None:
+    """The brief's rule: reuse core.tool_pin's constants. `--all` is exactly
+    the store's own "forget everything" statement."""
+    module = _load_script("tool_pin_admin")
+    from pcai_llm.core import tool_pin
+
+    sql, params = module._clear_plan(None, None, True, True)
+    assert sql == tool_pin._CLEAR_SQL
+    assert params == ()
+
+
+def test_tool_pin_admin_clear_one_key_is_narrow() -> None:
+    """Clearing ONE pin must never be able to wipe the table: the delete is
+    keyed on both server and tool."""
+    module = _load_script("tool_pin_admin")
+
+    sql, params = module._clear_plan("logsearch", "search_logs", False, False)
+    assert params == ("logsearch", "search_logs")
+    assert "DELETE FROM tool_pins" in sql
+    assert "WHERE server = $1 AND tool = $2" in sql
+    # and it strips whitespace, so a pasted name with a newline still matches
+    assert module._clear_plan(" logsearch\n", " search_logs ", False, False)[1] == ("logsearch", "search_logs")
+
+
+def test_tool_pin_admin_refuses_all_without_yes() -> None:
+    """`--all` is irreversible and fleet-wide: it needs an explicit --yes."""
+    module = _load_script("tool_pin_admin")
+    with pytest.raises(module.CommandError) as caught:
+        module._clear_plan(None, None, True, False)
+    assert caught.value.code == 2
+    assert "--yes" in caught.value.message
+
+
+def test_tool_pin_admin_refuses_an_ambiguous_or_half_target() -> None:
+    """A half target or a mixed ask is a usage error, never a guess."""
+    module = _load_script("tool_pin_admin")
+    for server, tool, all_pins in (
+        (None, None, False),
+        ("logsearch", None, False),
+        (None, "search_logs", False),
+        ("logsearch", "search_logs", True),
+    ):
+        with pytest.raises(module.CommandError) as caught:
+            module._clear_plan(server, tool, all_pins, True)
+        assert caught.value.code == 2
+
+
+def test_tool_pin_admin_list_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """One connection, one SELECT, the table printed, the connection closed."""
+    module = _load_script("tool_pin_admin")
+    conn = _FakeAdminConn(rows=[{"server": "s", "tool": "t", "fingerprint": "abcdef0123456789"}])
+    _install_conn(monkeypatch, module, conn)
+    assert module.main(["list"]) == 0
+    assert len(conn.fetched) == 1
+    assert conn.fetched[0][0] == module._LIST_SQL
+    assert "last_seen" in conn.fetched[0][0], "the list read must carry last_seen"
+    assert "s" in capsys.readouterr().out
+    assert conn.closed is True
+
+
+def test_tool_pin_admin_clear_deletes_and_names_the_restart(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A clear deletes the durable row and says the running gateway must be
+    restarted - otherwise the operator thinks the lever worked when it did not."""
+    module = _load_script("tool_pin_admin")
+    conn = _FakeAdminConn(tag="DELETE 1")
+    _install_conn(monkeypatch, module, conn)
+    assert module.main(["clear", "--server", "logsearch", "--tool", "search_logs"]) == 0
+    assert conn.executed == [(module._DELETE_ONE_SQL, ("logsearch", "search_logs"))]
+    out = capsys.readouterr().out
+    assert "cleared 1 pin(s)" in out
+    assert "logsearch__search_logs" in out
+    assert "RESTARTED" in out
+    assert conn.closed is True
+
+
+def test_tool_pin_admin_clear_all_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--all --yes` issues the store's clear constant, not a hand-written one."""
+    module = _load_script("tool_pin_admin")
+    from pcai_llm.core import tool_pin
+
+    conn = _FakeAdminConn(tag="DELETE 4")
+    _install_conn(monkeypatch, module, conn)
+    assert module.main(["clear", "--all", "--yes"]) == 0
+    assert conn.executed == [(tool_pin._CLEAR_SQL, ())]
+
+
+def test_tool_pin_admin_reports_an_absent_pin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deleting nothing is not an error, but it is never silent either."""
+    module = _load_script("tool_pin_admin")
+    _install_conn(monkeypatch, module, _FakeAdminConn(tag="DELETE 0"))
+    assert module.main(["clear", "--server", "s", "--tool", "t"]) == 0
+    assert "nothing was deleted" in capsys.readouterr().out
+
+
+def test_tool_pin_admin_clear_all_on_an_empty_table_says_so(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fleet-wide clear of an empty table reports the empty table, not a
+    per-tool "no pin matched every pin" sentence."""
+    module = _load_script("tool_pin_admin")
+    _install_conn(monkeypatch, module, _FakeAdminConn(tag="DELETE 0"))
+    assert module.main(["clear", "--all", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "no pins recorded" in out
+    assert "no pin matched" not in out
+
+
+def test_tool_pin_admin_without_a_database_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE brief's rule: no database configuration is a CLEAR failure, never an
+    empty list an operator can mistake for "no pins"."""
+    module = _load_script("tool_pin_admin")
+    _blank_database(monkeypatch)
+    assert module.main(["list"]) == 2
+    err = capsys.readouterr().err
+    assert "database is not configured" in err
+    assert "PCAI_LLM_DATABASE_URL" in err
+
+
+def test_tool_pin_admin_validates_the_target_before_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bad ask must be answered as a bad ask (exit 2, --yes named), not as a
+    database problem: the target is validated before any connection."""
+    module = _load_script("tool_pin_admin")
+    _blank_database(monkeypatch)
+    assert module.main(["clear", "--all"]) == 2
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_tool_pin_admin_names_a_missing_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cluster that never booted the gateway has no schema: say so."""
+    module = _load_script("tool_pin_admin")
+    import asyncpg
+
+    conn = _FakeAdminConn(fault=asyncpg.UndefinedTableError("relation does not exist"))
+    _install_conn(monkeypatch, module, conn)
+    assert module.main(["list"]) == 1
+    assert "tool_pins table does not exist" in capsys.readouterr().err
+    assert conn.closed is True, "a failed read must still close the connection"
+
+
+class _FakeReportConn:
+    """The four reads agent_eval_report issues, routed by statement text."""
+
+    def __init__(
+        self,
+        counts: Any = (),
+        total: Any = None,
+        recent: Any = (),
+        payload: Any = None,
+        fault: Exception | None = None,
+    ) -> None:
+        self.counts = list(counts)
+        self.total = total
+        self.recent = list(recent)
+        self.payload = payload
+        self.fault = fault
+        self.statements: list[str] = []
+        self.closed = False
+
+    async def fetch(self, sql: str, *params: Any) -> list[Any]:
+        if self.fault is not None:
+            raise self.fault
+        self.statements.append(sql)
+        return self.counts if "GROUP BY verdict" in sql else self.recent
+
+    async def fetchrow(self, sql: str, *params: Any) -> Any:
+        if self.fault is not None:
+            raise self.fault
+        self.statements.append(sql)
+        return self.total if "count(DISTINCT request_id)" in sql else self.payload
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _verdict_row(request_id: str, verdict: str, reason: str, minutes_ago: int = 0) -> dict[str, Any]:
+    from datetime import UTC, datetime, timedelta
+
+    return {
+        "request_id": request_id,
+        "verdict": verdict,
+        "reason": reason,
+        "ts": datetime(2026, 11, 23, 18, 0, 0, tzinfo=UTC) - timedelta(minutes=minutes_ago),
+    }
+
+
+def test_agent_eval_report_ranks_the_worst_turns_first() -> None:
+    """Severity first (a denied call outranks a loop), then recency."""
+    module = _load_script("agent_eval_report")
+    rows = [
+        _verdict_row("req-loop", "loop", "3 repeats", minutes_ago=1),
+        _verdict_row("req-denied", "not_granted", "1 denied", minutes_ago=9),
+        _verdict_row("req-both", "tool_error", "1 failed", minutes_ago=5),
+        _verdict_row("req-both", "step_budget", "41 rounds", minutes_ago=5),
+        _verdict_row("req-clean", "clean", "no findings", minutes_ago=2),
+    ]
+    turns = module.rank_turns(rows, 10)
+    assert [turn.request_id for turn in turns] == ["req-denied", "req-both", "req-loop"]
+    assert turns[1].weight == 4, "tool_error (3) + step_budget (1)"
+    assert turns[1].severity == 3, "the worst single finding on that turn"
+    assert turns[1].findings == (("tool_error", "1 failed"), ("step_budget", "41 rounds"))
+    assert all(turn.request_id != "req-clean" for turn in turns), "clean turns are not findings"
+
+
+def test_agent_eval_report_one_denial_outranks_many_operational_findings() -> None:
+    """Severity is PRIMARY, weight secondary: a turn with one DENIED call beats a
+    turn carrying three operational findings, because a denial is the signal an
+    operator must see first."""
+    module = _load_script("agent_eval_report")
+    rows = [
+        _verdict_row("req-many", "tool_error", "1 failed", minutes_ago=1),
+        _verdict_row("req-many", "loop", "3 repeats", minutes_ago=1),
+        _verdict_row("req-many", "step_budget", "41 rounds", minutes_ago=1),
+        _verdict_row("req-denied", "not_granted", "1 denied", minutes_ago=30),
+    ]
+    turns = module.rank_turns(rows, 10)
+    assert [turn.request_id for turn in turns] == ["req-denied", "req-many"]
+    assert turns[0].weight == 4 and turns[1].weight == 6, "the heavier turn still ranks second"
+
+
+def test_agent_eval_report_ranking_is_total_and_deterministic() -> None:
+    """Equal weight and equal timestamp still order by request_id, so a re-run
+    prints the same report (and a test can assert on it)."""
+    module = _load_script("agent_eval_report")
+    rows = [
+        _verdict_row("req-b", "loop", "3 repeats"),
+        _verdict_row("req-a", "loop", "3 repeats"),
+    ]
+    assert [turn.request_id for turn in module.rank_turns(rows, 10)] == ["req-a", "req-b"]
+    assert len(module.rank_turns(rows, 1)) == 1, "--limit caps the ranking"
+
+
+def test_agent_eval_report_counts_every_verdict_in_report_order() -> None:
+    """All five verdicts are listed (zeros included) in core.agent_eval order; an
+    unknown verdict row is visible instead of silently dropped."""
+    module = _load_script("agent_eval_report")
+    from pcai_llm.core import agent_eval
+
+    rows = [
+        {"verdict": "clean", "rows": 7, "turns": 7},
+        {"verdict": "tool_error", "rows": 2, "turns": 2},
+        {"verdict": "legacy_verdict", "rows": 1, "turns": 1},
+    ]
+    out = module.format_counts(rows, days=7, turns_scored=9)
+    positions = [out.index(verdict) for verdict in agent_eval.VERDICTS]
+    assert positions == sorted(positions), "the report order is core.agent_eval.VERDICTS"
+    assert "step_budget" in out and "0 row(s)" in out
+    assert "legacy_verdict" in out
+    assert "NOT in the verdict vocabulary" in out
+
+
+def test_agent_eval_report_empty_states_name_the_knobs() -> None:
+    """An empty report must explain itself: the flags are OFF by default, and the
+    reader says so instead of printing nothing."""
+    module = _load_script("agent_eval_report")
+    counts = module.format_counts([], days=7, turns_scored=0)
+    assert "agent_eval_enabled" in counts
+    turns = module.format_turns([], days=7, scanned=0, turns_scored=0)
+    assert "no verdict rows in the window" in turns
+    # a scored-but-clean window is a DIFFERENT answer from "nothing was scored"
+    clean = module.format_turns([], days=7, scanned=12, turns_scored=12)
+    assert "no findings" in clean and "12 turn(s) scored" in clean
+    payload = module.format_payload_stats({"rows": 0}, retention_days=7)
+    assert "trace_payload_sampling" in payload
+
+
+def test_agent_eval_report_payload_stats_show_shares_and_timestamps() -> None:
+    """rows, oldest/newest, and the truncated/redacted shares - the numbers that
+    tell an operator the table is healthy and the scrubber is firing."""
+    module = _load_script("agent_eval_report")
+    from datetime import UTC, datetime
+
+    row = {
+        "rows": 1234,
+        "oldest": datetime(2026, 11, 16, 10, 0, 0, tzinfo=UTC),
+        "newest": datetime(2026, 11, 23, 18, 0, 0, tzinfo=UTC),
+        "truncated": 152,
+        "redacted": 563,
+    }
+    out = module.format_payload_stats(row, retention_days=7)
+    assert "1,234" in out
+    assert "2026-11-16 10:00:00+00:00" in out
+    assert "2026-11-23 18:00:00+00:00" in out
+    assert "12.3%" in out
+    assert "45.6%" in out
+    assert "retention 7 day(s)" in out
+
+
+def test_agent_eval_report_issues_reads_only() -> None:
+    """THE brief's hard rule: the report is read-only. Every statement it can
+    issue is a SELECT."""
+    module = _load_script("agent_eval_report")
+    statements = [value for name, value in vars(module).items() if name.endswith("_SQL") and isinstance(value, str)]
+    assert len(statements) == 4, "one statement per read (counts, total, recent, payload)"
+    for sql in statements:
+        head = " ".join(sql.split()).upper()
+        assert head.startswith("SELECT"), head
+        for forbidden in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "DROP", "ALTER", "CREATE"):
+            assert re.search(rf"\b{forbidden}\b", head) is None, f"{forbidden} in a read-only report: {head}"
+
+
+def test_agent_eval_report_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """All three sections print from ONE connection, and the connection closes."""
+    module = _load_script("agent_eval_report")
+    from datetime import UTC, datetime
+
+    conn = _FakeReportConn(
+        counts=[{"verdict": "tool_error", "rows": 2, "turns": 2}],
+        total={"turns": 5},
+        recent=[_verdict_row("req-bad", "tool_error", "1 tool call(s) did not succeed")],
+        payload={
+            "rows": 10,
+            "oldest": datetime(2026, 11, 22, 10, 0, 0, tzinfo=UTC),
+            "newest": datetime(2026, 11, 23, 18, 0, 0, tzinfo=UTC),
+            "truncated": 1,
+            "redacted": 2,
+        },
+    )
+    _install_conn(monkeypatch, module, conn)
+    assert module.main(["--days", "3", "--limit", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "agent quality layer report -- window: last 3 day(s)" in out
+    assert "verdict counts" in out
+    assert "req-bad" in out
+    assert "1 tool call(s) did not succeed" in out
+    assert "agent_trace_payloads" in out
+    assert conn.closed is True
+    assert all(" ".join(sql.split()).upper().startswith("SELECT") for sql in conn.statements)
+
+
+def test_agent_eval_report_without_a_database_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script("agent_eval_report")
+    _blank_database(monkeypatch)
+    assert module.main([]) == 2
+    assert "database is not configured" in capsys.readouterr().err
+
+
+def test_agent_eval_report_names_a_missing_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script("agent_eval_report")
+    import asyncpg
+
+    conn = _FakeReportConn(fault=asyncpg.UndefinedTableError("relation does not exist"))
+    _install_conn(monkeypatch, module, conn)
+    assert module.main([]) == 1
+    assert "quality-layer tables do not exist" in capsys.readouterr().err
+    assert conn.closed is True

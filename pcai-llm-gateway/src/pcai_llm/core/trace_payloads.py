@@ -17,9 +17,14 @@ THE FOUR RULES, each its own testable function:
    sampled at 0.5.
 2. REDACTION IS A PURE FUNCTION (`redact`). Best-effort pattern matching over
    bearer/basic tokens, api keys, aws secret keys, session cookies, passwords
-   and DSN userinfo. It reduces blast radius; it is NOT a guarantee — a
-   credential HARD-WRAPPED across a line break is stored raw (see redact()'s
-   docstring for the demonstrated defeat).
+   and DSN userinfo, plus a bounded SECOND pass that catches a credential
+   HARD-WRAPPED across a line break in its short-head shape (2026-11-23; see
+   _WRAP_HEAD_RULES for exactly what it fires on and what it still misses). The
+   continuation guard was NARROWED the same day: a log level must be followed by
+   a space or a colon and a date by `T`/space to count as a stacked-log record,
+   so `ERROR-...` and bare `2026-...` continuations are redacted rather than
+   exempted.
+   It reduces blast radius; it is NOT a guarantee.
 3. TRUNCATION IS RECORDED (`prepare`). A payload is capped at
    trace_payload_max_chars and `payload_chars` keeps the length BEFORE the
    cut, so a reader can tell a short result from a truncated one.
@@ -30,17 +35,37 @@ DISCIPLINE: the same one core/traces.py documents — every write here is
 BEST-EFFORT and never raises. A broken payload pipeline is a gap in the
 quality layer, never a failed request.
 
-COVERAGE (stated precisely, 2026-11-23 cross-review): rule 1 holds for the
-calls that reach this module, and today that is the SERVER-EXECUTED MCP path —
-the one `_trace_step` call site in the relay that has both the arguments and
-the result in scope. The other tool-phase trace steps (ACL denial, pin
-refusal, unknown tool, invalid arguments, client dispatch, handbacks) write a
-trace row and NO payload, because they do not go through this hook. So a
-red-team set built from this table systematically under-samples REFUSALS: it
-shows what the agent did when allowed, not what it asked for when refused.
-Widening the hook to those sites is the obvious next step and is deliberately
-NOT done here — each site needs its own review, and a half-wired payload
-pipeline that silently drops refusals is worse than one that says so.
+COVERAGE (restated 2026-11-23, A4 — all 10 tool-phase sites feed this store):
+every tool-phase `_trace_step` call site in core/toolrelay.py now passes what
+it has. COUNT CORRECTION: earlier drafts of this paragraph said "13 tool-phase
+sites, one fed" — that was a grep artefact (the pattern also matched the
+`async def _trace_step` definition). The module has 12 call sites: 10 are
+phase="tool" and all 10 are fed, 2 are phase="chat" and correctly carry no
+payload (the model-call settle and the mid-loop budget marker are not tool
+steps, and the hook below fires only for phase == "tool").
+
+The fed tool sites, and what each one contributes:
+  * server-executed MCP execution — arguments + result (the original site);
+  * ACL denial — arguments + the refusal text (the headline red-team gap);
+  * dispatch-time tool-pin refusal — arguments + the vanished/changed text;
+  * unknown tool — the raw argument JSON + the error fed back;
+  * invalid-arguments JSON — the MALFORMED argument text verbatim + the error;
+  * compressed-result retrieval (pcai__retrieve) — args + slice/unknown-digest;
+  * Wave B client-tool dispatch — arguments + the executor's result;
+  * client loop-guard denial — the parsed call + the guard's reason;
+  * the two handback sites (pure-client batch, twin-rewritten mixed batch) —
+    the model's raw argument JSON ONLY: the client executes after the turn, so
+    no result exists at trace time and none is invented.
+So "captured completely or not at all" (rule 1) now holds across TOOL steps:
+what the agent asked for when refused is stored, not just what it did when
+allowed. The two chat-phase steps remain payload-free by design.
+
+The coverage is ENFORCED, not just claimed: tests/test_trace_payload_wiring.py
+walks the relay's AST and fails unless every tool-phase `_trace_step` site
+passes `tool_args` or appears in an explicit, commented allowlist (currently
+empty — every site has its arguments in scope). A new unwired tool-phase site
+is therefore a test failure, which is how the old 1-of-10 gap survived: the
+previous guard only asked for "at least one" fed site.
 """
 
 from __future__ import annotations
@@ -99,17 +124,31 @@ _SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_\-]{10,}")
 # api_key / api-key / apikey / x-api-key as a key-value pair (JSON, header,
 # query string). "x-api-key" matches at its api-key tail, leaving the "x-"
 # prefix in place — the shape still reads correctly.
-_API_KEY_KV = re.compile(r"(?i)((?:api[_-]?key|apikey)[\"']?\s*[:=]\s*[\"']?)([^\s\"',;&}\[\]]+)")
+# The (?!\d+(?:[\s\"',;&}\[\]]|$)) guard spares a COUNT from being treated as a
+# credential: a config dump says "token: 512" / "api_key: 4096" and redacting
+# those mangles the very diagnostics the payload table exists to serve. Added
+# 2026-11-23 after cross-review found the digit exception existed only in the
+# wrapped-continuation pass while the one-line rules — the common shape — still
+# ate it. "password" deliberately keeps no guard: a numeric password is real.
+_COUNT_NOT_CREDENTIAL = r"(?!\d+(?:[\s\"',;&}\[\]]|$))"
+_API_KEY_KV = re.compile(
+    r"(?i)((?:api[_-]?key|apikey)[\"']?\s*[:=]\s*[\"']?)" + _COUNT_NOT_CREDENTIAL + r"([^\s\"',;&}\[\]]+)"
+)
 
 # token / access_token / refresh_token / client_secret as a key-value pair.
 _SECRET_KV = re.compile(
     r"(?i)((?:client[_-]?secret|secret|refresh[_-]?token|access[_-]?token|token)[\"']?\s*[:=]\s*[\"']?)"
-    r"([^\s\"',;&}\[\]]+)"
+    + _COUNT_NOT_CREDENTIAL
+    + r"([^\s\"',;&}\[\]]+)"
 )
 
 # AWS secret access keys (2026-11-23). The generic _SECRET_KV cannot see these:
 # "secret" is followed by "_access_key=" so the ["']?\s*[:=] anchor never fires.
-_AWS_SECRET = re.compile(r"(?i)((?:aws[_-]?)?secret[_-]?access[_-]?key[\"']?\s*[:=]\s*[\"']?)([^\s\"',;&}\[\]]+)")
+_AWS_SECRET = re.compile(
+    r"(?i)((?:aws[_-]?)?secret[_-]?access[_-]?key[\"']?\s*[:=]\s*[\"']?)"
+    + _COUNT_NOT_CREDENTIAL
+    + r"([^\s\"',;&}\[\]]+)"
+)
 
 # Session cookies (2026-11-23): the credential class most often echoed by an HTTP
 # tool result. Anchored on the cookie header AND a session-ish name, so an ordinary
@@ -136,6 +175,144 @@ _REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (_AWS_SECRET, r"\1" + REDACT_MARKER.format(kind="aws_secret")),
     (_COOKIE, r"\1" + REDACT_MARKER.format(kind="cookie")),
     (_PASSWORD_KV, r"\1" + REDACT_MARKER.format(kind="password")),
+)
+
+# --- hard-wrap continuations (B9, 2026-11-23) ------------------------------
+# A credential HARD-WRAPPED across a line break defeats every rule above: they
+# are single-line, so a terminal or log wrapping at column 76 turns one 60-char
+# bearer token into "Bearer abc" + newline + "defgh..." - the head is under the
+# 8-char floor and the tail carries no keyword anchor, and BOTH fragments are
+# stored raw (the exact defeat the 2026-11-23 cross-review demonstrated).
+#
+# This second pass closes the SHORT-HEAD shape WITHOUT re-joining any lines.
+# Re-joining is what mangles structured payloads (a JSONL record welded to the
+# next one, two CSV rows merged, stacked log lines turned into one sentence),
+# so the heuristic NEVER rewrites a line boundary: it redacts the partial value
+# at the END of a line and the fragment at the START of the NEXT line, leaving
+# both newlines and every other byte in place.
+#
+# WHAT FIRES (all four must hold):
+#   1. the line ends with a credential anchor plus a value that CANNOT be a
+#      complete credential for its class - under the 8-char floor for
+#      Bearer/Basic, or at most WRAP_KV_FRAGMENT_MAX chars for a key=value
+#      class (password/token/secret/api_key/cookie) whose single-line rule has
+#      no floor of its own;
+#   2. the next line STARTS with a credential-charset run of at least
+#      WRAP_TAIL_MIN_CHARS chars;
+#   3. head + fragment together are long enough for a real credential (the
+#      same per-class floor), so "password=ab" + "12" is left alone;
+#   4. the next line does not START like a real new record - a log level
+#      followed by a SPACE or a COLON (`ERROR `, `INFO:`), a line that is JUST
+#      the level, or an ISO date followed by `T`/space (`2026-11-23T12:00`,
+#      `2026-11-23 12:00`). That is a stacked log, not a continuation.
+#      NARROWED 2026-11-23 (R4): the first
+#      version accepted a log level at a WORD BOUNDARY and a bare `YYYY-MM-DD`,
+#      so `ERROR-xyz...` and a line beginning `2026-` both read as records and
+#      BOTH credential fragments were stored raw - the exact shapes the
+#      cross-review used to defeat the pass. A record whose level ends in a
+#      hyphen is not a record shape any logger emits; a credential fragment
+#      that happens to begin with a date prefix is far more likely.
+# The partial head value and the leading fragment then BOTH become the typed
+# marker: "Bearer abc" / "defghijklmnop" -> "Bearer [REDACTED:bearer]" /
+# "[REDACTED:bearer]".
+#
+# WHAT IT STILL DOES NOT CATCH (stated so nobody mistakes it for a guarantee):
+#   * a wrap whose head value is ALREADY a full-length credential (a 40-char
+#     token wrapped after 20): the single-line rule redacts the head and the
+#     tail fragment stays raw, because a long dangling value at EOL is
+#     indistinguishable from an ordinary word;
+#   * a continuation starting with punctuation ("!x9", "=abc", "..."): the
+#     fragment charset is the same one the single-line rules use;
+#   * DSN userinfo split across lines (the "@host" anchor is on the other
+#     line, so no rule can see a credential there);
+#   * a wrap longer than ONE line break (the fragment continues onto a third
+#     line), and any credential in a shape the single-line rules miss.
+# THE NARROWED RECORD GUARD IS A DELIBERATE TRADE (2026-11-23, R4): a stacked
+# log whose level is followed by anything other than a space/colon (`ERROR-`,
+# `INFO|`) or whose date has no time after it is now read as a CONTINUATION, so
+# such a line can be redacted as a credential fragment. That costs a redacted
+# log line in an exotic format; leaving the guard broad cost a stored
+# credential in the shape a reviewer actually produced. The credential wins.
+# It can still MISFIRE on prose that ends in an anchor word plus a short word
+# followed by a long one ("the bearer of" + "goodness"): the per-class joined
+# length floor makes that much rarer but cannot remove it, because a wrapped
+# short credential and a sentence have the same shape. The marker keeps the key
+# ("Bearer", "password=") visible, so the damage is a redacted word, not a
+# destroyed record. The sample rate and the retention window remain the real
+# controls.
+
+# A dangling head value longer than this is treated as COMPLETE - the
+# single-line rules have already had their chance at it.
+WRAP_SCHEME_FRAGMENT_MAX = 7  # one below the 8-char floor _BEARER/_BASIC use
+WRAP_KV_FRAGMENT_MAX = 5
+# A continuation shorter than this is not worth redacting and is far more
+# likely to be the first word of ordinary prose.
+WRAP_TAIL_MIN_CHARS = 3
+
+# Cheap pre-filter: the pass only runs at all on text that mentions an anchor.
+_WRAP_HINT_RE = re.compile(r"(?i)(?:bearer|basic|password|passwd|pwd|token|secret|api[_-]?key|apikey|cookie|sk-)")
+
+# The next line leading credential-charset run: the wrapped fragment.
+_WRAP_TAIL_RE = re.compile(r"^(?P<frag>[A-Za-z0-9\-._~+/]{" + str(WRAP_TAIL_MIN_CHARS) + r",})")
+
+# A continuation that STARTS like a REAL record is not a fragment (rule 4).
+# NARROWED 2026-11-23 (R4, cross-review): the old pattern accepted a log level
+# at a WORD BOUNDARY (`\b` matches between "ERROR" and "-") and a bare
+# `YYYY-MM-DD` prefix, so "Bearer abc" + newline + "ERROR-xyz..." and a line
+# beginning "2026-..." were both read as stacked records and BOTH fragments were
+# stored RAW. A real record follows its level with a SPACE or a COLON (or is the
+# whole line) and its date with `T` or a space; those are the only shapes
+# honoured here.
+_RECORD_START_RE = re.compile(
+    r"(?i)^(?:\d{4}-\d{2}-\d{2}[T ]|(?:TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:[ :]|$))"
+)
+
+_WRAP_SCHEME_VALUE = r"[A-Za-z0-9\-._~+/]{1," + str(WRAP_SCHEME_FRAGMENT_MAX) + "}"
+_WRAP_KV_VALUE = r"[^\s\"\',;&}\[\]]{1," + str(WRAP_KV_FRAGMENT_MAX) + "}"
+
+# Head rules: (pattern over the END of a line, marker kind, minimum joined
+# length for a real credential). The named value group is what gets replaced.
+_WRAP_HEAD_RULES: tuple[tuple[re.Pattern[str], str, int], ...] = (
+    # Scheme-auth classes use a HIGHER joined floor (12): their head value is a
+    # dangling word far more often than a credential fragment ("the bearer of"
+    # + "goodness" is prose), and a real wrapped bearer token is far longer.
+    (re.compile(r"(?i)\bbearer\s+(?P<value>" + _WRAP_SCHEME_VALUE + r")=*$"), "bearer", 12),
+    (re.compile(r"(?i)\bbasic\s+(?P<value>" + _WRAP_SCHEME_VALUE + r")={0,2}$"), "basic", 12),
+    (re.compile(r"\bsk-(?P<value>[A-Za-z0-9_\-]{1,9})$"), "api_key", 10),
+    (
+        re.compile(r"(?i)(?:api[_-]?key|apikey)[\"\']?\s*[:=]\s*[\"\']?(?P<value>" + _WRAP_KV_VALUE + r")$"),
+        "api_key",
+        8,
+    ),
+    (
+        re.compile(
+            r"(?i)(?:client[_-]?secret|secret|refresh[_-]?token|access[_-]?token|token)"
+            r"[\"\']?\s*[:=]\s*[\"\']?(?P<value>" + _WRAP_KV_VALUE + r")$"
+        ),
+        "secret",
+        8,
+    ),
+    (
+        re.compile(
+            r"(?i)(?:aws[_-]?)?secret[_-]?access[_-]?key[\"\']?\s*[:=]\s*[\"\']?"
+            r"(?P<value>" + _WRAP_KV_VALUE + r")$"
+        ),
+        "aws_secret",
+        20,
+    ),
+    (
+        re.compile(
+            r"(?i)(?:set-)?cookie\b[^\n=]{0,80}?(?:session|sess|sid|auth|token|jwt)"
+            r"[A-Za-z0-9_-]*=(?P<value>[^;\s\"\']{1," + str(WRAP_KV_FRAGMENT_MAX) + r"})$"
+        ),
+        "cookie",
+        8,
+    ),
+    (
+        re.compile(r"(?i)(?:password|passwd|pwd)[\"\']?\s*[:=]\s*[\"\']?(?P<value>" + _WRAP_KV_VALUE + r")$"),
+        "password",
+        6,
+    ),
 )
 
 _INSERT_SQL = """
@@ -165,6 +342,56 @@ class Prepared:
     redacted: bool
 
 
+def _redact_wrapped(text: str) -> str:
+    """Redact the CONTINUATION of a credential hard-wrapped across a line break.
+
+    One bounded pass over the line PAIRS; the block comment above
+    _WRAP_HEAD_RULES states exactly what fires and what it still misses. Line
+    boundaries are preserved - a rewrite never moves text between lines -
+    which is what keeps JSONL records, CSV rows and stacked logs intact. Never
+    raises: a redactor must not break a payload, so any fault returns the
+    input unchanged.
+    """
+    if "\n" not in text or _WRAP_HINT_RE.search(text) is None:
+        return text
+    try:
+        lines = text.split("\n")
+        changed = False
+        for index in range(len(lines) - 1):
+            line = lines[index]
+            head = line.removesuffix("\r")
+            if _WRAP_HINT_RE.search(head) is None:
+                continue
+            continuation = lines[index + 1]
+            fragment_match = _WRAP_TAIL_RE.match(continuation)
+            if fragment_match is None or _RECORD_START_RE.match(continuation) is not None:
+                continue
+            fragment = fragment_match.group("frag")
+            for pattern, kind, min_joined in _WRAP_HEAD_RULES:
+                match = pattern.search(head)
+                if match is None:
+                    continue
+                value = match.group("value")
+                if value.isdigit() and kind != "password":
+                    # A dangling ALL-DIGITS value under token/secret/api_key
+                    # is a COUNT, not a truncated credential ("token: 512",
+                    # "tokens: 4096" in a config dump). A numeric password is
+                    # real, so that one class keeps the rule.
+                    continue
+                if len(value) + len(fragment) < min_joined:
+                    continue
+                marker = REDACT_MARKER.format(kind=kind)
+                lines[index] = head[: match.start("value")] + marker + head[match.end("value") :]
+                if line.endswith("\r"):
+                    lines[index] += "\r"
+                lines[index + 1] = marker + continuation[fragment_match.end("frag") :]
+                changed = True
+                break
+        return "\n".join(lines) if changed else text
+    except Exception:  # pragma: no cover - a redactor never breaks a payload
+        return text
+
+
 def redact(text: str) -> str:
     """Scrub credential-shaped substrings from `text`. PURE, best-effort.
 
@@ -175,29 +402,36 @@ def redact(text: str) -> str:
     becomes a TYPED marker (`[REDACTED:bearer]`, `[REDACTED:api_key]`, ...) so a
     reader can see what class of secret was removed.
 
-    THIS IS NOT A GUARANTEE. It is pattern matching: a secret in an
-    unrecognised shape (a bespoke header, a split/encoded token, a credential
-    inside free prose) passes through untouched. It reduces the blast radius
-    of storing payloads at all; it does not make the table safe to publish.
-    The sample rate and the retention window are the real controls.
+    HARD-WRAPPED CREDENTIALS (B9, 2026-11-23): a credential broken across a
+    line break is now caught in its SHORT-HEAD shape. A terminal or log that
+    wraps at column 76 turns one 60-char bearer token into "Bearer abc" +
+    newline + "defgh..." - the head is under the 8-char floor and the tail
+    carries no keyword anchor - and the second pass (_redact_wrapped) redacts
+    BOTH fragments: "Bearer [REDACTED:bearer]" + newline + "[REDACTED:bearer]".
+    It does that WITHOUT re-joining lines: the line boundary is preserved, so
+    JSONL records, CSV rows and stacked log lines keep their shape. A next line
+    counts as a stacked-log RECORD (and is left alone) only when it starts like
+    a real one - a log level followed by a SPACE or a COLON (or alone on the
+    line), or an ISO date followed by `T`/space; `ERROR-...` and a bare `2026-...` are treated as
+    credential fragments since 2026-11-23 (R4), because they were the shapes
+    that left both halves of a wrapped credential raw. The exact shapes that
+    fire, and the ones that still do not, are listed in the block comment above
+    _WRAP_HEAD_RULES - read it before relying on this.
 
-    KNOWN DEFEAT, demonstrated 2026-11-23: a credential HARD-WRAPPED across a
-    line break defeats every rule whose value charset is a single line. A
-    terminal or log that wraps at column 76 turns one 60-char bearer token into
-    "Bearer abc" + newline + "defgh..." — the head is under the 8-char floor and
-    the tail carries no keyword anchor, so BOTH fragments are stored raw. The
-    same is true of "password=hun" + newline + "ter2". Re-joining continuations
-    before matching is deliberately NOT done here: it would need a tokenizer
-    guess about which newline was a wrap and which was a record boundary, and a
-    wrong guess mangles structured payloads (JSONL, CSV, stacked log lines).
-    Treat wrapped secrets as OUT OF SCOPE for redaction and let the retention
-    window bound the exposure.
+    THIS IS NOT A GUARANTEE. It is pattern matching: a secret in an
+    unrecognised shape (a bespoke header, an encoded token, a credential
+    inside free prose, a wrap whose head already looks like a complete
+    credential, a continuation starting with punctuation) passes through
+    untouched. It reduces the blast radius of storing payloads at all; it does
+    not make the table safe to publish. The sample rate and the retention
+    window are the real controls.
 
     Idempotent: redact(redact(x)) == redact(x), because every value class
     excludes the brackets a marker is made of.
     """
     if not text:
         return text
+    text = _redact_wrapped(text)
     for pattern, replacement in _REDACTION_RULES:
         text = pattern.sub(replacement, text)
     return text

@@ -402,3 +402,55 @@ def test_propagate_grants_cte_is_safe_when_the_key_already_holds_the_pairs(pg: s
             await conn.close()
 
     _run(go())
+
+
+# ---------------------------------------------------------------------------
+# 6. tool_pins — the four statements the persistence backend actually ships
+# ---------------------------------------------------------------------------
+# WHY (2026-11-23, cross-review): every behavioural guarantee B2 makes — "a restart
+# keeps the approval", "CHANGED is not FIRST_SEEN", the touch's fingerprint guard —
+# rests on four SQL strings that no test executed. A typo'd column, a missing PK or
+# an ON CONFLICT mismatch would degrade to in-memory pinning at boot with one
+# warning, and a fully green unit suite would not notice. Fakes cannot see SQL.
+
+
+def test_tool_pin_sql_round_trip(pg: str) -> None:
+    """_SAVE/_TOUCH/_SELECT_ALL/_CLEAR against a real PostgreSQL."""
+    from pcai_llm.core.tool_pin import _CLEAR_SQL, _SAVE_SQL, _SELECT_ALL_SQL, _TOUCH_SQL
+
+    async def go() -> None:
+        conn = await _connect()
+        try:
+            await conn.execute(SCHEMA_SQL)
+            await conn.execute(_CLEAR_SQL)
+
+            # save -> one row, readable by the load path
+            await conn.execute(_SAVE_SQL, "mm-rag", "search", "0123456789abcdef")
+            rows = await conn.fetch(_SELECT_ALL_SQL)
+            assert len(rows) == 1
+            assert (rows[0]["server"], rows[0]["tool"]) == ("mm-rag", "search")
+            assert rows[0]["fingerprint"] == "0123456789abcdef"
+            assert rows[0]["first_seen"] is not None
+
+            # upsert, not insert: a re-record replaces the digest and moves first_seen
+            first_seen = rows[0]["first_seen"]
+            await conn.execute(_SAVE_SQL, "mm-rag", "search", "fedcba9876543210")
+            rows = await conn.fetch(_SELECT_ALL_SQL)
+            assert len(rows) == 1, "ON CONFLICT must update, not duplicate"
+            assert rows[0]["fingerprint"] == "fedcba9876543210"
+            assert rows[0]["first_seen"] >= first_seen
+
+            # touch matches only the CURRENT digest
+            status = await conn.execute(_TOUCH_SQL, "mm-rag", "search", "fedcba9876543210")
+            assert status.endswith(" 1"), f"touch of the current digest must update 1 row, got {status}"
+            status = await conn.execute(_TOUCH_SQL, "mm-rag", "search", "0123456789abcdef")
+            assert status.endswith(" 0"), f"touch of a stale digest must update 0 rows, got {status}"
+
+            # clear empties the table
+            await conn.execute(_CLEAR_SQL)
+            assert await conn.fetch(_SELECT_ALL_SQL) == []
+        finally:
+            await conn.close()
+
+    _run(go())
+

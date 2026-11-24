@@ -303,6 +303,20 @@ only — TPM is blind to them.
   tokens per relayed request and made tool SELECTION a 111-way choice.
   `full` re-offers every definition, per site, for a client that cannot
   discover-then-call.
+  The discovery tool (`pcai_tools`) answers three actions: `list` (the server
+  directory), `describe` (one server's full schemas — which also PROMOTES that
+  server so its tools become directly callable for the rest of the turn) and
+  **`search`** (2026-11-23): BM25 over server name, tool name and description,
+  returning the top `tool_search_max_results` candidates (chart:
+  `settings.relay.toolSearchMaxResults`). Search
+  exists because `describe` is keyed by SERVER: finding "the tool that deletes a
+  dataset" used to pull a whole server's catalogue into context. It is pure
+  local ranking — no network, no new dependency, and it does NOT promote, so a
+  search costs a few candidate lines and the model still `describe`s the server
+  it picks. `toolSearchMaxResults` of 0 (or less) disables the action with an
+  explicit error rather than an empty result, because an empty result reads as
+  "no such tool" and sends the model hunting. `list` and `describe` are
+  byte-identical to before.
 - **Rendered call deltas** (`settings.relay.renderDeltas`, default off;
   needs request header `X-PCAI-Relay-Deltas: 1`): each in-cluster tool call
   is re-emitted as a NATIVE OpenAI `tool_call` delta stamped
@@ -329,9 +343,12 @@ the OWASP MCP guidance.
   so the pin covers the whole definition, not just its prose.
 - **When it is observed**: once per relay request, at the catalog → offered-surface
   boundary (`toolrelay.pin_catalog_with_verdicts`). The verdict is
-  FIRST_SEEN / MATCH / CHANGED per `(server, tool)`; pins are in-memory, so a
-  restart re-records them (a persisted pin table is a deliberate non-goal of
-  this cut — it needs a schema migration).
+  FIRST_SEEN / MATCH / CHANGED per `(server, tool)`. **Pins are PERSISTENT**
+  (2026-11-23): they live in the `tool_pins` table, so a pod restart does NOT
+  re-record a definition — an approval survives a restart, and so does a
+  CHANGED verdict. A process that could not READ the table at boot degrades to
+  in-memory pinning for its lifetime and refuses to overwrite what it could not
+  read (writes are disabled rather than risking a silent re-approval).
 - **Modes** (`tool_pin_mode`): `off` inert; `warn` logs the old → new digest
   and keeps offering the tool; `block` drops the changed tool from the
   OFFERED surface **and** refuses the call at dispatch
@@ -349,6 +366,24 @@ the OWASP MCP guidance.
   longer carries is refused at dispatch ("vanished from the listing since this
   grant approved it") and reported during the offer pass. A tool that was
   NEVER pinned still dispatches: the defence must not break a first run.
+- **Re-approving a changed definition** (`scripts/tool_pin_admin.py`,
+  2026-11-23): a DURABLE pin is also a trap — a server that legitimately ships a
+  new description stays refused until an operator re-approves it, and there is
+  deliberately no automatic re-approval (a rewritten definition must never be
+  able to approve itself). The supported lever is a small operator CLI, not a
+  hand-edited row:
+  `python scripts/tool_pin_admin.py list` prints every pin — server, tool,
+  fingerprint, first_seen, last_seen — so the digest being retired is READ
+  before it is retired; `... clear --server S --tool T` deletes ONE row, so the
+  next observation of that tool is FIRST_SEEN and the definition being served is
+  approved; `... clear --all --yes` is the fleet-wide version (irreversible, so
+  it needs the explicit `--yes`). It reuses the store's own SQL constants and
+  refuses to guess a target (a half target or a mixed `--all --server` ask is a
+  usage error), and it FAILS LOUDLY: exit 2 when the database is not
+  configured, exit 1 when it is unreachable or `tool_pins` is missing — never an
+  empty list that reads as "no pins". **Restart the gateway after a clear**: the
+  running process still holds the retired digest in memory, so `block` mode
+  keeps refusing until it reloads.
 - **Fail-open on fault**: a fingerprint error or a missing verdict for an
   unpinned tool dispatches the call. A pinning bug must never break a turn.
 
@@ -412,14 +447,30 @@ can cause in a comment beside it.
   [Tool-definition pinning](#tool-definition-pinning-rug-pull-defence).
   `warn` logs the old → new digest and keeps offering the tool — evidence,
   not prevention. `block` (G2) drops the changed tool from the OFFERED
-  surface AND refuses the call at dispatch. **Pins are in-memory**: a pod
-  restart re-records every definition, so `block` protects a running pod from
-  a change made after first sighting and nothing more — it is not a durable
-  approval. The GRANT is untouched in every mode: a definition change is not
+  surface AND refuses the call at dispatch. **Pins are PERSISTENT**
+  (2026-11-23): the approval outlives the pod, so `block` is a durable control,
+  not a per-process tripwire. The one lever is an operator re-approval, and it
+  has a supported path: `python scripts/tool_pin_admin.py clear` (list first,
+  then restart the gateway) — see
+  [Tool-definition pinning](#tool-definition-pinning-rug-pull-defence). There is
+  deliberately NO automatic re-approval: a rewritten definition must not be able
+  to approve itself. A pod that could not READ the table at boot falls back to
+  **in-memory** pinning for its lifetime and disables writes, so it can never
+  overwrite an approval it never saw — the trade is that its own pins do not
+  survive that restart.
+  **Cold listing cache** (2026-11-23): the offer/dispatch gate needs the current
+  definition to compare. A tool that was NEVER pinned still dispatches — a first
+  run must work. A tool that IS pinned but has no cached listing to verify against
+  is REFUSED in `block` mode (we know what was approved; we cannot prove the live
+  definition still matches it) and dispatches with a WARNING in `warn`. This is a
+  separate rule from fail-open-on-fault: a pinning *fault* still dispatches.
+  The GRANT is untouched in every mode: a definition change is not
   an ACL change. Failure mode of `block`: a server that legitimately ships a
-  new description loses that one tool from every relay turn until a restart
-  re-records the pin (a self-inflicted one-tool outage) — which is why the
-  tracked default is `warn`.
+  new description loses that one tool from every relay turn until an operator
+  re-approves it — a RESTART does not help (the pin is durable; restarting only
+  reloads the same digest), so the lever is
+  `scripts/tool_pin_admin.py clear` followed by a restart. That is a
+  self-inflicted one-tool outage, which is why the tracked default is `warn`.
 - **Tool-result injection screening** (`settings.relay.toolInjectionScreen` →
   `PCAI_LLM_TOOL_INJECTION_SCREEN`): `off` | `warn` | `annotate` | `block`,
   chart default `annotate` (code default `warn`; G2 `annotate`). Detectors and
@@ -431,9 +482,11 @@ can cause in a comment beside it.
   traffic. `block` substitutes a short refusal and is the mode that can lose
   information — a false positive withholds a legitimate document from the
   model. **Coverage, honestly**: screening runs in the relay's tool-result path
-  (`_prepare_tool_content`) and on the compressed-original retrieval path; the
-  federated **`/mcp` surface is not screened yet**, so this knob is not
-  whole-gateway coverage. An unknown value falls back to `warn` (and logs
+  (`_prepare_tool_content`), on the compressed-original retrieval path, AND on
+  the federated **`/mcp` surface** (2026-11-23, applied per model-visible field
+  so the JSON envelope stays parseable). Pinning likewise covers both surfaces
+  and shares one process-wide pin store, so a pin recorded on either protects
+  both. An unknown value falls back to `warn` (and logs
   once) — a typo degrades to detection without mitigation, never to `block`
   (which would refuse legitimate results) or `off`.
 - **Pre-task playbook injection** (`settings.memory.playbookInject.*` →
@@ -480,11 +533,18 @@ can cause in a comment beside it.
   cookies, passwords and DSN userinfo into typed markers — best-effort pattern
   matching that reduces blast radius and is NOT a guarantee; leave it on. Two
   limits worth knowing before relying on it: a credential HARD-WRAPPED across a
-  line break is stored raw (the rules match within one line), and **coverage is
+  line break is caught only in its SHORT-HEAD shape — both fragments become
+  markers without ever re-joining the lines, and a wrap whose head already looks
+  like a complete credential, a continuation starting with punctuation, or a
+  wrap across more than one break still passes through (the block comment above
+  `_WRAP_HEAD_RULES` lists exactly what fires) — and **coverage is
   the server-executed MCP path only** — ACL denials, pin refusals, unknown-tool
   and client-dispatch steps write a trace row with NO payload, so a red-team set
-  built from this table under-samples exactly the refusals. The table is also
-  write-only today: no judge or console reads it yet. Failure mode: sampling on with
+  built from this table under-samples exactly the refusals. The table is READ by
+  `scripts/agent_eval_report.py` (below), which reports its HEALTH — rows,
+  oldest/newest, share truncated, share redacted — and deliberately does not
+  render payload text (the sensitive half; query the row when a specific turn is
+  being investigated). Failure mode: sampling on with
   `redact: false` writes whatever the fleet touched, credentials included,
   into Postgres, and `retentionDays: 0` makes it unbounded. Payloads are DB
   rows, not OTel spans — they are not exported and do not appear in a trace
@@ -511,6 +571,24 @@ can cause in a comment beside it.
   flagging every turn — a zeroed knob must not fail everything. Failure
   mode: this is a SCORER, not a gate — wiring a build gate to verdicts
   before reading real ones turns scorer noise into failed builds.
+- **Reading the quality layer** (`scripts/agent_eval_report.py`, 2026-11-23):
+  both quality tables were WRITE-ONLY — an operator who turned the knobs on saw
+  nothing, so a working feature and a silently broken one looked identical. This
+  reader makes them useful now: READ-ONLY (every statement is a SELECT), no
+  model, no judge, no new dependency. It prints (a) verdict counts per verdict
+  over `--days` (default 7) with the number of turns scored, so "nothing is
+  firing" is distinguishable from "nothing is being recorded"; (b) the WORST
+  recent turns — `request_id`, every non-clean verdict and its reason — ranked
+  by their worst single finding, then by finding count, then by recency, over
+  the newest `--scan-rows` verdict rows (default 5000), `--limit` shown
+  (default 10); and (c) `agent_trace_payloads` health TABLE-WIDE: rows,
+  oldest/newest, share truncated, share redacted (retention is a property of the
+  whole table, so that section is deliberately not windowed). An empty report is
+  a normal ANSWER and names the flags that explain it — `agent_eval_enabled` and
+  `trace_payload_sampling` are both OFF by default. Exit 2 = database not
+  configured, exit 1 = unreachable or the tables do not exist. It never renders
+  payload text and it is not a gate: wiring verdicts into a build gate stays the
+  separate decision the bullet above describes.
 - **Wiring**: `settings.<section>.<key>` in the values document → one
   `PCAI_LLM_*` env var on the gateway container
   (`helm/templates/deployment.yaml`). Validate with `helm template
