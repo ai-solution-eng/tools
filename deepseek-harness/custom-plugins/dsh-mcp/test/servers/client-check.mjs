@@ -475,6 +475,108 @@ await check('a connected server can list its tools', () => {
   assert.match(text, /search/)
 })
 
+await check('a federating server lists the servers behind it', () => {
+  const tree = renderPage({
+    form: readyForm([
+      { id: 'gateway', serverName: 'gateway', transport: 'streamable-http', url: 'https://gw.example.com/mcp', enabled: true },
+    ]),
+    live: {
+      status: 'ready',
+      error: null,
+      data: {
+        bridge: { available: true },
+        servers: [
+          {
+            id: 'gateway',
+            serverName: 'gateway',
+            state: 'ready',
+            fiberState: 'active',
+            toolCount: 2,
+            tools: ['mcp_call', 'mcp_catalog'],
+            upstream: {
+              tool: 'mcp_catalog',
+              servers: [
+                { server: 'applygate', toolCount: 6, reachable: true },
+                { server: 'k8s-ops', toolCount: 20, reachable: true },
+                { server: 'logsearch', toolCount: 0, reachable: false, error: 'HTTP 500' },
+              ],
+            },
+          },
+        ],
+        problems: [],
+        external: [],
+      },
+    },
+  })
+  const text = textOf(tree)
+  // The row still reports the gateway's own tools, and now says how many
+  // servers those two tools stand for …
+  assert.match(text, /Tools \(2\)/)
+  assert.match(text, /3 servers behind/)
+  // … and now names what the connection actually offers.
+  assert.match(text, /Servers behind gateway/)
+  assert.match(text, /applygate/)
+  assert.match(text, /6 tools/)
+  assert.match(text, /k8s-ops/)
+  assert.match(text, /20 tools/)
+  assert.match(text, /logsearch/)
+  assert.match(text, /HTTP 500/, 'an unreachable upstream carries its reason')
+  const blocks = byClass(tree, 'dsh-mcp-servers__upstream')
+  assert.equal(blocks.length, 1, 'one upstream block per federating server')
+})
+
+await check('a plain server shows no upstream block', () => {
+  const tree = renderPage({
+    form: readyForm([
+      { id: 'plain', serverName: 'plain', transport: 'streamable-http', url: 'https://plain.example.com/mcp', enabled: true },
+    ]),
+    live: {
+      status: 'ready',
+      error: null,
+      data: {
+        bridge: { available: true },
+        servers: [{ id: 'plain', serverName: 'plain', state: 'ready', fiberState: 'active', toolCount: 2, tools: ['fetch', 'search'] }],
+        problems: [],
+        external: [],
+      },
+    },
+  })
+  assert.equal(byClass(tree, 'dsh-mcp-servers__upstream').length, 0)
+  assert.equal(textOf(tree).includes('Servers behind'), false)
+})
+
+await check('a gateway configured elsewhere lists its upstream servers too', () => {
+  const tree = renderPage({
+    form: readyForm([]),
+    live: {
+      status: 'ready',
+      error: null,
+      data: {
+        bridge: { available: true },
+        servers: [],
+        problems: [],
+        external: [
+          {
+            id: 'mcp-gw',
+            serverName: 'legacy-gw',
+            transport: 'streamable-http',
+            endpoint: 'https://legacy.example.com/mcp',
+            fiberState: 'active',
+            toolCount: 2,
+            tools: ['mcp_catalog', 'mcp_call'],
+            upstream: { tool: 'mcp_catalog', servers: [{ server: 'github', toolCount: 7, reachable: true }] },
+          },
+        ],
+      },
+    },
+  })
+  const text = textOf(tree)
+  assert.match(text, /Servers behind legacy-gw/)
+  assert.match(text, /github/)
+  assert.match(text, /7 tools/)
+  assert.equal(byClass(tree, 'dsh-mcp-servers__upstream').length, 1)
+})
+
 await check('the editor masks a credential header value', () => {
   const base = {
     id: '', serverName: 'x', transport: 'streamable-http', url: 'http://x/mcp',

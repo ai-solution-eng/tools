@@ -53,6 +53,9 @@ const SAVE_ENDPOINT = 'api/mcp-servers/save'
 /** Cap on server instructions; generous so large-instruction servers work. */
 const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
 
+/** Upstream rows rendered under one federating server before summarizing the rest. */
+const MAX_UPSTREAM_ROWS = 32
+
     const EN = {
       'nav': 'MCP servers',
       'title': 'MCP servers',
@@ -77,6 +80,12 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'tools.list': 'Tools ({count})',
       'tools.one': '1 tool',
       'tools.many': '{count} tools',
+      'upstream.title': 'Servers behind {server}',
+      'upstream.count': '{count} servers behind',
+      'upstream.tools': '{count} tools',
+      'upstream.toolOne': '1 tool',
+      'upstream.more': '+{count} more',
+      'upstream.unreachable': 'unreachable',
       'action.edit': 'Edit',
       'action.enable': 'Enable',
       'action.disable': 'Disable',
@@ -184,6 +193,12 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       'tools.list': '工具（{count}）',
       'tools.one': '1 个工具',
       'tools.many': '{count} 个工具',
+      'upstream.title': '{server} 背后的服务器',
+      'upstream.count': '背后有 {count} 个服务器',
+      'upstream.tools': '{count} 个工具',
+      'upstream.toolOne': '1 个工具',
+      'upstream.more': '另有 {count} 个',
+      'upstream.unreachable': '无法连接',
       'action.edit': '编辑',
       'action.enable': '启用',
       'action.disable': '禁用',
@@ -301,6 +316,12 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       '.dsh-mcp-servers__tools{margin-top:2px}',
       '.dsh-mcp-servers__toolsSummary{cursor:pointer;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
       '.dsh-mcp-servers__toolList{margin:4px 0 0;padding-left:18px;max-height:200px;overflow:auto;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}',
+      '.dsh-mcp-servers__upstream{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding-left:10px;border-left:1px solid var(--dsw-alias-border-l2)}',
+      '.dsh-mcp-servers__upstreamTitle{font-size:12px;line-height:18px;font-weight:500;color:var(--dsw-alias-label-secondary)}',
+      '.dsh-mcp-servers__upstreamItem{display:flex;align-items:baseline;gap:6px;min-width:0;flex-wrap:wrap;font-size:12px;line-height:18px}',
+      '.dsh-mcp-servers__upstreamName{color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}',
+      '.dsh-mcp-servers__upstreamMeta{color:var(--dsw-alias-label-tertiary)}',
+      '.dsh-mcp-servers__dot--small{width:5px;height:5px}',
       '.dsh-mcp-servers__error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
       '.dsh-mcp-servers__rowActions{display:flex;align-items:center;gap:6px;flex:none;flex-wrap:wrap;justify-content:flex-end}',
       '.dsh-mcp-servers__empty{display:flex;flex-direction:column;gap:4px;padding:20px 12px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}',
@@ -861,6 +882,45 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
      * ---------------------------------------------------------------- */
 
     /**
+     * The upstream servers behind a federating gateway.
+     *
+     * A gateway's own tool list is two entries — `mcp_catalog` and `mcp_call` —
+     * which is the truth about the gateway and not about what it offers. The
+     * servers it federates are what an operator opens this page to see, so they
+     * are listed here, from the same discovery the status chip uses.
+     * @param {{ serverName: string, upstream: any, t: Function }} props - block props.
+     * @returns {any} element.
+     */
+    function UpstreamBlock(props) {
+      const { serverName, upstream, t } = props
+      const servers = Array.isArray(upstream?.servers) ? upstream.servers : []
+      const shown = servers.slice(0, MAX_UPSTREAM_ROWS)
+      const hidden = servers.length - shown.length
+      return h('div', { className: 'dsh-mcp-servers__upstream' },
+        h('div', { className: 'dsh-mcp-servers__upstreamTitle' }, t('upstream.title', { server: serverName })),
+        upstream?.error && servers.length === 0
+          ? h('div', { className: 'dsh-mcp-servers__hint' }, upstream.error)
+          : null,
+        shown.map((server) =>
+          h('div', { className: 'dsh-mcp-servers__upstreamItem', key: server.server },
+            h('span', {
+              className: 'dsh-mcp-servers__dot dsh-mcp-servers__dot--small',
+              'data-tone': server.reachable === false ? 'error' : 'ok',
+              'aria-hidden': true,
+            }),
+            h('span', { className: 'dsh-mcp-servers__upstreamName' }, server.server),
+            h('span', { className: 'dsh-mcp-servers__upstreamMeta' },
+              server.reachable === false
+                ? server.error || t('upstream.unreachable')
+                : Number(server.toolCount ?? 0) === 1
+                  ? t('upstream.toolOne')
+                  : t('upstream.tools', { count: Number(server.toolCount ?? 0) })),
+          )),
+        hidden > 0 ? h('div', { className: 'dsh-mcp-servers__hint' }, t('upstream.more', { count: hidden })) : null,
+      )
+    }
+
+    /**
      * One configured server.
      * @param {{ row: any, live: any, problem: any, t: Function, onEdit: Function, onToggle: Function, onRemove: Function }} props - row props.
      * @returns {any} element.
@@ -871,8 +931,15 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
       const endpoint = row.transport === 'stdio' ? row.command : row.url
       const state = enabled ? live?.state : 'disabled'
       const toolCount = typeof live?.toolCount === 'number' ? live.toolCount : undefined
+      // A gateway's own two tools are not what it offers: say how many servers
+      // sit behind it, so the row is honest before the list below is read.
+      const upstreamCount = Array.isArray(live?.upstream?.servers) ? live.upstream.servers.length : 0
       const metaText = enabled && typeof toolCount === 'number'
-        ? `${t(stateKey(state))} · ${toolCount === 1 ? t('tools.one') : t('tools.many', { count: toolCount })}`
+        ? [
+            t(stateKey(state)),
+            toolCount === 1 ? t('tools.one') : t('tools.many', { count: toolCount }),
+            upstreamCount > 0 ? t('upstream.count', { count: upstreamCount }) : null,
+          ].filter(Boolean).join(' · ')
         : t(enabled ? stateKey(state) : 'state.disabled')
       const error = problem?.message ?? live?.error
       return h('li', { className: 'dsh-mcp-servers__row' },
@@ -895,6 +962,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                   t('tools.list', { count: live.tools.length })),
                 h('ul', { className: 'dsh-mcp-servers__toolList' },
                   live.tools.map((name) => h('li', { key: name }, name))))
+            : null,
+          enabled && live?.upstream
+            ? h(UpstreamBlock, { serverName: row.serverName, upstream: live.upstream, t })
             : null,
           error
             ? h('div', { className: 'dsh-mcp-servers__error' }, problem ? `${t('problem.title')}: ${error}` : error)
@@ -1408,7 +1478,12 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                         : null,
                       typeof entry.toolCount === 'number'
                         ? h('div', { className: 'dsh-mcp-servers__meta' },
-                            entry.toolCount === 1 ? t('tools.one') : t('tools.many', { count: entry.toolCount }))
+                            [
+                              entry.toolCount === 1 ? t('tools.one') : t('tools.many', { count: entry.toolCount }),
+                              Array.isArray(entry.upstream?.servers) && entry.upstream.servers.length > 0
+                                ? t('upstream.count', { count: entry.upstream.servers.length })
+                                : null,
+                            ].filter(Boolean).join(' · '))
                         : null,
                       !entry.disabled && Array.isArray(entry.tools) && entry.tools.length > 0
                         ? h('details', { className: 'dsh-mcp-servers__tools' },
@@ -1416,6 +1491,9 @@ const DEFAULT_MAX_INSTRUCTION_BYTES = 262144
                               t('tools.list', { count: entry.tools.length })),
                             h('ul', { className: 'dsh-mcp-servers__toolList' },
                               entry.tools.map((name) => h('li', { key: name }, name))))
+                        : null,
+                      !entry.disabled && entry.upstream
+                        ? h(UpstreamBlock, { serverName: entry.serverName, upstream: entry.upstream, t })
                         : null,
                     ),
                   ),

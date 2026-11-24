@@ -15,6 +15,55 @@ import { apply } from '../../src/servers/index.js'
 
 const WRITE = Symbol.for('cosmokit.volatile.write')
 
+/* ------------------------------------------------------------------ *
+ * Network stub
+ * ------------------------------------------------------------------ */
+
+/**
+ * A snapshot read asks a federating server for its upstream list, so it is a
+ * network operation. Every check runs against this stub: by default nothing is
+ * a gateway (404 on the derived catalog URL, which is the "plain server"
+ * answer), and a check that wants one installs its own responder.
+ * @type {(url: string, init: any) => Promise<Response>}
+ */
+let respond = async () => new Response('not found', { status: 404 })
+globalThis.fetch = async (input, init) => respond(String(input), init ?? {})
+
+/**
+ * A minimal federating gateway: one MCP handshake, a catalog tool, and the
+ * upstream list that tool answers with.
+ * @param {Array<Record<string, any>>} catalog - upstream rows.
+ * @returns {(url: string, init: any) => Promise<Response>} fetch responder.
+ */
+function gatewayResponder(catalog) {
+  return async (url, init) => {
+    const method = init.method ?? 'GET'
+    if (method === 'DELETE') return new Response(null, { status: 200 })
+    if (method !== 'POST') return new Response('not found', { status: 404 })
+    const message = JSON.parse(String(init.body ?? '{}'))
+    const reply = (result) =>
+      new Response(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    if (message.method === 'initialize') {
+      return reply({
+        protocolVersion: '2026-07-28',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'mock-gateway', version: '1.0.0' },
+      })
+    }
+    if (message.method === 'notifications/initialized') return new Response(null, { status: 202 })
+    if (message.method === 'tools/list') {
+      return reply({ tools: [{ name: 'mcp_catalog' }, { name: 'mcp_call' }] })
+    }
+    if (message.method === 'tools/call') {
+      return reply({ content: [{ type: 'text', text: JSON.stringify({ servers: catalog }) }] })
+    }
+    return new Response(null, { status: 400 })
+  }
+}
+
 const results = []
 /**
  * Run one check.
@@ -462,6 +511,122 @@ await check('retry disposes a failed child and mounts it again', async () => {
   assert.deepEqual(state.disposed, ['boom'], 'the failed child is disposed before the retry')
   assert.equal(state.mounts.length, 2, 'the retry mounts it again')
   assert.equal(body.servers[0].state, 'failed', 'and reports that it failed again')
+})
+
+/* ------------------------------------------------------------------ *
+ * Upstream servers behind a federating gateway
+ * ------------------------------------------------------------------ */
+
+await check('a federating gateway lists the servers behind it', async () => {
+  respond = gatewayResponder([
+    { server: 'applygate', tool_count: 6 },
+    { server: 'k8s-ops', tool_count: 20 },
+    { server: 'logsearch', tool_count: 0, status: 'error' },
+  ])
+  const { start, snapshot } = createContext({
+    servers: [
+      { id: 'gw', serverName: 'gw', url: 'https://gw.example.com/mcp', headers: { Authorization: 'Bearer super-secret' } },
+    ],
+    // The registry says the gateway exposes a catalog tool, which is the cheap
+    // signal that this connection stands for more than itself.
+    tools: [{ name: 'mcp__gw__mcp_catalog' }, { name: 'mcp__gw__mcp_call' }],
+  })
+  start()
+  await tick()
+  const body = await snapshot()
+  const [server] = body.servers
+  assert.equal(server.toolCount, 2, 'the gateway still reports its own two tools')
+  assert.equal(server.upstream.tool, 'mcp_catalog', 'the tool that answered is reported')
+  assert.deepEqual(server.upstream.servers.map((entry) => entry.server), ['applygate', 'k8s-ops', 'logsearch'])
+  assert.equal(server.upstream.servers[1].toolCount, 20)
+  assert.equal(server.upstream.servers[2].reachable, false, 'a failure status marks an upstream unreachable')
+  assert.equal(JSON.stringify(body).includes('super-secret'), false, 'the credential never reaches the browser')
+  respond = async () => new Response('not found', { status: 404 })
+})
+
+await check('the upstream list is cached, not re-probed on every read', async () => {
+  let calls = 0
+  const gateway = gatewayResponder([{ server: 'github', tool_count: 5 }])
+  respond = (url, init) => {
+    calls += 1
+    return gateway(url, init)
+  }
+  const { start, snapshot } = createContext({
+    servers: [{ id: 'gw', serverName: 'gw', url: 'https://gw.example.com/mcp' }],
+    tools: [{ name: 'mcp__gw__mcp_catalog' }],
+  })
+  start()
+  await tick()
+  await snapshot()
+  const afterFirst = calls
+  assert.ok(afterFirst > 0, 'the first read probes the gateway')
+  const second = await snapshot()
+  assert.equal(calls, afterFirst, 'a second read reuses the cached answer')
+  assert.equal(second.servers[0].upstream.servers[0].server, 'github')
+  respond = async () => new Response('not found', { status: 404 })
+})
+
+await check('a plain server reports no upstream block', async () => {
+  respond = async () => new Response('not found', { status: 404 })
+  const { start, snapshot } = createContext({
+    servers: [{ id: 'plain', serverName: 'plain', url: 'https://plain.example.com/mcp' }],
+    tools: [{ name: 'mcp__plain__search' }, { name: 'mcp__plain__fetch' }],
+  })
+  start()
+  await tick()
+  const body = await snapshot()
+  assert.equal(body.servers[0].toolCount, 2)
+  assert.equal(body.servers[0].upstream, undefined, 'a 404 catalog means this is not a gateway')
+})
+
+await check('a gateway configured elsewhere lists its upstream servers too', async () => {
+  respond = gatewayResponder([{ server: 'github', tool_count: 5 }])
+  const { start, snapshot } = createContext({
+    external: [
+      {
+        options: { id: 'mcp-gw', name: '@deepseek-ai/dsh-mcp-client' },
+        fiber: {
+          state: 2,
+          effectiveConfig: { transport: 'streamable-http', serverName: 'legacy-gw', url: 'https://legacy.example.com/mcp' },
+        },
+      },
+    ],
+    tools: [{ name: 'mcp__legacy-gw__mcp_catalog' }],
+  })
+  start()
+  await tick()
+  const body = await snapshot()
+  assert.equal(body.external[0].serverName, 'legacy-gw')
+  assert.deepEqual(body.external[0].upstream.servers.map((entry) => entry.server), ['github'])
+  respond = async () => new Response('not found', { status: 404 })
+})
+
+await check('a disabled external row is not probed for upstreams', async () => {
+  let calls = 0
+  const gateway = gatewayResponder([{ server: 'github', tool_count: 5 }])
+  respond = (url, init) => {
+    calls += 1
+    return gateway(url, init)
+  }
+  const { start, snapshot } = createContext({
+    external: [
+      {
+        options: { id: 'mcp-gw', name: '@deepseek-ai/dsh-mcp-client' },
+        disabled: true,
+        fiber: {
+          state: 2,
+          effectiveConfig: { transport: 'streamable-http', serverName: 'legacy-gw', url: 'https://legacy.example.com/mcp' },
+        },
+      },
+    ],
+    tools: [{ name: 'mcp__legacy-gw__mcp_catalog' }],
+  })
+  start()
+  await tick()
+  const body = await snapshot()
+  assert.equal(body.external[0].upstream, undefined)
+  assert.equal(calls, 0, 'a disabled server has nothing to ask')
+  respond = async () => new Response('not found', { status: 404 })
 })
 
 /* ------------------------------------------------------------------ *

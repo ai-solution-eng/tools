@@ -39,6 +39,10 @@ import { createRequire } from 'node:module'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+// Upstream discovery is the status half's question, answered here with the same
+// code: a gateway's own tool list says nothing about the servers behind it, and
+// the Settings page has to show what the status chip shows.
+import { connectionFor, resolveUpstreamSettings, withUpstream } from '../status/upstream.js'
 import { probeMcpHttp } from './probe.js'
 import {
   Config as McpServersConfig,
@@ -262,11 +266,14 @@ function registeredToolNames(ctx, serverName) {
  * Read the MCP rows other layers of the profile configure. These are not
  * managed by this page: they belong to the profile patch, a bundle, or an
  * agent preset, and their configuration is not this plugin's to rewrite.
- * Request headers never leave the Host.
+ * Request headers never leave the Host — they are handed to the upstream probe
+ * and dropped from the row it returns.
  * @param {any} ctx - plugin context.
- * @returns {Array<Record<string, any>>} external rows.
+ * @param {ReturnType<typeof resolveUpstreamSettings>} settings - resolved settings.
+ * @param {Map<string, any>} cache - upstream cache shared with the managed rows.
+ * @returns {Promise<Array<Record<string, any>>>} external rows.
  */
-function externalRows(ctx) {
+async function externalRows(ctx, settings, cache) {
   let entries = []
   try {
     const loader = ctx.loader
@@ -287,6 +294,7 @@ function externalRows(ctx) {
     }
     if (!config || typeof config.serverName !== 'string' || typeof config.transport !== 'string') continue
     const transport = config.transport
+    const toolNames = registeredToolNames(ctx, config.serverName)
     const row = {
       id: String(entry.options?.id ?? config.serverName),
       serverName: config.serverName,
@@ -296,10 +304,29 @@ function externalRows(ctx) {
       toolCount: registeredToolCount(ctx, config.serverName),
       // A server configured in the profile patch lists its tools here too: the
       // page is where an operator looks, whichever layer declared the server.
-      tools: registeredToolNames(ctx, config.serverName),
+      tools: toolNames,
     }
     if (transport === 'streamable-http') row.endpoint = displayEndpoint(config.url)
     else if (typeof config.command === 'string') row.command = config.command.split(/\s+/)[0]
+    // A gateway declared in the profile patch federates exactly like one this
+    // page manages, so it answers the same question — but only while its bridge
+    // is actually running: a disabled or failed row has nothing to ask.
+    if (transport === 'streamable-http' && typeof config.url === 'string' && config.url.trim()) {
+      const connection = connectionFor(
+        {
+          serverName: config.serverName,
+          url: config.url,
+          headers: config.headers,
+          catalogUrl: config.catalogUrl,
+          toolNames: toolNames ?? [],
+          endpoint: row.endpoint,
+          connected: !row.disabled && row.fiberState === 'active',
+        },
+        settings,
+      )
+      const resolved = await withUpstream(connection, settings, cache)
+      if (resolved.upstream !== undefined) row.upstream = resolved.upstream
+    }
     rows.push(row)
   }
   return rows
@@ -403,6 +430,10 @@ async function probeDraft(draft) {
 export function apply(ctx, config) {
   /** Mounted children, keyed by the bridge's `serverName`. */
   const mounted = new Map()
+  /** Upstream discoveries, keyed by server name and endpoint. */
+  const upstreams = new Map()
+  /** Upstream discovery settings, resolved once from this row's config. */
+  const upstreamSettings = resolveUpstreamSettings(config)
   /** Resolved bridge module, or undefined while unresolved. */
   let bridge
   /** Last bridge resolution failure and when it happened. */
@@ -568,30 +599,99 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Build the snapshot served to the browser.
-   * @returns {Record<string, any>} snapshot.
+   * One configured server: what the page shows, plus the facts the upstream
+   * probe needs. `target` never reaches the browser — it carries the MCP
+   * credential.
+   * @param {{ id: string, row: Record<string, any> }} server - mountable server.
+   * @returns {Record<string, any>} row view.
    */
-  const snapshot = () => {
+  const describe = (server) => {
+    const serverName = server.row.serverName
+    const record = mounted.get(serverName)
+    const state = fiberStateName(record?.fiber?.state)
+    const failed = Boolean(record?.error) || state === 'failed'
+    return {
+      id: server.id,
+      serverName,
+      transport: server.row.transport,
+      endpoint: server.row.transport === 'streamable-http' ? server.row.url : server.row.command,
+      state: failed ? 'failed' : state === 'active' ? 'ready' : record?.fiber ? 'starting' : 'pending',
+      fiberState: state,
+      toolCount: registeredToolCount(ctx, serverName),
+      // The names, so the page can list them; the count alone left the
+      // operator guessing what a server actually offers.
+      tools: registeredToolNames(ctx, serverName),
+      error: record?.error,
+      target: {
+        url: server.row.url,
+        headers: server.row.headers,
+        catalogUrl: server.row.catalogUrl,
+      },
+    }
+  }
+
+  /**
+   * Add the upstream servers behind a federating one.
+   *
+   * A gateway reports two tools of its own (`mcp_catalog`, `mcp_call`), which
+   * is the truth about the gateway and not about what it offers. The servers it
+   * federates are what an operator opens this page to see, so they are resolved
+   * here through the same discovery the status chip uses — one implementation,
+   * one TTL cache, and the two surfaces cannot disagree about one gateway.
+   * @param {Record<string, any>} server - row view from `describe()`.
+   * @param {ReturnType<typeof resolveUpstreamSettings>} settings - resolved settings.
+   * @returns {Promise<Record<string, any>>} row view, with `upstream` when it federates.
+   */
+  const addUpstream = async (server, settings) => {
+    if (server.transport !== 'streamable-http' || !server.target.url) return server
+    const connection = connectionFor(
+      {
+        serverName: server.serverName,
+        url: server.target.url,
+        headers: server.target.headers,
+        catalogUrl: server.target.catalogUrl,
+        toolNames: server.tools ?? [],
+        endpoint: server.endpoint,
+        connected: server.state === 'ready',
+      },
+      settings,
+    )
+    const resolved = await withUpstream(connection, settings, upstreams)
+    return resolved.upstream === undefined ? server : { ...server, upstream: resolved.upstream }
+  }
+
+  /**
+   * Whitelist the fields that may reach the browser.
+   * @param {Record<string, any>} server - row view.
+   * @returns {Record<string, any>} wire row.
+   */
+  const toWire = (server) => {
+    const wire = {
+      id: server.id,
+      serverName: server.serverName,
+      transport: server.transport,
+      endpoint: server.endpoint,
+      state: server.state,
+      fiberState: server.fiberState,
+      toolCount: server.toolCount,
+      tools: server.tools,
+      error: server.error,
+    }
+    if (server.upstream !== undefined) wire.upstream = server.upstream
+    return wire
+  }
+
+  /**
+   * Build the snapshot served to the browser.
+   * @param {{ upstream?: boolean }} [options] - whether to resolve upstream servers.
+   * @returns {Promise<Record<string, any>>} snapshot.
+   */
+  const snapshot = async (options = {}) => {
     const desired = mountableServers(configuredRows())
-    const servers = desired.servers.map((server) => {
-      const serverName = server.row.serverName
-      const record = mounted.get(serverName)
-      const state = fiberStateName(record?.fiber?.state)
-      const failed = Boolean(record?.error) || state === 'failed'
-      return {
-        id: server.id,
-        serverName,
-        transport: server.row.transport,
-        endpoint: server.row.transport === 'streamable-http' ? server.row.url : server.row.command,
-        state: failed ? 'failed' : state === 'active' ? 'ready' : record?.fiber ? 'starting' : 'pending',
-        fiberState: state,
-        toolCount: registeredToolCount(ctx, serverName),
-        // The names, so the page can list them; the count alone left the
-        // operator guessing what a server actually offers.
-        tools: registeredToolNames(ctx, serverName),
-        error: record?.error,
-      }
-    })
+    const rows = desired.servers.map(describe)
+    const resolved = options.upstream === false
+      ? rows
+      : await Promise.all(rows.map((server) => addUpstream(server, upstreamSettings)))
     return {
       generatedAt: new Date().toISOString(),
       writable: true,
@@ -604,9 +704,9 @@ export function apply(ctx, config) {
             // unavailable made a fresh install look broken.
             ? { available: true }
             : { available: false, error: 'the MCP bridge has not been resolved yet' },
-      servers,
+      servers: resolved.map(toWire),
       problems: desired.problems,
-      external: externalRows(ctx),
+      external: await externalRows(ctx, upstreamSettings, upstreams),
     }
   }
 
@@ -643,7 +743,9 @@ export function apply(ctx, config) {
             } else {
               void reconcile()
             }
-            return jsonResponse(snapshot())
+            // `?upstream=0` answers without probing, for a caller that only
+            // wants the registry view.
+            return jsonResponse(await snapshot({ upstream: url.searchParams.get('upstream') !== '0' }))
           } catch (error) {
             return jsonResponse(
               { generatedAt: new Date().toISOString(), error: messageOf(error), servers: [], problems: [], external: [] },

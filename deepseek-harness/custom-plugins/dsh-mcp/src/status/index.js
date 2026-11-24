@@ -21,7 +21,8 @@
  * @module
  */
 
-import { catalogCandidatesFor, commandName, fetchCatalog, messageOf, probeMcpHttp, redactUrl } from './probe.js'
+import { catalogCandidatesFor, commandName, messageOf, probeMcpHttp, redactUrl } from './probe.js'
+import { UPSTREAM_BOUNDS, UPSTREAM_DEFAULTS, resolveUpstreamSettings, withUpstream } from './upstream.js'
 
 /** Loader rows this plugin reports on. */
 const MCP_CLIENT_SPECIFIER = 'mcp-client'
@@ -32,37 +33,32 @@ const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 /** Fiber lifecycle names, indexed by the Cordis `FiberState` value. */
 const FIBER_STATES = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
 
-/** Accepted settings and their defaults. */
-const DEFAULT_SETTINGS = {
+/**
+ * Settings this half owns.
+ *
+ * Upstream discovery is shared with the Settings page, so its keys are
+ * resolved by `./upstream.js` instead of here.
+ */
+const LOCAL_SETTINGS = {
   /** Authenticated route path served to the browser. */
   routePath: '/api/mcp-status',
-  /** Budget for one endpoint probe (handshake plus tool listing). */
-  probeTimeoutMs: 4000,
   /** How long one probe result is reused for later reads. */
   connectionTtlMs: 5000,
-  /** How long a federating server's upstream catalog is reused. */
-  upstreamTtlMs: 60000,
-  /** Preferred tool that lists a federating server's upstream MCP servers. */
-  catalogTool: 'mcp_catalog',
-  /**
-   * Catalog tool names tried when the preferred one does not exist. Federating
-   * gateways disagree about the name, so one panel can unroll several of them.
-   */
-  catalogTools: ['mcp_catalog', 'list_mcp_servers', 'list_servers', 'list_mcp_tools'],
   /** Tool names included per connection in the snapshot. */
   maxToolsListed: 24,
-  /** Upstream server rows included per connection. */
-  maxUpstreamServers: 64,
 }
 
-/** Numeric bounds applied to configured settings. */
-const BOUNDS = {
-  probeTimeoutMs: [200, 30000],
+/** Numeric bounds for the settings this half owns. */
+const LOCAL_BOUNDS = {
   connectionTtlMs: [0, 300000],
-  upstreamTtlMs: [0, 3600000],
   maxToolsListed: [1, 200],
-  maxUpstreamServers: [1, 500],
 }
+
+/** Accepted settings and their defaults. */
+const DEFAULT_SETTINGS = { ...LOCAL_SETTINGS, ...UPSTREAM_DEFAULTS }
+
+/** Numeric bounds applied to configured settings. */
+const BOUNDS = { ...LOCAL_BOUNDS, ...UPSTREAM_BOUNDS }
 
 /**
  * Services required before this plugin can answer.
@@ -80,19 +76,13 @@ export const inject = ['connection', 'tools']
  */
 function resolveSettings(config) {
   const raw = config && typeof config === 'object' ? config : {}
-  const settings = { ...DEFAULT_SETTINGS }
-  for (const [key, fallback] of Object.entries(DEFAULT_SETTINGS)) {
+  const settings = { ...DEFAULT_SETTINGS, ...resolveUpstreamSettings(raw) }
+  for (const [key, fallback] of Object.entries(LOCAL_SETTINGS)) {
     const value = raw[key]
     if (typeof fallback === 'number') {
       if (typeof value !== 'number' || !Number.isFinite(value)) continue
       const [min, max] = BOUNDS[key] ?? [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]
       settings[key] = Math.min(max, Math.max(min, Math.floor(value)))
-    } else if (Array.isArray(fallback)) {
-      if (!Array.isArray(value)) continue
-      const names = value
-        .filter((entry) => typeof entry === 'string' && entry.trim())
-        .map((entry) => entry.trim())
-      if (names.length > 0) settings[key] = names
     } else if (typeof value === 'string' && value.trim()) {
       settings[key] = value.trim()
     }
@@ -497,119 +487,6 @@ function readConnections(ctx, settings, caches) {
   )
   cache.pending = pending
   return pending
-}
-
-/**
- * Ask a federating connection for its upstream servers, cached per endpoint.
- * @param {Record<string, any>} connection - connected MCP server view.
- * @param {typeof DEFAULT_SETTINGS} settings - resolved settings.
- * @param {Map<string, { at: number, value: any }>} cache - upstream cache.
- * @returns {Promise<Record<string, any>>} connection view with `upstream`.
- */
-/**
- * Group a gateway's tool names into upstream servers.
- *
- * A gateway that refuses its catalog still namespaces every proxied tool as
- * `<server>-<tool>` (LiteLLM does), so the server names and their tool counts
- * are already in the tool list. This is the last resort, used only when the
- * catalog endpoint exists but denies access — a 404 means "not a gateway".
- * @param {string[]} toolNames - tools the server listed.
- * @returns {Array<{ server: string, toolCount: number, reachable: boolean }>} derived rows.
- */
-function deriveServersFromTools(toolNames) {
-  const counts = new Map()
-  for (const name of Array.isArray(toolNames) ? toolNames : []) {
-    const at = name.indexOf('-')
-    if (at <= 0 || at === name.length - 1) continue
-    const server = name.slice(0, at)
-    counts.set(server, (counts.get(server) ?? 0) + 1)
-  }
-  return [...counts.entries()].map(([server, toolCount]) => ({ server, toolCount, reachable: true }))
-}
-
-/**
- * Guess a gateway's REST catalog endpoint from its MCP endpoint.
- *
- * LiteLLM proxies the upstream tools and keeps the server list at
- * `/v1/mcp/server`, so a gateway that publishes no catalog tool still has an
- * answer — it is just not an MCP one.
- * @param {string} url - MCP endpoint.
- * @returns {string | undefined} catalog URL, or undefined when the shape is unknown.
- */
-function deriveCatalogUrl(url) {
-  try {
-    const parsed = new URL(url)
-    if (!/\/mcp\/?$/.test(parsed.pathname)) return undefined
-    return parsed.origin + '/v1/mcp/server'
-  } catch {
-    return undefined
-  }
-}
-
-async function withUpstream(connection, settings, cache) {
-  if (connection.state !== 'connected' || !connection.target) return connection
-  const key = `${connection.serverName}|${connection.endpoint ?? ''}`
-  const cached = cache.get(key)
-  if (cached && Date.now() - cached.at < settings.upstreamTtlMs) {
-    // A null value records "this server federates nothing": cache the negative
-    // answer too, or a plain server is re-probed on every poll.
-    return cached.value === null ? connection : { ...connection, upstream: cached.value }
-  }
-
-  const headers = connection.target.headers
-  const explicit = typeof connection.catalogUrl === 'string' && connection.catalogUrl !== ''
-  const derived = explicit ? connection.catalogUrl : deriveCatalogUrl(connection.target.url)
-  let servers = []
-  let tool = settings.catalogTool
-  let error
-
-  if (connection.catalogAvailable) {
-    const probe = await probeMcpHttp({
-      url: connection.target.url,
-      headers,
-      timeoutMs: settings.probeTimeoutMs,
-      catalogTool: settings.catalogTool,
-      catalogTools: settings.catalogTools,
-    })
-    servers = Array.isArray(probe.catalog) ? probe.catalog : []
-    tool = probe.catalogTool ?? settings.catalogTool
-    error = probe.catalogError
-  } else if (derived !== undefined) {
-    const fetched = await fetchCatalog({ url: derived, headers, timeoutMs: settings.probeTimeoutMs })
-    servers = Array.isArray(fetched.rows) ? fetched.rows : []
-    tool = 'rest'
-    error = fetched.error
-    // A denied catalog (401/403) still proves this is a gateway, and its tool
-    // names carry the upstream server names. A 404 means there is no catalog
-    // here at all, so nothing is derived from a plain server's tool names.
-    if (servers.length === 0 && (fetched.status === 401 || fetched.status === 403)) {
-      const derivedRows = deriveServersFromTools(connection.toolNames)
-      if (derivedRows.length > 0) {
-        servers = derivedRows
-        tool = 'tool-names'
-        error = undefined
-      }
-    }
-    // Nothing answered and nothing could be inferred: this is a plain MCP
-    // server, not a gateway. Say nothing rather than render "HTTP 404" under
-    // every server that happens to end in /mcp. An explicitly configured
-    // catalog URL is the exception — there the operator asked for it.
-    if (servers.length === 0 && !explicit) {
-      cache.set(key, { at: Date.now(), value: null })
-      return connection
-    }
-  } else {
-    return connection
-  }
-
-  const upstream = {
-    generatedAt: new Date().toISOString(),
-    tool,
-    servers: servers.slice(0, settings.maxUpstreamServers),
-    error: error ?? (servers.length ? undefined : 'no upstream servers reported'),
-  }
-  cache.set(key, { at: Date.now(), value: upstream })
-  return { ...connection, upstream }
 }
 
 /**
