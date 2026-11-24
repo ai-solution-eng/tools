@@ -5,6 +5,52 @@ the audit reports and the tree (the repo's changelog was frozen at 0.1.16
 while three release waves shipped); where a cut boundary was uncertain the
 feature is listed under the LATER version.
 
+## 2026-11-23 (night) — the destructive-action hole closes, and the judge starts reading
+
+Waves 5–7. The morning built the quality layer and made the controls bind; this one closes the last hole that
+mattered (an agent could mutate a cluster on a static grant) and puts the first half of a calibrated judge in place.
+
+- **Destructive-tool approval gate.** `InputRequiredResult` had zero construction sites: `applygate plan_apply`,
+  `workbench run` and `k8s exec_in_pod` ran on a static grant, and the ACL answers "may this key call this tool",
+  never "should this specific call happen". There is now a pre-authorization token model: an operator grants a
+  token for a `(server, tool, args-fingerprint)` with a MANDATORY use count and expiry, and in `enforce` mode a
+  call without one is refused with `detail=approval_required`, naming the request id to grant against.
+  **The gate covers BOTH surfaces** — `_gated_mcp_call` for /mcp and `routes_proxy._relay_executor` for the relay —
+  in the same position: after the loop guard, rate limit, tool policy and argument policy, before credentials are
+  built. It ships `off` by default, and G2 runs **`enforce`**.
+  Two asymmetries are deliberate and commented: approval **fails CLOSED** on a store fault (the opposite of pinning —
+  a broken pinning gate must not break a turn, a broken approval gate must not let a destructive call through), and
+  an unknown mode coerces to `off` (a typo must not start refusing). The refusal text tells the caller — often a
+  MODEL — that retrying will not help, because a bare `error:` reads as transient and a loop-prone agent re-issues
+  the same call, re-records the request, and eventually trips the loop guard.
+- **Operator lever.** `scripts/tool_approval_admin.py list|grant|revoke` and `scripts/tool_pin_admin.py` — durable
+  pinning created a support burden (a legitimate definition change locks a tool out), so there is a supported path
+  instead of hand SQL. `scripts/` is NOT in the image; both say so.
+- **The judge, first half.** `core/judge.py`: a `Verdict` schema over four dimensions, an injectable `judge_fn`
+  (no model call in the module), and THE load-bearing rule — **a claim that cannot cite a `(request_id, iteration)`
+  is DROPPED, not stored at low confidence** — enforced twice: in code, and in the table via
+  `CHECK (jsonb_array_length(evidence_refs) > 0)`, because this table will feed a release gate and a hand-written
+  INSERT must not be able to bypass it. An ABSTENTION is a first-class outcome and cites the turn's own steps; the
+  schema deliberately carries NO citation exemption for it, because a rule with a door in it is not a rule.
+  Tool results are untrusted input, so payloads pass `tool_injection.scan` first and a HIGH finding sets
+  `contaminated` while the verdicts are still returned. `PROMPT_VERSION` is stamped on every row.
+- **The judge, second half (the sweep).** `scripts/judge_sweep.py`: selects turns with no verdicts, applies a
+  10-minute quiet period (a running turn's rows are incomplete), samples PER REQUEST, bounds by `judge_daily_usd`
+  re-read after every turn, and writes `kind='shadow'`. `--dry` shows what it would judge and calls nothing.
+  It gates nothing — calibration comes first, or the judge produces numbers that look like evidence.
+- **Retention** for `tool_approval_requests` (30 d, keyed on `last_seen` so a shape the fleet still calls never
+  ages out) and `judge_verdicts` (90 d), as housekeeping steps 1f/1g. The TOKEN table is never pruned — a grant
+  must not evaporate because its request aged out.
+- **All 24 new knobs are chart-reachable** (`PCAI_LLM_TOOL_APPROVAL_*`, `PCAI_LLM_JUDGE_*`, plus the morning's
+  families). They were env-only, which meant an operator could not set them without editing a Deployment.
+- **Gate 2b/4: mypy.** The fleet's definition of "clean" always included mypy; no gate ever ran it. That gap
+  shipped a real defect — the relay approval wiring returned `decision.message` where the dataclass has `.reason`,
+  an `AttributeError` waiting for the first enforce-mode refusal on the path an agent uses. Dormant in off/warn,
+  live the day the gate is turned on. Fixed, gated, and covered by a guard asserting every
+  `approval_decision.<attr>` read exists on the dataclass.
+- **Suite:** 4235 → 4528 tests, 0 failed; ruff + mypy + SQL↔schema + agent-behaviour gates all green.
+- **Residuals:** the judge is inert until calibrated (40 hand-labelled turns); the sweep's production `judge_fn`
+  has never been exercised against a real model; per-agent identity and egress isolation are unchanged.
 ## 2026-11-23 (console) — the usage rollups agree on what "top" means, and the headers sort
 
 - **Reported:** "By model seems to sort by billed cost while by key seems to sort cost. Default for both should

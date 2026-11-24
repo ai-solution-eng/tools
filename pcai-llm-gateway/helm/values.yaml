@@ -39,7 +39,7 @@ image:
   repository: ghcr.io/ai-solution-eng/pcai-llm-gateway
   # tag: "" inherits appVersion. The tag is MUTABLE: pin with tag@sha256:<digest>
   # (or pullPolicy: Always) for a reproducible supply chain.
-  tag: v4.4.0
+  tag: v4.4.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -296,7 +296,7 @@ settings:
     # approval that never expires is a grant wearing a disguise.
     toolApproval:
       mode: "off"
-      required: "applygate.*apply*,workbench.run,k8s.exec_in_pod"
+      required: "applygate.*apply*,workbench.run*,k8s-ops.exec_in_pod"
       tokenTtlS: 900
       tokenMaxUses: 1
 

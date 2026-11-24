@@ -609,7 +609,7 @@ observe clock in `warn`, and the judge stays off.
 - **Destructive-tool approval gate** (`settings.mcp.toolApproval.*` →
   `PCAI_LLM_TOOL_APPROVAL_*`): `mode` (chart default **off**, G2 **warn**),
   `required` (default the destructive set
-  `applygate.*apply*,workbench.run,k8s.exec_in_pod`), `tokenTtlS` (default
+  `applygate.*apply*,workbench.run*,k8s-ops.exec_in_pod`), `tokenTtlS` (default
   **900**) and `tokenMaxUses` (default **1**) as the ceilings a token may not
   exceed. The hole it closes: `InputRequiredResult` still has zero construction
   sites, so `applygate plan_apply`, `workbench run` and `k8s exec_in_pod` execute

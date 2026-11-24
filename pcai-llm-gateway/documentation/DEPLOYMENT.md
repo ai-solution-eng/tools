@@ -468,6 +468,28 @@ FEATURES.md coverage; the design rationale for each lives in
 | `settings.audio.ttsCharsPerToken` / `.asrTokensPerSecond` (`PCAI_LLM_AUDIO_TTS_CHARS_PER_TOKEN` / `_ASR_TOKENS_PER_SECOND`) | 4 / 3.0 | Audio billing estimates (TTS/ASR report no token usage; a zero-token row would be a budget bypass) — superseded per model by unit-aware pricing (`model_costs.unit`) |
 | `settings.memory.distiller.maxTokens` (`PCAI_LLM_DISTILLER_MAX_TOKENS`) | 4096 | Distill OUTPUT cap — an overrun is rejected whole by `document_is_complete()`, so the memory write is lost rather than shortened |
 | `settings.memory.distiller.disableThinking` (`PCAI_LLM_DISTILLER_DISABLE_THINKING`) | true | Send `chat_template_kwargs {"enable_thinking": false}` to the summarizer (engines without the kwarg ignore it) |
+
+### Settings knobs added in the 2026-11-23 waves (the scorecard + controls)
+
+All rendered from `settings.*` to `PCAI_LLM_*`. The tracked chart defaults are deliberately CONSERVATIVE — a chart
+default must not change what a deployment DOES — so every knob below is inert or measure-only until a site opts in.
+The G2 site values are the worked example of the aggressive posture.
+
+| Values key (env) | Default | Why |
+|---|---|---|
+| `settings.relay.toolPinMode` (`PCAI_LLM_TOOL_PIN_MODE`) | `warn` | Tool-DEFINITION pinning (`off \| warn \| block`). `block` drops a changed definition from the offered surface AND refuses at dispatch. Pins are PERSISTENT (`tool_pins`), so an approval survives a restart; a pod that could not READ the table falls back to in-memory for its lifetime and disables writes rather than overwrite an unread approval |
+| `settings.relay.toolInjectionScreen` (`PCAI_LLM_TOOL_INJECTION_SCREEN`) | `annotate` | Screening of tool RESULTS (`off \| warn \| annotate \| block`) on the relay, the compressed-original retrieval path AND `/mcp`. `annotate` prepends a provenance header and keeps the content |
+| `settings.relay.toolSearchMaxResults` (`PCAI_LLM_TOOL_SEARCH_MAX_RESULTS`) | `10` | Cap on the `search` action of the `pcai_tools` discovery tool (BM25 over server/tool/description). `0` disables the action with an explicit error rather than an empty result the model reads as "no such tool" |
+| `settings.memory.playbookInject.*` (`PCAI_LLM_PLAYBOOK_INJECT_*`) | false / 3 / 2000 / 800 / 0.0 | Pre-task playbook injection: recall top-k procedures for the task signature and prepend them to the system preamble. **FAILS OPEN** past `timeoutMs`; disabled is byte-identical. G2 runs `timeoutMs: 3000` — at 800 the live rollout timed out on every turn |
+| `settings.memory.playbookStaleAfterDays` (`PCAI_LLM_PLAYBOOK_STALE_AFTER_DAYS`) | 90 | A procedure older than this is WITHHELD and labelled `[stale]` rather than injected — playbooks are the one memory kind protected from decay, so they are the one most likely to drift. 0 = never expire |
+| `settings.tracing.tracePayload.*` (`PCAI_LLM_TRACE_PAYLOAD_*`) | 0.0 / 7 / 2000 / true | `agent_trace_payloads`: what the agent SAW beside what it did. Sampled PER REQUEST so a captured turn is whole; at `sampling: 0` the path is a no-op before any hash/serialise/DB write. Redaction is best-effort, NOT a guarantee |
+| `settings.tracing.agentEval.*` (`PCAI_LLM_AGENT_EVAL_*`) | false / 40 / 3 | Deterministic, model-free scoring: `not_granted`, `tool_error`, `loop`, `step_budget`, else `clean`. Handbacks are not failures; a DENIED call still counts toward `loop`. `0` disables a rule rather than flagging everything |
+| `settings.mcp.toolApproval.*` (`PCAI_LLM_TOOL_APPROVAL_*`) | off / destructive globs / 900 / 1 | The destructive-tool approval gate (`off \| warn \| enforce`). `warn` records `tool_approval_requests` and never blocks; `enforce` refuses without a live token. **FAILS CLOSED on a store fault — deliberately the opposite of pinning.** An unknown mode coerces to `off`: a typo must not start refusing |
+| `settings.tracing.judge.*` (`PCAI_LLM_JUDGE_*`) | false / "" / 0.0 / 25 / 0.1 / 0.0 | The calibrated behaviour judge (a sweep, never the request path). `dailyUsd` is the REAL switch — 0.0 makes the sweep inert even when enabled. It must not gate anything until it clears 0.80 agreement per dimension against hand-labelled turns |
+
+Retention for the two new tables rides the existing housekeeping sweep: `tool_approval_retention_days` (30) and
+`judge_verdict_retention_days` (90). Neither is chart-exposed — code settings with sane defaults.
+
 | `settings.memory.capture.skipTitleRequests` (`PCAI_LLM_CANONICAL_SKIP_TITLE_REQUESTS`) | true | Never capture a title-generation request as a canonical conversation (it would distill a bogus "session summary" of a title string) |
 | `settings.mcp.selfService` (`PCAI_LLM_MCP_SELF_SERVICE`) | true | Keyed users manage their OWN key's per-server MCP credential overrides and toggle grants within their entitlement catalog (`/v1/mcp/creds`, `/v1/mcp/selfservice`); false hides the routes |
 | `settings.tracing.enabled` / `.endpoint` / `.headers` / `.sampleRatio` / `.serviceName` (`PCAI_LLM_OTEL_*`) | false / `http://otel-collector:4318` / "" / 1.0 / `pcai-llm-gateway` | OTLP/Langfuse spans (FEATURES.md § OTLP / Langfuse spans); `tracing.headers` is comma-separated `Key=Value` pairs for exporter auth; spans carry metadata only — never prompt/completion content |

@@ -554,7 +554,14 @@ class Settings(BaseSettings):
     # Comma-separated server.tool globs that REQUIRE a token in enforce mode. Defaults
     # to the destructive set; everything else is unaffected, so enabling this cannot
     # break the fleet's read paths.
-    tool_approval_required: str = "applygate.*apply*,workbench.run,k8s.exec_in_pod"
+    # MUST match the REAL registered names — a glob that matches nothing fails open
+    # silently, which is how the first cut of this list shipped a hole:
+    #   * workbench's exec tool is `run_command`, not `run` — `workbench.run` matched
+    #     NOTHING and the workbench exec ran ungated (caught live, 2026-11-23);
+    #   * the kubernetes server is named `k8s-ops`, not `k8s` — same failure.
+    # `run*` is deliberate: any future run-shaped workbench tool is destructive too.
+    # tests/test_tool_approval.py::test_default_globs_match_real_tool_names pins this.
+    tool_approval_required: str = "applygate.*apply*,workbench.run*,k8s-ops.exec_in_pod"
     # A token's lifetime and use count are MANDATORY (an approval that never expires
     # is a grant wearing a disguise). Operators set these per token; these are the
     # ceilings a token may not exceed.

@@ -69,7 +69,14 @@ def _isolate(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(settings, "tool_pin_mode", "warn")
     monkeypatch.setattr(settings, "tool_injection_screen", "off")
     monkeypatch.setattr(settings, "tool_approval_mode", "off")
-    monkeypatch.setattr(settings, "tool_approval_required", "applygate.*apply*,workbench.run,k8s.exec_in_pod")
+    # Read the REQUIRED-GLOB DEFAULT from config rather than restating it. The
+    # hardcoded copy this replaces said "workbench.run"/"k8s.exec_in_pod", which
+    # matched no real tool — so the suite exercised a list the gateway never used,
+    # and the two ungated destructive tools stayed invisible (found live 2026-11-23).
+    # A fixture that restates production config is a fixture that can disagree with it.
+    from pcai_llm.config import Settings as _S
+
+    monkeypatch.setattr(settings, "tool_approval_required", _S().tool_approval_required)
     monkeypatch.setattr(approval, "_UNKNOWN_MODE_LOGGED", set())
     yield
     routes_mcp.listing_cache_clear()
@@ -1334,3 +1341,46 @@ def test_schema_approval_statements_are_idempotent() -> None:
                 "ALTER TABLE tool_approvals ADD CONSTRAINT",
             )
         ), statement
+
+
+# ---------------------------------------------------------------------------
+# The default required-glob list must match the REAL registered tool names.
+# ---------------------------------------------------------------------------
+# 2026-11-23: the first cut listed `workbench.run` (the tool is `run_command`) and
+# `k8s.exec_in_pod` (the server is `k8s-ops`). Both globs matched NOTHING, so the
+# gate read `enforce` while two of the three destructive tools ran ungated — found
+# live, by calling the real tool and watching it execute. A glob matching no tool
+# fails OPEN and silently: the worst failure shape a gate can have.
+
+
+def test_default_globs_match_real_tool_names() -> None:
+    """Every destructive tool the fleet actually registers must be gated by default."""
+    from pcai_llm.config import settings
+    from pcai_llm.core import approval
+
+    destructive = [
+        ("applygate", "plan_apply"),
+        ("applygate", "confirm_apply"),
+        ("workbench", "run_command"),
+        ("k8s-ops", "exec_in_pod"),
+    ]
+    for server, tool in destructive:
+        assert approval.requires_approval(server, tool), (
+            f"{server}.{tool} is NOT gated by {settings.tool_approval_required!r} — the glob "
+            "does not match the real tool name, so the gate fails OPEN for it"
+        )
+
+
+def test_read_only_tools_stay_ungated() -> None:
+    """Enabling the gate must not refuse the fleet's read paths."""
+    from pcai_llm.core import approval
+
+    for server, tool in (
+        ("k8s-ops", "list_pods"),
+        ("k8s-ops", "get_pod_logs"),
+        ("workbench", "list_workspaces"),
+        ("prometheus", "prom_query"),
+    ):
+        assert not approval.requires_approval(server, tool), (
+            f"{server}.{tool} is read-only but is gated — enabling the gate would refuse ordinary fleet operations"
+        )

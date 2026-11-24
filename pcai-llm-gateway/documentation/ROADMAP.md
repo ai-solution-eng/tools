@@ -7,7 +7,7 @@ about what the gateway does — shipped behaviour lives in
 design conversation with a real constraint behind it, kept so the next one
 starts from that constraint instead of from scratch.
 
-- **Current release:** 4.2.1 (`helm/Chart.yaml`, `pyproject.toml`).
+- **Current release:** 4.4.0 (`helm/Chart.yaml`, `pyproject.toml`).
 - **The October 2026 original** is archived verbatim at
   [`history/ROADMAP-2026-10.md`](history/ROADMAP-2026-10.md). Most of it has
   since shipped (first section below); the archive is the record of that design

@@ -45,7 +45,7 @@ approval { id, key_id, server, tool, args_fingerprint, max_uses, expires_at, iss
 - `max_uses` and `expires_at` are mandatory. An approval that never expires is a grant wearing a disguise.
 
 **Which tools require a token** is a settings list (`approval_required_tools`), defaulting to the destructive set:
-`applygate.*apply*`, `workbench.run`, `k8s.exec_in_pod`. Default-deny for the named tools; everything else is
+`applygate.*apply*`, `workbench.run*`, `k8s-ops.exec_in_pod`. Default-deny for the named tools; everything else is
 unaffected, so enabling this cannot break the fleet's read paths.
 
 ### 3.2 Durable handoff (why `tooljobs` exists)
