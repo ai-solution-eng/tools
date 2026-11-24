@@ -285,7 +285,15 @@ def test_admin_layout_observer_scoped_to_row_containers() -> None:
     assert "rowObs.observe(moEps, { childList: true, subtree: true });" in s
     # the explicit render-site calls that cover dynamic rows are intact
     assert "layoutFormRowsNow();\nwindow.addEventListener('resize', layoutFormRows);" in s
-    assert "armPasswordToggles($('dlg-body')); layoutFormRowsNow(); }" in s
+    # the explicit render sites that cover dynamic rows are intact: dlg() is
+    # still the ONE place a dialog's rows are armed + laid out after its
+    # innerHTML lands (2026-11-23: the [?] help panels added a scroll flag, so
+    # the call pair is pinned INSIDE the function rather than as a one-liner)
+    dlg_at = s.index("function dlg(html")
+    dlg_body = s[dlg_at : s.index("\n}", dlg_at)]
+    assert "$('dlg-body').innerHTML = html;" in dlg_body
+    assert "armPasswordToggles($('dlg-body'));" in dlg_body
+    assert "layoutFormRowsNow();" in dlg_body
     assert "layoutFormRowsNow();\n  return true;" in s  # activateTab
 
 

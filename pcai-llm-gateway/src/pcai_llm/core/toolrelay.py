@@ -427,6 +427,138 @@ def with_system_prefix(msgs: list[dict], prefix: str) -> list[dict]:
     return [*msgs[:lead], head, *msgs[lead:]]
 
 
+# ---------------------------------------------------------------------------
+# Pre-task playbook injection (2026-11-23)
+# ---------------------------------------------------------------------------
+# The memory store holds outcome-labelled playbooks (core.playbook's write
+# half, core.memory_write) and mm-rag exposes recall_playbooks, but nothing
+# put a recalled procedure in front of the model BEFORE it started work: the
+# model had to choose to call the tool. This is the missing read half, wired
+# at the ONE seam every relay turn passes through - the gateway-authored
+# system prefix above (with_system_prefix).
+#
+# CONTRACT: fail open, always. Disabled -> the prefix is returned untouched
+# (byte-for-byte today's behaviour). Enabled -> ONE bounded recall per turn;
+# any error, timeout or malformed response logs once and the turn proceeds
+# without the block. The block is computed ONCE here, so it can never be
+# injected twice in a turn, and it never enters relay_msgs: the handback
+# boundary stays exactly where it was.
+#
+# I/O discipline mirrors core.distiller / core.memory_write: the recall call
+# is bound below and injected into core.playbook, so the parse/render half is
+# testable without a DB or a network.
+
+PlaybookRecall = Callable[[str, int], Awaitable[str]]
+
+# Transport bound used when playbook_inject_timeout_ms is 0 ("no timeout"):
+# an unbounded MCP call in the request path is never what an operator means.
+PLAYBOOK_RECALL_DEFAULT_TIMEOUT_S = 30.0
+
+
+def _playbook_recall_timeout_s() -> float:
+    """The transport bound for ONE recall call (seconds)."""
+    try:
+        ms = int(settings.playbook_inject_timeout_ms or 0)
+    except (TypeError, ValueError):
+        ms = 0
+    return ms / 1000.0 if ms > 0 else PLAYBOOK_RECALL_DEFAULT_TIMEOUT_S
+
+
+async def _playbook_recall_client(key_id: uuid.UUID | None) -> PlaybookRecall | None:
+    """Bind recall_playbooks to the registered memory server (the distiller path).
+
+    Same credential/URL discipline as the distiller's search probe
+    (routes_distill._mcp_search_for): the registry row named by
+    settings.distiller_memory_server, resolve_mcp_headers' server-auth-then-
+    key-override merge, and _upstream_session. No second HTTP client, no env
+    URL, no fallback credential path. None = no usable server (inject nothing).
+    """
+    from ..api.routes_mcp import _upstream_session, resolve_mcp_headers
+    from . import enroll_memory
+    from .playbook import RECALL_TOOL_DEFAULT
+
+    target = await enroll_memory.resolve_memory_server(settings.distiller_memory_server)
+    if target is None:
+        log.info("playbook recall: memory server %r is not in the enabled registry", settings.distiller_memory_server)
+        return None
+    url = str(target.get("url") or "")
+    if not url:
+        return None
+    # Operator-overridable like the distiller's search tool; the constant is the
+    # default, so a site can retarget the tool without a config.py change.
+    tool = str(getattr(settings, "playbook_inject_recall_tool", "") or RECALL_TOOL_DEFAULT)
+    timeout_s = _playbook_recall_timeout_s()
+
+    async def recall(task: str, k: int) -> str:
+        headers = await resolve_mcp_headers(target, key_id=key_id)
+
+        async def do(session: Any) -> Any:
+            return await session.call_tool(tool, {"task": task, "k": k})
+
+        result = await _upstream_session(url, headers, do, timeout_s=timeout_s)
+        if getattr(result, "is_error", False):
+            return ""
+        for block in getattr(result, "content", None) or []:
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                return text
+        return ""
+
+    return recall
+
+
+async def _with_playbook_block(
+    system_prefix: str,
+    messages: list[dict],
+    *,
+    request_id: str,
+    key_id: uuid.UUID | None,
+) -> str:
+    """system_prefix + the recalled-procedure block for this turn (fail open).
+
+    Returns system_prefix UNCHANGED - the same string, byte-for-byte - when the
+    feature is off, when the turn carries no usable task text, when the store
+    answers nothing, or when anything at all goes wrong. The block rides at the
+    END of the gateway prefix so an agent profile's own prompt keeps its
+    opening position; with_system_prefix then puts the whole prefix in front of
+    the conversation.
+    """
+    if not settings.playbook_inject_enabled:
+        return system_prefix
+    try:
+        from . import decision_routing
+        from .playbook import contains_playbook_block, recall_playbook_block
+
+        if contains_playbook_block(messages):
+            return system_prefix  # never twice in one turn
+        # The task is the OPENING ask (decision_routing own scheme, harness
+        # preamble stripped), not the last turn: in an agent loop the last user
+        # row is often a tool or subagent notice, not the task.
+        task = decision_routing.extract_user_task({"messages": messages})
+        recall = await _playbook_recall_client(key_id)
+        block = await recall_playbook_block(
+            task,
+            recall=recall,
+            k=settings.playbook_inject_k,
+            max_chars=settings.playbook_inject_max_chars,
+            min_success_rate=settings.playbook_inject_min_success_rate,
+            timeout_ms=settings.playbook_inject_timeout_ms,
+            request_id=request_id,
+        )
+        if not block:
+            return system_prefix
+        # SEPARATOR (2026-11-23, cross-review): an agent profile's prompt usually ends
+        # in prose with no trailing newline, so a bare concatenation welded its last
+        # sentence onto our markdown header ("...identical arguments.## Recalled
+        # playbooks"). The block must start on its own line or it corrupts the operator
+        # prompt's final line. An empty prefix gets no leading blank line.
+        separator = "" if not system_prefix or system_prefix.endswith("\n") else "\n"
+        return system_prefix + separator + block
+    except Exception:
+        log.warning("playbook injection failed open (request=%s)", request_id, exc_info=True)
+        return system_prefix
+
+
 def tools_payload(catalog: list[dict]) -> list[dict]:
     """OpenAI tools array from the granted (server, tool) catalog.
 
@@ -1647,6 +1779,11 @@ async def relay_stream(
         # (>=1 answered call id) may label the turn.
         continuation = None
     relay_msgs = list(messages)
+    # Pre-task playbook injection (2026-11-23): the gateway system prefix gains
+    # the recalled-procedure block for THIS turn, computed once here and applied
+    # to every model call below by with_system_prefix. Disabled => appended "",
+    # i.e. the caller's prefix stays byte-for-byte what it was.
+    system_prefix = await _with_playbook_block(system_prefix, relay_msgs, request_id=request_id, key_id=key_id)
     # Conversation fingerprint for trace grouping — one long multi-turn
     # harness session = one trace thread (see _thread_key).
     thread_id = _thread_key(relay_msgs, key_id)
@@ -1826,6 +1963,8 @@ async def relay_stream(
         completion_tokens: int = 0,
         status: str = "ok",
         cached_tokens: int = 0,
+        tool_args: Any = None,
+        tool_result: Any = None,
     ) -> None:
         """Best-effort agent-trace write for ONE relay step.
 
@@ -1850,6 +1989,8 @@ async def relay_stream(
             status=status,
             thread_id=thread_id,
             cached_tokens=cached_tokens,
+            tool_args=tool_args,
+            tool_result=tool_result,
         )
 
     def _emit_tool_span(server: str, tool: str, ms: int | None, status: str) -> None:
@@ -3684,7 +3825,16 @@ async def relay_stream(
             )
             yield _reasoning_trace(server, tool, args, "ok" if ok else "error", ms=ms, content=content)
             _tool_status = _tool_trace_status(ok, content)
-            await _trace_step(iteration, "tool", server=server, tool=tool, ms=ms, status=_tool_status)
+            await _trace_step(
+                iteration,
+                "tool",
+                server=server,
+                tool=tool,
+                ms=ms,
+                status=_tool_status,
+                tool_args=args,
+                tool_result=content,
+            )
             _emit_tool_span(server, tool, ms, _tool_status)
             mcp_summaries.append(
                 f"[tool result] {server}__{tool} → {'ok' if ok else 'error'} ({ms}ms)\n{_preview(content)}\n"

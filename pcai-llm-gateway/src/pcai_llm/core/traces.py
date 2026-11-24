@@ -10,6 +10,13 @@ DISCIPLINE (mirrors the schema comment): trace writes are BEST-EFFORT —
 `record()` swallows every failure at WARNING. A broken/missing trace
 pipeline must never fail a request that the ledger already settled.
 
+PAYLOADS (2026-11-23): `record()` also takes optional tool_args/tool_result
+— what the model SENT to a tool and what came back — and hands them to
+core.trace_payloads, which stores them sampled per request, redacted and
+truncated (agent_trace_payloads). The trace row stays the anchor: a payload
+is written only AFTER its trace row lands, and only when
+trace_payload_sampling says so.
+
 READS: both return REQUEST-GROUPED timelines (GROUP BY request_id with
 json_agg of the steps ordered by ts, joined to api_keys/users for the actor
 names and to subjects for the Phase A identity projection) — the admin
@@ -38,6 +45,7 @@ from datetime import datetime
 from typing import Any
 
 from ..db import db
+from . import trace_payloads
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +73,8 @@ async def record(
     status: str = "ok",
     thread_id: str | None = None,
     cached_tokens: int = 0,
+    tool_args: Any = None,
+    tool_result: Any = None,
 ) -> None:
     """Write ONE trace row. BEST-EFFORT: never raises — a trace write
     failure is logged at WARNING and swallowed (trace writes must never
@@ -74,6 +84,14 @@ async def record(
     `key_id` is NOT NULL in the schema: callers without a key (keyless
     unit-test runs of the relay) skip tracing upstream of this function,
     the same gate the settle contract uses.
+
+    tool_args / tool_result (2026-11-23) are the PAYLOAD half: what the
+    model sent to the tool and what came back. They are written by
+    core.trace_payloads AFTER this row lands (so a payload row can never
+    outlive a trace row that does not exist) and are gated there by
+    trace_payload_sampling. When sampling is 0 — the default — the whole
+    path is a no-op before any serialisation, hashing or DB write, so a
+    deployment that does not opt in pays nothing for the kwargs.
     """
     try:
         await db.execute(
@@ -100,6 +118,21 @@ async def record(
             phase,
             iteration,
             exc_info=True,
+        )
+        return
+    # Payload hook (2026-11-23): the trace row says WHAT the agent did, the
+    # payload rows say WHAT IT SAW. Only tool steps carry a payload, and only
+    # when the caller passed one — trace_payloads owns the sampling decision,
+    # the redaction and the truncation, and is itself best-effort, so nothing
+    # here can affect the row that just landed.
+    if phase == "tool" and (tool_args is not None or tool_result is not None):
+        await trace_payloads.record_step(
+            request_id,
+            iteration,
+            server,
+            tool,
+            args=tool_args,
+            result=tool_result,
         )
 
 

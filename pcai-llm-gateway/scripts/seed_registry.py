@@ -53,20 +53,31 @@ CA_BUNDLE = os.environ.get("GATEWAY_CA") or (DEFAULT_CA or True)
 # verified 2026-09-19) — and the proxy env exists precisely so the gateway
 # can reach MCP servers via their gateway hostnames. Cluster-internal
 # .svc.cluster.local traffic bypasses the proxy (NO_PROXY) and works.
+#
+# 2026-11-23: GLM-5.3-Flash retired, replaced by Inkling-2-Small; the chat fleet
+# is Deepseek + Inkling + Qwen. The 4th element is the SERVING PROJECT
+# NAMESPACE — it is per-deployment, not per-cluster (Inkling is served out of
+# project-user-jeff-oxenberg while the rest are andrew's), so it cannot be
+# hardcoded once in the URL template below.
 DEPLOYED = [
-    ("GLM-5.3-Flash", "chat", "glm-53-flash"),
-    ("Qwen/Qwen3.8-27B-FP8", "chat", "qwen-38-27b"),
-    ("RamManavalan/Qwen3-VL-Embedding-8B-FP8", "embedding", "qwen3-vl-embedding-8b"),
+    ("Deepseek-V4.1-Flash-1017", "chat", "deepseek-v41-flash-offload", "project-user-andrew-bydlon"),
+    ("Inkling-2-Small", "chat", "inkling-2-small", "project-user-jeff-oxenberg"),
+    ("Qwen/Qwen3.8-27B-FP8", "chat", "qwen-38-27b", "project-user-andrew-bydlon"),
+    ("RamManavalan/Qwen3-VL-Embedding-8B-FP8", "embedding", "qwen3-vl-embedding-8b", "project-user-andrew-bydlon"),
 ]
 
 # Reference prices, USD per 1M tokens — PUBLIC MARKET rates for parity /
 # chargeback-style accounting. Your true internal cost (GPU amortization) is
 # almost certainly lower; these are the "what would this cost at list price"
-# numbers. Sources: Z.ai official list (GLM-5.3-Flash $0.15/$0.50/$0.03);
-# OpenRouter (Qwen3.8-27B $0.15/$1.875; cached ≈ $0.03-0.06).
+# numbers. Source: OpenRouter (Qwen3.8-27B $0.15/$1.875; cached ≈ $0.03-0.06).
+#
+# NOT priced here on purpose: Deepseek-V4.1-Flash-1017 and Inkling-2-Small —
+# inventing a market rate would corrupt chargeback. Set real rates with
+# POST /admin/costs before relying on USD budgets: an unpriced model ledgers
+# cost_usd NULL and the budget SUM ignores NULL, so it consumes ZERO of every
+# USD budget (silent spend-control hole, not just a missing routing hint).
 MODEL_PRICES = {
     "Qwen/Qwen3.8-27B-FP8": {"input_per_m": 0.15, "output_per_m": 1.88, "cached_per_m": 0.03},
-    "GLM-5.3-Flash": {"input_per_m": 0.15, "output_per_m": 0.50, "cached_per_m": 0.03},
     "RamManavalan/Qwen3-VL-Embedding-8B-FP8": {"input_per_m": 0.05, "output_per_m": 0.0, "cached_per_m": 0.0},
 }
 
@@ -86,16 +97,31 @@ MCP_SERVERS = [
 
 
 def extract_jwt(var_hint: str) -> str:
-    """Pull the api_key JWT for the model whose entry contains var_hint."""
+    """Pull the api_key JWT for the model whose entry contains var_hint.
+
+    Matches BOTH catalog styles in pcai_models.py: the older
+    `x = ChatModel(...)` assignment and the current `return ChatModel(...)`
+    inside a `_build_*` factory. The old `= ChatModel(`-only pattern matched
+    ZERO blocks after the 2026-11 refactor, so this script died on its first
+    model with "no JWT found" — independent of which models were listed.
+    """
     src = open(MODELS_SRC).read()
-    # find the ChatModel(...) block that contains both the url and the api_key
-    blocks = re.findall(r"=(?:\s*)(ChatModel|EmbeddingModel)\(\n(.*?)\n\)", src, re.DOTALL)
-    for _, body in blocks:
-        if var_hint in body and "api_key" in body:
-            m = re.search(r'"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"', body)
-            if m:
-                return m.group(1)
-    raise SystemExit(f"FATAL: no JWT found for {var_hint!r} in {MODELS_SRC}")
+    # Locate the CONSTRUCTOR that encloses the hint, then read the JWT out of it.
+    # Block-boundary regexing is not reliable: an entry whose url_remote is a
+    # multi-line `url_remote=(...)` ends at that paren, BEFORE the api_key, so
+    # qwen/deepseek matched a block with no key in it.
+    at = src.find(var_hint)
+    if at < 0:
+        raise SystemExit(f"FATAL: no catalog entry mentions {var_hint!r} in {MODELS_SRC}")
+    starts = [i for i in (src.rfind("ChatModel(", 0, at), src.rfind("EmbeddingModel(", 0, at)) if i >= 0]
+    if not starts:
+        raise SystemExit(f"FATAL: no ChatModel/EmbeddingModel constructor encloses {var_hint!r}")
+    end = src.find("\n    )", at)
+    body = src[max(starts) : end if end > at else len(src)]
+    m = re.search(r'"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"', body)
+    if not m:
+        raise SystemExit(f"FATAL: no JWT in the entry for {var_hint!r} in {MODELS_SRC}")
+    return m.group(1)
 
 
 def call(method: str, path: str, body: dict | None = None) -> dict:
@@ -128,7 +154,7 @@ def main() -> None:
     print(f"== Seeding {BASE} ==")
 
     if args.dry_run:
-        for virtual, mtype, host_prefix in DEPLOYED:
+        for virtual, mtype, host_prefix, ns in DEPLOYED:
             extract_jwt(host_prefix)  # proves the JWT is findable
             print(f"[dry] model {virtual} ({mtype}) + panel token")
         for name, host, port in MCP_SERVERS:
@@ -157,13 +183,13 @@ def main() -> None:
     print(f"tenant/user: fleet/andrew ({uid})")
 
     # --- models (deployed only; sproket excluded) ---
-    for virtual, mtype, host_prefix in DEPLOYED:
+    for virtual, mtype, host_prefix, ns in DEPLOYED:
         jwt = extract_jwt(host_prefix)
         print(f"model: {virtual} ({mtype}) — token extracted, not printed")
         if not args.dry_run:
             # IN-CLUSTER svc URL (see DEPLOYED comment): the pod's proxy egress
             # cannot reach the external serving hostnames.
-            svc = f"{host_prefix}.project-user-andrew-bydlon.svc.cluster.local"
+            svc = f"{host_prefix}.{ns}.svc.cluster.local"
             r = call(
                 "POST",
                 "/admin/models",

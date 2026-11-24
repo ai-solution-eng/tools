@@ -67,13 +67,13 @@ rows above:
 
 - **Blue — routing (row 4).** The gateway asks **d3-turbo** (vLLM-SR System One,
   `decision_mode: shadow | active`), which picks exactly ONE model: DeepSeek for
-  hard code, GLM for review / lowest hallucination, a Qwen for lighter
+  hard code, Inkling for review / lowest hallucination, a Qwen for lighter
   work. It sees a SUMMARY of the request — estimated tokens, message/tool
   counts, per-candidate cost and live GPU load — never the message content, and
   a confidence under 0.60 leaves the heuristics standing rather than downgrading
   on a guess ([FEATURES.md § Routing](FEATURES.md#routing)).
 - **Green — fallback (row 5).** With no routing decision the gateway walks the
-  cascade **DeepSeek → GLM → Qwen**, promoting on budget exhaustion or a dead /
+  cascade **DeepSeek → Inkling → Qwen**, promoting on budget exhaustion or a dead /
   5xx primary. Every hop is re-gated at walk time — registered, inside the key's
   `allowed_models`, a healthy chat pool, fresh budget headroom — so failover can
   never become a budget bypass, and each attempt settles under the model that

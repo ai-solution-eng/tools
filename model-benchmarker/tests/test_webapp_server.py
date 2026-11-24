@@ -1582,6 +1582,143 @@ def test_public_index_fuses_resumed_roster_subset(tmp_path, monkeypatch):
     assert sum(1 for r in idx if r["run_id"].startswith("ds-")) == 1
 
 
+def test_compare_data_merges_fused_runs_additively(tmp_path, monkeypatch):
+    """A fused listing entry must not LOSE the absorbed run's levels.
+
+    _fuse_key deliberately excludes the number_users / context_length ROSTERS
+    (a roster is sweep progress, not experiment identity), so a cold ctx=0 run
+    and a padded ctx=32768 run of the same experiment collapse into ONE listing
+    row. Reading only the representative's report.md dropped the other half —
+    which is exactly how a ctx=0 series vanished from the compare charts while
+    its ctx=32.8k half plotted fine.
+    """
+    from model_benchmarker.webapp.runner import RunManager
+
+    work = tmp_path / "w"
+    (work / "runs").mkdir(parents=True)
+    sweep = {
+        "number_users": "1,4,32",
+        "context_length": "0,32768",
+        "requests_per_user": 5,
+        "tasks": "coding,creative",
+        "multiturn": True,
+        "separate_tasks": True,
+    }
+    header = (
+        "| ctx | users | task | failed | TTFT turn1 P50/P95/P99/P100 (ms) | "
+        "TTFT-post P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 |\n"
+        "|:---|:---|:---|:---|---:|---:|---:|\n"
+    )
+
+    def fabricate(run_id, started, rows, params=None):
+        d = work / "runs" / run_id
+        d.mkdir()
+        (d / "run_meta.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "kind": "chat",
+                    "endpoint": "http://ds:8000",
+                    "target_url": "http://ds:8000",
+                    "params": params or dict(sweep),
+                    "started_utc": started,
+                    "status": "cancelled",
+                    "exit_code": -15,
+                    "finished_utc": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        body = "".join(
+            f"| {ctx} | {users} | {task} | 0 | {ttft:.1f} / 1.0 / 1.0 / 1.0 | "
+            "1.0 / 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 / 1.0 |\n"
+            for (ctx, users, task, ttft) in rows
+        )
+        (d / "report.md").write_text(
+            "# t\n\n- Model: ChatModel name='inkling-2-small'\n\n" + header + body,
+            encoding="utf-8",
+        )
+
+    # older run: the COLD half only
+    fabricate("cold", "2026-01-01T00:00:00+00:00", [(0, 1, "coding", 1000.0), (0, 4, "coding", 900.0)])
+    # newer run: the PADDED half only — plus it re-measured one shared condition
+    fabricate(
+        "warm",
+        "2026-01-02T00:00:00+00:00",
+        [(32768, 1, "coding", 2000.0), (32768, 4, "coding", 6000.0), (0, 1, "coding", 1111.0)],
+    )
+    # a genuinely different experiment must never leak into the group
+    fabricate(
+        "other",
+        "2026-01-03T00:00:00+00:00",
+        [(0, 1, "mixed", 7.0)],
+        params=dict(sweep, tasks="mixed"),
+    )
+
+    monkeypatch.setenv("BENCH_WORK_DIR", str(work))
+    mgr = RunManager(work)
+
+    by_id = {r["run_id"]: r for r in mgr.public_index()}
+    assert by_id["warm"]["fused_count"] == 2, by_id
+    assert by_id["warm"]["fused_from"] == ["cold"]
+
+    data = mgr.compare_data("warm")
+    labels = {r["label"] for r in data["rows"]}
+    # BOTH halves survive the fusion
+    assert "ctx=32768 users=4 coding" in labels
+    assert "ctx=0 users=4 coding" in labels, "the absorbed run's level must not vanish"
+    assert "ctx=0 users=1 coding" in labels
+    # a different experiment stays out
+    assert not any("mixed" in lb for lb in labels), labels
+
+    vals = {r["label"]: r["metrics"]["ttft_turn1_p50_ms"] for r in data["rows"]}
+    # a condition measured by BOTH runs resolves to the NEWER measurement
+    assert vals["ctx=0 users=1 coding"] == 1111.0
+    assert vals["ctx=32768 users=4 coding"] == 6000.0
+    assert data["fused_from"] == ["cold"]
+
+    # symmetric: opening either half of the group yields the same merged view
+    cold = mgr.compare_data("cold")
+    assert {r["label"] for r in cold["rows"]} == labels
+
+
+def test_compare_data_single_run_unchanged(tmp_path, monkeypatch):
+    """No siblings -> byte-for-byte the old single-report behaviour."""
+    from model_benchmarker.webapp.runner import RunManager
+
+    work = tmp_path / "w"
+    (work / "runs" / "solo").mkdir(parents=True)
+    (work / "runs" / "solo" / "run_meta.json").write_text(
+        json.dumps(
+            {
+                "run_id": "solo",
+                "kind": "chat",
+                "endpoint": "http://ds:8000",
+                "target_url": "http://ds:8000",
+                "params": {"tasks": "coding", "context_length": "0", "number_users": "1"},
+                "started_utc": "2026-01-01T00:00:00+00:00",
+                "status": "success",
+                "exit_code": 0,
+                "finished_utc": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (work / "runs" / "solo" / "report.md").write_text(
+        "# t\n\n| ctx | users | task | failed | TTFT P50/P95/P99/P100 (ms) | tokens/s P50/P95/P99/P100 |\n"
+        "|:---|:---|:---|:---|---:|---:|\n"
+        "| 0 | 1 | coding | 0 | 100.0 / 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 / 1.0 |\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("BENCH_WORK_DIR", str(work))
+    mgr = RunManager(work)
+    data = mgr.compare_data("solo")
+    assert len(data["rows"]) == 1
+    assert data["rows"][0]["label"] == "ctx=0 users=1 coding"
+    assert "fused_from" not in data
+
+
 def test_public_index_fuses_by_model_across_targets(tmp_path, monkeypatch):
     """Fusion identity is the MODEL, not the resolved target: a re-run of the
     same experiment against a re-deployed endpoint of the same model (new
